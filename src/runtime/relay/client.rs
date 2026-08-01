@@ -23,7 +23,10 @@ use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream,
 use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
-use crate::runtime::sender::{RelaySendCause, ReliableRelaySenderQueue, RequestSenderService};
+use crate::runtime::sender::{
+    RelaySendCause, ReliableRelaySenderQueue, RequestProductAckReceipt,
+    RequestProductAckReceiptTarget, RequestSenderService,
+};
 use crate::runtime::stream::{ReliableRecvProgress, ReliableRelayRemoteSet};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
@@ -365,6 +368,7 @@ pub(super) struct ClientStreamAckContext<'a> {
     pub(super) send_stream: &'a mut ReliableSendStream,
     pub(super) path_snapshot: Option<PathSnapshot>,
     pub(super) relay_lane: TrafficClass,
+    pub(super) product_ack_receipt: Option<RequestProductAckReceiptTarget<'a>>,
 }
 
 /// Runs exact-attachment stale-path decisions on both Data ACK events and
@@ -619,18 +623,25 @@ pub(super) fn apply_client_stream_ack(
         send_stream,
         path_snapshot,
         relay_lane,
+        product_ack_receipt,
     } = ack_context;
     let normalized_ranges = validated_ack.ranges();
     #[cfg(feature = "lab-diagnostics")]
     let previous_reinjection_bytes = send_stream.reinjection_bytes();
-    let ack_outcome =
-        sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?;
+    let ack_outcome = sender.apply_request_product_ack(
+        context,
+        remotes,
+        send_stream,
+        &validated_ack,
+        product_ack_receipt.is_some(),
+    )?;
     update_reinjection_authoritative_ack_snapshot(
         &mut state.progress.last_send_ack,
         &validated_ack,
     );
     state.progress.last_send_ack_frontier = send_stream.data_ack_frontier();
     let data_ack_progress_paths = ack_outcome.data_ack_progress_paths;
+    let original_releases = ack_outcome.original_releases;
     let ack = ack_outcome.mux;
     sender_queue.release_normalized_acked_reinjections(normalized_ranges);
     update_request_path_staleness(
@@ -677,7 +688,20 @@ pub(super) fn apply_client_stream_ack(
             reinjection.persistent_ready,
         ),
     );
-    state.progress.last_stream_at = Instant::now();
+    let completed_at = Instant::now();
+    state.progress.last_stream_at = completed_at;
+    if let Some(target) = product_ack_receipt {
+        debug_assert_eq!(target.identity.stream_id, stream_id);
+        let original_releases =
+            original_releases.expect("active Product ACK receipt capture returns its release set");
+        target
+            .sink
+            .publish_request_product_ack(RequestProductAckReceipt {
+                identity: target.identity,
+                completed_at,
+                original_releases,
+            });
+    }
     Ok(ack.released_bytes)
 }
 

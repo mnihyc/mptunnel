@@ -40,7 +40,8 @@ pub(in crate::runtime) use ports::{
     ServerNewStreamPolicy, ServerPathValidation, ServerRealtimeFlowLease,
     ServerSessionManagementSnapshot, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
     ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort,
-    ServerStreamPortBackend,
+    ServerStreamPortBackend, ServerTcpCarrierValidationLease, ServerValidationStreamBinding,
+    ServerValidationStreamBindingBackend,
 };
 #[cfg(test)]
 pub(super) use proof::*;

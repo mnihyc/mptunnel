@@ -236,15 +236,14 @@ async fn handle_client_udp_stream_input(
             proof_id,
             payload_bytes,
         } if proof_path_id == path_id => {
-            if let Some(observation) = path_proofs.acknowledge(path_id, proof_id, payload_bytes)
-                && let Some(record) = state
-                    .health()
-                    .lock()
-                    .expect("client path health lock")
-                    .udp
-                    .get_mut(path_index)
-            {
-                record.mark_path_proof_success(observation);
+            if let Some(observation) = path_proofs.acknowledge(path_id, proof_id, payload_bytes) {
+                let _ = state.mutate_path_eligibility(
+                    crate::model::path::RelayPathKey {
+                        underlay: crate::protocol::UnderlayProtocol::Udp,
+                        index: path_index,
+                    },
+                    |record| record.mark_path_proof_success(observation),
+                );
             }
         }
         Frame::PathCapacityData { .. }

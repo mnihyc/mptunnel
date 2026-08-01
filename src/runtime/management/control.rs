@@ -194,6 +194,7 @@ fn set_client_path_state(
     let record = records
         .get_mut(index)
         .expect("configured UDP path must have one health record");
+    let before = record.eligibility_fingerprint();
     let now = Instant::now();
     record.invalidate_path_proofs();
     match state {
@@ -215,6 +216,8 @@ fn set_client_path_state(
             record.relay_queue_bytes = 0;
         }
     }
+    let eligibility_changed = before != record.eligibility_fingerprint();
+    context.publish_path_control_eligibility_change(&mut health, eligibility_changed);
     Ok(())
 }
 

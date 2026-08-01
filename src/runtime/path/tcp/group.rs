@@ -11,7 +11,7 @@ use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::path_record_failure_cooldown;
 use crate::scheduler::PathState as SchedulerPathState;
 use crate::transport::TcpCarrierRange;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,15 +64,16 @@ impl ClientTcpEndpointPolicy {
     }
 
     /// Replaces the published policy while the caller owns `commitment`.
-    fn replace_enabled(&self, enabled: bool) {
+    fn replace_enabled(&self, enabled: bool) -> bool {
         let current = self.snapshot();
         if current.enabled == enabled {
-            return;
+            return false;
         }
         self.changes.send_replace(ClientTcpEndpointPolicySnapshot {
             enabled,
             generation: current.generation.wrapping_add(1),
         });
+        true
     }
 
     pub(in crate::runtime) fn subscribe(&self) -> watch::Receiver<ClientTcpEndpointPolicySnapshot> {
@@ -85,6 +86,9 @@ pub(in crate::runtime) struct ClientTcpCarrierGroup {
     pub(in crate::runtime) config_index: usize,
     pub(in crate::runtime) range: TcpCarrierRange,
     pub(in crate::runtime) members: Vec<usize>,
+    /// Local path-key slots reserved for elastic instances. A slot has no
+    /// health record, actor, queue, or ordinary authority while unoccupied.
+    pub(in crate::runtime) elastic_slots: Vec<usize>,
     policy: Arc<ClientTcpEndpointPolicy>,
 }
 
@@ -98,6 +102,7 @@ impl ClientTcpCarrierGroup {
             config_index,
             range,
             members,
+            elastic_slots: Vec::new(),
             policy: ClientTcpEndpointPolicy::enabled(),
         }
     }
@@ -106,6 +111,7 @@ impl ClientTcpCarrierGroup {
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientTcpCarrierGroups {
     groups: Box<[ClientTcpCarrierGroup]>,
+    elastic_slot_owners: BTreeMap<usize, (usize, u16)>,
     resources: Mutex<ClientTcpCarrierResourceState>,
     changes: watch::Sender<()>,
 }
@@ -114,6 +120,7 @@ pub(in crate::runtime) struct ClientTcpCarrierGroups {
 struct ClientTcpCarrierResourceState {
     occupied_by_group: Box<[u16]>,
     occupied_path_ids: BTreeSet<u16>,
+    occupied_elastic_slots: BTreeSet<usize>,
     next_path_id: u16,
 }
 
@@ -127,11 +134,20 @@ pub(in crate::runtime) struct ClientTcpCarrierReservation {
     owner: Weak<ClientTcpCarrierGroups>,
     config_index: usize,
     path_id: PathId,
+    elastic_path_index: Option<usize>,
 }
 
 impl ClientTcpCarrierReservation {
     pub(in crate::runtime) fn path_id(&self) -> PathId {
         self.path_id
+    }
+
+    pub(in crate::runtime) fn config_index(&self) -> usize {
+        self.config_index
+    }
+
+    pub(in crate::runtime) fn elastic_path_index(&self) -> Option<usize> {
+        self.elastic_path_index
     }
 }
 
@@ -153,6 +169,12 @@ impl Drop for ClientTcpCarrierReservation {
                 resources.occupied_path_ids.remove(&self.path_id.0),
                 "TCP wire PathId reservation released once"
             );
+            if let Some(path_index) = self.elastic_path_index {
+                assert!(
+                    resources.occupied_elastic_slots.remove(&path_index),
+                    "TCP elastic local path slot released once"
+                );
+            }
         }
         owner.publish_change();
     }
@@ -187,11 +209,29 @@ impl ClientTcpCarrierGroups {
     pub(in crate::runtime) fn new(groups: Vec<ClientTcpCarrierGroup>) -> Arc<Self> {
         let (changes, _) = watch::channel(());
         let occupied_by_group = vec![0; groups.len()].into_boxed_slice();
+        let mut elastic_slot_owners = BTreeMap::new();
+        for group in &groups {
+            for (offset, &path_index) in group.elastic_slots.iter().enumerate() {
+                let member_ordinal = group
+                    .range
+                    .min()
+                    .checked_add(u16::try_from(offset).expect("TCP elastic slot ordinal fits u16"))
+                    .expect("TCP elastic member ordinal fits configured range");
+                assert!(
+                    elastic_slot_owners
+                        .insert(path_index, (group.config_index, member_ordinal))
+                        .is_none(),
+                    "TCP elastic local path slots are unique"
+                );
+            }
+        }
         Arc::new(Self {
             groups: groups.into_boxed_slice(),
+            elastic_slot_owners,
             resources: Mutex::new(ClientTcpCarrierResourceState {
                 occupied_by_group,
                 occupied_path_ids: BTreeSet::new(),
+                occupied_elastic_slots: BTreeSet::new(),
                 next_path_id: 0,
             }),
             changes,
@@ -206,12 +246,41 @@ impl ClientTcpCarrierGroups {
         self: &Arc<Self>,
         config_index: usize,
     ) -> Option<ClientTcpCarrierReservation> {
+        self.reserve_inner(config_index, false)
+    }
+
+    /// Reserves the physical envelope, wire identity, and one unpublished
+    /// local path-key slot for an elastic candidate.
+    pub(in crate::runtime) fn reserve_elastic(
+        self: &Arc<Self>,
+        config_index: usize,
+    ) -> Option<ClientTcpCarrierReservation> {
+        self.reserve_inner(config_index, true)
+    }
+
+    fn reserve_inner(
+        self: &Arc<Self>,
+        config_index: usize,
+        elastic: bool,
+    ) -> Option<ClientTcpCarrierReservation> {
         let group = self.get(config_index)?;
         let mut resources = self.resources.lock().expect("TCP carrier resource lock");
         let occupied = *resources.occupied_by_group.get(config_index)?;
         if occupied >= group.range.max() {
             return None;
         }
+
+        let elastic_path_index = if elastic {
+            Some(
+                group
+                    .elastic_slots
+                    .iter()
+                    .copied()
+                    .find(|slot| !resources.occupied_elastic_slots.contains(slot))?,
+            )
+        } else {
+            None
+        };
 
         let mut candidate = resources.next_path_id;
         let path_id = (0..=u16::MAX).find_map(|_| {
@@ -222,6 +291,9 @@ impl ClientTcpCarrierGroups {
         })?;
         resources.next_path_id = candidate;
         resources.occupied_path_ids.insert(path_id);
+        if let Some(path_index) = elastic_path_index {
+            resources.occupied_elastic_slots.insert(path_index);
+        }
         resources.occupied_by_group[config_index] = occupied + 1;
         drop(resources);
 
@@ -229,6 +301,7 @@ impl ClientTcpCarrierGroups {
             owner: Arc::downgrade(self),
             config_index,
             path_id: PathId(path_id),
+            elastic_path_index,
         })
     }
 
@@ -239,6 +312,13 @@ impl ClientTcpCarrierGroups {
             .occupied_by_group
             .get(config_index)
             .copied()
+    }
+
+    /// Resolves immutable configured ownership without consulting live
+    /// reservation state. Callers pair this metadata with active health or an
+    /// exact reservation owner before granting any carrier authority.
+    pub(in crate::runtime) fn elastic_path_owner(&self, path_index: usize) -> Option<(usize, u16)> {
+        self.elastic_slot_owners.get(&path_index).copied()
     }
 
     pub(in crate::runtime) fn iter(&self) -> std::slice::Iter<'_, ClientTcpCarrierGroup> {
@@ -568,18 +648,25 @@ impl ClientPathContext {
                     .expect("TCP group member must have one carrier actor")
                     .begin_path_drain();
             }
+            self.tcp_retained_carriers
+                .begin_endpoint_drain(config_index);
         }
-        group.policy.replace_enabled(enabled);
+        let admission_policy_changed = group.policy.replace_enabled(enabled);
         let mut health = self
             .health()
             .lock()
             .expect("client path health management lock");
         let now = std::time::Instant::now();
-        for &index in &group.members {
-            let record = health
-                .tcp
-                .get_mut(index)
-                .expect("TCP group member must have one health record");
+        let mut ordinary_eligibility_changed = false;
+        for &index in group.members.iter().chain(&group.elastic_slots) {
+            let Some(record) = health.tcp_record_mut(index) else {
+                assert!(
+                    group.elastic_slots.contains(&index),
+                    "TCP configured-minimum member must have one health record"
+                );
+                continue;
+            };
+            let before = record.eligibility_fingerprint();
             match state {
                 ClientTcpEndpointControlState::Enabled | ClientTcpEndpointControlState::Suspect => {
                     record.invalidate_path_proofs();
@@ -610,7 +697,13 @@ impl ClientPathContext {
                     record.relay_queue_bytes = 0;
                 }
             }
+            ordinary_eligibility_changed |= before != record.eligibility_fingerprint();
         }
+        self.state.publish_tcp_carrier_policy_changes(
+            &mut health,
+            ordinary_eligibility_changed,
+            admission_policy_changed,
+        );
         drop(health);
         drop(_policy_commitment);
 

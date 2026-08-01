@@ -27,6 +27,9 @@ use super::lifecycle::{
 };
 use super::open::{ReliableRelayOpenSpec, relay_error_is_tcp_path_failure};
 use super::remote::ReliableRelayAttachMode;
+use super::tcp_validation::{
+    ClientC2sTcpValidation, ClientC2sTcpValidationAction, receive_client_c2s_tcp_validation,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
 use crate::model::capacity::{
@@ -44,6 +47,7 @@ use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, ResetReason};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
+use crate::runtime::path::tcp::retained::adopt_client_to_server_retained_carrier;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::sender::{
     ClientQueuedDispatch, RelayRecvProgressSend, RelaySendCause, ReliableRelaySenderQueue,
@@ -238,6 +242,8 @@ where
     let mut observed_stream_ack_generation = remotes.stream_ack_generation();
     let mut stream_ack_capacity_wait = None;
     let stream_id = remotes.stream_id();
+    let mut tcp_carrier_workload = context.register_tcp_carrier_workload(stream_id);
+    let mut c2s_tcp_validation = None::<ClientC2sTcpValidation>;
     let telemetry_flow = context.telemetry.open_reliable_flow(
         Some(context.session_id),
         stream_id,
@@ -463,6 +469,9 @@ where
             context.mux_limits,
         );
         let request_lane = request_demand_update.lane;
+        if let Some(workload) = tcp_carrier_workload.as_mut() {
+            let _ = workload.update_demand(request_lane, sender_queue.data_bytes() != 0);
+        }
         let path_snapshot =
             remotes.lowest_eta_path_snapshot(context, relay_lane, PATH_OPEN_SCORE_BYTES);
         let request_membership_generation = remotes.membership_generation();
@@ -890,7 +899,76 @@ where
             }
         }
 
+        if let Some(validation) = c2s_tcp_validation.as_mut() {
+            validation.revalidate(context, remotes.membership_generation());
+            validation.drive(&sender, &sender_queue, &send_stream);
+        }
+
         tokio::select! {
+            validation_input = receive_client_c2s_tcp_validation(&mut c2s_tcp_validation) => {
+                let validation_input = validation_input
+                    .expect("active C2S TCP validation produces an input");
+                let action = c2s_tcp_validation
+                    .as_mut()
+                    .expect("validation input retains its coordinator")
+                    .handle_input(context, validation_input);
+                match action {
+                    ClientC2sTcpValidationAction::None => {}
+                    ClientC2sTcpValidationAction::RemoteFrame(frame) => {
+                        if deferred_remote_frame.is_some() {
+                            // The serialized target relay must consume the
+                            // preceding remote control before accepting a
+                            // second carrier source.
+                            continue;
+                        }
+                        deferred_remote_frame = Some(frame);
+                    }
+                    ClientC2sTcpValidationAction::RecoverCandidate(instance) => {
+                        let queued = sender.enqueue_failed_path_reinjections(
+                            &mut sender_queue,
+                            context,
+                            &remotes,
+                            &send_stream,
+                            instance,
+                        );
+                        request_recovery_dirty = true;
+                        if queued {
+                            state.progress.sender_retry_at = None;
+                        }
+                        c2s_tcp_validation = None;
+                    }
+                    ClientC2sTcpValidationAction::Retained {
+                        handoff,
+                        attachment,
+                    } => {
+                        let retained = adopt_client_to_server_retained_carrier(
+                            context,
+                            &mut remotes,
+                            handoff,
+                            attachment,
+                            request_lane,
+                            send_stream.max_offset(),
+                            recv_stream.published_max_offset(),
+                        )
+                        .await;
+                        c2s_tcp_validation = None;
+                        if let Err(error) = retained {
+                            crate::observability::process_event!(
+                                Warn,
+                                "tcp",
+                                "retained_carrier_publication_failed",
+                                "acknowledged TCP carrier could not enter ordinary C2S service: {error}"
+                            );
+                        } else {
+                            send_stream.update_max_offset(remotes.max_offset());
+                            state.progress.sender_retry_at = None;
+                        }
+                    }
+                    ClientC2sTcpValidationAction::Finished => {
+                        c2s_tcp_validation = None;
+                    }
+                }
+            }
             _ = wait_for_optional_deadline(request_path_recovery_deadline), if request_path_recovery_deadline.is_some() => {
                 // Re-evaluate exact attachment and range recovery clocks
                 // before assigning more OriginalData; native recovery continues.
@@ -1336,7 +1414,15 @@ where
                         )
                         .await;
                     match dispatch {
-                        Ok(ClientQueuedDispatch::Data { payload_bytes }) => {
+                        Ok(ClientQueuedDispatch::Data {
+                            payload_bytes,
+                            tcp_carrier_stable,
+                        }) => {
+                            if let Some(workload) = tcp_carrier_workload.as_mut()
+                                && let Some(stable) = tcp_carrier_stable
+                            {
+                                let _ = workload.record_successful_ordinary_placement(stable);
+                            }
                             dispatched_items = dispatched_items.saturating_add(1);
                             dispatched_payload_bytes =
                                 dispatched_payload_bytes.saturating_add(payload_bytes);
@@ -1356,6 +1442,55 @@ where
                             state.progress.ack_gap_reinjection.release_reinjection_attempt();
                             state.progress.sender_retry_at = None;
                             dispatched_items = dispatched_items.saturating_add(1);
+                        }
+                        Ok(ClientQueuedDispatch::OrdinarySaturation(ordinary_saturation)) => {
+                            if let Some(validation) = c2s_tcp_validation.as_mut() {
+                                let candidate_quantum = reliable_relay_client_dispatch_payload_limit(
+                                    adaptive_chunk,
+                                    sender_dispatch_byte_budget
+                                        .saturating_sub(dispatched_payload_bytes),
+                                );
+                                match validation.dispatch_candidate(
+                                    &mut sender,
+                                    &mut send_stream,
+                                    &mut sender_queue,
+                                    candidate_quantum,
+                                ) {
+                                    Ok(Some(payload_bytes)) => {
+                                        dispatched_items = dispatched_items.saturating_add(1);
+                                        dispatched_payload_bytes = dispatched_payload_bytes
+                                            .saturating_add(payload_bytes);
+                                        state.progress.last_stream_at = Instant::now();
+                                        state.delivery.total.record_payload_bytes(payload_bytes);
+                                        continue;
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) if reliable_path_error_is_migratable(&err) => {}
+                                    Err(err) => {
+                                        dispatch_error = Some(err);
+                                        break;
+                                    }
+                                }
+                            } else if let Some(workload) = tcp_carrier_workload.as_mut() {
+                                match ClientC2sTcpValidation::admit(
+                                    context,
+                                    &mut remotes,
+                                    workload,
+                                    *ordinary_saturation,
+                                ) {
+                                    Ok(Some(validation)) => {
+                                        c2s_tcp_validation = Some(validation);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) if reliable_path_error_is_migratable(&err) => {}
+                                    Err(err) => {
+                                        dispatch_error = Some(err);
+                                        break;
+                                    }
+                                }
+                            }
+                            blocked_by_carrier = true;
+                            break;
                         }
                         Ok(ClientQueuedDispatch::PathAttachmentRequired(err)) => {
                             if remotes.is_empty() {
@@ -1637,7 +1772,7 @@ where
                     );
                 }
                 result
-            }, if state.endpoint.remote_open || send_stream.reinjection_bytes() > 0 => {
+            }, if !state.is_finished(&send_stream, &recv_stream, &sender_queue) => {
                 let ReliableRelayRemoteFrame { instance, frame } = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -1900,6 +2035,9 @@ where
                         complete,
                         ranges,
                     } if ack_stream_id == stream_id => {
+                        let product_ack_receipt = tcp_carrier_workload
+                            .as_mut()
+                            .and_then(|workload| workload.request_product_ack_receipt_target());
                         let released_bytes = match apply_client_stream_ack(
                             ClientStreamAckContext {
                                 state: &mut state,
@@ -1910,6 +2048,7 @@ where
                                 send_stream: &mut send_stream,
                                 path_snapshot,
                                 relay_lane,
+                                product_ack_receipt,
                             },
                             stream_id,
                             complete,

@@ -11,6 +11,7 @@ use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
 use crate::protocol::{DatagramFlowId, Frame, PathId, ResetReason, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::{PathSnapshot, TrafficClass};
+use std::num::NonZeroU64;
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -250,6 +251,18 @@ pub(in crate::runtime) enum ReliablePathCommand {
         response: Option<oneshot::Sender<Result<(), RuntimeError>>>,
     },
     SendFrame(Frame),
+    #[cfg_attr(not(test), allow(dead_code))]
+    SendTcpCarrierValidationData {
+        validation_id: NonZeroU64,
+        frame: Frame,
+    },
+    /// Zero-wire marker serialized on the same bounded FIFO as Product data.
+    /// The owning writer publishes the local completion instant only after
+    /// every preceding frame has reached its transport write boundary.
+    TcpCarrierValidationWriterBoundary {
+        validation_id: NonZeroU64,
+        completion: oneshot::Sender<Instant>,
+    },
     SendTcpCapacityProbe(TcpCapacityProbeCommand),
     ResetAndCloseStream {
         stream_id: StreamId,

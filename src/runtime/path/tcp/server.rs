@@ -9,6 +9,7 @@ use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader};
 use super::metrics::TcpMetricPublisher;
 use super::server_evidence::ServerTcpEvidenceState;
 use super::server_session::{ServerTcpPathAdmission, ServerTcpPathSession};
+use super::server_validation::{ServerTcpValidationAdmission, ServerTcpValidationSession};
 use super::server_writer::ServerTcpWriter;
 use crate::protocol::{Frame, PathPurpose, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
@@ -66,12 +67,6 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         let path_join = authenticated_session
             .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
             .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
-        match path_join.purpose {
-            PathPurpose::Ordinary => {}
-            PathPurpose::Validation => {
-                return Err(RuntimeError::Protocol("invalid PATH_JOIN"));
-            }
-        }
         if !context.accept_path_join_nonce(
             path_join.session_id,
             path_join.credential_id.clone(),
@@ -106,17 +101,26 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     let session_id = path_join.session_id;
     let path_id = path_join.path_id;
     let local_metrics = local_path.startup_metrics(path_id);
-    let path_registration = context.reliable_streams.register_carrier_path(
-        session_id,
-        UnderlayProtocol::Tcp,
-        path_id,
-        ServerLocalPathProperties {
-            config_ordinal: local_path.config_ordinal(),
-            policy: local_path.policy(),
-            initial_metrics: Some(local_metrics),
-        },
-        path_join.principal_permit,
-    )?;
+    let local_properties = ServerLocalPathProperties {
+        config_ordinal: local_path.config_ordinal(),
+        policy: local_path.policy(),
+        initial_metrics: Some(local_metrics),
+    };
+    let path_registration = match path_join.purpose {
+        PathPurpose::Ordinary => context.reliable_streams.register_carrier_path(
+            session_id,
+            UnderlayProtocol::Tcp,
+            path_id,
+            local_properties,
+            path_join.principal_permit,
+        )?,
+        PathPurpose::Validation => context.reliable_streams.register_validation_carrier_path(
+            session_id,
+            path_id,
+            local_properties,
+            path_join.principal_permit,
+        )?,
+    };
     context
         .reliable_streams
         .record_peer_path_usage(&path_registration, 0, peer_usage);
@@ -147,23 +151,41 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     let (reader, writer) = framed.split()?;
     let path_frames =
         spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(context.mux_limits));
-    let (commands_tx, commands_rx) =
-        reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
     let evidence =
         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);
     let peer_status = context.peer_status.register(session_id);
-    ServerTcpPathSession::new(ServerTcpPathAdmission {
-        context,
-        session_id,
-        path_id,
-        path_registration,
-        writer: ServerTcpWriter::new(writer),
-        path_frames,
-        commands_tx,
-        commands_rx,
-        evidence,
-        peer_status,
-    })
-    .run()
-    .await
+    match path_join.purpose {
+        PathPurpose::Ordinary => {
+            let (commands_tx, commands_rx) =
+                reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
+            ServerTcpPathSession::new(ServerTcpPathAdmission {
+                context,
+                session_id,
+                path_id,
+                path_registration,
+                writer: ServerTcpWriter::new(writer),
+                path_frames,
+                commands_tx,
+                commands_rx,
+                evidence,
+                peer_status,
+            })
+            .run()
+            .await
+        }
+        PathPurpose::Validation => {
+            ServerTcpValidationSession::new(ServerTcpValidationAdmission {
+                context,
+                session_id,
+                path_id,
+                path_registration,
+                writer: ServerTcpWriter::new(writer),
+                path_frames,
+                evidence,
+                peer_status,
+            })
+            .run()
+            .await
+        }
+    }
 }

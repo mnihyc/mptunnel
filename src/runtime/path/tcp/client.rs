@@ -14,15 +14,23 @@ use super::client_session::{
 };
 pub(in crate::runtime) use super::client_state::ClientTcpPathSessionRuntime;
 use super::client_stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
-use crate::model::path::CarrierPathInstanceId;
+use super::client_validation::ClientTcpValidationAdmission;
+#[cfg(test)]
+use super::group::ClientTcpCarrierReservation;
+use super::service::ClientTcpCarrierAdmission;
+use crate::model::path::{
+    CarrierPathInstanceId, RelayPathInstance, RelayPathKey, next_carrier_path_instance_id,
+};
 use crate::performance::ResourceLimits;
-use crate::protocol::{PathId, StreamId, TargetAddr};
+use crate::protocol::{PathId, StreamId, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenDeadlines, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
     ReliablePathCommandSender, reliable_path_command_channels, reliable_path_command_queue,
 };
 use crate::scheduler::TrafficClass;
+#[cfg(test)]
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -112,6 +120,86 @@ impl ClientTcpPathSessionHandle {
                 retiring_predecessor: None,
             })),
         }
+    }
+
+    /// Binds one exact elastic reservation to this endpoint without exposing
+    /// a configured-minimum actor runtime to the admission coordinator.
+    pub(in crate::runtime) fn c2s_validation_admission(
+        &self,
+        admission: ClientTcpCarrierAdmission,
+        stream_id: StreamId,
+        attachment_id: u64,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<ClientTcpValidationAdmission, RuntimeError> {
+        if admission.target().stream_id != stream_id {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation admission belongs to another stream",
+            ));
+        }
+        let parts = admission.into_validation_parts();
+        let validation_id = parts.admission.validation_id();
+        let endpoint_generation = parts.admission.endpoint_generation();
+        let reservation = parts.reservation;
+        if reservation.config_index() != self.runtime.config_index {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation reservation belongs to another endpoint",
+            ));
+        }
+        let path_index = reservation
+            .elastic_path_index()
+            .ok_or(RuntimeError::Protocol(
+                "TCP carrier validation reservation has no elastic path slot",
+            ))?;
+        Ok(ClientTcpValidationAdmission {
+            runtime: self.runtime.clone(),
+            service_admission: Some(parts.admission),
+            reservation,
+            endpoint_generation,
+            validation_id,
+            stream_id,
+            instance: RelayPathInstance {
+                key: RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: path_index,
+                },
+                path_instance_id: next_carrier_path_instance_id(),
+                attachment_id,
+            },
+            open_deadline,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn c2s_validation_admission_for_test(
+        &self,
+        reservation: ClientTcpCarrierReservation,
+        endpoint_generation: u64,
+        validation_id: NonZeroU64,
+        stream_id: StreamId,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<ClientTcpValidationAdmission, RuntimeError> {
+        if reservation.config_index() != self.runtime.config_index {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation reservation belongs to another endpoint",
+            ));
+        }
+        Ok(ClientTcpValidationAdmission {
+            runtime: self.runtime.clone(),
+            service_admission: None,
+            reservation,
+            endpoint_generation,
+            validation_id,
+            stream_id,
+            instance: RelayPathInstance {
+                key: RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: self.runtime.path_index,
+                },
+                path_instance_id: next_carrier_path_instance_id(),
+                attachment_id: validation_id.get(),
+            },
+            open_deadline,
+        })
     }
 
     pub(in crate::runtime) async fn open_stream_with_deadlines(

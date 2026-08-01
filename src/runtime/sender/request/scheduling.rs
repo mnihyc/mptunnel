@@ -25,10 +25,12 @@ use crate::model::capacity::{
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::request_evidence::RequestPerFlowRateModel;
+use crate::model::tcp_carrier::{TcpCarrierPolicyEpochs, TcpCarrierStableGenerations};
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::protocol::{Frame, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::ReliableRequestTcpPathEvidence;
+use crate::runtime::sender::RelaySendCause;
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestPathState, RequestPathStates,
 };
@@ -38,6 +40,129 @@ use crate::scheduler::{
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::collections::HashSet;
+
+/// Exact ordinary authority class that could not accept one fresh request
+/// placement. This is an admission observation, not a scheduling instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestOrdinaryCarrierService {
+    pub(in crate::runtime) instance: RelayPathInstance,
+    pub(in crate::runtime) service_pipe_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestOrdinarySaturationObservation {
+    pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) stable: TcpCarrierStableGenerations,
+    pub(in crate::runtime) ordinary_services: SmallVec<[RequestOrdinaryCarrierService; 4]>,
+}
+
+pub(super) struct RequestOrdinarySaturationCheck<'a> {
+    pub(super) observation: &'a RequestRelaySchedulingObservation,
+    pub(super) lane: TrafficClass,
+    pub(super) frame: &'a Frame,
+    pub(super) cause: RelaySendCause,
+    pub(super) avoid_instances: &'a [RelayPathInstance],
+    pub(super) path_flights: &'a RequestFlightLedger,
+    pub(super) stale_paths: &'a HashSet<RelayPathInstance>,
+}
+
+/// Recognizes the Core ordinary-saturation boundary from one fresh blocked
+/// observation. Transient apply, proof, load, and carrier-reservation failures
+/// never call this check and therefore remain ordinary sender backpressure.
+pub(super) fn request_ordinary_saturation_observation(
+    check: RequestOrdinarySaturationCheck<'_>,
+) -> Option<RequestOrdinarySaturationObservation> {
+    let RequestOrdinarySaturationCheck {
+        observation,
+        lane,
+        frame,
+        cause,
+        avoid_instances,
+        path_flights,
+        stale_paths,
+    } = check;
+    let Frame::StreamData {
+        stream_id, payload, ..
+    } = frame
+    else {
+        return None;
+    };
+    if lane != TrafficClass::Throughput
+        || cause != RelaySendCause::StreamData
+        || *stream_id != observation.stream_id
+        || payload.is_empty()
+        || !avoid_instances.is_empty()
+        || observation.latency_pressure
+        || !path_flights.sent_instances_for_frame(frame).is_empty()
+    {
+        return None;
+    }
+
+    let payload_bytes = payload.len();
+    let eligible = observation
+        .paths
+        .iter()
+        .filter(|path| !stale_paths.contains(&path.instance))
+        .filter(|path| {
+            path.shared_snapshot.is_some_and(|snapshot| {
+                scheduler::score_path(snapshot, lane, payload_bytes).is_some()
+            })
+        })
+        .collect::<SmallVec<[&RequestRelayPathObservation; 4]>>();
+    let authority_class = if eligible.iter().any(|path| {
+        path.shared_snapshot
+            .is_some_and(|snapshot| !scheduler::path_is_backup(snapshot))
+    }) {
+        PathUsage::Available
+    } else if eligible
+        .iter()
+        .any(|path| path.shared_snapshot.is_some_and(scheduler::path_is_backup))
+    {
+        PathUsage::Backup
+    } else {
+        return None;
+    };
+    let ordinary_services = eligible
+        .into_iter()
+        .filter(|path| {
+            path.shared_snapshot.is_some_and(|snapshot| {
+                scheduler::path_is_backup(snapshot) == (authority_class == PathUsage::Backup)
+            })
+        })
+        .filter_map(|path| {
+            let service_pipe = data_level_service_window_bytes(
+                path.shared_snapshot?,
+                TrafficClass::Throughput,
+                observation.mux_limits,
+            )
+            .ceil();
+            (service_pipe.is_finite() && service_pipe > 0.0).then_some(
+                RequestOrdinaryCarrierService {
+                    instance: path.instance,
+                    service_pipe_bytes: service_pipe as u64,
+                },
+            )
+        })
+        .collect::<SmallVec<[RequestOrdinaryCarrierService; 4]>>();
+    if ordinary_services.is_empty()
+        || ordinary_services.iter().any(|ordinary| {
+            let path = observation
+                .path_by_instance(ordinary.instance)
+                .expect("ordinary saturation instance came from this observation");
+            path.can_enqueue_stream_lane
+                || !path_flights.has_original_transmission_flights_for_instance(ordinary.instance)
+        })
+    {
+        return None;
+    }
+
+    Some(RequestOrdinarySaturationObservation {
+        stream_id: observation.stream_id,
+        stable: observation.tcp_carrier_stable_generations(authority_class)?,
+        ordinary_services,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BulkRelayPathChoice {
@@ -181,9 +306,37 @@ pub(super) struct RequestRelaySchedulingObservation {
     pub(super) paths: SmallVec<[RequestRelayPathObservation; 4]>,
     pub(super) global_bulk_candidates: SmallVec<[ObservedBulkPathCandidate; 4]>,
     pub(super) latency_pressure: bool,
+    pub(super) tcp_carrier_policy_epochs: Option<TcpCarrierPolicyEpochs>,
 }
 
 impl RequestRelaySchedulingObservation {
+    pub(super) fn tcp_carrier_stable_generations(
+        &self,
+        authority_class: PathUsage,
+    ) -> Option<TcpCarrierStableGenerations> {
+        let policy = self.tcp_carrier_policy_epochs?;
+        Some(TcpCarrierStableGenerations {
+            membership_generation: self.membership_generation,
+            ordinary_eligibility_generation: policy.ordinary_eligibility_generation,
+            authority_class,
+            admission_policy_generation: policy.admission_policy_generation,
+            resource_policy_generation: policy.resource_policy_generation,
+        })
+    }
+
+    pub(super) fn tcp_carrier_stable_generations_for_instance(
+        &self,
+        instance: RelayPathInstance,
+    ) -> Option<TcpCarrierStableGenerations> {
+        let snapshot = self.path_by_instance(instance)?.shared_snapshot?;
+        let authority_class = if scheduler::path_is_backup(snapshot) {
+            PathUsage::Backup
+        } else {
+            PathUsage::Available
+        };
+        self.tcp_carrier_stable_generations(authority_class)
+    }
+
     pub(super) fn path_by_instance(
         &self,
         instance: RelayPathInstance,

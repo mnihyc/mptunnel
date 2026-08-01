@@ -17,13 +17,15 @@ pub(in crate::runtime) use queue::{
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use request::{
-    ClientQueuedDispatch, RelayRecvProgressSend, RequestSenderService,
+    ClientQueuedDispatch, RelayRecvProgressSend, RequestOrdinarySaturationObservation,
+    RequestProductAckOriginalResolution, RequestProductAckReceipt, RequestProductAckReceiptSink,
+    RequestProductAckReceiptTarget, RequestSenderService,
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use response::{ServerResponseSenderService, emit_response_control_frame};
 #[cfg(not(test))]
 pub(in crate::runtime) use work::{
-    CarrierEmitMode, RelaySendCause, ServerReinjectionOutputIdentity,
+    CarrierEmitMode, ProductWorkloadIdentity, RelaySendCause, ServerReinjectionOutputIdentity,
     sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
 };
 

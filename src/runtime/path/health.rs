@@ -11,16 +11,25 @@ use super::quic::metrics::UdpPathMetrics;
 use super::tcp::capacity::RequestTcpCapacityRecord;
 use super::tcp::metrics::TcpNativeObservation;
 use crate::model::capacity::{PathRateSample, TcpCapacityProofCandidate};
-use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
-use crate::protocol::{PathId, PathUsage};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+use crate::model::tcp_carrier::TcpCarrierPolicyEpochs;
+use crate::protocol::{PathId, PathUsage, UnderlayProtocol};
 use crate::scheduler::{PathState as SchedulerPathState, TrafficClass};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathHealth {
+    /// Configured-minimum TCP members. Their stable indices are positional.
     pub(in crate::runtime) tcp: Vec<ClientPathHealthRecord>,
+    /// Published elastic TCP members. Reserved but unpublished slots have no
+    /// health record and therefore no ordinary scheduling authority.
+    tcp_elastic: BTreeMap<usize, ClientPathHealthRecord>,
     pub(in crate::runtime) udp: Vec<ClientPathHealthRecord>,
+    tcp_carrier_ordinary_eligibility_generation: Option<NonZeroU64>,
+    tcp_carrier_admission_policy_generation: Option<NonZeroU64>,
+    tcp_carrier_resource_policy_generation: NonZeroU64,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +79,18 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     successful_path_proofs: HashMap<u64, SuccessfulPathProof>,
     successful_path_proof_order: VecDeque<u64>,
     successful_path_proof_limit: usize,
+}
+
+/// Non-queue facts that decide whether one configured carrier may provide
+/// ordinary Product service. Rate, RTT, loss, proof, load, queue, and flight
+/// evidence are intentionally excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ClientPathEligibilityFingerprint {
+    state: SchedulerPathState,
+    manual_disabled: bool,
+    path_instance_id: Option<CarrierPathInstanceId>,
+    data_plane_failure_instance_id: Option<CarrierPathInstanceId>,
+    peer_usage: Option<PathUsage>,
 }
 
 /// One lock-coherent carrier-authority view for request reconciliation.
@@ -151,15 +172,184 @@ impl Default for ClientPathHealthRecord {
 }
 
 impl ClientPathHealth {
+    pub(in crate::runtime) fn new(
+        tcp: Vec<ClientPathHealthRecord>,
+        udp: Vec<ClientPathHealthRecord>,
+    ) -> Self {
+        let one = NonZeroU64::new(1).expect("one is nonzero");
+        Self {
+            tcp,
+            tcp_elastic: BTreeMap::new(),
+            udp,
+            tcp_carrier_ordinary_eligibility_generation: Some(one),
+            tcp_carrier_admission_policy_generation: Some(one),
+            tcp_carrier_resource_policy_generation: one,
+        }
+    }
+
+    pub(in crate::runtime) fn tcp_carrier_policy_epochs(&self) -> Option<TcpCarrierPolicyEpochs> {
+        Some(TcpCarrierPolicyEpochs {
+            ordinary_eligibility_generation: self.tcp_carrier_ordinary_eligibility_generation?,
+            admission_policy_generation: self.tcp_carrier_admission_policy_generation?,
+            resource_policy_generation: self.tcp_carrier_resource_policy_generation,
+        })
+    }
+
+    pub(in crate::runtime) fn advance_tcp_carrier_ordinary_eligibility_generation(
+        &mut self,
+    ) -> Option<TcpCarrierPolicyEpochs> {
+        self.tcp_carrier_ordinary_eligibility_generation = self
+            .tcp_carrier_ordinary_eligibility_generation
+            .and_then(next_nonzero_generation);
+        self.tcp_carrier_policy_epochs()
+    }
+
+    pub(in crate::runtime) fn advance_tcp_carrier_admission_policy_generation(
+        &mut self,
+    ) -> Option<TcpCarrierPolicyEpochs> {
+        self.tcp_carrier_admission_policy_generation = self
+            .tcp_carrier_admission_policy_generation
+            .and_then(next_nonzero_generation);
+        self.tcp_carrier_policy_epochs()
+    }
+
     pub(in crate::runtime) fn is_product_quiescent(&self) -> bool {
-        self.tcp
-            .iter()
+        self.tcp_records()
             .chain(&self.udp)
             .all(ClientPathHealthRecord::has_no_product_work)
     }
+
+    pub(in crate::runtime) fn tcp_record(&self, index: usize) -> Option<&ClientPathHealthRecord> {
+        self.tcp.get(index).or_else(|| self.tcp_elastic.get(&index))
+    }
+
+    pub(super) fn tcp_elastic_record(&self, index: usize) -> Option<&ClientPathHealthRecord> {
+        self.tcp_elastic.get(&index)
+    }
+
+    pub(in crate::runtime) fn tcp_record_mut(
+        &mut self,
+        index: usize,
+    ) -> Option<&mut ClientPathHealthRecord> {
+        if index < self.tcp.len() {
+            self.tcp.get_mut(index)
+        } else {
+            self.tcp_elastic.get_mut(&index)
+        }
+    }
+
+    pub(in crate::runtime) fn path_record(
+        &self,
+        key: RelayPathKey,
+    ) -> Option<&ClientPathHealthRecord> {
+        match key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_record(key.index),
+            UnderlayProtocol::Udp => self.udp.get(key.index),
+        }
+    }
+
+    pub(in crate::runtime) fn path_record_mut(
+        &mut self,
+        key: RelayPathKey,
+    ) -> Option<&mut ClientPathHealthRecord> {
+        match key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_record_mut(key.index),
+            UnderlayProtocol::Udp => self.udp.get_mut(key.index),
+        }
+    }
+
+    pub(in crate::runtime) fn tcp_records(&self) -> impl Iterator<Item = &ClientPathHealthRecord> {
+        self.tcp.iter().chain(self.tcp_elastic.values())
+    }
+
+    pub(in crate::runtime) fn tcp_records_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut ClientPathHealthRecord> {
+        self.tcp.iter_mut().chain(self.tcp_elastic.values_mut())
+    }
+
+    pub(in crate::runtime) fn tcp_records_with_indices(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ClientPathHealthRecord)> {
+        self.tcp.iter().enumerate().chain(
+            self.tcp_elastic
+                .iter()
+                .map(|(&index, record)| (index, record)),
+        )
+    }
+
+    pub(in crate::runtime) fn new_tcp_elastic_record(&self) -> ClientPathHealthRecord {
+        let path_proof_limit = self
+            .tcp
+            .first()
+            .map_or(1, |record| record.successful_path_proof_limit);
+        ClientPathHealthRecord::with_path_proof_limit(path_proof_limit)
+    }
+
+    pub(in crate::runtime) fn insert_tcp_elastic_record(
+        &mut self,
+        index: usize,
+        record: ClientPathHealthRecord,
+    ) -> bool {
+        if index < self.tcp.len() || self.tcp_elastic.contains_key(&index) {
+            return false;
+        }
+        self.tcp_elastic.insert(index, record);
+        true
+    }
+
+    pub(in crate::runtime) fn remove_tcp_elastic_record(
+        &mut self,
+        index: usize,
+    ) -> Option<ClientPathHealthRecord> {
+        if let Some(record) = self.tcp_elastic.get_mut(&index) {
+            record.tcp_capacity.reset_after_data_plane_failure();
+            record.invalidate_path_proofs();
+        }
+        self.tcp_elastic.remove(&index)
+    }
+
+    pub(in crate::runtime) fn tcp_records_have_schedulable_alternative(
+        &self,
+        excluded_index: usize,
+        now: Instant,
+    ) -> bool {
+        self.tcp_records_with_indices().any(|(index, record)| {
+            index != excluded_index
+                && !matches!(
+                    record.observation_at(now).state,
+                    SchedulerPathState::Failed | SchedulerPathState::Draining
+                )
+        })
+    }
+}
+
+fn next_nonzero_generation(current: NonZeroU64) -> Option<NonZeroU64> {
+    current.get().checked_add(1).and_then(NonZeroU64::new)
 }
 
 impl ClientPathHealthRecord {
+    pub(in crate::runtime) fn wire_path_id(&self) -> Option<PathId> {
+        self.wire_path_id
+    }
+
+    pub(in crate::runtime) fn owns_path_instance(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        self.path_instance_id == Some(path_instance_id)
+    }
+
+    pub(in crate::runtime) fn eligibility_fingerprint(&self) -> ClientPathEligibilityFingerprint {
+        ClientPathEligibilityFingerprint {
+            state: self.state,
+            manual_disabled: self.manual_disabled,
+            path_instance_id: self.path_instance_id,
+            data_plane_failure_instance_id: self.data_plane_failure_instance_id,
+            peer_usage: self.peer_usage,
+        }
+    }
+
     pub(in crate::runtime) fn install_peer_usage(
         &mut self,
         path_instance_id: CarrierPathInstanceId,

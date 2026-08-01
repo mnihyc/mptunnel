@@ -117,10 +117,10 @@ impl UdpDatagramClientSession {
         open_deadline: tokio::time::Instant,
         carrier_network: std::sync::Arc<dyn CarrierNetworkProvider>,
     ) -> Result<Self, RuntimeError> {
-        let state = ClientPathState::new(ClientPathHealth {
-            tcp: Vec::new(),
-            udp: vec![ClientPathHealthRecord::default(); path_index.saturating_add(1)],
-        });
+        let state = ClientPathState::new(ClientPathHealth::new(
+            Vec::new(),
+            vec![ClientPathHealthRecord::default(); path_index.saturating_add(1)],
+        ));
         let peer_status = PeerStatusBroker::new(false);
         let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
             paths: std::sync::Arc::new(vec![path.clone()]),

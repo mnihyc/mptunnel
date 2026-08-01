@@ -318,21 +318,23 @@ pub(super) async fn handle_client_tcp_capacity_frame(
             };
             let accepted = runtime
                 .state
-                .health()
-                .lock()
-                .expect("client path health lock")
-                .tcp
-                .get_mut(runtime.path_index)
-                .is_some_and(|record| {
-                    record.accept_request_tcp_capacity_proof(
-                        stream_id,
-                        path_instance,
-                        candidate,
-                        metrics,
-                        native_observation,
-                        accepted_at,
-                    )
-                });
+                .mutate_path_eligibility(
+                    crate::model::path::RelayPathKey {
+                        underlay: crate::protocol::UnderlayProtocol::Tcp,
+                        index: runtime.path_index,
+                    },
+                    |record| {
+                        record.accept_request_tcp_capacity_proof(
+                            stream_id,
+                            path_instance,
+                            candidate,
+                            metrics,
+                            native_observation,
+                            accepted_at,
+                        )
+                    },
+                )
+                .unwrap_or(false);
             if !accepted {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(

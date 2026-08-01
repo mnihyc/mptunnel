@@ -4,11 +4,13 @@
 //! observe/intent/apply scheduling cycle. TCP keeps its portable fallback;
 //! QUIC path use is gated by validation and native writer backpressure.
 
-use self::multipath::RequestMultipathController;
+use self::multipath::{RequestMultipathController, RequestMultipathPlanError};
+pub(in crate::runtime) use self::scheduling::RequestOrdinarySaturationObservation;
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
-    CarrierEmitMode, ClientReinjectionOutputIdentity, RelaySendCause, RelaySendOutcome,
-    sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
+    CarrierEmitMode, ClientReinjectionOutputIdentity, ProductWorkloadIdentity, RelaySendCause,
+    RelaySendOutcome, sender_extra_traffic_startup_floor_bytes,
+    sender_reinjection_minimum_useful_attempt_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record, lab_sender_service_decision};
@@ -18,6 +20,9 @@ use crate::model::capacity::{
 };
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::tcp_carrier::{
+    TcpCarrierStableGenerations, TcpCarrierValidationState, TcpCarrierValidationUpdate,
+};
 use crate::model::timing::{
     reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
 };
@@ -81,16 +86,87 @@ fn sender_service_frame_kind(frame: &Frame) -> &'static str {
 
 #[derive(Debug)]
 pub(in crate::runtime) enum ClientQueuedDispatch {
-    Data { payload_bytes: usize },
-    Reinjection { payload_bytes: usize },
+    Data {
+        payload_bytes: usize,
+        tcp_carrier_stable: Option<TcpCarrierStableGenerations>,
+    },
+    Reinjection {
+        payload_bytes: usize,
+    },
     ReinjectionDeferred,
     PersistentReinjectionCancelled,
+    OrdinarySaturation(Box<RequestOrdinarySaturationObservation>),
     PathAttachmentRequired(RuntimeError),
+}
+
+/// One exact finite assignment to a validation-purpose TCP carrier.
+///
+/// The candidate remains outside ordinary membership. This receipt exists so
+/// its directional validation owner can retain the exact Data Sequence range
+/// until normal Product ACK or recovery ownership resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ClientTcpCarrierCandidateDispatch {
+    pub(in crate::runtime) range: OffsetRange,
+    pub(in crate::runtime) payload_bytes: usize,
+}
+
+fn request_multipath_plan_error_runtime(error: RequestMultipathPlanError) -> RuntimeError {
+    match error {
+        RequestMultipathPlanError::Runtime(error) => error,
+        RequestMultipathPlanError::OrdinarySaturation(_) => RuntimeError::SenderServiceBlocked,
+    }
+}
+
+pub(in crate::runtime) type RequestProductAckReceiptIdentity = ProductWorkloadIdentity;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum RequestProductAckOriginalResolution {
+    Unambiguous,
+    Ambiguous,
+}
+
+/// One normalized newly released OriginalData interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestProductAckOriginalRelease {
+    pub(in crate::runtime) range: OffsetRange,
+    pub(in crate::runtime) bytes: usize,
+    pub(in crate::runtime) instance: RelayPathInstance,
+    pub(in crate::runtime) sent_at: Instant,
+    pub(in crate::runtime) resolution: RequestProductAckOriginalResolution,
+}
+
+/// One indivisible, fully applied Product Data-ACK transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestProductAckReceipt {
+    pub(in crate::runtime) identity: RequestProductAckReceiptIdentity,
+    pub(in crate::runtime) completed_at: Instant,
+    pub(in crate::runtime) original_releases:
+        smallvec::SmallVec<[RequestProductAckOriginalRelease; 4]>,
+}
+
+pub(in crate::runtime) trait RequestProductAckReceiptSink {
+    fn publish_request_product_ack(&mut self, receipt: RequestProductAckReceipt);
+}
+
+impl<F> RequestProductAckReceiptSink for F
+where
+    F: FnMut(RequestProductAckReceipt),
+{
+    fn publish_request_product_ack(&mut self, receipt: RequestProductAckReceipt) {
+        self(receipt);
+    }
+}
+
+pub(in crate::runtime) struct RequestProductAckReceiptTarget<'a> {
+    pub(in crate::runtime) identity: ProductWorkloadIdentity,
+    pub(in crate::runtime) sink: &'a mut dyn RequestProductAckReceiptSink,
 }
 
 pub(in crate::runtime) struct RequestProductAckOutcome {
     pub(in crate::runtime) mux: AckOutcome,
     pub(in crate::runtime) data_ack_progress_paths: smallvec::SmallVec<[RelayPathInstance; 4]>,
+    pub(in crate::runtime) original_releases:
+        Option<smallvec::SmallVec<[RequestProductAckOriginalRelease; 4]>>,
 }
 
 #[derive(Debug, Default)]
@@ -259,6 +335,7 @@ impl RequestSenderService {
         remotes: &ReliableRelayRemoteSet,
         send_stream: &mut ReliableSendStream,
         ack: &ValidatedStreamAck,
+        capture_original_releases: bool,
     ) -> Result<RequestProductAckOutcome, StreamError> {
         #[cfg(feature = "lab-diagnostics")]
         let mux_started = Instant::now();
@@ -269,12 +346,17 @@ impl RequestSenderService {
             self.record_delivered_data(mux.released_bytes);
         }
         let acked_at = Instant::now();
-        let data_ack_progress_paths =
-            self.multipath
-                .apply_product_ack(context, remotes, ack.ranges(), acked_at);
+        let (data_ack_progress_paths, original_releases) = self.multipath.apply_product_ack(
+            context,
+            remotes,
+            ack.ranges(),
+            acked_at,
+            capture_original_releases,
+        );
         Ok(RequestProductAckOutcome {
             mux,
             data_ack_progress_paths,
+            original_releases,
         })
     }
 
@@ -334,6 +416,13 @@ impl RequestSenderService {
             .unacked_original_paths_before(remotes, horizon)
     }
 
+    pub(in crate::runtime) fn tcp_carrier_candidate_original_flight_bytes(
+        &self,
+        candidate: RelayPathInstance,
+    ) -> u64 {
+        self.multipath.original_data_in_flight_bytes(candidate)
+    }
+
     pub(in crate::runtime) fn request_path_has_reinjection_path(
         &self,
         remotes: &ReliableRelayRemoteSet,
@@ -356,13 +445,23 @@ impl RequestSenderService {
             .record_original_frame_for_test(instance, frame);
     }
 
+    #[cfg(test)]
+    pub(in crate::runtime) fn record_reinjection_frame_for_test(
+        &mut self,
+        instance: RelayPathInstance,
+        frame: &Frame,
+    ) {
+        self.multipath
+            .record_reinjection_frame_for_test(instance, frame);
+    }
+
     async fn send_stream_data_for_request_lane(
         &mut self,
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
         request_lane: TrafficClass,
-    ) -> Result<RelaySendOutcome, RuntimeError> {
+    ) -> Result<RelaySendOutcome, RequestMultipathPlanError> {
         self.send_frame(
             context,
             remotes,
@@ -381,7 +480,9 @@ impl RequestSenderService {
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         debug_assert!(!cause.is_reinjection());
-        self.send_frame(context, remotes, frame, cause, None).await
+        self.send_frame(context, remotes, frame, cause, None)
+            .await
+            .map_err(request_multipath_plan_error_runtime)
     }
 
     pub(in crate::runtime) async fn send_reinjection_frame(
@@ -392,7 +493,9 @@ impl RequestSenderService {
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         debug_assert!(cause.is_reinjection());
-        self.send_frame(context, remotes, frame, cause, None).await
+        self.send_frame(context, remotes, frame, cause, None)
+            .await
+            .map_err(request_multipath_plan_error_runtime)
     }
 
     pub(in crate::runtime) fn data_ack_gap_reinjection_model(
@@ -452,6 +555,100 @@ impl RequestSenderService {
         }
     }
 
+    /// Assigns one bounded fresh target prefix to an admitted C2S validation
+    /// carrier without granting it ordinary scheduling authority.
+    ///
+    /// Queue reservation, stream offset ownership, validation credit, exact
+    /// original-flight provenance, Product queue consumption, and carrier
+    /// publication form one serialized transaction in that order. Before the
+    /// final command commit, every fallible step either owns no Product state
+    /// or rolls the just-committed stream frame back.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn dispatch_client_tcp_carrier_validation_data(
+        &mut self,
+        validation_id: std::num::NonZeroU64,
+        candidate: RelayPathInstance,
+        validation_data: &ReliablePathCommandSender,
+        validation: &mut TcpCarrierValidationState,
+        send_stream: &mut ReliableSendStream,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        data_quantum_bytes: usize,
+    ) -> Result<Option<ClientTcpCarrierCandidateDispatch>, RuntimeError> {
+        let credit_bytes = validation.candidate_assignment_credit_bytes();
+        if credit_bytes == 0 || data_quantum_bytes == 0 {
+            return Ok(None);
+        }
+        let Some((_, queued)) = sender_queue.front() else {
+            return Ok(None);
+        };
+        let ReliableRelayQueuedWorkKind::Data(payload) = &queued.kind else {
+            return Ok(None);
+        };
+        let dispatch_payload_bytes = usize::try_from(credit_bytes)
+            .unwrap_or(usize::MAX)
+            .min(data_quantum_bytes)
+            .min(payload.len());
+        if dispatch_payload_bytes == 0 {
+            return Ok(None);
+        }
+
+        let frame = send_stream
+            .prepare_data(payload.slice(..dispatch_payload_bytes))
+            .map_err(RuntimeError::Stream)?;
+        let command = validation_data.try_reserve_tcp_carrier_validation_data(
+            validation_id,
+            frame.clone(),
+            TrafficClass::Throughput,
+        )?;
+        send_stream
+            .commit_prepared_data(&frame)
+            .map_err(RuntimeError::Stream)?;
+
+        if validation.record_candidate_assignment(dispatch_payload_bytes as u64)
+            != TcpCarrierValidationUpdate::Pending
+        {
+            send_stream
+                .rollback_committed_data(&frame)
+                .map_err(RuntimeError::Stream)?;
+            return Ok(None);
+        }
+
+        let Frame::StreamData {
+            offset, payload, ..
+        } = &frame
+        else {
+            unreachable!("prepared reliable data is STREAM_DATA");
+        };
+        let end = offset
+            .checked_add(payload.len() as u64)
+            .ok_or(RuntimeError::Protocol(
+                "TCP carrier validation assignment offset overflow",
+            ))?;
+        let recorded =
+            self.multipath
+                .record_emitted_frame(candidate, &frame, RelaySendCause::StreamData);
+        assert_eq!(
+            recorded, dispatch_payload_bytes,
+            "candidate original-flight accounting must match its Product prefix"
+        );
+        let committed = sender_queue
+            .commit_front_data_prefix(dispatch_payload_bytes)
+            .expect("serialized candidate assignment retains its queued Product prefix");
+        assert_eq!(
+            committed.payload_bytes, dispatch_payload_bytes,
+            "candidate Product queue commit must match its reserved frame"
+        );
+        command.commit();
+
+        Ok(Some(ClientTcpCarrierCandidateDispatch {
+            range: OffsetRange {
+                start: *offset,
+                end,
+            },
+            payload_bytes: dispatch_payload_bytes,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_client_data_work(
         &mut self,
@@ -478,20 +675,26 @@ impl RequestSenderService {
                 let committed = sender_queue
                     .commit_front_data_prefix(dispatch_payload_bytes)
                     .expect("sent queued data must still be at queue front");
-                let _ = outcome;
                 Ok(ClientQueuedDispatch::Data {
                     payload_bytes: committed.payload_bytes,
+                    tcp_carrier_stable: outcome.tcp_carrier_stable,
                 })
             }
-            Err(RuntimeError::SenderServiceBlocked) => {
+            Err(RequestMultipathPlanError::OrdinarySaturation(observation)) => {
+                let _ = send_stream.rollback_committed_data(&frame);
+                Ok(ClientQueuedDispatch::OrdinarySaturation(observation))
+            }
+            Err(RequestMultipathPlanError::Runtime(RuntimeError::SenderServiceBlocked)) => {
                 let _ = send_stream.rollback_committed_data(&frame);
                 Err(RuntimeError::SenderServiceBlocked)
             }
-            Err(err) if reliable_path_error_is_migratable(&err) => {
+            Err(RequestMultipathPlanError::Runtime(err))
+                if reliable_path_error_is_migratable(&err) =>
+            {
                 let _ = send_stream.rollback_committed_data(&frame);
                 Ok(ClientQueuedDispatch::PathAttachmentRequired(err))
             }
-            Err(err) => {
+            Err(RequestMultipathPlanError::Runtime(err)) => {
                 let _ = send_stream.rollback_committed_data(&frame);
                 Err(err)
             }
@@ -565,12 +768,12 @@ impl RequestSenderService {
         frame: Frame,
         cause: RelaySendCause,
         request_lane: Option<TrafficClass>,
-    ) -> Result<RelaySendOutcome, RuntimeError> {
+    ) -> Result<RelaySendOutcome, RequestMultipathPlanError> {
         let sent_frame = frame.clone();
         let avoid_instances =
             self.multipath
                 .reinjection_avoid_instances(&sent_frame, cause, remotes);
-        let (instance, payload_bytes) = self
+        let (instance, payload_bytes, tcp_carrier_stable) = self
             .emit_relay_frame(
                 context,
                 remotes,
@@ -582,7 +785,10 @@ impl RequestSenderService {
             .await?;
         let path_key = instance.key;
         self.record_decision(path_key, payload_bytes, &sent_frame, cause);
-        Ok(RelaySendOutcome { path_key })
+        Ok(RelaySendOutcome {
+            tcp_carrier_stable,
+            path_key,
+        })
     }
 
     async fn emit_relay_frame(
@@ -593,7 +799,14 @@ impl RequestSenderService {
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
         request_lane: Option<TrafficClass>,
-    ) -> Result<(RelayPathInstance, usize), RuntimeError> {
+    ) -> Result<
+        (
+            RelayPathInstance,
+            usize,
+            Option<TcpCarrierStableGenerations>,
+        ),
+        RequestMultipathPlanError,
+    > {
         let mut last_error = None;
         while !remotes.paths.is_empty() {
             if let Some(instance) = remotes
@@ -625,16 +838,22 @@ impl RequestSenderService {
                 avoid_instances,
             ) {
                 Ok(plan) => plan,
-                Err(RuntimeError::SenderServiceBlocked) => {
-                    return Err(RuntimeError::SenderServiceBlocked);
+                Err(RequestMultipathPlanError::OrdinarySaturation(observation)) => {
+                    return Err(RequestMultipathPlanError::OrdinarySaturation(observation));
                 }
-                Err(err) => return Err(last_error.unwrap_or(err)),
+                Err(RequestMultipathPlanError::Runtime(RuntimeError::SenderServiceBlocked)) => {
+                    return Err(RuntimeError::SenderServiceBlocked.into());
+                }
+                Err(RequestMultipathPlanError::Runtime(err)) => {
+                    return Err(last_error.unwrap_or(err).into());
+                }
             };
             let (membership_generation, instance) = plan.target();
+            let tcp_carrier_stable = plan.tcp_carrier_stable();
             let Some(position) =
                 remotes.path_position_at_generation(membership_generation, instance)
             else {
-                return Err(RuntimeError::SenderServiceBlocked);
+                return Err(RuntimeError::SenderServiceBlocked.into());
             };
             if plan.proof_expectation().is_some_and(|proof| {
                 !context.relay_path_proof_epoch_is_current(instance.key, proof)
@@ -650,7 +869,7 @@ impl RequestSenderService {
                         instance.attachment_id,
                     ),
                 );
-                return Err(RuntimeError::SenderServiceBlocked);
+                return Err(RuntimeError::SenderServiceBlocked.into());
             }
             let failure_recovery = matches!(
                 cause,
@@ -665,7 +884,7 @@ impl RequestSenderService {
                     cause,
                 )
             {
-                return Err(RuntimeError::SenderServiceBlocked);
+                return Err(RuntimeError::SenderServiceBlocked.into());
             }
             let (lane, emit_mode) = if matches!(cause, RelaySendCause::StreamFin) {
                 (
@@ -696,7 +915,7 @@ impl RequestSenderService {
                                 instance.attachment_id,
                             ),
                         );
-                        return Err(RuntimeError::SenderServiceBlocked);
+                        return Err(RuntimeError::SenderServiceBlocked.into());
                     };
                     Some(claim)
                 } else {
@@ -746,9 +965,11 @@ impl RequestSenderService {
                 }
             };
             match publish_result {
-                Ok(payload_bytes) => return Ok((instance, payload_bytes)),
+                Ok(payload_bytes) => {
+                    return Ok((instance, payload_bytes, tcp_carrier_stable));
+                }
                 Err(RuntimeError::SenderServiceBlocked) => {
-                    return Err(RuntimeError::SenderServiceBlocked);
+                    return Err(RuntimeError::SenderServiceBlocked.into());
                 }
                 Err(err) => {
                     last_error = Some(err);
@@ -758,7 +979,9 @@ impl RequestSenderService {
                 }
             }
         }
-        Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed))
+        Err(last_error
+            .unwrap_or(RuntimeError::ReliablePathSessionClosed)
+            .into())
     }
 
     pub(in crate::runtime) async fn send_recv_progress(

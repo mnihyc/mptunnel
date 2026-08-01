@@ -70,6 +70,7 @@ pub(super) async fn run(
                     id.clone(),
                     ClientPathRuntimeOptions {
                         session_retention_timeout: session.retention_timeout,
+                        path_probe_timeout: config.path_probe_timeout,
                         path_group_ordinal,
                         carrier_network: runtime_carrier_network.clone(),
                         allow_peer_diagnostics: management.peer_diagnostics_enabled(),

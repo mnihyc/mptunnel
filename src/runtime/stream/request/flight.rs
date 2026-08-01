@@ -26,6 +26,62 @@ pub(in crate::runtime) struct RequestPathRelease {
     pub(in crate::runtime) path_proving: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct RequestOriginalPathRelease {
+    pub(in crate::runtime) instance: RelayPathInstance,
+    pub(in crate::runtime) range: OffsetRange,
+    pub(in crate::runtime) sent_at: Instant,
+    pub(in crate::runtime) path_proving: bool,
+}
+
+fn record_original_release_segments<F>(
+    instance: RelayPathInstance,
+    sent_at: Instant,
+    start: u64,
+    end: u64,
+    ambiguous_intervals: &[(u64, u64)],
+    record: &mut F,
+) where
+    F: FnMut(RelayPathInstance, OffsetRange, Instant, bool),
+{
+    let mut cursor = start;
+    let mut index = ambiguous_intervals.partition_point(|(_, interval_end)| *interval_end <= start);
+    while let Some(&(ambiguous_start, ambiguous_end)) = ambiguous_intervals.get(index) {
+        if ambiguous_start >= end {
+            break;
+        }
+        let ambiguous_start = ambiguous_start.max(cursor);
+        let ambiguous_end = ambiguous_end.min(end);
+        if cursor < ambiguous_start {
+            record(
+                instance,
+                OffsetRange {
+                    start: cursor,
+                    end: ambiguous_start,
+                },
+                sent_at,
+                true,
+            );
+        }
+        if ambiguous_start < ambiguous_end {
+            record(
+                instance,
+                OffsetRange {
+                    start: ambiguous_start,
+                    end: ambiguous_end,
+                },
+                sent_at,
+                false,
+            );
+            cursor = ambiguous_end;
+        }
+        index += 1;
+    }
+    if cursor < end {
+        record(instance, OffsetRange { start: cursor, end }, sent_at, true);
+    }
+}
+
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct RequestFlightLedger {
     // OriginalData identifies the ordered path; ReinjectedData remains a duplicate.
@@ -73,6 +129,36 @@ impl RequestFlightLedger {
         &mut self,
         ranges: &[OffsetRange],
     ) -> Vec<RequestPathRelease> {
+        self.release_normalized_acked_ranges_inner::<false, _>(ranges, |_, _, _, _| {})
+    }
+
+    pub(in crate::runtime) fn release_normalized_acked_ranges_with_originals(
+        &mut self,
+        ranges: &[OffsetRange],
+    ) -> (Vec<RequestPathRelease>, Vec<RequestOriginalPathRelease>) {
+        let mut originals = Vec::new();
+        let released = self.release_normalized_acked_ranges_inner::<true, _>(
+            ranges,
+            |instance, range, sent_at, path_proving| {
+                originals.push(RequestOriginalPathRelease {
+                    instance,
+                    range,
+                    sent_at,
+                    path_proving,
+                });
+            },
+        );
+        (released, originals)
+    }
+
+    fn release_normalized_acked_ranges_inner<const CAPTURE_ORIGINALS: bool, F>(
+        &mut self,
+        ranges: &[OffsetRange],
+        mut record_original: F,
+    ) -> Vec<RequestPathRelease>
+    where
+        F: FnMut(RelayPathInstance, OffsetRange, Instant, bool),
+    {
         if ranges.is_empty() || self.flights.is_empty() {
             return Vec::new();
         }
@@ -95,13 +181,24 @@ impl RequestFlightLedger {
                 if bytes == 0 {
                     continue;
                 }
+                let path_proving = flight.kind.is_original_transmission()
+                    && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end);
+                if CAPTURE_ORIGINALS && flight.kind.is_original_transmission() {
+                    record_original_release_segments(
+                        flight.instance,
+                        flight.sent_at,
+                        acked_start,
+                        acked_end,
+                        &ambiguous_intervals,
+                        &mut record_original,
+                    );
+                }
                 released.push(RequestPathRelease {
                     instance: flight.instance,
                     bytes,
                     sent_at: flight.sent_at,
                     elapsed: now.saturating_duration_since(flight.sent_at),
-                    path_proving: flight.kind.is_original_transmission()
-                        && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end),
+                    path_proving,
                 });
             }
             for (retained_start, retained_end) in split.retained {

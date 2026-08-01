@@ -11,6 +11,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::scheduler::TrafficClass;
+use std::num::NonZeroU64;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -216,6 +217,60 @@ impl ReliablePathFrameReservation<'_> {
                 self.lane,
                 self.effective_lane,
                 self.bytes,
+            ),
+        );
+    }
+}
+
+/// A bounded queue reservation whose command remains scoped to one exact TCP
+/// carrier validation. Keeping this wrapper separate leaves the ordinary
+/// `SendFrame` reservation and commit path structurally unchanged.
+pub(in crate::runtime) struct TcpCarrierValidationDataReservation<'a> {
+    reservation: ReliablePathFrameReservation<'a>,
+    validation_id: NonZeroU64,
+}
+
+impl TcpCarrierValidationDataReservation<'_> {
+    pub(in crate::runtime) fn commit(mut self) {
+        #[cfg(feature = "lab-diagnostics")]
+        let stream_id = reliable_path_frame_stream_id(
+            self.reservation
+                .frame
+                .as_ref()
+                .expect("reserved TCP carrier validation frame"),
+        )
+        .unwrap_or(StreamId(0));
+        let frame = self
+            .reservation
+            .frame
+            .take()
+            .expect("reserved TCP carrier validation frame");
+        self.reservation
+            .metrics
+            .add_pending_bytes(self.reservation.bytes);
+        self.reservation
+            .permit
+            .take()
+            .expect("reserved TCP carrier validation queue permit")
+            .send(QueuedReliablePathCommand::new(
+                ReliablePathCommand::SendTcpCarrierValidationData {
+                    validation_id: self.validation_id,
+                    frame,
+                },
+                self.reservation.bytes,
+                self.reservation.metrics.clone(),
+            ));
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "path_command_queue_send",
+            format_args!(
+                "queue={} command_kind=tcp_carrier_validation_data stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result=queued validation_id={}",
+                self.reservation.queue_name,
+                stream_id.0,
+                self.reservation.lane,
+                self.reservation.effective_lane,
+                self.reservation.bytes,
+                self.validation_id,
             ),
         );
     }
@@ -699,6 +754,29 @@ impl ReliablePathCommandSender {
             .await
     }
 
+    /// Establishes one exact local writer boundary for an active TCP carrier
+    /// validation. The command shares the bounded Product-data FIFO, carries
+    /// no wire frame or byte charge, and resolves only after the carrier actor
+    /// has committed every preceding frame to its transport writer.
+    pub(in crate::runtime) async fn tcp_carrier_validation_writer_boundary(
+        &self,
+        validation_id: NonZeroU64,
+    ) -> Result<std::time::Instant, RuntimeError> {
+        let (completion, receipt) = tokio::sync::oneshot::channel();
+        self.send_stream_ordered_command(
+            ReliablePathCommand::TcpCarrierValidationWriterBoundary {
+                validation_id,
+                completion,
+            },
+            TrafficClass::Throughput,
+        )
+        .await
+        .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+        receipt
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
+    }
+
     pub(in crate::runtime) async fn send_datagram_frame(
         &self,
         attachment_id: u64,
@@ -935,6 +1013,40 @@ impl ReliablePathCommandSender {
             lane,
             Some(reliable_path_stream_ordered_queue_lane()),
         )
+    }
+
+    /// Reserves one finite candidate assignment on the bounded bulk-data
+    /// queue. The typed command keeps validation authority distinct from
+    /// ordinary STREAM_DATA until the validation actor consumes it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn try_reserve_tcp_carrier_validation_data(
+        &self,
+        validation_id: NonZeroU64,
+        frame: Frame,
+        lane: TrafficClass,
+    ) -> Result<TcpCarrierValidationDataReservation<'_>, RuntimeError> {
+        if !matches!(&frame, Frame::StreamData { .. }) {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation data requires STREAM_DATA",
+            ));
+        }
+        if lane != TrafficClass::Throughput {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation data requires throughput traffic",
+            ));
+        }
+
+        let reservation = self.try_reserve_frame_on_queue(
+            frame,
+            lane,
+            TrafficClass::Throughput,
+            &self.data,
+            "data",
+        )?;
+        Ok(TcpCarrierValidationDataReservation {
+            reservation,
+            validation_id,
+        })
     }
 
     /// Reserves carrier work for a repeated Data Sequence range. Reinjection is
@@ -1180,6 +1292,8 @@ fn reliable_path_command_requires_product_admission(command: &ReliablePathComman
         | ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::OpenDatagramAttachment { .. }
         | ReliablePathCommand::OpenDatagramFlow { .. }
+        | ReliablePathCommand::SendTcpCarrierValidationData { .. }
+        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. }
         | ReliablePathCommand::SendTcpCapacityProbe(_) => true,
         ReliablePathCommand::SendDatagramFrame { frame, .. }
         | ReliablePathCommand::SendFrame(frame) => {
@@ -1580,7 +1694,8 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
 ) -> usize {
     match command {
         ReliablePathCommand::SendFrame(frame)
-        | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
+        | ReliablePathCommand::SendDatagramFrame { frame, .. }
+        | ReliablePathCommand::SendTcpCarrierValidationData { frame, .. } => {
             reliable_path_frame_pacing_bytes(frame)
         }
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
@@ -1598,6 +1713,7 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
         | ReliablePathCommand::OpenDatagramAttachment { .. }
         | ReliablePathCommand::OpenDatagramFlow { .. }
         | ReliablePathCommand::CloseDatagramAttachment { .. }
+        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. }
         | ReliablePathCommand::CloseStream(_) => 0,
     }
 }
@@ -1607,7 +1723,8 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
 ) -> usize {
     match command {
         ReliablePathCommand::SendFrame(frame)
-        | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
+        | ReliablePathCommand::SendDatagramFrame { frame, .. }
+        | ReliablePathCommand::SendTcpCarrierValidationData { frame, .. } => {
             crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
         }
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
@@ -1628,17 +1745,22 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
         | ReliablePathCommand::OpenDatagramAttachment { .. }
         | ReliablePathCommand::OpenDatagramFlow { .. }
         | ReliablePathCommand::CloseDatagramAttachment { .. }
+        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. }
         | ReliablePathCommand::CloseStream(_) => 1,
     }
 }
 
 fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> Option<StreamId> {
     match command {
-        ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
+        ReliablePathCommand::SendFrame(frame)
+        | ReliablePathCommand::SendTcpCarrierValidationData { frame, .. } => {
+            reliable_path_frame_stream_id(frame)
+        }
         ReliablePathCommand::SendDatagramFrame { .. }
         | ReliablePathCommand::OpenDatagramAttachment { .. }
         | ReliablePathCommand::OpenDatagramFlow { .. }
-        | ReliablePathCommand::CloseDatagramAttachment { .. } => None,
+        | ReliablePathCommand::CloseDatagramAttachment { .. }
+        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. } => None,
         ReliablePathCommand::SendTcpCapacityProbe(probe) => Some(probe.stream_id),
         ReliablePathCommand::PrepareConnection { .. } => None,
         ReliablePathCommand::OpenStream { stream_id, .. }
@@ -1672,6 +1794,10 @@ fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
         ReliablePathCommand::SendDatagramFrame { frame, .. } => reliable_path_frame_kind(frame),
         ReliablePathCommand::CloseDatagramAttachment { .. } => "close_datagram_attachment",
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
+        ReliablePathCommand::SendTcpCarrierValidationData { .. } => "tcp_carrier_validation_data",
+        ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. } => {
+            "tcp_carrier_validation_writer_boundary"
+        }
         ReliablePathCommand::SendTcpCapacityProbe(_) => "tcp_capacity_probe",
         ReliablePathCommand::ResetAndCloseStream { .. } => "reset_and_close_stream",
         ReliablePathCommand::CloseStream(_) => "close_stream",

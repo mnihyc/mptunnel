@@ -327,16 +327,15 @@ fn spawn_client_udp_path_metrics(
                 metrics,
                 poll_elapsed,
             );
-            if let Some(record) = runtime
-                .state
-                .health()
-                .lock()
-                .expect("client QUIC UDP path health lock")
-                .udp
-                .get_mut(runtime.path_index)
-            {
-                record.mark_quic_path_metrics(path_instance_id, metrics);
-            }
+            let _ = runtime.state.mutate_path_eligibility(
+                crate::model::path::RelayPathKey {
+                    underlay: crate::protocol::UnderlayProtocol::Udp,
+                    index: runtime.path_index,
+                },
+                |record| {
+                    record.mark_quic_path_metrics(path_instance_id, metrics);
+                },
+            );
             tokio::select! {
                 _ = tokio::time::sleep(quic_path_metrics_poll_interval(metrics)) => {}
                 _ = &mut activity_started => {

@@ -10,9 +10,31 @@ use super::capacity::{
     reliable_path_startup_sample_limit_bytes, reliable_product_measurement_session_envelope_bytes,
 };
 use crate::mux::MuxLimits;
-use crate::protocol::TcpCarrierValidationResult;
+use crate::protocol::{PathUsage, TcpCarrierValidationResult};
 use std::cmp::Ordering;
+use std::num::NonZeroU64;
 use std::time::Duration;
+
+/// Session-owned policy epochs that may invalidate one frozen comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpCarrierPolicyEpochs {
+    pub(crate) ordinary_eligibility_generation: NonZeroU64,
+    pub(crate) admission_policy_generation: NonZeroU64,
+    pub(crate) resource_policy_generation: NonZeroU64,
+}
+
+/// Stable sender-owned generations surrounding one ordinary placement.
+///
+/// Queue occupancy and transport samples are deliberately absent. They are
+/// mutable evidence, not authority to create another admission generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpCarrierStableGenerations {
+    pub(crate) membership_generation: u64,
+    pub(crate) ordinary_eligibility_generation: NonZeroU64,
+    pub(crate) authority_class: PathUsage,
+    pub(crate) admission_policy_generation: NonZeroU64,
+    pub(crate) resource_policy_generation: NonZeroU64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpCarrierValidationGeometry {
@@ -20,6 +42,12 @@ pub(crate) struct TcpCarrierValidationGeometry {
     rate_window_bytes: u64,
     cohort_coverage_bytes: u64,
     candidate_work_limit_bytes: u64,
+}
+
+impl TcpCarrierValidationGeometry {
+    pub(crate) fn cohort_coverage_bytes(self) -> u64 {
+        self.cohort_coverage_bytes
+    }
 }
 
 /// Freezes one validation's byte geometry before candidate Product service.
@@ -286,6 +314,10 @@ impl TcpCarrierValidationState {
             TcpCarrierValidationPhase::Settled(result) => Some(result),
             _ => None,
         }
+    }
+
+    pub(crate) fn cohort_coverage_bytes(self) -> u64 {
+        self.geometry.cohort_coverage_bytes()
     }
 
     pub(crate) fn candidate_assignment_credit_bytes(self) -> u64 {

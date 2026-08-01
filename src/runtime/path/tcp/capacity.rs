@@ -90,6 +90,14 @@ struct RequestTcpCapacityProof {
     candidate: TcpCapacityProofCandidate,
 }
 
+struct RequestTcpCapacityProofEvidence {
+    path_id: PathId,
+    candidate: TcpCapacityProofCandidate,
+    proof_metrics: PathMetrics,
+    native_transport_state: Option<TcpNativeObservation>,
+    observed_at: Instant,
+}
+
 impl RequestTcpCapacityRecord {
     fn is_idle(&self) -> bool {
         self.reservation.is_none() && self.proof.is_none()
@@ -191,21 +199,25 @@ impl RequestTcpCapacityRecord {
         &mut self,
         stream_id: StreamId,
         path_instance: RelayPathInstance,
-        candidate: TcpCapacityProofCandidate,
-        proof_metrics: PathMetrics,
-        native_transport_state: Option<TcpNativeObservation>,
-        now: Instant,
+        evidence: RequestTcpCapacityProofEvidence,
     ) -> bool {
+        let RequestTcpCapacityProofEvidence {
+            path_id,
+            candidate,
+            proof_metrics,
+            native_transport_state,
+            observed_at,
+        } = evidence;
         let Some(reservation) = self.reservation.as_ref() else {
             return false;
         };
         if path_instance.key.underlay != UnderlayProtocol::Tcp
             || proof_metrics.underlay != UnderlayProtocol::Tcp
             || proof_metrics.direction != PathMetricDirection::ClientToServer
-            || proof_metrics.path_id.0 as usize != path_instance.key.index
+            || proof_metrics.path_id != path_id
             || native_transport_state.is_some_and(|observation| {
                 observation.direction() != PathMetricDirection::ClientToServer
-                    || observation.path_id().0 as usize != path_instance.key.index
+                    || observation.path_id() != path_id
             })
             || reservation.stream_id != stream_id
             || reservation.path_instance != path_instance
@@ -216,7 +228,7 @@ impl RequestTcpCapacityRecord {
             || candidate.rate_sample_bytes > candidate.train_bytes
             || candidate.accepted_at < reservation.valid_after
             || candidate.accepted_at >= reservation.expires_at
-            || !valid_tcp_capacity_proof_candidate_at(candidate, now)
+            || !valid_tcp_capacity_proof_candidate_at(candidate, observed_at)
         {
             return false;
         }
@@ -309,8 +321,7 @@ impl Drop for RequestTcpCapacityProbeLeaseState {
             .health()
             .lock()
             .expect("client path health lock")
-            .tcp
-            .get_mut(self.path_index)
+            .tcp_record_mut(self.path_index)
         {
             record.tcp_capacity.clear_token(self.token);
         }
@@ -341,13 +352,19 @@ impl ClientPathHealthRecord {
         native_transport_state: Option<TcpNativeObservation>,
         now: Instant,
     ) -> bool {
+        let Some(path_id) = self.wire_path_id() else {
+            return false;
+        };
         if !self.tcp_capacity.accept_proof(
             stream_id,
             path_instance,
-            candidate,
-            proof_metrics,
-            native_transport_state,
-            now,
+            RequestTcpCapacityProofEvidence {
+                path_id,
+                candidate,
+                proof_metrics,
+                native_transport_state,
+                observed_at: now,
+            },
         ) {
             return false;
         }
@@ -417,8 +434,12 @@ impl ClientPathState {
             return None;
         }
         let mut health = self.health().lock().expect("client path health lock");
-        let record = health.tcp.get_mut(path_index)?;
+        let record = health.tcp_record_mut(path_index)?;
+        let before = record.eligibility_fingerprint();
         record.maintain(now);
+        let eligibility_changed = before != record.eligibility_fingerprint();
+        self.publish_eligibility_change_if(&mut health, eligibility_changed);
+        let record = health.tcp_record_mut(path_index)?;
         // Distinct TCP sockets have independent ordering. The path capsule owns
         // exact identity while the session budget bounds their cumulative cost.
         if !record.tcp_capacity.is_idle() {

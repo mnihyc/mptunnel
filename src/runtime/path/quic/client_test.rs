@@ -23,10 +23,10 @@ fn address_retry_fits_alternates_inside_short_budget() {
 
 #[test]
 fn stream_open_path_status_uses_carrier_instance_and_sequence_fences() {
-    let state = ClientPathState::new(ClientPathHealth {
-        tcp: Vec::new(),
-        udp: vec![ClientPathHealthRecord::default()],
-    });
+    let state = ClientPathState::new(ClientPathHealth::new(
+        Vec::new(),
+        vec![ClientPathHealthRecord::default()],
+    ));
     let old_instance = next_carrier_path_instance_id();
     state.install_peer_path_usage(
         UnderlayProtocol::Udp,
@@ -89,10 +89,10 @@ fn stream_open_path_status_uses_carrier_instance_and_sequence_fences() {
 
 #[test]
 fn stream_open_path_status_rejects_a_different_wire_path() {
-    let state = ClientPathState::new(ClientPathHealth {
-        tcp: Vec::new(),
-        udp: vec![ClientPathHealthRecord::default()],
-    });
+    let state = ClientPathState::new(ClientPathHealth::new(
+        Vec::new(),
+        vec![ClientPathHealthRecord::default()],
+    ));
     let instance = next_carrier_path_instance_id();
     state.install_peer_path_usage(UnderlayProtocol::Udp, 0, instance, 0, PathUsage::Available);
 

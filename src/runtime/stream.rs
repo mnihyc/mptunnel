@@ -29,7 +29,7 @@ pub(in crate::runtime) use registry::{
     ServerReliableStreamRegistry,
 };
 pub(in crate::runtime) use request::{
-    OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
-    ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayAttachmentReservation,
+    ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
 };
 pub(in crate::runtime) use send_buffer::SessionSendBuffer;

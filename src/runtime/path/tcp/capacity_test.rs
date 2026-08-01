@@ -482,6 +482,12 @@ fn request_tcp_capacity_authority_expires_without_a_native_rate_prior() {
     let rate_sample_bytes = 256 * 1024;
     let token = 40;
     let mut record = ClientPathHealthRecord::default();
+    record.install_tcp_peer_usage(
+        PathId(path_index as u16),
+        path_instance.path_instance_id,
+        0,
+        crate::protocol::PathUsage::Available,
+    );
     record.tcp_capacity.reserve(
         stream_id,
         path_instance,

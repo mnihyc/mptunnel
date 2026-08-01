@@ -601,6 +601,7 @@ impl ServerTcpPathSession {
         let mut sent_items = 0usize;
         let mut wrote_frame = false;
         let mut writer_pending_bytes = 0usize;
+        let mut writer_boundary = None;
 
         loop {
             let Some(command) = next_command.take().or_else(|| {
@@ -657,6 +658,20 @@ impl ServerTcpPathSession {
                     return Err(RuntimeError::Protocol(
                         "server TCP path received request capacity command",
                     ));
+                }
+                ReliablePathCommand::SendTcpCarrierValidationData { .. } => {
+                    self.commands_rx
+                        .release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "ordinary server TCP path received carrier validation data",
+                    ));
+                }
+                ReliablePathCommand::TcpCarrierValidationWriterBoundary {
+                    validation_id: _,
+                    completion,
+                } => {
+                    writer_boundary = Some(completion);
+                    break;
                 }
                 ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
                     // A TCP session is shared, so retire only this attachment
@@ -758,8 +773,12 @@ impl ServerTcpPathSession {
                 sent_items >= item_budget,
             ),
         );
-        if wrote_frame && !self.writer.flush().await? {
+        if (wrote_frame || writer_boundary.is_some()) && !self.writer.flush().await? {
             return Ok(ServerTcpSessionDisposition::Stop);
+        }
+        if let Some(completion) = writer_boundary {
+            self.commands_rx.release_pending_command_bytes(0);
+            let _ = completion.send(std::time::Instant::now());
         }
         Ok(ServerTcpSessionDisposition::Continue)
     }

@@ -11,6 +11,7 @@ use crate::model::admission::{
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
 use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
+use crate::model::tcp_carrier::TcpCarrierPolicyEpochs;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
@@ -56,6 +57,7 @@ pub(in crate::runtime) struct ReliableRequestPathBatchObservation {
     pub(in crate::runtime) paths: SmallVec<[ReliableRequestPathEvidence; 4]>,
     pub(in crate::runtime) bulk_candidates: SmallVec<[BulkPathCandidate; 4]>,
     pub(in crate::runtime) latency_pressure: bool,
+    pub(in crate::runtime) tcp_carrier_policy_epochs: Option<TcpCarrierPolicyEpochs>,
 }
 
 impl ClientPathContext {
@@ -64,7 +66,7 @@ impl ClientPathContext {
         key: RelayPathKey,
     ) -> bool {
         match key.underlay {
-            UnderlayProtocol::Tcp => self.tcp_paths.get(key.index),
+            UnderlayProtocol::Tcp => self.tcp_path_spec(key.index),
             UnderlayProtocol::Udp => self.udp_paths.get(key.index),
         }
         .is_some_and(path_allows_automatic_bulk_use)
@@ -118,11 +120,7 @@ impl ClientPathContext {
     ) -> Option<RelayPathLoadLease> {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
-        let records = match key.underlay {
-            UnderlayProtocol::Tcp => &mut health.tcp,
-            UnderlayProtocol::Udp => &mut health.udp,
-        };
-        let current = records.get_mut(key.index)?;
+        let current = health.path_record_mut(key)?;
         // Topology and carrier credit are revalidated by the sender. This
         // conditional claim fences only the shared load that influenced the
         // score; a still-attached Suspect path remains usable as before.
@@ -131,9 +129,13 @@ impl ClientPathContext {
         {
             return None;
         }
+        let before = current.eligibility_fingerprint();
         if !current.reserve_load(lane, now) {
             return None;
         }
+        let eligibility_changed = before != current.eligibility_fingerprint();
+        self.state
+            .publish_eligibility_change_if(&mut health, eligibility_changed);
         drop(health);
         Some(RelayPathLoadLease::new(
             self.state.clone(),
@@ -544,7 +546,23 @@ impl ClientPathContext {
         I: IntoIterator<Item = (RelayPathKey, Option<RelayPathProofEpoch>)>,
     {
         let now = Instant::now();
-        let health = self.state.health().lock().expect("client path health lock");
+        let mut health = self.state.health().lock().expect("client path health lock");
+        if include_bulk_admission {
+            let mut eligibility_changed = false;
+            for record in health.tcp_records_mut() {
+                let before = record.eligibility_fingerprint();
+                record.maintain(now);
+                eligibility_changed |= before != record.eligibility_fingerprint();
+            }
+            for record in &mut health.udp {
+                let before = record.eligibility_fingerprint();
+                record.maintain(now);
+                eligibility_changed |= before != record.eligibility_fingerprint();
+            }
+            self.state
+                .publish_eligibility_change_if(&mut health, eligibility_changed);
+        }
+        let tcp_carrier_policy_epochs = health.tcp_carrier_policy_epochs();
         // Full configured-path vectors are needed only for multipath admission.
         // Ordinary and single-path sends sample attached records directly.
         let bulk_observations = include_bulk_admission.then(|| {
@@ -559,9 +577,10 @@ impl ClientPathContext {
                 self.reliable_bulk_path_candidates_from_observations(payload_bytes, tcp, udp)
             })
             .unwrap_or_default();
-        let latency_pressure = bulk_observations.as_ref().is_some_and(|(tcp, udp)| {
-            tcp.iter()
-                .chain(udp)
+        let latency_pressure = bulk_observations.as_ref().is_some_and(|(_, _)| {
+            health
+                .tcp_records()
+                .chain(&health.udp)
                 .any(|observation| observation.active_latency_sensitive_flows > 0)
         });
         let paths = attached_paths
@@ -569,9 +588,8 @@ impl ClientPathContext {
             .map(|(key, proof)| {
                 let observed = match key.underlay {
                     UnderlayProtocol::Tcp => self
-                        .tcp_paths
-                        .get(key.index)
-                        .zip(health.tcp.get(key.index))
+                        .tcp_path_spec(key.index)
+                        .zip(health.tcp_record(key.index))
                         .map(|(path, record)| {
                             let observation = bulk_observations
                                 .as_ref()
@@ -646,6 +664,7 @@ impl ClientPathContext {
             paths,
             bulk_candidates,
             latency_pressure,
+            tcp_carrier_policy_epochs,
         }
     }
 
@@ -669,14 +688,13 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn tcp_path_snapshot(&self, index: usize) -> Option<PathSnapshot> {
         let now = Instant::now();
-        let path = self.tcp_paths.get(index)?;
+        let path = self.tcp_path_spec(index)?;
         let observation = self
             .state
             .health()
             .lock()
             .expect("client path health lock")
-            .tcp
-            .get(index)?
+            .tcp_record(index)?
             .observation_at(now);
         Some(path_snapshot(path, index, observation))
     }
@@ -710,18 +728,13 @@ impl ClientPathContext {
             .health()
             .lock()
             .expect("client path health lock")
-            .tcp
-            .get(index)
+            .tcp_record(index)
             .is_some_and(|record| record.native_drain_observed)
     }
 
     pub(in crate::runtime) fn reliable_path_rtt_is_observed(&self, key: RelayPathKey) -> bool {
         let health = self.state.health().lock().expect("client path health lock");
-        let record = match key.underlay {
-            UnderlayProtocol::Tcp => health.tcp.get(key.index),
-            UnderlayProtocol::Udp => health.udp.get(key.index),
-        };
-        record.is_some_and(|record| {
+        health.path_record(key).is_some_and(|record| {
             record.carrier_srtt_ms.is_some()
                 || record.carrier_rttvar_ms.is_some()
                 || record.measured_srtt_ms.is_some()
@@ -748,14 +761,13 @@ impl ClientPathContext {
         let now = Instant::now();
         let (path, observation) = match underlay {
             UnderlayProtocol::Tcp => {
-                let path = self.tcp_paths.get(index)?;
+                let path = self.tcp_path_spec(index)?;
                 let observation = self
                     .state
                     .health()
                     .lock()
                     .expect("client path health lock")
-                    .tcp
-                    .get(index)?
+                    .tcp_record(index)?
                     .observation_at(now);
                 (path, observation)
             }
@@ -928,12 +940,11 @@ impl ClientPathContext {
         let health = self.state.health().lock().expect("client path health lock");
         match underlay {
             UnderlayProtocol::Tcp => {
-                let Some(path) = self.tcp_paths.get(index) else {
+                let Some(path) = self.tcp_path_spec(index) else {
                     return false;
                 };
                 health
-                    .tcp
-                    .get(index)
+                    .tcp_record(index)
                     .map(|record| {
                         bulk_candidate_has_bulk_rate_evidence(path, record.observation_at(now))
                     })
@@ -988,11 +999,9 @@ impl ClientPathContext {
         index: usize,
     ) -> Option<u64> {
         let health = self.state.health().lock().expect("client path health lock");
-        match underlay {
-            UnderlayProtocol::Tcp => health.tcp.get(index),
-            UnderlayProtocol::Udp => health.udp.get(index),
-        }
-        .map(ClientPathHealthRecord::path_proof_generation)
+        health
+            .path_record(RelayPathKey { underlay, index })
+            .map(ClientPathHealthRecord::path_proof_generation)
     }
 
     /// Revalidates the exact proof epoch at the apply linearization point.
@@ -1003,11 +1012,7 @@ impl ClientPathContext {
     ) -> bool {
         let now = Instant::now();
         let health = self.state.health().lock().expect("client path health lock");
-        let record = match key.underlay {
-            UnderlayProtocol::Tcp => health.tcp.get(key.index),
-            UnderlayProtocol::Udp => health.udp.get(key.index),
-        };
-        record.is_some_and(|record| {
+        health.path_record(key).is_some_and(|record| {
             let observation = record.observation_at(now);
             observation.state == SchedulerPathState::Active
                 && !observation.manual_disabled
@@ -1027,24 +1032,21 @@ impl ClientPathContext {
         now: Instant,
     ) -> Option<Instant> {
         let health = self.state.health().lock().expect("client path health lock");
-        let record = match underlay {
-            UnderlayProtocol::Tcp => health.tcp.get(index),
-            UnderlayProtocol::Udp => health.udp.get(index),
-        };
-        record.and_then(|record| {
-            let observation = record.observation_at(now);
-            (observation.state == SchedulerPathState::Active && !observation.manual_disabled)
-                .then(|| record.successful_path_proof_acked_at(proof_id, attached_at, now))
-                .flatten()
-        })
+        health
+            .path_record(RelayPathKey { underlay, index })
+            .and_then(|record| {
+                let observation = record.observation_at(now);
+                (observation.state == SchedulerPathState::Active && !observation.manual_disabled)
+                    .then(|| record.successful_path_proof_acked_at(proof_id, attached_at, now))
+                    .flatten()
+            })
     }
 
     pub(in crate::runtime) fn reliable_relay_has_latency_pressure(&self) -> bool {
         let now = Instant::now();
         let health = self.state.health().lock().expect("client path health lock");
         let tcp_pressure = health
-            .tcp
-            .iter()
+            .tcp_records()
             .any(|record| record.observation_at(now).active_latency_sensitive_flows > 0);
         tcp_pressure
             || health

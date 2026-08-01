@@ -176,10 +176,7 @@ impl ServerUdpTerminalWriterFixture {
             codec_limits: context.codec_limits,
             mux_limits: context.mux_limits,
             stream_frame_queue: 8,
-            state: ClientPathState::new(ClientPathHealth {
-                tcp: Vec::new(),
-                udp: Vec::new(),
-            }),
+            state: ClientPathState::new(ClientPathHealth::new(Vec::new(), Vec::new())),
             carrier_network: Arc::new(SystemCarrierNetworkProvider),
             peer_status: PeerStatusBroker::new(false),
             peer_status_snapshot: PeerStatusSnapshotSource::new(|| Some(Vec::new())),
@@ -534,10 +531,10 @@ async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
     let mut server_recv = fixture.server_recv.take().expect("server QUIC receiver");
     let (commands_tx, commands_rx) = reliable_path_command_channels(8);
     let (frames_tx, mut frames_rx) = mpsc::channel(8);
-    let state = ClientPathState::new(ClientPathHealth {
-        tcp: Vec::new(),
-        udp: vec![ClientPathHealthRecord::default()],
-    });
+    let state = ClientPathState::new(ClientPathHealth::new(
+        Vec::new(),
+        vec![ClientPathHealthRecord::default()],
+    ));
     let codec_limits = fixture.context.codec_limits;
     let mux_limits = fixture.context.mux_limits;
     let actor = tokio::spawn(run_client_udp_stream(
@@ -619,10 +616,10 @@ async fn client_quic_clean_eof_reports_attachment_failure_then_allows_detach() {
     let mut server_recv = fixture.server_recv.take().expect("server QUIC receiver");
     let (commands_tx, commands_rx) = reliable_path_command_channels(8);
     let (frames_tx, mut frames_rx) = mpsc::channel(8);
-    let state = ClientPathState::new(ClientPathHealth {
-        tcp: Vec::new(),
-        udp: vec![ClientPathHealthRecord::default()],
-    });
+    let state = ClientPathState::new(ClientPathHealth::new(
+        Vec::new(),
+        vec![ClientPathHealthRecord::default()],
+    ));
     let codec_limits = fixture.context.codec_limits;
     let actor = tokio::spawn(run_client_udp_stream(
         client_send,

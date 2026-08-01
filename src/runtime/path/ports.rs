@@ -9,8 +9,8 @@ use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_in
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{
-    Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId,
-    StreamId, TargetAddr, UnderlayProtocol,
+    Frame, OffsetRange, PathId, PathMetricDirection, PathMetrics, PathPurpose, PathUsage,
+    PeerPathState, PeerPathStatus, SessionId, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
@@ -248,7 +248,7 @@ pub(in crate::runtime) struct ServerStreamManagementSnapshot {
     pub(in crate::runtime) sessions: Vec<ServerSessionManagementSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct ServerCarrierPathIdentity {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) underlay: UnderlayProtocol,
@@ -268,6 +268,19 @@ pub(in crate::runtime) struct ServerLocalPathProperties {
 #[derive(Clone)]
 pub(in crate::runtime) struct ServerCarrierPathRegistration {
     inner: Arc<ServerCarrierPathRegistrationInner>,
+}
+
+/// Exact session-owned authority for one directional TCP-carrier validation.
+///
+/// The lease is deliberately non-cloneable. Dropping it withdraws only the
+/// exact active transaction; retaining consumes it and commits authority in
+/// the same neutral registry transaction that releases the session slot.
+pub(in crate::runtime) struct ServerTcpCarrierValidationLease {
+    backend: Arc<dyn ServerStreamPortBackend>,
+    identity: ServerCarrierPathIdentity,
+    direction: PathMetricDirection,
+    lease_id: u64,
+    active: bool,
 }
 
 /// Completion authority for one exact carrier's ordered attachment retirement.
@@ -298,6 +311,7 @@ struct ServerCarrierPathRegistrationInner {
     backend: Arc<dyn ServerStreamPortBackend>,
     owner_token: usize,
     identity: ServerCarrierPathIdentity,
+    purpose: PathPurpose,
     local: ServerLocalPathProperties,
     principal_permit: PrincipalPermit,
     validation: Arc<AtomicBool>,
@@ -337,8 +351,23 @@ impl ServerCarrierPathRegistration {
         self.inner.identity.path_id
     }
 
+    pub(in crate::runtime) fn purpose(&self) -> PathPurpose {
+        self.inner.purpose
+    }
+
     pub(in crate::runtime) fn local_policy(&self) -> PathPolicy {
         self.inner.local.policy
+    }
+
+    /// Directional usage advertised by this receiver for peer Product work.
+    /// Validation admission and RETAIN commitment recheck this exact local
+    /// value instead of trusting that the peer honored the readiness frame.
+    pub(in crate::runtime) fn local_usage(&self) -> PathUsage {
+        if self.local_policy().backup {
+            PathUsage::Backup
+        } else {
+            PathUsage::Available
+        }
     }
 
     pub(in crate::runtime) fn local_config_ordinal(&self) -> usize {
@@ -382,6 +411,39 @@ impl ServerCarrierPathRegistration {
         self.inner.backend.retire_carrier_path(self.inner.identity)
     }
 
+    /// Reserves the one active directional validation slot for this session.
+    /// Ordinary carriers never acquire this authority.
+    pub(in crate::runtime) fn begin_tcp_carrier_validation(
+        &self,
+        direction: PathMetricDirection,
+    ) -> Result<ServerTcpCarrierValidationLease, RuntimeError> {
+        if self.purpose() != PathPurpose::Validation {
+            return Err(RuntimeError::Protocol(
+                "ordinary carrier cannot begin TCP carrier validation",
+            ));
+        }
+        let lease_id = self
+            .inner
+            .backend
+            .begin_tcp_carrier_validation(self.inner.identity, direction)?;
+        Ok(ServerTcpCarrierValidationLease {
+            backend: self.inner.backend.clone(),
+            identity: self.inner.identity,
+            direction,
+            lease_id,
+            active: true,
+        })
+    }
+
+    pub(in crate::runtime) fn tcp_carrier_direction_authorized(
+        &self,
+        direction: PathMetricDirection,
+    ) -> bool {
+        self.inner
+            .backend
+            .tcp_carrier_direction_authorized(self.inner.identity, direction)
+    }
+
     fn belongs_to(&self, port: &ServerStreamPort) -> bool {
         self.inner.owner_token == port.owner_token
     }
@@ -395,8 +457,69 @@ impl std::fmt::Debug for ServerCarrierPathRegistration {
             .field("underlay", &self.underlay())
             .field("path_id", &self.path_id())
             .field("path_instance_id", &self.path_instance_id())
+            .field("purpose", &self.purpose())
             .field("local_config_ordinal", &self.local_config_ordinal())
             .finish()
+    }
+}
+
+impl ServerTcpCarrierValidationLease {
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.identity.path_instance_id
+    }
+
+    pub(in crate::runtime) fn direction(&self) -> PathMetricDirection {
+        self.direction
+    }
+
+    /// Settles a complete negative or withdrawn validation. An unretained
+    /// carrier keeps its admission reservation until exact retirement.
+    pub(in crate::runtime) fn settle_without_retain(mut self) -> Result<(), RuntimeError> {
+        self.backend.finish_tcp_carrier_validation(
+            self.identity,
+            self.direction,
+            self.lease_id,
+            false,
+        )?;
+        self.active = false;
+        Ok(())
+    }
+
+    /// Commits receiver-side directional authority at RETAIN acknowledgment
+    /// serialization. Authority is carrier state, not stream-binding state.
+    pub(in crate::runtime) fn commit_retain(mut self) -> Result<(), RuntimeError> {
+        self.backend.finish_tcp_carrier_validation(
+            self.identity,
+            self.direction,
+            self.lease_id,
+            true,
+        )?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ServerTcpCarrierValidationLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerTcpCarrierValidationLease")
+            .field("session_id", &self.identity.session_id)
+            .field("path_instance_id", &self.identity.path_instance_id)
+            .field("direction", &self.direction)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+impl Drop for ServerTcpCarrierValidationLease {
+    fn drop(&mut self) {
+        if self.active {
+            self.backend.abandon_tcp_carrier_validation(
+                self.identity,
+                self.direction,
+                self.lease_id,
+            );
+        }
     }
 }
 
@@ -435,6 +558,105 @@ pub(in crate::runtime) enum ServerStreamFrameRoute {
     Backpressured(Frame),
 }
 
+/// Exact receive-side binding used while one existing throughput stream is
+/// validating a carrier. It deliberately owns no response-output command
+/// channel, so creating it cannot publish ordinary server-to-client authority.
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerValidationStreamBinding {
+    inner: Arc<dyn ServerValidationStreamBindingBackend>,
+}
+
+impl std::fmt::Debug for ServerValidationStreamBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerValidationStreamBinding")
+            .field("session_id", &self.session_id())
+            .field("stream_id", &self.stream_id())
+            .field("path_instance_id", &self.path_instance_id())
+            .finish()
+    }
+}
+
+impl ServerValidationStreamBinding {
+    pub(in crate::runtime) fn new(inner: Arc<dyn ServerValidationStreamBindingBackend>) -> Self {
+        Self { inner }
+    }
+
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
+        self.inner.session_id()
+    }
+
+    pub(in crate::runtime) fn stream_id(&self) -> StreamId {
+        self.inner.stream_id()
+    }
+
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.inner.path_instance_id()
+    }
+
+    /// Revalidates both the exact physical carrier and exact Product-stream
+    /// lifetime. A lane change ends throughput-validation eligibility.
+    pub(in crate::runtime) fn is_current(&self) -> bool {
+        self.inner.is_current()
+    }
+
+    pub(in crate::runtime) async fn route_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
+        validate_validation_stream_frame(self.stream_id(), &frame)?;
+        self.inner.route_frame(frame).await
+    }
+
+    pub(in crate::runtime) fn try_route_frame(
+        &self,
+        frame: Frame,
+    ) -> Result<ServerStreamFrameRoute, RuntimeError> {
+        validate_validation_stream_frame(self.stream_id(), &frame)?;
+        self.inner.try_route_frame(frame)
+    }
+
+    /// Stops new input on this exact attachment and orders its completion
+    /// after every frame already accepted into the Product stream actor.
+    pub(in crate::runtime) fn begin_detach(&self) {
+        self.inner.begin_detach();
+    }
+}
+
+fn validate_validation_stream_frame(
+    stream_id: StreamId,
+    frame: &Frame,
+) -> Result<(), RuntimeError> {
+    let frame_stream_id = match frame {
+        Frame::StreamData { stream_id, .. }
+        | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamMaxData { stream_id, .. }
+        | Frame::StreamFin { stream_id, .. }
+        | Frame::StreamReset { stream_id, .. }
+        | Frame::StreamDetach { stream_id } => *stream_id,
+        _ => {
+            return Err(RuntimeError::Protocol(
+                "validation stream binding received non-stream frame",
+            ));
+        }
+    };
+    if frame_stream_id != stream_id {
+        return Err(RuntimeError::Protocol(
+            "validation stream binding frame stream mismatch",
+        ));
+    }
+    Ok(())
+}
+
+pub(in crate::runtime) trait ServerValidationStreamBindingBackend:
+    Send + Sync
+{
+    fn session_id(&self) -> SessionId;
+    fn stream_id(&self) -> StreamId;
+    fn path_instance_id(&self) -> CarrierPathInstanceId;
+    fn is_current(&self) -> bool;
+    fn route_frame<'a>(&'a self, frame: Frame) -> ServerStreamPortFuture<'a, ()>;
+    fn try_route_frame(&self, frame: Frame) -> Result<ServerStreamFrameRoute, RuntimeError>;
+    fn begin_detach(&self);
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) enum ServerNewStreamPolicy {
     Submit,
@@ -454,9 +676,37 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
+        purpose: PathPurpose,
         local: ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<(), RuntimeError>;
+
+    fn begin_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+    ) -> Result<u64, RuntimeError>;
+
+    fn finish_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+        lease_id: u64,
+        retain: bool,
+    ) -> Result<(), RuntimeError>;
+
+    fn abandon_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+        lease_id: u64,
+    );
+
+    fn tcp_carrier_direction_authorized(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+    ) -> bool;
 
     fn retire_carrier_path(
         &self,
@@ -472,6 +722,12 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         request: ServerStreamOpenRequest,
         new_stream_policy: ServerNewStreamPolicy,
     ) -> ServerStreamPortFuture<'a, ServerStreamOpenOutcome>;
+
+    fn bind_validation_input_existing(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Result<Option<ServerValidationStreamBinding>, RuntimeError>;
 
     fn route_frame<'a>(
         &'a self,
@@ -579,6 +835,49 @@ impl ServerStreamPort {
         local: ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        self.register_carrier_path_with_purpose(
+            session_id,
+            underlay,
+            path_id,
+            PathPurpose::Ordinary,
+            local,
+            principal_permit,
+        )
+    }
+
+    /// Registers one validation-purpose TCP carrier and atomically reserves
+    /// the session's sole unretained-candidate slot.
+    pub(in crate::runtime) fn register_validation_carrier_path(
+        &self,
+        session_id: SessionId,
+        path_id: PathId,
+        local: ServerLocalPathProperties,
+        principal_permit: PrincipalPermit,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        self.register_carrier_path_with_purpose(
+            session_id,
+            UnderlayProtocol::Tcp,
+            path_id,
+            PathPurpose::Validation,
+            local,
+            principal_permit,
+        )
+    }
+
+    fn register_carrier_path_with_purpose(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        purpose: PathPurpose,
+        local: ServerLocalPathProperties,
+        principal_permit: PrincipalPermit,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        if purpose == PathPurpose::Validation && underlay != UnderlayProtocol::Tcp {
+            return Err(RuntimeError::Protocol(
+                "validation-purpose carrier requires TCP underlay",
+            ));
+        }
         let identity = ServerCarrierPathIdentity {
             session_id,
             underlay,
@@ -586,12 +885,13 @@ impl ServerStreamPort {
             path_instance_id: next_carrier_path_instance_id(),
         };
         self.backend
-            .activate_carrier_path(identity, local, principal_permit.clone())?;
+            .activate_carrier_path(identity, purpose, local, principal_permit.clone())?;
         Ok(ServerCarrierPathRegistration {
             inner: Arc::new(ServerCarrierPathRegistrationInner {
                 backend: self.backend.clone(),
                 owner_token: self.owner_token,
                 identity,
+                purpose,
                 local,
                 principal_permit,
                 validation: Arc::new(AtomicBool::new(false)),
@@ -617,6 +917,21 @@ impl ServerStreamPort {
         .expect("register test carrier path")
     }
 
+    #[cfg(test)]
+    pub(in crate::runtime) fn register_test_validation_carrier_path(
+        &self,
+        session_id: SessionId,
+        path_id: PathId,
+        local: ServerLocalPathProperties,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        self.register_validation_carrier_path(
+            session_id,
+            path_id,
+            local,
+            PrincipalPermit::for_test("test-peer"),
+        )
+    }
+
     pub(in crate::runtime) fn register_realtime_flow(
         &self,
         session_id: SessionId,
@@ -638,6 +953,23 @@ impl ServerStreamPort {
     ) -> Result<ServerStreamOpenOutcome, RuntimeError> {
         self.open_with_policy(request, ServerNewStreamPolicy::Reject)
             .await
+    }
+
+    /// Binds an exact live carrier to the receive side of one already-existing
+    /// throughput stream. This neither creates a stream nor changes response
+    /// output membership.
+    pub(in crate::runtime) fn bind_validation_input_existing(
+        &self,
+        path_registration: &ServerCarrierPathRegistration,
+        stream_id: StreamId,
+    ) -> Result<Option<ServerValidationStreamBinding>, RuntimeError> {
+        if !path_registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
+        self.backend
+            .bind_validation_input_existing(path_registration.inner.identity, stream_id)
     }
 
     async fn open_with_policy(

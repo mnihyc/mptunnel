@@ -4,10 +4,10 @@ use crate::runtime::path::{ClientPathHealth, ClientPathHealthRecord};
 
 #[test]
 fn quic_datagram_status_uses_the_spawning_carrier_instance_fence() {
-    let state = ClientPathState::new(ClientPathHealth {
-        tcp: Vec::new(),
-        udp: vec![ClientPathHealthRecord::default()],
-    });
+    let state = ClientPathState::new(ClientPathHealth::new(
+        Vec::new(),
+        vec![ClientPathHealthRecord::default()],
+    ));
     let stale_instance_id = next_carrier_path_instance_id();
     let current_instance_id = next_carrier_path_instance_id();
     state.install_peer_path_usage(
@@ -62,10 +62,10 @@ fn quic_datagram_status_uses_the_spawning_carrier_instance_fence() {
 
 #[test]
 fn quic_datagram_status_rejects_a_different_wire_path_id() {
-    let state = ClientPathState::new(ClientPathHealth {
-        tcp: Vec::new(),
-        udp: vec![ClientPathHealthRecord::default()],
-    });
+    let state = ClientPathState::new(ClientPathHealth::new(
+        Vec::new(),
+        vec![ClientPathHealthRecord::default()],
+    ));
     let path_instance_id = next_carrier_path_instance_id();
     state.install_peer_path_usage(
         UnderlayProtocol::Udp,

@@ -85,6 +85,19 @@ pub(super) struct ClientTcpPathStreamState {
     pub(super) pending_open: Option<ClientTcpPendingOpen>,
 }
 
+impl ClientTcpPathStreamState {
+    /// Adopts the exact stream binding already established by an acknowledged
+    /// directional TCP-carrier validation. No second `OPEN_STREAM` transaction
+    /// exists for this state.
+    pub(super) fn retained(frames: mpsc::Sender<Result<Frame, RuntimeError>>) -> Self {
+        Self {
+            open_attempt_id: next_client_tcp_open_attempt_id(),
+            frames,
+            pending_open: None,
+        }
+    }
+}
+
 pub(super) struct ClientTcpPendingOpen {
     response: oneshot::Sender<ClientTcpOpenResponse>,
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,

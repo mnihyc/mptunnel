@@ -69,6 +69,16 @@ pub(in crate::runtime) enum ServerReliableStreamEvent {
         path_instance_id: CarrierPathInstanceId,
         output_incarnation: u64,
     },
+    /// Ordered completion of one validation-only input attachment. Reaching
+    /// this event proves that every preceding frame accepted from that exact
+    /// attachment has already been returned to, and applied by, the stream
+    /// actor. The sender is deliberately carried by the lifecycle event so a
+    /// closed actor also releases the retirement waiter.
+    ValidationInputDetached {
+        path_instance_id: CarrierPathInstanceId,
+        attachment_incarnation: u64,
+        completion: watch::Sender<bool>,
+    },
 }
 
 impl From<mpsc::Receiver<Result<Frame, RuntimeError>>> for ReliablePathStreamInput {
@@ -274,6 +284,15 @@ impl ReliablePathStream {
                             path_instance_id,
                             output_incarnation,
                         ),
+                        Some(ServerReliableStreamEvent::ValidationInputDetached {
+                            path_instance_id,
+                            attachment_incarnation,
+                            completion,
+                        }) => {
+                            debug_assert!(path_instance_id.as_u64() > 0);
+                            debug_assert!(attachment_incarnation > 0);
+                            completion.send_replace(true);
+                        }
                         None => return Err(RuntimeError::ReliablePathSessionClosed),
                     }
                 }
@@ -304,7 +323,10 @@ impl ReliablePathStream {
             ReliablePathStreamInput::Server { events, pending } => {
                 if matches!(
                     pending.front(),
-                    Some(ServerReliableStreamEvent::PathDetached { .. })
+                    Some(
+                        ServerReliableStreamEvent::PathDetached { .. }
+                            | ServerReliableStreamEvent::ValidationInputDetached { .. }
+                    )
                 ) {
                     return None;
                 }
@@ -313,7 +335,10 @@ impl ReliablePathStream {
                 }
                 match events.try_recv() {
                     Ok(ServerReliableStreamEvent::Frame(frame)) => Some(Ok(frame)),
-                    Ok(boundary @ ServerReliableStreamEvent::PathDetached { .. }) => {
+                    Ok(
+                        boundary @ (ServerReliableStreamEvent::PathDetached { .. }
+                        | ServerReliableStreamEvent::ValidationInputDetached { .. }),
+                    ) => {
                         pending.push_back(boundary);
                         None
                     }

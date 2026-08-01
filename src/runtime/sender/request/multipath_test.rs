@@ -602,8 +602,9 @@ async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
         payload_bytes
     );
 
-    let data_ack_progress_paths =
-        controller.apply_product_ack(&context, &remotes, &[range], Instant::now());
+    let (data_ack_progress_paths, original_releases) =
+        controller.apply_product_ack(&context, &remotes, &[range], Instant::now(), false);
+    assert!(original_releases.is_none());
     assert!(
         data_ack_progress_paths.is_empty(),
         "a Data ACK cannot identify which duplicate delivered the range"
@@ -637,7 +638,7 @@ async fn product_ack_returns_the_exact_path_that_made_progress() {
         .flights
         .record_original_frame_instance(tcp, &frame);
 
-    let data_ack_progress_paths = controller.apply_product_ack(
+    let (data_ack_progress_paths, original_releases) = controller.apply_product_ack(
         &context,
         &remotes,
         &[OffsetRange {
@@ -645,7 +646,9 @@ async fn product_ack_returns_the_exact_path_that_made_progress() {
             end: payload_bytes as u64,
         }],
         Instant::now(),
+        false,
     );
+    assert!(original_releases.is_none());
 
     assert_eq!(data_ack_progress_paths.as_slice(), &[tcp]);
     assert!(
@@ -791,7 +794,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
         "the never-attempted second range remains immediately eligible"
     );
 
-    let data_ack_progress_paths = controller.apply_product_ack(
+    let (data_ack_progress_paths, original_releases) = controller.apply_product_ack(
         &context,
         &remotes,
         &[OffsetRange {
@@ -799,7 +802,9 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
             end: 4096,
         }],
         Instant::now(),
+        false,
     );
+    assert!(original_releases.is_none());
 
     assert!(
         data_ack_progress_paths.is_empty(),

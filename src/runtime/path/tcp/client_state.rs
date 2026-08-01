@@ -66,6 +66,27 @@ impl ClientTcpPathConnection {
         }
     }
 
+    pub(super) fn new_with_path_proofs(
+        path_instance_id: CarrierPathInstanceId,
+        startup_snapshot: PathSnapshot,
+        startup_metrics: PathMetrics,
+        carrier: ClientTcpCarrierConnection,
+        peer_status: PeerStatusCarrier,
+        path_proofs: PathProofTracker,
+        mux_limits: MuxLimits,
+    ) -> Self {
+        let mut connection = Self::new(
+            path_instance_id,
+            startup_snapshot,
+            startup_metrics,
+            carrier,
+            peer_status,
+            mux_limits,
+        );
+        connection.path_proofs = path_proofs;
+        connection
+    }
+
     pub(super) fn record_outbound_activity(&mut self) {
         self.carrier.refresh_liveness();
     }
@@ -223,16 +244,15 @@ impl ClientTcpPathSessionRuntime {
                 ),
             );
         }
-        if let Some(record) = self
-            .state
-            .health()
-            .lock()
-            .expect("client path health lock")
-            .tcp
-            .get_mut(self.path_index)
-        {
-            record.mark_tcp_transport_state(connection.path_instance_id, observation);
-        }
+        let _ = self.state.mutate_path_eligibility(
+            crate::model::path::RelayPathKey {
+                underlay: crate::protocol::UnderlayProtocol::Tcp,
+                index: self.path_index,
+            },
+            |record| {
+                record.mark_tcp_transport_state(connection.path_instance_id, observation);
+            },
+        );
     }
 }
 

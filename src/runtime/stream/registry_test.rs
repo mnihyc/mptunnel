@@ -2,7 +2,7 @@ use super::*;
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS};
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, PathMetricDirection, PathUsage};
+use crate::protocol::{OffsetRange, PathMetricDirection, PathPurpose, PathUsage};
 use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
@@ -1397,4 +1397,614 @@ async fn late_frame_after_relay_exit_does_not_close_shared_carrier() {
         port.try_route_frame(&registration, stream_id, late_fin),
         Ok(ServerStreamFrameRoute::Routed)
     ));
+}
+
+#[tokio::test]
+async fn validation_input_binding_is_existing_throughput_input_only() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(8));
+    let port = registry.path_port();
+    let session_id = SessionId(910);
+    let stream_id = StreamId(41);
+    let opening_path = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let validation_path = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("register validation carrier path");
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: opening_path.clone(),
+                commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open throughput stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new throughput stream"),
+    };
+    let mut stream = accepted.take_stream();
+    let response_binding = match &stream.output {
+        ReliablePathStreamOutput::Switchable(binding) => binding.clone(),
+        ReliablePathStreamOutput::Fixed(_) => panic!("expected switchable response output"),
+    };
+    let output_membership_generation = response_binding.output_membership_generation();
+    let output_targets = response_binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(output_targets.len(), 1);
+    assert_eq!(
+        output_targets[0].observation.key.underlay,
+        UnderlayProtocol::Udp
+    );
+    assert_eq!(
+        output_targets[0].observation.path_instance_id,
+        opening_path.path_instance_id()
+    );
+
+    let active_streams = port.management_snapshot().active_streams;
+    assert!(
+        port.bind_validation_input_existing(&validation_path, StreamId(999))
+            .expect("absent-stream lookup")
+            .is_none()
+    );
+    assert_eq!(
+        port.management_snapshot().active_streams,
+        active_streams,
+        "validation lookup must never create a product stream"
+    );
+
+    let validation = port
+        .bind_validation_input_existing(&validation_path, stream_id)
+        .expect("bind validation input")
+        .expect("existing throughput stream");
+    assert_eq!(validation.session_id(), session_id);
+    assert_eq!(validation.stream_id(), stream_id);
+    assert_eq!(
+        validation.path_instance_id(),
+        validation_path.path_instance_id()
+    );
+    assert!(validation.is_current());
+    assert_eq!(
+        response_binding.output_membership_generation(),
+        output_membership_generation,
+        "validation binding must not publish response output authority"
+    );
+    let output_targets = response_binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(output_targets.len(), 1);
+    assert_eq!(
+        output_targets[0].observation.path_instance_id,
+        opening_path.path_instance_id(),
+        "validation carrier must remain absent from response output membership"
+    );
+
+    let data = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: bytes::Bytes::from_static(b"validation input"),
+    };
+    validation
+        .route_frame(data.clone())
+        .await
+        .expect("route validation input");
+    assert_eq!(stream.recv_frame().await.expect("receive input"), data);
+    assert_eq!(
+        stream.request_feedback_underlay(),
+        Some(UnderlayProtocol::Udp),
+        "validation input is not ordinary response-return-path evidence"
+    );
+    assert!(matches!(
+        validation.try_route_frame(Frame::StreamFin {
+            stream_id: StreamId(stream_id.0 + 1),
+            final_offset: 0,
+        }),
+        Err(RuntimeError::Protocol(_))
+    ));
+    assert!(matches!(
+        validation.try_route_frame(Frame::SessionReady),
+        Err(RuntimeError::Protocol(_))
+    ));
+    assert_eq!(
+        response_binding.output_membership_generation(),
+        output_membership_generation
+    );
+
+    stream.set_lane(TrafficClass::Latency);
+    assert!(!validation.is_current());
+    assert!(
+        port.bind_validation_input_existing(&validation_path, stream_id)
+            .expect("latency-stream lookup")
+            .is_none(),
+        "validation input is restricted to throughput streams"
+    );
+    stream.set_lane(TrafficClass::Throughput);
+
+    let stream_lifetime = port
+        .bind_validation_input_existing(&validation_path, stream_id)
+        .expect("bind stream lifetime witness")
+        .expect("live stream lifetime");
+    assert!(stream_lifetime.is_current());
+    registry.close(session_id, stream_id);
+    assert!(!stream_lifetime.is_current());
+    assert!(matches!(
+        stream_lifetime.try_route_frame(Frame::StreamFin {
+            stream_id,
+            final_offset: 16,
+        }),
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+
+    let carrier_stream_id = StreamId(stream_id.0 + 1);
+    let (carrier_commands, _carrier_receivers) = reliable_path_command_channels(8);
+    let _carrier_stream = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id: carrier_stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: opening_path.clone(),
+                commands: carrier_commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open carrier-lifetime stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new carrier-lifetime stream"),
+    };
+    let carrier_lifetime = port
+        .bind_validation_input_existing(&validation_path, carrier_stream_id)
+        .expect("bind carrier lifetime witness")
+        .expect("live validation carrier");
+    validation_path.set_state(PeerPathState::Draining);
+    assert!(!carrier_lifetime.is_current());
+    assert!(matches!(
+        carrier_lifetime.try_route_frame(Frame::StreamFin {
+            stream_id: carrier_stream_id,
+            final_offset: 16,
+        }),
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+    registry.close(session_id, carrier_stream_id);
+    assert_eq!(port.management_snapshot().active_streams, 0);
+}
+
+#[tokio::test]
+async fn validation_input_retirement_waits_for_ordered_stream_application() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(8));
+    let port = registry.path_port();
+    let session_id = SessionId(911);
+    let stream_id = StreamId(42);
+    let opening_path = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let validation_path = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("register validation carrier path");
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut stream = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: opening_path.clone(),
+                commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open throughput stream")
+    {
+        ServerReliableStreamOpen::New(mut accepted) => accepted.take_stream(),
+        _ => panic!("expected new throughput stream"),
+    };
+    let validation = port
+        .bind_validation_input_existing(&validation_path, stream_id)
+        .expect("bind validation input")
+        .expect("existing throughput stream");
+    let payload = bytes::Bytes::from_static(b"ordered validation input");
+    let final_offset = payload.len() as u64;
+    let data = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload,
+    };
+    assert!(matches!(
+        validation.try_route_frame(data.clone()),
+        Ok(ServerStreamFrameRoute::Routed)
+    ));
+
+    validation.begin_detach();
+    assert!(!validation.is_current());
+    let retirement = validation_path.begin_retirement().wait();
+    tokio::pin!(retirement);
+    assert!(matches!(
+        futures::poll!(&mut retirement),
+        std::task::Poll::Pending
+    ));
+
+    let following = Frame::StreamFin {
+        stream_id,
+        final_offset,
+    };
+    port.route_frame(&opening_path, stream_id, following.clone())
+        .await
+        .expect("queue frame after validation detach");
+    assert_eq!(stream.recv_frame().await.expect("validation data"), data);
+    assert!(matches!(
+        futures::poll!(&mut retirement),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(
+        stream.recv_frame().await.expect("post-detach frame"),
+        following,
+        "the stream actor applies the validation detach between preceding candidate data and following work",
+    );
+    retirement.await;
+    assert!(
+        port.management_snapshot()
+            .paths
+            .iter()
+            .all(|path| path.path_instance_id != validation_path.path_instance_id()),
+        "carrier retirement completes only after the ordered input lifecycle event",
+    );
+}
+
+#[tokio::test]
+async fn blocked_validation_input_cannot_cross_detach_admission_fence() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(8));
+    let port = registry.path_port();
+    let session_id = SessionId(912);
+    let stream_id = StreamId(43);
+    let opening_path = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let validation_path = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("register validation carrier path");
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut stream = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: opening_path.clone(),
+                commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open throughput stream")
+    {
+        ServerReliableStreamOpen::New(mut accepted) => accepted.take_stream(),
+        _ => panic!("expected new throughput stream"),
+    };
+    let validation = port
+        .bind_validation_input_existing(&validation_path, stream_id)
+        .expect("bind validation input")
+        .expect("existing throughput stream");
+
+    let mut queued = Vec::new();
+    let blocked = loop {
+        let frame = Frame::StreamData {
+            stream_id,
+            offset: queued.len() as u64,
+            payload: bytes::Bytes::from_static(b"x"),
+        };
+        match validation
+            .try_route_frame(frame.clone())
+            .expect("try route validation input")
+        {
+            ServerStreamFrameRoute::Routed => queued.push(frame),
+            ServerStreamFrameRoute::Backpressured(frame) => break frame,
+        }
+    };
+    assert!(!queued.is_empty());
+
+    let pending = validation.route_frame(blocked);
+    tokio::pin!(pending);
+    assert!(matches!(
+        futures::poll!(&mut pending),
+        std::task::Poll::Pending
+    ));
+
+    validation.begin_detach();
+    assert_eq!(
+        stream.recv_frame().await.expect("first queued frame"),
+        queued[0]
+    );
+    assert!(matches!(
+        pending.await,
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+    for expected in queued.into_iter().skip(1) {
+        assert_eq!(stream.recv_frame().await.expect("queued frame"), expected);
+    }
+
+    let following = Frame::StreamFin {
+        stream_id,
+        final_offset: 0,
+    };
+    port.route_frame(&opening_path, stream_id, following.clone())
+        .await
+        .expect("queue ordinary frame after detach");
+    assert_eq!(
+        stream.recv_frame().await.expect("post-detach frame"),
+        following,
+        "the detach boundary must precede every frame admitted after detach began",
+    );
+}
+
+#[test]
+fn tcp_validation_candidate_and_active_direction_are_session_scoped() {
+    let registry = constrained_registry(16, 8);
+    let port = registry.path_port();
+    let session_id = SessionId(920);
+
+    let ordinary = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    assert_eq!(ordinary.purpose(), PathPurpose::Ordinary);
+    assert!(matches!(
+        ordinary.begin_tcp_carrier_validation(PathMetricDirection::ClientToServer),
+        Err(RuntimeError::Protocol(_))
+    ));
+
+    let candidate = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("first unretained candidate");
+    assert_eq!(candidate.purpose(), PathPurpose::Validation);
+    assert!(matches!(
+        port.register_test_validation_carrier_path(
+            session_id,
+            PathId(2),
+            ServerLocalPathProperties::default(),
+        ),
+        Err(RuntimeError::Protocol(_))
+    ));
+
+    let other_session = port
+        .register_test_validation_carrier_path(
+            SessionId(session_id.0 + 1),
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("candidate ownership is session scoped");
+    let active = candidate
+        .begin_tcp_carrier_validation(PathMetricDirection::ClientToServer)
+        .expect("first active direction");
+    assert_eq!(active.path_instance_id(), candidate.path_instance_id());
+    assert_eq!(active.direction(), PathMetricDirection::ClientToServer);
+    assert!(matches!(
+        candidate.begin_tcp_carrier_validation(PathMetricDirection::ServerToClient),
+        Err(RuntimeError::Protocol(_))
+    ));
+
+    // Dropping an unfinished validation withdraws only its exact active lease.
+    // The unretained candidate remains occupied and cannot be retried.
+    drop(active);
+    assert!(matches!(
+        candidate.begin_tcp_carrier_validation(PathMetricDirection::ClientToServer),
+        Err(RuntimeError::Protocol(_))
+    ));
+    assert!(matches!(
+        port.register_test_validation_carrier_path(
+            session_id,
+            PathId(2),
+            ServerLocalPathProperties::default(),
+        ),
+        Err(RuntimeError::Protocol(_))
+    ));
+
+    drop(candidate);
+    let replacement = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(2),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("exact candidate retirement releases the unretained slot");
+    let stale_active = replacement
+        .begin_tcp_carrier_validation(PathMetricDirection::ClientToServer)
+        .expect("replacement active validation");
+    let _retirement = replacement.begin_retirement();
+    let next_candidate = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(3),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("retirement releases exact active and candidate ownership");
+    let next_active = next_candidate
+        .begin_tcp_carrier_validation(PathMetricDirection::ClientToServer)
+        .expect("next exact active validation");
+    drop(stale_active);
+    next_active
+        .commit_retain()
+        .expect("stale lease drop cannot clear a later exact transaction");
+    assert!(next_candidate.tcp_carrier_direction_authorized(PathMetricDirection::ClientToServer));
+    drop(next_candidate);
+    drop(replacement);
+    drop(other_session);
+    drop(ordinary);
+}
+
+#[test]
+fn tcp_validation_requires_receiver_local_available_at_admission_and_retain() {
+    let registry = constrained_registry(16, 8);
+    let port = registry.path_port();
+    let session_id = SessionId(921);
+    let backup = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(0),
+            ServerLocalPathProperties {
+                policy: PathPolicy {
+                    backup: true,
+                    ..PathPolicy::default()
+                },
+                ..ServerLocalPathProperties::default()
+            },
+        )
+        .expect("register backup validation carrier");
+    assert!(matches!(
+        backup.begin_tcp_carrier_validation(PathMetricDirection::ClientToServer),
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+    drop(backup);
+
+    let candidate = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("register available validation carrier");
+    let lease = candidate
+        .begin_tcp_carrier_validation(PathMetricDirection::ClientToServer)
+        .expect("available receiver admits validation");
+    {
+        let mut paths = registry
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        paths
+            .instances
+            .get_mut(&server_physical_path_key(ServerCarrierPathIdentity {
+                session_id,
+                underlay: UnderlayProtocol::Tcp,
+                path_id: candidate.path_id(),
+                path_instance_id: candidate.path_instance_id(),
+            }))
+            .expect("registered candidate")
+            .local
+            .policy
+            .backup = true;
+    }
+    assert!(matches!(
+        lease.commit_retain(),
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+    assert!(!candidate.tcp_carrier_direction_authorized(PathMetricDirection::ClientToServer));
+}
+
+#[test]
+fn tcp_validation_retain_commits_direction_independently_of_candidate_binding() {
+    let registry = constrained_registry(16, 8);
+    let port = registry.path_port();
+    let session_id = SessionId(922);
+    let candidate = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("unretained candidate");
+
+    candidate
+        .begin_tcp_carrier_validation(PathMetricDirection::ClientToServer)
+        .expect("C2S validation lease")
+        .commit_retain()
+        .expect("commit C2S retain");
+    assert!(candidate.tcp_carrier_direction_authorized(PathMetricDirection::ClientToServer));
+    assert!(!candidate.tcp_carrier_direction_authorized(PathMetricDirection::ServerToClient));
+    assert!(matches!(
+        candidate.begin_tcp_carrier_validation(PathMetricDirection::ClientToServer),
+        Err(RuntimeError::Protocol(_))
+    ));
+
+    let server_to_client = candidate
+        .begin_tcp_carrier_validation(PathMetricDirection::ServerToClient)
+        .expect("opposite direction can validate on a retained carrier");
+    assert!(matches!(
+        port.register_test_validation_carrier_path(
+            session_id,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        ),
+        Err(RuntimeError::Protocol(_))
+    ));
+    server_to_client
+        .settle_without_retain()
+        .expect("negative opposite-direction settlement");
+    assert!(candidate.tcp_carrier_direction_authorized(PathMetricDirection::ClientToServer));
+    assert!(!candidate.tcp_carrier_direction_authorized(PathMetricDirection::ServerToClient));
+
+    let waiting_candidate = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("retain releases the unretained-candidate slot");
+    assert!(matches!(
+        candidate.begin_tcp_carrier_validation(PathMetricDirection::ServerToClient),
+        Err(RuntimeError::Protocol(_))
+    ));
+    drop(waiting_candidate);
+
+    candidate
+        .begin_tcp_carrier_validation(PathMetricDirection::ServerToClient)
+        .expect("later opposite-direction generation")
+        .commit_retain()
+        .expect("commit S2C retain");
+    assert!(candidate.tcp_carrier_direction_authorized(PathMetricDirection::ClientToServer));
+    assert!(candidate.tcp_carrier_direction_authorized(PathMetricDirection::ServerToClient));
+
+    let retirement = candidate.begin_retirement();
+    assert!(
+        !candidate.tcp_carrier_direction_authorized(PathMetricDirection::ClientToServer),
+        "retirement revokes exact carrier authority before attachment cleanup"
+    );
+    drop(retirement);
+    let replacement = port
+        .register_test_validation_carrier_path(
+            session_id,
+            PathId(2),
+            ServerLocalPathProperties::default(),
+        )
+        .expect("retired authority cannot retain the session candidate slot");
+    assert!(!replacement.tcp_carrier_direction_authorized(PathMetricDirection::ClientToServer));
 }

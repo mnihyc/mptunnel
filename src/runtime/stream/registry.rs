@@ -19,8 +19,8 @@ use crate::product::PrincipalPermit;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
-    Frame, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, ResetReason, SessionId,
-    StreamId, TargetAddr, UnderlayProtocol,
+    Frame, PathId, PathMetricDirection, PathMetrics, PathPurpose, PathUsage, PeerPathState,
+    PeerPathStatus, ResetReason, SessionId, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::RuntimeError;
 #[cfg(test)]
@@ -34,7 +34,8 @@ use crate::runtime::path::{
     ServerCarrierPathStatusSnapshot, ServerNewStreamPolicy, ServerPathValidation,
     ServerRealtimeFlowLease, ServerSessionManagementSnapshot, ServerStreamFrameRoute,
     ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPort, ServerStreamPortBackend,
+    ServerStreamPort, ServerStreamPortBackend, ServerValidationStreamBinding,
+    ServerValidationStreamBindingBackend,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
 use crate::scheduler::TrafficClass;
@@ -42,7 +43,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
@@ -89,29 +90,88 @@ struct ServerStreamFrameRouteTarget {
     binding: Arc<ResponseStreamBinding>,
 }
 
+struct RegistryServerValidationStreamBinding {
+    registry: Weak<ServerReliableStreamRegistry>,
+    identity: ServerCarrierPathIdentity,
+    stream_id: StreamId,
+    attachment_incarnation: u64,
+    events: mpsc::Sender<ServerReliableStreamEvent>,
+    stream_lifetime: Arc<ResponseStreamBinding>,
+    lifecycle: Mutex<ServerValidationInputLifecycle>,
+}
+
+enum ServerValidationInputLifecycle {
+    Attached,
+    Detaching { completed: watch::Receiver<bool> },
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ServerPathUsageEntry {
     sequence: u64,
     usage: PathUsage,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ServerRegisteredPath {
+    purpose: PathPurpose,
     local: crate::runtime::path::ServerLocalPathProperties,
     state: PeerPathState,
     path_proof: Option<PathProofObservation>,
+    authorized_tcp_directions: u8,
+    unretained_validation_settled: bool,
+    validation_inputs: HashMap<StreamId, Arc<RegistryServerValidationStreamBinding>>,
     retirement_started: bool,
     retirement_completion: watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerActiveTcpCarrierValidation {
+    identity: ServerCarrierPathIdentity,
+    direction: PathMetricDirection,
+    lease_id: u64,
 }
 
 type ServerLogicalPathKey = (SessionId, UnderlayProtocol, PathId);
 type ServerPhysicalPathKey = (SessionId, UnderlayProtocol, PathId, CarrierPathInstanceId);
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ServerCarrierPathRegistry {
     instances: HashMap<ServerPhysicalPathKey, ServerRegisteredPath>,
     logical_instances: HashMap<ServerLogicalPathKey, CarrierPathInstanceId>,
     session_path_counts: HashMap<SessionId, usize>,
+    unretained_validation_candidates: HashMap<SessionId, CarrierPathInstanceId>,
+    active_tcp_carrier_validations: HashMap<SessionId, ServerActiveTcpCarrierValidation>,
+    next_tcp_carrier_validation_lease_id: u64,
+    next_validation_input_attachment_incarnation: u64,
+}
+
+fn tcp_carrier_direction_bit(direction: PathMetricDirection) -> u8 {
+    match direction {
+        PathMetricDirection::ClientToServer => 1,
+        PathMetricDirection::ServerToClient => 2,
+    }
+}
+
+fn server_physical_path_key(identity: ServerCarrierPathIdentity) -> ServerPhysicalPathKey {
+    (
+        identity.session_id,
+        identity.underlay,
+        identity.path_id,
+        identity.path_instance_id,
+    )
+}
+
+fn server_logical_path_key(identity: ServerCarrierPathIdentity) -> ServerLogicalPathKey {
+    (identity.session_id, identity.underlay, identity.path_id)
+}
+
+fn active_tcp_validation_matches(
+    active: &ServerActiveTcpCarrierValidation,
+    identity: ServerCarrierPathIdentity,
+    direction: PathMetricDirection,
+    lease_id: u64,
+) -> bool {
+    active.identity == identity && active.direction == direction && active.lease_id == lease_id
 }
 
 fn decrement_session_path_count(
@@ -276,6 +336,88 @@ fn queue_ordered_path_detach(
         // With no async caller available, blocking preserves FIFO. A closed
         // receiver has no actor left to observe the transition.
         pending.blocking_send();
+    }
+}
+
+impl RegistryServerValidationStreamBinding {
+    fn is_attached(&self) -> bool {
+        matches!(
+            *self
+                .lifecycle
+                .lock()
+                .expect("server validation input lifecycle lock"),
+            ServerValidationInputLifecycle::Attached
+        )
+    }
+
+    fn begin_input_detach(&self) -> watch::Receiver<bool> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("server validation input lifecycle lock");
+        if let ServerValidationInputLifecycle::Detaching { completed } = &*lifecycle {
+            return completed.clone();
+        }
+
+        let (completion, completed) = watch::channel(false);
+        *lifecycle = ServerValidationInputLifecycle::Detaching {
+            completed: completed.clone(),
+        };
+        drop(lifecycle);
+
+        let event = ServerReliableStreamEvent::ValidationInputDetached {
+            path_instance_id: self.identity.path_instance_id,
+            attachment_incarnation: self.attachment_incarnation,
+            completion,
+        };
+        match self.events.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                let events = self.events.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = events.send(event).await;
+                    });
+                } else {
+                    let _ = events.blocking_send(event);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Dropping the event's completion sender closes the receiver.
+                // With no stream actor, no queued Product work can remain.
+            }
+        }
+        let registry = self.registry.clone();
+        let identity = self.identity;
+        let stream_id = self.stream_id;
+        let attachment_incarnation = self.attachment_incarnation;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let cleanup = completed.clone();
+            runtime.spawn(async move {
+                wait_for_validation_input_detach(cleanup).await;
+                if let Some(registry) = registry.upgrade() {
+                    registry.remove_validation_input_exact(
+                        identity,
+                        stream_id,
+                        attachment_incarnation,
+                    );
+                }
+            });
+        } else if let Some(registry) = registry.upgrade() {
+            // The synchronous send above returns only after the boundary owns
+            // its FIFO slot (or its receiver is gone), so no future route can
+            // overtake it and registry membership can be released now.
+            registry.remove_validation_input_exact(identity, stream_id, attachment_incarnation);
+        }
+        completed
+    }
+}
+
+async fn wait_for_validation_input_detach(mut completed: watch::Receiver<bool>) {
+    while !*completed.borrow_and_update() {
+        if completed.changed().await.is_err() {
+            break;
+        }
     }
 }
 
@@ -846,16 +988,17 @@ impl ServerReliableStreamRegistry {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
+        purpose: PathPurpose,
         local: crate::runtime::path::ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<(), RuntimeError> {
         let ServerCarrierPathIdentity {
             session_id,
             underlay,
-            path_id,
+            path_id: _,
             path_instance_id,
         } = identity;
-        let logical_key = (session_id, underlay, path_id);
+        let logical_key = server_logical_path_key(identity);
         {
             let mut paths = self
                 .registered_path_instances
@@ -880,6 +1023,27 @@ impl ServerReliableStreamRegistry {
                 return Err(RuntimeError::Protocol(
                     "server session carrier path limit reached",
                 ));
+            }
+            if purpose == PathPurpose::Validation {
+                if underlay != UnderlayProtocol::Tcp {
+                    return Err(RuntimeError::Protocol(
+                        "validation-purpose carrier requires TCP underlay",
+                    ));
+                }
+                if paths
+                    .unretained_validation_candidates
+                    .contains_key(&session_id)
+                    || paths
+                        .active_tcp_carrier_validations
+                        .contains_key(&session_id)
+                {
+                    return Err(RuntimeError::Protocol(
+                        "server session already owns TCP carrier validation state",
+                    ));
+                }
+                paths
+                    .unretained_validation_candidates
+                    .insert(session_id, path_instance_id);
             }
             paths
                 .logical_instances
@@ -909,11 +1073,15 @@ impl ServerReliableStreamRegistry {
                 paths
                     .instances
                     .insert(
-                        (session_id, underlay, path_id, path_instance_id),
+                        server_physical_path_key(identity),
                         ServerRegisteredPath {
+                            purpose,
                             local,
                             state: PeerPathState::Active,
                             path_proof: None,
+                            authorized_tcp_directions: 0,
+                            unretained_validation_settled: false,
+                            validation_inputs: HashMap::new(),
                             retirement_started: false,
                             retirement_completion,
                         },
@@ -932,7 +1100,7 @@ impl ServerReliableStreamRegistry {
     }
 
     fn rollback_carrier_path_reservation(&self, identity: ServerCarrierPathIdentity) {
-        let logical_key = (identity.session_id, identity.underlay, identity.path_id);
+        let logical_key = server_logical_path_key(identity);
         let mut paths = self
             .registered_path_instances
             .lock()
@@ -941,7 +1109,223 @@ impl ServerReliableStreamRegistry {
             return;
         }
         paths.logical_instances.remove(&logical_key);
+        if paths
+            .unretained_validation_candidates
+            .get(&identity.session_id)
+            == Some(&identity.path_instance_id)
+        {
+            paths
+                .unretained_validation_candidates
+                .remove(&identity.session_id);
+        }
         decrement_session_path_count(&mut paths.session_path_counts, identity.session_id);
+    }
+
+    fn begin_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+    ) -> Result<u64, RuntimeError> {
+        let mut paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if paths
+            .active_tcp_carrier_validations
+            .contains_key(&identity.session_id)
+        {
+            return Err(RuntimeError::Protocol(
+                "server session already owns an active TCP carrier validation",
+            ));
+        }
+        if paths
+            .unretained_validation_candidates
+            .get(&identity.session_id)
+            .is_some_and(|candidate| *candidate != identity.path_instance_id)
+        {
+            return Err(RuntimeError::Protocol(
+                "server session owns a different unretained TCP carrier candidate",
+            ));
+        }
+        if paths
+            .logical_instances
+            .get(&server_logical_path_key(identity))
+            != Some(&identity.path_instance_id)
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let path = paths
+            .instances
+            .get(&server_physical_path_key(identity))
+            .ok_or(RuntimeError::ReliablePathRetired)?;
+        if path.purpose != PathPurpose::Validation {
+            return Err(RuntimeError::Protocol(
+                "ordinary carrier cannot begin TCP carrier validation",
+            ));
+        }
+        if path.local.policy.backup {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        if path.state != PeerPathState::Active || path.retirement_started {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        if path.authorized_tcp_directions & tcp_carrier_direction_bit(direction) != 0 {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier direction is already authorized",
+            ));
+        }
+        if path.authorized_tcp_directions == 0 {
+            if paths
+                .unretained_validation_candidates
+                .get(&identity.session_id)
+                != Some(&identity.path_instance_id)
+            {
+                return Err(RuntimeError::ReliablePathRetired);
+            }
+            if path.unretained_validation_settled {
+                return Err(RuntimeError::Protocol(
+                    "unretained TCP carrier validation is already settled",
+                ));
+            }
+        }
+
+        let lease_id = paths
+            .next_tcp_carrier_validation_lease_id
+            .checked_add(1)
+            .ok_or(RuntimeError::Protocol(
+                "TCP carrier validation lease identifiers exhausted",
+            ))?;
+        paths.next_tcp_carrier_validation_lease_id = lease_id;
+        paths.active_tcp_carrier_validations.insert(
+            identity.session_id,
+            ServerActiveTcpCarrierValidation {
+                identity,
+                direction,
+                lease_id,
+            },
+        );
+        Ok(lease_id)
+    }
+
+    fn finish_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+        lease_id: u64,
+        retain: bool,
+    ) -> Result<(), RuntimeError> {
+        let mut paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if !paths
+            .active_tcp_carrier_validations
+            .get(&identity.session_id)
+            .is_some_and(|active| {
+                active_tcp_validation_matches(active, identity, direction, lease_id)
+            })
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        if paths
+            .logical_instances
+            .get(&server_logical_path_key(identity))
+            != Some(&identity.path_instance_id)
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let key = server_physical_path_key(identity);
+        let path = paths
+            .instances
+            .get_mut(&key)
+            .ok_or(RuntimeError::ReliablePathRetired)?;
+        if path.purpose != PathPurpose::Validation
+            || path.state != PeerPathState::Active
+            || path.retirement_started
+            || (retain && path.local.policy.backup)
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let direction_bit = tcp_carrier_direction_bit(direction);
+        if path.authorized_tcp_directions & direction_bit != 0 {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier direction is already authorized",
+            ));
+        }
+        if retain {
+            path.authorized_tcp_directions |= direction_bit;
+        } else if path.authorized_tcp_directions == 0 {
+            path.unretained_validation_settled = true;
+        }
+        paths
+            .active_tcp_carrier_validations
+            .remove(&identity.session_id);
+        if retain
+            && paths
+                .unretained_validation_candidates
+                .get(&identity.session_id)
+                == Some(&identity.path_instance_id)
+        {
+            paths
+                .unretained_validation_candidates
+                .remove(&identity.session_id);
+        }
+        Ok(())
+    }
+
+    fn abandon_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+        lease_id: u64,
+    ) {
+        let mut paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if !paths
+            .active_tcp_carrier_validations
+            .get(&identity.session_id)
+            .is_some_and(|active| {
+                active_tcp_validation_matches(active, identity, direction, lease_id)
+            })
+        {
+            return;
+        }
+        paths
+            .active_tcp_carrier_validations
+            .remove(&identity.session_id);
+        if let Some(path) = paths.instances.get_mut(&server_physical_path_key(identity))
+            && path.purpose == PathPurpose::Validation
+            && path.authorized_tcp_directions == 0
+        {
+            path.unretained_validation_settled = true;
+        }
+    }
+
+    fn tcp_carrier_direction_authorized(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+    ) -> bool {
+        let paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        paths
+            .logical_instances
+            .get(&server_logical_path_key(identity))
+            .is_some_and(|instance| *instance == identity.path_instance_id)
+            && paths
+                .instances
+                .get(&server_physical_path_key(identity))
+                .is_some_and(|path| {
+                    path.purpose == PathPurpose::Validation
+                        && path.state == PeerPathState::Active
+                        && !path.retirement_started
+                        && path.authorized_tcp_directions & tcp_carrier_direction_bit(direction)
+                            != 0
+                })
     }
 
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState) {
@@ -972,9 +1356,9 @@ impl ServerReliableStreamRegistry {
             path_id,
             path_instance_id,
         } = identity;
-        let (retirement, retirement_started) = {
-            let logical_key = (session_id, underlay, path_id);
-            let physical_key = (session_id, underlay, path_id, path_instance_id);
+        let (retirement, retirement_started, validation_inputs) = {
+            let logical_key = server_logical_path_key(identity);
+            let physical_key = server_physical_path_key(identity);
             let mut paths = self
                 .registered_path_instances
                 .lock()
@@ -982,19 +1366,37 @@ impl ServerReliableStreamRegistry {
             if paths.logical_instances.get(&logical_key) != Some(&path_instance_id) {
                 return ServerCarrierPathRetirement::complete();
             } else {
-                let Some(path) = paths.instances.get_mut(&physical_key) else {
-                    return ServerCarrierPathRetirement::complete();
+                let (retirement, retirement_started, validation_inputs) = {
+                    let Some(path) = paths.instances.get_mut(&physical_key) else {
+                        return ServerCarrierPathRetirement::complete();
+                    };
+                    let retirement = ServerCarrierPathRetirement::pending(
+                        path.retirement_completion.subscribe(),
+                    );
+                    let retirement_started = if path.retirement_started {
+                        false
+                    } else {
+                        path.retirement_started = true;
+                        path.state = PeerPathState::Draining;
+                        path.authorized_tcp_directions = 0;
+                        true
+                    };
+                    let validation_inputs = if retirement_started {
+                        path.validation_inputs.values().cloned().collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    (retirement, retirement_started, validation_inputs)
                 };
-                let retirement =
-                    ServerCarrierPathRetirement::pending(path.retirement_completion.subscribe());
-                let retirement_started = if path.retirement_started {
-                    false
-                } else {
-                    path.retirement_started = true;
-                    path.state = PeerPathState::Draining;
-                    true
-                };
-                (retirement, retirement_started)
+                if retirement_started
+                    && paths
+                        .active_tcp_carrier_validations
+                        .get(&session_id)
+                        .is_some_and(|active| active.identity == identity)
+                {
+                    paths.active_tcp_carrier_validations.remove(&session_id);
+                }
+                (retirement, retirement_started, validation_inputs)
             }
         };
         if !retirement_started {
@@ -1054,7 +1456,11 @@ impl ServerReliableStreamRegistry {
                 }
             }
         }
-        if pending.is_empty() && existing.is_empty() {
+        let validation_input_retirements = validation_inputs
+            .into_iter()
+            .map(|binding| binding.begin_input_detach())
+            .collect::<Vec<_>>();
+        if pending.is_empty() && existing.is_empty() && validation_input_retirements.is_empty() {
             self.finish_carrier_path_retirement(identity);
             return retirement;
         }
@@ -1067,6 +1473,9 @@ impl ServerReliableStreamRegistry {
                 for detach in existing {
                     detach.wait().await;
                 }
+                for completed in validation_input_retirements {
+                    wait_for_validation_input_detach(completed).await;
+                }
                 registry.finish_carrier_path_retirement(identity);
             });
         } else {
@@ -1076,6 +1485,10 @@ impl ServerReliableStreamRegistry {
             for detach in existing {
                 detach.finish_without_runtime();
             }
+            // Carrier actors and Product stream actors share one Tokio runtime
+            // in production. Without a runtime there is no live async actor to
+            // wait on; closed event channels already release their receivers.
+            drop(validation_input_retirements);
             self.finish_carrier_path_retirement(identity);
         }
         retirement
@@ -1089,8 +1502,8 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         } = identity;
         let removed = {
-            let logical_key = (session_id, underlay, path_id);
-            let physical_key = (session_id, underlay, path_id, path_instance_id);
+            let logical_key = server_logical_path_key(identity);
+            let physical_key = server_physical_path_key(identity);
             let mut paths = self
                 .registered_path_instances
                 .lock()
@@ -1101,6 +1514,18 @@ impl ServerReliableStreamRegistry {
                 let removed = paths.instances.remove(&physical_key);
                 if removed.is_some() {
                     paths.logical_instances.remove(&logical_key);
+                    if paths.unretained_validation_candidates.get(&session_id)
+                        == Some(&path_instance_id)
+                    {
+                        paths.unretained_validation_candidates.remove(&session_id);
+                    }
+                    if paths
+                        .active_tcp_carrier_validations
+                        .get(&session_id)
+                        .is_some_and(|active| active.identity == identity)
+                    {
+                        paths.active_tcp_carrier_validations.remove(&session_id);
+                    }
                     decrement_session_path_count(&mut paths.session_path_counts, session_id);
                 }
                 removed
@@ -1679,6 +2104,166 @@ impl ServerReliableStreamRegistry {
         Ok(())
     }
 
+    fn bind_validation_input_existing(
+        self: &Arc<Self>,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Result<Option<ServerValidationStreamBinding>, RuntimeError> {
+        let (events, stream_lifetime) = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            let Some(entry) = streams.get(&(identity.session_id, stream_id)) else {
+                return Ok(None);
+            };
+            if entry.binding.lane() != TrafficClass::Throughput {
+                return Ok(None);
+            }
+            (entry.events.clone(), entry.binding.clone())
+        };
+
+        let binding = {
+            let mut paths = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            if paths
+                .logical_instances
+                .get(&server_logical_path_key(identity))
+                != Some(&identity.path_instance_id)
+            {
+                return Ok(None);
+            }
+            let physical_key = server_physical_path_key(identity);
+            let Some(path) = paths.instances.get(&physical_key) else {
+                return Ok(None);
+            };
+            if path.purpose != PathPurpose::Validation
+                || path.state != PeerPathState::Active
+                || path.retirement_started
+            {
+                return Ok(None);
+            }
+            if let Some(existing) = path.validation_inputs.get(&stream_id) {
+                if existing.is_attached()
+                    && Arc::ptr_eq(&existing.stream_lifetime, &stream_lifetime)
+                {
+                    existing.clone()
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                let attachment_incarnation = paths
+                    .next_validation_input_attachment_incarnation
+                    .checked_add(1)
+                    .ok_or(RuntimeError::Protocol(
+                        "server validation input attachment incarnations exhausted",
+                    ))?;
+                paths.next_validation_input_attachment_incarnation = attachment_incarnation;
+                let binding = Arc::new(RegistryServerValidationStreamBinding {
+                    registry: Arc::downgrade(self),
+                    identity,
+                    stream_id,
+                    attachment_incarnation,
+                    events,
+                    stream_lifetime,
+                    lifecycle: Mutex::new(ServerValidationInputLifecycle::Attached),
+                });
+                paths
+                    .instances
+                    .get_mut(&physical_key)
+                    .expect("validated carrier remained registered")
+                    .validation_inputs
+                    .insert(stream_id, binding.clone());
+                binding
+            }
+        };
+        Ok(Some(ServerValidationStreamBinding::new(binding)))
+    }
+
+    fn validation_input_is_registered(
+        &self,
+        binding: &RegistryServerValidationStreamBinding,
+    ) -> bool {
+        let identity = binding.identity;
+        {
+            let paths = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            paths
+                .logical_instances
+                .get(&server_logical_path_key(identity))
+                .is_some_and(|instance| *instance == identity.path_instance_id)
+                && paths
+                    .instances
+                    .get(&server_physical_path_key(identity))
+                    .is_some_and(|path| {
+                        path.purpose == PathPurpose::Validation
+                            && path.state == PeerPathState::Active
+                            && !path.retirement_started
+                            && path
+                                .validation_inputs
+                                .get(&binding.stream_id)
+                                .is_some_and(|current| std::ptr::eq(current.as_ref(), binding))
+                    })
+        }
+    }
+
+    fn remove_validation_input_exact(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        attachment_incarnation: u64,
+    ) {
+        let mut paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        let Some(path) = paths.instances.get_mut(&server_physical_path_key(identity)) else {
+            return;
+        };
+        let exact = path
+            .validation_inputs
+            .get(&stream_id)
+            .is_some_and(|binding| {
+                binding.identity == identity
+                    && binding.attachment_incarnation == attachment_incarnation
+            });
+        if exact {
+            path.validation_inputs.remove(&stream_id);
+        }
+    }
+
+    fn validation_stream_route_target(
+        &self,
+        binding: &RegistryServerValidationStreamBinding,
+    ) -> Option<ServerStreamFrameRouteTarget> {
+        let streams = self
+            .streams
+            .lock()
+            .expect("server reliable stream registry lock");
+        let entry = streams.get(&(binding.identity.session_id, binding.stream_id))?;
+        if !Arc::ptr_eq(&entry.binding, &binding.stream_lifetime)
+            || entry.binding.lane() != TrafficClass::Throughput
+            || !self.validation_input_is_registered(binding)
+        {
+            return None;
+        }
+        Some(ServerStreamFrameRouteTarget {
+            events: entry.events.clone(),
+            binding: entry.binding.clone(),
+        })
+    }
+
+    fn validation_stream_is_current(
+        &self,
+        binding: &RegistryServerValidationStreamBinding,
+    ) -> bool {
+        self.validation_stream_route_target(binding).is_some() && binding.is_attached()
+    }
+
     fn stream_frame_route_target(
         &self,
         session_id: SessionId,
@@ -1735,7 +2320,10 @@ impl ServerReliableStreamRegistry {
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(ServerStreamFrameRoute::Routed),
             Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::PathDetached {
                 ..
-            })) => {
+            }))
+            | Err(mpsc::error::TrySendError::Full(
+                ServerReliableStreamEvent::ValidationInputDetached { .. },
+            )) => {
                 unreachable!("server frame routing only sends frame events")
             }
         }
@@ -1821,6 +2409,114 @@ impl ServerReliableStreamRegistry {
                 .insert((session_id, stream_id));
         }
         drop(streams);
+        if removed {
+            let validation_inputs = {
+                let paths = self
+                    .registered_path_instances
+                    .lock()
+                    .expect("server active path instance lock");
+                paths
+                    .instances
+                    .values()
+                    .filter_map(|path| path.validation_inputs.get(&stream_id))
+                    .filter(|binding| binding.identity.session_id == session_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            for binding in validation_inputs {
+                let _ = binding.begin_input_detach();
+            }
+        }
+    }
+}
+
+impl ServerValidationStreamBindingBackend for RegistryServerValidationStreamBinding {
+    fn session_id(&self) -> SessionId {
+        self.identity.session_id
+    }
+
+    fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.identity.path_instance_id
+    }
+
+    fn is_current(&self) -> bool {
+        self.registry
+            .upgrade()
+            .is_some_and(|registry| registry.validation_stream_is_current(self))
+    }
+
+    fn route_frame<'a>(
+        &'a self,
+        frame: Frame,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let registry = self
+                .registry
+                .upgrade()
+                .ok_or(RuntimeError::ReliablePathRetired)?;
+            let target = registry
+                .validation_stream_route_target(self)
+                .ok_or(RuntimeError::ReliablePathRetired)?;
+            #[cfg(feature = "lab-diagnostics")]
+            let bytes = reliable_path_frame_pacing_bytes(&frame);
+            #[cfg(feature = "lab-diagnostics")]
+            let started = Instant::now();
+
+            // Reserve capacity without holding the lifecycle mutex. Detach
+            // changes the lifecycle before queueing its boundary event, so the
+            // second membership check below linearizes this frame on exactly
+            // one side of that boundary.
+            let permit = match target.events.clone().reserve_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return Ok(()),
+            };
+            if registry.validation_stream_route_target(self).is_none() {
+                return Err(RuntimeError::ReliablePathRetired);
+            }
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .expect("server validation input lifecycle lock");
+            if !matches!(*lifecycle, ServerValidationInputLifecycle::Attached) {
+                return Err(RuntimeError::ReliablePathRetired);
+            }
+            permit.send(ServerReliableStreamEvent::Frame(frame));
+            drop(lifecycle);
+
+            #[cfg(feature = "lab-diagnostics")]
+            lab_perf_record(
+                "runtime.server_stream.route_frame",
+                started.elapsed(),
+                bytes,
+            );
+            Ok(())
+        })
+    }
+
+    fn try_route_frame(&self, frame: Frame) -> Result<ServerStreamFrameRoute, RuntimeError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or(RuntimeError::ReliablePathRetired)?;
+        let target = registry
+            .validation_stream_route_target(self)
+            .ok_or(RuntimeError::ReliablePathRetired)?;
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("server validation input lifecycle lock");
+        if !matches!(*lifecycle, ServerValidationInputLifecycle::Attached) {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        ServerReliableStreamRegistry::try_route_frame_to_target(frame, target)
+    }
+
+    fn begin_detach(&self) {
+        let _ = self.begin_input_detach();
     }
 }
 
@@ -1836,11 +2532,51 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
+        purpose: PathPurpose,
         local: crate::runtime::path::ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<(), RuntimeError> {
         self.registry
-            .activate_carrier_path(identity, local, principal_permit)
+            .activate_carrier_path(identity, purpose, local, principal_permit)
+    }
+
+    fn begin_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+    ) -> Result<u64, RuntimeError> {
+        self.registry
+            .begin_tcp_carrier_validation(identity, direction)
+    }
+
+    fn finish_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+        lease_id: u64,
+        retain: bool,
+    ) -> Result<(), RuntimeError> {
+        self.registry
+            .finish_tcp_carrier_validation(identity, direction, lease_id, retain)
+    }
+
+    fn abandon_tcp_carrier_validation(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+        lease_id: u64,
+    ) {
+        self.registry
+            .abandon_tcp_carrier_validation(identity, direction, lease_id);
+    }
+
+    fn tcp_carrier_direction_authorized(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        direction: PathMetricDirection,
+    ) -> bool {
+        self.registry
+            .tcp_carrier_direction_authorized(identity, direction)
     }
 
     fn retire_carrier_path(
@@ -1889,6 +2625,15 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
                 ServerReliableStreamOpen::Rejected => Ok(ServerStreamOpenOutcome::Rejected),
             }
         })
+    }
+
+    fn bind_validation_input_existing(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Result<Option<ServerValidationStreamBinding>, RuntimeError> {
+        self.registry
+            .bind_validation_input_existing(identity, stream_id)
     }
 
     fn route_frame<'a>(

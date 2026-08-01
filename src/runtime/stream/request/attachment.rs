@@ -180,6 +180,40 @@ pub(in crate::runtime) enum ReliableRelayAttachOutcome {
     RejectedDuplicate,
 }
 
+/// One unpublished attachment incarnation reserved for an exact validation
+/// candidate. The value is deliberately non-clone: ordinary membership may
+/// consume the reservation once, after its target stream and physical carrier
+/// identity have been bound.
+#[derive(Debug)]
+pub(in crate::runtime) struct ReliableRelayAttachmentReservation {
+    stream_id: StreamId,
+    attachment_id: u64,
+    instance: Option<RelayPathInstance>,
+}
+
+impl ReliableRelayAttachmentReservation {
+    pub(in crate::runtime) fn attachment_id(&self) -> u64 {
+        self.attachment_id
+    }
+
+    pub(in crate::runtime) fn bind_exact(
+        mut self,
+        stream_id: StreamId,
+        instance: RelayPathInstance,
+    ) -> Result<Self, RuntimeError> {
+        if self.instance.is_some()
+            || stream_id != self.stream_id
+            || instance.attachment_id != self.attachment_id
+        {
+            return Err(RuntimeError::Protocol(
+                "reserved relay attachment identity does not match validation candidate",
+            ));
+        }
+        self.instance = Some(instance);
+        Ok(self)
+    }
+}
+
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
@@ -217,6 +251,26 @@ impl ReliableRelayRemoteSet {
 
     pub(in crate::runtime) fn membership_generation(&self) -> u64 {
         self.membership_generation
+    }
+
+    /// Reserves one target-stream attachment incarnation without publishing
+    /// membership. Failed candidates consume their incarnation; it is never
+    /// reused for another physical carrier.
+    pub(in crate::runtime) fn reserve_attachment_incarnation(
+        &mut self,
+    ) -> ReliableRelayAttachmentReservation {
+        let attachment_id = self.allocate_attachment_incarnation();
+        ReliableRelayAttachmentReservation {
+            stream_id: self.stream_id,
+            attachment_id,
+            instance: None,
+        }
+    }
+
+    fn allocate_attachment_incarnation(&mut self) -> u64 {
+        let attachment_id = self.next_instance_id;
+        self.next_instance_id = self.next_instance_id.wrapping_add(1);
+        attachment_id
     }
 
     /// A selection is valid only for the exact attachment topology it observed.
@@ -526,6 +580,37 @@ impl ReliableRelayRemoteSet {
         self.attach_opened(opened, false)
     }
 
+    /// Publishes an already accepted validation attachment under the exact
+    /// incarnation reserved before candidate I/O. This consumes no new
+    /// attachment ID and performs no carrier or `OPEN_STREAM` operation.
+    pub(in crate::runtime) fn adopt_reserved_attachment(
+        &mut self,
+        opened: OpenedRemoteStream,
+        reservation: ReliableRelayAttachmentReservation,
+    ) -> Result<ReliableRelayAttachOutcome, RuntimeError> {
+        let expected = reservation.instance.ok_or(RuntimeError::Protocol(
+            "reserved relay attachment is not bound to a carrier instance",
+        ))?;
+        let key = RelayPathKey {
+            underlay: opened.stream().underlay,
+            index: opened.path_index(),
+        };
+        if reservation.stream_id != self.stream_id
+            || opened.stream().stream_id != self.stream_id
+            || reservation.attachment_id != expected.attachment_id
+            || key != expected.key
+            || opened.path_instance_id != expected.path_instance_id
+        {
+            return Err(RuntimeError::Protocol(
+                "opened relay attachment does not match its exact reservation",
+            ));
+        }
+        if self.contains_path_key(key) {
+            return Ok(ReliableRelayAttachOutcome::RejectedDuplicate);
+        }
+        Ok(self.commit_opened(opened, true, reservation.attachment_id))
+    }
+
     fn attach_opened(
         &mut self,
         opened: OpenedRemoteStream,
@@ -540,8 +625,23 @@ impl ReliableRelayRemoteSet {
         if self.contains_path_key(key) {
             return ReliableRelayAttachOutcome::RejectedDuplicate;
         }
-        let attachment_id = self.next_instance_id;
-        self.next_instance_id = self.next_instance_id.wrapping_add(1);
+        let attachment_id = self.allocate_attachment_incarnation();
+        self.commit_opened(opened, retain_open_load, attachment_id)
+    }
+
+    fn commit_opened(
+        &mut self,
+        opened: OpenedRemoteStream,
+        retain_open_load: bool,
+        attachment_id: u64,
+    ) -> ReliableRelayAttachOutcome {
+        let path_index = opened.path_index();
+        let underlay = opened.stream().underlay;
+        let key = RelayPathKey {
+            underlay,
+            index: path_index,
+        };
+        debug_assert!(!self.contains_path_key(key));
         let path_instance_id = opened.path_instance_id;
         let instance = RelayPathInstance {
             key,

@@ -4,12 +4,16 @@ use crate::config::{
     SessionConfig,
 };
 use crate::outbound::OutboundConfig;
-use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId};
+use crate::protocol::{
+    DatagramFlowId, DatagramId, PathUsage, SessionId, TcpCarrierValidationResult,
+};
 use crate::runtime::path::ServerLocalPath;
 use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
-use crate::transport::SystemCarrierNetworkProvider;
+use crate::runtime::relay::open::open_remote_stream;
+use crate::transport::{CarrierPathIdentity, SystemCarrierNetworkProvider};
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const TCP_VALIDATION_WIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn spawn_configured_tcp_minimum_reconciliation(
     context: &ClientPathContext,
@@ -448,6 +452,7 @@ fn client_context_with_session_retention(
         None,
         crate::runtime::path::ClientPathRuntimeOptions {
             session_retention_timeout: retention_timeout,
+            path_probe_timeout: crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
             path_group_ordinal: 0,
             carrier_network: Arc::new(SystemCarrierNetworkProvider),
             allow_peer_diagnostics: false,
@@ -637,6 +642,208 @@ impl RangedTcpCarrierServer {
     }
 }
 
+/// Full production-boundary TCP listener used by the carrier-validation wire
+/// contract. Each accepted actor is returned to the test so protocol errors
+/// and task panics cannot disappear behind an accept loop.
+struct TcpValidationWireServer {
+    path: PathSpec,
+    paths: crate::runtime::path::ServerPathContext,
+    actors: mpsc::UnboundedReceiver<tokio::task::JoinHandle<Result<(), RuntimeError>>>,
+    listener: tokio::task::JoinHandle<Result<(), RuntimeError>>,
+    relay: tokio::task::JoinHandle<Result<(), RuntimeError>>,
+}
+
+impl TcpValidationWireServer {
+    async fn spawn() -> Self {
+        let path = reserve_tcp_path_with_query("tcp-carriers=1-3").await;
+        let listener = bind_listener(&path)
+            .await
+            .expect("bind validation TCP listener");
+        let local_path = ServerLocalPath::new(0, path.clone());
+        let ServerIdentityRuntime {
+            paths,
+            reliable_relay,
+        } = server_runtime(OutboundConfig::Direct);
+        let relay = tokio::spawn(reliable_relay.run());
+        let server_paths = paths.clone();
+        let (actors_tx, actors) = mpsc::unbounded_channel();
+        let listener = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.map_err(RuntimeError::Io)?;
+                let local_path = local_path.clone();
+                let paths = server_paths.clone();
+                let actor =
+                    tokio::spawn(
+                        async move { handle_server_path(stream, local_path, paths).await },
+                    );
+                if actors_tx.send(actor).is_err() {
+                    return Ok(());
+                }
+            }
+        });
+        Self {
+            path,
+            paths,
+            actors,
+            listener,
+            relay,
+        }
+    }
+
+    async fn next_actor(&mut self) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
+        tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, async {
+            let actor = tokio::select! {
+                listener = &mut self.listener => {
+                    match listener {
+                        Ok(Ok(())) => panic!("validation TCP listener stopped unexpectedly"),
+                        Ok(Err(error)) => panic!("validation TCP listener failed: {error}"),
+                        Err(error) => panic!("validation TCP listener task failed: {error}"),
+                    }
+                }
+                actor = self.actors.recv() => actor.expect("validation TCP actor channel"),
+            };
+            // A one-field tuple keeps the timeout future's output from itself
+            // implementing Future; the enclosed JoinHandle remains owned by
+            // the caller for the later exact actor-settlement assertion.
+            (actor,)
+        })
+        .await
+        .expect("validation TCP accept timed out")
+        .0
+    }
+
+    async fn shutdown(mut self) {
+        self.listener.abort();
+        match self.listener.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("validation TCP listener failed: {error}"),
+            Err(error) => panic!("validation TCP listener task failed: {error}"),
+        }
+        self.relay.abort();
+        match self.relay.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("validation reliable relay failed: {error}"),
+            Err(error) => panic!("validation reliable relay task failed: {error}"),
+        }
+        self.actors.close();
+    }
+}
+
+async fn connect_validation_tcp_carrier(
+    context: &ClientPathContext,
+) -> (
+    crate::runtime::path::tcp::group::ClientTcpCarrierReservation,
+    ClientTcpCarrierConnection,
+) {
+    let config_index = context
+        .tcp_config_index(0)
+        .expect("validation TCP endpoint index");
+    let reservation = context
+        .tcp_carrier_groups
+        .reserve(config_index)
+        .expect("reserve validation TCP carrier");
+    let carrier = connect_reserved_validation_tcp_carrier(context, &reservation)
+        .await
+        .expect("connect validation TCP carrier");
+    (reservation, carrier)
+}
+
+async fn connect_reserved_validation_tcp_carrier(
+    context: &ClientPathContext,
+    reservation: &crate::runtime::path::tcp::group::ClientTcpCarrierReservation,
+) -> Result<ClientTcpCarrierConnection, RuntimeError> {
+    let carrier_network = SystemCarrierNetworkProvider;
+    let carrier = connect_client_tcp_carrier(
+        ClientTcpCarrierConnect {
+            path: context.tcp_paths.first().expect("validation TCP endpoint"),
+            path_id: reservation.path_id(),
+            purpose: PathPurpose::Validation,
+            carrier_identity: CarrierPathIdentity {
+                group_ordinal: 0,
+                path_ordinal: context.tcp_path_ordinals[0],
+            },
+            session_id: context.session_id,
+            security: context
+                .tcp_path_security(0)
+                .expect("validation TCP security"),
+            tls: context.tcp_path_tls(0).expect("validation TCP TLS"),
+            codec_limits: ResourceLimits::default().into(),
+            mux_limits: context.mux_limits,
+            carrier_network: &carrier_network,
+            remote_port: None,
+        },
+        tokio::time::Instant::now() + TCP_VALIDATION_WIRE_TIMEOUT,
+    )
+    .await?;
+    assert_eq!(carrier.path_id, reservation.path_id());
+    assert_eq!(carrier.purpose, PathPurpose::Validation);
+    Ok(carrier)
+}
+
+async fn write_validation_frames(carrier: &mut ClientTcpCarrierConnection, frames: &[Frame]) {
+    for frame in frames {
+        carrier
+            .writer
+            .write_frame(frame)
+            .await
+            .expect("write validation TCP frame");
+    }
+    carrier
+        .writer
+        .flush()
+        .await
+        .expect("flush validation TCP frames");
+}
+
+async fn read_validation_frame(carrier: &mut ClientTcpCarrierConnection) -> Frame {
+    tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, carrier.frames.recv())
+        .await
+        .expect("validation TCP response timed out")
+        .expect("validation TCP response stream ended")
+        .expect("read validation TCP response")
+}
+
+async fn assert_validation_actor_ok(actor: tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, actor)
+        .await
+        .expect("validation TCP server actor did not finish")
+        .expect("validation TCP server actor task")
+        .expect("validation TCP server actor");
+}
+
+async fn assert_validation_actor_rejected(
+    actor: tokio::task::JoinHandle<Result<(), RuntimeError>>,
+) {
+    let error = tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, actor)
+        .await
+        .expect("rejected validation TCP server actor did not finish")
+        .expect("rejected validation TCP server actor task")
+        .expect_err("simultaneous unretained validation carrier was accepted");
+    assert!(matches!(error, RuntimeError::Protocol(_)));
+}
+
+async fn assert_target_payload(received: &mut mpsc::Receiver<Bytes>, expected: &'static [u8]) {
+    assert_eq!(
+        tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, received.recv())
+            .await
+            .expect("validation target delivery timed out")
+            .expect("validation target delivery channel"),
+        Bytes::from_static(expected),
+    );
+}
+
+async fn abort_expected_server_actor(actor: tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    actor.abort();
+    match actor.await {
+        Err(error) if error.is_cancelled() => {}
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("ordinary TCP server actor failed: {error}"),
+        Err(error) => panic!("ordinary TCP server actor task failed: {error}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id() {
     let tcp_path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=100").await;
@@ -705,6 +912,260 @@ async fn initial_path_probe_retains_tcp_carrier_without_stream_load() {
 
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_validation_carrier_preserves_exact_c2s_authority_and_ordered_retirement() {
+    let mut server = TcpValidationWireServer::spawn().await;
+    let context = ClientPathContext::new(
+        vec![server.path.clone()],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("validation client context");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+    let ordinary_actor = server.next_actor().await;
+
+    let target_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind validation target");
+    let target_address = target_listener
+        .local_addr()
+        .expect("validation target address");
+    let (target_payload_tx, mut target_payload_rx) = mpsc::channel(3);
+    let (target_release_tx, target_release_rx) = oneshot::channel();
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = target_listener
+            .accept()
+            .await
+            .expect("accept validation target");
+        for payload_bytes in [6_usize, 5, 8] {
+            let mut payload = vec![0_u8; payload_bytes];
+            stream
+                .read_exact(&mut payload)
+                .await
+                .expect("read validation target payload");
+            target_payload_tx
+                .send(Bytes::from(payload))
+                .await
+                .expect("publish validation target payload");
+        }
+        target_release_rx.await.expect("release validation target");
+        stream.shutdown().await.expect("shutdown validation target");
+    });
+    let remote = tokio::time::timeout(
+        FULL_STACK_RESPONSE_TIMEOUT,
+        open_remote_stream(
+            &context,
+            TargetAddr::Ip(target_address),
+            TrafficClass::Throughput,
+        ),
+    )
+    .await
+    .expect("open validation reference stream timed out")
+    .expect("open validation reference stream");
+    let stream_id = remote.stream().stream_id;
+    let ordinary_snapshot = server.paths.reliable_streams.management_snapshot();
+    assert_eq!(ordinary_snapshot.paths.len(), 1);
+    assert_eq!(ordinary_snapshot.active_streams, 1);
+
+    let (retained_reservation, mut retained_carrier) =
+        connect_validation_tcp_carrier(&context).await;
+    let retained_actor = server.next_actor().await;
+    let retained_path_id = retained_carrier.path_id;
+    assert_eq!(
+        server
+            .paths
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .len(),
+        2,
+        "validation readiness registers only the exact candidate lifetime",
+    );
+
+    let simultaneous_reservation = context
+        .tcp_carrier_groups
+        .reserve(0)
+        .expect("reserve simultaneous validation TCP carrier");
+    assert_ne!(
+        simultaneous_reservation.path_id(),
+        retained_path_id,
+        "simultaneous candidates own distinct wire identities"
+    );
+    let simultaneous =
+        connect_reserved_validation_tcp_carrier(&context, &simultaneous_reservation).await;
+    let simultaneous_actor = server.next_actor().await;
+    assert!(
+        simultaneous.is_err(),
+        "a second unretained validation carrier received readiness"
+    );
+    assert_validation_actor_rejected(simultaneous_actor).await;
+    drop(simultaneous);
+    drop(simultaneous_reservation);
+    assert_eq!(
+        context.tcp_carrier_groups.occupied(0),
+        Some(2),
+        "rejected candidate releases its exact client reservation"
+    );
+    assert_eq!(
+        server
+            .paths
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .len(),
+        2,
+        "rejected candidate never enters the server path inventory",
+    );
+
+    write_validation_frames(
+        &mut retained_carrier,
+        &[
+            Frame::TcpCarrierValidate {
+                validation_id: 1,
+                request_id: 0,
+                direction: PathMetricDirection::ClientToServer,
+                stream_id,
+            },
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"retain"),
+            },
+        ],
+    )
+    .await;
+    write_validation_frames(
+        &mut retained_carrier,
+        &[Frame::TcpCarrierResult {
+            validation_id: 1,
+            direction: PathMetricDirection::ClientToServer,
+            result: TcpCarrierValidationResult::Retain,
+        }],
+    )
+    .await;
+    assert_eq!(
+        read_validation_frame(&mut retained_carrier).await,
+        Frame::TcpCarrierResultAck {
+            validation_id: 1,
+            direction: PathMetricDirection::ClientToServer,
+            result: TcpCarrierValidationResult::Retain,
+        },
+        "retained authority starts only at the exact result acknowledgment",
+    );
+    write_validation_frames(
+        &mut retained_carrier,
+        &[Frame::StreamData {
+            stream_id,
+            offset: 6,
+            payload: Bytes::from_static(b"-kept"),
+        }],
+    )
+    .await;
+    write_validation_frames(
+        &mut retained_carrier,
+        &[
+            Frame::StreamDetach { stream_id },
+            Frame::PathDrain {
+                path_id: retained_path_id,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        read_validation_frame(&mut retained_carrier).await,
+        Frame::PathClose {
+            path_id: retained_path_id,
+            reason: crate::protocol::CloseReason::Normal,
+        },
+        "PATH_CLOSE is the ordered suffix after retained-stream detach and drain",
+    );
+    assert_validation_actor_ok(retained_actor).await;
+    assert_target_payload(&mut target_payload_rx, b"retain").await;
+    assert_target_payload(&mut target_payload_rx, b"-kept").await;
+    drop(retained_carrier);
+    drop(retained_reservation);
+    assert_eq!(context.tcp_carrier_groups.occupied(0), Some(1));
+
+    let after_retain = server.paths.reliable_streams.management_snapshot();
+    assert_eq!(after_retain.paths.len(), 1);
+    assert_eq!(after_retain.active_streams, 1);
+
+    let (negative_reservation, mut negative_carrier) =
+        connect_validation_tcp_carrier(&context).await;
+    let negative_actor = server.next_actor().await;
+    let negative_path_id = negative_carrier.path_id;
+    write_validation_frames(
+        &mut negative_carrier,
+        &[
+            Frame::TcpCarrierValidate {
+                validation_id: 2,
+                request_id: 0,
+                direction: PathMetricDirection::ClientToServer,
+                stream_id,
+            },
+            Frame::StreamData {
+                stream_id,
+                offset: 11,
+                payload: Bytes::from_static(b"withdraw"),
+            },
+        ],
+    )
+    .await;
+    write_validation_frames(
+        &mut negative_carrier,
+        &[Frame::TcpCarrierResult {
+            validation_id: 2,
+            direction: PathMetricDirection::ClientToServer,
+            result: TcpCarrierValidationResult::NoGain,
+        }],
+    )
+    .await;
+    assert_eq!(
+        read_validation_frame(&mut negative_carrier).await,
+        Frame::TcpCarrierResultAck {
+            validation_id: 2,
+            direction: PathMetricDirection::ClientToServer,
+            result: TcpCarrierValidationResult::NoGain,
+        },
+    );
+    write_validation_frames(
+        &mut negative_carrier,
+        &[
+            Frame::StreamDetach { stream_id },
+            Frame::PathDrain {
+                path_id: negative_path_id,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        read_validation_frame(&mut negative_carrier).await,
+        Frame::PathClose {
+            path_id: negative_path_id,
+            reason: crate::protocol::CloseReason::Normal,
+        },
+        "a negative result remains bounded until the client-owned drain fence",
+    );
+    assert_validation_actor_ok(negative_actor).await;
+    assert_target_payload(&mut target_payload_rx, b"withdraw").await;
+    drop(negative_carrier);
+    drop(negative_reservation);
+    assert_eq!(context.tcp_carrier_groups.occupied(0), Some(1));
+
+    let after_negative = server.paths.reliable_streams.management_snapshot();
+    assert_eq!(after_negative.paths.len(), 1);
+    assert_eq!(after_negative.active_streams, 1);
+
+    target_release_tx
+        .send(())
+        .expect("release validation target");
+    target.await.expect("validation target task");
+    remote.close().await;
+    drop(context);
+    abort_expected_server_actor(ordinary_actor).await;
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

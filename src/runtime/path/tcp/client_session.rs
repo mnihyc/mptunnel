@@ -113,6 +113,23 @@ struct ClientTcpPathSessionState {
     datagrams: ClientTcpDatagramState,
 }
 
+struct ClientTcpPathSessionOwnership {
+    published_carrier_instance: Arc<AtomicU64>,
+    published_remote_port: Arc<AtomicU32>,
+    actor_terminal: Arc<AtomicBool>,
+    reservation: ClientTcpCarrierReservation,
+}
+
+#[derive(Default)]
+struct ClientTcpPathSessionStart {
+    connection: Option<ClientTcpPathConnection>,
+    retained_stream: Option<(
+        StreamId,
+        tokio::sync::mpsc::Sender<Result<Frame, RuntimeError>>,
+    )>,
+    terminal_cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
 pub(super) async fn run_client_tcp_path_session(
     runtime: ClientTcpPathSessionRuntime,
     commands: ReliablePathCommandReceivers,
@@ -124,11 +141,13 @@ pub(super) async fn run_client_tcp_path_session(
     run_client_tcp_path_session_inner(
         runtime,
         commands,
-        published_carrier_instance,
-        published_remote_port,
-        actor_terminal,
-        reservation,
-        None,
+        ClientTcpPathSessionOwnership {
+            published_carrier_instance,
+            published_remote_port,
+            actor_terminal,
+            reservation,
+        },
+        ClientTcpPathSessionStart::default(),
     )
     .await;
 }
@@ -145,11 +164,65 @@ pub(super) async fn run_client_tcp_path_session_with_connection(
     run_client_tcp_path_session_inner(
         runtime,
         commands,
+        ClientTcpPathSessionOwnership {
+            published_carrier_instance,
+            published_remote_port,
+            actor_terminal,
+            reservation,
+        },
+        ClientTcpPathSessionStart {
+            connection: Some(connection),
+            ..ClientTcpPathSessionStart::default()
+        },
+    )
+    .await;
+}
+
+pub(super) struct ClientTcpRetainedSessionStart {
+    pub(super) runtime: ClientTcpPathSessionRuntime,
+    pub(super) commands: ReliablePathCommandReceivers,
+    pub(super) published_carrier_instance: Arc<AtomicU64>,
+    pub(super) published_remote_port: Arc<AtomicU32>,
+    pub(super) actor_terminal: Arc<AtomicBool>,
+    pub(super) reservation: ClientTcpCarrierReservation,
+    pub(super) connection: ClientTcpPathConnection,
+    pub(super) stream_id: StreamId,
+    pub(super) stream_frames: tokio::sync::mpsc::Sender<Result<Frame, RuntimeError>>,
+    pub(super) terminal_cleanup: Box<dyn FnOnce() + Send>,
+}
+
+/// Continues one acknowledged validation-purpose carrier as an ordinary
+/// request-direction owner without replaying its already-established target
+/// binding.
+pub(super) async fn run_client_tcp_path_session_with_retained_stream(
+    start: ClientTcpRetainedSessionStart,
+) {
+    let ClientTcpRetainedSessionStart {
+        runtime,
+        commands,
         published_carrier_instance,
         published_remote_port,
         actor_terminal,
         reservation,
-        Some(connection),
+        connection,
+        stream_id,
+        stream_frames,
+        terminal_cleanup,
+    } = start;
+    run_client_tcp_path_session_inner(
+        runtime,
+        commands,
+        ClientTcpPathSessionOwnership {
+            published_carrier_instance,
+            published_remote_port,
+            actor_terminal,
+            reservation,
+        },
+        ClientTcpPathSessionStart {
+            connection: Some(connection),
+            retained_stream: Some((stream_id, stream_frames)),
+            terminal_cleanup: Some(terminal_cleanup),
+        },
     )
     .await;
 }
@@ -157,13 +230,22 @@ pub(super) async fn run_client_tcp_path_session_with_connection(
 async fn run_client_tcp_path_session_inner(
     runtime: ClientTcpPathSessionRuntime,
     mut commands: ReliablePathCommandReceivers,
-    published_carrier_instance: Arc<AtomicU64>,
-    published_remote_port: Arc<AtomicU32>,
-    actor_terminal: Arc<AtomicBool>,
-    reservation: ClientTcpCarrierReservation,
-    initial_connection: Option<ClientTcpPathConnection>,
+    ownership: ClientTcpPathSessionOwnership,
+    start: ClientTcpPathSessionStart,
 ) {
-    let mut actor_terminal = ClientTcpPathActorTerminal::new(actor_terminal, reservation);
+    let ClientTcpPathSessionOwnership {
+        published_carrier_instance,
+        published_remote_port,
+        actor_terminal,
+        reservation,
+    } = ownership;
+    let ClientTcpPathSessionStart {
+        connection: initial_connection,
+        retained_stream,
+        terminal_cleanup,
+    } = start;
+    let mut actor_terminal =
+        ClientTcpPathActorTerminal::new(actor_terminal, reservation, terminal_cleanup);
     let mut carrier_readiness = ClientTcpCarrierReadiness::new(
         published_carrier_instance,
         published_remote_port,
@@ -172,9 +254,13 @@ async fn run_client_tcp_path_session_inner(
     if let Some(connection) = initial_connection.as_ref() {
         carrier_readiness.adopt_published(connection.path_instance_id);
     }
+    let mut streams = HashMap::new();
+    if let Some((stream_id, frames)) = retained_stream {
+        streams.insert(stream_id, ClientTcpPathStreamState::retained(frames));
+    }
     let mut state = ClientTcpPathSessionState {
         connection: initial_connection,
-        streams: HashMap::new(),
+        streams,
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
         datagrams: ClientTcpDatagramState::new(
             runtime.mux_limits.max_streams,
@@ -575,14 +661,20 @@ async fn run_client_tcp_path_session_inner(
 struct ClientTcpPathActorTerminal {
     terminal: Arc<AtomicBool>,
     reservation: Option<ClientTcpCarrierReservation>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
     finished: bool,
 }
 
 impl ClientTcpPathActorTerminal {
-    fn new(terminal: Arc<AtomicBool>, reservation: ClientTcpCarrierReservation) -> Self {
+    fn new(
+        terminal: Arc<AtomicBool>,
+        reservation: ClientTcpCarrierReservation,
+        cleanup: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Self {
         Self {
             terminal,
             reservation: Some(reservation),
+            cleanup,
             finished: false,
         }
     }
@@ -593,8 +685,12 @@ impl ClientTcpPathActorTerminal {
         }
         self.terminal.store(true, Ordering::Release);
         self.finished = true;
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
         // Reconciliation wakes from the reservation's release only after the
-        // slot is terminal and group capacity is actually available.
+        // slot is terminal, all elastic publication is removed, and group
+        // capacity is actually available.
         drop(self.reservation.take());
     }
 }
@@ -876,6 +972,8 @@ fn reject_client_tcp_command_for_path_drain(command: ReliablePathCommand) {
         }
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)
+        | ReliablePathCommand::SendTcpCarrierValidationData { .. }
+        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. }
         | ReliablePathCommand::ResetAndCloseStream { .. }
         | ReliablePathCommand::CloseStream(_) => {}
     }
@@ -1109,6 +1207,8 @@ async fn handle_disconnected_client_tcp_command(
         ReliablePathCommand::SendTcpCapacityProbe(_) => {}
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)
+        | ReliablePathCommand::SendTcpCarrierValidationData { .. }
+        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. }
         | ReliablePathCommand::ResetAndCloseStream { .. }
         | ReliablePathCommand::CloseStream(_) => {}
     }

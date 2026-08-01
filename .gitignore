@@ -6,3 +6,4 @@ __pycache__/
 *.py[cod]
 /config.toml
 /AGENTS.md
+/docs-dev

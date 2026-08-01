@@ -3766,3 +3766,51 @@ entry is authoritative.
   carrier authority without adding policy or timing, then add the symmetric
   server sender owner and the existing wire transaction in separate green
   commits.
+
+## 2026-08-01T20:36:31+08:00: Accepted shared client validation ownership
+
+- Name: one client session transaction across fresh and retained-direction
+  TCP carrier validation
+- Category: Core runtime ownership
+- State: accepted bounded foundation; S2C demand, sender verdict, and wire
+  execution remain deliberately disconnected
+- Clean model:
+  - the existing client session service now owns one direction-neutral
+    validation transaction and one monotonic client-issued validation-ID
+    sequence, while its established C2S workload and evidence owner remains
+    direction-specific;
+  - a fresh C2S candidate and an opposite-direction validation on any retained
+    carrier exclude each other through that same session transaction;
+  - retained authority is represented per direction and exact physical
+    instance, and a negative result preserves already-acknowledged authority in
+    the other direction; and
+  - exact removal, lease abandonment, endpoint drain, and replacement release
+    validation ownership after the retained-registry lock is dropped, so stale
+    actors cannot settle or depublish a replacement instance.
+- Performance boundary:
+  - no wire frame, timer, threshold, resource bound, scheduling decision,
+    congestion controller, pacing rule, transport parameter, or platform path
+    changed;
+  - existing C2S production behavior is mechanically preserved behind the
+    shared transaction enum; and
+  - the new retained-direction entry points have no production caller yet, so
+    representative throughput remains deferred until the complete S2C
+    transaction is connected.
+- Evidence:
+  - strict formatting, whitespace, and all-target/all-feature Clippy passed
+    with warnings denied;
+  - the locked all-feature suite passed 1,485 library tests, 2 persistent
+    allocation tests, 6 packaged daily-use acceptance tests, and doctests;
+  - the standalone patched Quinn suite passed 282 unit tests and 3 doctests;
+  - the 29-cell/66-metric performance registry, 198 lab tests, 5 deterministic
+    benchmark tests, 9 packaging tests, shell syntax checks, and release-version
+    self-test passed; and
+  - persistent lifecycle tests prove cross-role mutual exclusion and shared ID
+    sequencing, exact directional retain/no-gain semantics, stale replacement
+    fencing, and endpoint-drain cancellation.
+- Review: the authoritative implementation audit and one independent read-only
+  audit found no actionable ownership, lock-order, C2S-preservation, or RFC
+  7.2/15.1 discrepancy.
+- Next: establish the server-owned S2C demand and Product comparison owner over
+  the already-separated response evidence/output seams, without connecting
+  transport execution or adding policy/timing.

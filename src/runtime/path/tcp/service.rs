@@ -1,11 +1,12 @@
-//! Session-owned admission for client-to-server TCP carrier validation.
+//! Session-owned admission for TCP carrier validation.
 //!
 //! The serialized request sender reports only demand-lifecycle transitions,
 //! successful ordinary placement, and the immediately following exact
 //! saturation observation. This owner turns those cold facts into the one
 //! bounded admission transaction defined by RFC 7.2 and 15.1. Native TCP
 //! congestion control, candidate I/O, Product evidence, and verdicts remain
-//! with their existing owners.
+//! with their existing owners. Direction-specific admission sources share one
+//! validation transaction and one client-issued validation-ID sequence.
 
 use super::group::{
     ClientTcpCarrierGroups, ClientTcpCarrierReservation, ClientTcpEndpointPolicy,
@@ -18,9 +19,9 @@ use crate::model::tcp_carrier::{
     tcp_carrier_validation_geometry,
 };
 use crate::mux::MuxLimits;
-use crate::protocol::StreamId;
 #[cfg(test)]
 use crate::protocol::{PathId, PathUsage};
+use crate::protocol::{PathMetricDirection, StreamId};
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::sender::{
     ProductWorkloadIdentity, RequestProductAckReceipt, RequestProductAckReceiptSink,
@@ -86,6 +87,35 @@ struct ClientTcpCarrierCandidateState {
     observations: Option<mpsc::Sender<ClientTcpCarrierObservation>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientTcpCarrierRetainedValidationState {
+    validation_id: NonZeroU64,
+    direction: PathMetricDirection,
+}
+
+#[derive(Debug)]
+enum ClientTcpCarrierValidationTransaction {
+    ClientToServerCandidate(ClientTcpCarrierCandidateState),
+    #[cfg_attr(not(test), allow(dead_code))]
+    RetainedDirection(ClientTcpCarrierRetainedValidationState),
+}
+
+impl ClientTcpCarrierValidationTransaction {
+    fn client_to_server_candidate(&self) -> Option<&ClientTcpCarrierCandidateState> {
+        match self {
+            Self::ClientToServerCandidate(candidate) => Some(candidate),
+            Self::RetainedDirection(_) => None,
+        }
+    }
+
+    fn client_to_server_candidate_mut(&mut self) -> Option<&mut ClientTcpCarrierCandidateState> {
+        match self {
+            Self::ClientToServerCandidate(candidate) => Some(candidate),
+            Self::RetainedDirection(_) => None,
+        }
+    }
+}
+
 /// Exact sender facts routed to the one active directional validation owner.
 /// No observation is created or captured while validation is inactive.
 #[derive(Debug)]
@@ -110,11 +140,11 @@ struct ClientTcpCarrierServiceState {
     workload_generation: NonZeroU64,
     workloads: BTreeMap<StreamId, ClientTcpCarrierWorkload>,
     admission: Option<ClientTcpCarrierAdmissionGeneration>,
-    candidate: Option<ClientTcpCarrierCandidateState>,
+    validation_transaction: Option<ClientTcpCarrierValidationTransaction>,
     observations_active: Arc<AtomicBool>,
 }
 
-/// One client-to-server carrier admission owner per MPP session.
+/// One carrier-validation admission owner per client MPP session.
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientTcpCarrierService {
     state: Mutex<ClientTcpCarrierServiceState>,
@@ -141,7 +171,7 @@ impl ClientTcpCarrierService {
                 workload_generation: one,
                 workloads: BTreeMap::new(),
                 admission: None,
-                candidate: None,
+                validation_transaction: None,
                 observations_active: observations_active.clone(),
             }),
             policy_changes,
@@ -238,14 +268,20 @@ impl ClientTcpCarrierService {
         workload.queued_unique_original = queued_unique_original;
         workload.demand_generation = demand_generation;
 
-        if state.candidate.as_ref().is_some_and(|candidate| {
-            let target_changed = state.admission.as_ref().is_some_and(|admission| {
-                admission.key.target == identity
-                    && Some(admission.key.demand_generation) != demand_generation
-            });
-            let latency_work_became_active = queued_unique_original && lane.is_latency_sensitive();
-            !candidate.withdrawn && (target_changed || latency_work_became_active)
-        }) {
+        if state
+            .validation_transaction
+            .as_ref()
+            .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate)
+            .is_some_and(|candidate| {
+                let target_changed = state.admission.as_ref().is_some_and(|admission| {
+                    admission.key.target == identity
+                        && Some(admission.key.demand_generation) != demand_generation
+                });
+                let latency_work_became_active =
+                    queued_unique_original && lane.is_latency_sensitive();
+                !candidate.withdrawn && (target_changed || latency_work_became_active)
+            })
+        {
             withdraw_candidate(&mut state);
         }
         Some(demand_generation)
@@ -327,7 +363,7 @@ impl ClientTcpCarrierService {
         }
 
         let mut state = self.state.lock().expect("TCP carrier service lock");
-        if state.candidate.is_some() {
+        if state.validation_transaction.is_some() {
             return None;
         }
         let target = *state.workloads.get(&identity.stream_id)?;
@@ -404,13 +440,17 @@ impl ClientTcpCarrierService {
             admission.attempted_groups.insert(config_index);
             admission.candidate_started = true;
         }
-        state.candidate = Some(ClientTcpCarrierCandidateState {
-            validation_id,
-            admission_generation,
-            phase: ClientTcpCarrierCandidatePhase::Establishing,
-            withdrawn: false,
-            observations: None,
-        });
+        state.validation_transaction = Some(
+            ClientTcpCarrierValidationTransaction::ClientToServerCandidate(
+                ClientTcpCarrierCandidateState {
+                    validation_id,
+                    admission_generation,
+                    phase: ClientTcpCarrierCandidatePhase::Establishing,
+                    withdrawn: false,
+                    observations: None,
+                },
+            ),
+        );
         let workloads = state
             .workloads
             .values()
@@ -444,7 +484,11 @@ impl ClientTcpCarrierService {
         admission_generation: NonZeroU64,
     ) -> bool {
         let mut state = self.state.lock().expect("TCP carrier service lock");
-        let Some(candidate) = state.candidate.as_mut() else {
+        let Some(candidate) = state
+            .validation_transaction
+            .as_mut()
+            .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate_mut)
+        else {
             return false;
         };
         if candidate.validation_id != validation_id
@@ -466,8 +510,9 @@ impl ClientTcpCarrierService {
         self.state
             .lock()
             .expect("TCP carrier service lock")
-            .candidate
+            .validation_transaction
             .as_ref()
+            .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate)
             .is_none_or(|candidate| {
                 candidate.validation_id != validation_id
                     || candidate.admission_generation != admission_generation
@@ -482,7 +527,10 @@ impl ClientTcpCarrierService {
         capacity: usize,
     ) -> Option<mpsc::Receiver<ClientTcpCarrierObservation>> {
         let mut state = self.state.lock().expect("TCP carrier service lock");
-        let candidate = state.candidate.as_mut()?;
+        let candidate = state
+            .validation_transaction
+            .as_mut()?
+            .client_to_server_candidate_mut()?;
         if candidate.validation_id != validation_id
             || candidate.admission_generation != admission_generation
             || candidate.withdrawn
@@ -502,7 +550,11 @@ impl ClientTcpCarrierService {
             return;
         }
         let mut state = self.state.lock().expect("TCP carrier service lock");
-        let Some(candidate) = state.candidate.as_mut() else {
+        let Some(candidate) = state
+            .validation_transaction
+            .as_mut()
+            .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate_mut)
+        else {
             state.observations_active.store(false, Ordering::Release);
             return;
         };
@@ -542,11 +594,15 @@ impl ClientTcpCarrierService {
             )
         });
         let mut state = self.state.lock().expect("TCP carrier service lock");
-        let exact_candidate = state.candidate.as_ref().is_some_and(|candidate| {
-            candidate.validation_id == validation_id
-                && candidate.admission_generation == admission_generation
-                && !candidate.withdrawn
-        });
+        let exact_candidate = state
+            .validation_transaction
+            .as_ref()
+            .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate)
+            .is_some_and(|candidate| {
+                candidate.validation_id == validation_id
+                    && candidate.admission_generation == admission_generation
+                    && !candidate.withdrawn
+            });
         let exact_key = state.admission.as_ref().is_some_and(|admission| {
             admission.id == admission_generation
                 && admission.key.stable == stable
@@ -575,12 +631,64 @@ impl ClientTcpCarrierService {
 
     fn release_candidate(&self, validation_id: NonZeroU64, admission_generation: NonZeroU64) {
         let mut state = self.state.lock().expect("TCP carrier service lock");
-        if state.candidate.as_ref().is_some_and(|candidate| {
-            candidate.validation_id == validation_id
-                && candidate.admission_generation == admission_generation
-        }) {
-            state.candidate = None;
+        if state
+            .validation_transaction
+            .as_ref()
+            .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate)
+            .is_some_and(|candidate| {
+                candidate.validation_id == validation_id
+                    && candidate.admission_generation == admission_generation
+            })
+        {
+            state.validation_transaction = None;
             state.observations_active.store(false, Ordering::Release);
+        }
+    }
+
+    /// Reserves this session's sole validation transaction for the opposite
+    /// direction of an already-retained exact carrier. The same monotonic ID
+    /// sequence is used by fresh and retained-carrier validation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn reserve_retained_direction_validation(
+        self: &Arc<Self>,
+        direction: PathMetricDirection,
+    ) -> Option<ClientTcpRetainedDirectionValidationLease> {
+        let mut state = self.state.lock().expect("TCP carrier service lock");
+        if state.validation_transaction.is_some() {
+            return None;
+        }
+        let validation_id = take_sequence(&mut state.next_validation_id)?;
+        let validation = ClientTcpCarrierRetainedValidationState {
+            validation_id,
+            direction,
+        };
+        state.validation_transaction = Some(
+            ClientTcpCarrierValidationTransaction::RetainedDirection(validation),
+        );
+        Some(ClientTcpRetainedDirectionValidationLease {
+            owner: Arc::downgrade(self),
+            validation,
+            active: true,
+        })
+    }
+
+    fn release_retained_direction_validation(
+        &self,
+        validation: ClientTcpCarrierRetainedValidationState,
+    ) {
+        let mut state = self.state.lock().expect("TCP carrier service lock");
+        if state
+            .validation_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction,
+                    ClientTcpCarrierValidationTransaction::RetainedDirection(current)
+                        if *current == validation
+                )
+            })
+        {
+            state.validation_transaction = None;
         }
     }
 }
@@ -633,10 +741,50 @@ fn increment_generation(current: NonZeroU64) -> Option<NonZeroU64> {
 }
 
 fn withdraw_candidate(state: &mut ClientTcpCarrierServiceState) {
-    if let Some(candidate) = state.candidate.as_mut() {
+    if let Some(candidate) = state
+        .validation_transaction
+        .as_mut()
+        .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate_mut)
+    {
         candidate.withdrawn = true;
         candidate.observations = None;
         state.observations_active.store(false, Ordering::Release);
+    }
+}
+
+/// Exact session reservation for one directional validation on a carrier that
+/// already owns ordinary authority in the other direction.
+pub(in crate::runtime) struct ClientTcpRetainedDirectionValidationLease {
+    owner: Weak<ClientTcpCarrierService>,
+    validation: ClientTcpCarrierRetainedValidationState,
+    active: bool,
+}
+
+impl ClientTcpRetainedDirectionValidationLease {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn validation_id(&self) -> NonZeroU64 {
+        self.validation.validation_id
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn direction(&self) -> PathMetricDirection {
+        self.validation.direction
+    }
+
+    fn cancel_inner(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_retained_direction_validation(self.validation);
+        }
+    }
+}
+
+impl Drop for ClientTcpRetainedDirectionValidationLease {
+    fn drop(&mut self) {
+        self.cancel_inner();
     }
 }
 
@@ -897,8 +1045,9 @@ impl ClientTcpCarrierAdmissionLease {
             .state
             .lock()
             .expect("TCP carrier service lock")
-            .candidate
+            .validation_transaction
             .as_ref()
+            .and_then(ClientTcpCarrierValidationTransaction::client_to_server_candidate)
             .is_some_and(|candidate| {
                 candidate.validation_id == self.validation_id
                     && candidate.admission_generation == self.admission_generation

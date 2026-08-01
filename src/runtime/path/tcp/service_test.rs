@@ -337,3 +337,53 @@ fn latency_work_and_inconsistent_membership_cannot_mint_authority() {
         "changed instances under one membership generation are inconsistent"
     );
 }
+
+#[test]
+fn fresh_and_retained_direction_validation_share_one_session_transaction() {
+    let service = ClientTcpCarrierService::new();
+    let groups = groups(&[(1, 3)]);
+    let _minimum = occupy_minimum(&groups, 0);
+    let mut workload = active_throughput_workload(&service, 21);
+    let authority = stable(14);
+
+    let retained = service
+        .reserve_retained_direction_validation(PathMetricDirection::ServerToClient)
+        .expect("one retained-direction transaction");
+    assert_eq!(retained.validation_id().get(), 1);
+    assert_eq!(retained.direction(), PathMetricDirection::ServerToClient);
+
+    assert!(workload.record_successful_ordinary_placement(authority));
+    assert!(
+        workload
+            .try_admit_saturation(
+                saturation(authority, &[(0, 81, 65_536)], &[0]),
+                &groups,
+                MuxLimits::default(),
+            )
+            .is_none(),
+        "a retained-direction transaction excludes a fresh candidate"
+    );
+    drop(retained);
+
+    assert!(workload.record_successful_ordinary_placement(authority));
+    let candidate = workload
+        .try_admit_saturation(
+            saturation(authority, &[(0, 81, 65_536)], &[0]),
+            &groups,
+            MuxLimits::default(),
+        )
+        .expect("released transaction admits a fresh candidate");
+    assert_eq!(candidate.validation_id().get(), 2);
+    assert!(
+        service
+            .reserve_retained_direction_validation(PathMetricDirection::ClientToServer)
+            .is_none(),
+        "a fresh candidate excludes retained-direction validation"
+    );
+    drop(candidate);
+
+    let next = service
+        .reserve_retained_direction_validation(PathMetricDirection::ClientToServer)
+        .expect("candidate release restores the sole transaction slot");
+    assert_eq!(next.validation_id().get(), 3);
+}

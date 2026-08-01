@@ -9,6 +9,7 @@ use super::client_session::{
 };
 use super::client_state::ClientTcpPathConnection;
 use super::client_validation::ClientTcpValidationHandoff;
+use super::service::{ClientTcpCarrierService, ClientTcpRetainedDirectionValidationLease};
 use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::protocol::{PathMetricDirection, UnderlayProtocol};
@@ -24,40 +25,70 @@ use crate::runtime::stream::{
 };
 use crate::scheduler::TrafficClass;
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 
-pub(in crate::runtime) struct ClientTcpRetainedCarrier {
-    pub(in crate::runtime) config_index: usize,
-    pub(in crate::runtime) key: RelayPathKey,
-    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) client_to_server_authority: bool,
-    pub(in crate::runtime) commands: ReliablePathCommandSender,
+struct ClientTcpRetainedCarrier {
+    config_index: usize,
+    key: RelayPathKey,
+    path_instance_id: CarrierPathInstanceId,
+    commands: ReliablePathCommandSender,
+    #[cfg_attr(not(test), allow(dead_code))]
+    authorized_tcp_directions: u8,
+    retiring: bool,
+    validation: Option<ClientTcpRetainedCarrierValidation>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct ClientTcpRetainedCarrierValidation {
+    validation_id: NonZeroU64,
+    direction: PathMetricDirection,
+    _session_lease: ClientTcpRetainedDirectionValidationLease,
 }
 
 pub(in crate::runtime) struct ClientTcpRetainedCarrierRegistry {
+    #[cfg_attr(not(test), allow(dead_code))]
+    service: Arc<ClientTcpCarrierService>,
     carriers: Mutex<BTreeMap<usize, ClientTcpRetainedCarrier>>,
 }
 
 impl ClientTcpRetainedCarrierRegistry {
-    pub(in crate::runtime) fn new() -> Arc<Self> {
+    pub(in crate::runtime) fn new(service: Arc<ClientTcpCarrierService>) -> Arc<Self> {
         Arc::new(Self {
+            service,
             carriers: Mutex::new(BTreeMap::new()),
         })
     }
 
     /// Publishes one exact retained instance. The elastic slot remains unique
     /// for the lifetime of its group reservation.
-    pub(in crate::runtime) fn insert(&self, carrier: ClientTcpRetainedCarrier) -> bool {
-        if carrier.key.index == usize::MAX || !carrier.client_to_server_authority {
+    pub(in crate::runtime) fn insert(
+        &self,
+        config_index: usize,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        commands: ReliablePathCommandSender,
+        initial_direction: PathMetricDirection,
+    ) -> bool {
+        if key.underlay != UnderlayProtocol::Tcp || key.index == usize::MAX {
             return false;
         }
+        let carrier = ClientTcpRetainedCarrier {
+            config_index,
+            key,
+            path_instance_id,
+            commands,
+            authorized_tcp_directions: tcp_carrier_direction_bit(initial_direction),
+            retiring: false,
+            validation: None,
+        };
         let mut carriers = self.carriers.lock().expect("retained TCP carrier lock");
-        if carriers.contains_key(&carrier.key.index) {
+        if carriers.contains_key(&key.index) {
             return false;
         }
-        carriers.insert(carrier.key.index, carrier);
+        carriers.insert(key.index, carrier);
         true
     }
 
@@ -74,23 +105,235 @@ impl ClientTcpRetainedCarrierRegistry {
         }) {
             return false;
         }
-        carriers.remove(&key.index);
+        let removed = carriers.remove(&key.index);
+        drop(carriers);
+        drop(removed);
         true
+    }
+
+    /// Reports ordinary payload authority only for the exact live instance.
+    /// A draining carrier is immediately ineligible for fresh placement while
+    /// its actor continues ordered settlement of already-admitted work.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn direction_authorized(
+        &self,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        direction: PathMetricDirection,
+    ) -> bool {
+        self.carriers
+            .lock()
+            .expect("retained TCP carrier lock")
+            .get(&key.index)
+            .is_some_and(|carrier| {
+                carrier.key == key
+                    && carrier.path_instance_id == path_instance_id
+                    && !carrier.retiring
+                    && carrier.authorized_tcp_directions & tcp_carrier_direction_bit(direction) != 0
+            })
+    }
+
+    /// Begins one opposite-direction validation on an exact retained carrier.
+    /// No registry lock is held while session ownership is reserved; the exact
+    /// carrier is then rechecked before publication. Terminal cleanup remains
+    /// exact-instance fenced.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn begin_directional_validation(
+        self: &Arc<Self>,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        direction: PathMetricDirection,
+    ) -> Option<ClientTcpRetainedCarrierValidationLease> {
+        let eligible = self
+            .carriers
+            .lock()
+            .expect("retained TCP carrier lock")
+            .get(&key.index)
+            .is_some_and(|carrier| {
+                carrier.key == key
+                    && carrier.path_instance_id == path_instance_id
+                    && !carrier.retiring
+                    && carrier.authorized_tcp_directions & tcp_carrier_direction_bit(direction) == 0
+                    && carrier.validation.is_none()
+            });
+        if !eligible {
+            return None;
+        }
+        let session = self
+            .service
+            .reserve_retained_direction_validation(direction)?;
+        let validation_id = session.validation_id();
+        debug_assert_eq!(session.direction(), direction);
+        let mut carriers = self.carriers.lock().expect("retained TCP carrier lock");
+        let carrier = carriers.get_mut(&key.index)?;
+        if carrier.key != key
+            || carrier.path_instance_id != path_instance_id
+            || carrier.retiring
+            || carrier.authorized_tcp_directions & tcp_carrier_direction_bit(direction) != 0
+            || carrier.validation.is_some()
+        {
+            return None;
+        }
+        carrier.validation = Some(ClientTcpRetainedCarrierValidation {
+            validation_id,
+            direction,
+            _session_lease: session,
+        });
+        Some(ClientTcpRetainedCarrierValidationLease {
+            registry: Arc::downgrade(self),
+            key,
+            path_instance_id,
+            validation_id,
+            direction,
+            active: true,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn finish_directional_validation(
+        &self,
+        lease: &ClientTcpRetainedCarrierValidationLease,
+        retain: bool,
+    ) -> bool {
+        let validation = {
+            let mut carriers = self.carriers.lock().expect("retained TCP carrier lock");
+            let Some(carrier) = carriers.get_mut(&lease.key.index) else {
+                return false;
+            };
+            if carrier.key != lease.key
+                || carrier.path_instance_id != lease.path_instance_id
+                || carrier.retiring
+                || !carrier.validation.as_ref().is_some_and(|validation| {
+                    validation.validation_id == lease.validation_id
+                        && validation.direction == lease.direction
+                })
+            {
+                return false;
+            }
+            if retain {
+                carrier.authorized_tcp_directions |= tcp_carrier_direction_bit(lease.direction);
+            }
+            carrier.validation.take()
+        };
+        drop(validation);
+        true
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn abandon_directional_validation(&self, lease: &ClientTcpRetainedCarrierValidationLease) {
+        let validation = {
+            let mut carriers = self.carriers.lock().expect("retained TCP carrier lock");
+            let Some(carrier) = carriers.get_mut(&lease.key.index) else {
+                return;
+            };
+            if carrier.key != lease.key
+                || carrier.path_instance_id != lease.path_instance_id
+                || !carrier.validation.as_ref().is_some_and(|validation| {
+                    validation.validation_id == lease.validation_id
+                        && validation.direction == lease.direction
+                })
+            {
+                return;
+            }
+            carrier.validation.take()
+        };
+        drop(validation);
     }
 
     /// Endpoint retirement is actor-owned and ordered. A later enable does
     /// not revoke a drain already requested for an older generation.
     pub(in crate::runtime) fn begin_endpoint_drain(&self, config_index: usize) {
-        let commands = self
-            .carriers
-            .lock()
-            .expect("retained TCP carrier lock")
-            .values()
-            .filter(|carrier| carrier.config_index == config_index)
-            .map(|carrier| carrier.commands.clone())
-            .collect::<Vec<_>>();
+        let (commands, validations) = {
+            let mut carriers = self.carriers.lock().expect("retained TCP carrier lock");
+            let mut commands = Vec::new();
+            let mut validations = Vec::new();
+            for carrier in carriers
+                .values_mut()
+                .filter(|carrier| carrier.config_index == config_index)
+            {
+                carrier.retiring = true;
+                if let Some(validation) = carrier.validation.take() {
+                    validations.push(validation);
+                }
+                commands.push(carrier.commands.clone());
+            }
+            (commands, validations)
+        };
+        drop(validations);
         for commands in commands {
             commands.begin_path_drain();
+        }
+    }
+}
+
+fn tcp_carrier_direction_bit(direction: PathMetricDirection) -> u8 {
+    match direction {
+        PathMetricDirection::ClientToServer => 1,
+        PathMetricDirection::ServerToClient => 2,
+    }
+}
+
+/// Exact non-clone ownership of one validation on a retained physical carrier.
+/// Dropping it abandons only the matching transaction and releases the shared
+/// session slot; it cannot affect a replacement instance or later validation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::runtime) struct ClientTcpRetainedCarrierValidationLease {
+    registry: Weak<ClientTcpRetainedCarrierRegistry>,
+    key: RelayPathKey,
+    path_instance_id: CarrierPathInstanceId,
+    validation_id: NonZeroU64,
+    direction: PathMetricDirection,
+    active: bool,
+}
+
+impl ClientTcpRetainedCarrierValidationLease {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn validation_id(&self) -> NonZeroU64 {
+        self.validation_id
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn direction(&self) -> PathMetricDirection {
+        self.direction
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// Commits ordinary authority only for the measured direction and exact
+    /// physical instance after the role-specific result boundary.
+    pub(in crate::runtime) fn commit_retained(mut self) -> bool {
+        let committed = self
+            .registry
+            .upgrade()
+            .is_some_and(|registry| registry.finish_directional_validation(&self, true));
+        if committed {
+            self.active = false;
+        }
+        committed
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// Settles a complete negative result without revoking authority already
+    /// granted to the carrier's other direction.
+    pub(in crate::runtime) fn settle_without_retain(mut self) -> bool {
+        let settled = self
+            .registry
+            .upgrade()
+            .is_some_and(|registry| registry.finish_directional_validation(&self, false));
+        if settled {
+            self.active = false;
+        }
+        settled
+    }
+}
+
+impl Drop for ClientTcpRetainedCarrierValidationLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Some(registry) = self.registry.upgrade() {
+            registry.abandon_directional_validation(self);
         }
     }
 }
@@ -203,13 +446,13 @@ pub(in crate::runtime) async fn adopt_client_to_server_retained_carrier(
                     readiness_rtt: Some(readiness_rtt),
                 },
                 || {
-                    registry_published = registry.insert(ClientTcpRetainedCarrier {
-                        config_index: runtime.config_index,
-                        key: expected.key,
-                        path_instance_id: expected.path_instance_id,
-                        client_to_server_authority: true,
-                        commands: commands.clone(),
-                    });
+                    registry_published = registry.insert(
+                        runtime.config_index,
+                        expected.key,
+                        expected.path_instance_id,
+                        commands.clone(),
+                        PathMetricDirection::ClientToServer,
+                    );
                     if registry_published {
                         authenticated_carrier = Some(runtime.authenticated_carriers.register());
                     }
@@ -260,3 +503,7 @@ pub(in crate::runtime) async fn adopt_client_to_server_retained_carrier(
     });
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "retained_test.rs"]
+mod tests;

@@ -305,7 +305,6 @@ impl ClientPathContext {
         let tcp_config_indices = Arc::new(tcp_config_indices);
         let tcp_member_ordinals = Arc::new(tcp_member_ordinals);
         let tcp_carrier_groups = ClientTcpCarrierGroups::new(tcp_carrier_groups);
-        let tcp_retained_carriers = ClientTcpRetainedCarrierRegistry::new();
         let tcp_security = Arc::new(tcp_security);
         let tcp_tls = Arc::new(tcp_tls);
         let udp_paths = Arc::new(udp_paths);
@@ -327,6 +326,8 @@ impl ClientPathContext {
             ),
             next_elastic_path_index,
         );
+        let tcp_retained_carriers =
+            ClientTcpRetainedCarrierRegistry::new(state.tcp_carrier_service().clone());
         let codec_limits = resources.into();
         let mux_limits = resources.into();
         let session_send_buffer = SessionSendBuffer::from_limits(mux_limits);

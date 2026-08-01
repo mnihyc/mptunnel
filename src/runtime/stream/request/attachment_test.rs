@@ -60,9 +60,18 @@ async fn reserved_attachment_adoption_preserves_exact_identity_without_double_al
         path_instance_id: candidate.path_instance_id,
         attachment_id: reservation.attachment_id(),
     };
-    let reservation = reservation
-        .bind_exact(stream_id, expected)
+    let reservation = remotes
+        .bind_validation_attachment(reservation, expected)
         .expect("bind exact validation attachment");
+
+    assert!(remotes.validation_attachment_is_current(expected));
+    assert!(!remotes.contains_path_instance(expected));
+    assert!(remotes.contains_flight_owner_instance(expected));
+    assert_eq!(
+        remotes.membership_generation(),
+        membership_before_adoption,
+        "validation flight ownership is not ordinary membership",
+    );
 
     assert_eq!(
         remotes
@@ -71,6 +80,8 @@ async fn reserved_attachment_adoption_preserves_exact_identity_without_double_al
         ReliableRelayAttachOutcome::Attached,
     );
     assert_eq!(remotes.paths[1].instance(), expected);
+    assert!(!remotes.validation_attachment_is_current(expected));
+    assert!(remotes.contains_path_instance(expected));
     assert_eq!(
         remotes.membership_generation(),
         membership_before_adoption.wrapping_add(1),

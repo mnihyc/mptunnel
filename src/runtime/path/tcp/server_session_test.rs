@@ -291,7 +291,7 @@ async fn ready_server_tcp_actor_serializes_session_demand_ahead_of_bulk_work() {
             )
             .expect("fill ordinary bulk command queue");
     }
-    assert!(workload.update_demand(TrafficClass::Throughput, false));
+    assert!(workload.update_demand(TrafficClass::Latency, false));
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
             .await
@@ -301,7 +301,7 @@ async fn ready_server_tcp_actor_serializes_session_demand_ahead_of_bulk_work() {
             request_id: 2,
             stream_id: None,
         },
-        "session control demand must not starve behind a continuously ready bulk queue",
+        "a classifier-boundary withdrawal must not starve behind a continuously ready bulk queue",
     );
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())

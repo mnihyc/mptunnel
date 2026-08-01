@@ -992,6 +992,11 @@ where
                         deferred_remote_frame = Some(frame);
                     }
                     ClientC2sTcpValidationAction::RecoverCandidate(instance) => {
+                        let settled = remotes.settle_validation_attachment(instance);
+                        debug_assert!(
+                            settled,
+                            "C2S recovery must retire its exact validation attachment"
+                        );
                         let queued = sender.enqueue_failed_path_reinjections(
                             &mut sender_queue,
                             context,
@@ -1009,6 +1014,7 @@ where
                         handoff,
                         attachment,
                     } => {
+                        let candidate_instance = handoff.candidate.instance;
                         let retained = adopt_client_to_server_retained_carrier(
                             context,
                             &mut remotes,
@@ -1021,6 +1027,7 @@ where
                         .await;
                         c2s_tcp_validation = None;
                         if let Err(error) = retained {
+                            let _ = remotes.settle_validation_attachment(candidate_instance);
                             crate::observability::process_event!(
                                 Warn,
                                 "tcp",
@@ -1032,7 +1039,12 @@ where
                             state.progress.sender_retry_at = None;
                         }
                     }
-                    ClientC2sTcpValidationAction::Finished => {
+                    ClientC2sTcpValidationAction::Finished(instance) => {
+                        let settled = remotes.settle_validation_attachment(instance);
+                        debug_assert!(
+                            settled,
+                            "C2S settlement must retire its exact validation attachment"
+                        );
                         c2s_tcp_validation = None;
                     }
                 }

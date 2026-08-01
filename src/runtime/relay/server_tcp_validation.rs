@@ -241,12 +241,14 @@ impl ServerS2cTcpValidation {
         match self.phase {
             TcpCarrierValidationPhase::CandidateStartup
                 if self.validation.candidate_assignment_credit_bytes() == 0
+                    && self.validation.candidate_assignments_are_resolved()
                     && work == TcpCarrierCandidateWorkState::default() =>
             {
                 self.advance_phase(work);
             }
             TcpCarrierValidationPhase::Assisted
                 if self.assisted_cohort_closed
+                    && self.validation.candidate_assignments_are_resolved()
                     && work == TcpCarrierCandidateWorkState::default() =>
             {
                 self.assisted_cohort_closed = false;
@@ -378,9 +380,7 @@ impl ServerS2cTcpValidation {
         let mut qualified = 0_u64;
         let mut candidate = 0_u64;
         for release in &receipt.original_releases {
-            if release.resolution != ResponseProductAckOriginalResolution::Unambiguous
-                || release.sent_at < cohort.opening_writer_at
-            {
+            if release.resolution != ResponseProductAckOriginalResolution::Unambiguous {
                 continue;
             }
             let bytes = release.bytes as u64;
@@ -395,8 +395,11 @@ impl ServerS2cTcpValidation {
             cohort.candidate_bytes = cohort.candidate_bytes.saturating_add(candidate);
         }
 
-        if cohort.target_bytes >= self.validation.cohort_coverage_bytes()
-            && self.writer_boundary.is_none()
+        if self.validation.cohort_is_covered(
+            cohort.target_bytes,
+            cohort.aggregate_bytes,
+            cohort.candidate_bytes,
+        ) && self.writer_boundary.is_none()
         {
             let cohort = self.cohort.take().expect("covered cohort remains active");
             self.start_writer_boundary(WriterBoundaryPurpose::Close(CompleteProductCohort {

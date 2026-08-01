@@ -5,14 +5,17 @@ use crate::model::ack_clock::{
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, reliable_path_startup_sample_limit_bytes,
     reliable_product_measurement_session_envelope_bytes,
+    reliable_unproven_path_startup_flight_limit_bytes,
 };
 
 fn geometry() -> TcpCarrierValidationGeometry {
     TcpCarrierValidationGeometry {
+        startup_sample_floor_bytes: 500,
         startup_coverage_bytes: 500,
-        rate_window_bytes: 1_000,
         cohort_coverage_bytes: 4_000,
         candidate_work_limit_bytes: 4_500,
+        candidate_startup_flight_limit_bytes: 500,
+        candidate_mature_flight_limit_bytes: 4_000,
     }
 }
 
@@ -105,13 +108,53 @@ fn geometry_reuses_existing_directional_coverage_and_resource_bounds() {
         frozen.startup_coverage_bytes,
         reliable_path_startup_sample_limit_bytes(mux_limits)
     );
-    assert_eq!(frozen.rate_window_bytes, rate_window);
+    assert_eq!(
+        frozen.startup_sample_floor_bytes,
+        reliable_path_startup_sample_limit_bytes(mux_limits)
+    );
     assert_eq!(frozen.cohort_coverage_bytes % rate_window, 0);
     assert!(frozen.cohort_coverage_bytes >= 45_000_000);
     assert!(frozen.cohort_coverage_bytes <= envelope);
     assert_eq!(
         frozen.candidate_work_limit_bytes,
         frozen.startup_coverage_bytes + frozen.cohort_coverage_bytes
+    );
+    assert_eq!(
+        frozen.candidate_startup_flight_limit_bytes,
+        reliable_unproven_path_startup_flight_limit_bytes(mux_limits).min(envelope)
+    );
+    assert_eq!(frozen.candidate_mature_flight_limit_bytes, envelope);
+}
+
+#[test]
+fn candidate_assignment_reuses_startup_and_mature_flight_bounds() {
+    let mut bounded = geometry();
+    bounded.startup_sample_floor_bytes = 250;
+    bounded.startup_coverage_bytes = 1_000;
+    bounded.candidate_work_limit_bytes = 5_000;
+    bounded.candidate_startup_flight_limit_bytes = 500;
+    let mut state = TcpCarrierValidationState::new(bounded);
+    install_reference(&mut state);
+
+    assert_eq!(state.candidate_assignment_credit_bytes(), 500);
+    assert_eq!(
+        state.record_candidate_assignment(500),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert_eq!(state.candidate_assignment_credit_bytes(), 0);
+    assert_eq!(
+        state.observe_candidate_resolution(250, 250),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert_eq!(
+        state.candidate_assignment_credit_bytes(),
+        500,
+        "one exact startup sample opens the existing mature Product envelope"
+    );
+    assert_eq!(
+        state.record_candidate_assignment(501),
+        TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn),
+        "callers cannot bypass instantaneous or cumulative candidate credit"
     );
 }
 
@@ -180,9 +223,9 @@ fn target_redistribution_without_aggregate_gain_is_no_gain() {
     let mut state = TcpCarrierValidationState::new(geometry());
     install_reference(&mut state);
     complete_startup(&mut state);
-    install_assisted(&mut state, 4_000, Duration::from_millis(20));
+    install_assisted(&mut state, 8_000, Duration::from_millis(20));
     assert_eq!(
-        install_confirmation(&mut state, 8_000, Duration::from_millis(40)),
+        install_confirmation(&mut state, 16_000, Duration::from_millis(40)),
         TcpCarrierValidationResult::NoGain
     );
 }
@@ -214,18 +257,54 @@ fn startup_assignment_is_exact_and_qualified_before_assisted_service() {
         ambiguous.record_candidate_assignment(500),
         TcpCarrierValidationUpdate::Pending
     );
+    assert!(!ambiguous.candidate_assignments_are_resolved());
     assert_eq!(
         ambiguous.observe_candidate_resolution(500, 499),
+        TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn)
+    );
+
+    let mut repaired = TcpCarrierValidationState::new(geometry());
+    install_reference(&mut repaired);
+    assert_eq!(
+        repaired.record_candidate_assignment(500),
         TcpCarrierValidationUpdate::Pending
     );
     assert_eq!(
-        ambiguous.advance_at_causal_boundary(zero_work()),
-        TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn)
+        repaired.observe_candidate_resolution(500, 499),
+        TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn),
+        "startup requires every assigned byte to retain exact candidate provenance"
     );
 }
 
 #[test]
-fn assisted_assignment_is_bounded_and_needs_one_qualified_rate_window() {
+fn native_flight_completion_does_not_overtake_product_ack_receipts() {
+    let mut state = TcpCarrierValidationState::new(geometry());
+    install_reference(&mut state);
+    assert_eq!(
+        state.record_candidate_assignment(500),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert_eq!(state.candidate_assignment_credit_bytes(), 0);
+    assert!(!state.candidate_assignments_are_resolved());
+
+    assert_eq!(
+        state.observe_candidate_resolution(100, 100),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert!(!state.candidate_assignments_are_resolved());
+    assert_eq!(
+        state.observe_candidate_resolution(400, 400),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert!(state.candidate_assignments_are_resolved());
+    assert_eq!(
+        state.advance_at_causal_boundary(zero_work()),
+        TcpCarrierValidationUpdate::Advanced(TcpCarrierValidationPhase::Assisted)
+    );
+}
+
+#[test]
+fn assisted_assignment_is_bounded_and_needs_one_complete_candidate_coverage() {
     let mut over_budget = TcpCarrierValidationState::new(geometry());
     install_reference(&mut over_budget);
     complete_startup(&mut over_budget);
@@ -238,27 +317,22 @@ fn assisted_assignment_is_bounded_and_needs_one_qualified_rate_window() {
     install_reference(&mut insufficient);
     complete_startup(&mut insufficient);
     assert_eq!(
-        insufficient.record_candidate_assignment(999),
+        insufficient.record_candidate_assignment(1_000),
         TcpCarrierValidationUpdate::Pending
     );
     assert_eq!(
-        insufficient.observe_candidate_resolution(999, 999),
+        insufficient.observe_candidate_resolution(1_000, 1_000),
         TcpCarrierValidationUpdate::Pending
     );
-    assert_eq!(
-        insufficient.observe_cohort(
-            4_000,
-            8_000,
-            999,
-            Duration::from_millis(20),
-            Duration::from_millis(20),
-        ),
-        TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn)
+    assert!(
+        !insufficient.cohort_is_covered(4_000, 8_000, 1_000),
+        "one rate window cannot stand in for the frozen candidate cohort"
     );
+    assert_eq!(insufficient.candidate_assignment_credit_bytes(), 3_000);
 }
 
 #[test]
-fn assisted_cohort_closure_seals_assignment_but_drains_existing_flight() {
+fn assisted_cohort_closes_only_after_complete_candidate_and_ordinary_coverage() {
     let mut state = TcpCarrierValidationState::new(geometry());
     install_reference(&mut state);
     complete_startup(&mut state);
@@ -270,11 +344,24 @@ fn assisted_cohort_closure_seals_assignment_but_drains_existing_flight() {
         state.observe_candidate_resolution(1_000, 1_000),
         TcpCarrierValidationUpdate::Pending
     );
+    assert!(
+        !state.cohort_is_covered(4_000, 8_000, 1_000),
+        "partial candidate service cannot close Assisted"
+    );
+    assert_eq!(state.candidate_assignment_credit_bytes(), 3_000);
+    assert_eq!(
+        state.record_candidate_assignment(3_000),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert_eq!(
+        state.observe_candidate_resolution(3_000, 3_000),
+        TcpCarrierValidationUpdate::Pending
+    );
     assert_eq!(
         state.observe_cohort(
             4_000,
             8_000,
-            1_000,
+            4_000,
             Duration::from_millis(20),
             Duration::from_millis(20),
         ),
@@ -282,42 +369,9 @@ fn assisted_cohort_closure_seals_assignment_but_drains_existing_flight() {
     );
     assert_eq!(state.candidate_assignment_credit_bytes(), 0);
     assert_eq!(
-        state.record_candidate_assignment(1),
-        TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn),
-        "new candidate assignment is sealed at cohort closure"
-    );
-
-    let mut draining = TcpCarrierValidationState::new(geometry());
-    install_reference(&mut draining);
-    complete_startup(&mut draining);
-    assert_eq!(
-        draining.record_candidate_assignment(2_000),
-        TcpCarrierValidationUpdate::Pending
-    );
-    assert_eq!(
-        draining.observe_candidate_resolution(1_000, 1_000),
-        TcpCarrierValidationUpdate::Pending
-    );
-    assert_eq!(
-        draining.observe_cohort(
-            4_000,
-            8_000,
-            1_000,
-            Duration::from_millis(20),
-            Duration::from_millis(20),
-        ),
-        TcpCarrierValidationUpdate::Pending,
-        "the cohort closes over only releases processed by its closing ACK"
-    );
-    assert_eq!(draining.candidate_assignment_credit_bytes(), 0);
-    assert_eq!(
-        draining.observe_candidate_resolution(1_000, 1_000),
-        TcpCarrierValidationUpdate::Pending,
-        "already-assigned flight may resolve after cohort closure"
-    );
-    assert_eq!(
-        draining.advance_at_causal_boundary(zero_work()),
-        TcpCarrierValidationUpdate::Advanced(TcpCarrierValidationPhase::Confirmation)
+        state.advance_at_causal_boundary(zero_work()),
+        TcpCarrierValidationUpdate::Advanced(TcpCarrierValidationPhase::Confirmation),
+        "complete candidate and ordinary coverage advances at zero Product work"
     );
 }
 
@@ -345,6 +399,29 @@ fn malformed_cohort_or_phase_contamination_withdraws() {
             Duration::from_millis(40),
         ),
         TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn)
+    );
+
+    let mut candidate_only_assisted = TcpCarrierValidationState::new(geometry());
+    install_reference(&mut candidate_only_assisted);
+    complete_startup(&mut candidate_only_assisted);
+    assert_eq!(
+        candidate_only_assisted.record_candidate_assignment(4_000),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert_eq!(
+        candidate_only_assisted.observe_candidate_resolution(4_000, 4_000),
+        TcpCarrierValidationUpdate::Pending
+    );
+    assert_eq!(
+        candidate_only_assisted.observe_cohort(
+            4_000,
+            4_000,
+            4_000,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        ),
+        TcpCarrierValidationUpdate::Settled(TcpCarrierValidationResult::Withdrawn),
+        "candidate service cannot substitute for ordinary comparison coverage"
     );
 
     let mut zero_elapsed = TcpCarrierValidationState::new(geometry());

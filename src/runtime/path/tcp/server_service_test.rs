@@ -91,6 +91,12 @@ fn exact_success_to_saturation_publishes_one_monotonic_demand() {
     assert!(workload.update_demand(TrafficClass::Throughput, false));
     assert_eq!(
         demands.current(),
+        Some(demand),
+        "a work-conserving queue drain preserves the classifier-owned demand episode"
+    );
+    assert!(workload.update_demand(TrafficClass::Latency, false));
+    assert_eq!(
+        demands.current(),
         Some(ServerTcpCarrierDemand {
             request_id: NonZeroU64::new(2).expect("nonzero request"),
             stream_id: None,
@@ -153,6 +159,77 @@ fn changed_stable_generation_supersedes_the_current_request() {
 }
 
 #[test]
+fn pending_target_is_serialized_and_issued_comparison_keys_do_not_repeat() {
+    let service = ServerTcpCarrierService::new();
+    let mut first = active_workload(&service, 30);
+    let mut second = active_workload(&service, 31);
+    let authority = stable(15);
+    let ordinary = instance(UnderlayProtocol::Tcp, 16, 36, 46);
+
+    assert!(first.record_successful_ordinary_placement(authority));
+    let first_demand = first
+        .try_issue_saturation_demand(
+            saturation(authority, &[(ordinary, 65_536)]),
+            MuxLimits::default(),
+        )
+        .expect("first target owns the pending request");
+
+    assert!(second.record_successful_ordinary_placement(authority));
+    assert!(
+        second
+            .try_issue_saturation_demand(
+                saturation(authority, &[(ordinary, 65_536)]),
+                MuxLimits::default(),
+            )
+            .is_none(),
+        "another saturated target cannot churn an unchanged pending request"
+    );
+
+    let first_admission = service
+        .admit_validation(
+            first_demand.request_id,
+            NonZeroU64::new(91).expect("first validation ID"),
+            StreamId(30),
+            instance(UnderlayProtocol::Tcp, 17, 37, 47),
+            authority,
+            &[ordinary],
+        )
+        .expect("the serialized pending target admits");
+    first_admission.release();
+
+    assert!(second.record_successful_ordinary_placement(authority));
+    let second_demand = second
+        .try_issue_saturation_demand(
+            saturation(authority, &[(ordinary, 65_536)]),
+            MuxLimits::default(),
+        )
+        .expect("another target may follow the settled first attempt");
+    assert!(second_demand.request_id > first_demand.request_id);
+    let second_admission = service
+        .admit_validation(
+            second_demand.request_id,
+            NonZeroU64::new(92).expect("second validation ID"),
+            StreamId(31),
+            instance(UnderlayProtocol::Tcp, 18, 38, 48),
+            authority,
+            &[ordinary],
+        )
+        .expect("the second serialized target admits");
+    second_admission.release();
+
+    assert!(first.record_successful_ordinary_placement(authority));
+    assert!(
+        first
+            .try_issue_saturation_demand(
+                saturation(authority, &[(ordinary, 65_536)]),
+                MuxLimits::default(),
+            )
+            .is_none(),
+        "an already-issued comparison key cannot repeat after another target"
+    );
+}
+
+#[test]
 fn changed_ordinary_set_without_membership_generation_is_rejected() {
     let service = ServerTcpCarrierService::new();
     let mut workload = active_workload(&service, 17);
@@ -211,6 +288,7 @@ fn admission_freezes_complete_workloads_and_routes_exact_ack_receipts() {
             MuxLimits::default(),
         )
         .expect("qualified demand");
+    assert!(target.update_demand(TrafficClass::Throughput, false));
     let candidate = instance(UnderlayProtocol::Tcp, 5, 25, 35);
     let admission = service
         .admit_validation(
@@ -231,6 +309,12 @@ fn admission_freezes_complete_workloads_and_routes_exact_ack_receipts() {
     assert_eq!(admission.ordinary_services()[0].instance, ordinary);
     assert!(admission.geometry().cohort_coverage_bytes() > 0);
     assert!(admission.revalidate(authority, &[ordinary]));
+
+    assert!(
+        !admission.is_withdrawn() && admission.revalidate(authority, &[ordinary]),
+        "successful placement may drain the bounded queue before or during response validation"
+    );
+    assert!(target.update_demand(TrafficClass::Throughput, true));
 
     let mut observations = admission
         .activate_observations(2)

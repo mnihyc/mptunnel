@@ -459,7 +459,10 @@ impl ClientTcpCarrierService {
             return None;
         }
 
-        let throughput_demand = lane == TrafficClass::Throughput && queued_unique_original;
+        // The classifier owns the continuous demand episode. A bounded sender
+        // queue may momentarily drain because ordinary placement succeeded;
+        // that is not an idle transition and must not mint a new generation.
+        let throughput_demand = lane == TrafficClass::Throughput;
         let demand_generation = match (current.demand_generation, throughput_demand) {
             (Some(generation), true) => Some(generation),
             (None, true) => Some(take_sequence(&mut state.next_demand_generation)?),
@@ -827,7 +830,6 @@ impl ClientTcpCarrierService {
                         target.identity == admission.key.target
                             && target.demand_generation == Some(admission.key.demand_generation)
                             && target.lane == TrafficClass::Throughput
-                            && target.queued_unique_original
                     })
                 && !state.workloads.values().any(|workload| {
                     workload.queued_unique_original && workload.lane.is_latency_sensitive()
@@ -1128,8 +1130,10 @@ impl ClientTcpCarrierWorkloadLease {
     }
 
     /// Updates the continuous target-demand episode at a sender lifecycle
-    /// boundary. Repeating the same queued throughput state preserves its
-    /// generation; ending and later restarting it creates a new generation.
+    /// boundary. Fresh queued work is retained for admission, while a
+    /// work-conserving queue drain inside the same throughput classification
+    /// preserves the generation. Crossing the classifier's idle boundary and
+    /// later returning to throughput creates a new generation.
     pub(in crate::runtime) fn update_demand(
         &mut self,
         lane: TrafficClass,

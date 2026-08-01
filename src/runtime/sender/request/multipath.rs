@@ -332,7 +332,7 @@ impl RequestMultipathController {
             .unique_original_flight_for_frame(preview);
         let original_path = original_flight
             .map(|(instance, _)| instance)
-            .filter(|instance| remotes.contains_path_instance(*instance));
+            .filter(|instance| remotes.contains_flight_owner_instance(*instance));
         let original_underlay = self
             .request
             .flights
@@ -341,7 +341,7 @@ impl RequestMultipathController {
         // its RTT or congestion evidence to an older attachment's flight.
         let original_path_timing =
             original_path.and_then(|instance| context.reliable_path_snapshot(instance.key));
-        let live_instances = remotes.path_instances();
+        let live_instances = remotes.flight_owner_instances();
         let avoid_instances = self
             .request
             .flights
@@ -396,7 +396,7 @@ impl RequestMultipathController {
             RelaySendCause::TailReinjection => {
                 let owner_keys = self.request.flights.tail_reinjection_owner_keys(
                     frame,
-                    &remotes.path_instances(),
+                    &remotes.flight_owner_instances(),
                     Duration::ZERO,
                     Duration::ZERO,
                 );
@@ -409,11 +409,17 @@ impl RequestMultipathController {
             cause if cause.is_ack_gap_reinjection() => self
                 .request
                 .flights
-                .original_transmission_instances_for_frame(frame, &remotes.path_instances()),
+                .original_transmission_instances_for_frame(
+                    frame,
+                    &remotes.flight_owner_instances(),
+                ),
             RelaySendCause::StalePathReinjection(_) => self
                 .request
                 .flights
-                .original_transmission_instances_for_frame(frame, &remotes.path_instances()),
+                .original_transmission_instances_for_frame(
+                    frame,
+                    &remotes.flight_owner_instances(),
+                ),
             cause if cause.is_reinjection() => self.request.flights.sent_instances_for_frame(frame),
             _ => Vec::new(),
         }
@@ -710,7 +716,10 @@ impl RequestMultipathController {
             && self
                 .request
                 .flights
-                .has_missing_original_transmission_before_offset(offset, &remotes.path_instances())
+                .has_missing_original_transmission_before_offset(
+                    offset,
+                    &remotes.flight_owner_instances(),
+                )
         {
             return Err(RuntimeError::SenderServiceBlocked);
         }
@@ -1705,13 +1714,14 @@ impl RequestMultipathController {
         self.request
             .missing_owner_reinjection_attempts
             .retain(|instance, _| {
-                owner_instances.contains(instance) && !remotes.contains_path_instance(*instance)
+                owner_instances.contains(instance)
+                    && !remotes.contains_flight_owner_instance(*instance)
             });
         let now = Instant::now();
         owner_instances
             .into_iter()
             .filter(|instance| {
-                !remotes.contains_path_instance(*instance)
+                !remotes.contains_flight_owner_instance(*instance)
                     && self
                         .request
                         .missing_owner_reinjection_attempts

@@ -110,7 +110,7 @@ pub(super) enum ClientC2sTcpValidationAction {
         handoff: Box<ClientTcpValidationHandoff>,
         attachment: ReliableRelayAttachmentReservation,
     },
-    Finished,
+    Finished(RelayPathInstance),
 }
 
 /// One target stream's exact C2S validation transaction.
@@ -209,7 +209,7 @@ impl ClientC2sTcpValidation {
         )?;
         let candidate_instance = actor_admission.instance();
         let attachment_reservation =
-            attachment_reservation.bind_exact(target.stream_id, candidate_instance)?;
+            remotes.bind_validation_attachment(attachment_reservation, candidate_instance)?;
         let (carrier, controller, carrier_events) =
             ClientTcpValidationSession::new(actor_admission);
         let carrier_task = tokio::spawn(carrier.run());
@@ -337,7 +337,7 @@ impl ClientC2sTcpValidation {
                     self.finished = true;
                     ClientC2sTcpValidationAction::RecoverCandidate(self.candidate_instance)
                 } else {
-                    ClientC2sTcpValidationAction::Finished
+                    ClientC2sTcpValidationAction::Finished(self.candidate_instance)
                 }
             }
         }
@@ -433,7 +433,7 @@ impl ClientC2sTcpValidation {
                     return ClientC2sTcpValidationAction::RecoverCandidate(self.candidate_instance);
                 }
                 self.finished = true;
-                ClientC2sTcpValidationAction::Finished
+                ClientC2sTcpValidationAction::Finished(self.candidate_instance)
             }
             ClientTcpValidationEvent::ReceiverAdmitted { .. }
             | ClientTcpValidationEvent::ResultReceived { .. } => {
@@ -520,11 +520,7 @@ impl ClientC2sTcpValidation {
             if release.resolution != RequestProductAckOriginalResolution::Unambiguous {
                 continue;
             }
-            let release_bytes = if release.sent_at >= cohort.opening_writer_at {
-                release.bytes as u64
-            } else {
-                0
-            };
+            let release_bytes = release.bytes as u64;
             qualified = qualified.saturating_add(release_bytes);
             if release.instance == self.candidate_instance {
                 candidate = candidate.saturating_add(release_bytes);
@@ -536,8 +532,11 @@ impl ClientC2sTcpValidation {
             cohort.candidate_bytes = cohort.candidate_bytes.saturating_add(candidate);
         }
 
-        if cohort.target_bytes >= self.validation_geometry_cohort_coverage()
-            && self.writer_boundary.is_none()
+        if self.validation.cohort_is_covered(
+            cohort.target_bytes,
+            cohort.aggregate_bytes,
+            cohort.candidate_bytes,
+        ) && self.writer_boundary.is_none()
         {
             let cohort = self.cohort.take().expect("covered cohort remains active");
             self.start_writer_boundary(WriterBoundaryPurpose::Close(CompleteProductCohort {
@@ -550,12 +549,6 @@ impl ClientC2sTcpValidation {
                 candidate_bytes: cohort.candidate_bytes,
             }));
         }
-    }
-
-    fn validation_geometry_cohort_coverage(&self) -> u64 {
-        // Credit outside CandidateStartup/Assisted is zero, so the geometry's
-        // cohort floor is exposed through the immutable admission model.
-        self.validation.cohort_coverage_bytes()
     }
 
     fn start_writer_boundary(&mut self, purpose: WriterBoundaryPurpose) {
@@ -684,12 +677,14 @@ impl ClientC2sTcpValidation {
         match self.phase {
             TcpCarrierValidationPhase::CandidateStartup
                 if self.validation.candidate_assignment_credit_bytes() == 0
+                    && self.validation.candidate_assignments_are_resolved()
                     && work == TcpCarrierCandidateWorkState::default() =>
             {
                 self.advance_phase(work);
             }
             TcpCarrierValidationPhase::Assisted
                 if self.assisted_cohort_closed
+                    && self.validation.candidate_assignments_are_resolved()
                     && work == TcpCarrierCandidateWorkState::default() =>
             {
                 self.assisted_cohort_closed = false;

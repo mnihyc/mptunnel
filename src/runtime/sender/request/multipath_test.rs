@@ -3,6 +3,7 @@ use super::super::test_support::{
     opened_test_relay_stream_with_underlay, seed_client_bulk_evidence_for_test,
 };
 use super::*;
+use crate::model::path::next_carrier_path_instance_id;
 use crate::model::request_evidence::RequestPerFlowRateModel;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::runtime::path::commands::{
@@ -929,6 +930,77 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
         controller
             .unreported_missing_owner_instances(&remotes, Duration::from_secs(1))
             .is_empty()
+    );
+
+    controller.release_all(&context);
+}
+
+#[tokio::test]
+async fn validation_attachment_owns_flight_without_entering_ordinary_scheduling() {
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
+    let stream_id = StreamId(32);
+    let (ordinary_commands, _ordinary_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, ordinary_commands), 8);
+    let ordinary = remotes.paths[0].instance();
+    let reservation = remotes.reserve_attachment_incarnation();
+    let candidate = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        },
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: reservation.attachment_id(),
+    };
+    let _reservation = remotes
+        .bind_validation_attachment(reservation, candidate)
+        .expect("bind validation-only request attachment");
+    assert_eq!(remotes.path_instances(), vec![ordinary]);
+    assert_eq!(remotes.flight_owner_instances(), vec![ordinary, candidate]);
+
+    let candidate_frame = data_frame(stream_id, 0, 4096);
+    let next_frame = data_frame(stream_id, 4096, 4096);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .flights
+        .record_original_frame_instance(candidate, &candidate_frame);
+
+    assert!(
+        controller
+            .prepare_relay_path_decision(
+                &context,
+                &mut remotes,
+                &next_frame,
+                TrafficClass::Throughput,
+                RelaySendCause::StreamData,
+            )
+            .is_ok(),
+        "a live validation owner must not serialize later Product placement",
+    );
+    assert!(
+        controller
+            .unreported_missing_owner_instances(&remotes, Duration::ZERO)
+            .is_empty(),
+        "validation flight remains owned until its lifecycle settles",
+    );
+
+    assert!(remotes.settle_validation_attachment(candidate));
+    assert!(matches!(
+        controller.prepare_relay_path_decision(
+            &context,
+            &mut remotes,
+            &next_frame,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert_eq!(
+        controller.unreported_missing_owner_instances(&remotes, Duration::ZERO),
+        vec![candidate],
+        "settlement exposes unresolved candidate flight to normal recovery",
     );
 
     controller.release_all(&context);

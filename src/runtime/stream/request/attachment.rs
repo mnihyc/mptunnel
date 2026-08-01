@@ -228,6 +228,9 @@ impl ReliableRelayAttachmentReservation {
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
+    /// One exact validation-only request attachment. It owns its bounded
+    /// OriginalData flight without entering ordinary scheduling membership.
+    validation_attachment: Option<RelayPathInstance>,
     receive_only_paths: Vec<ReliableRelayReceiveOnlyPath>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
@@ -245,6 +248,7 @@ impl ReliableRelayRemoteSet {
         let mut set = Self {
             stream_id,
             paths: Vec::new(),
+            validation_attachment: None,
             receive_only_paths: Vec::new(),
             frames_tx,
             frames_rx,
@@ -278,6 +282,52 @@ impl ReliableRelayRemoteSet {
             attachment_id,
             instance: None,
         }
+    }
+
+    /// Binds one validation-only attachment as a live request-flight owner.
+    ///
+    /// The attachment remains absent from `paths`, so ordinary selection,
+    /// flow load, and membership generations do not change. Its exact
+    /// identity is nevertheless live for ordered-flight and recovery
+    /// ownership until settlement or acknowledged promotion.
+    pub(in crate::runtime) fn bind_validation_attachment(
+        &mut self,
+        reservation: ReliableRelayAttachmentReservation,
+        instance: RelayPathInstance,
+    ) -> Result<ReliableRelayAttachmentReservation, RuntimeError> {
+        let reservation = reservation.bind_exact(self.stream_id, instance)?;
+        if instance.key.underlay != UnderlayProtocol::Tcp
+            || self.validation_attachment.is_some()
+            || self
+                .paths
+                .iter()
+                .any(|path| path.key() == instance.key || path.instance() == instance)
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        self.validation_attachment = Some(instance);
+        Ok(reservation)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn validation_attachment_is_current(
+        &self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        self.validation_attachment == Some(instance)
+    }
+
+    /// Removes the exact validation-only attachment from live flight
+    /// ownership without changing ordinary membership.
+    pub(in crate::runtime) fn settle_validation_attachment(
+        &mut self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        if self.validation_attachment != Some(instance) {
+            return false;
+        }
+        self.validation_attachment = None;
+        true
     }
 
     fn allocate_attachment_incarnation(&mut self) -> u64 {
@@ -361,6 +411,23 @@ impl ReliableRelayRemoteSet {
 
     pub(in crate::runtime) fn contains_path_instance(&self, instance: RelayPathInstance) -> bool {
         self.paths.iter().any(|path| path.instance() == instance)
+    }
+
+    /// Exact live owners of request OriginalData. Validation ownership is
+    /// included here but remains absent from ordinary `path_instances()`.
+    pub(in crate::runtime) fn flight_owner_instances(&self) -> Vec<RelayPathInstance> {
+        self.paths
+            .iter()
+            .map(ReliableRelayRemotePath::instance)
+            .chain(self.validation_attachment)
+            .collect()
+    }
+
+    pub(in crate::runtime) fn contains_flight_owner_instance(
+        &self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        self.contains_path_instance(instance) || self.validation_attachment == Some(instance)
     }
 
     pub(in crate::runtime) fn path_keys(&self) -> Vec<RelayPathKey> {
@@ -766,6 +833,7 @@ impl ReliableRelayRemoteSet {
             || reservation.attachment_id != expected.attachment_id
             || key != expected.key
             || opened.path_instance_id != expected.path_instance_id
+            || self.validation_attachment != Some(expected)
         {
             return Err(RuntimeError::Protocol(
                 "opened relay attachment does not match its exact reservation",
@@ -774,6 +842,7 @@ impl ReliableRelayRemoteSet {
         if self.contains_path_key(key) {
             return Ok(ReliableRelayAttachOutcome::RejectedDuplicate);
         }
+        self.validation_attachment = None;
         Ok(self.commit_opened(opened, true, reservation.attachment_id))
     }
 
@@ -788,7 +857,11 @@ impl ReliableRelayRemoteSet {
             underlay,
             index: path_index,
         };
-        if self.contains_path_key(key) {
+        if self.contains_path_key(key)
+            || self
+                .validation_attachment
+                .is_some_and(|validation| validation.key == key)
+        {
             return ReliableRelayAttachOutcome::RejectedDuplicate;
         }
         let attachment_id = self.allocate_attachment_incarnation();

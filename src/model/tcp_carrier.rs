@@ -8,6 +8,7 @@
 use super::ack_clock::reliable_data_ack_rate_coverage_floor_bytes;
 use super::capacity::{
     reliable_path_startup_sample_limit_bytes, reliable_product_measurement_session_envelope_bytes,
+    reliable_unproven_path_startup_flight_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::protocol::{PathUsage, TcpCarrierValidationResult};
@@ -38,15 +39,38 @@ pub(crate) struct TcpCarrierStableGenerations {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpCarrierValidationGeometry {
+    startup_sample_floor_bytes: u64,
     startup_coverage_bytes: u64,
-    rate_window_bytes: u64,
     cohort_coverage_bytes: u64,
     candidate_work_limit_bytes: u64,
+    candidate_startup_flight_limit_bytes: u64,
+    candidate_mature_flight_limit_bytes: u64,
 }
 
 impl TcpCarrierValidationGeometry {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cohort_coverage_bytes(self) -> u64 {
         self.cohort_coverage_bytes
+    }
+
+    fn cohort_is_covered(
+        self,
+        target_bytes: u64,
+        aggregate_bytes: u64,
+        candidate_bytes: u64,
+    ) -> bool {
+        target_bytes >= self.cohort_coverage_bytes
+            && aggregate_bytes
+                .checked_sub(candidate_bytes)
+                .is_some_and(|ordinary_bytes| ordinary_bytes >= self.cohort_coverage_bytes)
+    }
+
+    fn candidate_flight_limit_bytes(self, qualified_release_bytes: u64) -> u64 {
+        if qualified_release_bytes >= self.startup_sample_floor_bytes {
+            self.candidate_mature_flight_limit_bytes
+        } else {
+            self.candidate_startup_flight_limit_bytes
+        }
     }
 }
 
@@ -60,10 +84,12 @@ pub(crate) fn tcp_carrier_validation_geometry(
     ordinary_service_pipes: impl IntoIterator<Item = u64>,
     mux_limits: MuxLimits,
 ) -> Option<TcpCarrierValidationGeometry> {
-    let startup_coverage_bytes = reliable_path_startup_sample_limit_bytes(mux_limits);
+    let startup_sample_floor_bytes = reliable_path_startup_sample_limit_bytes(mux_limits);
+    let candidate_startup_flight_limit_bytes =
+        reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
     let rate_window_bytes = reliable_data_ack_rate_coverage_floor_bytes(mux_limits);
     let validation_envelope = reliable_product_measurement_session_envelope_bytes(mux_limits);
-    if startup_coverage_bytes == 0
+    if startup_sample_floor_bytes == 0
         || rate_window_bytes == 0
         || validation_envelope < rate_window_bytes
     {
@@ -90,13 +116,17 @@ pub(crate) fn tcp_carrier_validation_geometry(
     if cohort_coverage_bytes > validation_envelope {
         return None;
     }
+    let startup_coverage_bytes = startup_sample_floor_bytes;
     let candidate_work_limit_bytes = startup_coverage_bytes.checked_add(cohort_coverage_bytes)?;
 
     Some(TcpCarrierValidationGeometry {
+        startup_sample_floor_bytes,
         startup_coverage_bytes,
-        rate_window_bytes,
         cohort_coverage_bytes,
         candidate_work_limit_bytes,
+        candidate_startup_flight_limit_bytes: candidate_startup_flight_limit_bytes
+            .min(validation_envelope),
+        candidate_mature_flight_limit_bytes: validation_envelope,
     })
 }
 
@@ -185,7 +215,7 @@ impl ProductServiceCohort {
         writer_elapsed: Duration,
         ack_elapsed: Duration,
     ) -> Option<Self> {
-        if target_bytes < geometry.cohort_coverage_bytes
+        if !geometry.cohort_is_covered(target_bytes, aggregate_bytes, candidate_bytes)
             || aggregate_bytes < target_bytes
             || candidate_bytes > target_bytes
         {
@@ -316,42 +346,90 @@ impl TcpCarrierValidationState {
         }
     }
 
-    pub(crate) fn cohort_coverage_bytes(self) -> u64 {
-        self.geometry.cohort_coverage_bytes()
+    /// A comparison cohort contains one complete target-service coverage and
+    /// one complete causally eligible ordinary-carrier coverage. Candidate
+    /// bytes cannot stand in for the ordinary service being compared.
+    pub(crate) fn cohort_is_covered(
+        self,
+        target_bytes: u64,
+        aggregate_bytes: u64,
+        candidate_bytes: u64,
+    ) -> bool {
+        self.geometry
+            .cohort_is_covered(target_bytes, aggregate_bytes, candidate_bytes)
+            && match self.phase {
+                TcpCarrierValidationPhase::Reference | TcpCarrierValidationPhase::Confirmation => {
+                    candidate_bytes == 0
+                }
+                TcpCarrierValidationPhase::Assisted => {
+                    candidate_bytes >= self.geometry.cohort_coverage_bytes
+                }
+                TcpCarrierValidationPhase::CandidateStartup
+                | TcpCarrierValidationPhase::Settled(_) => false,
+            }
     }
 
     pub(crate) fn candidate_assignment_credit_bytes(self) -> u64 {
+        let (ledger, phase_limit) = match self.phase {
+            TcpCarrierValidationPhase::CandidateStartup => {
+                (self.startup, self.geometry.startup_coverage_bytes)
+            }
+            TcpCarrierValidationPhase::Assisted if self.assisted.is_none() => {
+                (self.assisted_work, self.geometry.cohort_coverage_bytes)
+            }
+            _ => return 0,
+        };
+        let phase_credit = phase_limit.saturating_sub(ledger.assigned_bytes);
+        let qualified_release_bytes = self
+            .startup
+            .qualified_release_bytes
+            .saturating_add(self.assisted_work.qualified_release_bytes);
+        let flight_limit = self
+            .geometry
+            .candidate_flight_limit_bytes(qualified_release_bytes);
+        let flight_credit = ledger
+            .unresolved_bytes()
+            .map_or(0, |unresolved| flight_limit.saturating_sub(unresolved));
+        phase_credit.min(flight_credit)
+    }
+
+    /// Reports whether every candidate assignment owned by the current phase
+    /// has reached this coordinator through the ordered Product-ACK receipt
+    /// stream.
+    ///
+    /// Native flight can become empty before the corresponding receipt is
+    /// consumed.  Runtime must not attempt a causal phase transition in that
+    /// interval.
+    pub(crate) fn candidate_assignments_are_resolved(self) -> bool {
         match self.phase {
-            TcpCarrierValidationPhase::CandidateStartup => self
-                .geometry
-                .startup_coverage_bytes
-                .saturating_sub(self.startup.assigned_bytes),
-            TcpCarrierValidationPhase::Assisted if self.assisted.is_none() => self
-                .geometry
-                .cohort_coverage_bytes
-                .saturating_sub(self.assisted_work.assigned_bytes),
-            _ => 0,
+            TcpCarrierValidationPhase::CandidateStartup => {
+                self.startup.unresolved_bytes() == Some(0)
+            }
+            TcpCarrierValidationPhase::Assisted => self.assisted_work.unresolved_bytes() == Some(0),
+            _ => true,
         }
     }
 
     pub(crate) fn record_candidate_assignment(&mut self, bytes: u64) -> TcpCarrierValidationUpdate {
-        let valid = match self.phase {
-            TcpCarrierValidationPhase::CandidateStartup => self
-                .startup
-                .record_assignment(bytes, self.geometry.startup_coverage_bytes),
-            TcpCarrierValidationPhase::Assisted if self.assisted.is_none() => {
-                let within_phase = self
-                    .assisted_work
-                    .record_assignment(bytes, self.geometry.cohort_coverage_bytes);
-                let within_total = self
+        let within_flight = bytes > 0 && bytes <= self.candidate_assignment_credit_bytes();
+        let valid = within_flight
+            && match self.phase {
+                TcpCarrierValidationPhase::CandidateStartup => self
                     .startup
-                    .assigned_bytes
-                    .checked_add(self.assisted_work.assigned_bytes)
-                    .is_some_and(|total| total <= self.geometry.candidate_work_limit_bytes);
-                within_phase && within_total
-            }
-            _ => false,
-        };
+                    .record_assignment(bytes, self.geometry.startup_coverage_bytes),
+                TcpCarrierValidationPhase::Assisted if self.assisted.is_none() => {
+                    let within_phase = self
+                        .assisted_work
+                        .record_assignment(bytes, self.geometry.cohort_coverage_bytes);
+                    let within_total = self
+                        .startup
+                        .assigned_bytes
+                        .checked_add(self.assisted_work.assigned_bytes)
+                        .is_some_and(|total| total <= self.geometry.candidate_work_limit_bytes);
+                    within_phase && within_total
+                }
+                _ => false,
+            };
         if valid {
             TcpCarrierValidationUpdate::Pending
         } else {
@@ -364,15 +442,19 @@ impl TcpCarrierValidationState {
         resolved_bytes: u64,
         qualified_release_bytes: u64,
     ) -> TcpCarrierValidationUpdate {
-        let valid = match self.phase {
-            TcpCarrierValidationPhase::CandidateStartup => self
-                .startup
-                .record_resolution(resolved_bytes, qualified_release_bytes),
-            TcpCarrierValidationPhase::Assisted => self
-                .assisted_work
-                .record_resolution(resolved_bytes, qualified_release_bytes),
-            _ => false,
-        };
+        // Candidate service is admissible only with exact unique-original
+        // provenance. Once any assigned byte resolves ambiguously, the finite
+        // phase credit cannot establish the required candidate coverage.
+        let valid = resolved_bytes == qualified_release_bytes
+            && match self.phase {
+                TcpCarrierValidationPhase::CandidateStartup => self
+                    .startup
+                    .record_resolution(resolved_bytes, qualified_release_bytes),
+                TcpCarrierValidationPhase::Assisted => self
+                    .assisted_work
+                    .record_resolution(resolved_bytes, qualified_release_bytes),
+                _ => false,
+            };
         if valid {
             TcpCarrierValidationUpdate::Pending
         } else {
@@ -409,7 +491,7 @@ impl TcpCarrierValidationState {
             TcpCarrierValidationPhase::Assisted
                 if self.assisted.is_none()
                     && self.assisted_work.qualified_release_bytes
-                        >= self.geometry.rate_window_bytes
+                        == self.geometry.cohort_coverage_bytes
                     && candidate_bytes == self.assisted_work.qualified_release_bytes =>
             {
                 self.assisted = Some(cohort);
@@ -454,7 +536,7 @@ impl TcpCarrierValidationState {
                 if self.assisted.is_some()
                     && self.assisted_work.unresolved_bytes() == Some(0)
                     && self.assisted.is_some_and(|cohort| {
-                        cohort.candidate_bytes >= self.geometry.rate_window_bytes
+                        cohort.candidate_bytes == self.geometry.cohort_coverage_bytes
                     }) =>
             {
                 Some(TcpCarrierValidationPhase::Confirmation)

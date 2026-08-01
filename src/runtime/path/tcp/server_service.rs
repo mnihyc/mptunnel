@@ -177,6 +177,7 @@ struct ServerTcpCarrierWorkload {
     lane: TrafficClass,
     queued_unique_original: bool,
     demand_generation: Option<NonZeroU64>,
+    last_issued_demand_key: Option<ServerTcpCarrierDemandKey>,
     validation_offers: mpsc::Sender<ServerTcpCarrierValidationOffer>,
 }
 
@@ -402,6 +403,7 @@ impl ServerTcpCarrierService {
                 lane: TrafficClass::Latency,
                 queued_unique_original: false,
                 demand_generation: None,
+                last_issued_demand_key: None,
                 validation_offers,
             },
         );
@@ -462,7 +464,10 @@ impl ServerTcpCarrierService {
         if current_identity != identity {
             return None;
         }
-        let throughput_demand = lane == TrafficClass::Throughput && queued_unique_original;
+        // The classifier owns the continuous demand episode. A bounded sender
+        // queue may momentarily drain because ordinary placement succeeded;
+        // that is not an idle transition and must not mint a new generation.
+        let throughput_demand = lane == TrafficClass::Throughput;
         let demand_generation = match (current_demand_generation, throughput_demand) {
             (Some(generation), true) => Some(generation),
             (None, true) => Some(take_sequence(&mut state.next_demand_generation)?),
@@ -579,7 +584,6 @@ impl ServerTcpCarrierService {
         if target.identity != identity
             || target.demand_generation != Some(demand_generation)
             || target.lane != TrafficClass::Throughput
-            || !target.queued_unique_original
             || state.realtime_workloads != 0
             || state.workloads.values().any(|workload| {
                 workload.queued_unique_original && workload.lane.is_latency_sensitive()
@@ -613,11 +617,31 @@ impl ServerTcpCarrierService {
         {
             return None;
         }
+        if state
+            .demand
+            .as_ref()
+            .is_some_and(|demand| !demand.validation_started && demand.key.target != identity)
+        {
+            return None;
+        }
+        if state
+            .workloads
+            .get(&identity.stream_id)
+            .and_then(|workload| workload.last_issued_demand_key.as_ref())
+            == Some(&key)
+        {
+            return None;
+        }
         let request_id = take_sequence(&mut state.next_request_id)?;
         let publication = ServerTcpCarrierDemand {
             request_id,
             stream_id: Some(identity.stream_id),
         };
+        state
+            .workloads
+            .get_mut(&identity.stream_id)
+            .expect("validated target remains registered")
+            .last_issued_demand_key = Some(key.clone());
         state.demand = Some(ServerTcpCarrierDemandState {
             publication,
             key,
@@ -673,7 +697,6 @@ impl ServerTcpCarrierService {
             if target.identity != demand.key.target
                 || target.demand_generation != Some(demand.key.demand_generation)
                 || target.lane != TrafficClass::Throughput
-                || !target.queued_unique_original
                 || state.realtime_workloads != 0
                 || state.workloads.values().any(|workload| {
                     workload.queued_unique_original && workload.lane.is_latency_sensitive()
@@ -823,7 +846,6 @@ impl ServerTcpCarrierService {
                         target.identity == demand.key.target
                             && target.demand_generation == Some(demand.key.demand_generation)
                             && target.lane == TrafficClass::Throughput
-                            && target.queued_unique_original
                     })
                 && state.realtime_workloads == 0
                 && !state.workloads.values().any(|workload| {
@@ -931,6 +953,10 @@ impl ServerTcpCarrierWorkloadLease {
         self.validation_offers.take()
     }
 
+    /// Tracks one classifier-owned throughput-demand episode. Fresh queued
+    /// work remains an admission fact, but successful ordinary placement may
+    /// drain the bounded queue without ending the episode or changing its
+    /// generation.
     pub(in crate::runtime) fn update_demand(
         &mut self,
         lane: TrafficClass,

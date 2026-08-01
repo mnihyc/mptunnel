@@ -801,6 +801,14 @@ Ordinary scheduling, new stream or flow creation, datagrams, reinjection, and
 the opposite direction remain prohibited before their respective acknowledged
 authority.
 
+A validation-only attachment is a live owner of the exact Product flight
+assigned through its directional validation binding. It MUST therefore remain
+in ordered-flight and failure-recovery ownership until that binding is settled
+or atomically converted to ordinary membership. It remains absent from
+ordinary scheduling membership throughout validation. Unresolved work on a
+live validation-only attachment is not missing-owner work; only exact native
+failure or settlement may expose it to ordinary recovery.
+
 The client owns physical TCP establishment because only it knows the
 configured carrier group and its bounds. The sender owns demand and delivery
 evidence for its direction:
@@ -839,6 +847,10 @@ every older request and names the one current response-demand target. It
 remains current until superseded, withdrawn, or the target no longer satisfies
 Section 15.1. Each exact candidate uses a fresh validation ID on its own
 carrier.
+Present-stream supersession is a wire ordering rule, not authority for local
+demand churn. Section 15.1 admission ownership does not publish a different
+target merely because that target also becomes saturated while an unchanged,
+not-yet-admitted request remains current.
 Because different TCP carriers may fail or reorder session-level delivery, an
 exact duplicate of the current request is idempotent, an older request is
 ignored, and reuse of the current ID with different presence or stream content
@@ -1666,6 +1678,17 @@ session direction. Only a transition from successful ordinary placement to
 this condition admits an attempt; rechecking unchanged state, retained flight,
 reinjection, native buffer state, elapsed time, or ACK silence does not.
 
+The throughput-demand episode is owned by the existing Product demand
+classifier, not by an implementation queue snapshot. Fresh queued
+unique-original data is required at the successful-placement-to-saturation
+transition, but draining that queue through successful ordinary placement does
+not end an already-established episode while the classifier still reports
+throughput demand. The episode ends only when the existing classifier observes
+the absence of queued or pending Product work and crosses its normal idle
+boundary. Implementations MUST NOT turn a momentary work-conserving queue drain
+into a new admission generation or use it to withdraw an otherwise unchanged
+comparison.
+
 That transition creates one sender-owned admission generation for the
 continuous demand episode and its stable ordinary membership, authority,
 admission-policy, and resource-policy generations. Each eligible TCP carrier
@@ -1673,6 +1696,17 @@ group may be attempted at most once in it. A new demand episode, or a change to
 one of those stable generations, creates fresh admission authority; a timer,
 ACK silence, queue or credit oscillation, repeated blocked observation,
 candidate result, or candidate connection failure does not.
+
+For server-to-client expansion, the sender serializes target selection with
+that admission authority. While a current present request has not reached
+exact validation admission, saturation from another target MUST NOT replace
+it. The current target or frozen generations changing may supersede or withdraw
+it as already specified. After the request reaches validation and that exact
+transaction settles or fails, another eligible target may be selected, but a
+comparison key already issued for a target workload MUST NOT be published
+again. The sender therefore retains one latest issued comparison key per live
+target workload. This state is bounded by the existing workload envelope and
+contains no timer, queue occupancy, or transport sample.
 
 One MPP session has at most one unretained elastic carrier and one directional
 validation at a time. The candidate authenticates with `PATH_JOIN` purpose
@@ -1733,41 +1767,67 @@ below the frozen ordinary pipe. This is a reuse of established scheduling and
 resource geometry, not a new byte constant, percentage, or transport
 parameter. Geometry is never recomputed from candidate results.
 
+Candidate assignment reuses the Core's existing reliable-path flight model.
+Before `startup_coverage` has been released by unambiguous candidate-owned
+Data ACK, unresolved candidate original work MUST NOT exceed the unproven-path
+startup-flight limit. Afterwards it MUST NOT exceed `measurement_envelope`,
+the existing mature TCP Product-flight ceiling when the carrier exports no
+native congestion window. Cumulative phase credit and instantaneous flight
+credit are both enforced at every assignment. Candidate placement remains
+work-conserving within those bounds; neither an entire phase credit nor the
+carrier command queue is a second congestion window.
+
 The comparison has four contiguous placement phases under the frozen key:
 
 1. An ordinary reference cohort covers at least `cohort_coverage` qualified
-   target bytes while the target remains continuously queued and every
-   eligible ordinary carrier remains work-conserving. This phase begins only
+   target bytes and at least `cohort_coverage` qualified ordinary-carrier
+   aggregate bytes while the target remains in the same continuous throughput-
+   demand episode and every eligible ordinary carrier remains work-conserving.
+   This phase begins only
    after candidate readiness, validation admission, and key and geometry
    freeze; the authenticated candidate remains Product-idle throughout it.
 2. Candidate startup assigns exactly `startup_coverage` cumulative
    unique-original target bytes to the candidate under the candidate-flight
    and shared resource bounds, splitting the final Product frame when needed.
-   All of that work MUST resolve, and its unambiguous candidate-owned original
-   Data ACK releases MUST reach `startup_coverage`, before the next phase.
-   These releases establish exact provenance and startup maturity but enter no
-   comparison cohort.
+   All of that work MUST resolve through unambiguous candidate-owned original
+   Data ACK releases before the next phase. Native flight becoming empty does
+   not substitute for consumption of those ordered Product-ACK receipts.
+   Resolved repaired bytes do not contribute. These releases establish exact
+   provenance and startup maturity but enter no comparison cohort.
 3. A candidate-assisted cohort covers at least `cohort_coverage` qualified
-   target bytes with ordinary carriers still work-conserving. The candidate
-   MUST contribute at least one `rate_window` of unambiguous unique-original
-   target releases after startup. Candidate cumulative validation work is
-   bounded by the checked sum of `startup_coverage` and `cohort_coverage`.
+   target bytes and at least `cohort_coverage` qualified ordinary-carrier
+   aggregate bytes with ordinary carriers still work-conserving. Candidate-
+   attributed bytes do not satisfy the latter coverage. The candidate assigns
+   exactly one `cohort_coverage` and all of it MUST resolve through unambiguous
+   candidate-owned original Data ACK releases inside the assisted cohort.
+   Candidate cumulative validation work is bounded by the checked sum of
+   `startup_coverage` and `cohort_coverage`.
 4. New candidate placement stops. Confirmation begins only after the
    candidate's validation queue, original flight, recovery work, and reorder
    debt are zero. An ordinary confirmation cohort then covers at least
-   `cohort_coverage` qualified target bytes with the candidate Product-idle and
+   `cohort_coverage` qualified target bytes and `cohort_coverage` qualified
+   ordinary-carrier aggregate bytes with the candidate Product-idle and
    ordinary carriers work-conserving.
 
 Every cohort is seeded after a fully processed target Data ACK at a serialized
-writer boundary. Only originals assigned after that opening boundary and
-released by fully processed, unambiguous Data ACK enter it. Its closing Data
-ACK transaction is indivisible: all qualified releases from that transaction
-remain in the closing cohort even when they exceed the nominal byte coverage.
+writer boundary. Every unique original released by a fully processed,
+unambiguous Data ACK transaction completed on or after both opening boundaries
+enters the cohort, including ordinary work assigned before the boundary whose
+Product service completes inside the measured ACK interval. Assignment time
+is not service time and has no cohort-membership authority; exact carrier
+provenance is used only for candidate attribution. The closing Data ACK
+transaction is indivisible: all qualified
+releases from that transaction remain in the closing cohort even when they
+exceed the nominal byte coverage.
 The writer span and Data-ACK span MUST yield a positive effective elapsed time.
 Each cohort records target service and aggregate service by every stream in the
 frozen directional workload over identical opening and closing timestamps.
-Duplicate, reinjected, pre-boundary, ambiguous, unqualified, or
-foreign-workload releases may resolve ordinary state but contribute no
+The aggregate minus exact candidate-attributed bytes MUST cover one complete
+`cohort_coverage`; this makes every comparison observe a causally eligible
+ordinary service pipe instead of allowing fast candidate startup work to close
+the assisted cohort before ordinary post-boundary work turns over.
+Duplicate, reinjected, ambiguous, unqualified, foreign-workload, or
+pre-boundary-completed releases may resolve ordinary state but contribute no
 comparison bytes. At every phase boundary all phase-owned candidate work is
 resolved before the next writer and Data-ACK boundaries are seeded.
 

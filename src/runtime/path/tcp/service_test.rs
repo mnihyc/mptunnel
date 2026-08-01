@@ -204,7 +204,7 @@ fn demand_or_stable_generation_change_is_required_for_later_admission() {
     assert_eq!(second.admission_generation().get(), 2);
     drop(second);
 
-    assert!(workload.update_demand(TrafficClass::Throughput, false));
+    assert!(workload.update_demand(TrafficClass::Latency, false));
     assert!(workload.update_demand(TrafficClass::Throughput, true));
     assert!(workload.record_successful_ordinary_placement(changed_membership));
     let third = workload
@@ -319,6 +319,13 @@ fn frozen_workload_membership_and_geometry_are_revalidated() {
         .collect::<Vec<_>>();
     assert!(admission.revalidate(authority, &ordinary_instances));
     assert!(admission.begin_validation());
+
+    assert!(target.update_demand(TrafficClass::Throughput, false));
+    assert!(
+        !admission.is_withdrawn() && admission.revalidate(authority, &ordinary_instances),
+        "successful placement may drain the bounded queue without ending the throughput episode"
+    );
+    assert!(target.update_demand(TrafficClass::Throughput, true));
 
     let added = service
         .register_workload(StreamId(18))

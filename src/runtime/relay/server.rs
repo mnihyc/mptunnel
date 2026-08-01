@@ -1248,6 +1248,7 @@ async fn drain_server_response_sender_ready(
     send_stream: &mut ReliableSendStream,
     relay_lane: TrafficClass,
     mux_limits: MuxLimits,
+    sender_dispatch_quantum_bytes: usize,
     sender_dispatch_byte_budget: usize,
     sender_dispatch_item_budget: usize,
     stats: &mut PathDeliveryStats,
@@ -1271,9 +1272,11 @@ async fn drain_server_response_sender_ready(
             Ok(ServerQueuedDispatch::Dispatched(dispatch)) => dispatch,
             Ok(ServerQueuedDispatch::OrdinarySaturation(saturation)) => {
                 if let Some(validation) = s2c_tcp_validation.as_mut() {
-                    let candidate_quantum = sender_dispatch_byte_budget
-                        .saturating_sub(dispatched_payload_bytes)
-                        .min(path_stream.max_frame_payload_bytes);
+                    let candidate_quantum = sender_dispatch_quantum_bytes.min(
+                        sender_dispatch_byte_budget
+                            .saturating_sub(dispatched_payload_bytes)
+                            .min(path_stream.max_frame_payload_bytes),
+                    );
                     if let Some(payload_bytes) = validation.dispatch_candidate(
                         response_sender,
                         send_stream,
@@ -1573,6 +1576,7 @@ where
         relay_lane_startup_chunk_bytes(close.lane, mux_limits)
             .min(path_stream.max_frame_payload_bytes)
             .max(1);
+    let mut last_sender_dispatch_quantum_bytes = last_sender_dispatch_byte_budget;
     let mut last_sender_dispatch_item_budget = 1usize;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(TrafficClass, usize, usize)> = None;
@@ -1903,6 +1907,7 @@ where
                 sender_queue_limit,
             );
         close.lane = relay_lane;
+        last_sender_dispatch_quantum_bytes = adaptive_chunk;
         last_sender_dispatch_byte_budget = sender_dispatch_byte_budget;
         last_sender_dispatch_item_budget = sender_dispatch_item_budget;
         #[cfg(feature = "lab-diagnostics")]
@@ -2093,6 +2098,7 @@ where
                 &mut send_stream,
                 relay_lane,
                 mux_limits,
+                adaptive_chunk,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
                 &mut stats,
@@ -2671,6 +2677,7 @@ where
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
+                    adaptive_chunk,
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
@@ -2829,6 +2836,7 @@ where
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
+                    adaptive_chunk,
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
@@ -2911,6 +2919,7 @@ where
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
+                    adaptive_chunk,
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
@@ -2946,6 +2955,7 @@ where
                 &mut send_stream,
                 relay_lane,
                 mux_limits,
+                adaptive_chunk,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
                 &mut stats,
@@ -2972,6 +2982,7 @@ where
                 &mut send_stream,
                 relay_lane,
                 mux_limits,
+                adaptive_chunk,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
                 &mut stats,
@@ -3127,6 +3138,7 @@ where
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
+                        adaptive_chunk,
                         sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
                         &mut stats,
@@ -3165,6 +3177,7 @@ where
                 &mut send_stream,
                 close.lane,
                 mux_limits,
+                last_sender_dispatch_quantum_bytes,
                 last_sender_dispatch_byte_budget,
                 last_sender_dispatch_item_budget,
                 &mut stats,

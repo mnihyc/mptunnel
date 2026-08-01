@@ -11,6 +11,73 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T03:59:13+08:00: elastic TCP validation restores useful parallel service
+
+- Name: RFC-conformant `1..3` TCP carrier validation in both Product directions
+- Category: Core lifecycle, causal measurement, and targeted performance proof
+- State: implementation, correctness, and the preregistered single-flow-QoS
+  gate are accepted; the frozen representative and disruption matrix remains
+  the next release gate
+- Clean model:
+  - the existing Product classifier owns a continuous throughput-demand
+    episode; successful work-conserving queue drains neither mint a generation
+    nor withdraw an unchanged comparison;
+  - each comparison freezes its ordinary membership and model-derived byte
+    geometry, requires complete candidate and ordinary service coverage, and
+    advances only after ordered Product-ACK receipts resolve exact candidate
+    assignments;
+  - a validation-only attachment is a live owner of its exact ordered Product
+    flight and recovery while remaining outside ordinary scheduling; RETAIN
+    atomically converts that owner into ordinary membership, while failure or
+    withdrawal settles it before the existing recovery path can act; and
+  - candidate flight reuses the existing unproven-path startup and mature
+    Product envelopes. No scheduler score, congestion controller, timing,
+    percentage, carrier-range default, or new fixed threshold was introduced.
+- Reproduced root cause and correction:
+  - the candidate's original flight was recorded in the shared request ledger
+    while the candidate was absent from the live owner topology;
+  - ordinary placement consequently observed missing original ownership before
+    candidate dispatch, reinjected the work, and serialized upload validation;
+  - making the validation attachment an explicit lifecycle owner corrects that
+    data-flow contradiction without granting it ordinary scheduling authority;
+    and
+  - the one stale actor test was corrected to withdraw at a real classifier
+    transition rather than a momentary queue drain; it then passed 50
+    consecutive executions.
+- Targeted 100-Mbit/s per-flow-QoS evidence:
+  - client-to-server upload improved from 76.088 Mbit/s with `1..1` to
+    121.871 Mbit/s with `1..3` in the paired root-cause run;
+  - in the complete eight-case confirmation, download improved from 75.246 to
+    133.130 Mbit/s and upload from 75.675 to 139.136 Mbit/s;
+  - shared-bottleneck download was 158.424 versus 150.129 Mbit/s, a 5.2%
+    adjacent-run difference, while upload was 158.748 versus 159.831 Mbit/s;
+    no strict fluctuation cap is inferred from adjacent lab samples; and
+  - every case reported zero recovery gap and zero qdisc drops. The formal lab
+  host-validity gate remained false solely because an unrelated external
+  Docker container was already running, so release acceptance must use a
+  clean host or the exact CI environment.
+- Rate-stability diagnosis:
+  - the 200-ms upload trace attributes each cumulative ACK delta to its receipt
+    bucket, so its zero/spike pattern is not an instantaneous-rate signal;
+  - one-second interface counters reproduce the same samples 11/22 troughs in
+    `1..1` controls, shared-bottleneck runs, and shaped direct/Xray/Hysteria
+    traffic without carrier failure, retirement, qdisc drops, or ownership
+    change; and
+  - the troughs correlate with bounded sender-side qdisc backpressure and
+    resume on ACK release. No MPTUNNEL change is justified unless an unshaped
+    representative case reproduces instability.
+- Verification:
+  - `cargo test --locked --all-targets --all-features` passes 1,507 library
+    tests, two allocation tests, and six packaged daily-use acceptance tests;
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+    formatting, and whitespace checks pass; and
+  - the correction is symmetric across neutral request/response Product
+    ownership and contains no OS-specific branch.
+- Next: commit this bounded Core milestone, then run the frozen representative
+  throughput, aggregation, failover, whole-link swap, outage/restart, latency,
+  resource, and competitor-baseline matrix without further model change unless
+  it exposes a reproducible lifecycle or data-flow defect.
+
 ## 2026-08-02T00:41:10+08:00: maintained Quinn baseline updated to 0.11.16
 
 - Name: exact `quinn-proto` upstream refresh with the MPTUNNEL patch intact

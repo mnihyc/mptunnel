@@ -302,7 +302,7 @@ fn byte_threshold_classifies_bulk_even_when_average_rate_is_low() {
 }
 
 #[test]
-fn latency_startup_credit_stops_at_the_unconditional_bulk_threshold() {
+fn latency_startup_credit_follows_the_directional_demand_episode() {
     let limits = MuxLimits::default();
     let path = PathSnapshot::new(
         crate::protocol::PathId(0),
@@ -317,42 +317,62 @@ fn latency_startup_credit_stops_at_the_unconditional_bulk_threshold() {
         "test path must have a BDP above one relay quantum"
     );
 
-    assert_eq!(
-        reliable_latency_startup_credit_remaining_bytes(
-            TrafficClass::Latency,
-            Some(path),
-            threshold.saturating_sub(1),
-            0,
-            limits,
-        ),
-        1
+    let mut tracker = ReliableRelayFlowDemandTracker::new();
+    let historical_offset = threshold;
+    let initial_bulk = tracker.refresh(
+        ReliableRelayFlowSignals::new(historical_offset, 0),
+        Some(path),
+        limits,
     );
+    assert_eq!(initial_bulk.lane, TrafficClass::Throughput);
     assert_eq!(
-        reliable_latency_startup_credit_remaining_bytes(
-            TrafficClass::Latency,
-            Some(path),
-            threshold,
-            0,
-            limits,
-        ),
-        0
-    );
-    assert_eq!(
-        reliable_latency_startup_credit_remaining_bytes(
-            TrafficClass::Latency,
-            Some(path),
-            threshold / 2,
-            usize::try_from(threshold - threshold / 2).unwrap(),
-            limits,
-        ),
-        0
-    );
-    assert_eq!(
-        reliable_latency_startup_credit_remaining_bytes(
+        tracker.latency_startup_credit_remaining_bytes(
             TrafficClass::Throughput,
             Some(path),
-            threshold,
-            usize::MAX,
+            limits,
+        ),
+        usize::MAX
+    );
+
+    tracker.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(Some(path));
+    let idle = tracker.refresh(
+        ReliableRelayFlowSignals::new(historical_offset, 0),
+        Some(path),
+        limits,
+    );
+    assert_eq!(idle.lane, TrafficClass::Latency);
+    assert_eq!(
+        tracker.latency_startup_credit_remaining_bytes(TrafficClass::Latency, Some(path), limits,),
+        usize::try_from(threshold).unwrap(),
+        "lifetime stream volume must not consume a fresh demand episode's bounded credit"
+    );
+
+    // Make byte volume, rather than the independent rate signal, own the
+    // remainder of this assertion.
+    tracker.epoch_started_at = Some(Instant::now() - Duration::from_secs(60));
+    let almost_bulk_offset = historical_offset.saturating_add(threshold.saturating_sub(1));
+    let almost_bulk = tracker.refresh(
+        ReliableRelayFlowSignals::new(almost_bulk_offset, 0),
+        Some(path),
+        limits,
+    );
+    assert_eq!(almost_bulk.lane, TrafficClass::Latency);
+
+    assert_eq!(
+        tracker.latency_startup_credit_remaining_bytes(TrafficClass::Latency, Some(path), limits,),
+        1
+    );
+
+    let reproven = tracker.refresh(
+        ReliableRelayFlowSignals::new(almost_bulk_offset.saturating_add(1), 0),
+        Some(path),
+        limits,
+    );
+    assert_eq!(reproven.lane, TrafficClass::Throughput);
+    assert_eq!(
+        tracker.latency_startup_credit_remaining_bytes(
+            TrafficClass::Throughput,
+            Some(path),
             limits,
         ),
         usize::MAX

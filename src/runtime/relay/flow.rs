@@ -87,6 +87,24 @@ impl ReliableRelayFlowDemandTracker {
         self.current
     }
 
+    /// Returns the source admission still available while the active relay
+    /// lane is latency-oriented. Credit belongs to this demand episode, not
+    /// to the reliable stream's lifetime Data Sequence offset.
+    pub(in crate::runtime) fn latency_startup_credit_remaining_bytes(
+        &self,
+        active_lane: TrafficClass,
+        path: Option<PathSnapshot>,
+        mux_limits: MuxLimits,
+    ) -> usize {
+        if active_lane != TrafficClass::Latency {
+            return usize::MAX;
+        }
+        // Admission and unconditional byte classification share one boundary.
+        // The classifier's idle transition starts a fresh bounded episode.
+        let cap = reliable_flow_bulk_threshold_bytes(path, mux_limits);
+        usize::try_from(cap.saturating_sub(self.epoch_bytes)).unwrap_or(usize::MAX)
+    }
+
     pub(in crate::runtime) fn refresh(
         &mut self,
         signals: ReliableRelayFlowSignals,
@@ -289,24 +307,6 @@ pub(in crate::runtime) fn reliable_relay_bulk_path_open_threshold_bytes(
     } else {
         amortized_probe_floor.clamp(initial_window.saturating_add(1), bulk_floor)
     }
-}
-
-pub(in crate::runtime) fn reliable_latency_startup_credit_remaining_bytes(
-    lane: TrafficClass,
-    path: Option<PathSnapshot>,
-    sent_offset: u64,
-    queued_data_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    if lane != TrafficClass::Latency {
-        return usize::MAX;
-    }
-    // The admission boundary and unconditional byte classifier must be the
-    // same model value. A lower ceiling can stop source reads before the relay
-    // has enough evidence to leave latency-oriented scheduling.
-    let cap = reliable_flow_bulk_threshold_bytes(path, mux_limits);
-    let committed = sent_offset.saturating_add(queued_data_bytes as u64);
-    usize::try_from(cap.saturating_sub(committed)).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]

@@ -11,6 +11,64 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T05:32:13+08:00: reliable response demand-episode self-lock removed
+
+- Name: directional Product-episode admission across idle transitions
+- Category: Core lifecycle correctness and repeated disruption proof
+- State: deterministic mixed-carrier terminal stall is corrected and accepted;
+  the frozen representative and disruption matrix remains the next release
+  gate
+- Causal defect:
+  - the Product classifier correctly ended a drained throughput-demand episode
+    at its established idle boundary, but latency-oriented source admission
+    continued subtracting the reliable stream's lifetime Data Sequence offset;
+  - after one long response exceeded the adaptive classification boundary,
+    lifetime-based credit remained permanently zero, so the target socket was
+    no longer polled and no fresh demand could reclassify the stream; and
+  - causal diagnostics reproduced the self-lock exactly when Product ACK
+    reached the full 635,733,664-byte response frontier, pending delivery and
+    queues reached zero, and the lane returned to latency-oriented service.
+- Clean correction:
+  - finite response-source admission is now owned by the existing directional
+    Product demand tracker and its resettable episode bytes;
+  - the admission and unconditional classifier retain the same existing
+    adaptive boundary, and the existing idle transition alone grants a fresh
+    bounded episode;
+  - moving admitted response data from its queue into assigned offsets does not
+    count it twice, while queued or pending delivery continues to prevent an
+    idle reset; and
+  - no timer, threshold, configured limit, scheduler score, transport branch,
+    congestion controller, pacing rule, or platform-specific path changed.
+- Repeated normal-release evidence under the frozen mixed TCP+QUIC balanced
+  blackhole profile:
+  - four consecutive 20-second runs delivered 306.607, 307.406, 386.169, and
+    392.997 Mbit/s, with maximum bulk read gaps of 0.486, 0.791, 0.393, and
+    0.567 seconds respectively;
+  - all four retained continuous bulk progress through the former failure
+    point, with zero interactive and small-flow failures; the earlier repeated
+    5-14 second plateaus did not recur;
+  - realtime datagram loss was 0%, 1.948%, 0.543%, and 0.495% during the
+    injected blackhole and remains a separate frozen disruption-matrix result,
+    not justification for another Core change; and
+  - one-second management and container snapshots are retained under
+    `./.tmp/lab/results/v014-epoch-fix-{1,2,3,4}`. Formal comparability remains
+    false solely because the versioned host-validity gate detects the unrelated
+    external Docker container already documented for this host.
+- Verification:
+  - a durable composed lifecycle regression proves historical bulk, complete
+    drain, idle reset, fresh bounded credit, exact credit consumption, and
+    promotion at the unchanged boundary;
+  - `cargo test --locked --all-features` passes 1,507 library tests, two
+    allocation tests, six packaged daily-use acceptance tests, and doctests;
+  - strict all-target/all-feature Clippy, formatting, and whitespace checks
+    pass; and
+  - the normal release binary was rebuilt without lab diagnostics before every
+    repeated performance run.
+- Next: execute the already-frozen representative and disruption matrix,
+  including healthy controls, whole-link condition swap, outage/restart,
+  port-hopping, latency, resources, and competitor baselines; change the model
+  only if a reproducible causal lifecycle or data-flow contradiction remains.
+
 ## 2026-08-02T03:59:13+08:00: elastic TCP validation restores useful parallel service
 
 - Name: RFC-conformant `1..3` TCP carrier validation in both Product directions

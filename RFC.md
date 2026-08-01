@@ -1689,6 +1689,15 @@ boundary. Implementations MUST NOT turn a momentary work-conserving queue drain
 into a new admission generation or use it to withdraw an otherwise unchanged
 comparison.
 
+Finite source admission while a reliable relay is latency-oriented is scoped
+to that direction's current Product demand episode. It MUST use the same
+adaptive byte boundary as unconditional throughput classification. When the
+classifier crosses its normal idle boundary, the new episode receives fresh
+bounded admission; the reliable stream's lifetime Data Sequence offset MUST
+NOT consume that credit. Queued unique-original data counts once when admitted,
+moving it from the sender queue into assigned offsets does not count it again,
+and pending delivery prevents the episode from being declared idle.
+
 That transition creates one sender-owned admission generation for the
 continuous demand episode and its stable ordinary membership, authority,
 admission-policy, and resource-policy generations. Each eligible TCP carrier

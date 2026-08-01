@@ -4,10 +4,7 @@
 //! carrier-neutral lifetime from target connection through ordered close.
 
 use super::diagnostics::log_unexpected_stream_relay_frame;
-use super::flow::{
-    ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals,
-    reliable_latency_startup_credit_remaining_bytes,
-};
+use super::flow::{ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals};
 #[cfg(feature = "lab-diagnostics")]
 use super::io::normalized_stream_ack_first_gap;
 use super::io::{
@@ -1874,11 +1871,9 @@ where
         let inflight_limit =
             adaptive_reliable_relay_inflight_bytes(send_path_snapshot, relay_lane, mux_limits);
         let sender_queue_limit = reliable_relay_sender_queue_limit(mux_limits, inflight_limit);
-        let latency_startup_credit = reliable_latency_startup_credit_remaining_bytes(
+        let latency_startup_credit = response_flow_demand.latency_startup_credit_remaining_bytes(
             relay_lane,
             classifier_path,
-            send_stream.next_offset(),
-            response_sender.data_bytes(),
             mux_limits,
         );
         let source_staging_headroom = reliable_relay_source_staging_headroom(

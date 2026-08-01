@@ -10,7 +10,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 

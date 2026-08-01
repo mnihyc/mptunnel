@@ -266,13 +266,13 @@ separate platform evidence cells.
 ## 5. Exact Quinn patch
 
 `crates/quinn-proto/` is the complete crates.io source of `quinn-proto`
-0.11.15 with registry SHA-256:
+0.11.16 with registry SHA-256:
 
 ```text
-4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e
+2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560
 ```
 
-The root manifest requires exactly `=0.11.15` and overrides it with this path.
+The root manifest requires exactly `=0.11.16` and overrides it with this path.
 It is the only package under `crates/`.
 
 The production semantic delta is limited to:

@@ -35,7 +35,7 @@ ipnet = "2.11"
 netstack-smoltcp = "0.2.4"
 percent-encoding = "2.3"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
-quinn-proto = { version = "=0.11.15", default-features = false }
+quinn-proto = { version = "=0.11.16", default-features = false }
 regex = { version = "1.12", default-features = false, features = ["perf", "std", "unicode-case"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }

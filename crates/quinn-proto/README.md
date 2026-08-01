@@ -1,14 +1,14 @@
 # MPTUNNEL Quinn protocol patch
 
-This core crate contains the crates.io source for `quinn-proto` 0.11.15,
-checksum `4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e`,
+This core crate contains the crates.io source for `quinn-proto` 0.11.16,
+checksum `2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560`,
 plus MPTUNNEL's performance-critical congestion-control patch. The upstream
 MIT and Apache-2.0 licenses are included unchanged.
 
 The local patch keeps Quinn's public congestion-controller boundary while
 aligning its experimental BBR implementation with the delivery-rate and pacing
 model used by the reference algorithm. The semantic deviations from upstream
-0.11.15 are:
+0.11.16 are:
 
 - each ack-eliciting packet records a compact controller delivery snapshot;
   Quinn's existing packet state supplies the packet number and
@@ -28,7 +28,9 @@ model used by the reference algorithm. The semantic deviations from upstream
   the first RTT sample instead of entering ProbeRTT on the first useful ACK.
 
 The added BBR, bandwidth-estimator, pacer, and path-lifecycle tests cover these
-changes. No unrelated upstream source file differs from 0.11.15.
+changes. No unrelated upstream source file differs from 0.11.16. The 0.11.16
+refresh first applies upstream's rand 0.10 and dependency baseline, then ports
+the MPTUNNEL delta across the overlapping BBR and connection plumbing files.
 
 The exact full-source mirror is deliberate: the required delivery, ACK/loss,
 pacing, and network-path hooks cross private Quinn internals and cannot be

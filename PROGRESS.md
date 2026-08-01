@@ -11,6 +11,46 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T00:41:10+08:00: maintained Quinn baseline updated to 0.11.16
+
+- Name: exact `quinn-proto` upstream refresh with the MPTUNNEL patch intact
+- Category: Core dependency provenance and performance change control
+- State: source, dependency, and correctness gates accepted; matched runtime
+  performance remains the next release gate
+- Provenance and port:
+  - the crates.io `quinn-proto-0.11.16.crate` archive has SHA-256
+    `2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560`;
+  - the upstream source change is the rand 0.10 migration and its published
+    dependency baseline, including the upstream BBR RNG change from `StdRng`
+    to `Pcg32`;
+  - all nonoverlapping upstream files were applied unchanged, while the four
+    overlapping files retain both upstream's `RngExt`/`Pcg32` changes and the
+    existing MPTUNNEL delivery-sampling plumbing; and
+  - a clean source comparison leaves exactly the documented MPTUNNEL BBR,
+    delivery-state, pacing, fresh-network-path, and associated regression-test
+    files different from upstream 0.11.16.
+- Repository contract:
+  - the root manifest now pins exactly `=0.11.16` and the root, standalone
+    Quinn, and benchmark lockfiles resolve that local path package;
+  - `./crates` still contains only the complete `quinn-proto` mirror; and
+  - the fork README and Core performance plan record the new checksum,
+    semantic delta, overlap handling, and reproducible update procedure.
+- Verification:
+  - the standalone fork passes 282 unit tests and three doc tests;
+  - `cargo test --locked --all-targets --all-features` passes 1,503 library
+    tests, two allocation tests, and six packaged daily-use acceptance tests;
+  - the benchmark crate passes all five deterministic tests;
+  - both root and benchmark `cargo tree` output identify only local
+    `quinn-proto v0.11.16`; and
+  - root clippy with warnings denied, formatting, and whitespace checks pass.
+- Performance boundary: the MPTUNNEL congestion, pacing, scheduling, timing,
+  and protocol parameters did not change; the preregistered matched QUIC and
+  full representative matrix must still prove that the upstream refresh did
+  not regress observable behavior.
+- Next: run the frozen representative performance, aggregation, failover,
+  whole-link swap, outage/restart, latency, resource, and competitor-baseline
+  gates; change code only for a reproducible root cause.
+
 ## 2026-08-02T00:30:13+08:00: server-to-client elastic TCP transaction closed
 
 - Name: exact S2C TCP carrier validation, retention, and recovery

@@ -1,4 +1,4 @@
-//! Target-relay ownership for one client-to-server TCP carrier validation.
+//! Target-relay ownership for client-side TCP carrier validation.
 //!
 //! The coordinator stays outside generic relay state. It joins session-owned
 //! admission, the validation-purpose carrier actor, exact Product assignment
@@ -20,8 +20,8 @@ use crate::runtime::path::tcp::client_validation::{
     ClientTcpValidationHandoff, ClientTcpValidationSession,
 };
 use crate::runtime::path::tcp::service::{
-    ClientTcpCarrierObservation, ClientTcpCarrierOrdinaryService, ClientTcpCarrierSaturation,
-    ClientTcpCarrierWorkloadLease,
+    ClientTcpCarrierDemand, ClientTcpCarrierObservation, ClientTcpCarrierOrdinaryService,
+    ClientTcpCarrierSaturation, ClientTcpCarrierWorkloadLease,
 };
 use crate::runtime::sender::{
     ProductWorkloadIdentity, ReliableRelaySenderQueue, RequestOrdinarySaturationObservation,
@@ -43,24 +43,24 @@ pub(super) enum ProductCohortKind {
 }
 
 #[derive(Debug)]
-struct ProductCohort {
-    kind: ProductCohortKind,
-    opening_writer_at: Instant,
-    opening_ack_at: Instant,
-    target_bytes: u64,
-    aggregate_bytes: u64,
-    candidate_bytes: u64,
+pub(super) struct ProductCohort {
+    pub(super) kind: ProductCohortKind,
+    pub(super) opening_writer_at: Instant,
+    pub(super) opening_ack_at: Instant,
+    pub(super) target_bytes: u64,
+    pub(super) aggregate_bytes: u64,
+    pub(super) candidate_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CompleteProductCohort {
-    kind: ProductCohortKind,
-    opening_writer_at: Instant,
-    opening_ack_at: Instant,
-    closing_ack_at: Instant,
-    target_bytes: u64,
-    aggregate_bytes: u64,
-    candidate_bytes: u64,
+    pub(super) kind: ProductCohortKind,
+    pub(super) opening_writer_at: Instant,
+    pub(super) opening_ack_at: Instant,
+    pub(super) closing_ack_at: Instant,
+    pub(super) target_bytes: u64,
+    pub(super) aggregate_bytes: u64,
+    pub(super) candidate_bytes: u64,
 }
 
 pub(super) enum WriterBoundaryPurpose {
@@ -434,6 +434,11 @@ impl ClientC2sTcpValidation {
                 }
                 self.finished = true;
                 ClientC2sTcpValidationAction::Finished
+            }
+            ClientTcpValidationEvent::ReceiverAdmitted { .. }
+            | ClientTcpValidationEvent::ResultReceived { .. } => {
+                self.withdraw();
+                ClientC2sTcpValidationAction::RecoverCandidate(self.candidate_instance)
             }
         }
     }
@@ -817,6 +822,242 @@ async fn wait_optional_task<T>(
 pub(super) async fn receive_client_c2s_tcp_validation(
     validation: &mut Option<ClientC2sTcpValidation>,
 ) -> Option<ClientC2sTcpValidationInput> {
+    match validation.as_mut() {
+        Some(validation) => Some(validation.next_input().await),
+        None => std::future::pending().await,
+    }
+}
+
+pub(super) enum ClientS2cTcpValidationInput {
+    CarrierEvent(Option<ClientTcpValidationEvent>),
+    Acknowledgment(
+        TcpCarrierValidationResult,
+        Result<Result<(), RuntimeError>, tokio::task::JoinError>,
+    ),
+    CarrierFinished(Result<Result<(), RuntimeError>, tokio::task::JoinError>),
+}
+
+pub(super) enum ClientS2cTcpValidationAction {
+    None,
+    RemoteFrame(ReliableRelayRemoteFrame),
+    Retained(Box<ClientTcpValidationHandoff>),
+    Finished,
+}
+
+/// Receiver-side owner for one exact server-issued S2C demand. Product
+/// comparison and verdict remain entirely server-owned; this coordinator only
+/// preserves target-frame FIFO ordering before asking the carrier actor to
+/// serialize the matching acknowledgment.
+pub(super) struct ClientS2cTcpValidation {
+    request_id: NonZeroU64,
+    stream_id: crate::protocol::StreamId,
+    candidate_instance: RelayPathInstance,
+    validation_id: NonZeroU64,
+    controller: ClientTcpValidationController,
+    carrier_events: Option<mpsc::Receiver<ClientTcpValidationEvent>>,
+    carrier_task: Option<JoinHandle<Result<(), RuntimeError>>>,
+    acknowledgment: Option<(
+        TcpCarrierValidationResult,
+        JoinHandle<Result<(), RuntimeError>>,
+    )>,
+    result: Option<TcpCarrierValidationResult>,
+    finished: bool,
+}
+
+impl ClientS2cTcpValidation {
+    pub(super) fn admit(
+        context: &ClientPathContext,
+        demand: ClientTcpCarrierDemand,
+        target_stream_id: crate::protocol::StreamId,
+    ) -> Result<Option<Self>, RuntimeError> {
+        if demand.stream_id != Some(target_stream_id) {
+            return Ok(None);
+        }
+        let Some(admission) = context.claim_server_to_client_tcp_carrier(demand) else {
+            return Ok(None);
+        };
+        let request_id = admission.request_id();
+        let validation_id = admission.validation_id();
+        let stream_id = admission.stream_id();
+        let config_index = admission.config_index();
+        let member_path_index = context
+            .tcp_endpoint(config_index)
+            .and_then(|group| group.members.first())
+            .copied()
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        let session = context
+            .tcp_sessions
+            .get(member_path_index)
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        let actor_admission = session.s2c_validation_admission(
+            admission,
+            tokio::time::Instant::now() + context.path_probe_timeout,
+        )?;
+        let candidate_instance = actor_admission.instance();
+        let (carrier, controller, carrier_events) =
+            ClientTcpValidationSession::new(actor_admission);
+        let carrier_task = tokio::spawn(carrier.run());
+        Ok(Some(Self {
+            request_id,
+            stream_id,
+            candidate_instance,
+            validation_id,
+            controller,
+            carrier_events: Some(carrier_events),
+            carrier_task: Some(carrier_task),
+            acknowledgment: None,
+            result: None,
+            finished: false,
+        }))
+    }
+
+    pub(super) fn matches_demand(&self, demand: ClientTcpCarrierDemand) -> bool {
+        demand.request_id == self.request_id && demand.stream_id == Some(self.stream_id)
+    }
+
+    pub(super) async fn next_input(&mut self) -> ClientS2cTcpValidationInput {
+        tokio::select! {
+            biased;
+            event = recv_optional(self.carrier_events.as_mut()) => {
+                ClientS2cTcpValidationInput::CarrierEvent(event)
+            }
+            completion = wait_optional_task(
+                self.acknowledgment.as_mut().map(|(_, task)| task)
+            ) => {
+                let (result, _) = self.acknowledgment
+                    .take()
+                    .expect("completed S2C acknowledgment remains owned");
+                ClientS2cTcpValidationInput::Acknowledgment(result, completion)
+            }
+            completion = wait_optional_task(self.carrier_task.as_mut()) => {
+                self.carrier_task = None;
+                ClientS2cTcpValidationInput::CarrierFinished(completion)
+            }
+        }
+    }
+
+    pub(super) fn handle_input(
+        &mut self,
+        input: ClientS2cTcpValidationInput,
+    ) -> ClientS2cTcpValidationAction {
+        match input {
+            ClientS2cTcpValidationInput::CarrierEvent(Some(event)) => {
+                self.handle_carrier_event(event)
+            }
+            ClientS2cTcpValidationInput::CarrierEvent(None) => {
+                self.carrier_events = None;
+                ClientS2cTcpValidationAction::None
+            }
+            ClientS2cTcpValidationInput::Acknowledgment(result, completion) => {
+                if !matches!(completion, Ok(Ok(()))) || self.result != Some(result) {
+                    self.finished = true;
+                    ClientS2cTcpValidationAction::Finished
+                } else {
+                    ClientS2cTcpValidationAction::None
+                }
+            }
+            ClientS2cTcpValidationInput::CarrierFinished(completion) => {
+                drop(completion);
+                self.carrier_task = None;
+                self.finished = true;
+                ClientS2cTcpValidationAction::Finished
+            }
+        }
+    }
+
+    fn handle_carrier_event(
+        &mut self,
+        event: ClientTcpValidationEvent,
+    ) -> ClientS2cTcpValidationAction {
+        match event {
+            ClientTcpValidationEvent::ReceiverAdmitted { candidate } => {
+                if !self.exact_candidate(candidate) {
+                    self.finished = true;
+                    return ClientS2cTcpValidationAction::Finished;
+                }
+                ClientS2cTcpValidationAction::None
+            }
+            ClientTcpValidationEvent::Control { candidate, frame } => {
+                if !self.exact_candidate(candidate) {
+                    self.finished = true;
+                    return ClientS2cTcpValidationAction::Finished;
+                }
+                match frame {
+                    frame @ Frame::StreamData { stream_id, .. } if stream_id == self.stream_id => {
+                        ClientS2cTcpValidationAction::RemoteFrame(ReliableRelayRemoteFrame {
+                            instance: candidate.instance,
+                            frame: Ok(frame),
+                        })
+                    }
+                    Frame::PathStatus { .. } => ClientS2cTcpValidationAction::None,
+                    _ => {
+                        self.finished = true;
+                        ClientS2cTcpValidationAction::Finished
+                    }
+                }
+            }
+            ClientTcpValidationEvent::ResultReceived { candidate, result } => {
+                if !self.exact_candidate(candidate)
+                    || self.result.replace(result).is_some()
+                    || self.acknowledgment.is_some()
+                {
+                    self.finished = true;
+                    return ClientS2cTcpValidationAction::Finished;
+                }
+                let controller = self.controller.clone();
+                self.acknowledgment = Some((
+                    result,
+                    tokio::spawn(async move {
+                        controller.acknowledge_server_to_client_result(result).await
+                    }),
+                ));
+                ClientS2cTcpValidationAction::None
+            }
+            ClientTcpValidationEvent::Retained(handoff) => {
+                if !self.exact_candidate(handoff.candidate)
+                    || self.result != Some(TcpCarrierValidationResult::Retain)
+                {
+                    self.finished = true;
+                    ClientS2cTcpValidationAction::Finished
+                } else {
+                    self.finished = true;
+                    ClientS2cTcpValidationAction::Retained(handoff)
+                }
+            }
+            ClientTcpValidationEvent::Drained { candidate } => {
+                if !self.exact_candidate(candidate)
+                    || !matches!(
+                        self.result,
+                        Some(
+                            TcpCarrierValidationResult::NoGain
+                                | TcpCarrierValidationResult::Withdrawn
+                        )
+                    )
+                {
+                    self.finished = true;
+                    return ClientS2cTcpValidationAction::Finished;
+                }
+                self.finished = true;
+                ClientS2cTcpValidationAction::Finished
+            }
+            ClientTcpValidationEvent::Admitted { .. }
+            | ClientTcpValidationEvent::ResultAcknowledged { .. } => {
+                self.finished = true;
+                ClientS2cTcpValidationAction::Finished
+            }
+        }
+    }
+
+    fn exact_candidate(&self, candidate: ClientTcpValidationCandidate) -> bool {
+        candidate.validation_id == self.validation_id
+            && candidate.stream_id == self.stream_id
+            && candidate.instance == self.candidate_instance
+    }
+}
+
+pub(super) async fn receive_client_s2c_tcp_validation(
+    validation: &mut Option<ClientS2cTcpValidation>,
+) -> Option<ClientS2cTcpValidationInput> {
     match validation.as_mut() {
         Some(validation) => Some(validation.next_input().await),
         None => std::future::pending().await,

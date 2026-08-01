@@ -15,6 +15,7 @@ use crate::protocol::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
+use crate::runtime::stream::response::ServerTcpValidationOutput;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::future::Future;
@@ -735,6 +736,13 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         stream_id: StreamId,
     ) -> Result<Option<ServerValidationStreamBinding>, RuntimeError>;
 
+    fn bind_validation_output_existing(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        commands: ReliablePathCommandSender,
+    ) -> Result<Option<ServerTcpValidationOutput>, RuntimeError>;
+
     fn route_frame<'a>(
         &'a self,
         identity: ServerCarrierPathIdentity,
@@ -989,6 +997,26 @@ impl ServerStreamPort {
         }
         self.backend
             .bind_validation_input_existing(path_registration.inner.identity, stream_id)
+    }
+
+    /// Binds one exact unpublished response output for S2C validation. It is
+    /// deliberately absent from ordinary output membership until promotion.
+    pub(in crate::runtime) fn bind_validation_output_existing(
+        &self,
+        path_registration: &ServerCarrierPathRegistration,
+        stream_id: StreamId,
+        commands: ReliablePathCommandSender,
+    ) -> Result<Option<ServerTcpValidationOutput>, RuntimeError> {
+        if !path_registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
+        self.backend.bind_validation_output_existing(
+            path_registration.inner.identity,
+            stream_id,
+            commands,
+        )
     }
 
     async fn open_with_policy(

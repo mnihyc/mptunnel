@@ -385,6 +385,7 @@ impl ClientPathContext {
                     authenticated_carriers: authenticated_carriers.clone(),
                     endpoint_policy,
                     carrier_groups: tcp_carrier_groups.clone(),
+                    retained_carriers: tcp_retained_carriers.clone(),
                 })
             })
             .collect::<Vec<_>>();

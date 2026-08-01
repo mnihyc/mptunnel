@@ -421,6 +421,26 @@ impl ResponseStreamBinding {
             })
     }
 
+    pub(in crate::runtime::stream) fn validation_output_peer_available(
+        &self,
+        identity: ResponseValidationOutputIdentity,
+    ) -> bool {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .validation
+            .as_ref()
+            .is_some_and(|entry| {
+                entry.key == identity.key
+                    && entry.path_instance_id == identity.path_instance_id
+                    && entry.incarnation == identity.incarnation
+                    && entry
+                        .state
+                        .peer_usage
+                        .is_some_and(|(_, usage)| usage == PathUsage::Available)
+            })
+    }
+
     /// Removes only the exact unpublished attachment. Any unresolved Product
     /// flight remains recoverable but can no longer prove this carrier.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1100,24 +1120,40 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let Some(entry) = outputs
+        let ordinary_eligibility_changed = if let Some(entry) = outputs
             .entries
             .iter_mut()
             .find(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
-        else {
+        {
+            if entry
+                .peer_usage_sequence
+                .is_some_and(|current| sequence <= current)
+            {
+                return false;
+            }
+            entry.peer_usage_sequence = Some(sequence);
+            let changed = (entry.local_policy.backup
+                || entry.peer_usage == Some(PathUsage::Backup))
+                != (entry.local_policy.backup || usage == PathUsage::Backup);
+            entry.peer_usage = Some(usage);
+            changed
+        } else if let Some(entry) = outputs
+            .validation
+            .as_mut()
+            .filter(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
+        {
+            if entry
+                .state
+                .peer_usage
+                .is_some_and(|(current, _)| sequence <= current)
+            {
+                return false;
+            }
+            entry.state.peer_usage = Some((sequence, usage));
+            false
+        } else {
             return false;
         };
-        if entry
-            .peer_usage_sequence
-            .is_some_and(|current| sequence <= current)
-        {
-            return false;
-        }
-        entry.peer_usage_sequence = Some(sequence);
-        let ordinary_eligibility_changed = (entry.local_policy.backup
-            || entry.peer_usage == Some(PathUsage::Backup))
-            != (entry.local_policy.backup || usage == PathUsage::Backup);
-        entry.peer_usage = Some(usage);
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
         if ordinary_eligibility_changed {

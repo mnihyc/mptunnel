@@ -209,6 +209,14 @@ fn validation_data_uses_only_the_exact_unpublished_output() {
         .try_enqueue_validation_data_frame(identity, validation_id, &frame)
         .expect("commit finite validation work");
 
+    assert!(
+        fixture
+            .binding
+            .uncovered_failed_original_ranges()
+            .is_empty(),
+        "an unpublished validation output remains the live exact owner until settlement"
+    );
+
     assert_eq!(candidate_commands.active_flow_counts(), (0, 0));
     assert!(
         fixture

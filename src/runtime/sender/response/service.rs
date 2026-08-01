@@ -22,7 +22,9 @@ use crate::lab_diagnostics::{
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::CarrierPathKey;
-use crate::model::tcp_carrier::TcpCarrierStableGenerations;
+use crate::model::tcp_carrier::{
+    TcpCarrierStableGenerations, TcpCarrierValidationState, TcpCarrierValidationUpdate,
+};
 use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::ReliableWorkClass;
 use crate::model::work::reliable_failed_original_reinjection_limit_bytes;
@@ -41,7 +43,7 @@ use crate::runtime::sender::{
     reliable_relay_can_read_product_source, reliable_relay_sender_queue_read_budget,
     sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
 };
-use crate::runtime::stream::response::ResponseSenderPathTarget;
+use crate::runtime::stream::response::{ResponseSenderPathTarget, ServerTcpValidationOutput};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::{self, PathSnapshot, TrafficClass};
 use bytes::Bytes;
@@ -121,6 +123,13 @@ pub(in crate::runtime) struct ServerResponseDispatch {
 pub(in crate::runtime) enum ServerQueuedDispatch {
     Dispatched(ServerResponseDispatch),
     OrdinarySaturation(Box<ResponseOrdinarySaturationObservation>),
+}
+
+/// One exact finite response assignment to an unpublished validation output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ServerTcpCarrierCandidateDispatch {
+    pub(in crate::runtime) range: OffsetRange,
+    pub(in crate::runtime) payload_bytes: usize,
 }
 
 pub(in crate::runtime) enum ServerCarrierReadiness {
@@ -562,6 +571,92 @@ impl ServerResponseSenderService {
 
     pub(in crate::runtime) fn has_queued_reinjection_overlap(&self, frame: &Frame) -> bool {
         self.queue.has_queued_reinjection_overlap(frame)
+    }
+
+    pub(in crate::runtime) fn has_queued_reinjection_range_overlap(
+        &self,
+        ranges: &[OffsetRange],
+    ) -> bool {
+        self.queue.has_queued_reinjection_range_overlap(ranges)
+    }
+
+    /// Assigns one bounded fresh target prefix to an admitted S2C validation
+    /// output without granting it ordinary scheduling authority.
+    ///
+    /// Carrier admission is the final fallible step. Stream offset ownership,
+    /// validation credit, exact recoverable flight, Product queue consumption,
+    /// and command publication then commit in one serialized order.
+    pub(in crate::runtime) fn dispatch_server_tcp_carrier_validation_data(
+        &mut self,
+        validation_id: std::num::NonZeroU64,
+        output: &ServerTcpValidationOutput,
+        validation: &mut TcpCarrierValidationState,
+        send_stream: &mut ReliableSendStream,
+        data_quantum_bytes: usize,
+    ) -> Result<Option<ServerTcpCarrierCandidateDispatch>, RuntimeError> {
+        let credit_bytes = validation.candidate_assignment_credit_bytes();
+        if credit_bytes == 0 || data_quantum_bytes == 0 {
+            return Ok(None);
+        }
+        let Some((_, queued)) = self.queue.front() else {
+            return Ok(None);
+        };
+        let ReliableRelayQueuedWorkKind::Data(payload) = &queued.kind else {
+            return Ok(None);
+        };
+        let dispatch_payload_bytes = usize::try_from(credit_bytes)
+            .unwrap_or(usize::MAX)
+            .min(data_quantum_bytes)
+            .min(payload.len());
+        if dispatch_payload_bytes == 0 {
+            return Ok(None);
+        }
+
+        let frame = send_stream
+            .prepare_data(payload.slice(..dispatch_payload_bytes))
+            .map_err(RuntimeError::Stream)?;
+        let reservation = output.try_reserve_data(validation_id, &frame)?;
+        send_stream
+            .commit_prepared_data(&frame)
+            .map_err(RuntimeError::Stream)?;
+        if validation.record_candidate_assignment(dispatch_payload_bytes as u64)
+            != TcpCarrierValidationUpdate::Pending
+        {
+            send_stream
+                .rollback_committed_data(&frame)
+                .map_err(RuntimeError::Stream)?;
+            return Ok(None);
+        }
+
+        let Frame::StreamData {
+            offset, payload, ..
+        } = &frame
+        else {
+            unreachable!("prepared reliable data is STREAM_DATA");
+        };
+        let end = offset
+            .checked_add(payload.len() as u64)
+            .ok_or(RuntimeError::Protocol(
+                "TCP carrier validation assignment offset overflow",
+            ))?;
+        let publication = reservation.record_flight();
+        let committed = self
+            .queue
+            .commit_front_data_prefix(dispatch_payload_bytes)
+            .expect("serialized candidate assignment retains its queued Product prefix");
+        assert_eq!(
+            committed.payload_bytes, dispatch_payload_bytes,
+            "candidate Product queue commit must match its reserved frame"
+        );
+        publication.commit();
+
+        Ok(Some(ServerTcpCarrierCandidateDispatch {
+            range: OffsetRange {
+                start: *offset,
+                end,
+            },
+            payload_bytes: dispatch_payload_bytes,
+        }))
     }
 
     pub(in crate::runtime) fn dispatch_next(

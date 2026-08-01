@@ -12,7 +12,8 @@ use super::client_connection::{
 use super::client_receive::apply_client_tcp_carrier_demand;
 use super::client_state::ClientTcpPathSessionRuntime;
 use super::group::ClientTcpCarrierReservation;
-use super::service::ClientTcpCarrierAdmissionLease;
+use super::retained::ClientTcpRetainedCarrierPublicationReservation;
+use super::service::{ClientTcpCarrierAdmissionLease, ClientTcpServerToClientAdmissionLease};
 use crate::model::path::RelayPathInstance;
 use crate::protocol::{
     CloseReason, Frame, PathId, PathMetricDirection, PathPurpose, PathUsage, StreamId,
@@ -37,9 +38,12 @@ use tokio::sync::{mpsc, oneshot};
 pub(in crate::runtime) struct ClientTcpValidationAdmission {
     pub(super) runtime: ClientTcpPathSessionRuntime,
     pub(super) service_admission: Option<ClientTcpCarrierAdmissionLease>,
+    pub(super) server_to_client_admission: Option<ClientTcpServerToClientAdmissionLease>,
     pub(super) reservation: ClientTcpCarrierReservation,
     pub(super) endpoint_generation: u64,
     pub(super) validation_id: NonZeroU64,
+    pub(super) request_id: Option<NonZeroU64>,
+    pub(super) direction: PathMetricDirection,
     pub(super) stream_id: StreamId,
     pub(super) instance: RelayPathInstance,
     /// Existing configured path-probe ceiling; validation defines no new
@@ -76,6 +80,16 @@ pub(in crate::runtime) struct ClientTcpValidationHandoff {
     pub(in crate::runtime) peer_status: PeerStatusCarrier,
     pub(in crate::runtime) path_proofs: PathProofTracker,
     pub(in crate::runtime) reservation: ClientTcpCarrierReservation,
+    pub(in crate::runtime) server_to_client: Option<ClientTcpServerToClientRetainedPreparation>,
+}
+
+/// Resources whose exact S2C registry authority was committed before the
+/// matching wire acknowledgment. They remain rollback-owned until adoption
+/// publishes path health and transfers cleanup to the retained actor.
+pub(in crate::runtime) struct ClientTcpServerToClientRetainedPreparation {
+    pub(in crate::runtime) commands: ReliablePathCommandSender,
+    pub(in crate::runtime) command_receivers: ReliablePathCommandReceivers,
+    pub(in crate::runtime) publication: ClientTcpRetainedCarrierPublicationReservation,
 }
 
 /// Configuration ownership for an acknowledged elastic instance.
@@ -103,6 +117,11 @@ pub(in crate::runtime) enum ClientTcpValidationEvent {
         candidate: ClientTcpValidationCandidate,
         validation_data: ReliablePathCommandSender,
     },
+    /// Receiver-side admission for S2C. No Product writer is exposed because
+    /// candidate placement belongs to the server sender.
+    ReceiverAdmitted {
+        candidate: ClientTcpValidationCandidate,
+    },
     /// Exact target/session control that remains owned by the existing Product
     /// stream and its sender evidence model.
     Control {
@@ -110,6 +129,12 @@ pub(in crate::runtime) enum ClientTcpValidationEvent {
         frame: Frame,
     },
     ResultAcknowledged {
+        candidate: ClientTcpValidationCandidate,
+        result: TcpCarrierValidationResult,
+    },
+    /// One immutable server-owned S2C verdict, delivered only after all prior
+    /// candidate Product frames have entered this same FIFO.
+    ResultReceived {
         candidate: ClientTcpValidationCandidate,
         result: TcpCarrierValidationResult,
     },
@@ -125,6 +150,10 @@ enum ClientTcpValidationControl {
         response: oneshot::Sender<Result<(), RuntimeError>>,
     },
     ConfirmCandidateWorkZero {
+        response: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    AcknowledgeServerToClientResult {
+        result: TcpCarrierValidationResult,
         response: oneshot::Sender<Result<(), RuntimeError>>,
     },
 }
@@ -180,10 +209,30 @@ impl ClientTcpValidationController {
             .await
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)?
     }
+
+    /// Commits the exact receiver-side S2C result after the target relay has
+    /// applied every preceding candidate frame. The carrier actor owns both
+    /// acknowledgment serialization and local admission settlement.
+    pub(in crate::runtime) async fn acknowledge_server_to_client_result(
+        &self,
+        result: TcpCarrierValidationResult,
+    ) -> Result<(), RuntimeError> {
+        let (response, receipt) = oneshot::channel();
+        self.controls
+            .send(ClientTcpValidationControl::AcknowledgeServerToClientResult { result, response })
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+        receipt
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?
+    }
 }
 
 enum ClientTcpValidationLifecycle {
     Active,
+    AwaitingServerToClientResultCommit {
+        result: TcpCarrierValidationResult,
+    },
     DrainingCommands {
         result: TcpCarrierValidationResult,
         response: Option<oneshot::Sender<Result<(), RuntimeError>>>,
@@ -218,8 +267,11 @@ pub(in crate::runtime) struct ClientTcpValidationSession {
     runtime: ClientTcpPathSessionRuntime,
     reservation: Option<ClientTcpCarrierReservation>,
     service_admission: Option<ClientTcpCarrierAdmissionLease>,
+    server_to_client_admission: Option<ClientTcpServerToClientAdmissionLease>,
     endpoint_generation: u64,
     validation_id: NonZeroU64,
+    request_id: Option<NonZeroU64>,
+    direction: PathMetricDirection,
     stream_id: StreamId,
     instance: RelayPathInstance,
     open_deadline: tokio::time::Instant,
@@ -231,6 +283,10 @@ pub(in crate::runtime) struct ClientTcpValidationSession {
     commands: Option<ReliablePathCommandReceivers>,
     controls: mpsc::Receiver<ClientTcpValidationControl>,
     controls_open: bool,
+    pending_server_to_client_ack: Option<(
+        TcpCarrierValidationResult,
+        oneshot::Sender<Result<(), RuntimeError>>,
+    )>,
     events: mpsc::Sender<ClientTcpValidationEvent>,
     lifecycle: ClientTcpValidationLifecycle,
     retention_deadline: Option<tokio::time::Instant>,
@@ -248,9 +304,12 @@ impl ClientTcpValidationSession {
         let ClientTcpValidationAdmission {
             mut runtime,
             service_admission,
+            server_to_client_admission,
             reservation,
             endpoint_generation,
             validation_id,
+            request_id,
+            direction,
             stream_id,
             instance,
             open_deadline,
@@ -270,9 +329,12 @@ impl ClientTcpValidationSession {
             path_proofs: PathProofTracker::from_limits(runtime.mux_limits),
             runtime,
             service_admission,
+            server_to_client_admission,
             reservation: Some(reservation),
             endpoint_generation,
             validation_id,
+            request_id,
+            direction,
             stream_id,
             instance,
             open_deadline,
@@ -283,6 +345,7 @@ impl ClientTcpValidationSession {
             commands: Some(commands),
             controls,
             controls_open: true,
+            pending_server_to_client_ack: None,
             events,
             lifecycle: ClientTcpValidationLifecycle::Active,
             retention_deadline: None,
@@ -309,7 +372,15 @@ impl ClientTcpValidationSession {
                 .expect("validation actor owns its connected carrier")
                 .heartbeat_deadline();
             let receive_mode = match self.lifecycle {
-                ClientTcpValidationLifecycle::Active => ValidationCommandReceiveMode::Live,
+                ClientTcpValidationLifecycle::Active
+                    if self.direction == PathMetricDirection::ClientToServer =>
+                {
+                    ValidationCommandReceiveMode::Live
+                }
+                ClientTcpValidationLifecycle::Active
+                | ClientTcpValidationLifecycle::AwaitingServerToClientResultCommit { .. } => {
+                    ValidationCommandReceiveMode::None
+                }
                 ClientTcpValidationLifecycle::DrainingCommands { .. } => {
                     ValidationCommandReceiveMode::Drain
                 }
@@ -386,8 +457,14 @@ impl ClientTcpValidationSession {
                 ActorEvent::Control(Some(control)) => self.handle_control(control)?,
                 ActorEvent::Control(None) => {
                     self.controls_open = false;
-                    if matches!(self.lifecycle, ClientTcpValidationLifecycle::Active) {
+                    if matches!(self.lifecycle, ClientTcpValidationLifecycle::Active)
+                        && self.direction == PathMetricDirection::ClientToServer
+                    {
                         self.begin_result(TcpCarrierValidationResult::Withdrawn, None, false)?;
+                    } else if self.direction == PathMetricDirection::ServerToClient
+                        && self.prepare_server_to_client_drain()
+                    {
+                        self.serialize_server_to_client_drain().await?;
                     }
                 }
                 ActorEvent::PeerStatus(Some(request_id)) => {
@@ -476,28 +553,35 @@ impl ClientTcpValidationSession {
         }
         self.retention_deadline =
             Some(tokio::time::Instant::now() + self.runtime.session_retention_timeout);
-        if self
-            .service_admission
-            .as_mut()
-            .is_some_and(|admission| !admission.begin_validation())
-        {
+        let admitted = match self.direction {
+            PathMetricDirection::ClientToServer => self
+                .service_admission
+                .as_mut()
+                .is_none_or(ClientTcpCarrierAdmissionLease::begin_validation),
+            PathMetricDirection::ServerToClient => self
+                .server_to_client_admission
+                .as_mut()
+                .is_some_and(ClientTcpServerToClientAdmissionLease::begin_validation),
+        };
+        if !admitted {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
         self.write_frames(&[Frame::TcpCarrierValidate {
             validation_id: self.validation_id.get(),
-            request_id: 0,
-            direction: PathMetricDirection::ClientToServer,
+            request_id: self.request_id.map_or(0, NonZeroU64::get),
+            direction: self.direction,
             stream_id: self.stream_id,
         }])
         .await?;
 
         let candidate = self.candidate();
-        let peer_available = self
-            .connection
-            .as_ref()
-            .expect("validation actor owns its connected carrier")
-            .peer_usage
-            == PathUsage::Available;
+        let peer_available = self.direction == PathMetricDirection::ServerToClient
+            || self
+                .connection
+                .as_ref()
+                .expect("validation actor owns its connected carrier")
+                .peer_usage
+                == PathUsage::Available;
         if !peer_available {
             // BACKUP preference is never bypassed to create favorable Product
             // evidence. No data sender escaped, so the candidate is already at
@@ -505,9 +589,14 @@ impl ClientTcpValidationSession {
             self.begin_result(TcpCarrierValidationResult::Withdrawn, None, true)?;
             return Ok(());
         }
-        let event = ClientTcpValidationEvent::Admitted {
-            candidate,
-            validation_data: self.validation_data.clone(),
+        let event = match self.direction {
+            PathMetricDirection::ClientToServer => ClientTcpValidationEvent::Admitted {
+                candidate,
+                validation_data: self.validation_data.clone(),
+            },
+            PathMetricDirection::ServerToClient => {
+                ClientTcpValidationEvent::ReceiverAdmitted { candidate }
+            }
         };
         if self.send_event(event).await.is_err() {
             // No sender/admission owner can consume the candidate. Because the
@@ -523,6 +612,16 @@ impl ClientTcpValidationSession {
         response: Option<oneshot::Sender<Result<(), RuntimeError>>>,
         work_zero: bool,
     ) -> Result<(), RuntimeError> {
+        if self.direction != PathMetricDirection::ClientToServer {
+            if let Some(response) = response {
+                let _ = response.send(Err(RuntimeError::Protocol(
+                    "S2C validation result is sender-owned by the server",
+                )));
+            }
+            return Err(RuntimeError::Protocol(
+                "S2C validation result is sender-owned by the server",
+            ));
+        }
         if !matches!(self.lifecycle, ClientTcpValidationLifecycle::Active) {
             if let Some(response) = response {
                 let _ = response.send(Err(RuntimeError::Protocol(
@@ -576,12 +675,110 @@ impl ClientTcpValidationSession {
                 let _ = response.send(result);
                 Ok(())
             }
+            ClientTcpValidationControl::AcknowledgeServerToClientResult { result, response } => {
+                let expected = match self.lifecycle {
+                    ClientTcpValidationLifecycle::AwaitingServerToClientResultCommit { result } => {
+                        Some(result)
+                    }
+                    _ => None,
+                };
+                if self.direction != PathMetricDirection::ServerToClient || expected != Some(result)
+                {
+                    let _ = response.send(Err(RuntimeError::Protocol(
+                        "S2C result acknowledgment has no exact current result",
+                    )));
+                    return Ok(());
+                }
+                // The async write and exact local settlement are performed by
+                // the actor loop so no other wire event can interleave them.
+                self.pending_server_to_client_ack = Some((result, response));
+                Ok(())
+            }
         }
     }
 
     async fn advance_lifecycle(&mut self) -> Result<bool, RuntimeError> {
         if self.terminal {
             return Ok(true);
+        }
+        if let Some((result, response)) = self.pending_server_to_client_ack.take() {
+            let current = self
+                .server_to_client_admission
+                .as_ref()
+                .is_some_and(ClientTcpServerToClientAdmissionLease::is_current);
+            if !current {
+                let _ = response.send(Err(RuntimeError::ReliablePathRetired));
+                return Err(RuntimeError::ReliablePathRetired);
+            }
+            let mut retained_preparation = if result == TcpCarrierValidationResult::Retain {
+                let commands = self.validation_data.clone();
+                let command_receivers = self
+                    .commands
+                    .take()
+                    .ok_or(RuntimeError::ReliablePathRetired)?;
+                let publication = self
+                    .runtime
+                    .retained_carriers
+                    .reserve_publication(
+                        self.runtime.config_index,
+                        self.instance.key,
+                        self.instance.path_instance_id,
+                        commands.clone(),
+                    )
+                    .ok_or(RuntimeError::ReliablePathRetired)?;
+                Some(ClientTcpServerToClientRetainedPreparation {
+                    commands,
+                    command_receivers,
+                    publication,
+                })
+            } else {
+                None
+            };
+            if self
+                .server_to_client_admission
+                .take()
+                .is_none_or(|admission| !admission.finish())
+            {
+                let _ = response.send(Err(RuntimeError::ReliablePathRetired));
+                return Err(RuntimeError::ReliablePathRetired);
+            }
+            if let Some(preparation) = retained_preparation.as_mut()
+                && !preparation
+                    .publication
+                    .commit_direction(PathMetricDirection::ServerToClient)
+            {
+                let _ = response.send(Err(RuntimeError::ReliablePathRetired));
+                return Err(RuntimeError::ReliablePathRetired);
+            }
+            self.write_frames(&[Frame::TcpCarrierResultAck {
+                validation_id: self.validation_id.get(),
+                direction: PathMetricDirection::ServerToClient,
+                result,
+            }])
+            .await?;
+            match result {
+                TcpCarrierValidationResult::Retain => {
+                    let handoff = self.take_retained_handoff(retained_preparation);
+                    self.send_event(ClientTcpValidationEvent::Retained(Box::new(handoff)))
+                        .await?;
+                    self.retention_deadline = None;
+                    self.terminal = true;
+                }
+                TcpCarrierValidationResult::NoGain | TcpCarrierValidationResult::Withdrawn => {
+                    self.path_proofs.cancel_for_path_drain();
+                    self.write_frames(&[
+                        Frame::StreamDetach {
+                            stream_id: self.stream_id,
+                        },
+                        Frame::PathDrain {
+                            path_id: self.candidate().path_id,
+                        },
+                    ])
+                    .await?;
+                    self.lifecycle = ClientTcpValidationLifecycle::Draining;
+                }
+            }
+            let _ = response.send(Ok(()));
         }
         let ready_result = match &mut self.lifecycle {
             ClientTcpValidationLifecycle::DrainingCommands {
@@ -647,7 +844,7 @@ impl ClientTcpValidationSession {
             .await?;
             self.lifecycle = ClientTcpValidationLifecycle::Draining;
         }
-        Ok(false)
+        Ok(self.terminal)
     }
 
     async fn handle_frame(&mut self, frame: Frame) -> Result<(), RuntimeError> {
@@ -660,18 +857,26 @@ impl ClientTcpValidationSession {
                 validation_id,
                 direction: PathMetricDirection::ClientToServer,
                 result,
-            } => self.handle_result_ack(validation_id, result).await,
+            } if self.direction == PathMetricDirection::ClientToServer => {
+                self.handle_result_ack(validation_id, result).await
+            }
+            Frame::TcpCarrierResult {
+                validation_id,
+                direction: PathMetricDirection::ServerToClient,
+                result,
+            } if self.direction == PathMetricDirection::ServerToClient => {
+                self.handle_server_to_client_result(validation_id, result)
+                    .await
+            }
             Frame::TcpCarrierResultAck { .. }
             | Frame::TcpCarrierResult { .. }
             | Frame::TcpCarrierValidate { .. } => Err(RuntimeError::Protocol(
                 "invalid TCP carrier validation result transaction",
             )),
-            frame @ (Frame::StreamAck { stream_id, .. }
-            | Frame::StreamMaxData { stream_id, .. }
-            | Frame::StreamFin { stream_id, .. }
-            | Frame::StreamReset { stream_id, .. }
-            | Frame::StreamDetach { stream_id })
-                if stream_id == self.stream_id =>
+            frame @ Frame::StreamData { stream_id, .. }
+                if self.direction == PathMetricDirection::ServerToClient
+                    && stream_id == self.stream_id
+                    && matches!(self.lifecycle, ClientTcpValidationLifecycle::Active) =>
             {
                 self.send_event(ClientTcpValidationEvent::Control {
                     candidate: self.candidate(),
@@ -679,7 +884,22 @@ impl ClientTcpValidationSession {
                 })
                 .await
             }
-            Frame::StreamAck { .. }
+            frame @ (Frame::StreamAck { stream_id, .. }
+            | Frame::StreamMaxData { stream_id, .. }
+            | Frame::StreamFin { stream_id, .. }
+            | Frame::StreamReset { stream_id, .. }
+            | Frame::StreamDetach { stream_id })
+                if self.direction == PathMetricDirection::ClientToServer
+                    && stream_id == self.stream_id =>
+            {
+                self.send_event(ClientTcpValidationEvent::Control {
+                    candidate: self.candidate(),
+                    frame,
+                })
+                .await
+            }
+            Frame::StreamData { .. }
+            | Frame::StreamAck { .. }
             | Frame::StreamMaxData { .. }
             | Frame::StreamFin { .. }
             | Frame::StreamReset { .. }
@@ -772,10 +992,12 @@ impl ClientTcpValidationSession {
             } if path_id == self.candidate().path_id
                 && matches!(self.lifecycle, ClientTcpValidationLifecycle::Draining) =>
             {
-                self.send_event(ClientTcpValidationEvent::Drained {
-                    candidate: self.candidate(),
-                })
-                .await?;
+                if self.controls_open {
+                    self.send_event(ClientTcpValidationEvent::Drained {
+                        candidate: self.candidate(),
+                    })
+                    .await?;
+                }
                 self.retention_deadline = None;
                 self.terminal = true;
                 Ok(())
@@ -794,8 +1016,7 @@ impl ClientTcpValidationSession {
                 "TCP client received peer path drain request",
             )),
             Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
-            Frame::StreamData { .. }
-            | Frame::OpenStream { .. }
+            Frame::OpenStream { .. }
             | Frame::OpenDatagramFlow { .. }
             | Frame::DatagramData { .. }
             | Frame::DatagramFeedback { .. }
@@ -856,29 +1077,7 @@ impl ClientTcpValidationSession {
                 {
                     return Err(RuntimeError::ReliablePathRetired);
                 }
-                let handoff = ClientTcpValidationHandoff {
-                    candidate: self.candidate(),
-                    endpoint_generation: self.endpoint_generation,
-                    runtime: ClientTcpElasticCarrierRuntime {
-                        runtime: self.runtime.clone(),
-                    },
-                    connection: self
-                        .connection
-                        .take()
-                        .expect("retained validation hands off its exact connection"),
-                    peer_status: self
-                        .peer_status
-                        .take()
-                        .expect("retained validation hands off peer-status ownership"),
-                    path_proofs: std::mem::replace(
-                        &mut self.path_proofs,
-                        PathProofTracker::from_limits(self.runtime.mux_limits),
-                    ),
-                    reservation: self
-                        .reservation
-                        .take()
-                        .expect("retained validation hands off its exact reservation"),
-                };
+                let handoff = self.take_retained_handoff(None);
                 self.send_event(ClientTcpValidationEvent::Retained(Box::new(handoff)))
                     .await?;
                 self.retention_deadline = None;
@@ -895,6 +1094,65 @@ impl ClientTcpValidationSession {
                     ClientTcpValidationLifecycle::NegativeAcknowledged { result, work_zero };
                 Ok(())
             }
+        }
+    }
+
+    async fn handle_server_to_client_result(
+        &mut self,
+        validation_id: u64,
+        result: TcpCarrierValidationResult,
+    ) -> Result<(), RuntimeError> {
+        if validation_id != self.validation_id.get()
+            || self.direction != PathMetricDirection::ServerToClient
+            || !matches!(self.lifecycle, ClientTcpValidationLifecycle::Active)
+        {
+            return Err(RuntimeError::Protocol(
+                "S2C TCP carrier result has no exact active validation",
+            ));
+        }
+        if !self
+            .server_to_client_admission
+            .as_ref()
+            .is_some_and(ClientTcpServerToClientAdmissionLease::is_current)
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        self.lifecycle =
+            ClientTcpValidationLifecycle::AwaitingServerToClientResultCommit { result };
+        self.send_event(ClientTcpValidationEvent::ResultReceived {
+            candidate: self.candidate(),
+            result,
+        })
+        .await
+    }
+
+    fn take_retained_handoff(
+        &mut self,
+        server_to_client: Option<ClientTcpServerToClientRetainedPreparation>,
+    ) -> ClientTcpValidationHandoff {
+        ClientTcpValidationHandoff {
+            candidate: self.candidate(),
+            endpoint_generation: self.endpoint_generation,
+            runtime: ClientTcpElasticCarrierRuntime {
+                runtime: self.runtime.clone(),
+            },
+            connection: self
+                .connection
+                .take()
+                .expect("retained validation hands off its exact connection"),
+            peer_status: self
+                .peer_status
+                .take()
+                .expect("retained validation hands off peer-status ownership"),
+            path_proofs: std::mem::replace(
+                &mut self.path_proofs,
+                PathProofTracker::from_limits(self.runtime.mux_limits),
+            ),
+            reservation: self
+                .reservation
+                .take()
+                .expect("retained validation hands off its exact reservation"),
+            server_to_client,
         }
     }
 
@@ -997,12 +1255,27 @@ impl ClientTcpValidationSession {
                 Ok(true)
             }
             ClientTcpValidationLifecycle::AwaitingResultAck { .. }
+            | ClientTcpValidationLifecycle::AwaitingServerToClientResultCommit { .. }
             | ClientTcpValidationLifecycle::NegativeAcknowledged { .. }
             | ClientTcpValidationLifecycle::Draining => Ok(false),
         }
     }
 
     async fn expire_validation(&mut self) -> Result<(), RuntimeError> {
+        if self.direction == PathMetricDirection::ServerToClient {
+            if matches!(
+                self.lifecycle,
+                ClientTcpValidationLifecycle::Active
+                    | ClientTcpValidationLifecycle::AwaitingServerToClientResultCommit { .. }
+            ) && self.prepare_server_to_client_drain()
+            {
+                match self.serialize_server_to_client_drain().now_or_never() {
+                    Some(Ok(())) | None => {}
+                    Some(Err(error)) => return Err(error),
+                }
+            }
+            return Err(RuntimeError::SessionRetentionTimeout);
+        }
         if self.begin_expired_withdrawal()? {
             match self.serialize_expired_withdrawal().now_or_never() {
                 Some(Ok(())) | None => {}
@@ -1014,6 +1287,41 @@ impl ClientTcpValidationSession {
         // carrier was immediately writable, is retired by exact native
         // failure without waiting for settlement beyond that ceiling.
         Err(RuntimeError::SessionRetentionTimeout)
+    }
+
+    fn prepare_server_to_client_drain(&mut self) -> bool {
+        debug_assert_eq!(self.direction, PathMetricDirection::ServerToClient);
+        if !matches!(
+            self.lifecycle,
+            ClientTcpValidationLifecycle::Active
+                | ClientTcpValidationLifecycle::AwaitingServerToClientResultCommit { .. }
+        ) {
+            return false;
+        }
+        if let Some((_, response)) = self.pending_server_to_client_ack.take() {
+            let _ = response.send(Err(RuntimeError::ReliablePathRetired));
+        }
+        drop(self.server_to_client_admission.take());
+        self.validation_data.begin_path_drain();
+        if let Some(commands) = self.commands.as_mut() {
+            commands.close_for_path_drain();
+        }
+        self.path_proofs.cancel_for_path_drain();
+        self.lifecycle = ClientTcpValidationLifecycle::Draining;
+        true
+    }
+
+    async fn serialize_server_to_client_drain(&mut self) -> Result<(), RuntimeError> {
+        debug_assert_eq!(self.direction, PathMetricDirection::ServerToClient);
+        self.write_frames(&[
+            Frame::StreamDetach {
+                stream_id: self.stream_id,
+            },
+            Frame::PathDrain {
+                path_id: self.candidate().path_id,
+            },
+        ])
+        .await
     }
 
     async fn serialize_expired_withdrawal(&mut self) -> Result<(), RuntimeError> {

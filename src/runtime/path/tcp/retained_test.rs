@@ -28,6 +28,39 @@ fn insert(
 }
 
 #[test]
+fn provisional_publication_grants_no_direction_and_rolls_back_exactly() {
+    let registry = registry();
+    let key = key(3);
+    let path_instance_id = instance(31);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut publication = registry
+        .reserve_publication(0, key, path_instance_id, commands)
+        .expect("reserve exact retained publication");
+    assert!(!registry.direction_authorized(
+        key,
+        path_instance_id,
+        PathMetricDirection::ClientToServer,
+    ));
+    assert!(!registry.direction_authorized(
+        key,
+        path_instance_id,
+        PathMetricDirection::ServerToClient,
+    ));
+    assert!(publication.commit_direction(PathMetricDirection::ServerToClient));
+    assert!(registry.direction_authorized(
+        key,
+        path_instance_id,
+        PathMetricDirection::ServerToClient,
+    ));
+    drop(publication);
+    assert!(!registry.direction_authorized(
+        key,
+        path_instance_id,
+        PathMetricDirection::ServerToClient,
+    ));
+}
+
+#[test]
 fn directional_settlement_preserves_exact_existing_authority() {
     let registry = registry();
     let key = key(4);

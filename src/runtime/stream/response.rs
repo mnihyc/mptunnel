@@ -23,9 +23,10 @@ pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
     ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
     ResponsePathDetachOutcome, ResponseSenderPathObservation, ResponseSenderPathTarget,
-    ResponseStreamAttachOutcome,
+    ResponseStreamAttachOutcome, ResponseValidationOutputIdentity,
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
+pub(in crate::runtime) use data_commit::ResponseValidationDataReservation;
 use delivery::ResponseAckOrderingState;
 pub(super) use delivery::{
     CarrierPathFlight, product_flights_have_recent_reinjection_overlap,
@@ -40,6 +41,63 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+
+/// Exact unpublished S2C validation output shared by the carrier actor and
+/// target response owner. Cloning this handle clones no authority: every
+/// operation exact-matches the binding's physical instance and incarnation.
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerTcpValidationOutput {
+    binding: Arc<ResponseStreamBinding>,
+    identity: ResponseValidationOutputIdentity,
+}
+
+impl ServerTcpValidationOutput {
+    pub(in crate::runtime::stream) fn new(
+        binding: Arc<ResponseStreamBinding>,
+        identity: ResponseValidationOutputIdentity,
+    ) -> Self {
+        Self { binding, identity }
+    }
+
+    pub(in crate::runtime) fn identity(&self) -> ResponseValidationOutputIdentity {
+        self.identity
+    }
+
+    pub(in crate::runtime) fn is_current(&self) -> bool {
+        self.binding.validation_output_is_current(self.identity)
+    }
+
+    pub(in crate::runtime) fn peer_available(&self) -> bool {
+        self.binding.validation_output_peer_available(self.identity)
+    }
+
+    pub(in crate::runtime) fn sender_path_observation(&self) -> ResponseSenderPathObservation {
+        self.binding
+            .sender_path_observation(TrafficClass::Throughput, 1)
+    }
+
+    pub(in crate::runtime) fn try_reserve_data(
+        &self,
+        validation_id: NonZeroU64,
+        frame: &crate::protocol::Frame,
+    ) -> Result<ResponseValidationDataReservation, crate::runtime::RuntimeError> {
+        self.binding
+            .try_reserve_validation_data_frame(self.identity, validation_id, frame)
+    }
+
+    pub(in crate::runtime) fn original_flight_bytes(&self) -> u64 {
+        self.binding
+            .validation_candidate_original_flight_bytes(self.identity)
+    }
+
+    pub(in crate::runtime) fn settle(&self) -> bool {
+        self.binding.settle_validation_output(self.identity)
+    }
+
+    pub(in crate::runtime) fn promote(&self) -> Result<(), crate::runtime::RuntimeError> {
+        self.binding.promote_validation_output(self.identity)
+    }
+}
 
 // Reliable-path bindings own attachment instances, exact range flights,
 // evidence, and atomic commit. Sender services rank immutable snapshots.

@@ -20,6 +20,7 @@ use super::io::{
     stream_data_range_already_delivered, stream_final_offset_tail_reinjection_frames_normalized,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
 };
+use super::server_tcp_validation::{ServerS2cTcpValidation, receive_server_s2c_tcp_validation};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_assert_server_sender_service_balanced, lab_diagnostic, lab_perf_flush, lab_perf_record,
@@ -1241,6 +1242,7 @@ fn enqueue_reliable_tail_reinjection(
 async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     tcp_carrier_workload: &mut Option<ServerTcpCarrierWorkloadLease>,
+    s2c_tcp_validation: &mut Option<ServerS2cTcpValidation>,
     path_stream: &ReliablePathStream,
     mut data_ack_outstanding_bytes: usize,
     send_stream: &mut ReliableSendStream,
@@ -1268,11 +1270,30 @@ async fn drain_server_response_sender_ready(
         ) {
             Ok(ServerQueuedDispatch::Dispatched(dispatch)) => dispatch,
             Ok(ServerQueuedDispatch::OrdinarySaturation(saturation)) => {
-                observe_server_tcp_carrier_saturation(
-                    tcp_carrier_workload,
-                    *saturation,
-                    mux_limits,
-                );
+                if let Some(validation) = s2c_tcp_validation.as_mut() {
+                    let candidate_quantum = sender_dispatch_byte_budget
+                        .saturating_sub(dispatched_payload_bytes)
+                        .min(path_stream.max_frame_payload_bytes);
+                    if let Some(payload_bytes) = validation.dispatch_candidate(
+                        response_sender,
+                        send_stream,
+                        candidate_quantum,
+                    )? {
+                        dispatched_items = dispatched_items.saturating_add(1);
+                        dispatched_payload_bytes =
+                            dispatched_payload_bytes.saturating_add(payload_bytes);
+                        data_ack_outstanding_bytes =
+                            data_ack_outstanding_bytes.saturating_add(payload_bytes);
+                        stats.record_payload_bytes(payload_bytes);
+                        continue;
+                    }
+                } else {
+                    observe_server_tcp_carrier_saturation(
+                        tcp_carrier_workload,
+                        *saturation,
+                        mux_limits,
+                    );
+                }
                 blocked_by_carrier = true;
                 break;
             }
@@ -1533,6 +1554,13 @@ where
         path_stream.has_multipath_reinjection_alternative();
     let mut response_sender =
         ServerResponseSenderService::new_with_performance(session_id, stream_id, performance);
+    let tcp_carrier_workload_identity = tcp_carrier_workload
+        .as_ref()
+        .map(ServerTcpCarrierWorkloadLease::identity);
+    let mut tcp_carrier_validation_offers = tcp_carrier_workload
+        .as_mut()
+        .and_then(ServerTcpCarrierWorkloadLease::take_validation_offers);
+    let mut s2c_tcp_validation = None::<ServerS2cTcpValidation>;
     let mut observed_response_recovery_generation =
         response_sender.stale_response_recovery_generation();
     let mut deferred_path_frame = None::<Result<Frame, RuntimeError>>;
@@ -1628,6 +1656,15 @@ where
             classifier_path,
             mux_limits,
         );
+        if let Some(validation) = s2c_tcp_validation.as_mut() {
+            validation.revalidate();
+            validation.drive(&response_sender, &send_stream);
+            if validation.is_finished() {
+                s2c_tcp_validation = None;
+            } else if validation.candidate_dispatch_ready() {
+                response_sender_retry_at = None;
+            }
+        }
         if relay_lane != previous_lane {
             path_stream.set_lane(relay_lane);
             #[cfg(feature = "lab-diagnostics")]
@@ -1917,12 +1954,16 @@ where
         let queued_front_has_carrier_credit = match carrier_readiness {
             ServerCarrierReadiness::Ready => true,
             ServerCarrierReadiness::OrdinarySaturation(saturation) => {
-                observe_server_tcp_carrier_saturation(
-                    &mut tcp_carrier_workload,
-                    *saturation,
-                    mux_limits,
-                );
-                false
+                if let Some(validation) = s2c_tcp_validation.as_ref() {
+                    validation.candidate_dispatch_ready()
+                } else {
+                    observe_server_tcp_carrier_saturation(
+                        &mut tcp_carrier_workload,
+                        *saturation,
+                        mux_limits,
+                    );
+                    false
+                }
             }
             ServerCarrierReadiness::Blocked => false,
         };
@@ -1968,6 +2009,35 @@ where
         // ready during an upload. Fair polling keeps response progress from
         // being hidden behind an unbounded run of incoming STREAM_DATA.
         tokio::select! {
+        offer = async {
+            match tcp_carrier_validation_offers.as_mut() {
+                Some(offers) => offers.recv().await,
+                None => std::future::pending().await,
+            }
+        }, if s2c_tcp_validation.is_none() && tcp_carrier_validation_offers.is_some() => {
+            match offer {
+                Some(offer) => {
+                    if let Some(target) = tcp_carrier_workload_identity {
+                        s2c_tcp_validation =
+                            ServerS2cTcpValidation::admit(offer, target, mux_limits);
+                    }
+                }
+                None => tcp_carrier_validation_offers = None,
+            }
+            continue;
+        }
+        validation_input = receive_server_s2c_tcp_validation(&mut s2c_tcp_validation) => {
+            let validation_input = validation_input
+                .expect("active server S2C TCP validation produces an input");
+            let validation = s2c_tcp_validation
+                .as_mut()
+                .expect("server S2C validation input retains its coordinator");
+            validation.handle_input(validation_input);
+            if validation.is_finished() {
+                s2c_tcp_validation = None;
+            }
+            continue;
+        }
         _ = async {
             match response_path_recovery_deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2017,6 +2087,7 @@ where
             if drain_server_response_sender_ready(
                 &mut response_sender,
                 &mut tcp_carrier_workload,
+                &mut s2c_tcp_validation,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
@@ -2594,6 +2665,7 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &mut tcp_carrier_workload,
+                    &mut s2c_tcp_validation,
                     path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
@@ -2751,6 +2823,7 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &mut tcp_carrier_workload,
+                    &mut s2c_tcp_validation,
                     path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
@@ -2832,6 +2905,7 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &mut tcp_carrier_workload,
+                    &mut s2c_tcp_validation,
                     path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
@@ -2866,6 +2940,7 @@ where
             if drain_server_response_sender_ready(
                 &mut response_sender,
                 &mut tcp_carrier_workload,
+                &mut s2c_tcp_validation,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
@@ -2891,6 +2966,7 @@ where
             if drain_server_response_sender_ready(
                 &mut response_sender,
                 &mut tcp_carrier_workload,
+                &mut s2c_tcp_validation,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
@@ -3045,6 +3121,7 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &mut tcp_carrier_workload,
+                        &mut s2c_tcp_validation,
                         path_stream,
                         data_ack_outstanding_bytes,
                         &mut send_stream,
@@ -3082,6 +3159,7 @@ where
             match drain_server_response_sender_ready(
                 &mut response_sender,
                 &mut tcp_carrier_workload,
+                &mut s2c_tcp_validation,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,

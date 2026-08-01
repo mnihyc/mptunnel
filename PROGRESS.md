@@ -11,6 +11,52 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T00:30:13+08:00: server-to-client elastic TCP transaction closed
+
+- Name: exact S2C TCP carrier validation, retention, and recovery
+- Category: Core RFC conformance and dynamic carrier lifecycle
+- State: implementation and correctness gates accepted; representative
+  performance remains a separate release gate
+- Clean model:
+  - the server admits one exact unpublished S2C output from existing Product
+    saturation and evaluates it with the same RFC validation state, Product
+    cohorts, writer boundaries, ACK evidence, and work-zero rule as C2S;
+  - candidate dispatch performs its output-capacity reservation before Product
+    mutation, then records exact recoverable flight before infallible command
+    publication;
+  - the client publishes exact zero-authority local ownership before a positive
+    wire acknowledgement, grants only S2C authority, and rolls the publication
+    back if acknowledgement or handoff does not complete;
+  - a retained S2C carrier enters a separate receive/feedback attachment set,
+    so multiple inputs can deliver data and publish cumulative ACK/MAX_DATA
+    without acquiring ordinary C2S scheduling, load, OPEN, or membership
+    authority; and
+  - rejection, expiry, and owner loss use the existing ordered STREAM_DETACH,
+    PATH_DRAIN, exact PATH_CLOSE, native-close, and exact-flight recovery
+    boundaries without a new timeout or retry loop.
+- Concrete corrections found by executable validation:
+  - retained-service identity now compares immutable transaction identity
+    rather than the mutable Establishing/Validating phase;
+  - terminal RETAIN lifecycle advancement no longer re-enters the actor loop;
+  - unpublished validation outputs remain visible to exact liveness, recovery,
+    and peer-usage state without becoming ordinary outputs; and
+  - an eligible validation candidate supplies existing sender-drain readiness,
+    preventing a queued candidate from waiting forever behind a saturation
+    wake condition.
+- Verification:
+  - `cargo test --locked --all-targets --all-features` passes 1,503 library
+    tests, two allocation tests, and six packaged daily-use acceptance tests;
+  - durable tests cover pre-ACK authority, rollback, negative ordered drain,
+    receive-only fan-in/feedback, unpublished-output liveness, peer usage, and
+    exact registry ownership;
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+    formatting, and whitespace checks pass; and
+  - no congestion controller, scheduler score, carrier-range value, model
+    threshold, or protocol timing changed in this slice.
+- Next: update the maintained `quinn-proto` fork to its current compatible
+  upstream while preserving and documenting the narrow MPTUNNEL patch, then
+  run the frozen representative performance and disruption matrix.
+
 ## 2026-07-31T21:32:01+08:00: process logging surface aligned with real output
 
 - Name: four-level operator logging model

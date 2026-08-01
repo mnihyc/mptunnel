@@ -109,6 +109,47 @@ fn validation_output_promotion_preserves_identity_and_publishes_once() {
 }
 
 #[test]
+fn validation_output_tracks_peer_usage_without_changing_ordinary_eligibility() {
+    let (binding, _initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let candidate = alternate_key(UnderlayProtocol::Tcp);
+    let (commands, _candidate_receivers) = reliable_path_command_channels(8);
+    let identity = binding
+        .bind_validation_output(validation_attachment(candidate, commands))
+        .expect("bind exact validation output");
+    let ordinary_generation = binding
+        .sender_path_observation(TrafficClass::Throughput, 1)
+        .ordinary_eligibility_generation;
+
+    assert!(binding.update_peer_path_usage_for_instance(
+        candidate,
+        identity.path_instance_id,
+        1,
+        PathUsage::Backup,
+    ));
+    assert!(!binding.validation_output_peer_available(identity));
+    assert_eq!(
+        binding
+            .sender_path_observation(TrafficClass::Throughput, 1)
+            .ordinary_eligibility_generation,
+        ordinary_generation,
+        "validation-only peer policy is outside ordinary membership"
+    );
+    assert!(!binding.update_peer_path_usage_for_instance(
+        candidate,
+        identity.path_instance_id,
+        1,
+        PathUsage::Available,
+    ));
+    assert!(binding.update_peer_path_usage_for_instance(
+        candidate,
+        identity.path_instance_id,
+        2,
+        PathUsage::Available,
+    ));
+    assert!(binding.validation_output_peer_available(identity));
+}
+
+#[test]
 fn live_output_tracks_real_carrier_receiver_lifetime_and_reattachment() {
     let (binding, _initial, initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     assert!(binding.has_live_output());

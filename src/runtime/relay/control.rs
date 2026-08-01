@@ -28,7 +28,9 @@ use super::lifecycle::{
 use super::open::{ReliableRelayOpenSpec, relay_error_is_tcp_path_failure};
 use super::remote::ReliableRelayAttachMode;
 use super::tcp_validation::{
-    ClientC2sTcpValidation, ClientC2sTcpValidationAction, receive_client_c2s_tcp_validation,
+    ClientC2sTcpValidation, ClientC2sTcpValidationAction, ClientS2cTcpValidation,
+    ClientS2cTcpValidationAction, receive_client_c2s_tcp_validation,
+    receive_client_s2c_tcp_validation,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
@@ -47,7 +49,9 @@ use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, ResetReason};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
-use crate::runtime::path::tcp::retained::adopt_client_to_server_retained_carrier;
+use crate::runtime::path::tcp::retained::{
+    adopt_client_to_server_retained_carrier, adopt_server_to_client_retained_carrier,
+};
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::sender::{
     ClientQueuedDispatch, RelayRecvProgressSend, RelaySendCause, ReliableRelaySenderQueue,
@@ -244,6 +248,12 @@ where
     let stream_id = remotes.stream_id();
     let mut tcp_carrier_workload = context.register_tcp_carrier_workload(stream_id);
     let mut c2s_tcp_validation = None::<ClientC2sTcpValidation>;
+    let mut server_tcp_demands = context.subscribe_server_tcp_carrier_demands();
+    let initial_server_tcp_demand = *server_tcp_demands.borrow_and_update();
+    let mut s2c_tcp_validation = match initial_server_tcp_demand {
+        Some(demand) => ClientS2cTcpValidation::admit(context, demand, stream_id)?,
+        None => None,
+    };
     let telemetry_flow = context.telemetry.open_reliable_flow(
         Some(context.session_id),
         stream_id,
@@ -784,7 +794,7 @@ where
         let pending_remote_fin_ready =
             pending_stream_fin_ready(&recv_stream, state.endpoint.pending_remote_fin_offset);
         let final_feedback_retry_blocked = pending_remote_fin_ready
-            && !remotes.is_empty()
+            && remotes.has_receive_feedback_output()
             && state.progress.sender_retry_at.is_some();
         let timed_carrier_retry_blocked = queued_send_blocked || final_feedback_retry_blocked;
         if !remotes.has_pending_stream_ack_publication() {
@@ -905,6 +915,64 @@ where
         }
 
         tokio::select! {
+            changed = server_tcp_demands.changed() => {
+                if changed.is_err() {
+                    s2c_tcp_validation = None;
+                    continue;
+                }
+                let demand = *server_tcp_demands.borrow_and_update();
+                if s2c_tcp_validation.as_ref().is_some_and(|validation| {
+                    demand.is_none_or(|demand| !validation.matches_demand(demand))
+                }) {
+                    s2c_tcp_validation = None;
+                }
+                if s2c_tcp_validation.is_none()
+                    && let Some(demand) = demand
+                {
+                    s2c_tcp_validation =
+                        ClientS2cTcpValidation::admit(context, demand, stream_id)?;
+                }
+                continue;
+            }
+            validation_input = receive_client_s2c_tcp_validation(&mut s2c_tcp_validation), if deferred_remote_frame.is_none() => {
+                let validation_input = validation_input
+                    .expect("active S2C TCP validation produces an input");
+                let action = s2c_tcp_validation
+                    .as_mut()
+                    .expect("S2C validation input retains its coordinator")
+                    .handle_input(validation_input);
+                match action {
+                    ClientS2cTcpValidationAction::None => {}
+                    ClientS2cTcpValidationAction::RemoteFrame(frame) => {
+                        debug_assert!(deferred_remote_frame.is_none());
+                        deferred_remote_frame = Some(frame);
+                    }
+                    ClientS2cTcpValidationAction::Retained(handoff) => {
+                        let retained =
+                            adopt_server_to_client_retained_carrier(context, handoff).await;
+                        s2c_tcp_validation = None;
+                        match retained {
+                            Ok(input) => {
+                                let attached = remotes.attach_receive_only(
+                                    input.instance,
+                                    input.commands,
+                                    input.frames,
+                                );
+                                debug_assert!(attached, "fresh S2C retain has an exact new instance");
+                            }
+                            Err(error) => crate::observability::process_event!(
+                                Warn,
+                                "tcp",
+                                "retained_s2c_carrier_publication_failed",
+                                "acknowledged TCP carrier could not enter ordinary S2C service: {error}"
+                            ),
+                        }
+                    }
+                    ClientS2cTcpValidationAction::Finished => {
+                        s2c_tcp_validation = None;
+                    }
+                }
+            }
             validation_input = receive_client_c2s_tcp_validation(&mut c2s_tcp_validation) => {
                 let validation_input = validation_input
                     .expect("active C2S TCP validation produces an input");
@@ -975,7 +1043,7 @@ where
                 continue;
             }
             _ = std::future::ready(()), if pending_remote_fin_ready
-                && !remotes.is_empty()
+                && remotes.has_receive_feedback_output()
                 && state.progress.sender_retry_at.is_none() => {
                 let feedback_published = match sender
                     .send_recv_progress(
@@ -1001,7 +1069,7 @@ where
                     &mut local,
                     &mut state,
                     &recv_stream,
-                    feedback_published && !remotes.is_empty(),
+                    feedback_published && remotes.has_receive_feedback_output(),
                 )
                 .await
                 {
@@ -1819,6 +1887,10 @@ where
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
+                        if remotes.is_receive_only_instance(instance) {
+                            let _ = remotes.remove_receive_only_instance(instance);
+                            continue;
+                        }
                         let planned_retirement = matches!(&err, RuntimeError::ReliablePathRetired);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
@@ -2022,7 +2094,7 @@ where
                                 &mut local,
                                 &mut state,
                                 &recv_stream,
-                                feedback_published && !remotes.is_empty(),
+                                feedback_published && remotes.has_receive_feedback_output(),
                             )
                             .await
                             {
@@ -2165,7 +2237,7 @@ where
                                 &mut local,
                                 &mut state,
                                 &recv_stream,
-                                feedback_published && !remotes.is_empty(),
+                                feedback_published && remotes.has_receive_feedback_output(),
                             )
                             .await
                             {

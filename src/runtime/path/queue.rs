@@ -230,6 +230,38 @@ pub(in crate::runtime) struct TcpCarrierValidationDataReservation<'a> {
     validation_id: NonZeroU64,
 }
 
+/// Owned form used when an exact validation output is selected under a
+/// binding lock but the enclosing Product transaction must commit after that
+/// lock is released.
+pub(in crate::runtime) struct OwnedTcpCarrierValidationDataReservation {
+    permit: Option<mpsc::OwnedPermit<QueuedReliablePathCommand>>,
+    frame: Option<Frame>,
+    bytes: usize,
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
+    validation_id: NonZeroU64,
+}
+
+impl OwnedTcpCarrierValidationDataReservation {
+    pub(in crate::runtime) fn commit(mut self) {
+        let frame = self
+            .frame
+            .take()
+            .expect("reserved owned TCP carrier validation frame");
+        self.metrics.add_pending_bytes(self.bytes);
+        self.permit
+            .take()
+            .expect("reserved owned TCP carrier validation permit")
+            .send(QueuedReliablePathCommand::new(
+                ReliablePathCommand::SendTcpCarrierValidationData {
+                    validation_id: self.validation_id,
+                    frame,
+                },
+                self.bytes,
+                self.metrics.clone(),
+            ));
+    }
+}
+
 impl TcpCarrierValidationDataReservation<'_> {
     pub(in crate::runtime) fn commit(mut self) {
         #[cfg(feature = "lab-diagnostics")]
@@ -1045,6 +1077,48 @@ impl ReliablePathCommandSender {
         )?;
         Ok(TcpCarrierValidationDataReservation {
             reservation,
+            validation_id,
+        })
+    }
+
+    pub(in crate::runtime) fn try_reserve_owned_tcp_carrier_validation_data(
+        &self,
+        validation_id: NonZeroU64,
+        frame: Frame,
+        lane: TrafficClass,
+    ) -> Result<OwnedTcpCarrierValidationDataReservation, RuntimeError> {
+        if !matches!(&frame, Frame::StreamData { .. }) {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation data requires STREAM_DATA",
+            ));
+        }
+        if lane != TrafficClass::Throughput {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation data requires throughput traffic",
+            ));
+        }
+        let bytes = reliable_path_frame_pacing_bytes(&frame);
+        let permit = match self.data.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                if !self.metrics.lifecycle.is_active() {
+                    return Err(RuntimeError::ReliablePathSessionClosed);
+                }
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(RuntimeError::ReliablePathSessionClosed);
+            }
+        };
+        if !self.metrics.lifecycle.is_active() {
+            drop(permit);
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        }
+        Ok(OwnedTcpCarrierValidationDataReservation {
+            permit: Some(permit),
+            frame: Some(frame),
+            bytes,
+            metrics: self.metrics.clone(),
             validation_id,
         })
     }

@@ -91,12 +91,36 @@ struct ClientTcpCarrierCandidateState {
 struct ClientTcpCarrierRetainedValidationState {
     validation_id: NonZeroU64,
     direction: PathMetricDirection,
+    request_id: Option<NonZeroU64>,
+    stream_id: Option<StreamId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientTcpCarrierServerToClientPhase {
+    Establishing,
+    Validating,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientTcpCarrierServerToClientState {
+    request_id: NonZeroU64,
+    validation_id: NonZeroU64,
+    stream_id: StreamId,
+    phase: ClientTcpCarrierServerToClientPhase,
+}
+
+impl ClientTcpCarrierServerToClientState {
+    fn same_transaction(self, other: Self) -> bool {
+        self.request_id == other.request_id
+            && self.validation_id == other.validation_id
+            && self.stream_id == other.stream_id
+    }
 }
 
 #[derive(Debug)]
 enum ClientTcpCarrierValidationTransaction {
     ClientToServerCandidate(ClientTcpCarrierCandidateState),
-    #[cfg_attr(not(test), allow(dead_code))]
+    ServerToClientCandidate(ClientTcpCarrierServerToClientState),
     RetainedDirection(ClientTcpCarrierRetainedValidationState),
 }
 
@@ -104,16 +128,34 @@ impl ClientTcpCarrierValidationTransaction {
     fn client_to_server_candidate(&self) -> Option<&ClientTcpCarrierCandidateState> {
         match self {
             Self::ClientToServerCandidate(candidate) => Some(candidate),
-            Self::RetainedDirection(_) => None,
+            Self::ServerToClientCandidate(_) | Self::RetainedDirection(_) => None,
         }
     }
 
     fn client_to_server_candidate_mut(&mut self) -> Option<&mut ClientTcpCarrierCandidateState> {
         match self {
             Self::ClientToServerCandidate(candidate) => Some(candidate),
-            Self::RetainedDirection(_) => None,
+            Self::ServerToClientCandidate(_) | Self::RetainedDirection(_) => None,
         }
     }
+}
+
+/// Exact server-owned request accepted by the client for one fresh S2C
+/// validation-purpose carrier. The local group reservation remains separate
+/// so the carrier actor can retain it only after the matching acknowledgment
+/// has been serialized.
+pub(in crate::runtime) struct ClientTcpServerToClientAdmission {
+    lease: Option<ClientTcpServerToClientAdmissionLease>,
+    reservation: Option<ClientTcpCarrierReservation>,
+}
+
+pub(in crate::runtime) struct ClientTcpServerToClientAdmissionLease {
+    owner: Weak<ClientTcpCarrierService>,
+    identity: ClientTcpCarrierServerToClientState,
+    config_index: usize,
+    endpoint_policy: Arc<ClientTcpEndpointPolicy>,
+    endpoint_snapshot: ClientTcpEndpointPolicySnapshot,
+    armed: bool,
 }
 
 /// Exact sender facts routed to the one active directional validation owner.
@@ -222,6 +264,131 @@ impl ClientTcpCarrierService {
         state.server_demand = Some(demand);
         self.server_demand_changes.send_replace(Some(demand));
         Ok(())
+    }
+
+    /// Claims the exact current nonzero S2C request and one locally bounded
+    /// elastic slot. A peer request never chooses an endpoint or bypasses the
+    /// configured minimum/maximum envelope; endpoint selection remains the
+    /// client's existing Product-policy order.
+    pub(in crate::runtime) fn try_claim_server_to_client_demand(
+        self: &Arc<Self>,
+        demand: ClientTcpCarrierDemand,
+        groups: &Arc<ClientTcpCarrierGroups>,
+    ) -> Option<ClientTcpServerToClientAdmission> {
+        let stream_id = demand.stream_id?;
+        let mut state = self.state.lock().expect("TCP carrier service lock");
+        if state.server_demand != Some(demand) || state.validation_transaction.is_some() {
+            return None;
+        }
+
+        let selected = (0..groups.len()).find_map(|config_index| {
+            let group = groups.get(config_index)?;
+            let occupied = groups.occupied(config_index)?;
+            if occupied < group.range.min() || occupied >= group.range.max() {
+                return None;
+            }
+            let endpoint_policy = groups.endpoint_policy(config_index)?;
+            let endpoint_snapshot = endpoint_policy.snapshot();
+            if !endpoint_snapshot.enabled {
+                return None;
+            }
+            groups.reserve_elastic(config_index).map(|reservation| {
+                (
+                    config_index,
+                    endpoint_policy,
+                    endpoint_snapshot,
+                    reservation,
+                )
+            })
+        })?;
+        let validation_id = take_sequence(&mut state.next_validation_id)?;
+        let identity = ClientTcpCarrierServerToClientState {
+            request_id: demand.request_id,
+            validation_id,
+            stream_id,
+            phase: ClientTcpCarrierServerToClientPhase::Establishing,
+        };
+        state.validation_transaction =
+            Some(ClientTcpCarrierValidationTransaction::ServerToClientCandidate(identity));
+        let (config_index, endpoint_policy, endpoint_snapshot, reservation) = selected;
+        Some(ClientTcpServerToClientAdmission {
+            lease: Some(ClientTcpServerToClientAdmissionLease {
+                owner: Arc::downgrade(self),
+                identity,
+                config_index,
+                endpoint_policy,
+                endpoint_snapshot,
+                armed: true,
+            }),
+            reservation: Some(reservation),
+        })
+    }
+
+    fn server_to_client_is_current(&self, identity: ClientTcpCarrierServerToClientState) -> bool {
+        let state = self.state.lock().expect("TCP carrier service lock");
+        state.server_demand
+            == Some(ClientTcpCarrierDemand {
+                request_id: identity.request_id,
+                stream_id: Some(identity.stream_id),
+            })
+            && state
+                .validation_transaction
+                .as_ref()
+                .is_some_and(|transaction| {
+                    matches!(
+                        transaction,
+                        ClientTcpCarrierValidationTransaction::ServerToClientCandidate(current)
+                            if current.same_transaction(identity)
+                    )
+                })
+    }
+
+    fn begin_server_to_client_validation(
+        &self,
+        identity: ClientTcpCarrierServerToClientState,
+    ) -> bool {
+        let mut state = self.state.lock().expect("TCP carrier service lock");
+        if state.server_demand
+            != Some(ClientTcpCarrierDemand {
+                request_id: identity.request_id,
+                stream_id: Some(identity.stream_id),
+            })
+        {
+            return false;
+        }
+        let Some(ClientTcpCarrierValidationTransaction::ServerToClientCandidate(current)) =
+            state.validation_transaction.as_mut()
+        else {
+            return false;
+        };
+        if !current.same_transaction(identity)
+            || current.phase != ClientTcpCarrierServerToClientPhase::Establishing
+        {
+            return false;
+        }
+        current.phase = ClientTcpCarrierServerToClientPhase::Validating;
+        true
+    }
+
+    fn finish_server_to_client_validation(
+        &self,
+        identity: ClientTcpCarrierServerToClientState,
+    ) -> bool {
+        let mut state = self.state.lock().expect("TCP carrier service lock");
+        let exact = state
+            .validation_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction,
+                    ClientTcpCarrierValidationTransaction::ServerToClientCandidate(current)
+                        if current.same_transaction(identity)
+                )
+            });
+        if exact {
+            state.validation_transaction = None;
+        }
+        exact
     }
 
     pub(in crate::runtime) fn subscribe_policy_epochs(
@@ -706,6 +873,8 @@ impl ClientTcpCarrierService {
         let validation = ClientTcpCarrierRetainedValidationState {
             validation_id,
             direction,
+            request_id: None,
+            stream_id: None,
         };
         state.validation_transaction = Some(
             ClientTcpCarrierValidationTransaction::RetainedDirection(validation),
@@ -794,6 +963,115 @@ fn withdraw_candidate(state: &mut ClientTcpCarrierServiceState) {
         candidate.withdrawn = true;
         candidate.observations = None;
         state.observations_active.store(false, Ordering::Release);
+    }
+}
+
+impl ClientTcpServerToClientAdmissionLease {
+    pub(in crate::runtime) fn request_id(&self) -> NonZeroU64 {
+        self.identity.request_id
+    }
+
+    pub(in crate::runtime) fn validation_id(&self) -> NonZeroU64 {
+        self.identity.validation_id
+    }
+
+    pub(in crate::runtime) fn stream_id(&self) -> StreamId {
+        self.identity.stream_id
+    }
+
+    pub(in crate::runtime) fn config_index(&self) -> usize {
+        self.config_index
+    }
+
+    pub(in crate::runtime) fn endpoint_generation(&self) -> u64 {
+        self.endpoint_snapshot.generation
+    }
+
+    pub(in crate::runtime) fn is_current(&self) -> bool {
+        self.endpoint_policy
+            .allows(self.endpoint_snapshot.generation)
+            && self
+                .owner
+                .upgrade()
+                .is_some_and(|owner| owner.server_to_client_is_current(self.identity))
+    }
+
+    pub(in crate::runtime) fn begin_validation(&mut self) -> bool {
+        self.is_current()
+            && self
+                .owner
+                .upgrade()
+                .is_some_and(|owner| owner.begin_server_to_client_validation(self.identity))
+    }
+
+    /// Completes the exact local S2C settlement after the result
+    /// acknowledgment has entered this carrier's ordered writer. Directional
+    /// publication remains the retained-carrier registry's responsibility.
+    pub(in crate::runtime) fn finish(mut self) -> bool {
+        let finished = self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| owner.finish_server_to_client_validation(self.identity));
+        if finished {
+            self.armed = false;
+        }
+        finished
+    }
+
+    fn cancel_inner(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Some(owner) = self.owner.upgrade() {
+            let _ = owner.finish_server_to_client_validation(self.identity);
+        }
+    }
+}
+
+impl Drop for ClientTcpServerToClientAdmissionLease {
+    fn drop(&mut self) {
+        self.cancel_inner();
+    }
+}
+
+impl ClientTcpServerToClientAdmission {
+    fn lease(&self) -> &ClientTcpServerToClientAdmissionLease {
+        self.lease
+            .as_ref()
+            .expect("live S2C admission owns its service lease")
+    }
+
+    pub(in crate::runtime) fn request_id(&self) -> NonZeroU64 {
+        self.lease().request_id()
+    }
+
+    pub(in crate::runtime) fn validation_id(&self) -> NonZeroU64 {
+        self.lease().validation_id()
+    }
+
+    pub(in crate::runtime) fn stream_id(&self) -> StreamId {
+        self.lease().stream_id()
+    }
+
+    pub(in crate::runtime) fn config_index(&self) -> usize {
+        self.lease().config_index()
+    }
+
+    pub(in crate::runtime) fn into_parts(
+        mut self,
+    ) -> (
+        ClientTcpServerToClientAdmissionLease,
+        ClientTcpCarrierReservation,
+    ) {
+        (
+            self.lease
+                .take()
+                .expect("live S2C admission owns its service lease"),
+            self.reservation
+                .take()
+                .expect("live S2C admission owns its carrier reservation"),
+        )
     }
 }
 
@@ -1214,6 +1492,21 @@ impl ClientTcpCarrierAdmission {
 }
 
 impl ClientPathContext {
+    pub(in crate::runtime) fn subscribe_server_tcp_carrier_demands(
+        &self,
+    ) -> watch::Receiver<Option<ClientTcpCarrierDemand>> {
+        self.state.tcp_carrier_service().subscribe_server_demands()
+    }
+
+    pub(in crate::runtime) fn claim_server_to_client_tcp_carrier(
+        &self,
+        demand: ClientTcpCarrierDemand,
+    ) -> Option<ClientTcpServerToClientAdmission> {
+        self.state
+            .tcp_carrier_service()
+            .try_claim_server_to_client_demand(demand, &self.tcp_carrier_groups)
+    }
+
     pub(in crate::runtime) fn register_tcp_carrier_workload(
         &self,
         stream_id: StreamId,

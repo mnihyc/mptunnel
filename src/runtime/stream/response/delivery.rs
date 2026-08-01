@@ -229,6 +229,28 @@ pub(in crate::runtime) fn response_latest_original_hole(
 }
 
 impl ResponseStreamBinding {
+    /// Exact unresolved unique-original flight owned by one unpublished S2C
+    /// validation output. Reinjections and ambiguous ownership never enter
+    /// this work-zero boundary.
+    pub(in crate::runtime) fn validation_candidate_original_flight_bytes(
+        &self,
+        identity: super::attachment::ResponseValidationOutputIdentity,
+    ) -> u64 {
+        self.flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .values()
+            .flatten()
+            .filter(|flight| {
+                flight.key == identity.key
+                    && flight.output_incarnation == identity.incarnation
+                    && flight.kind.is_original_transmission()
+            })
+            .fold(0_u64, |total, flight| {
+                total.saturating_add(u64::try_from(flight.bytes).unwrap_or(u64::MAX))
+            })
+    }
+
     pub(in crate::runtime) fn tail_reinjection_snapshot(
         &self,
         ack_frontier: u64,
@@ -608,6 +630,12 @@ impl ResponseStreamBinding {
             .iter()
             .chain(outputs.detaching.iter())
             .map(|entry| (entry.key, entry.incarnation))
+            .chain(
+                outputs
+                    .validation
+                    .iter()
+                    .map(|entry| (entry.key, entry.incarnation)),
+            )
             .collect::<Vec<_>>();
         drop(outputs);
         let flights = self
@@ -648,6 +676,12 @@ impl ResponseStreamBinding {
             .iter()
             .chain(outputs.detaching.iter())
             .map(|entry| (entry.key, entry.incarnation))
+            .chain(
+                outputs
+                    .validation
+                    .iter()
+                    .map(|entry| (entry.key, entry.incarnation)),
+            )
             .collect::<Vec<_>>();
         let flights = self
             .flights

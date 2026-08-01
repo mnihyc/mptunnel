@@ -54,11 +54,98 @@ pub(in crate::runtime) struct ClientTcpRetainedCarrierRegistry {
     carriers: Mutex<BTreeMap<usize, ClientTcpRetainedCarrier>>,
 }
 
+/// Exact provisional registry ownership established before a fresh S2C
+/// `RETAIN` acknowledgment. The entry carries no directional authority until
+/// `commit_direction`; dropping it removes only this physical instance.
+pub(in crate::runtime) struct ClientTcpRetainedCarrierPublicationReservation {
+    registry: Arc<ClientTcpRetainedCarrierRegistry>,
+    key: RelayPathKey,
+    path_instance_id: CarrierPathInstanceId,
+    active: bool,
+}
+
+impl ClientTcpRetainedCarrierPublicationReservation {
+    pub(in crate::runtime) fn commit_direction(&mut self, direction: PathMetricDirection) -> bool {
+        let mut carriers = self
+            .registry
+            .carriers
+            .lock()
+            .expect("retained TCP carrier lock");
+        let Some(carrier) = carriers.get_mut(&self.key.index) else {
+            return false;
+        };
+        if carrier.key != self.key
+            || carrier.path_instance_id != self.path_instance_id
+            || carrier.retiring
+            || carrier.authorized_tcp_directions != 0
+        {
+            return false;
+        }
+        carrier.authorized_tcp_directions = tcp_carrier_direction_bit(direction);
+        true
+    }
+
+    pub(in crate::runtime) fn is_direction_authorized(
+        &self,
+        direction: PathMetricDirection,
+    ) -> bool {
+        self.registry
+            .direction_authorized(self.key, self.path_instance_id, direction)
+    }
+
+    /// Transfers cleanup to the retained carrier actor after health and actor
+    /// publication have completed synchronously.
+    pub(in crate::runtime) fn commit_publication(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ClientTcpRetainedCarrierPublicationReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self.registry.remove(self.key, self.path_instance_id);
+        }
+    }
+}
+
 impl ClientTcpRetainedCarrierRegistry {
     pub(in crate::runtime) fn new(service: Arc<ClientTcpCarrierService>) -> Arc<Self> {
         Arc::new(Self {
             service,
             carriers: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub(in crate::runtime) fn reserve_publication(
+        self: &Arc<Self>,
+        config_index: usize,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        commands: ReliablePathCommandSender,
+    ) -> Option<ClientTcpRetainedCarrierPublicationReservation> {
+        if key.underlay != UnderlayProtocol::Tcp || key.index == usize::MAX {
+            return None;
+        }
+        let carrier = ClientTcpRetainedCarrier {
+            config_index,
+            key,
+            path_instance_id,
+            commands,
+            authorized_tcp_directions: 0,
+            retiring: false,
+            validation: None,
+        };
+        let mut carriers = self.carriers.lock().expect("retained TCP carrier lock");
+        if carriers.contains_key(&key.index) {
+            return None;
+        }
+        carriers.insert(key.index, carrier);
+        Some(ClientTcpRetainedCarrierPublicationReservation {
+            registry: self.clone(),
+            key,
+            path_instance_id,
+            active: true,
         })
     }
 
@@ -359,12 +446,14 @@ pub(in crate::runtime) async fn adopt_client_to_server_retained_carrier(
         peer_status,
         path_proofs,
         reservation,
+        server_to_client,
     } = *handoff;
     let expected = candidate.instance;
     if candidate.stream_id != remotes.stream_id()
         || expected.key.underlay != UnderlayProtocol::Tcp
         || reservation.elastic_path_index() != Some(expected.key.index)
         || reservation.path_id() != candidate.path_id
+        || server_to_client.is_some()
     {
         return Err(RuntimeError::Protocol(
             "retained TCP carrier handoff identity mismatch",
@@ -502,6 +591,146 @@ pub(in crate::runtime) async fn adopt_client_to_server_retained_carrier(
         .await;
     });
     Ok(())
+}
+
+/// Receive-only target attachment returned after an acknowledged fresh S2C
+/// retain. It remains outside request-output membership, so it cannot acquire
+/// C2S ordinary authority by representation accident.
+pub(in crate::runtime) struct ClientTcpServerToClientRetainedInput {
+    pub(in crate::runtime) instance: crate::model::path::RelayPathInstance,
+    pub(in crate::runtime) commands: ReliablePathCommandSender,
+    pub(in crate::runtime) frames: mpsc::Receiver<Result<crate::protocol::Frame, RuntimeError>>,
+}
+
+/// Publishes an acknowledged fresh S2C carrier and continues its existing
+/// target attachment in the ordinary TCP actor. Unlike the C2S path above,
+/// this returns only a receive/feedback attachment and never inserts the
+/// carrier into the request sender's ordinary output membership.
+pub(in crate::runtime) async fn adopt_server_to_client_retained_carrier(
+    context: &ClientPathContext,
+    handoff: Box<ClientTcpValidationHandoff>,
+) -> Result<ClientTcpServerToClientRetainedInput, RuntimeError> {
+    let ClientTcpValidationHandoff {
+        candidate,
+        endpoint_generation,
+        runtime,
+        connection: carrier,
+        peer_status,
+        path_proofs,
+        reservation,
+        server_to_client,
+    } = *handoff;
+    let Some(server_to_client) = server_to_client else {
+        return Err(RuntimeError::Protocol(
+            "retained S2C TCP carrier handoff has no acknowledged publication",
+        ));
+    };
+    let super::client_validation::ClientTcpServerToClientRetainedPreparation {
+        commands,
+        command_receivers,
+        publication,
+    } = server_to_client;
+    let expected = candidate.instance;
+    if expected.key.underlay != UnderlayProtocol::Tcp
+        || reservation.elastic_path_index() != Some(expected.key.index)
+        || reservation.path_id() != candidate.path_id
+    {
+        return Err(RuntimeError::Protocol(
+            "retained S2C TCP carrier handoff identity mismatch",
+        ));
+    }
+
+    let mut runtime = runtime.into_runtime();
+    if runtime.config_index != reservation.config_index()
+        || !runtime.endpoint_policy.allows(endpoint_generation)
+    {
+        return Err(RuntimeError::ReliablePathRetired);
+    }
+    runtime.path_index = expected.key.index;
+    runtime.path_id = Some(candidate.path_id);
+    runtime.remote_port = Some(candidate.remote_port);
+
+    let readiness_rtt = carrier.readiness_rtt;
+    let mut startup_snapshot = path_startup_snapshot(runtime.path(), candidate.path_id);
+    startup_snapshot.peer_usage = Some(carrier.peer_usage);
+    let startup_metrics = path_startup_metrics(
+        runtime.path(),
+        candidate.path_id,
+        PathMetricDirection::ServerToClient,
+    );
+    let mut connection = ClientTcpPathConnection::new_with_path_proofs(
+        expected.path_instance_id,
+        startup_snapshot,
+        startup_metrics,
+        carrier,
+        peer_status,
+        path_proofs,
+        runtime.mux_limits,
+    );
+    let (frames_tx, frames) = mpsc::channel(runtime.stream_frame_queue.max(1));
+
+    if !publication.is_direction_authorized(PathMetricDirection::ServerToClient) {
+        return Err(RuntimeError::ReliablePathRetired);
+    }
+    let mut authenticated_carrier = None;
+    let health_published = runtime
+        .endpoint_policy
+        .with_current(endpoint_generation, || {
+            runtime.state.publish_retained_tcp_carrier(
+                ClientTcpCarrierPublication {
+                    path_index: expected.key.index,
+                    path_id: candidate.path_id,
+                    path_instance_id: expected.path_instance_id,
+                    peer_usage_sequence: connection.carrier.peer_usage_sequence,
+                    peer_usage: connection.carrier.peer_usage,
+                    readiness_rtt: Some(readiness_rtt),
+                },
+                || {
+                    authenticated_carrier = Some(runtime.authenticated_carriers.register());
+                },
+            )
+        })
+        .unwrap_or(false);
+    if !health_published {
+        return Err(RuntimeError::ReliablePathRetired);
+    }
+    connection.retain_authenticated_carrier(
+        authenticated_carrier.expect("retained TCP publication registers its carrier"),
+    );
+
+    let published_instance = Arc::new(AtomicU64::new(expected.path_instance_id.as_u64()));
+    let published_remote_port = Arc::new(AtomicU32::new(u32::from(candidate.remote_port)));
+    let actor_terminal = Arc::new(AtomicBool::new(false));
+    let terminal_state = runtime.state.clone();
+    let terminal_registry = Arc::downgrade(&context.tcp_retained_carriers);
+    let terminal_cleanup = Box::new(move || {
+        let _ = terminal_state
+            .remove_retained_tcp_carrier(expected.key.index, expected.path_instance_id);
+        if let Some(registry) = terminal_registry.upgrade() {
+            let _ = registry.remove(expected.key, expected.path_instance_id);
+        }
+    });
+    publication.commit_publication();
+    tokio::spawn(async move {
+        run_client_tcp_path_session_with_retained_stream(ClientTcpRetainedSessionStart {
+            runtime,
+            commands: command_receivers,
+            published_carrier_instance: published_instance,
+            published_remote_port,
+            actor_terminal,
+            reservation,
+            connection,
+            stream_id: candidate.stream_id,
+            stream_frames: frames_tx,
+            terminal_cleanup,
+        })
+        .await;
+    });
+    Ok(ClientTcpServerToClientRetainedInput {
+        instance: expected,
+        commands,
+        frames,
+    })
 }
 
 #[cfg(test)]

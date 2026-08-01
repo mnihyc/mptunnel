@@ -168,6 +168,57 @@ async fn validation_actor_with_retention(
     (context, controller, events, task)
 }
 
+struct ServerToClientValidationActor {
+    context: ClientPathContext,
+    _minimum: ClientTcpCarrierReservation,
+    controller: ClientTcpValidationController,
+    events: mpsc::Receiver<ClientTcpValidationEvent>,
+    task: tokio::task::JoinHandle<Result<(), RuntimeError>>,
+}
+
+async fn server_to_client_validation_actor(
+    path: PathSpec,
+    request_id: NonZeroU64,
+    stream_id: StreamId,
+) -> ServerToClientValidationActor {
+    let context = ClientPathContext::new(vec![path], client_security(), ResourceLimits::default())
+        .expect("validation client context");
+    let config_index = context
+        .tcp_config_index(0)
+        .expect("validation TCP config index");
+    let minimum = context
+        .tcp_carrier_groups
+        .reserve(config_index)
+        .expect("reserve configured minimum carrier");
+    let demand = crate::runtime::path::tcp::service::ClientTcpCarrierDemand {
+        request_id,
+        stream_id: Some(stream_id),
+    };
+    context
+        .state
+        .tcp_carrier_service()
+        .apply_server_demand(demand)
+        .expect("publish exact server demand");
+    let admission = context
+        .claim_server_to_client_tcp_carrier(demand)
+        .expect("claim bounded S2C carrier");
+    let actor_admission = context.tcp_sessions[0]
+        .s2c_validation_admission(
+            admission,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .expect("create S2C validation admission");
+    let (session, controller, events) = ClientTcpValidationSession::new(actor_admission);
+    let task = tokio::spawn(session.run());
+    ServerToClientValidationActor {
+        context,
+        _minimum: minimum,
+        controller,
+        events,
+        task,
+    }
+}
+
 async fn next_wire_frame(peer: &mut ValidationWirePeer) -> Frame {
     tokio::time::timeout(Duration::from_secs(5), peer.observed.recv())
         .await
@@ -182,6 +233,23 @@ async fn next_actor_event(
         .await
         .expect("validation actor event timed out")
         .expect("validation actor event channel ended")
+}
+
+async fn next_server_to_client_actor_event(
+    actor: &mut ServerToClientValidationActor,
+) -> ClientTcpValidationEvent {
+    match tokio::time::timeout(Duration::from_secs(5), actor.events.recv())
+        .await
+        .expect("S2C validation actor event timed out")
+    {
+        Some(event) => event,
+        None => {
+            let result = (&mut actor.task)
+                .await
+                .expect("S2C validation actor task panicked");
+            panic!("S2C validation actor ended before its event: {result:?}");
+        }
+    }
 }
 
 async fn finish_actor(task: tokio::task::JoinHandle<Result<(), RuntimeError>>) {
@@ -441,5 +509,175 @@ async fn expired_c2s_validation_serializes_withdrawn_before_exact_native_retirem
         .expect("expired validation actor task");
     assert!(matches!(result, Err(RuntimeError::SessionRetentionTimeout)));
     assert_eq!(context.tcp_carrier_groups.occupied(0), Some(0));
+    stop_wire_peer(peer);
+}
+
+#[tokio::test]
+async fn retained_s2c_validation_commits_exact_authority_before_wire_ack() {
+    let request_id = NonZeroU64::new(17).expect("nonzero request ID");
+    let stream_id = StreamId(83);
+    let (path, mut peer) = validation_wire_peer(PathUsage::Available).await;
+    let mut actor = server_to_client_validation_actor(path, request_id, stream_id).await;
+
+    let validation_id = match next_wire_frame(&mut peer).await {
+        Frame::TcpCarrierValidate {
+            validation_id,
+            request_id: received_request_id,
+            direction: PathMetricDirection::ServerToClient,
+            stream_id: received_stream_id,
+        } if received_request_id == request_id.get() && received_stream_id == stream_id => {
+            NonZeroU64::new(validation_id).expect("nonzero validation ID")
+        }
+        _ => panic!("expected exact S2C validation request"),
+    };
+    let candidate = match next_server_to_client_actor_event(&mut actor).await {
+        ClientTcpValidationEvent::ReceiverAdmitted { candidate } => candidate,
+        _ => panic!("expected receiver-side validation admission"),
+    };
+    assert_eq!(candidate.validation_id, validation_id);
+    assert!(!actor.context.tcp_retained_carriers.direction_authorized(
+        candidate.instance.key,
+        candidate.instance.path_instance_id,
+        PathMetricDirection::ServerToClient,
+    ));
+
+    let candidate_data = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: Bytes::from_static(b"candidate"),
+    };
+    peer.frames
+        .send(candidate_data.clone())
+        .await
+        .expect("send S2C candidate data");
+    match next_server_to_client_actor_event(&mut actor).await {
+        ClientTcpValidationEvent::Control {
+            candidate: event_candidate,
+            frame,
+        } => {
+            assert_eq!(event_candidate, candidate);
+            assert_eq!(frame, candidate_data);
+        }
+        _ => panic!("expected exact S2C candidate data"),
+    }
+
+    peer.frames
+        .send(Frame::TcpCarrierResult {
+            validation_id: validation_id.get(),
+            direction: PathMetricDirection::ServerToClient,
+            result: TcpCarrierValidationResult::Retain,
+        })
+        .await
+        .expect("send S2C RETAIN result");
+    assert!(matches!(
+        next_server_to_client_actor_event(&mut actor).await,
+        ClientTcpValidationEvent::ResultReceived {
+            candidate: event_candidate,
+            result: TcpCarrierValidationResult::Retain,
+        } if event_candidate == candidate
+    ));
+    actor
+        .controller
+        .acknowledge_server_to_client_result(TcpCarrierValidationResult::Retain)
+        .await
+        .expect("acknowledge S2C RETAIN");
+    assert!(actor.context.tcp_retained_carriers.direction_authorized(
+        candidate.instance.key,
+        candidate.instance.path_instance_id,
+        PathMetricDirection::ServerToClient,
+    ));
+    assert_eq!(
+        next_wire_frame(&mut peer).await,
+        Frame::TcpCarrierResultAck {
+            validation_id: validation_id.get(),
+            direction: PathMetricDirection::ServerToClient,
+            result: TcpCarrierValidationResult::Retain,
+        }
+    );
+    let handoff = match next_server_to_client_actor_event(&mut actor).await {
+        ClientTcpValidationEvent::Retained(handoff) => handoff,
+        _ => panic!("expected S2C retained handoff"),
+    };
+    assert!(handoff.server_to_client.is_some());
+    finish_actor(actor.task).await;
+    drop(handoff);
+    assert!(!actor.context.tcp_retained_carriers.direction_authorized(
+        candidate.instance.key,
+        candidate.instance.path_instance_id,
+        PathMetricDirection::ServerToClient,
+    ));
+    assert_eq!(actor.context.tcp_carrier_groups.occupied(0), Some(1));
+    stop_wire_peer(peer);
+}
+
+#[tokio::test]
+async fn negative_s2c_validation_ack_precedes_ordered_candidate_drain() {
+    let request_id = NonZeroU64::new(19).expect("nonzero request ID");
+    let stream_id = StreamId(89);
+    let (path, mut peer) = validation_wire_peer(PathUsage::Available).await;
+    let mut actor = server_to_client_validation_actor(path, request_id, stream_id).await;
+    let validation_id = match next_wire_frame(&mut peer).await {
+        Frame::TcpCarrierValidate { validation_id, .. } => {
+            NonZeroU64::new(validation_id).expect("nonzero validation ID")
+        }
+        _ => panic!("expected S2C validation request"),
+    };
+    let candidate = match next_server_to_client_actor_event(&mut actor).await {
+        ClientTcpValidationEvent::ReceiverAdmitted { candidate } => candidate,
+        _ => panic!("expected receiver-side validation admission"),
+    };
+    peer.frames
+        .send(Frame::TcpCarrierResult {
+            validation_id: validation_id.get(),
+            direction: PathMetricDirection::ServerToClient,
+            result: TcpCarrierValidationResult::NoGain,
+        })
+        .await
+        .expect("send S2C NO_GAIN result");
+    assert!(matches!(
+        next_server_to_client_actor_event(&mut actor).await,
+        ClientTcpValidationEvent::ResultReceived {
+            result: TcpCarrierValidationResult::NoGain,
+            ..
+        }
+    ));
+    actor
+        .controller
+        .acknowledge_server_to_client_result(TcpCarrierValidationResult::NoGain)
+        .await
+        .expect("acknowledge S2C NO_GAIN");
+    assert_eq!(
+        next_wire_frame(&mut peer).await,
+        Frame::TcpCarrierResultAck {
+            validation_id: validation_id.get(),
+            direction: PathMetricDirection::ServerToClient,
+            result: TcpCarrierValidationResult::NoGain,
+        }
+    );
+    assert_eq!(
+        next_wire_frame(&mut peer).await,
+        Frame::StreamDetach { stream_id }
+    );
+    assert_eq!(
+        next_wire_frame(&mut peer).await,
+        Frame::PathDrain {
+            path_id: candidate.path_id,
+        }
+    );
+    peer.frames
+        .send(Frame::PathClose {
+            path_id: candidate.path_id,
+            reason: CloseReason::Normal,
+        })
+        .await
+        .expect("complete S2C candidate drain");
+    assert!(matches!(
+        next_server_to_client_actor_event(&mut actor).await,
+        ClientTcpValidationEvent::Drained {
+            candidate: event_candidate,
+        } if event_candidate == candidate
+    ));
+    finish_actor(actor.task).await;
+    assert_eq!(actor.context.tcp_carrier_groups.occupied(0), Some(1));
     stop_wire_peer(peer);
 }

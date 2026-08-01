@@ -178,6 +178,8 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
             .await
         }
         PathPurpose::Validation => {
+            let (commands_tx, commands_rx) =
+                reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
             ServerTcpValidationSession::new(ServerTcpValidationAdmission {
                 context,
                 session_id,
@@ -185,6 +187,8 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
                 path_registration,
                 writer: ServerTcpWriter::new(writer),
                 path_frames,
+                commands_tx,
+                commands_rx,
                 evidence,
                 peer_status,
                 carrier_demands,

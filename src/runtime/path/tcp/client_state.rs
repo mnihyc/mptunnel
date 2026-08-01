@@ -6,6 +6,7 @@
 use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_connection::ClientTcpCarrierConnection;
 use super::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
+use super::retained::ClientTcpRetainedCarrierRegistry;
 use crate::config::ClientSecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -130,6 +131,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) authenticated_carriers: AuthenticatedCarrierInventory,
     pub(in crate::runtime) endpoint_policy: Arc<ClientTcpEndpointPolicy>,
     pub(in crate::runtime) carrier_groups: Arc<ClientTcpCarrierGroups>,
+    pub(in crate::runtime) retained_carriers: Arc<ClientTcpRetainedCarrierRegistry>,
 }
 
 impl ClientTcpPathSessionRuntime {

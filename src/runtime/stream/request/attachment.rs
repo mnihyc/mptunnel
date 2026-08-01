@@ -14,6 +14,7 @@ use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey}
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
@@ -172,6 +173,16 @@ pub(in crate::runtime) struct ReliableRelayRemoteFrame {
     pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
 }
 
+/// One retained receive-only carrier attachment. Its separate collection is
+/// the authority fence: it can return receive progress for this stream, but it
+/// is never visible to request scheduling, load accounting, or OPEN_STREAM.
+struct ReliableRelayReceiveOnlyPath {
+    instance: RelayPathInstance,
+    commands: ReliablePathCommandSender,
+    published_max_data_offset: u64,
+    stream_ack_publication: StreamAckPublicationCursor,
+}
+
 /// Reports whether attachment-set ownership committed; a rejected pending open
 /// rolls back its carrier and scheduler lease when the value is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +228,7 @@ impl ReliableRelayAttachmentReservation {
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
+    receive_only_paths: Vec<ReliableRelayReceiveOnlyPath>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
     next_instance_id: u64,
@@ -233,6 +245,7 @@ impl ReliableRelayRemoteSet {
         let mut set = Self {
             stream_id,
             paths: Vec::new(),
+            receive_only_paths: Vec::new(),
             frames_tx,
             frames_rx,
             next_instance_id: 0,
@@ -376,6 +389,93 @@ impl ReliableRelayRemoteSet {
         self.paths.len()
     }
 
+    /// Adopts one already-retained S2C attachment without granting request
+    /// output authority. All inputs share the existing bounded relay fan-in.
+    pub(in crate::runtime) fn attach_receive_only(
+        &mut self,
+        instance: RelayPathInstance,
+        commands: ReliablePathCommandSender,
+        mut frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+    ) -> bool {
+        if self
+            .receive_only_paths
+            .iter()
+            .any(|path| path.instance == instance)
+        {
+            return false;
+        }
+        let frames_tx = self.frames_tx.clone();
+        tokio::spawn(async move {
+            let mut product_terminal_received = false;
+            while let Some(frame) = frames.recv().await {
+                product_terminal_received |= matches!(
+                    &frame,
+                    Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
+                );
+                let done = frame.is_err();
+                if frames_tx
+                    .send(ReliableRelayRemoteFrame { instance, frame })
+                    .await
+                    .is_err()
+                    || done
+                {
+                    return;
+                }
+            }
+            if !product_terminal_received {
+                let _ = frames_tx
+                    .send(ReliableRelayRemoteFrame {
+                        instance,
+                        frame: Err(RuntimeError::ReliablePathSessionClosed),
+                    })
+                    .await;
+            }
+        });
+        self.receive_only_paths.push(ReliableRelayReceiveOnlyPath {
+            instance,
+            commands,
+            published_max_data_offset: 0,
+            stream_ack_publication: StreamAckPublicationCursor::default(),
+        });
+        true
+    }
+
+    pub(in crate::runtime) fn has_receive_feedback_output(&self) -> bool {
+        self.paths
+            .iter()
+            .any(|path| !path.stream.request_control_frame_queue_is_closed())
+            || self
+                .receive_only_paths
+                .iter()
+                .any(|path| !path.commands.control_frame_queue_is_closed())
+    }
+
+    pub(in crate::runtime) fn is_receive_only_instance(&self, instance: RelayPathInstance) -> bool {
+        self.receive_only_paths
+            .iter()
+            .any(|path| path.instance == instance)
+    }
+
+    pub(in crate::runtime) fn remove_receive_only_instance(
+        &mut self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        let Some(position) = self
+            .receive_only_paths
+            .iter()
+            .position(|path| path.instance == instance)
+        else {
+            return false;
+        };
+        self.receive_only_paths.remove(position);
+        true
+    }
+
+    pub(in crate::runtime) fn remove_closed_receive_only_paths(&mut self) {
+        self.receive_only_paths
+            .retain(|path| !path.commands.control_frame_queue_is_closed());
+    }
+
     /// Advances retained shared receive credit and publishes it independently
     /// on every currently live attachment.
     pub(in crate::runtime) fn publish_max_data(
@@ -407,6 +507,27 @@ impl ReliableRelayRemoteSet {
                 publication.published_offset = Some(desired);
             }
         }
+        for path in &mut self.receive_only_paths {
+            if path.commands.control_frame_queue_is_closed()
+                || path.published_max_data_offset >= desired
+            {
+                continue;
+            }
+            if path
+                .commands
+                .try_enqueue_admitted_frame(
+                    Frame::StreamMaxData {
+                        stream_id: self.stream_id,
+                        max_offset: desired,
+                    },
+                    TrafficClass::Control,
+                )
+                .is_ok()
+            {
+                path.published_max_data_offset = desired;
+                publication.published_offset = Some(desired);
+            }
+        }
         publication.pending = self.has_pending_max_data_publication();
         publication
     }
@@ -414,6 +535,9 @@ impl ReliableRelayRemoteSet {
     pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
         self.paths.iter().any(|path| {
             !path.stream.request_control_frame_queue_is_closed()
+                && path.published_max_data_offset < self.desired_max_data_offset
+        }) || self.receive_only_paths.iter().any(|path| {
+            !path.commands.control_frame_queue_is_closed()
                 && path.published_max_data_offset < self.desired_max_data_offset
         })
     }
@@ -428,6 +552,15 @@ impl ReliableRelayRemoteSet {
                     && !path.stream.request_control_frame_queue_is_closed()
             })
             .filter_map(|path| path.stream.request_control_capacity_notify())
+            .chain(
+                self.receive_only_paths
+                    .iter()
+                    .filter(|path| {
+                        path.published_max_data_offset < self.desired_max_data_offset
+                            && !path.commands.control_frame_queue_is_closed()
+                    })
+                    .map(|path| path.commands.capacity_notify()),
+            )
             .collect()
     }
 
@@ -481,6 +614,26 @@ impl ReliableRelayRemoteSet {
             publication.accepted |= attachment.accepted;
             publication.published |= attachment.published;
         }
+        for path in &mut self.receive_only_paths {
+            if path.commands.control_frame_queue_is_closed() {
+                continue;
+            }
+            let commands = &path.commands;
+            let attachment = path.stream_ack_publication.retry_cumulative(
+                generation,
+                frames,
+                |frame| {
+                    debug_assert!(
+                        matches!(&frame, Frame::StreamAck { stream_id: id, .. } if *id == stream_id)
+                    );
+                    commands
+                        .try_enqueue_admitted_frame(frame, TrafficClass::Control)
+                        .is_ok()
+                },
+            );
+            publication.accepted |= attachment.accepted;
+            publication.published |= attachment.published;
+        }
         publication.pending = self.has_pending_stream_ack_publication();
         publication
     }
@@ -488,10 +641,13 @@ impl ReliableRelayRemoteSet {
     pub(in crate::runtime) fn has_pending_stream_ack_publication(&self) -> bool {
         let generation = self.desired_stream_ack_generation;
         generation != 0
-            && self.paths.iter().any(|path| {
+            && (self.paths.iter().any(|path| {
                 !path.stream.request_control_frame_queue_is_closed()
                     && path.stream_ack_publication.is_pending(generation)
-            })
+            }) || self.receive_only_paths.iter().any(|path| {
+                !path.commands.control_frame_queue_is_closed()
+                    && path.stream_ack_publication.is_pending(generation)
+            }))
     }
 
     pub(in crate::runtime) fn pending_stream_ack_capacity_notifies(
@@ -506,6 +662,16 @@ impl ReliableRelayRemoteSet {
                     && !path.stream.request_control_frame_queue_is_closed()
             })
             .filter_map(|path| path.stream.request_control_capacity_notify())
+            .chain(
+                self.receive_only_paths
+                    .iter()
+                    .filter(|path| {
+                        generation != 0
+                            && path.stream_ack_publication.is_pending(generation)
+                            && !path.commands.control_frame_queue_is_closed()
+                    })
+                    .map(|path| path.commands.capacity_notify()),
+            )
             .collect()
     }
 
@@ -732,9 +898,22 @@ impl ReliableRelayRemoteSet {
     }
 
     pub(in crate::runtime) async fn close_all(&mut self) {
+        let receive_only_paths = self.take_receive_only_paths();
         for path in self.take_paths_for_close() {
             path.stream.send_detach().await;
             path.stream.close().await;
+        }
+        for path in receive_only_paths {
+            let _ = path
+                .commands
+                .send_control(ReliablePathCommand::SendFrame(Frame::StreamDetach {
+                    stream_id: self.stream_id,
+                }))
+                .await;
+            let _ = path
+                .commands
+                .send_control(ReliablePathCommand::CloseStream(self.stream_id))
+                .await;
         }
     }
 
@@ -742,17 +921,43 @@ impl ReliableRelayRemoteSet {
     /// prevents retention and reinjection while carrier-only failures continue
     /// to use detach and preserve the logical stream for path recovery.
     pub(in crate::runtime) async fn reset_all(&mut self, reason: ResetReason) {
+        let receive_only_paths = self.take_receive_only_paths();
         let paths = self.take_paths_for_close();
         futures::future::join_all(paths.into_iter().map(|path| async move {
             path.stream.reset_and_close(reason).await;
         }))
         .await;
+        for path in receive_only_paths {
+            let _ = path
+                .commands
+                .send_control(ReliablePathCommand::ResetAndCloseStream {
+                    stream_id: self.stream_id,
+                    reason,
+                })
+                .await;
+        }
     }
 
     /// Successful retirement follows ordered FIN work on every carrier.
     pub(in crate::runtime) async fn close_all_ordered(&mut self) {
+        let receive_only_paths = self.take_receive_only_paths();
         for path in self.take_paths_for_close() {
             path.stream.detach_and_close_ordered().await;
+        }
+        for path in receive_only_paths {
+            let _ = path
+                .commands
+                .send_stream_ordered_frame(
+                    Frame::StreamDetach {
+                        stream_id: self.stream_id,
+                    },
+                    TrafficClass::Throughput,
+                )
+                .await;
+            let _ = path
+                .commands
+                .send_stream_ordered_close(self.stream_id, TrafficClass::Throughput)
+                .await;
         }
     }
 
@@ -767,6 +972,10 @@ impl ReliableRelayRemoteSet {
             path.depublish_load();
         }
         paths
+    }
+
+    fn take_receive_only_paths(&mut self) -> Vec<ReliableRelayReceiveOnlyPath> {
+        std::mem::take(&mut self.receive_only_paths)
     }
 
     pub(in crate::runtime) async fn fail_path_instance(

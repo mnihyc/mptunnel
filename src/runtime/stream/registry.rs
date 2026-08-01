@@ -6,6 +6,7 @@ use super::response::{
     ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
     ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsEntry,
     ServerPathMetricsSource, ServerSessionRegistration, ServerSessionTracker,
+    ServerTcpValidationOutput,
 };
 use super::send_buffer::SessionSendBuffer;
 #[cfg(feature = "lab-diagnostics")]
@@ -2238,6 +2239,87 @@ impl ServerReliableStreamRegistry {
         Ok(Some(ServerValidationStreamBinding::new(binding)))
     }
 
+    fn bind_validation_output_existing(
+        self: &Arc<Self>,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        commands: ReliablePathCommandSender,
+    ) -> Result<Option<ServerTcpValidationOutput>, RuntimeError> {
+        let (local_policy, initial_metrics) = {
+            let paths = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            if paths
+                .logical_instances
+                .get(&server_logical_path_key(identity))
+                != Some(&identity.path_instance_id)
+            {
+                return Ok(None);
+            }
+            let Some(path) = paths.instances.get(&server_physical_path_key(identity)) else {
+                return Ok(None);
+            };
+            if path.purpose != PathPurpose::Validation
+                || path.state != PeerPathState::Active
+                || path.retirement_started
+            {
+                return Ok(None);
+            }
+            (path.local.policy, path.local.initial_metrics)
+        };
+        let binding = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            let Some(entry) = streams.get(&(identity.session_id, stream_id)) else {
+                return Ok(None);
+            };
+            if entry.binding.lane() != TrafficClass::Throughput {
+                return Ok(None);
+            }
+            entry.binding.clone()
+        };
+        let initial_metrics = self.initial_path_metrics(
+            identity.session_id,
+            identity.underlay,
+            identity.path_id,
+            identity.path_instance_id,
+            initial_metrics,
+        );
+        let initial_usage = self.stored_path_usage(
+            identity.session_id,
+            identity.underlay,
+            identity.path_id,
+            identity.path_instance_id,
+        );
+        let path_proof = self.initial_path_proof(
+            identity.session_id,
+            identity.underlay,
+            identity.path_id,
+            identity.path_instance_id,
+        );
+        let validation_identity = binding.bind_validation_output(ResponseOutputAttachment {
+            key: CarrierPathKey {
+                underlay: identity.underlay,
+                path_id: identity.path_id,
+            },
+            path_instance_id: identity.path_instance_id,
+            local_policy,
+            commands,
+            state: ResponseOutputAttachmentState {
+                metrics: initial_metrics,
+                peer_usage: initial_usage.map(|usage| (usage.sequence, usage.usage)),
+                path_proof,
+            },
+        })?;
+        Ok(Some(ServerTcpValidationOutput::new(
+            binding,
+            validation_identity,
+        )))
+    }
+
     fn validation_input_is_registered(
         &self,
         binding: &RegistryServerValidationStreamBinding,
@@ -2702,6 +2784,16 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     ) -> Result<Option<ServerValidationStreamBinding>, RuntimeError> {
         self.registry
             .bind_validation_input_existing(identity, stream_id)
+    }
+
+    fn bind_validation_output_existing(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        commands: ReliablePathCommandSender,
+    ) -> Result<Option<ServerTcpValidationOutput>, RuntimeError> {
+        self.registry
+            .bind_validation_output_existing(identity, stream_id, commands)
     }
 
     fn route_frame<'a>(

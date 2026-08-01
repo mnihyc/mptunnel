@@ -13,10 +13,73 @@ use crate::model::work::CarrierWorkKind;
 use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::runtime::RuntimeError;
+use crate::runtime::path::commands::OwnedTcpCarrierValidationDataReservation;
 use crate::scheduler::TrafficClass;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+pub(in crate::runtime) struct ResponseValidationDataReservation {
+    binding: Arc<ResponseStreamBinding>,
+    identity: ResponseValidationOutputIdentity,
+    offset: u64,
+    end: u64,
+    bytes: usize,
+    command: OwnedTcpCarrierValidationDataReservation,
+}
+
+pub(in crate::runtime) struct ResponseValidationDataPublication {
+    command: OwnedTcpCarrierValidationDataReservation,
+}
+
+impl ResponseValidationDataReservation {
+    /// Records exact recoverable flight ownership after all fallible admission
+    /// but before Product queue consumption. Retirement that crosses an owned
+    /// carrier reservation invalidates evidence, not delivery ownership.
+    pub(in crate::runtime) fn record_flight(self) -> ResponseValidationDataPublication {
+        let outputs = self
+            .binding
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let evidence_eligible = self.binding.response_stream_open.load(Ordering::Acquire)
+            && outputs.validation.as_ref().is_some_and(|entry| {
+                entry.key == self.identity.key
+                    && entry.path_instance_id == self.identity.path_instance_id
+                    && entry.incarnation == self.identity.incarnation
+                    && !entry.commands.is_closed()
+            });
+        self.binding
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .entry(self.offset)
+            .or_default()
+            .push(CarrierPathFlight {
+                key: self.identity.key,
+                output_incarnation: self.identity.incarnation,
+                end: self.end,
+                bytes: self.bytes,
+                sent_at: Instant::now(),
+                kind: CarrierWorkKind::OriginalData,
+                evidence_eligible,
+            });
+        self.binding
+            .response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+        drop(outputs);
+        ResponseValidationDataPublication {
+            command: self.command,
+        }
+    }
+}
+
+impl ResponseValidationDataPublication {
+    pub(in crate::runtime) fn commit(self) {
+        self.command.commit();
+    }
+}
 
 impl ResponseStreamBinding {
     pub(in crate::runtime) fn try_enqueue_data_frame_for_dispatch_target(
@@ -68,63 +131,62 @@ impl ResponseStreamBinding {
     /// validation output. Ordinary dispatch has no route to this method.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::runtime::stream) fn try_enqueue_validation_data_frame(
-        &self,
+        self: &Arc<Self>,
         identity: ResponseValidationOutputIdentity,
         validation_id: NonZeroU64,
         frame: &Frame,
     ) -> Result<(), RuntimeError> {
+        self.try_reserve_validation_data_frame(identity, validation_id, frame)?
+            .record_flight()
+            .commit();
+        Ok(())
+    }
+
+    pub(in crate::runtime) fn try_reserve_validation_data_frame(
+        self: &Arc<Self>,
+        identity: ResponseValidationOutputIdentity,
+        validation_id: NonZeroU64,
+        frame: &Frame,
+    ) -> Result<ResponseValidationDataReservation, RuntimeError> {
         if !self.response_stream_open.load(Ordering::Acquire) {
             return Err(RuntimeError::SenderServiceBlocked);
         }
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return Err(RuntimeError::SenderServiceBlocked);
         };
-        let lane = self.lane.lock().expect("server reliable stream lane lock");
-        if *lane != TrafficClass::Throughput {
+        if self.lane() != TrafficClass::Throughput {
             return Err(RuntimeError::SenderServiceBlocked);
         }
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        if !self.response_stream_open.load(Ordering::Acquire) {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        let validation = outputs
-            .validation
-            .as_ref()
-            .filter(|entry| {
-                entry.key == identity.key
-                    && entry.path_instance_id == identity.path_instance_id
-                    && entry.incarnation == identity.incarnation
-                    && !entry.commands.is_closed()
-            })
-            .ok_or(RuntimeError::ReliablePathRetired)?;
-        let command = validation
-            .commands
-            .try_reserve_tcp_carrier_validation_data(
-                validation_id,
-                frame.clone(),
-                TrafficClass::Throughput,
-            )?;
-        self.flights
-            .lock()
-            .expect("server reliable stream flight lock")
-            .entry(offset)
-            .or_default()
-            .push(CarrierPathFlight {
-                key: identity.key,
-                output_incarnation: identity.incarnation,
-                end,
-                bytes,
-                sent_at: Instant::now(),
-                kind: CarrierWorkKind::OriginalData,
-                evidence_eligible: true,
-            });
-        self.response_model_generation
-            .fetch_add(1, Ordering::AcqRel);
-        command.commit();
-        Ok(())
+        let commands = {
+            let outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            outputs
+                .validation
+                .as_ref()
+                .filter(|entry| {
+                    entry.key == identity.key
+                        && entry.path_instance_id == identity.path_instance_id
+                        && entry.incarnation == identity.incarnation
+                        && !entry.commands.is_closed()
+                })
+                .map(|entry| entry.commands.clone())
+                .ok_or(RuntimeError::ReliablePathRetired)?
+        };
+        let command = commands.try_reserve_owned_tcp_carrier_validation_data(
+            validation_id,
+            frame.clone(),
+            TrafficClass::Throughput,
+        )?;
+        Ok(ResponseValidationDataReservation {
+            binding: self.clone(),
+            identity,
+            offset,
+            end,
+            bytes,
+            command,
+        })
     }
 }
 

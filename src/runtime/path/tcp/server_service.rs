@@ -12,18 +12,90 @@ use crate::model::tcp_carrier::{
 };
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
+use crate::runtime::RuntimeError;
+use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::sender::ProductWorkloadIdentity;
 use crate::runtime::stream::response::{
     ResponseProductAckOriginalRelease, ResponseProductAckOriginalResolution,
+    ResponseSenderPathObservation, ServerTcpValidationOutput,
 };
-use crate::scheduler::TrafficClass;
+use crate::scheduler::{TrafficClass, path_is_backup};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+
+pub(super) enum ServerTcpValidationControl {
+    SerializeResult {
+        result: crate::protocol::TcpCarrierValidationResult,
+        response: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ServerTcpValidationEvent {
+    ResultAcknowledged(crate::protocol::TcpCarrierValidationResult),
+    Retained,
+}
+
+/// Result and writer-boundary authority for one server-owned S2C carrier
+/// validation. The carrier actor remains the sole wire writer.
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerTcpValidationController {
+    pub(super) controls: mpsc::Sender<ServerTcpValidationControl>,
+    validation_data: ReliablePathCommandSender,
+    validation_id: NonZeroU64,
+}
+
+impl ServerTcpValidationController {
+    pub(super) fn new(
+        controls: mpsc::Sender<ServerTcpValidationControl>,
+        validation_data: ReliablePathCommandSender,
+        validation_id: NonZeroU64,
+    ) -> Self {
+        Self {
+            controls,
+            validation_data,
+            validation_id,
+        }
+    }
+
+    pub(in crate::runtime) async fn writer_boundary(&self) -> Result<Instant, RuntimeError> {
+        self.validation_data
+            .tcp_carrier_validation_writer_boundary(self.validation_id)
+            .await
+    }
+
+    pub(in crate::runtime) fn pending_bytes(&self) -> u64 {
+        self.validation_data
+            .pending_bytes()
+            .saturating_add(self.validation_data.writer_pending_bytes())
+    }
+
+    pub(in crate::runtime) async fn serialize_result(
+        &self,
+        result: crate::protocol::TcpCarrierValidationResult,
+    ) -> Result<(), RuntimeError> {
+        let (response, receipt) = oneshot::channel();
+        self.controls
+            .send(ServerTcpValidationControl::SerializeResult { result, response })
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+        receipt
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?
+    }
+}
+
+pub(in crate::runtime) struct ServerTcpCarrierValidationOffer {
+    pub(in crate::runtime) admission: ServerTcpCarrierValidationAdmission,
+    pub(in crate::runtime) output: ServerTcpValidationOutput,
+    pub(in crate::runtime) controller: ServerTcpValidationController,
+    pub(in crate::runtime) events: mpsc::Receiver<ServerTcpValidationEvent>,
+}
 
 /// Exact response-output lifetime used by one S2C comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,12 +171,13 @@ pub(in crate::runtime) enum ServerTcpCarrierObservation {
     ProductAck(ResponseProductAckReceipt),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct ServerTcpCarrierWorkload {
     identity: ProductWorkloadIdentity,
     lane: TrafficClass,
     queued_unique_original: bool,
     demand_generation: Option<NonZeroU64>,
+    validation_offers: mpsc::Sender<ServerTcpCarrierValidationOffer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +252,24 @@ impl ServerTcpCarrierDemandSubscription {
         self.changes.changed().await.ok()?;
         *self.changes.borrow_and_update()
     }
+
+    pub(in crate::runtime) fn admit_validation_from_observation(
+        &self,
+        request_id: NonZeroU64,
+        validation_id: NonZeroU64,
+        stream_id: StreamId,
+        output: &ServerTcpValidationOutput,
+    ) -> Option<ServerTcpCarrierValidationAdmission> {
+        self._owner
+            .admit_validation_from_observation(request_id, validation_id, stream_id, output)
+    }
+
+    pub(in crate::runtime) fn publish_validation_offer(
+        &self,
+        offer: ServerTcpCarrierValidationOffer,
+    ) -> Option<ServerTcpCarrierValidationOffer> {
+        self._owner.publish_validation_offer(offer)
+    }
 }
 
 impl ServerTcpCarrierService {
@@ -210,6 +301,86 @@ impl ServerTcpCarrierService {
         }
     }
 
+    fn admit_validation_from_observation(
+        self: &Arc<Self>,
+        request_id: NonZeroU64,
+        validation_id: NonZeroU64,
+        stream_id: StreamId,
+        output: &ServerTcpValidationOutput,
+    ) -> Option<ServerTcpCarrierValidationAdmission> {
+        let authority_class = {
+            let state = self.state.lock().expect("server TCP carrier service lock");
+            let demand = state.demand.as_ref()?;
+            if demand.publication.request_id != request_id
+                || demand.publication.stream_id != Some(stream_id)
+            {
+                return None;
+            }
+            demand.key.stable.authority_class
+        };
+        let observation: ResponseSenderPathObservation = output.sender_path_observation();
+        let (stable, ordinary_instances) =
+            server_tcp_carrier_comparison_key(&observation, authority_class)?;
+        let identity = output.identity();
+        self.admit_validation(
+            request_id,
+            validation_id,
+            stream_id,
+            ServerTcpCarrierOutputInstance {
+                key: identity.key,
+                path_instance_id: identity.path_instance_id,
+                output_incarnation: identity.incarnation,
+            },
+            stable,
+            &ordinary_instances,
+        )
+    }
+
+    fn publish_validation_offer(
+        &self,
+        offer: ServerTcpCarrierValidationOffer,
+    ) -> Option<ServerTcpCarrierValidationOffer> {
+        let target = offer.admission.target();
+        let sender = {
+            let state = self.state.lock().expect("server TCP carrier service lock");
+            let Some(workload) = state.workloads.get(&target.stream_id) else {
+                return Some(offer);
+            };
+            if workload.identity != target
+                || state.validation.as_ref().is_none_or(|validation| {
+                    validation.identity != offer.admission.validation || validation.withdrawn
+                })
+            {
+                return Some(offer);
+            }
+            workload.validation_offers.clone()
+        };
+        sender.try_send(offer).err().map(|error| error.into_inner())
+    }
+
+    fn revalidate_from_observation(
+        &self,
+        identity: ServerTcpCarrierValidationIdentity,
+        authority_class: crate::protocol::PathUsage,
+        output: &ServerTcpValidationOutput,
+    ) -> bool {
+        let observation = output.sender_path_observation();
+        let Some((stable, ordinary_instances)) =
+            server_tcp_carrier_comparison_key(&observation, authority_class)
+        else {
+            let mut state = self.state.lock().expect("server TCP carrier service lock");
+            if state
+                .validation
+                .as_ref()
+                .is_some_and(|validation| validation.identity == identity)
+            {
+                withdraw_validation(&mut state, &self.observations_active);
+            }
+            return false;
+        };
+        self.revalidate(identity, stable, &ordinary_instances)
+    }
+
     pub(in crate::runtime) fn register_workload(
         self: &Arc<Self>,
         stream_id: StreamId,
@@ -223,6 +394,7 @@ impl ServerTcpCarrierService {
             lifecycle_generation: take_sequence(&mut state.next_workload_generation)?,
         };
         state.workload_generation = increment_generation(state.workload_generation)?;
+        let (validation_offers, validation_offer_receiver) = mpsc::channel(1);
         state.workloads.insert(
             stream_id,
             ServerTcpCarrierWorkload {
@@ -230,6 +402,7 @@ impl ServerTcpCarrierService {
                 lane: TrafficClass::Latency,
                 queued_unique_original: false,
                 demand_generation: None,
+                validation_offers,
             },
         );
         let withdrawal = withdraw_demand(&mut state, &self.observations_active);
@@ -243,6 +416,7 @@ impl ServerTcpCarrierService {
             queued_unique_original: false,
             demand_generation: None,
             successful_placement: None,
+            validation_offers: Some(validation_offer_receiver),
         })
     }
 
@@ -276,19 +450,27 @@ impl ServerTcpCarrierService {
         queued_unique_original: bool,
     ) -> Option<Option<NonZeroU64>> {
         let mut state = self.state.lock().expect("server TCP carrier service lock");
-        let current = *state.workloads.get(&identity.stream_id)?;
-        if current.identity != identity {
+        let (current_identity, current_lane, current_queued, current_demand_generation) = {
+            let current = state.workloads.get(&identity.stream_id)?;
+            (
+                current.identity,
+                current.lane,
+                current.queued_unique_original,
+                current.demand_generation,
+            )
+        };
+        if current_identity != identity {
             return None;
         }
         let throughput_demand = lane == TrafficClass::Throughput && queued_unique_original;
-        let demand_generation = match (current.demand_generation, throughput_demand) {
+        let demand_generation = match (current_demand_generation, throughput_demand) {
             (Some(generation), true) => Some(generation),
             (None, true) => Some(take_sequence(&mut state.next_demand_generation)?),
             (_, false) => None,
         };
-        if current.lane == lane
-            && current.queued_unique_original == queued_unique_original
-            && current.demand_generation == demand_generation
+        if current_lane == lane
+            && current_queued == queued_unique_original
+            && current_demand_generation == demand_generation
         {
             return Some(demand_generation);
         }
@@ -393,7 +575,7 @@ impl ServerTcpCarrierService {
         if state.validation.is_some() {
             return None;
         }
-        let target = *state.workloads.get(&identity.stream_id)?;
+        let target = state.workloads.get(&identity.stream_id)?;
         if target.identity != identity
             || target.demand_generation != Some(demand_generation)
             || target.lane != TrafficClass::Throughput
@@ -487,7 +669,7 @@ impl ServerTcpCarrierService {
             {
                 return None;
             }
-            let target = *state.workloads.get(&stream_id)?;
+            let target = state.workloads.get(&stream_id)?;
             if target.identity != demand.key.target
                 || target.demand_generation != Some(demand.key.demand_generation)
                 || target.lane != TrafficClass::Throughput
@@ -735,11 +917,18 @@ pub(in crate::runtime) struct ServerTcpCarrierWorkloadLease {
     queued_unique_original: bool,
     demand_generation: Option<NonZeroU64>,
     successful_placement: Option<TcpCarrierStableGenerations>,
+    validation_offers: Option<mpsc::Receiver<ServerTcpCarrierValidationOffer>>,
 }
 
 impl ServerTcpCarrierWorkloadLease {
     pub(in crate::runtime) fn identity(&self) -> ProductWorkloadIdentity {
         self.identity
+    }
+
+    pub(in crate::runtime) fn take_validation_offers(
+        &mut self,
+    ) -> Option<mpsc::Receiver<ServerTcpCarrierValidationOffer>> {
+        self.validation_offers.take()
     }
 
     pub(in crate::runtime) fn update_demand(
@@ -870,7 +1059,6 @@ impl ServerTcpCarrierValidationAdmission {
         self.owner.activate_observations(self.validation, capacity)
     }
 
-    #[cfg(test)]
     pub(in crate::runtime) fn revalidate(
         &self,
         stable: TcpCarrierStableGenerations,
@@ -878,6 +1066,14 @@ impl ServerTcpCarrierValidationAdmission {
     ) -> bool {
         self.owner
             .revalidate(self.validation, stable, ordinary_instances)
+    }
+
+    pub(in crate::runtime) fn revalidate_current(
+        &self,
+        output: &ServerTcpValidationOutput,
+    ) -> bool {
+        self.owner
+            .revalidate_from_observation(self.validation, self.stable.authority_class, output)
     }
 
     pub(in crate::runtime) fn release(mut self) {
@@ -897,6 +1093,31 @@ impl Drop for ServerTcpCarrierValidationAdmission {
         self.armed = false;
         self.owner.release_validation(self.validation);
     }
+}
+
+fn server_tcp_carrier_comparison_key(
+    observation: &ResponseSenderPathObservation,
+    authority_class: crate::protocol::PathUsage,
+) -> Option<(
+    TcpCarrierStableGenerations,
+    Vec<ServerTcpCarrierOutputInstance>,
+)> {
+    let stable = observation.tcp_carrier_stable_generations(authority_class)?;
+    let ordinary_instances = observation
+        .targets
+        .iter()
+        .filter(|target| !target.observation.stale_for_original_data)
+        .filter(|target| {
+            path_is_backup(target.observation.snapshot)
+                == (authority_class == crate::protocol::PathUsage::Backup)
+        })
+        .map(|target| ServerTcpCarrierOutputInstance {
+            key: target.observation.key,
+            path_instance_id: target.observation.path_instance_id,
+            output_incarnation: target.observation.incarnation,
+        })
+        .collect();
+    Some((stable, ordinary_instances))
 }
 
 /// Filters one ACK release to the exact unambiguous candidate output. The
@@ -921,6 +1142,40 @@ pub(in crate::runtime) fn candidate_original_release_bytes(
         .try_fold(0_u64, |total, release| {
             total.checked_add(u64::try_from(release.bytes).ok()?)
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ServerTcpCandidateOriginalRelease {
+    pub(in crate::runtime) resolved_bytes: u64,
+    pub(in crate::runtime) qualified_bytes: u64,
+}
+
+pub(in crate::runtime) fn candidate_original_release_progress(
+    receipt: &ResponseProductAckReceipt,
+    candidate: ServerTcpCarrierOutputInstance,
+) -> Option<ServerTcpCandidateOriginalRelease> {
+    let mut resolved_bytes = 0_u64;
+    let mut qualified_bytes = 0_u64;
+    for release in receipt.original_releases.iter().filter(|release| {
+        release.key == candidate.key
+            && release.path_instance_id == Some(candidate.path_instance_id)
+            && release.output_incarnation == candidate.output_incarnation
+    }) {
+        if release.range.start >= release.range.end
+            || usize::try_from(release.range.end - release.range.start).ok() != Some(release.bytes)
+        {
+            return None;
+        }
+        let bytes = u64::try_from(release.bytes).ok()?;
+        resolved_bytes = resolved_bytes.checked_add(bytes)?;
+        if release.resolution == ResponseProductAckOriginalResolution::Unambiguous {
+            qualified_bytes = qualified_bytes.checked_add(bytes)?;
+        }
+    }
+    Some(ServerTcpCandidateOriginalRelease {
+        resolved_bytes,
+        qualified_bytes,
+    })
 }
 
 #[cfg(test)]

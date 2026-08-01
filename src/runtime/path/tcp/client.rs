@@ -17,7 +17,7 @@ use super::client_stream::{ClientTcpOpenCancellation, next_client_tcp_open_attem
 use super::client_validation::ClientTcpValidationAdmission;
 #[cfg(test)]
 use super::group::ClientTcpCarrierReservation;
-use super::service::ClientTcpCarrierAdmission;
+use super::service::{ClientTcpCarrierAdmission, ClientTcpServerToClientAdmission};
 use crate::model::path::{
     CarrierPathInstanceId, RelayPathInstance, RelayPathKey, next_carrier_path_instance_id,
 };
@@ -153,9 +153,12 @@ impl ClientTcpPathSessionHandle {
         Ok(ClientTcpValidationAdmission {
             runtime: self.runtime.clone(),
             service_admission: Some(parts.admission),
+            server_to_client_admission: None,
             reservation,
             endpoint_generation,
             validation_id,
+            request_id: None,
+            direction: crate::protocol::PathMetricDirection::ClientToServer,
             stream_id,
             instance: RelayPathInstance {
                 key: RelayPathKey {
@@ -186,14 +189,65 @@ impl ClientTcpPathSessionHandle {
         Ok(ClientTcpValidationAdmission {
             runtime: self.runtime.clone(),
             service_admission: None,
+            server_to_client_admission: None,
             reservation,
             endpoint_generation,
             validation_id,
+            request_id: None,
+            direction: crate::protocol::PathMetricDirection::ClientToServer,
             stream_id,
             instance: RelayPathInstance {
                 key: RelayPathKey {
                     underlay: UnderlayProtocol::Tcp,
                     index: self.runtime.path_index,
+                },
+                path_instance_id: next_carrier_path_instance_id(),
+                attachment_id: validation_id.get(),
+            },
+            open_deadline,
+        })
+    }
+
+    /// Binds one exact server-owned demand to a fresh locally-reserved
+    /// validation carrier. The peer request selects neither this endpoint nor
+    /// the elastic slot.
+    pub(in crate::runtime) fn s2c_validation_admission(
+        &self,
+        admission: ClientTcpServerToClientAdmission,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<ClientTcpValidationAdmission, RuntimeError> {
+        let request_id = admission.request_id();
+        let validation_id = admission.validation_id();
+        let stream_id = admission.stream_id();
+        let config_index = admission.config_index();
+        let (service_admission, reservation) = admission.into_parts();
+        let endpoint_generation = service_admission.endpoint_generation();
+        if config_index != self.runtime.config_index
+            || reservation.config_index() != self.runtime.config_index
+        {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier validation reservation belongs to another endpoint",
+            ));
+        }
+        let path_index = reservation
+            .elastic_path_index()
+            .ok_or(RuntimeError::Protocol(
+                "TCP carrier validation reservation has no elastic path slot",
+            ))?;
+        Ok(ClientTcpValidationAdmission {
+            runtime: self.runtime.clone(),
+            service_admission: None,
+            server_to_client_admission: Some(service_admission),
+            reservation,
+            endpoint_generation,
+            validation_id,
+            request_id: Some(request_id),
+            direction: crate::protocol::PathMetricDirection::ServerToClient,
+            stream_id,
+            instance: RelayPathInstance {
+                key: RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: path_index,
                 },
                 path_instance_id: next_carrier_path_instance_id(),
                 attachment_id: validation_id.get(),

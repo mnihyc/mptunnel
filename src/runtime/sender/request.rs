@@ -1002,7 +1002,8 @@ impl RequestSenderService {
             self.fail_client_path_instance(context, remotes, instance)
                 .await;
         }
-        if remotes.is_empty() {
+        remotes.remove_closed_receive_only_paths();
+        if !remotes.has_receive_feedback_output() {
             return Err(RuntimeError::ReliablePathSessionClosed);
         }
 

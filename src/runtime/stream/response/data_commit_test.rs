@@ -1,7 +1,9 @@
 use super::super::ResponseStreamBinding;
-use super::super::attachment::ResponseDispatchTarget;
+use super::super::attachment::{
+    ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
+};
 use super::super::test_support::{stream_data_frame, stream_data_frame_at};
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathKey, PathPolicy, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
@@ -11,6 +13,7 @@ use crate::runtime::path::commands::{
     try_recv_reliable_path_command,
 };
 use crate::scheduler::TrafficClass;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 struct Fixture {
@@ -177,6 +180,73 @@ fn successful_commit_publishes_exact_flight_before_carrier_work() {
             ..
         }))
     ));
+}
+
+#[test]
+fn validation_data_uses_only_the_exact_unpublished_output() {
+    let fixture = fixture(4);
+    let candidate = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(7),
+    };
+    let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(4);
+    let path_instance_id = next_carrier_path_instance_id();
+    let identity = fixture
+        .binding
+        .bind_validation_output(ResponseOutputAttachment {
+            key: candidate,
+            path_instance_id,
+            local_policy: PathPolicy::default(),
+            commands: candidate_commands.clone(),
+            state: ResponseOutputAttachmentState::default(),
+        })
+        .expect("bind validation-only response output");
+    let frame = stream_data_frame_at(8192, 2048);
+    let validation_id = NonZeroU64::new(11).expect("nonzero validation id");
+
+    fixture
+        .binding
+        .try_enqueue_validation_data_frame(identity, validation_id, &frame)
+        .expect("commit finite validation work");
+
+    assert_eq!(candidate_commands.active_flow_counts(), (0, 0));
+    assert!(
+        fixture
+            .binding
+            .sender_path_targets(TrafficClass::Throughput, 1)
+            .iter()
+            .all(|target| target.observation.key != candidate)
+    );
+    assert!(matches!(
+        fixture.binding.promote_validation_output(identity),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    let command = try_recv_reliable_path_command(&mut candidate_receivers)
+        .expect("validation command is queued on the exact candidate");
+    assert!(matches!(
+        &command,
+        ReliablePathCommand::SendTcpCarrierValidationData {
+            validation_id: received,
+            frame: Frame::StreamData { offset: 8192, .. },
+        } if *received == validation_id
+    ));
+    candidate_receivers
+        .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+
+    let (_, originals) = fixture
+        .binding
+        .release_normalized_acked_ranges_with_originals(&[crate::protocol::OffsetRange {
+            start: 8192,
+            end: 10240,
+        }]);
+    assert_eq!(originals.len(), 1);
+    assert_eq!(originals[0].path_instance_id, Some(path_instance_id));
+    assert_eq!(originals[0].output_incarnation, identity.incarnation);
+    fixture
+        .binding
+        .promote_validation_output(identity)
+        .expect("resolved validation output promotes exactly once");
+    assert_eq!(candidate_commands.active_flow_counts(), (1, 0));
 }
 
 #[test]

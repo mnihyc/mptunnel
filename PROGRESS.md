@@ -3722,3 +3722,47 @@ entry is authoritative.
   result authority, exact attachment adoption, and settlement; then run the
   disruption/recovery and representative performance gates before any Product
   surface or documentation phase.
+
+## 2026-08-01T20:12:51+08:00: Accepted S2C response-ownership foundation
+
+- Name: dormant exact response ACK provenance and validation-only output
+- Category: Core runtime ownership
+- State: accepted bounded foundation; no S2C demand, verdict, or wire actor is
+  connected yet
+- Clean model:
+  - optional response Product-ACK capture mirrors the established request
+    ledger and preserves exact unambiguous and ambiguous OriginalData
+    subranges, while the ordinary ACK result and call path remain unchanged;
+  - one exact TCP validation output is separately owned under the response
+    attachment transaction, heap-allocated only while active, absent from
+    ordinary targets, load registration, feedback publication, and membership
+    generations;
+  - finite validation data uses the existing typed bounded carrier command,
+    records exact Product flight before command publication, and cannot be
+    promoted while any candidate flight remains unresolved; and
+  - exact negative settlement, path retirement, or stream closure invalidates
+    candidate evidence, while successful promotion preserves the same carrier
+    instance and output incarnation and publishes ordinary membership once.
+- Performance boundary:
+  - no timer, threshold, parameter, scheduling score, congestion controller,
+    transport behavior, or wire format changed;
+  - the capture API has no production caller, and the inactive response path
+    allocates no validation state and retains the original ACK result type; and
+  - representative throughput is deferred until the complete S2C transaction
+    is connected, so no benchmark claim is inferred from this dormant slice.
+- Evidence:
+  - strict formatting, whitespace, and all-target/all-feature Clippy passed
+    with warnings denied;
+  - the locked all-feature suite passed 1,480 library tests, 2 allocation
+    tests, 6 packaged daily-use acceptance tests, and doctests;
+  - the standalone patched Quinn suite passed 282 unit tests and 3 doctests;
+  - the 29-cell/66-metric performance registry, 198 lab tests, 5 deterministic
+    benchmark tests, 9 packaging tests, shell syntax checks, and release-version
+    self-test passed; and
+  - persistent response tests prove ordinary invisibility, exact one-shot
+    promotion, bounded typed dispatch, unresolved-flight exclusion,
+    mixed-overlap ACK segmentation, and terminal cleanup.
+- Next: connect one client-side S2C validation owner to the existing retained
+  carrier authority without adding policy or timing, then add the symmetric
+  server sender owner and the existing wire transaction in separate green
+  commits.

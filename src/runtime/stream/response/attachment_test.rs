@@ -19,6 +19,95 @@ fn alternate_key(underlay: UnderlayProtocol) -> CarrierPathKey {
     }
 }
 
+fn validation_attachment(
+    key: CarrierPathKey,
+    commands: crate::runtime::path::commands::ReliablePathCommandSender,
+) -> ResponseOutputAttachment {
+    ResponseOutputAttachment {
+        key,
+        path_instance_id: next_server_carrier_path_instance_id(),
+        local_policy: PathPolicy::default(),
+        commands,
+        state: ResponseOutputAttachmentState::default(),
+    }
+}
+
+#[test]
+fn validation_output_is_structurally_absent_from_ordinary_membership() {
+    let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let candidate = alternate_key(UnderlayProtocol::Tcp);
+    let (commands, _candidate_receivers) = reliable_path_command_channels(8);
+    let generation = binding.output_membership_generation();
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+
+    let identity = binding
+        .bind_validation_output(validation_attachment(candidate, commands.clone()))
+        .expect("bind exact validation output");
+
+    assert!(binding.validation_output_is_current(identity));
+    assert_eq!(binding.output_membership_generation(), generation);
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+    let targets = binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].observation.key, initial);
+    assert!(!binding.has_multipath_reinjection_alternative());
+    assert_eq!(
+        binding.attach_output(
+            ResponseOutputAttachment {
+                key: candidate,
+                path_instance_id: identity.path_instance_id,
+                local_policy: PathPolicy::default(),
+                commands: commands.clone(),
+                state: ResponseOutputAttachmentState::default(),
+            },
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput,
+        "ordinary attachment cannot bypass validation retention"
+    );
+
+    assert!(binding.settle_validation_output(identity));
+    assert!(!binding.validation_output_is_current(identity));
+    assert_eq!(binding.output_membership_generation(), generation);
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+}
+
+#[test]
+fn validation_output_promotion_preserves_identity_and_publishes_once() {
+    let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let candidate = alternate_key(UnderlayProtocol::Tcp);
+    let (commands, _candidate_receivers) = reliable_path_command_channels(8);
+    let generation = binding.output_membership_generation();
+    let attachment = validation_attachment(candidate, commands.clone());
+    let path_instance_id = attachment.path_instance_id;
+    let identity = binding
+        .bind_validation_output(attachment)
+        .expect("bind exact validation output");
+
+    binding
+        .promote_validation_output(identity)
+        .expect("promote resolved validation output");
+
+    assert_eq!(binding.output_membership_generation(), generation + 1);
+    assert_eq!(commands.active_flow_counts(), (1, 0));
+    let targets = binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(targets.len(), 2);
+    assert!(
+        targets
+            .iter()
+            .any(|target| target.observation.key == initial)
+    );
+    let promoted = targets
+        .iter()
+        .find(|target| target.observation.key == candidate)
+        .expect("promoted output is ordinary membership");
+    assert_eq!(promoted.observation.path_instance_id, path_instance_id);
+    assert_eq!(promoted.observation.incarnation, identity.incarnation);
+    assert!(binding.promote_validation_output(identity).is_err());
+    assert_eq!(binding.output_membership_generation(), generation + 1);
+    assert_eq!(commands.active_flow_counts(), (1, 0));
+}
+
 #[test]
 fn live_output_tracks_real_carrier_receiver_lifetime_and_reattachment() {
     let (binding, _initial, initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);

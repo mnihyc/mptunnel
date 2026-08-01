@@ -15,7 +15,7 @@ mod snapshot;
 use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
-use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
+use crate::protocol::{OffsetRange, PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::TrafficClass;
 #[cfg(test)]
@@ -41,6 +41,26 @@ use tokio::sync::watch;
 
 // Reliable-path bindings own attachment instances, exact range flights,
 // evidence, and atomic commit. Sender services rank immutable snapshots.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ResponseProductAckOriginalResolution {
+    Unambiguous,
+    Ambiguous,
+}
+
+/// One normalized newly released response OriginalData interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ResponseProductAckOriginalRelease {
+    pub(in crate::runtime) key: CarrierPathKey,
+    /// Present only while the exact response attachment lifetime remains
+    /// resolvable. A missing instance makes the release ambiguous.
+    pub(in crate::runtime) path_instance_id: Option<CarrierPathInstanceId>,
+    pub(in crate::runtime) output_incarnation: u64,
+    pub(in crate::runtime) range: OffsetRange,
+    pub(in crate::runtime) bytes: usize,
+    pub(in crate::runtime) sent_at: std::time::Instant,
+    pub(in crate::runtime) resolution: ResponseProductAckOriginalResolution,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestFeedbackIngress {
@@ -187,6 +207,7 @@ impl ResponseStreamBinding {
             response_stream_open: AtomicBool::new(true),
             outputs: Mutex::new(ResponseStreamOutputs {
                 detaching: Vec::new(),
+                validation: None,
                 entries: vec![ResponseStreamOutputEntry {
                     key,
                     path_instance_id,
@@ -237,7 +258,7 @@ impl ResponseStreamBinding {
 
     fn begin_close(&self) -> Vec<ReliablePathCommandSender> {
         {
-            let outputs = self
+            let mut outputs = self
                 .outputs
                 .lock()
                 .expect("server reliable stream binding lock");
@@ -245,11 +266,20 @@ impl ResponseStreamBinding {
             for entry in outputs.entries.iter().chain(&outputs.detaching) {
                 entry.load_registration.deactivate();
             }
-            outputs
+            let validation = outputs.validation.take();
+            if let Some(entry) = &validation {
+                self.invalidate_path_flight_evidence(entry.key, entry.incarnation);
+            }
+            let mut commands = outputs
                 .entries
                 .iter()
                 .map(|entry| entry.commands.clone())
-                .collect()
+                .collect::<Vec<_>>();
+            if let Some(entry) = validation {
+                let entry = *entry;
+                commands.push(entry.commands);
+            }
+            commands
         }
     }
 

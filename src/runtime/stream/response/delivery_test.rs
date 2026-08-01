@@ -34,6 +34,23 @@ fn output_identity(
         .expect("attached response output")
 }
 
+fn output_lifetime_identity(
+    binding: &super::super::ResponseStreamBinding,
+    key: CarrierPathKey,
+) -> (crate::model::path::CarrierPathInstanceId, u64) {
+    binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == key)
+        .map(|target| {
+            (
+                target.observation.path_instance_id,
+                target.observation.incarnation,
+            )
+        })
+        .expect("attached response output")
+}
+
 fn server_output_identity(
     binding: &super::super::ResponseStreamBinding,
     key: CarrierPathKey,
@@ -123,6 +140,62 @@ fn exact_original_data_ack_releases_output_flight_and_progress() {
         binding
             .original_flight_outputs_overlapping_frame(&frame)
             .is_empty()
+    );
+}
+
+#[test]
+fn response_ack_capture_reports_exact_original_attachment_lifetime() {
+    let (binding, path, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let (path_instance_id, incarnation) = output_lifetime_identity(&binding, path);
+    let frame = stream_data_frame_at(1024, 3072);
+    binding.record_original_flight(path, &frame);
+
+    let (_, originals) =
+        binding.release_normalized_acked_ranges_with_originals(&[range(1024, 4096)]);
+    assert_eq!(originals.len(), 1);
+    let original = originals[0];
+    assert_eq!(original.key, path);
+    assert_eq!(original.path_instance_id, Some(path_instance_id));
+    assert_eq!(original.output_incarnation, incarnation);
+    assert_eq!(original.range, range(1024, 4096));
+    assert_eq!(original.bytes, 3072);
+    assert_eq!(
+        original.resolution,
+        ResponseProductAckOriginalResolution::Unambiguous
+    );
+}
+
+#[test]
+fn response_ack_capture_splits_mixed_ambiguous_original_ranges() {
+    let (binding, original, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let alternate = key(UnderlayProtocol::Udp, 1);
+    let (commands, _alternate_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        alternate.underlay,
+        alternate.path_id,
+        commands,
+        TrafficClass::Throughput,
+    );
+    binding.record_original_flight(original, &stream_data_frame_at(0, 4096));
+    binding.record_reinjected_flight(alternate, &stream_data_frame_at(1024, 2048));
+
+    let (_, originals) = binding.release_normalized_acked_ranges_with_originals(&[range(0, 4096)]);
+
+    assert_eq!(originals.len(), 3);
+    assert_eq!(originals[0].range, range(0, 1024));
+    assert_eq!(
+        originals[0].resolution,
+        ResponseProductAckOriginalResolution::Unambiguous
+    );
+    assert_eq!(originals[1].range, range(1024, 3072));
+    assert_eq!(
+        originals[1].resolution,
+        ResponseProductAckOriginalResolution::Ambiguous
+    );
+    assert_eq!(originals[2].range, range(3072, 4096));
+    assert_eq!(
+        originals[2].resolution,
+        ResponseProductAckOriginalResolution::Unambiguous
     );
 }
 

@@ -1,5 +1,8 @@
-use super::attachment::ResponseStreamAttachOutcome;
+use super::attachment::{
+    ResponseOutputAttachment, ResponseOutputAttachmentState, ResponseStreamAttachOutcome,
+};
 use super::{ResponseStreamBinding, ServerSessionTracker};
+use crate::model::path::{CarrierPathKey, PathPolicy, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
@@ -51,11 +54,28 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
         ),
         ResponseStreamAttachOutcome::Attached,
     );
+    let (validation_commands, mut validation_receivers) = reliable_path_command_channels(8);
+    let validation_identity = binding
+        .bind_validation_output(ResponseOutputAttachment {
+            key: CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(2),
+            },
+            path_instance_id: next_carrier_path_instance_id(),
+            local_policy: PathPolicy::default(),
+            commands: validation_commands,
+            state: ResponseOutputAttachmentState::default(),
+        })
+        .expect("bind validation-only output before terminal close");
     binding
         .reset_and_close_stream_ordered(stream_id, ResetReason::Refused, TrafficClass::Throughput)
         .await;
 
-    for receivers in [&mut first_receivers, &mut second_receivers] {
+    for receivers in [
+        &mut first_receivers,
+        &mut second_receivers,
+        &mut validation_receivers,
+    ] {
         let terminal = recv_reliable_path_command(receivers)
             .await
             .expect("terminal reset and close");
@@ -69,6 +89,7 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
         receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&terminal));
         assert!(try_recv_reliable_path_command(receivers).is_none());
     }
+    assert!(!binding.validation_output_is_current(validation_identity));
 
     let (late_commands, _late_receivers) = reliable_path_command_channels(8);
     assert_eq!(

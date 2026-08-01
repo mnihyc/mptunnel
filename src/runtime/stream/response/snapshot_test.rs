@@ -445,6 +445,7 @@ fn best_live_path_uses_completion_score_including_command_queue() {
     clear.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
     let outputs = ResponseStreamOutputs {
         detaching: Vec::new(),
+        validation: None,
         entries: vec![queued, clear],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
@@ -481,6 +482,7 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
     backup.peer_usage = Some(PathUsage::Backup);
     let outputs = ResponseStreamOutputs {
         detaching: Vec::new(),
+        validation: None,
         entries: vec![backup, available],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
@@ -546,6 +548,7 @@ fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
     drop(closed_receivers);
     let outputs = ResponseStreamOutputs {
         detaching: Vec::new(),
+        validation: None,
         entries: vec![closed, live],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,

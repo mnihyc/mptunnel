@@ -43,6 +43,15 @@ pub(in crate::runtime) enum ResponsePathDetachOutcome {
     Pending(u64),
 }
 
+/// Exact unpublished response attachment used by one directional TCP carrier
+/// validation. It is not ordinary output membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ResponseValidationOutputIdentity {
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) incarnation: u64,
+}
+
 /// Path evidence installed in the same transaction that publishes an output.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::runtime) struct ResponseOutputAttachmentState {
@@ -134,10 +143,23 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) path_proof: Option<PathProofObservation>,
 }
 
+/// One validation-only response output. Its absence from `entries` is the
+/// structural fence that keeps ordinary scheduling, load, and feedback state
+/// unchanged before acknowledged retention.
+pub(super) struct ResponseValidationOutputEntry {
+    pub(super) key: CarrierPathKey,
+    pub(super) path_instance_id: CarrierPathInstanceId,
+    pub(super) local_policy: PathPolicy,
+    pub(super) incarnation: u64,
+    pub(super) commands: ReliablePathCommandSender,
+    pub(super) state: ResponseOutputAttachmentState,
+}
+
 pub(in crate::runtime) struct ResponseStreamOutputs {
     /// Outputs withdrawn from scheduling but still owned by the stream actor.
     /// Their flights remain live until the ordered detach event is applied.
     pub(super) detaching: Vec<ResponseStreamOutputEntry>,
+    pub(super) validation: Option<Box<ResponseValidationOutputEntry>>,
     pub(super) entries: Vec<ResponseStreamOutputEntry>,
     /// Offset-free sender-service staging belongs to the response stream, not
     /// to any carrier output.
@@ -147,6 +169,24 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
 }
 
 impl ResponseStreamOutputs {
+    pub(super) fn physical_instance_for_output(
+        &self,
+        key: CarrierPathKey,
+        incarnation: u64,
+    ) -> Option<CarrierPathInstanceId> {
+        self.entries
+            .iter()
+            .chain(&self.detaching)
+            .find(|entry| entry.key == key && entry.incarnation == incarnation)
+            .map(|entry| entry.path_instance_id)
+            .or_else(|| {
+                self.validation
+                    .as_ref()
+                    .filter(|entry| entry.key == key && entry.incarnation == incarnation)
+                    .map(|entry| entry.path_instance_id)
+            })
+    }
+
     /// Restores stale outputs when no distinct live non-stale attachment
     /// remains. Staleness is relative placement state, not a permanent health
     /// verdict on a carrier that becomes the sole survivor.
@@ -285,6 +325,211 @@ impl ResponseStreamBinding {
 
     fn allocate_output_incarnation(&self) -> u64 {
         self.next_output_incarnation.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Installs one exact TCP validation output without publishing ordinary
+    /// flow membership or changing any ordinary scheduler projection.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime::stream) fn bind_validation_output(
+        &self,
+        attachment: ResponseOutputAttachment,
+    ) -> Result<ResponseValidationOutputIdentity, RuntimeError> {
+        let ResponseOutputAttachment {
+            key,
+            path_instance_id,
+            local_policy,
+            commands,
+            state,
+        } = attachment;
+        if key.underlay != UnderlayProtocol::Tcp || commands.is_closed() {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let lane = self.lane.lock().expect("server reliable stream lane lock");
+        if *lane != TrafficClass::Throughput {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if !self.response_stream_open.load(Ordering::Acquire) {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        if let Some(existing) = &outputs.validation {
+            if existing.key == key
+                && existing.path_instance_id == path_instance_id
+                && existing.commands.same_channel(&commands)
+            {
+                return Ok(ResponseValidationOutputIdentity {
+                    key,
+                    path_instance_id,
+                    incarnation: existing.incarnation,
+                });
+            }
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        if outputs
+            .entries
+            .iter()
+            .chain(&outputs.detaching)
+            .any(|entry| entry.key == key || entry.path_instance_id == path_instance_id)
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let incarnation = self.allocate_output_incarnation();
+        outputs.validation = Some(Box::new(ResponseValidationOutputEntry {
+            key,
+            path_instance_id,
+            local_policy,
+            incarnation,
+            commands,
+            state,
+        }));
+        Ok(ResponseValidationOutputIdentity {
+            key,
+            path_instance_id,
+            incarnation,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime::stream) fn validation_output_is_current(
+        &self,
+        identity: ResponseValidationOutputIdentity,
+    ) -> bool {
+        if !self.response_stream_open.load(Ordering::Acquire)
+            || self.lane() != TrafficClass::Throughput
+        {
+            return false;
+        }
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .validation
+            .as_ref()
+            .is_some_and(|entry| {
+                entry.key == identity.key
+                    && entry.path_instance_id == identity.path_instance_id
+                    && entry.incarnation == identity.incarnation
+                    && !entry.commands.is_closed()
+            })
+    }
+
+    /// Removes only the exact unpublished attachment. Any unresolved Product
+    /// flight remains recoverable but can no longer prove this carrier.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime::stream) fn settle_validation_output(
+        &self,
+        identity: ResponseValidationOutputIdentity,
+    ) -> bool {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let exact = outputs.validation.as_ref().is_some_and(|entry| {
+            entry.key == identity.key
+                && entry.path_instance_id == identity.path_instance_id
+                && entry.incarnation == identity.incarnation
+        });
+        if !exact {
+            return false;
+        }
+        let _ = outputs.validation.take();
+        self.invalidate_path_flight_evidence(identity.key, identity.incarnation);
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+        drop(outputs);
+        self.notify_update();
+        true
+    }
+
+    /// Atomically converts one exact validation-only attachment into ordinary
+    /// output membership after its bounded validation flight has resolved.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime::stream) fn promote_validation_output(
+        &self,
+        identity: ResponseValidationOutputIdentity,
+    ) -> Result<(), RuntimeError> {
+        let lane = self.lane.lock().expect("server reliable stream lane lock");
+        if *lane != TrafficClass::Throughput {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if !self.response_stream_open.load(Ordering::Acquire)
+            || outputs
+                .entries
+                .iter()
+                .chain(&outputs.detaching)
+                .any(|entry| {
+                    entry.key == identity.key || entry.path_instance_id == identity.path_instance_id
+                })
+        {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let exact = outputs.validation.as_ref().is_some_and(|entry| {
+            entry.key == identity.key
+                && entry.path_instance_id == identity.path_instance_id
+                && entry.incarnation == identity.incarnation
+                && !entry.commands.is_closed()
+        });
+        if !exact {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        let has_unresolved_flight = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .values()
+            .flatten()
+            .any(|flight| {
+                flight.key == identity.key && flight.output_incarnation == identity.incarnation
+            });
+        if has_unresolved_flight {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        let validation = *outputs
+            .validation
+            .take()
+            .expect("validated response output identity");
+        let load_registration = validation.commands.register_flow(*lane);
+        let mut entry = ResponseStreamOutputEntry {
+            key: validation.key,
+            path_instance_id: validation.path_instance_id,
+            local_policy: validation.local_policy,
+            incarnation: validation.incarnation,
+            commands: validation.commands,
+            load_registration,
+            original_data_in_flight_bytes: 0,
+            stale_for_original_data: false,
+            bytes_in_flight: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            original_data_acked_bytes: 0,
+            published_max_data_offset: 0,
+            ack_publication: StreamAckPublicationCursor::default(),
+            local_path_metrics: None,
+            peer_path_metrics: None,
+            peer_usage: None,
+            peer_usage_sequence: None,
+            path_proof: None,
+        };
+        apply_attachment_state(&mut entry, validation.state);
+        outputs.entries.push(entry);
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.output_membership_generation
+            .fetch_add(1, Ordering::AcqRel);
+        drop(outputs);
+        drop(lane);
+        self.notify_update();
+        Ok(())
     }
 
     pub(in crate::runtime) fn output_membership_generation(&self) -> u64 {
@@ -450,6 +695,13 @@ impl ResponseStreamBinding {
         // flag. An attach either enters that snapshot or observes closure.
         if !self.response_stream_open.load(Ordering::Acquire) {
             return ResponseStreamAttachOutcome::RejectedClosedStream;
+        }
+        if outputs
+            .validation
+            .as_ref()
+            .is_some_and(|entry| entry.key == key || entry.path_instance_id == path_instance_id)
+        {
+            return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
         }
         if outputs
             .detaching
@@ -651,6 +903,22 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let validation_matches = outputs
+            .validation
+            .as_ref()
+            .is_some_and(|entry| entry.key == key && entry.path_instance_id == path_instance_id);
+        if validation_matches {
+            let entry = outputs
+                .validation
+                .take()
+                .expect("matching validation output");
+            self.invalidate_path_flight_evidence(entry.key, entry.incarnation);
+            self.response_model_generation
+                .fetch_add(1, Ordering::AcqRel);
+            drop(outputs);
+            self.notify_update();
+            return None;
+        }
         if let Some(entry) = outputs
             .detaching
             .iter()

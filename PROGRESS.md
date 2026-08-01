@@ -3574,3 +3574,36 @@ entry is authoritative.
   - the benchmark lock repair is exactly one dependency-list entry. No
     performance verdict is claimed until the representative lab is repeated
     without concurrent build or container load.
+
+## 2026-08-01T13:16:59+08:00: Accepted historical-performance boundary
+
+- Name: clean eight-row TCP/QUIC representative restoration
+- Category: Core performance evidence
+- State: accepted baseline; elastic TCP work may proceed behind unchanged
+  ordinary-path gates
+- Method:
+  - built the optimized native Linux binary once, then repeated the matrix with
+    `BUILD_PRODUCT=0` so the host snapshot did not contain compiler load;
+  - used the documented 20-second, 500-Mbit/s, 180-ms, zero-loss equal-fat and
+    high-bandwidth single-path profiles with path hints disabled; and
+  - retained the first run only as diagnostics because its host snapshot
+    correctly rejected residual build load (`0.731` per available CPU).
+- Accepted evidence:
+  - source commit `982548d`, clean source snapshot, exact client/server binary
+    identity, no external containers, and valid host load (`0.201` per
+    available CPU);
+  - TCP/QUIC single-path downloads: `257.716` / `298.191` Mbit/s;
+  - TCP/QUIC equal-fat downloads: `793.576` / `742.797` Mbit/s;
+  - TCP/QUIC single-path uploads: `251.097` / `293.331` Mbit/s receiver-confirmed
+    duration lower bounds with zero recovery gap; and
+  - TCP/QUIC equal-fat uploads: `537.303` / `749.681` Mbit/s exact completed
+    results with zero recovery gap.
+- Interpretation:
+  - the accepted cohort restores the retained high-performance range without
+    a parameter, timing, scheduler, congestion-control, or transport change;
+  - the two single-path upload rows ended by the declared duration and are
+    deliberately classified as receiver-confirmed lower bounds rather than
+    silently promoted to exact completions; and
+  - no fixed percentage cap is inferred from one run. Later Core changes must
+    repeat matched rows and diagnose timing, delivery, and host validity before
+    acceptance.

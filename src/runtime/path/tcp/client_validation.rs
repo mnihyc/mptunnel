@@ -9,6 +9,7 @@
 use super::client_connection::{
     ClientTcpCarrierConnect, ClientTcpCarrierConnection, connect_client_tcp_carrier,
 };
+use super::client_receive::apply_client_tcp_carrier_demand;
 use super::client_state::ClientTcpPathSessionRuntime;
 use super::group::ClientTcpCarrierReservation;
 use super::service::ClientTcpCarrierAdmissionLease;
@@ -761,19 +762,10 @@ impl ClientTcpValidationSession {
                     .receive_response(request_id, code, paths);
                 Ok(())
             }
-            frame @ Frame::TcpCarrierDemand {
+            Frame::TcpCarrierDemand {
                 request_id,
-                stream_id: _,
-            } if request_id != 0 => {
-                self.send_event(ClientTcpValidationEvent::Control {
-                    candidate: self.candidate(),
-                    frame,
-                })
-                .await
-            }
-            Frame::TcpCarrierDemand { .. } => Err(RuntimeError::Protocol(
-                "invalid TCP carrier demand identifier",
-            )),
+                stream_id,
+            } => apply_client_tcp_carrier_demand(&self.runtime, request_id, stream_id),
             Frame::PathClose {
                 path_id,
                 reason: CloseReason::Normal,

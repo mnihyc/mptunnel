@@ -9,11 +9,31 @@ use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
     ClientTcpPathStreamState, expire_client_tcp_pending_opens, handle_client_tcp_stream_frame,
 };
+use super::service::ClientTcpCarrierDemand;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::path_proof_ack_frame;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
+
+pub(super) fn apply_client_tcp_carrier_demand(
+    runtime: &ClientTcpPathSessionRuntime,
+    request_id: u64,
+    stream_id: Option<StreamId>,
+) -> Result<(), RuntimeError> {
+    let request_id = NonZeroU64::new(request_id).ok_or(RuntimeError::Protocol(
+        "invalid TCP carrier demand identifier",
+    ))?;
+    runtime
+        .state
+        .tcp_carrier_service()
+        .apply_server_demand(ClientTcpCarrierDemand {
+            request_id,
+            stream_id,
+        })
+        .map_err(|_| RuntimeError::Protocol("conflicting current TCP carrier demand"))
+}
 
 pub(super) async fn handle_client_tcp_path_frame(
     frame: Frame,
@@ -139,6 +159,10 @@ pub(super) async fn handle_client_tcp_path_frame(
                 .receive_response(request_id, code, paths);
             Ok(())
         }
+        Frame::TcpCarrierDemand {
+            request_id,
+            stream_id,
+        } => apply_client_tcp_carrier_demand(runtime, request_id, stream_id),
         Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
         Frame::PathDrain { .. } => Err(RuntimeError::Protocol(
             "TCP client received peer path drain request",

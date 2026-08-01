@@ -179,7 +179,7 @@ impl ServerTcpCarrierService {
         stream_id: StreamId,
     ) -> Option<ServerTcpCarrierWorkloadLease> {
         let mut state = self.state.lock().expect("server TCP carrier service lock");
-        if stream_id.0 == 0 || state.workloads.contains_key(&stream_id) {
+        if state.workloads.contains_key(&stream_id) {
             return None;
         }
         let identity = ProductWorkloadIdentity {
@@ -197,8 +197,9 @@ impl ServerTcpCarrierService {
             },
         );
         let withdrawal = withdraw_demand(&mut state, &self.observations_active);
-        drop(state);
-        self.publish_demand(withdrawal);
+        if withdrawal.is_some() {
+            self.demand_changes.send_replace(withdrawal);
+        }
         Some(ServerTcpCarrierWorkloadLease {
             owner: Arc::downgrade(self),
             observations_active: self.observations_active.clone(),
@@ -215,7 +216,7 @@ impl ServerTcpCarrierService {
         identity: ProductWorkloadIdentity,
         lane: TrafficClass,
         queued_unique_original: bool,
-    ) -> Option<(Option<NonZeroU64>, Option<ServerTcpCarrierDemand>)> {
+    ) -> Option<Option<NonZeroU64>> {
         let mut state = self.state.lock().expect("server TCP carrier service lock");
         let current = *state.workloads.get(&identity.stream_id)?;
         if current.identity != identity {
@@ -231,7 +232,7 @@ impl ServerTcpCarrierService {
             && current.queued_unique_original == queued_unique_original
             && current.demand_generation == demand_generation
         {
-            return Some((demand_generation, None));
+            return Some(demand_generation);
         }
         let workload = state
             .workloads
@@ -248,7 +249,10 @@ impl ServerTcpCarrierService {
         let withdrawal = (current_target_invalid || latency_work_became_active)
             .then(|| withdraw_demand(&mut state, &self.observations_active))
             .flatten();
-        Some((demand_generation, withdrawal))
+        if withdrawal.is_some() {
+            self.demand_changes.send_replace(withdrawal);
+        }
+        Some(demand_generation)
     }
 
     fn unregister_workload(&self, identity: ProductWorkloadIdentity) {
@@ -267,8 +271,9 @@ impl ServerTcpCarrierService {
             state.next_request_id = None;
         }
         let withdrawal = withdraw_demand(&mut state, &self.observations_active);
-        drop(state);
-        self.publish_demand(withdrawal);
+        if withdrawal.is_some() {
+            self.demand_changes.send_replace(withdrawal);
+        }
     }
 
     fn try_issue_demand(
@@ -362,8 +367,7 @@ impl ServerTcpCarrierService {
             geometry,
             validation_started: false,
         });
-        drop(state);
-        self.publish_demand(Some(publication));
+        self.demand_changes.send_replace(Some(publication));
         Some(publication)
     }
 
@@ -561,12 +565,6 @@ impl ServerTcpCarrierService {
             self.observations_active.store(false, Ordering::Release);
         }
     }
-
-    fn publish_demand(&self, demand: Option<ServerTcpCarrierDemand>) {
-        if demand.is_some() {
-            self.demand_changes.send_replace(demand);
-        }
-    }
 }
 
 fn output_instance_order(
@@ -637,7 +635,7 @@ impl ServerTcpCarrierWorkloadLease {
         let Some(owner) = self.owner.upgrade() else {
             return false;
         };
-        let Some((demand_generation, withdrawal)) =
+        let Some(demand_generation) =
             owner.update_workload_demand(self.identity, lane, queued_unique_original)
         else {
             return false;
@@ -648,7 +646,6 @@ impl ServerTcpCarrierWorkloadLease {
         self.lane = lane;
         self.queued_unique_original = queued_unique_original;
         self.demand_generation = demand_generation;
-        owner.publish_demand(withdrawal);
         true
     }
 

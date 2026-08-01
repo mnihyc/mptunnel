@@ -123,6 +123,17 @@ pub(in crate::runtime) enum ClientTcpCarrierObservation {
     ProductAck(RequestProductAckReceipt),
 }
 
+/// Latest server-owned S2C expansion request observed by this client session.
+/// `stream_id = None` is an explicit withdrawal, not an absent publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ClientTcpCarrierDemand {
+    pub(in crate::runtime) request_id: NonZeroU64,
+    pub(in crate::runtime) stream_id: Option<StreamId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ClientTcpCarrierDemandConflict;
+
 #[derive(Debug, Clone, Copy)]
 struct ClientTcpCarrierWorkload {
     identity: ProductWorkloadIdentity,
@@ -141,6 +152,7 @@ struct ClientTcpCarrierServiceState {
     workloads: BTreeMap<StreamId, ClientTcpCarrierWorkload>,
     admission: Option<ClientTcpCarrierAdmissionGeneration>,
     validation_transaction: Option<ClientTcpCarrierValidationTransaction>,
+    server_demand: Option<ClientTcpCarrierDemand>,
     observations_active: Arc<AtomicBool>,
 }
 
@@ -149,6 +161,7 @@ struct ClientTcpCarrierServiceState {
 pub(in crate::runtime) struct ClientTcpCarrierService {
     state: Mutex<ClientTcpCarrierServiceState>,
     policy_changes: watch::Sender<Option<ClientTcpCarrierPolicyEpochs>>,
+    server_demand_changes: watch::Sender<Option<ClientTcpCarrierDemand>>,
     observations_active: Arc<AtomicBool>,
 }
 
@@ -161,6 +174,7 @@ impl ClientTcpCarrierService {
             resource_policy_generation: one,
         };
         let (policy_changes, _) = watch::channel(Some(initial_policy));
+        let (server_demand_changes, _) = watch::channel(None);
         let observations_active = Arc::new(AtomicBool::new(false));
         Arc::new(Self {
             state: Mutex::new(ClientTcpCarrierServiceState {
@@ -172,11 +186,42 @@ impl ClientTcpCarrierService {
                 workloads: BTreeMap::new(),
                 admission: None,
                 validation_transaction: None,
+                server_demand: None,
                 observations_active: observations_active.clone(),
             }),
             policy_changes,
+            server_demand_changes,
             observations_active,
         })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn subscribe_server_demands(
+        &self,
+    ) -> watch::Receiver<Option<ClientTcpCarrierDemand>> {
+        self.server_demand_changes.subscribe()
+    }
+
+    /// Applies the RFC monotonic request sequence shared by every TCP carrier
+    /// in this client session. Older requests and exact duplicates are
+    /// idempotent; reusing the current ID with different content is a protocol
+    /// conflict and never changes the published request.
+    pub(in crate::runtime) fn apply_server_demand(
+        &self,
+        demand: ClientTcpCarrierDemand,
+    ) -> Result<(), ClientTcpCarrierDemandConflict> {
+        let mut state = self.state.lock().expect("TCP carrier service lock");
+        if let Some(current) = state.server_demand {
+            match demand.request_id.cmp(&current.request_id) {
+                std::cmp::Ordering::Less => return Ok(()),
+                std::cmp::Ordering::Equal if demand == current => return Ok(()),
+                std::cmp::Ordering::Equal => return Err(ClientTcpCarrierDemandConflict),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        state.server_demand = Some(demand);
+        self.server_demand_changes.send_replace(Some(demand));
+        Ok(())
     }
 
     pub(in crate::runtime) fn subscribe_policy_epochs(
@@ -205,7 +250,7 @@ impl ClientTcpCarrierService {
         stream_id: StreamId,
     ) -> Option<ClientTcpCarrierWorkloadLease> {
         let mut state = self.state.lock().expect("TCP carrier service lock");
-        if stream_id.0 == 0 || state.workloads.contains_key(&stream_id) {
+        if state.workloads.contains_key(&stream_id) {
             return None;
         }
         let identity = ProductWorkloadIdentity {

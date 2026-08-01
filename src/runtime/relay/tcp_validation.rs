@@ -389,9 +389,7 @@ impl ClientC2sTcpValidation {
                             frame: Ok(frame),
                         })
                     }
-                    Frame::PathStatus { .. } | Frame::TcpCarrierDemand { .. } => {
-                        ClientC2sTcpValidationAction::None
-                    }
+                    Frame::PathStatus { .. } => ClientC2sTcpValidationAction::None,
                     _ => {
                         self.withdraw();
                         ClientC2sTcpValidationAction::None

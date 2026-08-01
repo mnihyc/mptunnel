@@ -93,7 +93,7 @@ fn exact_success_to_saturation_transition_is_consumed_once() {
     let service = ClientTcpCarrierService::new();
     let groups = groups(&[(1, 3)]);
     let minimum = occupy_minimum(&groups, 0);
-    let mut workload = active_throughput_workload(&service, 11);
+    let mut workload = active_throughput_workload(&service, 0);
     let authority = stable(7);
 
     assert!(workload.record_successful_ordinary_placement(authority));
@@ -133,6 +133,46 @@ fn exact_success_to_saturation_transition_is_consumed_once() {
         "candidate settlement cannot reauthorize the same generation"
     );
     drop(minimum);
+}
+
+#[test]
+fn server_demands_are_session_monotonic_and_conflicts_are_rejected() {
+    let service = ClientTcpCarrierService::new();
+    let demands = service.subscribe_server_demands();
+    let current = ClientTcpCarrierDemand {
+        request_id: NonZeroU64::new(2).expect("nonzero request"),
+        stream_id: Some(StreamId(0)),
+    };
+    assert!(service.apply_server_demand(current).is_ok());
+    assert_eq!(*demands.borrow(), Some(current));
+
+    assert!(service.apply_server_demand(current).is_ok());
+    assert!(
+        service
+            .apply_server_demand(ClientTcpCarrierDemand {
+                request_id: NonZeroU64::new(1).expect("older request"),
+                stream_id: Some(StreamId(99)),
+            })
+            .is_ok(),
+        "older requests are ignored independent of their content"
+    );
+    assert_eq!(*demands.borrow(), Some(current));
+
+    assert_eq!(
+        service.apply_server_demand(ClientTcpCarrierDemand {
+            request_id: current.request_id,
+            stream_id: None,
+        }),
+        Err(ClientTcpCarrierDemandConflict)
+    );
+    assert_eq!(*demands.borrow(), Some(current));
+
+    let withdrawal = ClientTcpCarrierDemand {
+        request_id: NonZeroU64::new(3).expect("newer request"),
+        stream_id: None,
+    };
+    assert!(service.apply_server_demand(withdrawal).is_ok());
+    assert_eq!(*demands.borrow(), Some(withdrawal));
 }
 
 #[test]

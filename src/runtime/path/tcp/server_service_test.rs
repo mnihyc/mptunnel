@@ -62,7 +62,7 @@ fn active_workload(
 fn exact_success_to_saturation_publishes_one_monotonic_demand() {
     let service = ServerTcpCarrierService::new();
     let demands = service.subscribe_demands();
-    let mut workload = active_workload(&service, 11);
+    let mut workload = active_workload(&service, 0);
     let authority = stable(7);
     let ordinary = instance(UnderlayProtocol::Tcp, 1, 21, 31);
 
@@ -74,7 +74,7 @@ fn exact_success_to_saturation_publishes_one_monotonic_demand() {
         )
         .expect("one fresh transition publishes demand");
     assert_eq!(demand.request_id.get(), 1);
-    assert_eq!(demand.stream_id, Some(StreamId(11)));
+    assert_eq!(demand.stream_id, Some(StreamId(0)));
     assert_eq!(*demands.borrow(), Some(demand));
 
     assert!(workload.record_successful_ordinary_placement(authority));

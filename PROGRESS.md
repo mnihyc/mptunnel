@@ -3864,3 +3864,49 @@ entry is authoritative.
   ready-carrier demand publication, the shared client validation-ID owner, and
   the existing directional authority transaction without adding policy or
   timing.
+
+## 2026-08-01T21:22:39+08:00: Accepted session-level S2C demand receipt
+
+- Name: monotonic server demand across every client TCP carrier actor
+- Category: Core runtime ownership
+- State: accepted bounded wire slice; demand execution and response-sender
+  saturation publication remain deliberately disconnected
+- Clean model:
+  - ordinary, retained, and dedicated-validation TCP actors apply the same
+    authenticated server demand to one client-session owner rather than to a
+    target stream or carrier-local coordinator;
+  - the nonzero server sequence is monotonic across concurrent carriers: older
+    requests and exact duplicates are idempotent, equal-ID content conflicts
+    fail as protocol errors, and a newer explicit withdrawal remains a real
+    publication;
+  - accepted state and its watch publication are serialized under the same
+    existing session mutex, preventing an older carrier actor from publishing
+    after a concurrently accepted newer request; and
+  - C2S validation no longer receives the S2C-only demand frame, while both
+    client and server workload owners accept `StreamId(0)`, which is the first
+    valid ID allocated by the established reliable-stream owner.
+- Performance boundary:
+  - no carrier is opened, closed, retained, promoted, or selected by this
+    slice, and no timer, threshold, configured bound, scheduler decision,
+    congestion controller, pacing rule, transport parameter, or wire encoding
+    changed;
+  - the demand subscriber remains dormant until the next execution slice, so
+    no throughput claim is inferred from this ownership correction; and
+  - server demand state and publication are now linearizable without adding a
+    lock or allocation to the response data path.
+- Evidence:
+  - strict formatting, whitespace, and all-target/all-feature Clippy pass with
+    warnings denied;
+  - the locked all-feature suite passes 1,492 library tests, 2 persistent
+    allocation tests, 6 packaged daily-use acceptance tests, and doctests;
+  - standalone patched Quinn passes 282 unit tests and 3 doctests;
+  - the 29-cell/66-metric performance registry, 198 lab contracts, 5
+    deterministic benchmark tests, 9 packaging contracts, shell syntax, and
+    release-version self-test pass; and
+  - the authoritative implementation review plus one independent quick
+    read-only audit found no remaining demand-sequence, actor-coverage,
+    direction-ownership, publication-order, or first-stream discrepancy.
+- Next: give the registry exactly one server-session service, bind response
+  workload leases and exact ordinary-saturation observations to it, and publish
+  demands through an already-ready TCP carrier before connecting client-side
+  candidate execution; add no policy or timing.

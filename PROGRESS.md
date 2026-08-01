@@ -3551,3 +3551,26 @@ entry is authoritative.
     correctness and lifecycle timing; it does not claim a new throughput
     verdict. Historical restoration and the representative competitive lab
     matrix remain mandatory before release.
+
+## 2026-08-01T13:01:56+08:00: Restored source-gate baseline
+
+- Name: clean `6aac504` source boundary and benchmark lock repair
+- Category: Build reproducibility and Core acceptance
+- State: complete; representative performance evidence remains the next gate
+- Content:
+  - rejected the incomplete elastic-runtime work after preserving it below the
+    ignored `./.tmp/forensics/` tree, and restored the last clean Core
+    lifecycle boundary without accepting any of its runtime or RFC changes;
+  - repaired the benchmark crate's stale lock dependency for the root
+    `same-file` dependency, with no dependency-version or runtime change; and
+  - kept candidate expansion disconnected, so this boundary changes no packet,
+    scheduler, congestion-control, admission, timing, or carrier behavior.
+- Evidence:
+  - formatting and strict all-target, all-feature Clippy passed;
+  - the main Rust, standalone Quinn, lab Python, benchmark, and packaging test
+    suites passed 1,941 tests in total;
+  - the 29-cell/66-metric performance registry, seven shell syntax checks, and
+    release-version self-test passed; and
+  - the benchmark lock repair is exactly one dependency-list entry. No
+    performance verdict is claimed until the representative lab is repeated
+    without concurrent build or container load.

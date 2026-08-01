@@ -712,7 +712,6 @@ impl ResponseStreamBinding {
         self.release_normalized_acked_ranges_at_inner::<false, _>(ranges, Instant::now(), |_, _| {})
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::runtime) fn release_normalized_acked_ranges_with_originals(
         &self,
         ranges: &[OffsetRange],

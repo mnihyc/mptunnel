@@ -5,6 +5,7 @@ use crate::runtime::path::commands::{
     try_recv_reliable_path_command,
 };
 use crate::runtime::stream::ReliablePathStreamOutput;
+use crate::runtime::stream::response::ResponseStreamBinding;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
@@ -134,6 +135,101 @@ fn unavailable_carrier_does_not_advance_mux_or_consume_data() {
     ));
     assert_eq!(send_stream.next_offset(), 0);
     assert_eq!(sender.data_bytes(), 7);
+}
+
+#[test]
+fn response_success_to_exact_ordinary_saturation_is_typed_and_nonmutating() {
+    let limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    let binding = ResponseStreamBinding::new_with_limits(
+        SessionId(32),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        commands.clone(),
+        TrafficClass::Throughput,
+        limits,
+    );
+    let (_frames_tx, frames) = mpsc::channel(1);
+    let stream = ReliablePathStream {
+        stream_id: StreamId(32),
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames.into(),
+    };
+    let mut sender = ServerResponseSenderService::new(SessionId(32), StreamId(32));
+    let mut send_stream = ReliableSendStream::new(StreamId(32), limits);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"first"), TrafficClass::Throughput);
+
+    let first = match sender
+        .dispatch_next_with_tcp_carrier_observation(
+            &stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            0,
+        )
+        .expect("first ordinary placement")
+    {
+        ServerQueuedDispatch::Dispatched(dispatch) => dispatch,
+        ServerQueuedDispatch::OrdinarySaturation(_) => {
+            panic!("empty ordinary carrier must accept the first placement")
+        }
+    };
+    let successful_stable = first
+        .tcp_carrier_stable
+        .expect("ordinary placement carries stable comparison generations");
+    let placed_offset = send_stream.next_offset();
+    sender.enqueue_data_for_lane(Bytes::from_static(b"second"), TrafficClass::Throughput);
+
+    let saturation = match sender
+        .dispatch_next_with_tcp_carrier_observation(
+            &stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            placed_offset as usize,
+        )
+        .expect("ordinary queue saturation is a typed observation")
+    {
+        ServerQueuedDispatch::OrdinarySaturation(saturation) => saturation,
+        ServerQueuedDispatch::Dispatched(_) => panic!("full ordinary queue dispatched data"),
+    };
+    assert_eq!(saturation.stream_id, StreamId(32));
+    assert_eq!(saturation.stable, successful_stable);
+    assert_eq!(saturation.ordinary_services.len(), 1);
+    assert_eq!(
+        saturation.ordinary_services[0].instance.key.path_id,
+        PathId(0)
+    );
+    assert_eq!(send_stream.next_offset(), placed_offset);
+    assert_eq!(sender.data_bytes(), b"second".len());
+
+    assert!(matches!(
+        sender.dispatch_next_with_tcp_carrier_observation(
+            &stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            limits.max_reorder_bytes,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    let _latency_flow = commands.register_flow(TrafficClass::Latency);
+    assert!(matches!(
+        sender.dispatch_next_with_tcp_carrier_observation(
+            &stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            placed_offset as usize,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert_eq!(send_stream.next_offset(), placed_offset);
+    assert_eq!(sender.data_bytes(), b"second".len());
 }
 
 #[test]

@@ -10,6 +10,7 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::model::response::ResponsePathObservation;
+use crate::model::tcp_carrier::TcpCarrierStableGenerations;
 #[cfg(test)]
 use crate::protocol::PathId;
 use crate::protocol::{Frame, PathUsage, StreamId, UnderlayProtocol};
@@ -22,6 +23,7 @@ use crate::runtime::stream::feedback::{
     StreamAckPublication, StreamAckPublicationCursor, StreamMaxDataPublication,
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
+use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 
 #[cfg(test)]
@@ -72,16 +74,20 @@ pub(in crate::runtime) struct ResponseOutputAttachment {
 fn apply_attachment_state(
     entry: &mut ResponseStreamOutputEntry,
     state: ResponseOutputAttachmentState,
-) -> bool {
+) -> (bool, bool) {
     let mut changed = state
         .metrics
         .is_some_and(|metrics| install_path_metrics_entry(entry, metrics));
+    let mut ordinary_eligibility_changed = false;
     if let Some((sequence, usage)) = state.peer_usage
         && entry
             .peer_usage_sequence
             .is_none_or(|current| sequence > current)
     {
-        changed |= entry.peer_usage != Some(usage) || entry.peer_usage_sequence != Some(sequence);
+        ordinary_eligibility_changed = (entry.local_policy.backup
+            || entry.peer_usage == Some(PathUsage::Backup))
+            != (entry.local_policy.backup || usage == PathUsage::Backup);
+        changed |= ordinary_eligibility_changed || entry.peer_usage_sequence != Some(sequence);
         entry.peer_usage_sequence = Some(sequence);
         entry.peer_usage = Some(usage);
     }
@@ -91,7 +97,7 @@ fn apply_attachment_state(
         entry.path_proof = Some(observation);
         changed = true;
     }
-    changed
+    (changed, ordinary_eligibility_changed)
 }
 
 /// One carrier output attached to a response stream.
@@ -520,7 +526,7 @@ impl ResponseStreamBinding {
             peer_usage_sequence: None,
             path_proof: None,
         };
-        apply_attachment_state(&mut entry, validation.state);
+        let _ = apply_attachment_state(&mut entry, validation.state);
         outputs.entries.push(entry);
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
@@ -737,7 +743,8 @@ impl ResponseStreamBinding {
                 if same_channel {
                     let lane_changed = *current_lane != lane;
                     *current_lane = lane;
-                    let evidence_changed = apply_attachment_state(entry, attachment_state);
+                    let (evidence_changed, ordinary_eligibility_changed) =
+                        apply_attachment_state(entry, attachment_state);
                     if lane_changed {
                         for output in outputs.entries.iter().chain(&outputs.detaching) {
                             output.load_registration.set_lane(lane);
@@ -746,6 +753,9 @@ impl ResponseStreamBinding {
                     if lane_changed || evidence_changed {
                         self.response_model_generation
                             .fetch_add(1, Ordering::AcqRel);
+                    }
+                    if ordinary_eligibility_changed {
+                        self.advance_tcp_carrier_ordinary_eligibility_generation();
                     }
                     drop(outputs);
                     drop(current_lane);
@@ -835,7 +845,7 @@ impl ResponseStreamBinding {
                 path_proof: None,
             }
         };
-        apply_attachment_state(&mut entry, attachment_state);
+        let _ = apply_attachment_state(&mut entry, attachment_state);
         outputs.entries.push(entry);
         for output in outputs.entries.iter().chain(&outputs.detaching) {
             output.load_registration.set_lane(lane);
@@ -1104,9 +1114,15 @@ impl ResponseStreamBinding {
             return false;
         }
         entry.peer_usage_sequence = Some(sequence);
+        let ordinary_eligibility_changed = (entry.local_policy.backup
+            || entry.peer_usage == Some(PathUsage::Backup))
+            != (entry.local_policy.backup || usage == PathUsage::Backup);
         entry.peer_usage = Some(usage);
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
+        if ordinary_eligibility_changed {
+            self.advance_tcp_carrier_ordinary_eligibility_generation();
+        }
         drop(outputs);
         self.notify_update();
         true
@@ -1249,6 +1265,33 @@ impl ResponseStreamBinding {
 pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) observation: ResponsePathObservation,
     pub(in crate::runtime) command_queue: ReliablePathCommandQueueSnapshot,
+}
+
+/// One coherent response-sender observation. Stable generations are captured
+/// under the same output lock as the exact carrier instances; mutable queue,
+/// flight, and transport evidence remain only in `targets`.
+pub(in crate::runtime) struct ResponseSenderPathObservation {
+    pub(in crate::runtime) targets: Vec<ResponseSenderPathTarget>,
+    pub(in crate::runtime) membership_generation: u64,
+    pub(in crate::runtime) ordinary_eligibility_generation: Option<NonZeroU64>,
+}
+
+impl ResponseSenderPathObservation {
+    pub(in crate::runtime) fn tcp_carrier_stable_generations(
+        &self,
+        authority_class: PathUsage,
+    ) -> Option<TcpCarrierStableGenerations> {
+        let one = NonZeroU64::new(1).expect("one is nonzero");
+        Some(TcpCarrierStableGenerations {
+            membership_generation: self.membership_generation,
+            ordinary_eligibility_generation: self.ordinary_eligibility_generation?,
+            authority_class,
+            // Server path and resource policy are immutable inside one runtime
+            // generation; configuration activation constructs a new registry.
+            admission_policy_generation: one,
+            resource_policy_generation: one,
+        })
+    }
 }
 
 impl AsRef<ResponsePathObservation> for ResponseSenderPathTarget {

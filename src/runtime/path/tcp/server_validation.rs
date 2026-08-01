@@ -8,6 +8,7 @@
 
 use super::io::encrypted_framed_peer_closed;
 use super::server_evidence::ServerTcpEvidenceState;
+use super::server_service::{ServerTcpCarrierDemand, ServerTcpCarrierDemandSubscription};
 use super::server_writer::ServerTcpWriter;
 use crate::protocol::{
     CloseReason, Frame, PathId, PathMetricDirection, PeerPathState, SessionId, StreamId,
@@ -34,6 +35,7 @@ pub(super) struct ServerTcpValidationAdmission {
     pub(super) path_frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     pub(super) evidence: ServerTcpEvidenceState,
     pub(super) peer_status: PeerStatusCarrier,
+    pub(super) carrier_demands: ServerTcpCarrierDemandSubscription,
 }
 
 struct ActiveClientToServerValidation {
@@ -69,6 +71,7 @@ pub(super) struct ServerTcpValidationSession {
     path_frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     evidence: ServerTcpEvidenceState,
     peer_status: PeerStatusCarrier,
+    carrier_demands: ServerTcpCarrierDemandSubscription,
     last_validation_id: u64,
     lifecycle: ServerTcpValidationLifecycle,
     validation_deadline: Option<tokio::time::Instant>,
@@ -85,6 +88,7 @@ impl ServerTcpValidationSession {
             path_frames: admission.path_frames,
             evidence: admission.evidence,
             peer_status: admission.peer_status,
+            carrier_demands: admission.carrier_demands,
             last_validation_id: 0,
             lifecycle: ServerTcpValidationLifecycle::AwaitingValidation,
             validation_deadline: None,
@@ -96,6 +100,12 @@ impl ServerTcpValidationSession {
             .context
             .wait_for_credential_retirement(self.path_registration.principal_permit().clone());
         tokio::pin!(retirement);
+
+        if let Some(demand) = self.carrier_demands.current()
+            && !self.write_frame(&demand.into_frame()).await?
+        {
+            return Ok(());
+        }
 
         loop {
             if self
@@ -131,6 +141,12 @@ impl ServerTcpValidationSession {
                         None => return Ok(()),
                     }
                 }
+                demand = self.carrier_demands.changed() => {
+                    match demand {
+                        Some(demand) => ValidationEvent::CarrierDemand(demand),
+                        None => return Ok(()),
+                    }
+                }
                 () = wait_for_optional_std_deadline(sender_observation_at) => {
                     ValidationEvent::SenderObservationDue
                 }
@@ -161,6 +177,18 @@ impl ServerTcpValidationSession {
                     }
                 }
                 ValidationEvent::SenderObservationDue => {}
+                ValidationEvent::CarrierDemand(demand) => {
+                    let deadline = self.validation_deadline;
+                    let frame = demand.into_frame();
+                    let Some(result) =
+                        complete_before_optional_deadline(deadline, self.write_frame(&frame)).await
+                    else {
+                        return Ok(());
+                    };
+                    if !result? {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -525,6 +553,7 @@ enum ValidationEvent {
     Frame(Frame),
     PeerStatusRequest(u64),
     SenderObservationDue,
+    CarrierDemand(ServerTcpCarrierDemand),
 }
 
 async fn sleep_until_optional_deadline(deadline: Option<tokio::time::Instant>) {

@@ -61,7 +61,7 @@ fn active_workload(
 #[test]
 fn exact_success_to_saturation_publishes_one_monotonic_demand() {
     let service = ServerTcpCarrierService::new();
-    let demands = service.subscribe_demands();
+    let mut demands = service.subscribe_demands();
     let mut workload = active_workload(&service, 0);
     let authority = stable(7);
     let ordinary = instance(UnderlayProtocol::Tcp, 1, 21, 31);
@@ -75,7 +75,7 @@ fn exact_success_to_saturation_publishes_one_monotonic_demand() {
         .expect("one fresh transition publishes demand");
     assert_eq!(demand.request_id.get(), 1);
     assert_eq!(demand.stream_id, Some(StreamId(0)));
-    assert_eq!(*demands.borrow(), Some(demand));
+    assert_eq!(demands.current(), Some(demand));
 
     assert!(workload.record_successful_ordinary_placement(authority));
     assert!(
@@ -90,7 +90,7 @@ fn exact_success_to_saturation_publishes_one_monotonic_demand() {
 
     assert!(workload.update_demand(TrafficClass::Throughput, false));
     assert_eq!(
-        *demands.borrow(),
+        demands.current(),
         Some(ServerTcpCarrierDemand {
             request_id: NonZeroU64::new(2).expect("nonzero request"),
             stream_id: None,
@@ -197,7 +197,7 @@ fn changed_ordinary_set_without_membership_generation_is_rejected() {
 #[test]
 fn admission_freezes_complete_workloads_and_routes_exact_ack_receipts() {
     let service = ServerTcpCarrierService::new();
-    let demands = service.subscribe_demands();
+    let mut demands = service.subscribe_demands();
     let mut target = active_workload(&service, 13);
     let mut background = service
         .register_workload(StreamId(14))
@@ -245,9 +245,7 @@ fn admission_freezes_complete_workloads_and_routes_exact_ack_receipts() {
         .response_product_ack_receipt_target()
         .expect("capture active");
     assert_eq!(receipt_target.identity, target_identity);
-    receipt_target
-        .sink
-        .publish_response_product_ack(receipt.clone());
+    receipt_target.publish(receipt.clone());
     let ServerTcpCarrierObservation::ProductAck(observed) =
         observations.try_recv().expect("exact receipt is routed");
     assert_eq!(observed, receipt);
@@ -255,7 +253,7 @@ fn admission_freezes_complete_workloads_and_routes_exact_ack_receipts() {
     assert!(background.update_demand(TrafficClass::Latency, true));
     assert!(admission.is_withdrawn());
     assert_eq!(
-        *demands.borrow(),
+        demands.current(),
         Some(ServerTcpCarrierDemand {
             request_id: NonZeroU64::new(2).expect("nonzero request"),
             stream_id: None,
@@ -383,5 +381,137 @@ fn candidate_release_count_requires_exact_unambiguous_output_provenance() {
     assert_eq!(
         candidate_original_release_bytes(&receipt, candidate),
         Some(1024)
+    );
+}
+
+#[test]
+fn response_ack_capture_cannot_cross_validation_transactions() {
+    let service = ServerTcpCarrierService::new();
+    let mut first_target = active_workload(&service, 21);
+    let mut second_target = service
+        .register_workload(StreamId(22))
+        .expect("second response workload");
+    let authority = stable(14);
+    let ordinary = instance(UnderlayProtocol::Tcp, 13, 33, 43);
+    assert!(first_target.record_successful_ordinary_placement(authority));
+    let first_demand = first_target
+        .try_issue_saturation_demand(
+            saturation(authority, &[(ordinary, 65_536)]),
+            MuxLimits::default(),
+        )
+        .expect("first demand");
+    let first_admission = service
+        .admit_validation(
+            first_demand.request_id,
+            NonZeroU64::new(81).expect("first validation ID"),
+            StreamId(21),
+            instance(UnderlayProtocol::Tcp, 14, 34, 44),
+            authority,
+            &[ordinary],
+        )
+        .expect("first validation");
+    let _first_observations = first_admission
+        .activate_observations(1)
+        .expect("first observation transaction");
+    let first_identity = first_target.identity();
+    let captured = first_target
+        .response_product_ack_receipt_target()
+        .expect("capture exact first validation");
+
+    assert!(second_target.update_demand(TrafficClass::Latency, true));
+    assert!(first_admission.is_withdrawn());
+    first_admission.release();
+    assert!(second_target.update_demand(TrafficClass::Throughput, true));
+    assert!(second_target.record_successful_ordinary_placement(authority));
+    let second_demand = second_target
+        .try_issue_saturation_demand(
+            saturation(authority, &[(ordinary, 65_536)]),
+            MuxLimits::default(),
+        )
+        .expect("second demand");
+    let second_admission = service
+        .admit_validation(
+            second_demand.request_id,
+            NonZeroU64::new(82).expect("second validation ID"),
+            StreamId(22),
+            instance(UnderlayProtocol::Tcp, 15, 35, 45),
+            authority,
+            &[ordinary],
+        )
+        .expect("second validation");
+    let mut second_observations = second_admission
+        .activate_observations(1)
+        .expect("second observation transaction");
+
+    captured.publish(ResponseProductAckReceipt {
+        identity: first_identity,
+        completed_at: Instant::now(),
+        original_releases: SmallVec::new(),
+    });
+    assert!(
+        matches!(
+            second_observations.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "an ACK captured for the first validation cannot enter the second transaction",
+    );
+}
+
+#[test]
+fn realtime_product_lifecycle_withdraws_and_fences_response_validation() {
+    let service = ServerTcpCarrierService::new();
+    let mut demands = service.subscribe_demands();
+    let mut target = active_workload(&service, 23);
+    let authority = stable(15);
+    let ordinary = instance(UnderlayProtocol::Tcp, 16, 36, 46);
+    assert!(target.record_successful_ordinary_placement(authority));
+    let demand = target
+        .try_issue_saturation_demand(
+            saturation(authority, &[(ordinary, 65_536)]),
+            MuxLimits::default(),
+        )
+        .expect("response demand before realtime flow");
+    let admission = service
+        .admit_validation(
+            demand.request_id,
+            NonZeroU64::new(83).expect("validation ID"),
+            StreamId(23),
+            instance(UnderlayProtocol::Tcp, 17, 37, 47),
+            authority,
+            &[ordinary],
+        )
+        .expect("validation before realtime flow");
+
+    let realtime = service.register_realtime_workload();
+    assert!(admission.is_withdrawn());
+    assert_eq!(
+        demands.current(),
+        Some(ServerTcpCarrierDemand {
+            request_id: NonZeroU64::new(2).expect("withdrawal request"),
+            stream_id: None,
+        })
+    );
+    admission.release();
+    assert!(target.record_successful_ordinary_placement(authority));
+    assert!(
+        target
+            .try_issue_saturation_demand(
+                saturation(authority, &[(ordinary, 65_536)]),
+                MuxLimits::default(),
+            )
+            .is_none(),
+        "active realtime Product work forbids expansion",
+    );
+
+    drop(realtime);
+    assert!(target.record_successful_ordinary_placement(authority));
+    assert!(
+        target
+            .try_issue_saturation_demand(
+                saturation(authority, &[(ordinary, 65_536)]),
+                MuxLimits::default(),
+            )
+            .is_some(),
+        "ending realtime work creates a new coherent workload generation",
     );
 }

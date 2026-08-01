@@ -6,6 +6,7 @@
 use super::io::encrypted_framed_peer_closed;
 use super::server_datagram::{ServerTcpDatagramEffect, ServerTcpDatagramState};
 use super::server_evidence::ServerTcpEvidenceState;
+use super::server_service::{ServerTcpCarrierDemand, ServerTcpCarrierDemandSubscription};
 use super::server_stream::ServerTcpStreamState;
 use super::server_writer::ServerTcpWriter;
 #[cfg(feature = "lab-diagnostics")]
@@ -52,6 +53,7 @@ enum ServerTcpPathEvent {
     Command(ReliablePathCommand),
     PeerStatusRequest(u64),
     SenderObservationDue,
+    CarrierDemand(ServerTcpCarrierDemand),
 }
 
 enum ServerTcpPathDrainEvent {
@@ -71,6 +73,7 @@ pub(super) struct ServerTcpPathAdmission {
     pub(super) commands_rx: ReliablePathCommandReceivers,
     pub(super) evidence: ServerTcpEvidenceState,
     pub(super) peer_status: PeerStatusCarrier,
+    pub(super) carrier_demands: ServerTcpCarrierDemandSubscription,
 }
 
 pub(super) struct ServerTcpPathSession {
@@ -87,6 +90,7 @@ pub(super) struct ServerTcpPathSession {
     deferred_input: Option<Frame>,
     writer: ServerTcpWriter,
     peer_status: PeerStatusCarrier,
+    carrier_demands: ServerTcpCarrierDemandSubscription,
     path_registration: ServerCarrierPathRegistration,
     context: ServerPathContext,
 }
@@ -106,6 +110,7 @@ impl ServerTcpPathSession {
             deferred_input: None,
             writer: admission.writer,
             peer_status: admission.peer_status,
+            carrier_demands: admission.carrier_demands,
             path_registration: admission.path_registration,
             context: admission.context,
         }
@@ -123,6 +128,14 @@ impl ServerTcpPathSession {
     }
 
     async fn run_active(mut self) -> Result<(), RuntimeError> {
+        if let Some(demand) = self.carrier_demands.current()
+            && matches!(
+                self.write_reply(demand.into_frame()).await?,
+                ServerTcpFrameDisposition::Stop
+            )
+        {
+            return Ok(());
+        }
         loop {
             let event = if let Some(frame) = self.deferred_input.take() {
                 Some(ServerTcpPathEvent::Frame(frame))
@@ -131,6 +144,7 @@ impl ServerTcpPathSession {
                     &mut self.path_frames,
                     &mut self.commands_rx,
                     &mut self.peer_status,
+                    Some(&mut self.carrier_demands),
                     self.evidence.next_sender_observation_at(),
                 )
                 .await?
@@ -177,6 +191,14 @@ impl ServerTcpPathSession {
                     }
                 }
                 ServerTcpPathEvent::SenderObservationDue => {}
+                ServerTcpPathEvent::CarrierDemand(demand) => {
+                    if matches!(
+                        self.write_reply(demand.into_frame()).await?,
+                        ServerTcpFrameDisposition::Stop
+                    ) {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -204,6 +226,7 @@ impl ServerTcpPathSession {
                         &mut self.path_frames,
                         &mut self.commands_rx,
                         &mut self.peer_status,
+                        None,
                         self.evidence.next_sender_observation_at(),
                     ) => event?,
                 }
@@ -236,6 +259,9 @@ impl ServerTcpPathSession {
                     }
                 }
                 ServerTcpPathEvent::SenderObservationDue => {}
+                ServerTcpPathEvent::CarrierDemand(_) => {
+                    unreachable!("draining TCP carrier does not receive new demand")
+                }
             }
         }
 
@@ -927,6 +953,7 @@ async fn recv_server_tcp_path_event(
     path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     commands_rx: &mut ReliablePathCommandReceivers,
     peer_status: &mut PeerStatusCarrier,
+    mut carrier_demands: Option<&mut ServerTcpCarrierDemandSubscription>,
     sender_observation_at: Option<std::time::Instant>,
 ) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {
     let sender_observation_timer = async move {
@@ -957,6 +984,16 @@ async fn recv_server_tcp_path_event(
                     // and streams regardless of transport close ordering.
                     None => Ok(None),
                 };
+            }
+            demand = async {
+                match carrier_demands.as_mut() {
+                    Some(demands) => demands.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(demand) = demand {
+                    return Ok(Some(ServerTcpPathEvent::CarrierDemand(demand)));
+                }
             }
             command = recv_reliable_path_command(commands_rx), if command_may_recv => {
                 match command {

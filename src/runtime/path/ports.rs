@@ -5,6 +5,7 @@
 //! reinjection, and attachment behavior.
 
 use super::commands::ReliablePathCommandSender;
+use super::tcp::server_service::ServerTcpCarrierDemandSubscription;
 use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
@@ -708,6 +709,11 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         direction: PathMetricDirection,
     ) -> bool;
 
+    fn subscribe_tcp_carrier_demands(
+        &self,
+        identity: ServerCarrierPathIdentity,
+    ) -> Result<ServerTcpCarrierDemandSubscription, RuntimeError>;
+
     fn retire_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
@@ -937,6 +943,19 @@ impl ServerStreamPort {
         session_id: SessionId,
     ) -> ServerRealtimeFlowLease {
         self.backend.register_realtime_flow(session_id)
+    }
+
+    pub(in crate::runtime) fn subscribe_tcp_carrier_demands(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+    ) -> Result<ServerTcpCarrierDemandSubscription, RuntimeError> {
+        if !registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
+        self.backend
+            .subscribe_tcp_carrier_demands(registration.inner.identity)
     }
 
     pub(in crate::runtime) async fn open_or_attach(

@@ -678,3 +678,59 @@ fn peer_path_usage_rejects_stale_sequences_and_wrong_instances() {
     assert_eq!(entry.peer_usage, Some(PathUsage::Available));
     assert_eq!(entry.peer_usage_sequence, Some(3));
 }
+
+#[test]
+fn peer_usage_generation_changes_only_effective_ordinary_authority() {
+    let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let path_instance_id = output_entry_for_key(&binding, key).path_instance_id;
+    let stable_generation = || {
+        binding
+            .sender_path_observation(TrafficClass::Throughput, 1)
+            .ordinary_eligibility_generation
+            .expect("ordinary eligibility generation")
+    };
+    let initial = stable_generation();
+
+    assert!(binding.update_peer_path_usage_for_instance(
+        key,
+        path_instance_id,
+        1,
+        PathUsage::Available,
+    ));
+    assert_eq!(
+        stable_generation(),
+        initial,
+        "an explicit Available advertisement preserves the default authority",
+    );
+    assert!(binding.update_peer_path_usage_for_instance(
+        key,
+        path_instance_id,
+        2,
+        PathUsage::Available,
+    ));
+    assert_eq!(stable_generation(), initial);
+
+    assert!(binding.update_peer_path_usage_for_instance(
+        key,
+        path_instance_id,
+        3,
+        PathUsage::Backup,
+    ));
+    let backup = stable_generation();
+    assert_eq!(backup.get(), initial.get() + 1);
+    assert!(binding.update_peer_path_usage_for_instance(
+        key,
+        path_instance_id,
+        4,
+        PathUsage::Backup,
+    ));
+    assert_eq!(stable_generation(), backup);
+
+    assert!(binding.update_peer_path_usage_for_instance(
+        key,
+        path_instance_id,
+        5,
+        PathUsage::Available,
+    ));
+    assert_eq!(stable_generation().get(), backup.get() + 1);
+}

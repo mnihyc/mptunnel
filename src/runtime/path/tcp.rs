@@ -23,7 +23,6 @@ pub(in crate::runtime) mod retained;
 pub(in crate::runtime) mod server;
 mod server_datagram;
 mod server_evidence;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::runtime) mod server_service;
 mod server_session;
 mod server_stream;

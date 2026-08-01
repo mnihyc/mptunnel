@@ -3910,3 +3910,81 @@ entry is authoritative.
   workload leases and exact ordinary-saturation observations to it, and publish
   demands through an already-ready TCP carrier before connecting client-side
   candidate execution; add no policy or timing.
+
+## 2026-08-01T22:25:31+08:00: Accepted server S2C demand publication boundary
+
+- Name: exact response saturation to ready-carrier demand and Product-ACK
+  transaction ownership
+- Category: Core runtime ownership and encrypted TCP wire integration
+- State: source-accepted bounded slice; client candidate execution, server
+  verdict execution, and representative performance acceptance remain next
+- Clean model:
+  - one weakly indexed service exists per live server MPP session; ready
+    ordinary and validation-purpose TCP actors retain a subscription to that
+    owner, serialize its current monotonic demand exactly once, and serialize
+    later requests ahead of ordinary throughput commands without changing the
+    existing bounded writer run;
+  - every reliable response relay holds one lifecycle-generation workload
+    lease, and every target-side realtime datagram flow holds a lease in the
+    same comparison boundary; lifecycle changes invalidate the complete
+    workload generation, and active realtime work withdraws or rejects TCP
+    expansion;
+  - the response sender recognizes only the RFC 15.1 transition from a
+    successful fresh ordinary placement to exact first-authority-class
+    saturation: shared credit remains, every eligible ordinary output owns
+    target OriginalData, every one is enqueue-blocked, and no latency-sensitive
+    work is active;
+  - stable comparison generations are captured with exact response output
+    instances under the response-output lock. Repeated sequence updates that
+    preserve effective `AVAILABLE`/`BACKUP` authority do not create fresh
+    admission authority, and mutable queue, transport, staleness, rate, timer,
+    and ACK-silence evidence is excluded from those generations; and
+  - response Product-ACK capture freezes the exact active validation identity
+    before the first ACK mutation, preserves exact original-output provenance,
+    and publishes only after the complete send-cache, binding, sender-queue,
+    authoritative-ACK, recovery, and FIN transaction. A withdrawn or replaced
+    validation cannot receive that earlier transaction.
+- Correctness findings closed during authoritative review:
+  - marking the initial watch value seen prevents a ready actor from emitting
+    the same current demand twice;
+  - post-read response demand is published before the same-turn sender drain,
+    so the first successful placement cannot occur before its demand episode;
+  - demand control cannot starve behind a continuously ready throughput queue;
+  - exact validation identity fences ACK receipts across concurrent validation
+    replacement; and
+  - realtime datagram lifecycle is no longer absent from the S2C comparison
+    owner.
+- Performance boundary:
+  - no RFC timing, threshold, byte geometry, percentage, congestion controller,
+    pacing rule, transport parameter, scheduler score, platform branch, or wire
+    encoding changed;
+  - successful response scheduling retains the existing path observation and
+    queue operations, adding only stable-generation capture and the separate
+    response-demand owner required for later bounded expansion; inactive ACK
+    capture remains one atomic fast rejection with no provenance allocation;
+    and
+  - no throughput acceptance is inferred from this incomplete transaction.
+    The frozen global map requires representative TCP/QUIC and disruption labs
+    after client execution and server result settlement are connected.
+- Evidence:
+  - six new persistent RFC regressions prove exact saturation and negative
+    boundaries, stable authority generations, realtime lifecycle fencing,
+    exact-validation ACK fencing, and encrypted ready-actor current/withdrawal
+    delivery under a full throughput queue;
+  - formatting, whitespace, locked all-target/all-feature checks, and strict
+    Clippy pass with warnings denied;
+  - the locked all-feature suite passes 1,498 library tests, 2 persistent
+    allocation tests, 6 packaged daily-use acceptance tests, and doctests;
+  - standalone patched Quinn passes 282 unit tests and 3 doctests; and
+  - the 29-cell/66-metric performance registry, 198 lab contracts, 5
+    deterministic benchmark tests, 9 packaging contracts, shell syntax, and
+    release-version self-test pass.
+- Review: the authoritative line-by-line review retained final editing
+  authority; three independent quick read-only audits identified concrete
+  starvation, transaction-fencing, and realtime-workload gaps, all reproduced
+  or resolved and covered above. No subagent edited the tree.
+- Next: connect the shared client validation-ID owner to fresh or retained
+  S2C candidate establishment, bind the server admission to the exact existing
+  response attachment, execute the established bounded comparison and immutable
+  result/acknowledgment settlement, then run the representative and disruption
+  performance gates before advancing to Product completion.

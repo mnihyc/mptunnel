@@ -1,4 +1,8 @@
 use super::super::server_evidence::ServerTcpEvidenceState;
+use super::super::server_service::{
+    ServerTcpCarrierOrdinaryService, ServerTcpCarrierOutputInstance, ServerTcpCarrierSaturation,
+    ServerTcpCarrierService,
+};
 use super::super::server_writer::ServerTcpWriter;
 use super::{
     ServerTcpPathAdmission, ServerTcpPathEvent, ServerTcpPathSession, ServerTcpSessionDisposition,
@@ -8,6 +12,8 @@ use crate::config::{
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, ServerSecurityConfig,
     SharedSecret,
 };
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::tcp_carrier::TcpCarrierStableGenerations;
 use crate::outbound::OutboundConfig;
 use crate::protocol::{
     Frame, PathId, PathUsage, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
@@ -22,6 +28,7 @@ use crate::scheduler::TrafficClass;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError};
 use bytes::Bytes;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -50,6 +57,7 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
         &mut path_frames,
         &mut commands_rx,
         &mut peer_status,
+        None,
         Some(std::time::Instant::now()),
     )
     .await
@@ -76,10 +84,16 @@ async fn server_tcp_peer_eof_terminates_carrier_cleanly() {
         .expect("queue peer close");
 
     assert!(
-        recv_server_tcp_path_event(&mut path_frames, &mut commands_rx, &mut peer_status, None)
-            .await
-            .expect("normal peer close")
-            .is_none()
+        recv_server_tcp_path_event(
+            &mut path_frames,
+            &mut commands_rx,
+            &mut peer_status,
+            None,
+            None,
+        )
+        .await
+        .expect("normal peer close")
+        .is_none()
     );
 }
 
@@ -97,6 +111,7 @@ async fn server_tcp_native_sender_deadline_wakes_an_idle_actor() {
             &mut path_frames,
             &mut commands_rx,
             &mut peer_status,
+            None,
             Some(deadline),
         ),
     )
@@ -188,6 +203,10 @@ async fn server_tcp_test_session(
     let (path_frames_tx, path_frames) = mpsc::channel(1);
     let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
     let peer_status = context.peer_status.register(session_id);
+    let carrier_demands = context
+        .reliable_streams
+        .subscribe_tcp_carrier_demands(&path_registration)
+        .expect("subscribe server carrier demands");
     (
         ServerTcpPathSession::new(ServerTcpPathAdmission {
             context,
@@ -200,12 +219,113 @@ async fn server_tcp_test_session(
             commands_rx,
             evidence,
             peer_status,
+            carrier_demands,
         }),
         client_framed,
         commands,
         path_frames_tx,
         reliable_relay,
     )
+}
+
+#[tokio::test]
+async fn ready_server_tcp_actor_serializes_session_demand_ahead_of_bulk_work() {
+    let session_id = SessionId(204);
+    let path_id = PathId(0);
+    let (mut session, mut client_framed, commands, path_frames, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    let service = ServerTcpCarrierService::new();
+    session.carrier_demands = service.subscribe_demands();
+    let mut workload = service
+        .register_workload(StreamId(401))
+        .expect("response workload");
+    assert!(workload.update_demand(TrafficClass::Throughput, true));
+    let stable = TcpCarrierStableGenerations {
+        membership_generation: 1,
+        ordinary_eligibility_generation: NonZeroU64::new(1).expect("eligibility generation"),
+        authority_class: PathUsage::Available,
+        admission_policy_generation: NonZeroU64::new(1).expect("admission generation"),
+        resource_policy_generation: NonZeroU64::new(1).expect("resource generation"),
+    };
+    assert!(workload.record_successful_ordinary_placement(stable));
+    let ordinary = ServerTcpCarrierOutputInstance {
+        key: CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(91),
+        output_incarnation: 1,
+    };
+    let demand = workload
+        .try_issue_saturation_demand(
+            ServerTcpCarrierSaturation {
+                stable,
+                ordinary_services: vec![ServerTcpCarrierOrdinaryService {
+                    instance: ordinary,
+                    service_pipe_bytes: 65_536,
+                }]
+                .into_boxed_slice(),
+            },
+            session.context.mux_limits,
+        )
+        .expect("current response carrier demand");
+
+    let actor = tokio::spawn(session.run());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+            .await
+            .expect("current demand timeout")
+            .expect("read current demand"),
+        demand.into_frame(),
+    );
+
+    for nonce in 10..18 {
+        commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(402),
+                    offset: nonce,
+                    payload: Bytes::from_static(b"bulk"),
+                },
+                TrafficClass::Throughput,
+            )
+            .expect("fill ordinary bulk command queue");
+    }
+    assert!(workload.update_demand(TrafficClass::Throughput, false));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+            .await
+            .expect("withdrawal timeout")
+            .expect("read withdrawal"),
+        Frame::TcpCarrierDemand {
+            request_id: 2,
+            stream_id: None,
+        },
+        "session control demand must not starve behind a continuously ready bulk queue",
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+            .await
+            .expect("bulk output timeout")
+            .expect("read queued bulk output"),
+        Frame::StreamData {
+            stream_id: StreamId(402),
+            offset: 10,
+            ..
+        },
+    ));
+
+    path_frames
+        .send(Err(EncryptedFramedTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "test carrier closed",
+        ))))
+        .await
+        .expect("close server path reader");
+    actor
+        .await
+        .expect("server actor task")
+        .expect("server actor close");
 }
 
 #[tokio::test]

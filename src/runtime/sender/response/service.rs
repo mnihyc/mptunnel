@@ -8,11 +8,12 @@ use super::dispatch::{
     response_frame_has_carrier_credit,
 };
 use super::multipath::{
-    plan_response_data_payload_with_data_ack_outstanding_impl,
-    preview_response_data_payload_with_data_ack_outstanding,
+    ResponseMultipathPlanError, plan_response_data_payload_with_data_ack_outstanding_impl,
 };
 use super::response_reinjection_avoid_outputs;
-use super::scheduling::{response_completion_snapshot, select_response_frame_path};
+use super::scheduling::{
+    ResponseOrdinarySaturationObservation, response_completion_snapshot, select_response_frame_path,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
@@ -21,6 +22,7 @@ use crate::lab_diagnostics::{
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::CarrierPathKey;
+use crate::model::tcp_carrier::TcpCarrierStableGenerations;
 use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::ReliableWorkClass;
 use crate::model::work::reliable_failed_original_reinjection_limit_bytes;
@@ -113,6 +115,18 @@ pub(in crate::runtime) struct ServerResponseDispatch {
     pub(in crate::runtime) lane: ReliableWorkClass,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) selected_path: Option<CarrierPathKey>,
+    pub(in crate::runtime) tcp_carrier_stable: Option<TcpCarrierStableGenerations>,
+}
+
+pub(in crate::runtime) enum ServerQueuedDispatch {
+    Dispatched(ServerResponseDispatch),
+    OrdinarySaturation(Box<ResponseOrdinarySaturationObservation>),
+}
+
+pub(in crate::runtime) enum ServerCarrierReadiness {
+    Ready,
+    OrdinarySaturation(Box<ResponseOrdinarySaturationObservation>),
+    Blocked,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -329,16 +343,16 @@ impl ServerResponseSenderService {
         self.queue.front().is_some()
     }
 
-    pub(in crate::runtime) fn front_has_carrier_credit_with_data_ack_outstanding(
+    pub(in crate::runtime) fn front_carrier_readiness_with_tcp_observation(
         &self,
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
         relay_lane: TrafficClass,
         mux_limits: MuxLimits,
         data_ack_outstanding_bytes: usize,
-    ) -> bool {
+    ) -> ServerCarrierReadiness {
         let Some((_, queued)) = self.queue.front() else {
-            return false;
+            return ServerCarrierReadiness::Blocked;
         };
         match &queued.kind {
             ReliableRelayQueuedWorkKind::Control(frame) => {
@@ -347,35 +361,55 @@ impl ServerResponseSenderService {
                 } else {
                     (TrafficClass::Control, CarrierEmitMode::Classified)
                 };
-                response_frame_has_carrier_credit(path_stream, frame, carrier_lane, emit_mode, None)
+                if response_frame_has_carrier_credit(
+                    path_stream,
+                    frame,
+                    carrier_lane,
+                    emit_mode,
+                    None,
+                ) {
+                    ServerCarrierReadiness::Ready
+                } else {
+                    ServerCarrierReadiness::Blocked
+                }
             }
             ReliableRelayQueuedWorkKind::Data(payload) => {
                 let data_lane = response_data_dispatch_lane(queued.data_lane, relay_lane);
-                response_dispatch_payload_bytes(
+                let Some(payload_bytes) = response_dispatch_payload_bytes(
                     path_stream,
                     send_stream,
                     data_lane,
                     mux_limits,
                     payload.len(),
-                )
-                .is_some_and(|payload_bytes| {
-                    preview_response_data_payload_with_data_ack_outstanding(
-                        path_stream,
-                        data_lane,
-                        send_stream.next_offset(),
-                        payload_bytes,
-                        data_ack_outstanding_bytes,
-                    )
-                })
+                ) else {
+                    return ServerCarrierReadiness::Blocked;
+                };
+                match plan_response_data_payload_with_data_ack_outstanding_impl(
+                    path_stream,
+                    data_lane,
+                    send_stream.next_offset(),
+                    payload_bytes,
+                    data_ack_outstanding_bytes,
+                ) {
+                    Ok(_) => ServerCarrierReadiness::Ready,
+                    Err(ResponseMultipathPlanError::OrdinarySaturation(saturation)) => {
+                        ServerCarrierReadiness::OrdinarySaturation(saturation)
+                    }
+                    Err(ResponseMultipathPlanError::Runtime(_)) => ServerCarrierReadiness::Blocked,
+                }
             }
             ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
-                response_frame_has_carrier_credit(
+                if response_frame_has_carrier_credit(
                     path_stream,
                     frame,
                     relay_lane,
                     CarrierEmitMode::Classified,
                     Some(*cause),
-                )
+                ) {
+                    ServerCarrierReadiness::Ready
+                } else {
+                    ServerCarrierReadiness::Blocked
+                }
             }
         }
     }
@@ -554,6 +588,43 @@ impl ServerResponseSenderService {
         mux_limits: MuxLimits,
         data_ack_outstanding_bytes: usize,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
+        match self.dispatch_next_attempt_with_data_ack_outstanding(
+            path_stream,
+            send_stream,
+            relay_lane,
+            mux_limits,
+            data_ack_outstanding_bytes,
+        )? {
+            ServerQueuedDispatch::Dispatched(dispatch) => Ok(dispatch),
+            ServerQueuedDispatch::OrdinarySaturation(_) => Err(RuntimeError::SenderServiceBlocked),
+        }
+    }
+
+    pub(in crate::runtime) fn dispatch_next_with_tcp_carrier_observation(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &mut ReliableSendStream,
+        relay_lane: TrafficClass,
+        mux_limits: MuxLimits,
+        data_ack_outstanding_bytes: usize,
+    ) -> Result<ServerQueuedDispatch, RuntimeError> {
+        self.dispatch_next_attempt_with_data_ack_outstanding(
+            path_stream,
+            send_stream,
+            relay_lane,
+            mux_limits,
+            data_ack_outstanding_bytes,
+        )
+    }
+
+    fn dispatch_next_attempt_with_data_ack_outstanding(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &mut ReliableSendStream,
+        relay_lane: TrafficClass,
+        mux_limits: MuxLimits,
+        data_ack_outstanding_bytes: usize,
+    ) -> Result<ServerQueuedDispatch, RuntimeError> {
         let (queued_lane, queued) = self
             .queue
             .front()
@@ -590,14 +661,20 @@ impl ServerResponseSenderService {
                     payload.len(),
                 )
                 .ok_or(RuntimeError::SenderServiceBlocked)?;
-                let (dispatch_payload_bytes, planned) =
-                    plan_response_data_payload_with_data_ack_outstanding_impl(
+                let (dispatch_payload_bytes, planned, tcp_carrier_stable) =
+                    match plan_response_data_payload_with_data_ack_outstanding_impl(
                         path_stream,
                         data_lane,
                         send_stream.next_offset(),
                         dispatch_payload_bytes,
                         data_ack_outstanding_bytes,
-                    )?;
+                    ) {
+                        Ok(plan) => plan,
+                        Err(ResponseMultipathPlanError::OrdinarySaturation(saturation)) => {
+                            return Ok(ServerQueuedDispatch::OrdinarySaturation(saturation));
+                        }
+                        Err(ResponseMultipathPlanError::Runtime(error)) => return Err(error),
+                    };
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
@@ -619,17 +696,20 @@ impl ServerResponseSenderService {
                             .queue
                             .commit_front_data_prefix(dispatch_payload_bytes)
                             .expect("dispatched queued data must still be at queue front");
-                        return self.finish_dispatched_work(
-                            path_stream,
-                            relay_lane,
-                            queued_lane,
-                            committed,
-                            frame,
-                            selected_path,
-                            "data",
-                            enqueue_id,
-                            queue_delay_ms,
-                        );
+                        return self
+                            .finish_dispatched_work(
+                                path_stream,
+                                relay_lane,
+                                queued_lane,
+                                committed,
+                                frame,
+                                selected_path,
+                                "data",
+                                enqueue_id,
+                                queue_delay_ms,
+                                tcp_carrier_stable,
+                            )
+                            .map(ServerQueuedDispatch::Dispatched);
                     }
                     Err(err) => {
                         let _ = send_stream.rollback_committed_data(&frame);
@@ -694,7 +774,9 @@ impl ServerResponseSenderService {
             dispatch_lane_name,
             enqueue_id,
             queue_delay_ms,
+            None,
         )
+        .map(ServerQueuedDispatch::Dispatched)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -709,6 +791,7 @@ impl ServerResponseSenderService {
         dispatch_lane_name: &'static str,
         enqueue_id: u64,
         queue_delay_ms: u128,
+        tcp_carrier_stable: Option<TcpCarrierStableGenerations>,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         if matches!(
             &committed.kind,
@@ -817,6 +900,7 @@ impl ServerResponseSenderService {
             payload_bytes: committed.payload_bytes,
             lane: queued_lane,
             selected_path,
+            tcp_carrier_stable,
         })
     }
 }

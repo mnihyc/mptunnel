@@ -11,7 +11,7 @@ use crate::model::tcp_carrier::{
     TcpCarrierStableGenerations, TcpCarrierValidationGeometry, tcp_carrier_validation_geometry,
 };
 use crate::mux::MuxLimits;
-use crate::protocol::{StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::sender::ProductWorkloadIdentity;
 use crate::runtime::stream::response::{
     ResponseProductAckOriginalRelease, ResponseProductAckOriginalResolution,
@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 
@@ -56,6 +56,15 @@ pub(in crate::runtime) struct ServerTcpCarrierDemand {
     pub(in crate::runtime) stream_id: Option<StreamId>,
 }
 
+impl ServerTcpCarrierDemand {
+    pub(in crate::runtime) fn into_frame(self) -> Frame {
+        Frame::TcpCarrierDemand {
+            request_id: self.request_id.get(),
+            stream_id: self.stream_id,
+        }
+    }
+}
+
 /// One indivisible, fully applied response Product Data-ACK transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::runtime) struct ResponseProductAckReceipt {
@@ -64,27 +73,27 @@ pub(in crate::runtime) struct ResponseProductAckReceipt {
     pub(in crate::runtime) original_releases: SmallVec<[ResponseProductAckOriginalRelease; 4]>,
 }
 
-pub(in crate::runtime) trait ResponseProductAckReceiptSink {
-    fn publish_response_product_ack(&mut self, receipt: ResponseProductAckReceipt);
-}
-
-impl<F> ResponseProductAckReceiptSink for F
-where
-    F: FnMut(ResponseProductAckReceipt),
-{
-    fn publish_response_product_ack(&mut self, receipt: ResponseProductAckReceipt) {
-        self(receipt);
-    }
-}
-
 pub(in crate::runtime) struct ResponseProductAckReceiptTarget<'a> {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::runtime) identity: ProductWorkloadIdentity,
-    pub(in crate::runtime) sink: &'a mut dyn ResponseProductAckReceiptSink,
+    validation: ServerTcpCarrierValidationIdentity,
+    workload: &'a mut ServerTcpCarrierWorkloadLease,
+}
+
+impl ResponseProductAckReceiptTarget<'_> {
+    pub(in crate::runtime) fn publish(self, receipt: ResponseProductAckReceipt) {
+        if receipt.identity != self.identity {
+            return;
+        }
+        self.workload.owner.publish_observation(
+            self.validation,
+            ServerTcpCarrierObservation::ProductAck(receipt),
+        );
+    }
 }
 
 /// Exact sender facts routed to the one active S2C validation owner. No
 /// observation is captured or allocated while validation is inactive.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(in crate::runtime) enum ServerTcpCarrierObservation {
     ProductAck(ResponseProductAckReceipt),
@@ -109,10 +118,14 @@ struct ServerTcpCarrierDemandKey {
 
 #[derive(Debug)]
 struct ServerTcpCarrierDemandState {
+    #[cfg_attr(not(test), allow(dead_code))]
     publication: ServerTcpCarrierDemand,
     key: ServerTcpCarrierDemandKey,
+    #[cfg_attr(not(test), allow(dead_code))]
     ordinary_services: Box<[ServerTcpCarrierOrdinaryService]>,
+    #[cfg_attr(not(test), allow(dead_code))]
     geometry: TcpCarrierValidationGeometry,
+    #[cfg_attr(not(test), allow(dead_code))]
     validation_started: bool,
 }
 
@@ -137,6 +150,7 @@ struct ServerTcpCarrierServiceState {
     next_request_id: Option<NonZeroU64>,
     workload_generation: NonZeroU64,
     workloads: BTreeMap<StreamId, ServerTcpCarrierWorkload>,
+    realtime_workloads: usize,
     demand: Option<ServerTcpCarrierDemandState>,
     validation: Option<ServerTcpCarrierValidationState>,
 }
@@ -147,6 +161,24 @@ pub(in crate::runtime) struct ServerTcpCarrierService {
     state: Mutex<ServerTcpCarrierServiceState>,
     demand_changes: watch::Sender<Option<ServerTcpCarrierDemand>>,
     observations_active: Arc<AtomicBool>,
+}
+
+/// Keeps one server-session demand owner alive for a ready TCP carrier while
+/// exposing only its monotonic publications to the carrier actor.
+pub(in crate::runtime) struct ServerTcpCarrierDemandSubscription {
+    _owner: Arc<ServerTcpCarrierService>,
+    changes: watch::Receiver<Option<ServerTcpCarrierDemand>>,
+}
+
+impl ServerTcpCarrierDemandSubscription {
+    pub(in crate::runtime) fn current(&mut self) -> Option<ServerTcpCarrierDemand> {
+        *self.changes.borrow_and_update()
+    }
+
+    pub(in crate::runtime) async fn changed(&mut self) -> Option<ServerTcpCarrierDemand> {
+        self.changes.changed().await.ok()?;
+        *self.changes.borrow_and_update()
+    }
 }
 
 impl ServerTcpCarrierService {
@@ -160,6 +192,7 @@ impl ServerTcpCarrierService {
                 next_request_id: Some(one),
                 workload_generation: one,
                 workloads: BTreeMap::new(),
+                realtime_workloads: 0,
                 demand: None,
                 validation: None,
             }),
@@ -169,9 +202,12 @@ impl ServerTcpCarrierService {
     }
 
     pub(in crate::runtime) fn subscribe_demands(
-        &self,
-    ) -> watch::Receiver<Option<ServerTcpCarrierDemand>> {
-        self.demand_changes.subscribe()
+        self: &Arc<Self>,
+    ) -> ServerTcpCarrierDemandSubscription {
+        ServerTcpCarrierDemandSubscription {
+            _owner: self.clone(),
+            changes: self.demand_changes.subscribe(),
+        }
     }
 
     pub(in crate::runtime) fn register_workload(
@@ -201,14 +237,36 @@ impl ServerTcpCarrierService {
             self.demand_changes.send_replace(withdrawal);
         }
         Some(ServerTcpCarrierWorkloadLease {
-            owner: Arc::downgrade(self),
-            observations_active: self.observations_active.clone(),
+            owner: self.clone(),
             identity,
             lane: TrafficClass::Latency,
             queued_unique_original: false,
             demand_generation: None,
             successful_placement: None,
         })
+    }
+
+    pub(in crate::runtime) fn register_realtime_workload(
+        self: &Arc<Self>,
+    ) -> ServerTcpCarrierRealtimeWorkloadLease {
+        let mut state = self.state.lock().expect("server TCP carrier service lock");
+        state.realtime_workloads = state
+            .realtime_workloads
+            .checked_add(1)
+            .expect("realtime workloads stay inside the session resource envelope");
+        if let Some(next) = increment_generation(state.workload_generation) {
+            state.workload_generation = next;
+        } else {
+            state.next_request_id = None;
+        }
+        let withdrawal = withdraw_demand(&mut state, &self.observations_active);
+        if withdrawal.is_some() {
+            self.demand_changes.send_replace(withdrawal);
+        }
+        ServerTcpCarrierRealtimeWorkloadLease {
+            owner: self.clone(),
+            active: true,
+        }
     }
 
     fn update_workload_demand(
@@ -276,6 +334,23 @@ impl ServerTcpCarrierService {
         }
     }
 
+    fn unregister_realtime_workload(&self) {
+        let mut state = self.state.lock().expect("server TCP carrier service lock");
+        if state.realtime_workloads == 0 {
+            return;
+        }
+        state.realtime_workloads -= 1;
+        if let Some(next) = increment_generation(state.workload_generation) {
+            state.workload_generation = next;
+        } else {
+            state.next_request_id = None;
+        }
+        let withdrawal = withdraw_demand(&mut state, &self.observations_active);
+        if withdrawal.is_some() {
+            self.demand_changes.send_replace(withdrawal);
+        }
+    }
+
     fn try_issue_demand(
         &self,
         identity: ProductWorkloadIdentity,
@@ -323,6 +398,7 @@ impl ServerTcpCarrierService {
             || target.demand_generation != Some(demand_generation)
             || target.lane != TrafficClass::Throughput
             || !target.queued_unique_original
+            || state.realtime_workloads != 0
             || state.workloads.values().any(|workload| {
                 workload.queued_unique_original && workload.lane.is_latency_sensitive()
             })
@@ -373,6 +449,7 @@ impl ServerTcpCarrierService {
 
     /// Admits one exact client validation only for the current demand and the
     /// unchanged sender-owned comparison key.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::runtime) fn admit_validation(
         self: &Arc<Self>,
         request_id: NonZeroU64,
@@ -415,6 +492,7 @@ impl ServerTcpCarrierService {
                 || target.demand_generation != Some(demand.key.demand_generation)
                 || target.lane != TrafficClass::Throughput
                 || !target.queued_unique_original
+                || state.realtime_workloads != 0
                 || state.workloads.values().any(|workload| {
                     workload.queued_unique_original && workload.lane.is_latency_sensitive()
                 })
@@ -445,7 +523,7 @@ impl ServerTcpCarrierService {
             .expect("validated demand remains current");
         demand.validation_started = true;
         let admission = ServerTcpCarrierValidationAdmission {
-            owner: Arc::downgrade(self),
+            owner: self.clone(),
             validation,
             target,
             stable: frozen_stable,
@@ -462,6 +540,7 @@ impl ServerTcpCarrierService {
         Some(admission)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validation_is_withdrawn(&self, identity: ServerTcpCarrierValidationIdentity) -> bool {
         self.state
             .lock()
@@ -471,6 +550,7 @@ impl ServerTcpCarrierService {
             .is_none_or(|validation| validation.identity != identity || validation.withdrawn)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn activate_observations(
         &self,
         identity: ServerTcpCarrierValidationIdentity,
@@ -490,7 +570,24 @@ impl ServerTcpCarrierService {
         Some(receiver)
     }
 
-    fn publish_observation(&self, observation: ServerTcpCarrierObservation) {
+    fn active_observation_validation(&self) -> Option<ServerTcpCarrierValidationIdentity> {
+        if !self.observations_active.load(Ordering::Acquire) {
+            return None;
+        }
+        self.state
+            .lock()
+            .expect("server TCP carrier service lock")
+            .validation
+            .as_ref()
+            .filter(|validation| !validation.withdrawn && validation.observations.is_some())
+            .map(|validation| validation.identity)
+    }
+
+    fn publish_observation(
+        &self,
+        identity: ServerTcpCarrierValidationIdentity,
+        observation: ServerTcpCarrierObservation,
+    ) {
         if !self.observations_active.load(Ordering::Acquire) {
             return;
         }
@@ -499,6 +596,9 @@ impl ServerTcpCarrierService {
             self.observations_active.store(false, Ordering::Release);
             return;
         };
+        if validation.identity != identity {
+            return;
+        }
         if validation.withdrawn {
             validation.observations = None;
             self.observations_active.store(false, Ordering::Release);
@@ -515,6 +615,7 @@ impl ServerTcpCarrierService {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn revalidate(
         &self,
         identity: ServerTcpCarrierValidationIdentity,
@@ -542,6 +643,7 @@ impl ServerTcpCarrierService {
                             && target.lane == TrafficClass::Throughput
                             && target.queued_unique_original
                     })
+                && state.realtime_workloads == 0
                 && !state.workloads.values().any(|workload| {
                     workload.queued_unique_original && workload.lane.is_latency_sensitive()
                 })
@@ -608,10 +710,26 @@ fn withdraw_demand(
     })
 }
 
+/// Keeps one active response-direction realtime Product workload inside the
+/// same session comparison boundary as reliable response streams.
+pub(in crate::runtime) struct ServerTcpCarrierRealtimeWorkloadLease {
+    owner: Arc<ServerTcpCarrierService>,
+    active: bool,
+}
+
+impl Drop for ServerTcpCarrierRealtimeWorkloadLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        self.owner.unregister_realtime_workload();
+    }
+}
+
 /// Cold RAII registration for one complete response-direction Product workload.
 pub(in crate::runtime) struct ServerTcpCarrierWorkloadLease {
-    owner: Weak<ServerTcpCarrierService>,
-    observations_active: Arc<AtomicBool>,
+    owner: Arc<ServerTcpCarrierService>,
     identity: ProductWorkloadIdentity,
     lane: TrafficClass,
     queued_unique_original: bool,
@@ -632,11 +750,9 @@ impl ServerTcpCarrierWorkloadLease {
         if self.lane == lane && self.queued_unique_original == queued_unique_original {
             return true;
         }
-        let Some(owner) = self.owner.upgrade() else {
-            return false;
-        };
         let Some(demand_generation) =
-            owner.update_workload_demand(self.identity, lane, queued_unique_original)
+            self.owner
+                .update_workload_demand(self.identity, lane, queued_unique_original)
         else {
             return false;
         };
@@ -667,7 +783,7 @@ impl ServerTcpCarrierWorkloadLease {
     ) -> Option<ServerTcpCarrierDemand> {
         let successful_placement = self.successful_placement.take()?;
         let demand_generation = self.demand_generation?;
-        self.owner.upgrade()?.try_issue_demand(
+        self.owner.try_issue_demand(
             self.identity,
             demand_generation,
             successful_placement,
@@ -679,38 +795,25 @@ impl ServerTcpCarrierWorkloadLease {
     pub(in crate::runtime) fn response_product_ack_receipt_target(
         &mut self,
     ) -> Option<ResponseProductAckReceiptTarget<'_>> {
-        if !self.observations_active.load(Ordering::Acquire) {
-            return None;
-        }
+        let validation = self.owner.active_observation_validation()?;
         Some(ResponseProductAckReceiptTarget {
             identity: self.identity,
-            sink: self,
+            validation,
+            workload: self,
         })
-    }
-}
-
-impl ResponseProductAckReceiptSink for ServerTcpCarrierWorkloadLease {
-    fn publish_response_product_ack(&mut self, receipt: ResponseProductAckReceipt) {
-        if receipt.identity != self.identity {
-            return;
-        }
-        if let Some(owner) = self.owner.upgrade() {
-            owner.publish_observation(ServerTcpCarrierObservation::ProductAck(receipt));
-        }
     }
 }
 
 impl Drop for ServerTcpCarrierWorkloadLease {
     fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.unregister_workload(self.identity);
-        }
+        self.owner.unregister_workload(self.identity);
     }
 }
 
 /// Frozen comparison input and exact service ownership for one S2C validation.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::runtime) struct ServerTcpCarrierValidationAdmission {
-    owner: Weak<ServerTcpCarrierService>,
+    owner: Arc<ServerTcpCarrierService>,
     validation: ServerTcpCarrierValidationIdentity,
     target: ProductWorkloadIdentity,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -721,6 +824,7 @@ pub(in crate::runtime) struct ServerTcpCarrierValidationAdmission {
     armed: bool,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ServerTcpCarrierValidationAdmission {
     pub(in crate::runtime) fn request_id(&self) -> NonZeroU64 {
         self.validation.request_id
@@ -756,18 +860,14 @@ impl ServerTcpCarrierValidationAdmission {
     }
 
     pub(in crate::runtime) fn is_withdrawn(&self) -> bool {
-        self.owner
-            .upgrade()
-            .is_none_or(|owner| owner.validation_is_withdrawn(self.validation))
+        self.owner.validation_is_withdrawn(self.validation)
     }
 
     pub(in crate::runtime) fn activate_observations(
         &self,
         capacity: usize,
     ) -> Option<mpsc::Receiver<ServerTcpCarrierObservation>> {
-        self.owner
-            .upgrade()?
-            .activate_observations(self.validation, capacity)
+        self.owner.activate_observations(self.validation, capacity)
     }
 
     #[cfg(test)]
@@ -777,8 +877,7 @@ impl ServerTcpCarrierValidationAdmission {
         ordinary_instances: &[ServerTcpCarrierOutputInstance],
     ) -> bool {
         self.owner
-            .upgrade()
-            .is_some_and(|owner| owner.revalidate(self.validation, stable, ordinary_instances))
+            .revalidate(self.validation, stable, ordinary_instances)
     }
 
     pub(in crate::runtime) fn release(mut self) {
@@ -786,9 +885,7 @@ impl ServerTcpCarrierValidationAdmission {
             return;
         }
         self.armed = false;
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release_validation(self.validation);
-        }
+        self.owner.release_validation(self.validation);
     }
 }
 
@@ -798,14 +895,13 @@ impl Drop for ServerTcpCarrierValidationAdmission {
             return;
         }
         self.armed = false;
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release_validation(self.validation);
-        }
+        self.owner.release_validation(self.validation);
     }
 }
 
 /// Filters one ACK release to the exact unambiguous candidate output. The
 /// shared comparison model consumes only the returned Product byte count.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::runtime) fn candidate_original_release_bytes(
     receipt: &ResponseProductAckReceipt,
     candidate: ServerTcpCarrierOutputInstance,

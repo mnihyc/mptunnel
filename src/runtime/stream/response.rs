@@ -22,7 +22,8 @@ use crate::scheduler::TrafficClass;
 pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
     ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
-    ResponsePathDetachOutcome, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
+    ResponsePathDetachOutcome, ResponseSenderPathObservation, ResponseSenderPathTarget,
+    ResponseStreamAttachOutcome,
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use delivery::ResponseAckOrderingState;
@@ -35,6 +36,7 @@ pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
@@ -90,6 +92,9 @@ pub(in crate::runtime) struct ResponseStreamBinding {
     next_output_incarnation: AtomicU64,
     /// Changes only when the set of live response attachments changes.
     output_membership_generation: AtomicU64,
+    /// Changes only when stable, non-queue ordinary policy eligibility
+    /// changes. Dynamic recovery evidence and transport samples are excluded.
+    tcp_carrier_ordinary_eligibility_generation: AtomicU64,
     // Publishes coherent path evidence, exact flights, ACK ordering, and queues.
     response_model_generation: AtomicU64,
     // Close publishes before carrier commands so no later scheduler commit can
@@ -203,6 +208,7 @@ impl ResponseStreamBinding {
             session_registration,
             next_output_incarnation: AtomicU64::new(2),
             output_membership_generation: AtomicU64::new(1),
+            tcp_carrier_ordinary_eligibility_generation: AtomicU64::new(1),
             response_model_generation: AtomicU64::new(0),
             response_stream_open: AtomicBool::new(true),
             outputs: Mutex::new(ResponseStreamOutputs {
@@ -246,6 +252,21 @@ impl ResponseStreamBinding {
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
             version,
         })
+    }
+
+    fn advance_tcp_carrier_ordinary_eligibility_generation(&self) {
+        let _ = self
+            .tcp_carrier_ordinary_eligibility_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.checked_add(1).unwrap_or(0))
+            });
+    }
+
+    fn tcp_carrier_ordinary_eligibility_generation(&self) -> Option<NonZeroU64> {
+        NonZeroU64::new(
+            self.tcp_carrier_ordinary_eligibility_generation
+                .load(Ordering::Acquire),
+        )
     }
 
     pub(in crate::runtime::stream) fn session_send_buffer(&self) -> super::SessionSendBuffer {

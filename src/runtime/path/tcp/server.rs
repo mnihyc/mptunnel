@@ -154,6 +154,9 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     let evidence =
         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);
     let peer_status = context.peer_status.register(session_id);
+    let carrier_demands = context
+        .reliable_streams
+        .subscribe_tcp_carrier_demands(&path_registration)?;
     match path_join.purpose {
         PathPurpose::Ordinary => {
             let (commands_tx, commands_rx) =
@@ -169,6 +172,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
                 commands_rx,
                 evidence,
                 peer_status,
+                carrier_demands,
             })
             .run()
             .await
@@ -183,6 +187,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
                 path_frames,
                 evidence,
                 peer_status,
+                carrier_demands,
             })
             .run()
             .await

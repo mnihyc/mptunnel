@@ -1,8 +1,8 @@
 use super::feedback::{StreamAckPublication, StreamMaxDataPublication};
 use super::response::{
     CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
-    ResponseStreamBinding, product_flights_have_recent_reinjection_overlap,
-    release_carrier_path_flight_ranges,
+    ResponseProductAckOriginalRelease, ResponseStreamBinding,
+    product_flights_have_recent_reinjection_overlap, release_carrier_path_flight_ranges,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
@@ -554,6 +554,17 @@ impl ReliablePathStream {
         ranges: &[OffsetRange],
     ) -> ResponseDataAckRelease {
         self.output.release_normalized_acked_ranges(ranges)
+    }
+
+    pub(in crate::runtime) fn release_normalized_acked_ranges_with_originals(
+        &self,
+        ranges: &[OffsetRange],
+    ) -> (
+        ResponseDataAckRelease,
+        SmallVec<[ResponseProductAckOriginalRelease; 4]>,
+    ) {
+        self.output
+            .release_normalized_acked_ranges_with_originals(ranges)
     }
 
     pub(in crate::runtime) fn has_recent_reinjection_overlap(
@@ -1332,6 +1343,24 @@ impl ReliablePathStreamOutput {
                 ResponseDataAckRelease::default()
             }
             Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
+        }
+    }
+
+    pub(in crate::runtime) fn release_normalized_acked_ranges_with_originals(
+        &self,
+        ranges: &[OffsetRange],
+    ) -> (
+        ResponseDataAckRelease,
+        SmallVec<[ResponseProductAckOriginalRelease; 4]>,
+    ) {
+        match self {
+            Self::Fixed(fixed) => {
+                fixed.release_normalized_acked_ranges(ranges);
+                (ResponseDataAckRelease::default(), SmallVec::new())
+            }
+            Self::Switchable(binding) => {
+                binding.release_normalized_acked_ranges_with_originals(ranges)
+            }
         }
     }
 

@@ -61,8 +61,13 @@ use crate::runtime::outbound_registry::{
     EgressSelection, OpenedTcpOutbound, RuntimeOutboundRegistry, finish_gateway_flow,
 };
 use crate::runtime::path::PathDeliveryStats;
+use crate::runtime::path::tcp::server_service::{
+    ResponseProductAckReceipt, ServerTcpCarrierOrdinaryService, ServerTcpCarrierOutputInstance,
+    ServerTcpCarrierSaturation, ServerTcpCarrierWorkloadLease,
+};
 use crate::runtime::sender::{
-    RelaySendCause, ServerReinjectionOutputIdentity, ServerResponseSenderService,
+    RelaySendCause, ResponseOrdinarySaturationObservation, ServerCarrierReadiness,
+    ServerQueuedDispatch, ServerReinjectionOutputIdentity, ServerResponseSenderService,
     emit_response_control_frame, reliable_relay_sender_queue_limit,
 };
 use crate::runtime::stream::response::ResponseDataAckRecoveryCandidate;
@@ -256,6 +261,7 @@ async fn relay_accepted_stream(
     }
 
     let session_send_buffer = accepted.session_send_buffer();
+    let tcp_carrier_workload = accepted.take_tcp_carrier_workload();
     let stream = accepted.take_stream();
     // Resolve the Product connector variant once, before entering the relay
     // loop. Direct and plain-proxy traffic therefore retains a concrete
@@ -273,6 +279,7 @@ async fn relay_accepted_stream(
                 context.as_ref(),
                 session_id,
                 session_send_buffer,
+                tcp_carrier_workload,
             )
             .await
             .map(|_| ());
@@ -290,6 +297,7 @@ async fn relay_accepted_stream(
                 context.as_ref(),
                 session_id,
                 session_send_buffer,
+                tcp_carrier_workload,
             )
             .await
             .map(|_| ());
@@ -1232,6 +1240,7 @@ fn enqueue_reliable_tail_reinjection(
 #[allow(clippy::too_many_arguments)]
 async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
+    tcp_carrier_workload: &mut Option<ServerTcpCarrierWorkloadLease>,
     path_stream: &ReliablePathStream,
     mut data_ack_outstanding_bytes: usize,
     send_stream: &mut ReliableSendStream,
@@ -1250,14 +1259,23 @@ async fn drain_server_response_sender_ready(
         && dispatched_items < sender_dispatch_item_budget
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
-        let dispatch = match response_sender.dispatch_next_with_data_ack_outstanding(
+        let dispatch = match response_sender.dispatch_next_with_tcp_carrier_observation(
             path_stream,
             send_stream,
             relay_lane,
             mux_limits,
             data_ack_outstanding_bytes,
         ) {
-            Ok(dispatch) => dispatch,
+            Ok(ServerQueuedDispatch::Dispatched(dispatch)) => dispatch,
+            Ok(ServerQueuedDispatch::OrdinarySaturation(saturation)) => {
+                observe_server_tcp_carrier_saturation(
+                    tcp_carrier_workload,
+                    *saturation,
+                    mux_limits,
+                );
+                blocked_by_carrier = true;
+                break;
+            }
             Err(RuntimeError::SenderServiceBlocked) => {
                 blocked_by_carrier = true;
                 break;
@@ -1289,6 +1307,11 @@ async fn drain_server_response_sender_ready(
                 dispatched_payload_bytes.saturating_add(dispatch.payload_bytes);
             stats.record_payload_bytes(dispatch.payload_bytes);
             if dispatch.lane == ReliableWorkClass::Data {
+                if let Some(workload) = tcp_carrier_workload.as_mut()
+                    && let Some(stable) = dispatch.tcp_carrier_stable
+                {
+                    let _ = workload.record_successful_ordinary_placement(stable);
+                }
                 data_ack_outstanding_bytes =
                     data_ack_outstanding_bytes.saturating_add(dispatch.payload_bytes);
             }
@@ -1321,6 +1344,70 @@ async fn drain_server_response_sender_ready(
     Ok(blocked_by_carrier)
 }
 
+fn server_tcp_carrier_saturation(
+    saturation: ResponseOrdinarySaturationObservation,
+) -> ServerTcpCarrierSaturation {
+    ServerTcpCarrierSaturation {
+        stable: saturation.stable,
+        ordinary_services: saturation
+            .ordinary_services
+            .into_iter()
+            .map(|ordinary| ServerTcpCarrierOrdinaryService {
+                instance: ServerTcpCarrierOutputInstance {
+                    key: ordinary.instance.key,
+                    path_instance_id: ordinary.instance.path_instance_id,
+                    output_incarnation: ordinary.instance.output_incarnation,
+                },
+                service_pipe_bytes: ordinary.service_pipe_bytes,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    }
+}
+
+fn observe_server_tcp_carrier_saturation(
+    workload: &mut Option<ServerTcpCarrierWorkloadLease>,
+    saturation: ResponseOrdinarySaturationObservation,
+    mux_limits: MuxLimits,
+) {
+    let Some(workload) = workload.as_mut() else {
+        return;
+    };
+    if saturation.stream_id != workload.identity().stream_id {
+        return;
+    }
+    let _ =
+        workload.try_issue_saturation_demand(server_tcp_carrier_saturation(saturation), mux_limits);
+}
+
+fn refresh_server_tcp_carrier_workload_demand(
+    response_flow_demand: &mut ReliableRelayFlowDemandTracker,
+    workload: &mut Option<ServerTcpCarrierWorkloadLease>,
+    response_sender: &ServerResponseSenderService,
+    send_stream: &ReliableSendStream,
+    classifier_path: Option<PathSnapshot>,
+    mux_limits: MuxLimits,
+) {
+    let queued_unique_original_bytes = response_sender.data_bytes();
+    let response_observed_bytes = send_stream
+        .next_offset()
+        .saturating_add(queued_unique_original_bytes as u64);
+    let response_demand_update = response_flow_demand.refresh(
+        ReliableRelayFlowSignals::new(response_observed_bytes, 0).with_product_work(
+            queued_unique_original_bytes,
+            send_stream.reinjection_bytes(),
+        ),
+        classifier_path,
+        mux_limits,
+    );
+    if let Some(workload) = workload.as_mut() {
+        let _ = workload.update_demand(
+            response_demand_update.lane,
+            queued_unique_original_bytes != 0,
+        );
+    }
+}
+
 // Reliable server response relay
 async fn relay_reliable_stream<S>(
     local: S,
@@ -1328,6 +1415,7 @@ async fn relay_reliable_stream<S>(
     context: &ServerReliableRelayContext,
     session_id: SessionId,
     session_send_buffer: crate::runtime::stream::SessionSendBuffer,
+    tcp_carrier_workload: Option<ServerTcpCarrierWorkloadLease>,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1344,6 +1432,7 @@ where
         context,
         session_id,
         session_send_buffer,
+        tcp_carrier_workload,
         &mut close,
     )
     .await;
@@ -1380,6 +1469,7 @@ async fn relay_reliable_stream_body<S>(
     context: &ServerReliableRelayContext,
     session_id: SessionId,
     session_send_buffer: crate::runtime::stream::SessionSendBuffer,
+    mut tcp_carrier_workload: Option<ServerTcpCarrierWorkloadLease>,
     close: &mut ServerRelayClose,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
@@ -1434,6 +1524,8 @@ where
     let mut last_send_ack = AuthoritativeStreamAckSnapshot::default();
     let mut tail_reinjection_timer = ReliableRelayTailReinjectionTimer::default();
     let mut flow_demand =
+        ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
+    let mut response_flow_demand =
         ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
     let mut output_updates = path_stream.subscribe_output_updates();
     let mut observed_output_membership_generation = path_stream.output_membership_generation();
@@ -1528,6 +1620,14 @@ where
             mux_limits,
         );
         let relay_lane = demand_update.lane;
+        refresh_server_tcp_carrier_workload_demand(
+            &mut response_flow_demand,
+            &mut tcp_carrier_workload,
+            &response_sender,
+            &send_stream,
+            classifier_path,
+            mux_limits,
+        );
         if relay_lane != previous_lane {
             path_stream.set_lane(relay_lane);
             #[cfg(feature = "lab-diagnostics")]
@@ -1807,14 +1907,25 @@ where
         if response_sender_retry_at.is_some_and(|deadline| deadline <= now) {
             response_sender_retry_at = None;
         }
-        let queued_front_has_carrier_credit = response_sender
-            .front_has_carrier_credit_with_data_ack_outstanding(
-                path_stream,
-                &send_stream,
-                relay_lane,
-                mux_limits,
-                data_ack_outstanding_bytes,
-            );
+        let carrier_readiness = response_sender.front_carrier_readiness_with_tcp_observation(
+            path_stream,
+            &send_stream,
+            relay_lane,
+            mux_limits,
+            data_ack_outstanding_bytes,
+        );
+        let queued_front_has_carrier_credit = match carrier_readiness {
+            ServerCarrierReadiness::Ready => true,
+            ServerCarrierReadiness::OrdinarySaturation(saturation) => {
+                observe_server_tcp_carrier_saturation(
+                    &mut tcp_carrier_workload,
+                    *saturation,
+                    mux_limits,
+                );
+                false
+            }
+            ServerCarrierReadiness::Blocked => false,
+        };
         let sender_wait = response_sender_wait_state(
             !response_sender.is_empty(),
             response_sender.queued_send_ready(),
@@ -1905,6 +2016,7 @@ where
             );
             if drain_server_response_sender_ready(
                 &mut response_sender,
+                &mut tcp_carrier_workload,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
@@ -2090,6 +2202,12 @@ where
                         continue;
                     }
                     let normalized_ranges = validated_ack.ranges();
+                    // Freeze the exact active validation before the first ACK
+                    // mutation. Publication below exact-matches this same
+                    // transaction after every ACK/recovery mutation is done.
+                    let response_product_ack_target = tcp_carrier_workload
+                        .as_mut()
+                        .and_then(|workload| workload.response_product_ack_receipt_target());
                     #[cfg(feature = "lab-diagnostics")]
                     let mux_started = Instant::now();
                     let ack = match send_stream.apply_validated_ack(&validated_ack) {
@@ -2102,8 +2220,16 @@ where
                     }
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                    let response_data_ack_release =
-                        path_stream.release_normalized_acked_ranges(normalized_ranges);
+                    let (response_data_ack_release, response_product_ack_originals) =
+                        if response_product_ack_target.is_some() {
+                            path_stream
+                                .release_normalized_acked_ranges_with_originals(normalized_ranges)
+                        } else {
+                            (
+                                path_stream.release_normalized_acked_ranges(normalized_ranges),
+                                SmallVec::new(),
+                            )
+                        };
                     response_data_ack_progress_outputs =
                         response_data_ack_release.path_progress_outputs.into_vec();
                     response_path_staleness_dirty = true;
@@ -2380,6 +2506,14 @@ where
                         close.sent = true;
                         pending_local_fin = false;
                     }
+                    if let Some(target) = response_product_ack_target {
+                        let identity = target.identity;
+                        target.publish(ResponseProductAckReceipt {
+                            identity,
+                            completed_at: Instant::now(),
+                            original_releases: response_product_ack_originals,
+                        });
+                    }
                 }
                 Frame::StreamMaxData {
                     stream_id: max_stream_id,
@@ -2459,6 +2593,7 @@ where
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
+                    &mut tcp_carrier_workload,
                     path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
@@ -2615,6 +2750,7 @@ where
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
+                    &mut tcp_carrier_workload,
                     path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
@@ -2695,6 +2831,7 @@ where
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
+                    &mut tcp_carrier_workload,
                     path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
@@ -2728,6 +2865,7 @@ where
             );
             if drain_server_response_sender_ready(
                 &mut response_sender,
+                &mut tcp_carrier_workload,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
@@ -2752,6 +2890,7 @@ where
             );
             if drain_server_response_sender_ready(
                 &mut response_sender,
+                &mut tcp_carrier_workload,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
@@ -2886,6 +3025,17 @@ where
                         ),
                     );
                 }
+                // A local read can create the response demand episode and
+                // immediately enter this drain in the same relay turn. Publish
+                // the post-enqueue episode before its first placement.
+                refresh_server_tcp_carrier_workload_demand(
+                    &mut response_flow_demand,
+                    &mut tcp_carrier_workload,
+                    &response_sender,
+                    &send_stream,
+                    classifier_path,
+                    mux_limits,
+                );
                 if response_sender.queued_send_ready() {
                     let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
                         relay_lane,
@@ -2894,6 +3044,7 @@ where
                     );
                     if drain_server_response_sender_ready(
                         &mut response_sender,
+                        &mut tcp_carrier_workload,
                         path_stream,
                         data_ack_outstanding_bytes,
                         &mut send_stream,
@@ -2930,6 +3081,7 @@ where
             );
             match drain_server_response_sender_ready(
                 &mut response_sender,
+                &mut tcp_carrier_workload,
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,

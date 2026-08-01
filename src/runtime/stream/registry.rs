@@ -29,6 +29,9 @@ use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::proof::PathProofObservation;
+use crate::runtime::path::tcp::server_service::{
+    ServerTcpCarrierDemandSubscription, ServerTcpCarrierService, ServerTcpCarrierWorkloadLease,
+};
 use crate::runtime::path::{
     CarrierDeliveryRateSample, ServerCarrierPathIdentity, ServerCarrierPathRetirement,
     ServerCarrierPathStatusSnapshot, ServerNewStreamPolicy, ServerPathValidation,
@@ -70,6 +73,7 @@ pub(in crate::runtime) struct ServerReliableStreamRegistry {
     registered_path_instances: Mutex<ServerCarrierPathRegistry>,
     closed_streams: Mutex<RecentIdCache<(SessionId, StreamId)>>,
     session_tracker: Arc<ServerSessionTracker>,
+    tcp_carrier_services: Mutex<HashMap<SessionId, Weak<ServerTcpCarrierService>>>,
 }
 
 impl std::fmt::Debug for ServerReliableStreamRegistry {
@@ -439,6 +443,7 @@ pub(in crate::runtime) struct AcceptedServerReliableStream {
     stream: Option<ReliablePathStream>,
     opening: AcceptedServerReliableStreamOpening,
     session_send_buffer: SessionSendBuffer,
+    tcp_carrier_workload: Option<ServerTcpCarrierWorkloadLease>,
     retirement: Arc<AcceptedServerReliableStreamRetirementInner>,
     supervised: bool,
 }
@@ -576,6 +581,12 @@ impl AcceptedServerReliableStream {
 
     pub(in crate::runtime) fn session_send_buffer(&self) -> SessionSendBuffer {
         self.session_send_buffer.clone()
+    }
+
+    pub(in crate::runtime) fn take_tcp_carrier_workload(
+        &mut self,
+    ) -> Option<ServerTcpCarrierWorkloadLease> {
+        self.tcp_carrier_workload.take()
     }
 
     /// Publishes OPEN acceptance and then carrier validation on the same
@@ -785,6 +796,7 @@ impl ServerReliableStreamRegistry {
                 max_streams,
             ))),
             session_tracker: Arc::new(ServerSessionTracker::from_limits(limits, max_streams)),
+            tcp_carrier_services: Mutex::new(HashMap::new()),
         }
     }
 
@@ -963,6 +975,9 @@ impl ServerReliableStreamRegistry {
     ) -> AcceptedServerReliableStream {
         let stream_id = stream.stream_id;
         let close_output = stream.output.clone();
+        let tcp_carrier_workload = self
+            .tcp_carrier_service(session_id)
+            .register_workload(stream_id);
         AcceptedServerReliableStream {
             session_id,
             principal_permit,
@@ -970,6 +985,7 @@ impl ServerReliableStreamRegistry {
             stream: Some(stream),
             opening,
             session_send_buffer,
+            tcp_carrier_workload,
             retirement: Arc::new(AcceptedServerReliableStreamRetirementInner {
                 registry: self.clone(),
                 session_id,
@@ -983,6 +999,46 @@ impl ServerReliableStreamRegistry {
             }),
             supervised: false,
         }
+    }
+
+    fn tcp_carrier_service(&self, session_id: SessionId) -> Arc<ServerTcpCarrierService> {
+        let mut services = self
+            .tcp_carrier_services
+            .lock()
+            .expect("server TCP carrier services lock");
+        if let Some(service) = services.get(&session_id).and_then(Weak::upgrade) {
+            return service;
+        }
+        // Stale weak entries can span at most the configured concurrent
+        // session envelope. Prune them only on cold service creation.
+        services.retain(|_, service| service.strong_count() != 0);
+        let service = ServerTcpCarrierService::new();
+        services.insert(session_id, Arc::downgrade(&service));
+        service
+    }
+
+    fn subscribe_tcp_carrier_demands(
+        &self,
+        identity: ServerCarrierPathIdentity,
+    ) -> Result<ServerTcpCarrierDemandSubscription, RuntimeError> {
+        if identity.underlay != UnderlayProtocol::Tcp {
+            return Err(RuntimeError::Protocol(
+                "TCP carrier demand subscription requires TCP underlay",
+            ));
+        }
+        let current = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock")
+            .instances
+            .get(&server_physical_path_key(identity))
+            .is_some_and(|path| path.state == PeerPathState::Active && !path.retirement_started);
+        if !current {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        Ok(self
+            .tcp_carrier_service(identity.session_id)
+            .subscribe_demands())
     }
 
     fn activate_carrier_path(
@@ -2579,6 +2635,13 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
             .tcp_carrier_direction_authorized(identity, direction)
     }
 
+    fn subscribe_tcp_carrier_demands(
+        &self,
+        identity: ServerCarrierPathIdentity,
+    ) -> Result<ServerTcpCarrierDemandSubscription, RuntimeError> {
+        self.registry.subscribe_tcp_carrier_demands(identity)
+    }
+
     fn retire_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
@@ -2591,7 +2654,12 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     }
 
     fn register_realtime_flow(&self, session_id: SessionId) -> ServerRealtimeFlowLease {
-        ServerRealtimeFlowLease::hold(self.registry.register_realtime_flow(session_id))
+        ServerRealtimeFlowLease::hold((
+            self.registry.register_realtime_flow(session_id),
+            self.registry
+                .tcp_carrier_service(session_id)
+                .register_realtime_workload(),
+        ))
     }
 
     fn open_or_attach<'a>(

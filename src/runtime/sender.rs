@@ -22,7 +22,10 @@ pub(in crate::runtime) use request::{
     RequestProductAckReceiptTarget, RequestSenderService,
 };
 #[cfg(not(test))]
-pub(in crate::runtime) use response::{ServerResponseSenderService, emit_response_control_frame};
+pub(in crate::runtime) use response::{
+    ResponseOrdinarySaturationObservation, ServerCarrierReadiness, ServerQueuedDispatch,
+    ServerResponseSenderService, emit_response_control_frame,
+};
 #[cfg(not(test))]
 pub(in crate::runtime) use work::{
     CarrierEmitMode, ProductWorkloadIdentity, RelaySendCause, ServerReinjectionOutputIdentity,

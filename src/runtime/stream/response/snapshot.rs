@@ -6,7 +6,8 @@
 
 use super::ResponseStreamBinding;
 use super::attachment::{
-    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
+    ResponseSenderPathObservation, ResponseSenderPathTarget, ResponseStreamOutputEntry,
+    ResponseStreamOutputs,
 };
 use super::evidence::{
     server_output_has_bulk_rate_evidence, server_output_has_durable_product_ack_progress,
@@ -86,8 +87,16 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn sender_path_targets(
         &self,
         lane: TrafficClass,
-        _payload_bytes: usize,
+        payload_bytes: usize,
     ) -> Vec<ResponseSenderPathTarget> {
+        self.sender_path_observation(lane, payload_bytes).targets
+    }
+
+    pub(in crate::runtime) fn sender_path_observation(
+        &self,
+        lane: TrafficClass,
+        _payload_bytes: usize,
+    ) -> ResponseSenderPathObservation {
         let mut outputs = self
             .outputs
             .lock()
@@ -136,13 +145,18 @@ impl ResponseStreamBinding {
                 }
             })
             .collect();
+        let observation = ResponseSenderPathObservation {
+            targets,
+            membership_generation: self.output_membership_generation.load(Ordering::Acquire),
+            ordinary_eligibility_generation: self.tcp_carrier_ordinary_eligibility_generation(),
+        };
         drop(outputs);
         if eligibility_changed {
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
             self.notify_update();
         }
-        targets
+        observation
     }
 
     pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {

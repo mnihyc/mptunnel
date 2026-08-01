@@ -3814,3 +3814,53 @@ entry is authoritative.
 - Next: establish the server-owned S2C demand and Product comparison owner over
   the already-separated response evidence/output seams, without connecting
   transport execution or adding policy/timing.
+
+## 2026-08-01T21:08:48+08:00: Accepted server-owned S2C transaction model
+
+- Name: monotonic response demand and exact sender-owned validation admission
+- Category: Core runtime ownership
+- State: accepted bounded foundation; carrier publication, client execution,
+  and response-sender wire integration remain the next Core slice
+- Clean model:
+  - one server session owner serializes the continuous response-demand episode,
+    successful ordinary placement, exact ordinary saturation, monotonic demand
+    publication, and one exact validation admission;
+  - request withdrawal and supersession preserve one nonzero server-owned
+    sequence, while repeated saturation, a changed ordinary set under an
+    unchanged membership generation, stale requests, candidate aliasing, and
+    concurrent validation cannot mint authority;
+  - admission freezes the target, complete directional Product-workload
+    identities, ordinary output lifetimes and service pipes, stable policy
+    generations, and the established RFC geometry without choosing or opening
+    a carrier; and
+  - optional response Data-ACK receipt routing is inactive behind one atomic
+    read, becomes bounded only for the exact active validation, and counts
+    candidate originals only under exact unambiguous carrier, attachment, range,
+    and output-incarnation provenance with checked conversion and accumulation.
+- Performance boundary:
+  - the module has no production caller and changes no wire frame, scheduling
+    decision, timer, threshold, congestion controller, pacing rule, transport
+    parameter, platform path, or packet behavior;
+  - no performance claim is inferred from a dormant ownership slice; and
+  - the non-test dead-code scope is attached only to this unconnected module
+    and remains disabled in its tests, to be removed when the following wire
+    slice consumes it.
+- Evidence:
+  - 6 persistent RFC ownership regressions pass, covering monotonic publication
+    and withdrawal, stable-generation supersession, inconsistent membership
+    rejection, complete-workload freeze, bounded exact receipt routing,
+    one-candidate admission, and exact candidate provenance;
+  - strict formatting, whitespace, and all-target/all-feature Clippy pass with
+    warnings denied;
+  - the locked all-feature suite passes 1,491 library tests, 2 persistent
+    allocation tests, 6 packaged daily-use acceptance tests, and doctests;
+  - standalone patched Quinn passes 282 unit tests and 3 doctests;
+  - the 29-cell/66-metric performance registry, 198 lab contracts, 5
+    deterministic benchmark tests, 9 packaging contracts, shell syntax, and
+    release-version self-test pass; and
+  - the authoritative implementation review plus one independent quick
+    read-only audit found no remaining RFC 7.2/15.1 ownership discrepancy.
+- Next: connect this owner to one registry-scoped server session service, exact
+  ready-carrier demand publication, the shared client validation-ID owner, and
+  the existing directional authority transaction without adding policy or
+  timing.

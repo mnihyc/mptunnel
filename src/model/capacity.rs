@@ -116,12 +116,20 @@ pub(crate) fn reliable_unproven_path_startup_flight_limit_bytes(mux_limits: MuxL
         .min(configured_envelope)
 }
 
-pub(crate) fn reliable_capacity_measurement_session_limit_bytes(mux_limits: MuxLimits) -> u64 {
+/// Shared Product-measurement envelope for one reliable stream and path.
+///
+/// Capacity trains and elastic-carrier validation reuse this same existing
+/// resource geometry; neither operation creates an additional byte budget.
+pub(crate) fn reliable_product_measurement_session_envelope_bytes(mux_limits: MuxLimits) -> u64 {
     (mux_limits.max_path_flight_bytes as u64)
         .min(mux_limits.max_repair_bytes as u64)
         .min(mux_limits.max_reorder_bytes as u64)
         .min(mux_limits.max_stream_window_bytes)
         .max(1)
+}
+
+pub(crate) fn reliable_capacity_measurement_session_limit_bytes(mux_limits: MuxLimits) -> u64 {
+    reliable_product_measurement_session_envelope_bytes(mux_limits)
 }
 
 /// Maximum product payload represented by one reliable sender read buffer.

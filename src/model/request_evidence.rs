@@ -3,7 +3,7 @@
 //! Carrier services attribute exact bytes and timestamps. This model advances
 //! bounded evidence without reading sockets, queues, or mutable path state.
 
-use super::ack_clock::reliable_ack_clock_measurement_rate_coverage_floor_bytes;
+use super::ack_clock::reliable_data_ack_rate_coverage_floor_bytes;
 use super::capacity::{PATH_OPEN_SCORE_BYTES, PathRateSample};
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
@@ -117,9 +117,8 @@ pub(crate) fn request_path_rate_coverage_floor_bytes(
     mux_limits: MuxLimits,
 ) -> u64 {
     match underlay {
-        UnderlayProtocol::Tcp => measurement_target.unwrap_or_else(|| {
-            reliable_ack_clock_measurement_rate_coverage_floor_bytes(mux_limits)
-        }),
+        UnderlayProtocol::Tcp => measurement_target
+            .unwrap_or_else(|| reliable_data_ack_rate_coverage_floor_bytes(mux_limits)),
         UnderlayProtocol::Udp => PATH_OPEN_SCORE_BYTES as u64,
     }
 }

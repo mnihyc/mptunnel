@@ -13,5 +13,7 @@ pub(crate) mod path;
 pub(crate) mod request_capacity;
 pub(crate) mod request_evidence;
 pub(crate) mod response;
+#[cfg(test)]
+pub(crate) mod tcp_carrier;
 pub(crate) mod timing;
 pub(crate) mod work;

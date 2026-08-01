@@ -187,6 +187,16 @@ third transport protocol.
   reorder debt, and memory MUST fit their stream and session resource
   envelopes at every point.
 
+**Product service cohort**
+: One sender-side interval collected under one frozen directional comparison
+  key and placement mode. It opens after a fully processed target-stream Data
+  ACK at an exact serialized writer boundary and closes with the complete Data
+  ACK transaction that reaches its target-byte coverage. Target and aggregate
+  Product-service rates use identical wall boundaries and the greater of the
+  writer-boundary and Data-ACK-boundary spans. A cohort is ordinary-only or
+  candidate-assisted according to which carriers may receive unique-original
+  placement after its opening writer boundary.
+
 ## 4. Architecture and Authority
 
 The ownership boundary is:
@@ -499,9 +509,14 @@ it receives `PATH_DRAIN`. Each uses the configured
 `[session].retention_timeout_ms`, never restarts or extends it, and does not
 assume that the peer's deadline is equal or synchronized. Expiry closes that
 exact native TCP carrier and enters ordinary exact-failure recovery; it does
-not synthesize `PATH_CLOSE`. This ceiling bounds graceful retirement only. It
-is not carrier-health, validation, Product-service, contraction, or
-performance evidence.
+not synthesize `PATH_CLOSE`.
+
+The same configured duration is the Product resource-lifetime ceiling for
+carrierless stream retention, graceful carrier retirement, and admitted
+pre-retain validation settlement. These are independent absolute lifetimes;
+progress in one never restarts another. The duration is not carrier health,
+delivery, Product service, contraction, or performance evidence and cannot
+produce `RETAIN` or `NO_GAIN`.
 
 `TCP_CARRIER_DEMAND`, `TCP_CARRIER_VALIDATE`, `TCP_CARRIER_RESULT`, and
 `TCP_CARRIER_RESULT_ACK` are also valid only on ready TCP carriers. They
@@ -864,12 +879,14 @@ direction. `BACKUP` preference is never bypassed to obtain a favorable result.
 Connection establishment remains subject to `path_probe_timeout_ms`.
 Admission of `TCP_CARRIER_VALIDATE` retains bounded sender and receiver state
 until the exact result acknowledgment, ordered drain, native failure, or
-session close. Either endpoint MAY make an unsettled validation `WITHDRAWN`
-under its local resource policy, but only the carrier client starts ordered
-carrier retirement. Server-side expiry or withdrawal requests retirement from
-the client-owned carrier lifecycle and MUST NOT send `PATH_DRAIN`. If graceful
-validation signaling or client-owned drain cannot complete, native carrier
-failure or `SESSION_CLOSE` remains the terminal fallback. No local resource
+session close. A sender MAY make an unsettled validation `WITHDRAWN` under its
+local resource policy and is the only endpoint that can serialize that result.
+A receiver that is also the carrier client cancels by ordered carrier drain. A
+receiver that is the carrier server cannot send `PATH_DRAIN` or a sender-owned
+result and therefore closes the exact candidate natively when its local state
+expires. If result signaling or client-owned drain cannot complete, exact
+native carrier failure remains the per-carrier terminal fallback;
+`SESSION_CLOSE` is never synthesized for this purpose. No local resource
 lifetime is known by the peer or used as delivery or performance evidence.
 
 The sender reports one result with
@@ -1649,6 +1666,14 @@ session direction. Only a transition from successful ordinary placement to
 this condition admits an attempt; rechecking unchanged state, retained flight,
 reinjection, native buffer state, elapsed time, or ACK silence does not.
 
+That transition creates one sender-owned admission generation for the
+continuous demand episode and its stable ordinary membership, authority,
+admission-policy, and resource-policy generations. Each eligible TCP carrier
+group may be attempted at most once in it. A new demand episode, or a change to
+one of those stable generations, creates fresh admission authority; a timer,
+ACK silence, queue or credit oscillation, repeated blocked observation,
+candidate result, or candidate connection failure does not.
+
 One MPP session has at most one unretained elastic carrier and one directional
 validation at a time. The candidate authenticates with `PATH_JOIN` purpose
 `VALIDATION`, reaches readiness, and sends `TCP_CARRIER_VALIDATE`. It remains
@@ -1672,20 +1697,120 @@ unchanged target demand, ordinary carrier membership and eligibility,
 concurrent Product workload, and local admission and resource policy
 establishes strict improvement in both target-flow and aggregate session
 Product service with the candidate. The same evidence qualification and bounds
-apply with and without the candidate. The comparison method is local Core
-policy, not a wire mechanism; it MUST NOT infer gain when observed variation
-prevents a strict ordering.
+apply with and without the candidate.
+
+At admission the sender freezes one comparison key containing the session and
+direction, target stream and demand generation, exact candidate instance,
+exact ordinary instances and directional authority class, ordinary
+non-queue liveness and policy eligibility, complete active Product-workload
+identities and lifecycle generations, and local admission-policy and
+resource-policy generations. Any change to that key makes an incomplete
+comparison `WITHDRAWN`. Instantaneous enqueue capacity, receive credit, flight,
+queue occupancy, rate or other evidence value, source address, interface,
+locator, native transport sample, peer metric, and elapsed-time observation is
+not a key member. Continuous target demand and work-conserving ordinary
+placement are phase invariants instead.
+
+The sender derives the comparison geometry once, before candidate Product
+service, from four existing Core quantities:
+
+- `startup_coverage` is the reliable-path Data ACK startup sample floor;
+- `rate_window` is the reliable Data-ACK rate-coverage floor;
+- `measurement_envelope` is the existing reliable Product-measurement session
+  envelope: the minimum of path flight, repair, reorder, stream-window, and
+  session resource bounds; and
+- `ordinary_pipe` is the checked sum of each frozen ordinary carrier's
+  established throughput-lane data-level service window, namely two Product
+  BDPs with the existing service-quantum and minimum-pipe floors, rounded up
+  per carrier and limited once by `measurement_envelope`.
+
+All quantities MUST be positive. Overflow or an envelope smaller than one
+`rate_window` makes the attempt `WITHDRAWN`. `cohort_coverage` is the least
+whole number of `rate_window` units that covers
+`max(rate_window, ordinary_pipe)`. If that checked aligned value exceeds
+`measurement_envelope`, validation is unavailable; it MUST NOT be rounded down
+below the frozen ordinary pipe. This is a reuse of established scheduling and
+resource geometry, not a new byte constant, percentage, or transport
+parameter. Geometry is never recomputed from candidate results.
+
+The comparison has four contiguous placement phases under the frozen key:
+
+1. An ordinary reference cohort covers at least `cohort_coverage` qualified
+   target bytes while the target remains continuously queued and every
+   eligible ordinary carrier remains work-conserving. This phase begins only
+   after candidate readiness, validation admission, and key and geometry
+   freeze; the authenticated candidate remains Product-idle throughout it.
+2. Candidate startup assigns exactly `startup_coverage` cumulative
+   unique-original target bytes to the candidate under the candidate-flight
+   and shared resource bounds, splitting the final Product frame when needed.
+   All of that work MUST resolve, and its unambiguous candidate-owned original
+   Data ACK releases MUST reach `startup_coverage`, before the next phase.
+   These releases establish exact provenance and startup maturity but enter no
+   comparison cohort.
+3. A candidate-assisted cohort covers at least `cohort_coverage` qualified
+   target bytes with ordinary carriers still work-conserving. The candidate
+   MUST contribute at least one `rate_window` of unambiguous unique-original
+   target releases after startup. Candidate cumulative validation work is
+   bounded by the checked sum of `startup_coverage` and `cohort_coverage`.
+4. New candidate placement stops. Confirmation begins only after the
+   candidate's validation queue, original flight, recovery work, and reorder
+   debt are zero. An ordinary confirmation cohort then covers at least
+   `cohort_coverage` qualified target bytes with the candidate Product-idle and
+   ordinary carriers work-conserving.
+
+Every cohort is seeded after a fully processed target Data ACK at a serialized
+writer boundary. Only originals assigned after that opening boundary and
+released by fully processed, unambiguous Data ACK enter it. Its closing Data
+ACK transaction is indivisible: all qualified releases from that transaction
+remain in the closing cohort even when they exceed the nominal byte coverage.
+The writer span and Data-ACK span MUST yield a positive effective elapsed time.
+Each cohort records target service and aggregate service by every stream in the
+frozen directional workload over identical opening and closing timestamps.
+Duplicate, reinjected, pre-boundary, ambiguous, unqualified, or
+foreign-workload releases may resolve ordinary state but contribute no
+comparison bytes. At every phase boundary all phase-owned candidate work is
+resolved before the next writer and Data-ACK boundaries are seeded.
+
+Rates are compared as exact nonnegative byte/time fractions. Floating-point
+rounding, EWMAs, percentage margins, configured rate hints, and native or peer
+acknowledgments have no verdict authority. Checked integer fraction comparison
+is used; overflow cannot become evidence. `RETAIN` requires all four strict
+whole-cohort comparisons:
+
+- assisted target-flow rate is greater than both reference and confirmation
+  target-flow rates; and
+- assisted aggregate-session rate is greater than both reference and
+  confirmation aggregate-session rates.
+
+Equality or failure of any comparison is not proven gain. Redistribution at
+one shared bottleneck may improve the target stream, but cannot retain the
+candidate without aggregate Product-service gain as well. The adjacent
+ordinary/assisted/ordinary shape rejects a phase-local transient that does not
+separate from both controls; it defines no per-window extrema or growing
+sample count. It makes no statistical or counterfactual claim about an
+external capacity change synchronized to the assisted phase.
 
 A complete comparison that does not establish both improvements is `NO_GAIN`.
 Ended demand, a changed comparison input, expiry, incomplete coverage, or
-ambiguous provenance is `WITHDRAWN`. This version defines no universal sample
-count, byte geometry, percentage, EWMA coefficient, or reopening timer.
+ambiguous provenance is `WITHDRAWN`. Candidate connection establishment uses
+the existing `path_probe_timeout_ms`. Each endpoint starts an independent,
+absolute session-retention ceiling when it locally admits
+`TCP_CARRIER_VALIDATE`; progress never extends it and expiry grants no
+authority. Sender expiry before result serialization emits `WITHDRAWN` when
+the candidate remains writable, otherwise exact native failure settles it. A
+receiver-side client expiry starts ordered candidate drain; a receiver-side
+server expiry closes the exact candidate natively because the server cannot
+initiate `PATH_DRAIN` or a sender-owned result. Expiry after immutable result
+serialization retires the unacknowledged candidate without changing that
+result. This version defines no new timer, percentage, EWMA coefficient,
+statistical confidence threshold, or reopening interval.
 
-`NO_GAIN` does not itself authorize another connection. A later attempt
-requires a fresh transition into the admission condition and remains subject
-to the connection-attempt rate, configured maximum, and session resource
-bounds. Waiting, polling, ACK silence, or a locator, source, or interface
-change alone does not authorize it.
+`NO_GAIN`, `WITHDRAWN`, candidate failure, and result settlement do not
+authorize another connection in the same admission generation. A later
+attempt requires fresh generation authority and remains subject to the
+connection-attempt rate, configured maximum, and session resource bounds.
+Waiting, polling, ACK silence, ordinary queue oscillation, or a locator,
+source, or interface change alone does not authorize it.
 
 ### 15.2 Reinjection budget and timing
 

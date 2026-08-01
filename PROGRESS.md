@@ -3607,3 +3607,50 @@ entry is authoritative.
   - no fixed percentage cap is inferred from one run. Later Core changes must
     repeat matched rows and diagnose timing, delivery, and host validity before
     acceptance.
+
+## 2026-08-01T13:50:12+08:00: Frozen elastic TCP validation model
+
+- Name: direction-neutral Product-service proof for TCP carrier retention
+- Category: Core RFC and implementation boundary
+- State: accepted model; runtime remains deliberately disconnected until one
+  complete directional integration can preserve these authorities exactly
+- Clean model:
+  - one transition into sustained ordinary placement failure creates one
+    admission generation, in which each eligible TCP group is attempted at
+    most once without timer, queue-oscillation, or failure retries;
+  - one frozen comparison key and existing startup, Data-ACK, service-pipe,
+    and Product-resource geometry govern an adjacent ordinary, startup,
+    assisted, and ordinary-confirmation sequence;
+  - exact writer and Data-ACK boundaries form whole causal cohorts, and exact
+    integer fractions require strict target-flow and aggregate-session gain
+    over both adjacent ordinary controls;
+  - candidate assignment, resolution, and qualified release are separate:
+    assisted cohort closure seals new assignment while already-assigned flight
+    may resolve before the zero-work confirmation boundary; and
+  - expiry, changed authority, malformed order, ambiguous evidence, overflow,
+    or insufficient coverage fail closed as `WITHDRAWN`; none authorizes a
+    retry in the same admission generation.
+- Corrections established before runtime work:
+  - generalized the existing ACK coverage and Product-measurement envelope
+    names without changing their arithmetic or callers' behavior;
+  - rejected alignment that could round coverage below an ordinary service
+    pipe, request-only evidence geometry, per-window extrema, post-close
+    candidate assignment, and premature rejection of draining candidate
+    flight; and
+  - generalized the existing non-restarting session-retention resource
+    lifetime to admitted pre-retain validation without adding a timer value.
+- Evidence:
+  - 12 focused state/geometry regressions pass, including exact overflow-safe
+    rate ordering, phase contamination, shared-bottleneck redistribution,
+    strict adjacent controls, bounded assignment, and post-cohort flight drain;
+  - the complete root library suite passes 1,449 tests;
+  - strict all-target, all-feature Clippy, formatting, and whitespace checks
+    pass; and
+  - two independent read-only reviews report no remaining RFC/model
+    correctness blocker after the final assisted-flight correction.
+- Performance boundary: the module is compiled only for tests and no runtime
+  caller exists, so this milestone changes no binary behavior, packet work,
+  scheduler, congestion controller, transport parameter, or timing value.
+- Next: integrate one complete client-to-server validation transaction outside
+  ordinary path membership, prove its exact lifecycle and unchanged disabled
+  path, then repeat the same neutral owner model for server-to-client service.

@@ -33,6 +33,14 @@ fn measurement_never_raises_a_configured_resource_ceiling() {
 }
 
 #[test]
+fn rate_coverage_geometry_is_shared_by_both_stream_directions() {
+    let mux_limits = MuxLimits::default();
+    let directional_floor = reliable_data_ack_rate_coverage_floor_bytes(mux_limits);
+    assert!(directional_floor >= PATH_OPEN_SCORE_BYTES as u64);
+    assert!(directional_floor <= reliable_ack_clock_measurement_limit_bytes(mux_limits));
+}
+
+#[test]
 fn request_measurement_is_a_bounded_seed_below_a_high_bdp_pipe() {
     let mux_limits = MuxLimits::default();
     let high_bdp_path = PathSnapshot::new(PathId(3), UnderlayProtocol::Tcp, 180.0, 500_000_000.0);

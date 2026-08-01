@@ -1,5 +1,5 @@
 use super::super::ack_clock::{
-    reliable_ack_clock_measurement_rate_coverage_floor_bytes,
+    reliable_data_ack_rate_coverage_floor_bytes,
     reliable_request_ack_clock_measurement_target_bytes,
 };
 use super::super::capacity::PATH_OPEN_SCORE_BYTES;
@@ -15,7 +15,7 @@ fn request_rate_coverage_uses_transport_evidence_requirements() {
 
     assert_eq!(
         request_path_rate_coverage_floor_bytes(UnderlayProtocol::Tcp, None, mux_limits),
-        reliable_ack_clock_measurement_rate_coverage_floor_bytes(mux_limits)
+        reliable_data_ack_rate_coverage_floor_bytes(mux_limits)
     );
     assert_eq!(
         request_path_rate_coverage_floor_bytes(

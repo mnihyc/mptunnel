@@ -3654,3 +3654,71 @@ entry is authoritative.
 - Next: integrate one complete client-to-server validation transaction outside
   ordinary path membership, prove its exact lifecycle and unchanged disabled
   path, then repeat the same neutral owner model for server-to-client service.
+
+## 2026-08-01T19:04:01+08:00: Accepted client-to-server elastic TCP lifecycle
+
+- Name: RFC-owned C2S validation, exact retained-carrier adoption, and matched
+  performance gate
+- Category: Core runtime, TCP aggregation, and performance acceptance
+- State: client-to-server direction complete and accepted; symmetric
+  server-to-client authority remains the next Core milestone
+- Clean model:
+  - one sender-owned ordinary-saturation transition creates one bounded
+    admission generation; repeated blockage, ACK silence, timers, native TCP
+    state, locators, and source or interface identity create no attempt;
+  - the validation-purpose connection owns one exact elastic reservation,
+    fresh wire `PathId`, frozen Product comparison, target attachment
+    incarnation, finite unique-original work, immutable result transaction,
+    and ordered settlement without entering ordinary membership early;
+  - an exact `RETAIN` acknowledgment consumes the existing attachment
+    reservation and transport, then publishes one sparse health record and one
+    retained actor for that exact physical instance; it creates no second
+    stream ID, `OPEN_STREAM`, carrier connection, or configured-minimum actor;
+  - negative results resolve candidate flight, detach the exact attachment,
+    drain the carrier, and hold the physical reservation until `PATH_CLOSE` or
+    native failure; exact failure removes health and registry publication
+    before releasing the reservation; and
+  - the original absolute retention ceiling is unchanged. Sender expiry emits
+    immutable `WITHDRAWN` only when already-admitted ordered work and the result
+    are immediately writable, then retires the exact carrier without extending
+    the ceiling; otherwise native failure is the terminal fallback.
+- Correctness evidence:
+  - commit `95f09ca` is a clean source boundary with no production timer,
+    percentage, EWMA, congestion-control, pacing, transport-parameter, or
+    scheduler-score change;
+  - the encrypted-wire lifecycle regressions cover exact retained handoff,
+    negative acknowledgment plus zero-work drain, writable expiry settlement,
+    sparse publication cleanup, configured-range reconciliation, active-path
+    failure, and exact attachment adoption;
+  - strict all-target, all-feature Clippy passes with warnings denied; and
+  - the locked all-feature suite passes 1,475 library tests, 2 persistent
+    allocation tests, 6 packaged daily-use acceptance tests, and doctests.
+- Matched performance evidence:
+  - the first post-link cohort was rejected because its host-load snapshot was
+    invalid; no result from it was promoted to acceptance;
+  - the accepted clean-source full cohort used the historical 20-second,
+    500-Mbit/s, 180-ms, zero-loss profiles with path hints and lab
+    instrumentation disabled, a valid host snapshot, the same Rust toolchain,
+    cached lab images, and binary SHA-256
+    `200925426eca8c6559bd77591bd6154251b4b75e8d586df16a8fee780ea31a04`;
+  - TCP single/equal-fat downloads were `235.657` / `782.653` Mbit/s and
+    uploads were `261.277` / `527.816` Mbit/s, all with zero recovery gap; an
+    isolated valid single-download confirmation was `251.149` Mbit/s with
+    normal startup and read-gap timing, showing that the lower full-cohort row
+    was run variation rather than a reproduced structural regression;
+  - QUIC single/equal-fat downloads were `311.466` / `740.593` Mbit/s and
+    uploads were `294.788` / `740.783` Mbit/s, all with zero recovery gap; the
+    equal-fat upload's duration lower bound was independently confirmed as an
+    exact two-stream completion at `741.383` Mbit/s; and
+  - TCP equal-fat throughput remains in the accepted historical range, TCP
+    single upload improved, and untouched QUIC controls remain in range. No
+    fixed percentage cap or parameter adjustment is inferred from individual
+    samples.
+- Evidence paths:
+  - `./.tmp/lab/results/candidate-95f09ca-representative-2/`
+  - `./.tmp/lab/results/candidate-95f09ca-tcp-single-confirm-1/`
+  - `./.tmp/lab/results/candidate-95f09ca-quic-equal-upload-confirm-1/`
+- Next: reuse the same direction-neutral owners for server-to-client demand,
+  result authority, exact attachment adoption, and settlement; then run the
+  disruption/recovery and representative performance gates before any Product
+  surface or documentation phase.

@@ -1,7 +1,11 @@
 use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
-use crate::model::work::{ReliableWorkClass, reliable_critical_tail_reinjection_limit_bytes};
+use crate::model::capacity::adaptive_reliable_relay_inflight_bytes;
+use crate::model::work::{
+    ReliableWorkClass, reliable_critical_tail_reinjection_limit_bytes,
+    reliable_reinjection_service_limit_bytes,
+};
 use crate::protocol::{PathId, SessionId};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
@@ -372,22 +376,38 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     );
     let (reinjection_target, reinjection_path) =
         reinjection_path.expect("distinct reinjection path");
+    let persistent_service_limit = reliable_reinjection_service_limit_bytes(
+        Some(reinjection_path),
+        0,
+        limits.max_repair_bytes,
+        limits,
+    );
     assert_eq!(
-        reliable_critical_tail_reinjection_limit_bytes(
-            adaptive_reliable_relay_reinjection_bytes(
-                Some(reinjection_path),
-                TrafficClass::Throughput,
-                limits,
-            ),
-            limits.max_repair_bytes,
-            limits,
-        ),
-        adaptive_reliable_relay_reinjection_bytes(
+        persistent_service_limit,
+        adaptive_reliable_relay_inflight_bytes(
             Some(reinjection_path),
             TrafficClass::Throughput,
             limits,
         ),
-        "the original carrier type must not amplify persistent Data ACK-gap recovery"
+        "persistent Data ACK-gap recovery uses the measured alternate's available Product service window",
+    );
+    assert!(
+        persistent_service_limit
+            > adaptive_reliable_relay_reinjection_bytes(
+                Some(reinjection_path),
+                TrafficClass::Throughput,
+                limits,
+            ),
+        "a persistent gap is serviced by target capacity rather than one latency quantum",
+    );
+    assert_eq!(
+        reliable_critical_tail_reinjection_limit_bytes(
+            persistent_service_limit,
+            limits.max_repair_bytes,
+            limits,
+        ),
+        persistent_service_limit,
+        "the shared repair and path-flight envelopes preserve the target-sized service authority",
     );
 
     seed_client_bulk_evidence_for_test(

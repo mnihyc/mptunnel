@@ -210,11 +210,13 @@ pub(in crate::runtime) fn stream_final_offset_tail_reinjection_frames_normalized
     send_stream.retransmission_frames_after_normalized_ack_frontier(ranges, byte_limit)
 }
 
+/// Persistent-gap identity and the immutable repeat deadline of its most
+/// recently accepted target-bound reinjection attempt.
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct ReliableAckGapReinjectionProgress {
     first_gap_start: Option<u64>,
     recovery_deadline: Option<Instant>,
-    last_reinjection_at: Option<Instant>,
+    next_reinjection_at: Option<Instant>,
 }
 
 /// One exact attachment with authoritative outstanding OriginalData.
@@ -370,14 +372,12 @@ impl ReliableAckGapReinjectionProgress {
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
         measured_reinjection_ready: bool,
-        retry_after: Duration,
     ) -> bool {
         self.reinjection_ready_at(
             complete,
             normalized_ranges,
             has_multipath_reinjection_alternative,
             measured_reinjection_ready,
-            retry_after,
             Instant::now(),
         )
     }
@@ -388,7 +388,6 @@ impl ReliableAckGapReinjectionProgress {
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
         measured_reinjection_ready: bool,
-        retry_after: Duration,
         now: Instant,
     ) -> bool {
         if !self.retain_gap_identity(
@@ -401,40 +400,46 @@ impl ReliableAckGapReinjectionProgress {
         if !measured_reinjection_ready {
             return false;
         }
-        if self.last_reinjection_at.is_some_and(|last_reinjection_at| {
-            now.saturating_duration_since(last_reinjection_at) < retry_after
-        }) {
+        if self
+            .next_reinjection_at
+            .is_some_and(|next_reinjection_at| now < next_reinjection_at)
+        {
             return false;
         }
         true
     }
 
-    pub(in crate::runtime) fn record_reinjection_queued(&mut self) {
-        self.record_reinjection_queued_at(Instant::now());
+    pub(in crate::runtime) fn record_reinjection_queued(&mut self, retry_after: Duration) {
+        self.record_reinjection_queued_at(Instant::now(), retry_after);
     }
 
-    fn record_reinjection_queued_at(&mut self, now: Instant) {
+    fn record_reinjection_queued_at(&mut self, now: Instant, retry_after: Duration) {
         if self.first_gap_start.is_some() {
-            self.last_reinjection_at = Some(now);
+            self.next_reinjection_at = now.checked_add(retry_after).or(Some(now));
         }
     }
 
     pub(in crate::runtime) fn release_reinjection_attempt(&mut self) {
-        self.last_reinjection_at = None;
+        self.next_reinjection_at = None;
     }
 
-    pub(in crate::runtime) fn repeat_reinjection_deadline(
-        &self,
-        retry_after: Duration,
-    ) -> Option<Instant> {
-        self.last_reinjection_at
-            .and_then(|attempt| attempt.checked_add(retry_after))
+    #[cfg(test)]
+    pub(in crate::runtime) fn repeat_reinjection_deadline(&self) -> Option<Instant> {
+        self.next_reinjection_at
+    }
+
+    pub(in crate::runtime) fn next_reinjection_deadline(&self) -> Option<Instant> {
+        match (self.recovery_deadline, self.next_reinjection_at) {
+            (Some(recovery), Some(repeat)) => Some(recovery.max(repeat)),
+            (Some(recovery), None) => Some(recovery),
+            (None, repeat) => repeat,
+        }
     }
 
     fn clear(&mut self) {
         self.first_gap_start = None;
         self.recovery_deadline = None;
-        self.last_reinjection_at = None;
+        self.next_reinjection_at = None;
     }
 
     fn retain_gap_identity(
@@ -454,7 +459,7 @@ impl ReliableAckGapReinjectionProgress {
         if self.first_gap_start != Some(first_gap.0) {
             self.first_gap_start = Some(first_gap.0);
             self.recovery_deadline = None;
-            self.last_reinjection_at = None;
+            self.next_reinjection_at = None;
         }
         true
     }

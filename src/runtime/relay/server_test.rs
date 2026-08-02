@@ -3205,7 +3205,7 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
 }
 
 #[test]
-fn ordinary_and_persistent_ack_gap_recovery_use_one_quantum() {
+fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(103);
     let original_key = CarrierPathKey {
@@ -3278,7 +3278,11 @@ fn ordinary_and_persistent_ack_gap_recovery_use_one_quantum() {
             end: (quantum * 9) as u64,
         },
     ];
-    let _ = send_stream.apply_ack(&ack_ranges);
+    let validated_ack = begin_reliable_stream_ack(&send_stream, true, ack_ranges.to_vec())
+        .expect("validate sparse ACK-gap snapshot");
+    let _ = send_stream.apply_validated_ack(&validated_ack);
+    let mut authoritative_ack = AuthoritativeStreamAckSnapshot::default();
+    update_reinjection_authoritative_ack_snapshot(&mut authoritative_ack, &validated_ack);
     let modeled_path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
     let base_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         Some(modeled_path),
@@ -3300,34 +3304,37 @@ fn ordinary_and_persistent_ack_gap_recovery_use_one_quantum() {
             extra_traffic_hint_percent: 5,
         },
     );
-    let outcome = enqueue_reliable_tail_reinjection(
-        &mut response_sender,
-        &path_stream,
-        stream_id,
-        &send_stream,
+    let mut progress = ReliableAckGapReinjectionProgress::default();
+    progress.arm_recovery_deadline(
+        true,
         &ack_ranges,
         true,
+        Some(Instant::now() - Duration::from_secs(1)),
+    );
+    let outcome = evaluate_server_data_ack_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &mut progress,
+        &authoritative_ack,
+        quantum as u64,
+        Some(modeled_path),
         Some(modeled_path),
         TrafficClass::Throughput,
         limits,
-        MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
-        },
-        path_stream.max_frame_payload_bytes,
-        quantum as u64,
+        stream_id,
     );
 
     assert_eq!(
-        outcome.queued, 1,
-        "the ordinary timer must repair only the frontier gap, not every sparse hole"
+        outcome.queued, 4,
+        "a proven recovery-copy timeout may service every exact omitted range within the measured target window"
     );
-    assert_eq!(response_sender.bytes(), base_limit);
-    let persistent_limit = reliable_critical_tail_reinjection_limit_bytes(
-        base_limit,
-        send_stream.reinjection_bytes(),
-        limits,
+    assert!(
+        response_sender.bytes() > base_limit,
+        "persistent timer service must not collapse back to one liveness quantum"
     );
-    assert_eq!(persistent_limit, base_limit);
+    assert!(outcome.persistent_ready);
+    assert!(progress.repeat_reinjection_deadline().is_some());
     let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
     let dispatch = response_sender
         .dispatch_next_with_data_ack_outstanding(

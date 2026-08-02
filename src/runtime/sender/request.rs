@@ -27,8 +27,7 @@ use crate::model::timing::{
     reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
 };
 use crate::model::work::{
-    reliable_critical_tail_reinjection_limit_bytes,
-    reliable_failed_original_reinjection_limit_bytes,
+    reliable_critical_tail_reinjection_limit_bytes, reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::{
@@ -1290,8 +1289,9 @@ impl RequestSenderService {
         let reinjection_path =
             self.multipath
                 .reinjection_path_snapshot(context, remotes, failed_instances);
-        let reinjection_limit = reliable_failed_original_reinjection_limit_bytes(
+        let reinjection_limit = reliable_reinjection_service_limit_bytes(
             reinjection_path,
+            sender_queue.bytes(),
             send_stream.reinjection_bytes(),
             context.mux_limits,
         );

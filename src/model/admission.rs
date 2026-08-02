@@ -366,12 +366,11 @@ fn bulk_path_has_completion_evidence(
     candidate: PathSnapshot,
     has_bulk_rate_evidence: bool,
 ) -> bool {
-    // An idle native carrier's rate is a lower bound while send-window credit
-    // remains available; let that credit reacquire bulk service instead of
-    // feeding scheduler-induced idleness back into ECF. Portable paths and
-    // carriers under latency pressure keep the conservative boundary.
-    let acquiring_native_capacity = bulk_path_acquiring_native_capacity(candidate);
-    has_bulk_rate_evidence && candidate.confidence >= 1.0 && !acquiring_native_capacity
+    // The evidence owner already retains a fresh qualified delivery sample
+    // across later app-limited polls. Current idleness cannot revoke that
+    // completion authority; after the sample expires, bounded native-credit
+    // acquisition below supplies fresh evidence.
+    has_bulk_rate_evidence && candidate.confidence >= 1.0
 }
 
 fn bulk_path_acquiring_native_capacity(candidate: PathSnapshot) -> bool {
@@ -478,7 +477,7 @@ fn bulk_product_inflight_limit_bytes(
     candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    _position: BulkCandidatePosition,
+    position: BulkCandidatePosition,
     has_qualified_bulk_rate: bool,
 ) -> u64 {
     let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
@@ -497,10 +496,18 @@ fn bulk_product_inflight_limit_bytes(
     } else {
         bdp_limit
     };
-    let modeled_limit = if !has_qualified_bulk_rate {
-        // Positive Data ACK attribution proves liveness, not capacity. Let the
-        // native congestion window acquire a complete rate sample; a cold path
-        // without native state retains only the bounded startup window.
+    let modeled_limit = if !has_qualified_bulk_rate
+        && position == BulkCandidatePosition::AdditionalPath
+        && bulk_path_acquiring_native_capacity(candidate)
+    {
+        // Positive Data ACK attribution proves liveness, not current capacity.
+        // While the rate sample is unqualified, reacquire service only through
+        // observed native congestion credit. A retained Product service window
+        // may describe an older network condition and must not enlarge that
+        // acquisition flight. A portable carrier with no native-window
+        // observation keeps the bounded Product fallback computed above.
+        bulk_unproven_path_flight_limit_bytes(candidate, mux_limits)
+    } else if !has_qualified_bulk_rate {
         modeled_limit.max(bulk_unproven_path_flight_limit_bytes(candidate, mux_limits))
     } else {
         modeled_limit
@@ -534,16 +541,20 @@ fn bulk_candidate_within_reorder_budget(
         // The connection-wide envelope still bounds the complete receive hole.
         let candidate_product_debt = bulk_product_reorder_debt_bytes(candidate);
         let measured_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
-        let acquisition_budget = if has_qualified_bulk_rate {
-            candidate.data_level_limit_bytes
-        } else {
-            // QUIC/TCP congestion credit bounds Startup below MPP. Keeping the
-            // product window in step lets that native controller finish its
-            // capacity search without granting completion-time authority.
-            candidate
-                .data_level_limit_bytes
-                .max(bulk_unproven_path_flight_limit_bytes(candidate, mux_limits))
-        };
+        let acquisition_budget =
+            if !has_qualified_bulk_rate && bulk_path_acquiring_native_capacity(candidate) {
+                // QUIC/TCP congestion credit bounds acquisition below MPP. An old
+                // Product service window is not current native send authority.
+                // Without a native-window observation, the portable Product model
+                // remains the only transport-neutral bound.
+                bulk_unproven_path_flight_limit_bytes(candidate, mux_limits)
+            } else if !has_qualified_bulk_rate {
+                candidate
+                    .data_level_limit_bytes
+                    .max(bulk_unproven_path_flight_limit_bytes(candidate, mux_limits))
+            } else {
+                candidate.data_level_limit_bytes
+            };
         let path_budget = measured_budget
             .max(acquisition_budget)
             .min(mux_limits.max_path_flight_bytes as u64)

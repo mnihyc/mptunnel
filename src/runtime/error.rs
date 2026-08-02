@@ -62,6 +62,9 @@ pub enum RuntimeError {
 /// Carrier failures for which the product relay may preserve queued work and
 /// seek another authenticated path.
 pub(in crate::runtime) fn reliable_path_error_is_migratable(err: &RuntimeError) -> bool {
+    if let RuntimeError::QuicCarrier(err) = err {
+        return err.is_path_lifetime_failure();
+    }
     matches!(
         err,
         RuntimeError::PathHeartbeatTimeout
@@ -294,5 +297,26 @@ impl std::error::Error for RuntimeError {
             | Self::ProductAdmission(_)
             | Self::Protocol(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quic_path_lifetime_failures_are_migratable_but_protocol_shape_errors_are_not() {
+        assert!(reliable_path_error_is_migratable(
+            &RuntimeError::QuicCarrier(QuicCarrierError::H3DriverClosed)
+        ));
+        assert!(reliable_path_error_is_migratable(
+            &RuntimeError::QuicCarrier(QuicCarrierError::UnexpectedEnd)
+        ));
+        assert!(!reliable_path_error_is_migratable(
+            &RuntimeError::QuicCarrier(QuicCarrierError::FrameTooLarge)
+        ));
+        assert!(!reliable_path_error_is_migratable(
+            &RuntimeError::QuicCarrier(QuicCarrierError::H3Role("invalid carrier role"))
+        ));
     }
 }

@@ -11,6 +11,73 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T08:30:24+08:00: retained Data-ACK recovery lifecycle restored
+
+- Name: target-serviced persistent gaps with one directional stream owner
+- Category: Core recovery correctness and causal performance restoration
+- State: source and correctness gates accepted; the clean-source representative
+  and disruption matrix is the next release gate
+- Reproduced defect:
+  - response recovery serviced an authoritative multi-megabyte Data Sequence
+    gap with one fixed 14,600-byte liveness quantum, then suppressed the
+    accepted alternate copy with the degraded original carrier's recovery
+    clock;
+  - after a frontier advance, response recovery could lose its retained gap
+    between the ACK event and later target eligibility, while request recovery
+    could lose a due timer when no target was eligible at that exact event; and
+  - Product queue and flight accounting used incomplete or stale views, which
+    could either over-admit a target or delay a refill that current service
+    authority allowed.
+- Clean model:
+  - one authoritative gap identity is retained until its lowest missing
+    frontier advances or resolves; ACK receipt, timer expiry, output/path-model
+    publication, and carrier-capacity release all return through the existing
+    directional stream owner;
+  - a measured alternate may fill only its available Product service window,
+    with queue plus flight summed within native and Product domains and the
+    overlapping domain totals counted once; current shared queue state is
+    authoritative over an older publication;
+  - once a recovery copy is accepted, its immutable repeat deadline belongs to
+    that selected alternate. The original-owner silence fallback remains a
+    separate one-shot authority armed only by fresh Data-ACK receipt; and
+  - retained qualified delivery evidence survives a later app-limited poll,
+    while an unqualified native carrier reacquires only through its current
+    native congestion credit. No stale Product window becomes native send
+    authority.
+- Adjacent causal evidence:
+  - the former fixed-quantum run delivered `60.895` Mbit/s and retained a
+    greater-than-4.5-second ordered plateau; a target-service-window diagnostic
+    removed that plateau and delivered `222.156` Mbit/s before the accounting
+    audit;
+  - after exact accounting and lifecycle ownership, three normal release runs
+    delivered `208.174`, `197.043`, and `210.795` Mbit/s. Maximum ordered gaps
+    were `2.250`, `0.768`, and `0.798` seconds, with bulk success in all three,
+    zero interactive failures, and zero/one/zero datagram losses respectively;
+  - the first run's longer ordered gap occurred after the injected fat path was
+    permanently changed to 20 Mbit/s, 900 ms one-way delay, 250 ms jitter, and
+    10% loss. Its 2.250-second gap was shorter than the path's measured
+    2.823-4.331-second native RTT; physical traffic, logical output, and healthy
+    path delivery continued before buffered ordered data was released; and
+  - these runs are causal diagnostics, not publishable benchmark rows: the
+    versioned host gate rejected the dirty source and one unrelated external
+    container. Evidence is retained under
+    `./.tmp/lab/results/v014-repair-retained-lifecycle-*` until the release
+    matrix is closed.
+- Verification:
+  - the optimized all-feature suite passes 1,511 library tests, two allocation
+    tests, six packaged daily-use acceptance tests, and doctests;
+  - focused persistent-gap and tail-recovery suites pass 23 and 33 tests, and
+    the durable service-accounting regression covers current queue authority;
+  - strict all-target/all-feature Clippy, formatting, and whitespace checks
+    pass; and
+  - authoritative review plus a bounded independent read-only review found no
+    remaining recovery ownership, target binding, deadline, accounting, or
+    request/response symmetry discrepancy.
+- Next: commit this bounded Core milestone, rebuild once from the clean source,
+  then execute only the frozen stationary aggregation, latency/blackhole/link
+  swap, outage/restart, and port-hopping release gates. Do not change the model
+  unless a reproducible causal lifecycle or data-flow contradiction remains.
+
 ## 2026-08-02T05:32:13+08:00: reliable response demand-episode self-lock removed
 
 - Name: directional Product-episode admission across idle transitions

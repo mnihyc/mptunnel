@@ -716,7 +716,7 @@ fn tcp_request_snapshot_publishes_native_service_window() {
 }
 
 #[test]
-fn open_app_limited_quic_window_precedes_blocked_lead_without_inventing_rate() {
+fn retained_completion_evidence_outweighs_an_open_app_limited_window() {
     let reference = instance(UnderlayProtocol::Udp, 0, 37);
     let candidate = instance(UnderlayProtocol::Udp, 1, 38);
     let mut reference_path = observed_path(reference, 40.0, 400_000_000.0);
@@ -738,8 +738,8 @@ fn open_app_limited_quic_window_precedes_blocked_lead_without_inventing_rate() {
 
     assert_eq!(
         choose_bulk(&observation, &flights, Some(&evidence)),
-        BulkRelayPathChoice::Selected(candidate),
-        "an open native window is send opportunity while an app-limited delivery rate is only a lower bound",
+        BulkRelayPathChoice::Selected(reference),
+        "an app-limited instant cannot revoke the candidate's retained completion evidence",
     );
 }
 

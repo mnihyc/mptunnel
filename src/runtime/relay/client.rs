@@ -18,7 +18,7 @@ use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::timing::{
     reliable_data_ack_recovery_deadline, reliable_data_retransmission_interval,
 };
-use crate::model::work::reliable_critical_tail_reinjection_limit_bytes;
+use crate::model::work::reliable_reinjection_service_limit_bytes;
 use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
 use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
@@ -448,13 +448,30 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     relay_lane: TrafficClass,
     stream_id: StreamId,
 ) -> ClientDataAckReinjectionOutcome {
+    let has_multipath_reinjection_alternative = remotes.path_keys().len() > 1;
+    let authoritative_ack_complete = state.progress.last_send_ack.complete();
+    let authoritative_ack_ranges = state.progress.last_send_ack.ranges();
+    if !stream_ack_ranges_expose_authoritative_gap(
+        authoritative_ack_complete,
+        authoritative_ack_ranges,
+    ) || !has_multipath_reinjection_alternative
+    {
+        state.progress.ack_gap_reinjection.arm_recovery_deadline(
+            authoritative_ack_complete,
+            authoritative_ack_ranges,
+            has_multipath_reinjection_alternative,
+            None,
+        );
+        state.progress.data_ack_reinjection_at = None;
+        return ClientDataAckReinjectionOutcome {
+            has_multipath_alternative: has_multipath_reinjection_alternative,
+            ..ClientDataAckReinjectionOutcome::default()
+        };
+    }
     let base_reinjection_limit =
         adaptive_reliable_relay_reinjection_bytes(path_snapshot, relay_lane, context.mux_limits);
     let reinjection_event_budget =
         sender.reinjection_extra_event_budget_remaining(context.mux_limits);
-    let has_multipath_reinjection_alternative = remotes.path_keys().len() > 1;
-    let authoritative_ack_complete = state.progress.last_send_ack.complete();
-    let authoritative_ack_ranges = state.progress.last_send_ack.ranges();
     let reinjection = sender.data_ack_gap_reinjection_model(
         context,
         remotes,
@@ -489,22 +506,27 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     );
     let measured_reinjection_ready = candidate_recovery_deadline.is_some()
         && recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
-    let reinjection_retry_after =
-        reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing);
+    let reinjection_retry_after = reinjection_target.map_or_else(
+        || reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing),
+        |(_, snapshot)| {
+            reliable_data_retransmission_interval(Some(snapshot.underlay), Some(snapshot))
+        },
+    );
     let ack_gap_reinjection_ready = state.progress.ack_gap_reinjection.reinjection_ready(
         authoritative_ack_complete,
         authoritative_ack_ranges,
         has_multipath_reinjection_alternative,
         measured_reinjection_ready,
-        reinjection_retry_after,
     );
     let persistent_ack_gap_reinjection_ready =
         ack_gap_reinjection_ready && reinjection_target.is_some();
-    // Persistent authoritative evidence may bypass optional duplicate budget,
-    // but a missing, failed, or declared-stale owner has separate recovery.
+    // Persistent authoritative evidence may fill one measured target service
+    // window despite optional duplicate-budget exhaustion. Missing, failed, or
+    // declared-stale owners retain their separate exact-range recovery.
     let reinjection_limit = if persistent_ack_gap_reinjection_ready {
-        reliable_critical_tail_reinjection_limit_bytes(
-            base_reinjection_limit,
+        reliable_reinjection_service_limit_bytes(
+            reinjection_target.map(|(_, snapshot)| snapshot),
+            sender_queue.bytes(),
             send_stream.reinjection_bytes(),
             context.mux_limits,
         )
@@ -566,19 +588,17 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         state
             .progress
             .ack_gap_reinjection
-            .record_reinjection_queued();
+            .record_reinjection_queued(reinjection_retry_after);
     }
     let timer_active = stream_ack_ranges_expose_authoritative_gap(
         authoritative_ack_complete,
         authoritative_ack_ranges,
     ) && has_multipath_reinjection_alternative
         && recovery_deadline.is_some();
-    let repeat_deadline = state
+    let next_deadline = state
         .progress
         .ack_gap_reinjection
-        .repeat_reinjection_deadline(reinjection_retry_after);
-    let next_deadline = recovery_deadline
-        .map(|deadline| repeat_deadline.map_or(deadline, |repeat| deadline.max(repeat)));
+        .next_reinjection_deadline();
     state.progress.data_ack_reinjection_at = timer_active
         .then_some(next_deadline)
         .flatten()

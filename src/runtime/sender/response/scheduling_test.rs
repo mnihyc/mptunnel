@@ -391,6 +391,42 @@ fn sole_quic_path_is_not_double_limited_by_product_flight() {
 }
 
 #[test]
+fn sole_survivor_cannot_extend_a_nonlive_cross_path_frontier_without_bound() {
+    let mux_limits = MuxLimits::default();
+    let mut survivor = response_target(
+        3,
+        UnderlayProtocol::Udp,
+        900.0,
+        8 * 1024 * 1024,
+        3 * 1024 * 1024,
+        true,
+    );
+    survivor.observation.snapshot.data_level_limit_bytes = 3 * 1024 * 1024;
+    survivor.observation.snapshot.data_level_bytes_in_flight = 8 * 1024 * 1024;
+    let absent_owner = CarrierPathFlightDebt {
+        key: crate::model::path::CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: crate::protocol::PathId(2),
+        },
+        output_incarnation: survivor.observation.incarnation.wrapping_add(1),
+        bytes: 10 * 1024 * 1024,
+    };
+
+    assert!(
+        select_response_data_path(
+            &[survivor],
+            TrafficClass::Throughput,
+            64 * 1024,
+            mux_limits,
+            &[absent_owner],
+            18 * 1024 * 1024,
+        )
+        .is_none(),
+        "a sole survivor is still an additional output while another output owns the lower Data Sequence frontier",
+    );
+}
+
+#[test]
 fn clear_frontier_owner_obeys_product_service_window_with_two_live_paths() {
     let mux_limits = MuxLimits::default();
     let product_flight = 2 * 1024 * 1024_u64;

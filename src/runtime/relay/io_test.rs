@@ -7,8 +7,7 @@ use crate::model::capacity::{
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::timing::{reliable_data_retransmission_interval, transport_pto_from_snapshot};
 use crate::model::work::{
-    reliable_critical_tail_reinjection_limit_bytes,
-    reliable_failed_original_reinjection_limit_bytes,
+    reliable_critical_tail_reinjection_limit_bytes, reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::validate_stream_ack;
@@ -766,7 +765,6 @@ fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
         snapshot.ranges(),
         true,
         false,
-        persistence,
         now,
     ));
 
@@ -780,13 +778,12 @@ fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
         snapshot.ranges(),
         true,
         true,
-        persistence,
         now + persistence,
     ));
 }
 
 #[test]
-fn persistent_ack_gap_reinjection_limit_uses_critical_event_quantum() {
+fn critical_reinjection_limit_uses_one_event_quantum() {
     let limits = MuxLimits::default();
     let base_limit = MAX_RELIABLE_SERVICE_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
     let reinjection_debt = base_limit.saturating_mul(32);
@@ -796,12 +793,12 @@ fn persistent_ack_gap_reinjection_limit_uses_critical_event_quantum() {
 
     assert_eq!(
         reinjection_limit, base_limit,
-        "persistent ACK-gap reinjection may bypass optional budget, but one event reinjections only one bounded quantum"
+        "a caller that grants one critical quantum cannot turn it into an unbounded repair flight"
     );
 }
 
 #[test]
-fn failed_original_reinjection_uses_available_target_flight() {
+fn reinjection_service_uses_available_target_flight() {
     let limits = MuxLimits::default();
     let mut tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
     let base_limit = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
@@ -816,11 +813,7 @@ fn failed_original_reinjection_uses_available_target_flight() {
         adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
 
     assert_eq!(
-        reliable_failed_original_reinjection_limit_bytes(
-            Some(tcp),
-            limits.max_repair_bytes,
-            limits,
-        ),
+        reliable_reinjection_service_limit_bytes(Some(tcp), 0, limits.max_repair_bytes, limits,),
         reliable_critical_tail_reinjection_limit_bytes(base_limit, limits.max_repair_bytes, limits,),
         "a full target retains one product work quantum while native congestion gates emission",
     );
@@ -831,15 +824,16 @@ fn failed_original_reinjection_uses_available_target_flight() {
 }
 
 #[test]
-fn failed_original_reinjection_is_transport_neutral_above_native_congestion() {
+fn reinjection_service_is_transport_neutral_above_native_congestion() {
     let limits = MuxLimits::default();
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let path = PathSnapshot::new(PathId(1), underlay, 40.0, 400_000_000.0);
         let target_flight =
             adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, limits);
         assert_eq!(
-            reliable_failed_original_reinjection_limit_bytes(
+            reliable_reinjection_service_limit_bytes(
                 Some(path),
+                0,
                 limits.max_repair_bytes,
                 limits,
             ),
@@ -851,6 +845,47 @@ fn failed_original_reinjection_is_transport_neutral_above_native_congestion() {
             "product reinjection is unified while each target retains native admission"
         );
     }
+}
+
+#[test]
+fn reinjection_service_counts_queue_and_flight_as_committed_target_work() {
+    let limits = MuxLimits::default();
+    let path = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 40.0, 400_000_000.0);
+    let target_flight =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, limits);
+    let base_limit = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
+        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits),
+    );
+    let mut occupied = path;
+    occupied.data_level_bytes_in_flight = (target_flight / 2) as u64;
+
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            Some(occupied),
+            target_flight / 2,
+            limits.max_repair_bytes,
+            limits,
+        ),
+        reliable_critical_tail_reinjection_limit_bytes(base_limit, limits.max_repair_bytes, limits,),
+        "current queued Product work and Product flight consume one shared service window",
+    );
+
+    occupied.data_level_queue_bytes = target_flight.saturating_mul(2) as u64;
+    let available_after_flight = target_flight.saturating_sub(target_flight / 2);
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            Some(occupied),
+            0,
+            limits.max_repair_bytes,
+            limits,
+        ),
+        reliable_critical_tail_reinjection_limit_bytes(
+            base_limit.max(available_after_flight),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        "an older published view of the shared queue cannot consume current service authority",
+    );
 }
 
 #[test]
@@ -1078,24 +1113,10 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
     let reinjection_delay =
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), None);
 
-    assert!(!progress.reinjection_ready_at(true, &first, true, false, reinjection_delay, now,));
-    assert!(!progress.reinjection_ready_at(
-        true,
-        &grown,
-        true,
-        false,
-        reinjection_delay,
-        now + interval,
-    ));
+    assert!(!progress.reinjection_ready_at(true, &first, true, false, now,));
+    assert!(!progress.reinjection_ready_at(true, &grown, true, false, now + interval,));
     assert!(
-        progress.reinjection_ready_at(
-            true,
-            &grown,
-            true,
-            true,
-            reinjection_delay,
-            now + reinjection_delay,
-        ),
+        progress.reinjection_ready_at(true, &grown, true, true, now + reinjection_delay,),
         "a growing ACK horizon with the same missing frontier is one persistent gap"
     );
     assert!(progress.reinjection_ready_at(
@@ -1103,16 +1124,17 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
         &grown,
         true,
         true,
-        reinjection_delay,
         now + reinjection_delay + Duration::from_millis(1),
     ));
-    progress.record_reinjection_queued_at(now + reinjection_delay + Duration::from_millis(1));
+    progress.record_reinjection_queued_at(
+        now + reinjection_delay + Duration::from_millis(1),
+        reinjection_delay,
+    );
     assert!(!progress.reinjection_ready_at(
         true,
         &grown,
         true,
         true,
-        reinjection_delay,
         now + reinjection_delay + Duration::from_millis(2),
     ));
 }
@@ -1144,22 +1166,14 @@ fn ack_gap_reinjection_progress_resets_repeat_suppression_when_frontier_advances
     let reinjection_delay =
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), None);
 
-    assert!(!progress.reinjection_ready_at(true, &first, true, false, reinjection_delay, now,));
-    assert!(progress.reinjection_ready_at(
-        true,
-        &first,
-        true,
-        true,
-        reinjection_delay,
-        now + reinjection_delay,
-    ));
-    progress.record_reinjection_queued_at(now + reinjection_delay);
+    assert!(!progress.reinjection_ready_at(true, &first, true, false, now,));
+    assert!(progress.reinjection_ready_at(true, &first, true, true, now + reinjection_delay,));
+    progress.record_reinjection_queued_at(now + reinjection_delay, reinjection_delay);
     assert!(progress.reinjection_ready_at(
         true,
         &advanced,
         true,
         true,
-        reinjection_delay,
         now + reinjection_delay + Duration::from_millis(1),
     ));
 }
@@ -1228,15 +1242,19 @@ fn ack_gap_reinjection_requires_measured_loss_and_suppresses_repeat_attempts() {
     let reinjection_delay = Duration::from_millis(300);
 
     let mut progress = ReliableAckGapReinjectionProgress::default();
-    assert!(!progress.reinjection_ready_at(true, &ranges, true, false, reinjection_delay, now,));
-    assert!(progress.reinjection_ready_at(true, &ranges, true, true, reinjection_delay, now,));
-    progress.record_reinjection_queued_at(now);
+    assert!(!progress.reinjection_ready_at(true, &ranges, true, false, now,));
+    assert!(progress.reinjection_ready_at(true, &ranges, true, true, now,));
+    progress.record_reinjection_queued_at(now, reinjection_delay);
+    assert_eq!(
+        progress.repeat_reinjection_deadline(),
+        now.checked_add(reinjection_delay),
+        "repeat suppression is owned by the selected recovery copy deadline",
+    );
     assert!(!progress.reinjection_ready_at(
         true,
         &ranges,
         true,
         true,
-        reinjection_delay,
         now + Duration::from_millis(1),
     ));
     progress.release_reinjection_attempt();
@@ -1245,7 +1263,6 @@ fn ack_gap_reinjection_requires_measured_loss_and_suppresses_repeat_attempts() {
         &ranges,
         true,
         true,
-        reinjection_delay,
         now + Duration::from_millis(1),
     ));
 }

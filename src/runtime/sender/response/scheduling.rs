@@ -292,12 +292,19 @@ pub(super) fn select_response_data_path_with_payload(
                         .original_data_in_flight_bytes
                         .saturating_add(target_payload_bytes as u64)
                         <= reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
-                // ECF and product service windows govern bulk placement. Once
-                // latency work is ready, deferring it cannot move it ahead of
-                // bytes already handed to an ordered carrier; publish it into
-                // the carrier's priority queue at the earliest opportunity.
+                // ECF and product service windows govern bulk placement. A
+                // sole enqueueable output may bypass that second controller
+                // only while it owns the contiguous frontier. If an absent
+                // output still owns lower bytes, this candidate remains an
+                // additional path and must not extend that receive hole
+                // without bound. Once latency work is ready, deferring it
+                // cannot move it ahead of bytes already handed to an ordered
+                // carrier; publish it into the carrier's priority queue at the
+                // earliest opportunity.
                 let suppression = if lane.is_latency_sensitive()
-                    || (single_live_path && snapshot.active_latency_sensitive_flows == 0)
+                    || (single_live_path
+                        && position == BulkCandidatePosition::FirstPath
+                        && snapshot.active_latency_sensitive_flows == 0)
                 {
                     None
                 } else {

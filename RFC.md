@@ -1584,6 +1584,13 @@ Failure publication MUST carry exact carrier-instance identity. A delayed
 status, ACK, measurement, or teardown from an older instance MUST NOT alter
 newer state.
 
+Loss of an established QUIC connection or its HTTP/3 carrier request stream is
+a failure of that exact carrier instance, not of every Product stream using the
+session. Carrier recovery preserves the logical stream and its exact retained
+ranges on surviving authenticated attachments. Frame-codec, authentication,
+configuration, and Product protocol failures do not acquire that recovery
+authority merely because they were observed through a QUIC carrier.
+
 ## 14. Security and Privacy
 
 ### 14.1 Authentication and replay
@@ -1663,9 +1670,26 @@ unambiguous Data ACK coverage for original transmissions, it may own at most
 one bounded startup flight. Native TCP ACK or QUIC packet-ACK evidence alone
 does not unlock mature additional-output placement.
 
+An output does not become the contiguous-frontier owner merely because it is
+the only output that can currently enqueue. While an unresolved lower original
+range belongs to another output, the survivor remains an additional output and
+MUST retain the corresponding Product flight, completion, and reorder bounds.
+
 After exact original-data Data ACK coverage reaches the configured startup
 sample floor, the response scheduler may use its mature completion-time model.
 Duplicated bytes do not satisfy that floor for either copy.
+
+A later app-limited carrier observation does not revoke an earlier qualified
+delivery sample while that sample remains fresh; mature placement continues to
+use its completion estimate. The app-limited observation itself creates no new
+admission generation or placement authority. After qualified completion
+evidence expires, the output returns to unqualified acquisition. When the
+carrier exports a positive native congestion window, its unresolved original
+work is bounded by that window and the existing startup-flight floor; an older
+Product service window MUST NOT enlarge it. When no native window is
+observable, the portable bounded Product service window remains the fallback.
+Acquisition does not grant a new completion estimate or bypass shared
+receive-credit, reorder, queue, or configured flight bounds.
 
 Non-failure TCP carrier expansion is a local delayed-start policy. It MAY be
 considered only for throughput demand with fresh queued unique-original data
@@ -1911,18 +1935,41 @@ For request-direction feedback whose fragments may arrive on different
 carriers, the same lowest missing frontier waits one MPP recovery interval
 from its first authoritative observation.
 
-For response-direction feedback, a later MPP Data ACK event may authorize one
-bounded repair after the original flight exceeds the local MPP Data-ACK
-threshold:
+For response-direction feedback, a later MPP Data ACK event may authorize
+bounded repair on one measured alternate after the original flight exceeds the
+local MPP Data-ACK threshold:
 
 - `5/4 * SRTT` for TCP; or
 - `9/8 * SRTT` for QUIC;
 
 provided the alternative is estimated to complete before the MPP recovery
-interval. These ratios are local approximations inspired by transport
-time-threshold loss detection; the TCP ratio is not RFC 8985 RACK and the QUIC
-ratio is not QUIC's native RFC 9002 loss decision. ACK silence alone waits one
-MPP recovery interval.
+interval. The repair may fill the alternate's available throughput-lane Product
+service window, bounded by exact omitted ranges and the configured repair and
+path-flight envelopes. Existing target flight and queued Product work consume
+that window. Queue and flight are summed within the Product and native carrier
+domains, while the overlapping domain totals are counted only once; one repair
+quantum remains available for liveness when the window is full. This is Data
+Sequence service authority, not native congestion
+authority: the selected TCP or QUIC sender remains the final enqueue, pacing,
+congestion, and recovery authority. These ratios are local approximations
+inspired by transport time-threshold loss detection; the TCP ratio is not RFC
+8985 RACK and the QUIC ratio is not QUIC's native RFC 9002 loss decision. ACK
+silence alone waits one MPP recovery interval.
+
+When a persistent-gap reinjection attempt is accepted by a selected alternate,
+its repeat deadline is fixed from that alternate's observed MPP recovery
+interval. The stream actor wakes at the earlier of that deadline and the
+original owner's live-tail deadline. If the same authoritative gap remains, a
+later attempt reselects a currently measured alternate and again remains
+bounded by its available Product service window. Advancement or resolution of
+the lowest missing frontier clears the prior attempt deadline. Thus a degraded
+original owner cannot impose its longer recovery clock on an already accepted
+reinjection attempt, while mutable later measurements cannot postpone that
+attempt's deadline. ACK receipt, either recovery deadline, carrier-capacity
+release, and output-model publication all return through the same stream-owner
+evaluation of the retained authoritative gap. Only a newly received Data ACK
+may arm the separate original-owner silence fallback; polling or another wake
+cannot restart that silence clock.
 
 A contiguous live tail without an authoritative gap may send one bounded probe
 after one MPP recovery interval. Another repair requires another full interval
@@ -1959,12 +2006,14 @@ restarts it. The clock is removed when that attachment has no authoritative
 outstanding OriginalData or no non-stale alternative. Attachment staleness is
 stream-local; only exact carrier-instance failure is session-wide.
 
-If cumulative extra-traffic credit is exhausted, an exact carrier failure,
-persistent authoritative gap, or live-tail event may use one critical recovery
-quantum to prevent the budget itself from deadlocking recovery. The quantum is
-bounded by retained ranges, exact flight identity, queue and flight limits,
-repeat-delay suppression, and a distinct output while the original carrier is
-live. Its bytes remain charged and reduce later optional reinjection authority.
+If cumulative extra-traffic credit is exhausted, an exact carrier failure or
+persistent authoritative gap may use one bounded target Product service window
+to prevent the budget itself from deadlocking recovery. A live-tail event
+without an authoritative gap remains limited to one critical recovery quantum.
+Both are bounded by retained ranges, exact flight identity, queue and flight
+limits, repeat-delay suppression, and a distinct output while the original
+carrier is live. Their bytes remain charged and reduce later optional
+reinjection authority.
 
 ### 15.3 Datagram retry
 

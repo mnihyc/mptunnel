@@ -767,7 +767,6 @@ where
             state.progress.last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot),
         );
-        let data_ack_reinjection_at = state.progress.data_ack_reinjection_at;
         if state
             .progress
             .sender_retry_at
@@ -786,6 +785,50 @@ where
         if sender.discard_resolved_stale_path_reinjections(&mut sender_queue, &remotes) > 0 {
             state.progress.sender_retry_at = None;
         }
+        let data_ack_timer_due = state
+            .progress
+            .data_ack_reinjection_at
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+        if data_ack_timer_due {
+            state.progress.data_ack_reinjection_at = None;
+        }
+        // ACK receipt, timer expiry, path/model publication, and carrier
+        // capacity all return through this stream-owner evaluation. A due gap
+        // therefore remains recoverable when no target was eligible at the
+        // exact timer event, without adding polling or another retry clock.
+        let data_ack_reinjection = evaluate_client_data_ack_reinjection(
+            &mut state,
+            &mut sender,
+            &mut sender_queue,
+            context,
+            &remotes,
+            &send_stream,
+            path_snapshot,
+            relay_lane,
+            stream_id,
+        );
+        #[cfg(feature = "lab-diagnostics")]
+        if data_ack_timer_due {
+            lab_diagnostic(
+                "data_ack_loss_timer",
+                format_args!(
+                    "stream_id={} reinjection_frames={} ack_gap_reinjection_ready={} multipath_reinjection_alternative={} next_deadline_armed={}",
+                    stream_id.0,
+                    data_ack_reinjection.frame_count,
+                    data_ack_reinjection.persistent_ready,
+                    data_ack_reinjection.has_multipath_alternative,
+                    state.progress.data_ack_reinjection_at.is_some(),
+                ),
+            );
+        }
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = data_ack_reinjection;
+        let data_ack_reinjection_at = state.progress.data_ack_reinjection_at;
+        let retained_data_ack_recovery_due = state
+            .progress
+            .ack_gap_reinjection
+            .next_reinjection_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now());
         let inbound_frame_ready = deferred_remote_frame.is_some() || remotes.has_buffered_frame();
         let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
             sender_queue.is_empty(),
@@ -829,7 +872,9 @@ where
             .progress
             .sender_retry_at
             .unwrap_or_else(tokio::time::Instant::now);
-        let carrier_capacity_notifies = if timed_carrier_retry_blocked {
+        let carrier_capacity_wait_needed =
+            timed_carrier_retry_blocked || retained_data_ack_recovery_due;
+        let carrier_capacity_notifies = if carrier_capacity_wait_needed {
             remotes
                 .paths
                 .iter()
@@ -1134,32 +1179,9 @@ where
                 state.progress.last_receive_hole_reinjection_at = Instant::now();
             }
             _ = wait_for_optional_deadline(data_ack_reinjection_at), if data_ack_reinjection_at.is_some() => {
-                state.progress.data_ack_reinjection_at = None;
-                let reinjection = evaluate_client_data_ack_reinjection(
-                    &mut state,
-                    &mut sender,
-                    &mut sender_queue,
-                    context,
-                    &remotes,
-                    &send_stream,
-                    path_snapshot,
-                    relay_lane,
-                    stream_id,
-                );
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "data_ack_loss_timer",
-                    format_args!(
-                        "stream_id={} reinjection_frames={} ack_gap_reinjection_ready={} multipath_reinjection_alternative={} next_deadline_armed={}",
-                        stream_id.0,
-                        reinjection.frame_count,
-                        reinjection.persistent_ready,
-                        reinjection.has_multipath_alternative,
-                        state.progress.data_ack_reinjection_at.is_some(),
-                    ),
-                );
-                #[cfg(not(feature = "lab-diagnostics"))]
-                let _ = reinjection;
+                // The next loop iteration owns evaluation and preserves the
+                // due retained gap if no target is currently eligible.
+                continue;
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
                 let queued_existing_tail_reinjection = sender.enqueue_tail_reinjection(
@@ -1646,7 +1668,7 @@ where
                 state.progress.sender_retry_at = None;
                 continue;
             }
-            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if timed_carrier_retry_blocked && has_carrier_capacity_notify => {
+            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if carrier_capacity_wait_needed && has_carrier_capacity_notify => {
                 state.progress.sender_retry_at = None;
                 continue;
             }

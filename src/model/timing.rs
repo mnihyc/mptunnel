@@ -36,8 +36,10 @@ pub(crate) fn tcp_retransmission_timeout_from_snapshot(path: Option<PathSnapshot
     .unwrap_or(TCP_INITIAL_RETRANSMISSION_TIMEOUT)
 }
 
-/// Data-level retransmission follows the recovery clock of the carrier that
-/// owns the missing range. It is distinct from declaring that carrier stale.
+/// Initial Data-level retransmission follows the recovery clock of the carrier
+/// that owns the missing range. Once reinjection is accepted, its repeat clock
+/// follows that selected carrier's immutable observation. Neither declares a
+/// carrier stale.
 pub(crate) fn reliable_data_retransmission_interval(
     underlay: Option<UnderlayProtocol>,
     path: Option<PathSnapshot>,
@@ -65,7 +67,7 @@ pub(crate) fn reliable_data_ack_loss_delay(
         .then(|| Duration::from_secs_f64(delay_ms / 1000.0))
 }
 
-/// An authoritative later Data ACK may repair one bounded range only after the
+/// An authoritative later Data ACK may start bounded repair only after the
 /// original flight is time-threshold lost and an alternate can beat recovery.
 pub(crate) fn reliable_data_ack_gap_reinjection_deadline(
     original_assignment_at: Option<std::time::Instant>,
@@ -98,6 +100,7 @@ pub(crate) fn reliable_data_ack_recovery_deadline(
     original_assignment_at.checked_add(recovery_interval)
 }
 
+#[cfg(test)]
 pub(crate) fn reliable_data_ack_gap_reinjection_ready(
     original_assignment_at: Option<std::time::Instant>,
     underlay: Option<UnderlayProtocol>,

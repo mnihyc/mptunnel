@@ -62,27 +62,41 @@ pub(crate) fn reliable_critical_tail_reinjection_limit_bytes(
         .min(resource_cap)
 }
 
-/// Sizes failover of original product data from the live target's measured
-/// service opportunity without replacing native transport recovery.
-pub(crate) fn reliable_failed_original_reinjection_limit_bytes(
+/// Sizes one Product reinjection service window from the selected target's
+/// measured opportunity without replacing native transport recovery.
+///
+/// Exact carrier failure and a persistent authoritative MPP Data ACK gap have
+/// different eligibility rules, but once either has selected a target they
+/// share the same byte authority: unacknowledged ranges may fill only the
+/// target's available Product service window. The target's TCP or QUIC sender
+/// remains the final pacing, congestion, and enqueue authority.
+pub(crate) fn reliable_reinjection_service_limit_bytes(
     path: Option<PathSnapshot>,
+    queued_product_bytes: usize,
     reinjection_debt_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    // Failed-output ranges have already lost their native recovery owner. Keep
-    // one product work quantum available even when the replacement path already
-    // owns a full modeled flight; its TCP/QUIC sender still gates actual emission.
+    // Keep one Product work quantum available even when the target already
+    // owns a full modeled flight; its TCP/QUIC sender still gates emission.
     let event_limit =
         adaptive_reliable_relay_reinjection_bytes(path, TrafficClass::Throughput, mux_limits)
             .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
     let target_flight =
         adaptive_reliable_relay_inflight_bytes(path, TrafficClass::Throughput, mux_limits);
-    let existing_target_debt = path.map_or(0, |snapshot| {
-        snapshot
+    let existing_target_debt = path.map_or(queued_product_bytes, |snapshot| {
+        // Native and Product accounting overlap once work enters the carrier,
+        // but queue and flight are disjoint within either domain. Use the same
+        // committed-work geometry as completion-time scheduling. The explicit
+        // queue value is authoritative for the current sender turn; the path
+        // snapshot contains an asynchronously published view of that same
+        // shared Product queue and must not retain a stale high watermark.
+        let native_work = snapshot
+            .queue_bytes
+            .saturating_add(snapshot.bytes_in_flight);
+        let product_work = snapshot
             .data_level_bytes_in_flight
-            .max(snapshot.data_level_queue_bytes)
-            .max(snapshot.queue_bytes)
-            .min(usize::MAX as u64) as usize
+            .saturating_add(u64::try_from(queued_product_bytes).unwrap_or(u64::MAX));
+        native_work.max(product_work).min(usize::MAX as u64) as usize
     });
     let event_limit = event_limit.max(target_flight.saturating_sub(existing_target_debt));
     reliable_critical_tail_reinjection_limit_bytes(event_limit, reinjection_debt_bytes, mux_limits)

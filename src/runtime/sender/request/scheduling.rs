@@ -1745,7 +1745,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     stream_ordering_debt_bytes: admission_ordering_debt,
                 },
                 completion_backlog_bytes,
-                path.has_bulk_model_evidence && !snapshot.app_limited,
+                path.has_bulk_model_evidence,
             );
             let measurement_reference_reservoir =
                 measurement_reference_fence.is_some_and(|candidate| {

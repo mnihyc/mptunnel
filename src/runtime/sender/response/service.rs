@@ -27,7 +27,7 @@ use crate::model::tcp_carrier::{
 };
 use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::ReliableWorkClass;
-use crate::model::work::reliable_failed_original_reinjection_limit_bytes;
+use crate::model::work::reliable_reinjection_service_limit_bytes;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::performance::MppPerformanceConfig;
@@ -551,8 +551,9 @@ impl ServerResponseSenderService {
                 outcome.blocked_for_carrier_capacity = true;
                 continue;
             };
-            let reinjection_limit = reliable_failed_original_reinjection_limit_bytes(
+            let reinjection_limit = reliable_reinjection_service_limit_bytes(
                 Some(reinjection_path),
+                self.bytes(),
                 send_stream.reinjection_bytes(),
                 mux_limits,
             );

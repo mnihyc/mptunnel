@@ -126,6 +126,28 @@ pub enum QuicCarrierError {
     IdleTimeoutOutOfRange(quinn::VarIntBoundsExceeded),
 }
 
+impl QuicCarrierError {
+    /// Whether an established QUIC/H3 carrier instance ended without proving
+    /// a Product-stream failure. The relay may retire that exact instance and
+    /// preserve its logical stream on other authenticated carriers.
+    pub(crate) fn is_path_lifetime_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(_)
+                | Self::Connection(_)
+                | Self::Write(_)
+                | Self::Read(_)
+                | Self::H3Connection(_)
+                | Self::H3Stream(_)
+                | Self::H3DriverClosed
+                | Self::H3StreamFinished
+                | Self::StreamFinished
+                | Self::UnexpectedEnd
+                | Self::ClosedStream(_)
+        )
+    }
+}
+
 impl fmt::Display for QuicCarrierError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

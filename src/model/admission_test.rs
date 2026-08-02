@@ -1533,7 +1533,7 @@ fn app_limited_rate_does_not_reclamp_the_product_service_window() {
 }
 
 #[test]
-fn app_limited_native_path_reacquires_service_unless_latency_is_active() {
+fn app_limited_native_path_retains_qualified_completion_authority() {
     let lead = candidate(0, 400.0, 40.0, 400.0);
     let mut extra = candidate(1, 800.0, 180.0, 20.0);
     extra.snapshot.confidence = 1.0;
@@ -1557,8 +1557,8 @@ fn app_limited_native_path_reacquires_service_unless_latency_is_active() {
     );
     assert_eq!(
         bulk_candidate_admission_suppression_with_completion_backlog(check, 0, true),
-        None,
-        "an idle bulk carrier must be allowed to reacquire native service credit"
+        Some("ecf_no_completion_gain"),
+        "a later app-limited poll cannot revoke retained completion evidence"
     );
 
     let mut latency_check = check;
@@ -1570,6 +1570,45 @@ fn app_limited_native_path_reacquires_service_unless_latency_is_active() {
         bulk_candidate_admission_suppression_with_completion_backlog(latency_check, 0, true),
         Some("ecf_no_completion_gain"),
         "an idle carrier sharing latency traffic retains the conservative ECF boundary"
+    );
+}
+
+#[test]
+fn unqualified_native_acquisition_cannot_reuse_a_larger_product_window() {
+    let lead = candidate(0, 900.0, 20.0, 30.0);
+    let mut extra = candidate(1, 2_300.0, 900.0, 70.0);
+    extra.snapshot.confidence = 1.0;
+    extra.snapshot.app_limited = true;
+    extra.snapshot.has_durable_product_progress = true;
+    extra.snapshot.carrier_inflight_limit_bytes = 4 * 1024 * 1024;
+    extra.snapshot.data_level_limit_bytes = 48 * 1024 * 1024;
+    extra.snapshot.data_level_bytes_in_flight = 3 * 1024 * 1024;
+    let mut check = BulkAdmissionCheck {
+        best_snapshot: lead.snapshot,
+        best_eta_ms: lead.eta_ms,
+        candidate_snapshot: extra.snapshot,
+        candidate_eta_ms: extra.eta_ms,
+        payload_bytes: 64 * 1024,
+        mux_limits: MuxLimits::default(),
+        position: BulkCandidatePosition::AdditionalPath,
+        stream_ordering_debt_bytes: 15 * 1024 * 1024,
+    };
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, false),
+        None,
+        "an output without qualified completion evidence may fill current native credit"
+    );
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, true),
+        Some("ecf_no_completion_gain"),
+        "current app-limited state cannot revoke retained completion evidence"
+    );
+    check.candidate_snapshot.data_level_bytes_in_flight = 4 * 1024 * 1024;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, false),
+        Some("inflight_limit"),
+        "an older Product service window cannot enlarge native acquisition credit"
     );
 }
 

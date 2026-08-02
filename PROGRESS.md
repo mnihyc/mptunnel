@@ -10,6 +10,38 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T11:21:54+08:00: complete local v0.1.4 gate passed
+
+- Name: exact-source local release acceptance
+- Category: Correctness, Product, Core, dependency, lab contract and Linux
+  package verification
+- State: accepted; native GitHub matrices and publication remain
+- Source gates:
+  - formatting and strict all-target/all-feature Clippy pass without warnings;
+  - the complete root suite passes 1,511 unit/integration tests, two Product
+    allocation contracts, all six packaged daily-use scenarios, and doctests;
+  - the standalone maintained `quinn-proto` suite passes 282 tests and three
+    doctests; and
+  - the deterministic benchmark/trace suite passes all five tests.
+- Infrastructure gates:
+  - the performance declaration/registry is valid and all 199 lab contract,
+    evidence, runner, and observation tests pass;
+  - all nine release-archive contract tests, Bash syntax checks, ShellCheck,
+    version-gate self-tests, actual `v0.1.4` monotonic-version check, public
+    local-link checks, whitespace checks, and tracked repository-shape checks
+    pass.
+- Local package evidence:
+  - `packaging/package-release.sh --target x86_64-unknown-linux-musl` built the
+    version `0.1.4` binary through the documented package path;
+  - the result is an x86-64 static PIE and the archive verifier found exactly
+    the six contracted Linux package files; and
+  - `.tmp/release/dist/mptunnel-linux-amd64.tar.gz` has SHA-256
+    `38afcef15d0d5497ab1c6c98ea0b5c85f21cca9feefcaf036f2efc9c6ed6bf98`.
+- Decision: freeze this source. Push its exact commit without changing the
+  workflows, require the normal CI and non-publishing Release Check to build
+  all seven targets successfully, then create and push the annotated
+  `v0.1.4` tag. The tag-triggered workflow alone may publish release assets.
+
 ## 2026-08-02T11:13:34+08:00: v0.1.4 Product and release surface closed
 
 - Name: bounded v0.1.4 Product/documentation closure

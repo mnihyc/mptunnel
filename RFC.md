@@ -1070,7 +1070,10 @@ No flight, proof, rate, feedback, queue, or load state from the old incarnation
 may be inherited merely because `StreamId` and `PathId` are unchanged.
 
 Each sender begins without implicit MPP credit and waits for
-`STREAM_MAX_DATA` or `STREAM_RESET` from that direction's receiver.
+`STREAM_MAX_DATA` from that direction's receiver. A receiver that refuses only
+the pending attachment sends `STREAM_DETACH` on that carrier. `STREAM_RESET`
+is reserved for terminating the logical MPP stream and MUST NOT be used to
+refuse an additional attachment.
 
 ### 8.2 Offset mapping and delivery
 
@@ -1183,10 +1186,12 @@ final offset. Otherwise FIN remains pending until contiguous delivery reaches
 it. Matching duplicate FINs are idempotent.
 
 `STREAM_DETACH(stream_id)` removes only the attachment on the carrier carrying
-the frame. It is not an acknowledgment of peer-side flight or carrier
-quiescence. During TCP carrier drain, an endpoint MUST retain the attachment
-state needed to receive preceding frames, publish or process Data ACK, and
-complete recovery until the ordered `PATH_CLOSE` boundary in Section 6.1.
+the frame. It also refuses a pending `OPEN_STREAM` on that carrier without
+terminating an existing logical stream or any sibling attachment. It is not an
+acknowledgment of peer-side flight or carrier quiescence. During TCP carrier
+drain, an endpoint MUST retain the attachment state needed to receive
+preceding frames, publish or process Data ACK, and complete recovery until the
+ordered `PATH_CLOSE` boundary in Section 6.1.
 `STREAM_RESET(stream_id, reason)` terminates the MPP stream.
 
 Native TCP EOF ends the carrier and is not stream FIN or detach. Native QUIC

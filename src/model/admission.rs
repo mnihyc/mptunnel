@@ -784,5 +784,5 @@ fn bulk_pipe_window_bytes(bdp_bytes: u64) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "admission_test.rs"]
+#[path = "tests_admission.rs"]
 mod tests;

@@ -387,6 +387,91 @@ class RunnerContractTests(unittest.TestCase):
             SCRIPT,
         )
 
+    def test_large_varying_and_asymmetric_cases_have_complete_topology_and_load(self):
+        server = SCRIPT.split("server_config_toml() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        endpoints = SCRIPT.split('tcp_scale_all="', 1)[1].split(
+            '\n\nif should_run_case "direct_low_latency"', 1
+        )[0]
+        asymmetric = SCRIPT.split("apply_asymmetric_netem() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        browser = SCRIPT.split("run_browser_probe_case() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        browser_batches = SCRIPT.split("run_browser_batch_case() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        browser_load = SCRIPT.split("run_browser_full_load_case() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        varying_download = SCRIPT.split(
+            "run_varying_links_download_case() {", 1
+        )[1].split("\n}", 1)[0]
+        schedule = SCRIPT.split("run_path_variation_schedule() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        initial = SCRIPT.split(
+            "prepare_path_variation_initial_epoch() {", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertEqual(endpoints.count("${tcp_endpoint_"), 5)
+        self.assertEqual(endpoints.count("--path 'tcp://"), 5)
+        self.assertEqual(endpoints.count("--path 'udp://"), 10)
+        for prefix in range(41, 46):
+            self.assertIn(f'"tcp://172.31.{prefix}.20:${{server_port}}"', server)
+        for prefix in range(51, 61):
+            self.assertIn(f'"udp://172.31.{prefix}.20:${{server_port}}"', server)
+        self.assertIn("exec_netem client asymmetric-client", asymmetric)
+        self.assertIn("exec_netem server asymmetric-server", asymmetric)
+        self.assertIn("--small-batch-size \"$browser_batch_size\"", browser_batches)
+        self.assertIn("--small-batch-period-ms \"$browser_batch_period_ms\"", browser_batches)
+        self.assertIn("--small-response-budget-ms \"$browser_batch_deadline_ms\"", browser_batches)
+        self.assertIn("--require-small-response-budget", browser_batches)
+        self.assertIn("--browser-only", browser)
+        self.assertIn("--browser-full-load", browser_load)
+        self.assertIn("--small-batch-size \"$browser_load_concurrency\"", browser_load)
+        self.assertIn("\"$browser_load_duration_seconds\"", browser_load)
+        self.assertNotIn("browser_batch_deadline_ms", browser_load)
+        self.assertIn("COMPLETION_TIMEOUT_SECONDS", browser)
+        self.assertIn("probe_process_timeout_seconds", browser)
+        self.assertNotIn("--bulk-path", browser)
+        self.assertNotIn("--tcp-echo-target", browser)
+        self.assertNotIn("--udp-payload-bytes", browser)
+        self.assertIn("scale-${rate_band}-epoch-0-client", initial)
+        self.assertIn("scale-${rate_band}-epoch-0-server", initial)
+        self.assertIn(
+            'start_client_with_netem "$case_name" "scale-${rate_band}-epoch-0"',
+            SCRIPT,
+        )
+        self.assertIn("preconditioned", schedule)
+        self.assertIn(
+            'exec_netem client "scale-${rate_band}-epoch-${epoch}-client"',
+            schedule,
+        )
+        self.assertIn(
+            'exec_netem server "scale-${rate_band}-epoch-${epoch}-server"',
+            schedule,
+        )
+        self.assertIn(
+            "scale_rate_bands=(access gigabit multi-gigabit)", SCRIPT
+        )
+        self.assertIn("run_browser_batch_case", SCRIPT)
+        self.assertIn('start_client "$case_name" "$tcp_all $udp_all"', browser)
+        self.assertIn("run_browser_full_load_case", SCRIPT)
+        self.assertIn(
+            'run_varying_links_download_case "$scale_rate_band"', SCRIPT
+        )
+        self.assertIn(
+            'run_varying_links_upload_case "$scale_rate_band"', SCRIPT
+        )
+        self.assertIn("--parallel-downloads '${bulk_connections}'", varying_download)
+        self.assertIn("run_path_variation_schedule", varying_download)
+        self.assertIn('--rate-band "$rate_band"', SCRIPT)
+        self.assertIn("path_variation_metadata", SCRIPT)
+        self.assertIn("attach_path_variation_metadata", SCRIPT)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -211,5 +211,5 @@ pub(crate) fn default_transport_pto() -> Duration {
 }
 
 #[cfg(test)]
-#[path = "timing_test.rs"]
+#[path = "tests_timing.rs"]
 mod tests;

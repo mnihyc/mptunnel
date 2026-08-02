@@ -58,7 +58,7 @@ use crate::runtime::outbound_registry::{
     EgressSelection, OpenedTcpOutbound, RuntimeOutboundRegistry, finish_gateway_flow,
 };
 use crate::runtime::path::PathDeliveryStats;
-use crate::runtime::path::tcp::server_service::{
+use crate::runtime::path::tcp::server::service::{
     ResponseProductAckReceipt, ServerTcpCarrierOrdinaryService, ServerTcpCarrierOutputInstance,
     ServerTcpCarrierSaturation, ServerTcpCarrierWorkloadLease,
 };
@@ -3366,5 +3366,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "server_test.rs"]
+#[path = "tests_server.rs"]
 mod tests;

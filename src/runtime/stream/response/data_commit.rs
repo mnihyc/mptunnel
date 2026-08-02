@@ -191,5 +191,5 @@ impl ResponseStreamBinding {
 }
 
 #[cfg(test)]
-#[path = "data_commit_test.rs"]
+#[path = "tests_data_commit.rs"]
 mod tests;

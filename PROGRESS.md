@@ -4528,3 +4528,201 @@ entry is authoritative.
   response attachment, execute the established bounded comparison and immutable
   result/acknowledgment settlement, then run the representative and disruption
   performance gates before advancing to Product completion.
+
+## 2026-08-02T16:06:41+08:00: Accepted v0.1.5 lifecycle and negotiated load gates
+
+- Name: request-local QUIC cancellation, attachment-local refusal, and bounded
+  browser/20-path load evidence
+- Category: Core lifecycle correctness and release performance verification
+- State: accepted implementation and persistent lab gates; clean-tree release
+  comparison remains a final pre-tag gate
+- Clean model:
+  - canceling an incomplete HTTP/3 carrier request resets only that request;
+    it does not close the shared QUIC connection or leave partially written
+    DATA state available for reuse;
+  - refusing a pending `OPEN_STREAM` attachment uses `STREAM_DETACH` on the
+    carrying TCP or QUIC carrier, while `STREAM_RESET` remains reserved for
+    terminating the logical MPP stream and all of its attachments;
+  - the ordered-detach fence remains unchanged and authoritative; no timeout,
+    scheduler, congestion-control, pacing, capacity, or carrier-count parameter
+    changed; and
+  - the periodic browser gate retains its 3-second batch SLA, while the distinct
+    saturation gate admits work for exactly 60 seconds at no more than 20 live
+    1 MiB requests and lets already accepted requests drain under the configured
+    probe completion timeout.
+- Practical cause and evidence:
+  - the initial 20-by-60 run exposed 12 incomplete requests and 15 H3 internal
+    errors; request-local cancellation removed every H3 internal error;
+  - the remaining 8 truncated bodies correlated with attachment retries during
+    ordered detach being answered by a logical `STREAM_RESET(Refused)`;
+  - after correcting refusal scope, the final retained saturation result is
+    `status=ok`: 570 started, 570 accepted, 570 completed, zero rejected, zero
+    incomplete, peak concurrency 20, 60-second admission window, 9.5 completed
+    requests/s normalized over the admission window; the retained 597,688,320
+    payload bytes over the complete 65.292-second run are 73.233 Mbps exact
+    elapsed goodput; and
+  - persistent TCP and QUIC regressions reproduce the ordered-detach retry and
+    prove an exact `STREAM_DETACH` response while the logical stream remains.
+- Twenty-link variation evidence:
+  - each of six cases configured 10 TCP and 10 UDP links, applied five complete
+    independently seeded bandwidth/latency/jitter/loss epochs, and passed in
+    both directions;
+  - access (30--100 Mbps/path): 344.534 Mbps download and 210.378 Mbps upload;
+  - gigabit (300--1000 Mbps/path): 1,178.811 Mbps download and 609.004 Mbps
+    upload; and
+  - multi-gigabit (3--10 Gbps/path): 2,261.932 Mbps download and 670.693 Mbps
+    upload. The VM became the high-band execution ceiling, so these results
+    establish successful completion, aggregation, and adaptation rather than a
+    claim that this host can saturate the configured aggregate line rate.
+- Verification:
+  - 175 focused Core path tests passed before the two new boundary regressions;
+  - both new TCP and QUIC attachment-refusal regressions pass;
+  - 75 focused Python lab/model contracts and shell syntax pass; and
+  - all retained lab result rows and every path-variation schedule report
+    `status=ok` and `trace_complete=true`.
+- Reproducibility note: the lab host validity record rejected comparison status
+  solely because the source tree necessarily contained the in-progress v0.1.5
+  changes. A clean committed-tree release gate remains required before tagging.
+- Next: perform the already-approved mechanical source/test layout pass, finish
+  Product/public-documentation and dependency audits, then run the clean-tree
+  final release gates without further model changes.
+
+## 2026-08-02T17:42:31+08:00: Live dashboard and public evidence hierarchy accepted
+
+- Name: dense live Overview and baseline-first README presentation
+- Category: Product observability, public documentation, and evidence scope
+- State: dashboard implementation and live rendering accepted; README evidence
+  structure accepted for final documentation reconciliation
+- Dashboard result:
+  - Overview now presents current upload/download speed, cumulative traffic,
+    active flows, paths, queue/flight, delivery, inbound connections, services,
+    configured inbounds/outbounds, MPP sessions, paths, and balancer readiness
+    from the existing management schema;
+  - history expands from a fresh load and then uses the selected 15-minute,
+    1-hour, 6-hour, 24-hour, or unbounded browser window; speed is the default
+    graph and cumulative traffic remains one compact alternate;
+  - refresh is transactional, retaining the last complete layout while the
+    next status request is in flight; the collapsible navigation state and a
+    successfully authenticated token persist in same-origin browser storage;
+    and
+  - the final live 1600-by-1000 capture contains three active inbound reliable
+    flows, one connected MPP session, two active TCP/QUIC paths, and changing
+    application traffic. Responsive 768-by-900 and 390-by-844 checks had no
+    console error or horizontal overflow.
+- Public evidence decision:
+  - the executable Docker runner exposes 196 selectable case names spanning
+    direct controls, pinned Xray/Hysteria2 and kernel-MPTCP baselines,
+    TCP/QUIC/mixed reliable traffic, datagrams, TUN, condition matrices,
+    asymmetry, blackholes, latency changes, saturation, port migration,
+    adaptive TCP carriers, 20-link variation, and browser load;
+  - the 29-cell/66-metric registry is an acceptance blueprint rather than
+    measured evidence, and rejected, superseded, simulator, or diagnostic
+    results cannot become public performance claims;
+  - README now keeps the complete same-condition external baseline table,
+    preserves the five-path MPTUNNEL/MPTCP comparison boundary, and summarizes
+    recovery/load evidence with compact numeric rows instead of internal case
+    names or explanatory paragraphs inside tables; and
+  - v0.1.5 scale/browser rows remain local capability evidence until the final
+    clean-source release gate; they are not blended into external comparisons.
+- Performance boundary: management projection and Core telemetry were not
+  changed. History retention, graph mode, navigation state, and refresh
+  transactions are browser-only; README changes make no runtime claim beyond
+  the recorded evidence.
+- Verification: dashboard JavaScript syntax, asset contract test, whitespace,
+  1600/768/390 rendering, delayed-refresh layout stability, and live-state
+  capture pass. README has no fixed release number or development-plan term.
+- Next: reconcile the exhaustive configuration reference, shipped examples,
+  operations guide, and remaining public documents with the implemented
+  schema, then complete the mechanical test layout and final source gates.
+
+## 2026-08-02T17:59:24+08:00: Configuration contract and Rust test layout reconciled
+
+- Name: accepted configuration mirror and role-local test organization
+- Category: Product documentation and mechanical source structure
+- State: implemented and source-compiled; no protocol, Product data flow,
+  scheduler, congestion, timing, capacity, or performance parameter changed
+- Configuration result:
+  - the exhaustive reference now mirrors outbound `credential_id`, inbound
+    `credential_ids`, all resource fields, DNS transports/IP strategies and
+    exact/suffix rules, routing/ACL fields, MPP inbound `dns_plan`, ranged
+    TCP/QUIC hopping, and TCP `tcp-carriers=MIN-MAX` with default `1-3`;
+  - the shipped client and server examples expose the operator-relevant
+    `allow_peer_diagnostics` setting as a disabled comment; and
+  - the README certificate command creates a non-CA server-authentication
+    leaf accepted by the configured TLS verifier.
+- Structure result:
+  - all 186 Rust test source files now use the `tests_<owner>.rs` form;
+  - 45 remaining inline test modules were moved to sibling test files without
+    changing their bodies or owner module; and
+  - no Rust suffix-form test file, inline `mod tests { ... }`, or singleton
+    source directory remains in the root crate, Quinn mirror, benchmark crate,
+    or integration-test tree.
+- Evidence:
+  - all three shipped TOML documents parse, the source-backed reference-config
+    contract passes, and documentation whitespace checks pass;
+  - `cargo fmt --all -- --check` passes;
+  - the root `--all-features` library test target compiles; and
+  - the Quinn mirror and benchmark-crate test targets compile independently.
+- Next: remove remaining internal-only public documentation, complete the
+  bounded Product/config/dependency audit, then run the final release gates.
+
+## 2026-08-02T19:16:22+08:00: v0.1.5 source and Linux package boundary accepted
+
+- Name: final Product, lifecycle, documentation, dependency, and package audit
+- Category: release acceptance
+- State: source and local package gates pass; one clean-tree representative
+  TCP/QUIC measurement remains before push and tag
+- Correctness boundary:
+  - incomplete HTTP/3 request cancellation retires only that request stream;
+    pending attachment refusal uses `STREAM_DETACH`, while logical-stream
+    termination remains `STREAM_RESET`;
+  - Product delivery is reserved before a QUIC write, only still-pending bytes
+    are rolled back on cancellation or error, and native-ACK publication cannot
+    later attribute canceled bytes;
+  - no scheduler, congestion controller, pacing rule, timer, threshold,
+    carrier range, transport parameter, platform policy, or wire geometry
+    changed; and
+  - all 195 Rust test files follow `tests_<owner>.rs`, all source test paths
+    resolve, no inline test body or singleton source directory remains, and the
+    move preserved every prior test except the intentional cancellation
+    lifecycle replacement.
+- Product and public surface:
+  - README presents compact product/baseline and numeric performance tables
+    without a fixed release number or internal development process; lower-bound
+    upload values are not promoted to a ratio or ranking;
+  - the public configuration reference mirrors the implemented credentials,
+    DNS, routing, outbound security, resource, port-range, and `1-3` TCP
+    carrier fields, including all three bounded chunk/range limits;
+  - bounded flow detail is labeled `Shown`/`Shown I/O` and reports overflow;
+    cumulative chart counters remain exact decimal strings and only a bounded
+    BigInt offset is converted for canvas plotting; and
+  - a fresh 1600-by-1000 live browser capture contains three active inbound
+    flows, one authenticated MPP session, two TCP/QUIC paths, changing speed,
+    and zero console warnings. Speed and cumulative-traffic modes both render.
+- Evidence boundaries:
+  - the 10-TCP/10-QUIC cases span 30--100, 300--1,000, and 3,000--10,000
+    Mbps/path ranges and prove completion/adaptation, not configured-rate
+    saturation or universal optimality;
+  - asymmetric download placed 91.5% on the faster direction; the exact upload
+    check placed 86.6% on its faster direction but is retained only as path-use
+    evidence because its host state was unsuitable for throughput comparison;
+  - periodic browser load completed 90/90 within its three-second batches; the
+    60-second, 20-concurrent, 1-MiB closed loop completed 570/570 with no
+    rejection or incomplete response; and
+  - the release workflow contains no provenance/signing step and publishes only
+    seven versioned bundles plus `version.json`, whose per-asset fields are
+    exactly `name` and tag-specific `download_url`.
+- Verification:
+  - formatting and warnings-denied all-target/all-feature Clippy pass;
+  - root tests pass 1,519 unit tests, 2 allocation contracts, and 6 packaged
+    daily-use scenarios; maintained Quinn passes 282 tests and 3 doctests;
+  - 207 lab contracts, 5 benchmark/trace tests, 9 packaging contracts, the
+    29-cell/66-metric registry, version gate, Bash syntax, ShellCheck,
+    Actionlint, JavaScript syntax, and whitespace checks pass; and
+  - the normalized Linux amd64 archive is a static PIE reporting
+    `mptunnel 0.1.5` and contains exactly five contracted files, with no project
+    license copy or checksum sidecar.
+- Next: commit this exact candidate, run the eight-row clean-source TCP/QUIC
+  single/equal-path download/upload matrix without instrumentation, and proceed
+  directly to native GitHub CI, tag, immutable release verification, and
+  requested generated-cache cleanup if it remains in the accepted range.

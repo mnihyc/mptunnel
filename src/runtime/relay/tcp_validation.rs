@@ -15,7 +15,7 @@ use crate::protocol::{Frame, OffsetRange, TcpCarrierValidationResult};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_queue};
-use crate::runtime::path::tcp::client_validation::{
+use crate::runtime::path::tcp::client::validation::{
     ClientTcpValidationCandidate, ClientTcpValidationController, ClientTcpValidationEvent,
     ClientTcpValidationHandoff, ClientTcpValidationSession,
 };

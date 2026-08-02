@@ -907,5 +907,5 @@ pub(in crate::runtime) fn stream_terminal_fin_replay_required(
 }
 
 #[cfg(test)]
-#[path = "io_test.rs"]
+#[path = "tests_io.rs"]
 mod tests;

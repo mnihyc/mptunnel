@@ -70,5 +70,5 @@ pub(crate) fn reliable_ack_clock_measurement_ceiling_bytes(mux_limits: MuxLimits
 }
 
 #[cfg(test)]
-#[path = "ack_clock_test.rs"]
+#[path = "tests_ack_clock.rs"]
 mod tests;

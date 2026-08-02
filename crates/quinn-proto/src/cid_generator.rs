@@ -168,13 +168,5 @@ const NONCE_LEN: usize = 3; // Good for more than 16 million connections
 const SIGNATURE_LEN: usize = 8 - NONCE_LEN; // 8-byte total CID length
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_keyed_cid() {
-        let mut generator = HashedConnectionIdGenerator::new();
-        let cid = generator.generate_cid();
-        generator.validate(&cid).unwrap();
-    }
-}
+#[path = "tests_cid_generator.rs"]
+mod tests;

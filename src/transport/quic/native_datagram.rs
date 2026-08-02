@@ -715,5 +715,5 @@ fn encode_varint(value: u64, output: &mut Vec<u8>) -> Result<(), QuicCarrierErro
 }
 
 #[cfg(test)]
-#[path = "native_datagram_test.rs"]
+#[path = "tests_native_datagram.rs"]
 mod tests;

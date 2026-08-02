@@ -42,6 +42,7 @@ pub enum RuntimeError {
     DatagramResponseTimedOut,
     SenderServiceBlocked,
     ReliablePathSessionClosed,
+    ReliablePathAttachmentRefused,
     ReliablePathRetired,
     SessionRetentionTimeout,
     ProductPolicy(String),
@@ -215,6 +216,9 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "sender service has no currently admissible path")
             }
             Self::ReliablePathSessionClosed => write!(f, "reliable path session closed"),
+            Self::ReliablePathAttachmentRefused => {
+                write!(f, "reliable path attachment refused")
+            }
             Self::ReliablePathRetired => write!(f, "reliable path retired normally"),
             Self::SessionRetentionTimeout => {
                 write!(
@@ -244,7 +248,7 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "credential admission rejected: {error}")
             }
             Self::ProductAdmission(error) => {
-                write!(f, "Product resource admission rejected: {error}")
+                write!(f, "flow resource admission rejected: {error}")
             }
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
         }
@@ -281,6 +285,7 @@ impl std::error::Error for RuntimeError {
             | Self::DatagramResponseTimedOut
             | Self::SenderServiceBlocked
             | Self::ReliablePathSessionClosed
+            | Self::ReliablePathAttachmentRefused
             | Self::ReliablePathRetired
             | Self::SessionRetentionTimeout
             | Self::ProductPolicy(_)
@@ -301,22 +306,5 @@ impl std::error::Error for RuntimeError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quic_path_lifetime_failures_are_migratable_but_protocol_shape_errors_are_not() {
-        assert!(reliable_path_error_is_migratable(
-            &RuntimeError::QuicCarrier(QuicCarrierError::H3DriverClosed)
-        ));
-        assert!(reliable_path_error_is_migratable(
-            &RuntimeError::QuicCarrier(QuicCarrierError::UnexpectedEnd)
-        ));
-        assert!(!reliable_path_error_is_migratable(
-            &RuntimeError::QuicCarrier(QuicCarrierError::FrameTooLarge)
-        ));
-        assert!(!reliable_path_error_is_migratable(
-            &RuntimeError::QuicCarrier(QuicCarrierError::H3Role("invalid carrier role"))
-        ));
-    }
-}
+#[path = "tests_error.rs"]
+mod tests;

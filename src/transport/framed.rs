@@ -98,5 +98,5 @@ impl std::error::Error for FramedTransportError {
 }
 
 #[cfg(test)]
-#[path = "framed_test.rs"]
+#[path = "tests_framed.rs"]
 mod tests;

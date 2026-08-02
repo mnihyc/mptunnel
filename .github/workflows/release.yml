@@ -350,8 +350,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     steps:
       - name: Checkout tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -488,14 +486,6 @@ jobs:
             done < .tmp/ci/existing-assets.txt
           fi
           echo "state=${state}" >> "$GITHUB_OUTPUT"
-
-      - name: Attest release archives
-        if: steps.release_state.outputs.state != 'published'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: |
-            .tmp/ci/artifacts/*.tar.gz
-            .tmp/ci/artifacts/*.zip
 
       - name: Complete matching draft payload
         if: steps.release_state.outputs.state == 'draft'

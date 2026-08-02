@@ -317,5 +317,5 @@ fn server_path_metrics_scheduling_equivalent(
 }
 
 #[cfg(test)]
-#[path = "evidence_test.rs"]
+#[path = "tests_evidence.rs"]
 mod tests;

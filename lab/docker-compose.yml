@@ -24,6 +24,36 @@ services:
         ipv4_address: 172.31.20.10
       path_poor:
         ipv4_address: 172.31.30.10
+      path_scale_tcp_06:
+        ipv4_address: 172.31.41.10
+      path_scale_tcp_07:
+        ipv4_address: 172.31.42.10
+      path_scale_tcp_08:
+        ipv4_address: 172.31.43.10
+      path_scale_tcp_09:
+        ipv4_address: 172.31.44.10
+      path_scale_tcp_10:
+        ipv4_address: 172.31.45.10
+      path_scale_udp_01:
+        ipv4_address: 172.31.51.10
+      path_scale_udp_02:
+        ipv4_address: 172.31.52.10
+      path_scale_udp_03:
+        ipv4_address: 172.31.53.10
+      path_scale_udp_04:
+        ipv4_address: 172.31.54.10
+      path_scale_udp_05:
+        ipv4_address: 172.31.55.10
+      path_scale_udp_06:
+        ipv4_address: 172.31.56.10
+      path_scale_udp_07:
+        ipv4_address: 172.31.57.10
+      path_scale_udp_08:
+        ipv4_address: 172.31.58.10
+      path_scale_udp_09:
+        ipv4_address: 172.31.59.10
+      path_scale_udp_10:
+        ipv4_address: 172.31.60.10
 
   server:
     build:
@@ -48,6 +78,36 @@ services:
         ipv4_address: 172.31.20.20
       path_poor:
         ipv4_address: 172.31.30.20
+      path_scale_tcp_06:
+        ipv4_address: 172.31.41.20
+      path_scale_tcp_07:
+        ipv4_address: 172.31.42.20
+      path_scale_tcp_08:
+        ipv4_address: 172.31.43.20
+      path_scale_tcp_09:
+        ipv4_address: 172.31.44.20
+      path_scale_tcp_10:
+        ipv4_address: 172.31.45.20
+      path_scale_udp_01:
+        ipv4_address: 172.31.51.20
+      path_scale_udp_02:
+        ipv4_address: 172.31.52.20
+      path_scale_udp_03:
+        ipv4_address: 172.31.53.20
+      path_scale_udp_04:
+        ipv4_address: 172.31.54.20
+      path_scale_udp_05:
+        ipv4_address: 172.31.55.20
+      path_scale_udp_06:
+        ipv4_address: 172.31.56.20
+      path_scale_udp_07:
+        ipv4_address: 172.31.57.20
+      path_scale_udp_08:
+        ipv4_address: 172.31.58.20
+      path_scale_udp_09:
+        ipv4_address: 172.31.59.20
+      path_scale_udp_10:
+        ipv4_address: 172.31.60.20
       target_net:
         ipv4_address: 172.31.40.20
 
@@ -98,6 +158,66 @@ networks:
     ipam:
       config:
         - subnet: 172.31.30.0/24
+  path_scale_tcp_06:
+    ipam:
+      config:
+        - subnet: 172.31.41.0/24
+  path_scale_tcp_07:
+    ipam:
+      config:
+        - subnet: 172.31.42.0/24
+  path_scale_tcp_08:
+    ipam:
+      config:
+        - subnet: 172.31.43.0/24
+  path_scale_tcp_09:
+    ipam:
+      config:
+        - subnet: 172.31.44.0/24
+  path_scale_tcp_10:
+    ipam:
+      config:
+        - subnet: 172.31.45.0/24
+  path_scale_udp_01:
+    ipam:
+      config:
+        - subnet: 172.31.51.0/24
+  path_scale_udp_02:
+    ipam:
+      config:
+        - subnet: 172.31.52.0/24
+  path_scale_udp_03:
+    ipam:
+      config:
+        - subnet: 172.31.53.0/24
+  path_scale_udp_04:
+    ipam:
+      config:
+        - subnet: 172.31.54.0/24
+  path_scale_udp_05:
+    ipam:
+      config:
+        - subnet: 172.31.55.0/24
+  path_scale_udp_06:
+    ipam:
+      config:
+        - subnet: 172.31.56.0/24
+  path_scale_udp_07:
+    ipam:
+      config:
+        - subnet: 172.31.57.0/24
+  path_scale_udp_08:
+    ipam:
+      config:
+        - subnet: 172.31.58.0/24
+  path_scale_udp_09:
+    ipam:
+      config:
+        - subnet: 172.31.59.0/24
+  path_scale_udp_10:
+    ipam:
+      config:
+        - subnet: 172.31.60.0/24
   target_net:
     ipam:
       config:

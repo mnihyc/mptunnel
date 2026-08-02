@@ -1505,5 +1505,5 @@ pub(in crate::runtime) fn arm_carrier_capacity_notifies(
 }
 
 #[cfg(test)]
-#[path = "handle_test.rs"]
+#[path = "tests_handle.rs"]
 mod tests;

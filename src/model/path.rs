@@ -100,5 +100,5 @@ pub(crate) fn next_carrier_path_instance_id() -> CarrierPathInstanceId {
 }
 
 #[cfg(test)]
-#[path = "path_test.rs"]
+#[path = "tests_path.rs"]
 mod tests;

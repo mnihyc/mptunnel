@@ -243,5 +243,5 @@ impl ManagementTarget {
 }
 
 #[cfg(test)]
-#[path = "management_test.rs"]
+#[path = "tests_management.rs"]
 mod tests;

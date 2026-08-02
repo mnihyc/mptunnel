@@ -771,5 +771,5 @@ pub(crate) fn test_server_tls_config() -> TcpServerTlsConfig {
 }
 
 #[cfg(test)]
-#[path = "encrypted_test.rs"]
+#[path = "tests_encrypted.rs"]
 mod tests;

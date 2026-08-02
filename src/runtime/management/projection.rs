@@ -166,7 +166,7 @@ pub(super) fn collect_snapshot(
             reason: target
                 .gateway_control
                 .is_none()
-                .then_some("balancer control requires a configured Product balancer"),
+                .then_some("balancer control requires a configured outbound balancer"),
         },
         peer_diagnostics: ManagementControlStatus {
             supported: !peer_sessions.is_empty(),

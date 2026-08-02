@@ -15,5 +15,5 @@ mod server_stream;
 mod server_writer;
 
 #[cfg(test)]
-#[path = "quic/estimator_test_support_test.rs"]
+#[path = "quic/tests_estimator_test_support.rs"]
 mod estimator_test_support;

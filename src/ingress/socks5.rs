@@ -431,5 +431,5 @@ impl std::fmt::Display for Socks5Error {
 impl std::error::Error for Socks5Error {}
 
 #[cfg(test)]
-#[path = "socks5_test.rs"]
+#[path = "tests_socks5.rs"]
 mod tests;

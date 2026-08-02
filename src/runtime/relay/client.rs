@@ -726,5 +726,5 @@ pub(super) fn apply_client_stream_ack(
 }
 
 #[cfg(test)]
-#[path = "client_test.rs"]
+#[path = "tests_client.rs"]
 mod tests;

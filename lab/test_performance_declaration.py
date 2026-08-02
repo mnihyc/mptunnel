@@ -122,8 +122,8 @@ class PerformanceDeclarationTests(unittest.TestCase):
             [
                 "src/runtime/datagram/quic.rs",
                 "src/scheduler/policy.rs",
-                "src/scheduler/policy_test.rs",
-                "docs/PERFORMANCE_DIAGNOSTICS.md",
+                "src/scheduler/tests_policy.rs",
+                "docs/ARCHITECTURE.md",
             ],
         )
 
@@ -137,8 +137,8 @@ class PerformanceDeclarationTests(unittest.TestCase):
             classified["matches"]["src/scheduler/policy.rs"]["required_scopes"],
             ["scheduler-and-recovery"],
         )
-        self.assertIn("src/scheduler/policy_test.rs", classified["ignored"])
-        self.assertIn("docs/PERFORMANCE_DIAGNOSTICS.md", classified["ignored"])
+        self.assertIn("src/scheduler/tests_policy.rs", classified["ignored"])
+        self.assertIn("docs/ARCHITECTURE.md", classified["ignored"])
 
     def test_performance_envelope_requires_full_matrix(self):
         changed_paths = ["src/performance.rs"]
@@ -372,7 +372,7 @@ class PerformanceDeclarationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             changed = Path(temp_dir) / "changed.txt"
-            changed.write_text("docs/PERFORMANCE_DIAGNOSTICS.md\n", encoding="utf-8")
+            changed.write_text("docs/ARCHITECTURE.md\n", encoding="utf-8")
             result = subprocess.run(
                 [
                     sys.executable,

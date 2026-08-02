@@ -1118,5 +1118,5 @@ impl ManagementHttpError {
 }
 
 #[cfg(test)]
-#[path = "http_test.rs"]
+#[path = "tests_http.rs"]
 mod tests;

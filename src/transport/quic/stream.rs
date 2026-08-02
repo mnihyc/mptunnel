@@ -10,7 +10,6 @@ use crate::protocol::codec::{
 };
 use crate::protocol::{DatagramFlowId, Frame};
 use bytes::{Bytes, BytesMut};
-use quinn::VarInt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,7 +21,6 @@ const QUIC_STREAM_RECORD_PAYLOAD_BYTES: usize = 10 * 1200;
 pub struct SendStream {
     pub(super) stream: H3SendStream,
     pub(super) native: NativeDatagramSender,
-    pub(super) connection: quinn::Connection,
     pub(super) write_backlog: Arc<AtomicU64>,
     pub(super) telemetry: Arc<QuicCarrierTelemetry>,
     pub(super) known_datagram_flows: Arc<Mutex<DatagramFlowRegistry>>,
@@ -50,46 +48,48 @@ impl SendStream {
 }
 
 pub(super) struct QuicWriteTransaction {
-    connection: quinn::Connection,
     write_backlog: Arc<AtomicU64>,
+    telemetry: Arc<QuicCarrierTelemetry>,
     packet_len: u64,
-    close_if_cancelled: bool,
+    delivery_evidence_bytes: u64,
+    rollback_delivery_evidence: bool,
 }
 
 impl QuicWriteTransaction {
     pub(super) fn new(
-        connection: quinn::Connection,
         write_backlog: Arc<AtomicU64>,
+        telemetry: Arc<QuicCarrierTelemetry>,
         packet_len: u64,
+        delivery_evidence_bytes: u64,
     ) -> Self {
+        telemetry.record_delivery_evidence_written(delivery_evidence_bytes);
         Self {
-            connection,
             write_backlog,
+            telemetry,
             packet_len,
-            close_if_cancelled: true,
+            delivery_evidence_bytes,
+            rollback_delivery_evidence: true,
         }
     }
 
     pub(super) fn complete(mut self) {
-        self.close_if_cancelled = false;
+        self.rollback_delivery_evidence = false;
     }
 
-    pub(super) fn fail_stream(mut self) {
-        self.close_if_cancelled = false;
-    }
+    pub(super) fn fail_stream(self) {}
 }
 
 impl Drop for QuicWriteTransaction {
     fn drop(&mut self) {
+        if self.rollback_delivery_evidence {
+            self.telemetry
+                .record_delivery_evidence_cancelled(self.delivery_evidence_bytes);
+        }
         let _ = self
             .write_backlog
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(self.packet_len))
             });
-        if self.close_if_cancelled {
-            self.connection
-                .close(VarInt::from_u32(1), b"cancelled HTTP/3 carrier write");
-        }
     }
 }
 
@@ -332,14 +332,14 @@ async fn write_reliable_frames(
     #[cfg(feature = "lab-diagnostics")]
     let write_started = std::time::Instant::now();
     send.write_backlog.fetch_add(packet_len, Ordering::Relaxed);
-    if delivery_evidence_bytes > 0 {
-        send.telemetry
-            .record_delivery_evidence_written(delivery_evidence_bytes);
-    }
+    // Reserve Product delivery evidence before handing DATA to H3. Native ACK
+    // callbacks may run before the write future resumes; the transaction rolls
+    // the reservation back if the request stream is cancelled or rejected.
     let transaction = QuicWriteTransaction::new(
-        send.connection.clone(),
         send.write_backlog.clone(),
+        send.telemetry.clone(),
         packet_len,
+        delivery_evidence_bytes,
     );
     if let Err(err) = send.stream.send_data(Bytes::from(packet)).await {
         transaction.fail_stream();
@@ -775,5 +775,5 @@ pub async fn finish_stream(send: &mut SendStream) -> Result<(), QuicCarrierError
 }
 
 #[cfg(test)]
-#[path = "stream_test.rs"]
+#[path = "tests_stream.rs"]
 mod tests;

@@ -1512,7 +1512,7 @@
     "README.md",
     "SECURITY.md",
     "docs/**",
-    "**/*_test.rs",
+    "**/tests_*.rs",
     "lab/test_*.py",
     "lab/PERFORMANCE_DECLARATIONS.md",
     "lab/performance-change.example.json",
@@ -1566,8 +1566,7 @@
     {
       "id": "performance-envelope",
       "patterns": [
-        "src/performance.rs",
-        "src/performance_test.rs"
+        "src/performance.rs"
       ],
       "required_scopes": [
         "full-matrix"

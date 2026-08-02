@@ -23,6 +23,9 @@ pub struct CongestionMetrics {
     pub timed_non_app_limited_acked_bytes: Option<u64>,
     pub non_app_limited_ack_elapsed: Option<Duration>,
     pub delivery_evidence_written_bytes: u64,
+    pub delivery_evidence_cancelled_bytes: u64,
+    pub delivery_evidence_pending_ack_bytes: u64,
+    pub delivery_evidence_newly_acked_bytes: Option<u64>,
     pub delivery_sample_count: u64,
     pub non_app_limited_delivery_sample_count: u64,
     pub timed_non_app_limited_delivery_sample_count: u64,
@@ -37,6 +40,7 @@ pub(super) struct QuicCarrierTelemetry {
     next_path_epoch: AtomicU64,
     current_path_epoch: AtomicU64,
     delivery_evidence_written_bytes: AtomicU64,
+    delivery_evidence_cancelled_bytes: AtomicU64,
     delivery_evidence_pending_ack_bytes: AtomicU64,
     delivery_activity_started: Arc<Notify>,
 }
@@ -57,6 +61,7 @@ struct QuicPathTelemetry {
     delivery_sample_count: AtomicU64,
     non_app_limited_delivery_sample_count: AtomicU64,
     timed_non_app_limited_delivery_sample_count: AtomicU64,
+    delivery_evidence_acked_bytes: AtomicU64,
     ack_snapshot_cursor: Mutex<QuicAckTelemetryTotals>,
     sent_bytes: AtomicU64,
     lost_bytes: AtomicU64,
@@ -72,6 +77,7 @@ struct QuicAckTelemetryTotals {
     sample_count: u64,
     non_app_limited_sample_count: u64,
     timed_non_app_limited_sample_count: u64,
+    delivery_evidence_acked_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +91,7 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
     pub(super) delivery_sample_count: u64,
     pub(super) non_app_limited_delivery_sample_count: u64,
     pub(super) timed_non_app_limited_delivery_sample_count: u64,
+    pub(super) delivery_evidence_newly_acked_bytes: Option<u64>,
     pub(super) loss_ppm: Option<u32>,
     pub(super) lost_bytes: u64,
     pub(super) app_limited: bool,
@@ -133,7 +140,25 @@ impl QuicCarrierTelemetry {
         self.delivery_evidence_written_bytes.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    pub(super) fn record_delivery_evidence_cancelled(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let pending_before = self
+            .delivery_evidence_pending_ack_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                Some(pending.saturating_sub(bytes))
+            })
+            .expect("delivery-evidence cancellation update is infallible");
+        self.delivery_evidence_cancelled_bytes
+            .fetch_add(pending_before.min(bytes), Ordering::Release);
+    }
+
+    pub(super) fn delivery_evidence_cancelled_bytes(&self) -> u64 {
+        self.delivery_evidence_cancelled_bytes
+            .load(Ordering::Acquire)
+    }
+
     pub(super) fn delivery_evidence_pending_ack_bytes(&self) -> u64 {
         self.delivery_evidence_pending_ack_bytes
             .load(Ordering::Acquire)
@@ -158,15 +183,17 @@ impl QuicCarrierTelemetry {
         })
     }
 
-    fn reconcile_delivery_evidence_ack(&self, path_epoch: u64, acked_bytes: u64) {
+    fn reconcile_delivery_evidence_ack(&self, path_epoch: u64, acked_bytes: u64) -> u64 {
         if acked_bytes == 0 || self.current_path_epoch.load(Ordering::Acquire) != path_epoch {
-            return;
+            return 0;
         }
-        let _ = self.delivery_evidence_pending_ack_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |pending| Some(pending.saturating_sub(acked_bytes)),
-        );
+        let pending_before = self
+            .delivery_evidence_pending_ack_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                Some(pending.saturating_sub(acked_bytes))
+            })
+            .expect("delivery-evidence ACK update is infallible");
+        pending_before.min(acked_bytes)
     }
 }
 
@@ -206,6 +233,9 @@ impl QuicPathTelemetry {
                 timed_non_app_limited_sample_count: self
                     .timed_non_app_limited_delivery_sample_count
                     .load(Ordering::Relaxed),
+                delivery_evidence_acked_bytes: self
+                    .delivery_evidence_acked_bytes
+                    .load(Ordering::Relaxed),
             };
             fence(Ordering::Acquire);
             let after = self.ack_snapshot_sequence.load(Ordering::Relaxed);
@@ -238,6 +268,9 @@ impl QuicPathTelemetry {
         let timed_non_app_limited_delivery_sample_count = totals
             .timed_non_app_limited_sample_count
             .wrapping_sub(cursor.timed_non_app_limited_sample_count);
+        let delivery_evidence_newly_acked_bytes = totals
+            .delivery_evidence_acked_bytes
+            .wrapping_sub(cursor.delivery_evidence_acked_bytes);
         *cursor = totals;
         drop(cursor);
         let sent_bytes = self.sent_bytes.load(Ordering::Relaxed);
@@ -260,6 +293,8 @@ impl QuicPathTelemetry {
             delivery_sample_count,
             non_app_limited_delivery_sample_count,
             timed_non_app_limited_delivery_sample_count,
+            delivery_evidence_newly_acked_bytes: (delivery_evidence_newly_acked_bytes > 0)
+                .then_some(delivery_evidence_newly_acked_bytes),
             loss_ppm,
             lost_bytes,
             app_limited: self.app_limited.load(Ordering::Relaxed),
@@ -294,6 +329,8 @@ impl QuicPathTelemetry {
                         .fetch_add(totals.timed_non_app_limited_sample_count, Ordering::Relaxed);
                 }
             }
+            self.delivery_evidence_acked_bytes
+                .fetch_add(totals.delivery_evidence_acked_bytes, Ordering::Relaxed);
             self.delivery_sample_count
                 .fetch_add(totals.sample_count, Ordering::Relaxed);
             self.ack_snapshot_sequence.fetch_add(1, Ordering::Release);
@@ -400,7 +437,7 @@ impl InstrumentedController {
                 };
                 (!elapsed.is_zero()).then_some(elapsed)
             });
-        let totals = QuicAckTelemetryTotals {
+        let mut totals = QuicAckTelemetryTotals {
             acked_bytes: self.ack_batch_acked_bytes,
             non_app_limited_acked_bytes: self.ack_batch_non_app_limited_acked_bytes,
             timed_non_app_limited_acked_bytes: non_app_limited_ack_elapsed
@@ -411,6 +448,7 @@ impl InstrumentedController {
             non_app_limited_sample_count: self.ack_batch_non_app_limited_sample_count,
             timed_non_app_limited_sample_count: non_app_limited_ack_elapsed
                 .map_or(0, |_| self.ack_batch_non_app_limited_sample_count),
+            delivery_evidence_acked_bytes: 0,
         };
 
         self.ack_batch_acked_bytes = 0;
@@ -432,10 +470,11 @@ impl InstrumentedController {
                     }),
             );
         }
+        totals.delivery_evidence_acked_bytes = self
+            .telemetry
+            .reconcile_delivery_evidence_ack(self.path_telemetry.path_epoch, totals.acked_bytes);
         self.path_telemetry
             .publish_ack_batch(totals, in_flight, app_limited);
-        self.telemetry
-            .reconcile_delivery_evidence_ack(self.path_telemetry.path_epoch, totals.acked_bytes);
     }
 }
 
@@ -606,5 +645,5 @@ impl quinn::congestion::Controller for InstrumentedController {
 }
 
 #[cfg(test)]
-#[path = "congestion_test.rs"]
+#[path = "tests_congestion.rs"]
 mod tests;

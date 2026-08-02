@@ -273,5 +273,5 @@ pub(super) fn quic_path_metrics_ack_interval(metrics: UdpPathMetrics) -> Duratio
 }
 
 #[cfg(test)]
-#[path = "metrics_test.rs"]
+#[path = "tests_metrics.rs"]
 mod tests;

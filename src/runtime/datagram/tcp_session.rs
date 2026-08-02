@@ -328,5 +328,5 @@ fn received_tcp_datagram_expires_at(
 }
 
 #[cfg(test)]
-#[path = "tcp_session_test.rs"]
+#[path = "tests_tcp_session.rs"]
 mod tests;

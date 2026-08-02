@@ -453,5 +453,5 @@ pub(in crate::runtime) struct AuthenticatedPathJoin {
 }
 
 #[cfg(test)]
-#[path = "authentication_test.rs"]
+#[path = "tests_authentication.rs"]
 mod tests;

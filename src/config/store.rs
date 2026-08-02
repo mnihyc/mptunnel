@@ -761,5 +761,5 @@ impl std::error::Error for ConfigStoreError {
 }
 
 #[cfg(test)]
-#[path = "store_test.rs"]
+#[path = "tests_store.rs"]
 mod tests;

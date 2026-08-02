@@ -1377,5 +1377,5 @@ impl From<ProcessExitError<AppError>> for AppError {
 impl std::error::Error for AppError {}
 
 #[cfg(test)]
-#[path = "app_test.rs"]
+#[path = "tests_app.rs"]
 mod tests;

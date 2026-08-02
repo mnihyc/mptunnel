@@ -1532,5 +1532,5 @@ impl std::fmt::Display for CodecError {
 impl std::error::Error for CodecError {}
 
 #[cfg(test)]
-#[path = "codec_test.rs"]
+#[path = "tests_codec.rs"]
 mod tests;

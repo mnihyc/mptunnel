@@ -1929,5 +1929,5 @@ impl RequestMultipathController {
 }
 
 #[cfg(test)]
-#[path = "multipath_test.rs"]
+#[path = "tests_multipath.rs"]
 mod tests;

@@ -38,6 +38,7 @@ impl UdpPathMetricTracker {
 struct QuicPathMetricTracker {
     path_epoch: Option<u64>,
     last_delivery_evidence_written_bytes: u64,
+    last_delivery_evidence_cancelled_bytes: u64,
     delivery_evidence_pending_ack_bytes: u64,
     delivery_rate_bps: Option<f64>,
     ack_derived_data_seen: bool,
@@ -69,6 +70,12 @@ impl QuicPathMetricTracker {
         match self.path_epoch {
             None => {
                 self.path_epoch = Some(congestion.path_epoch);
+                self.last_delivery_evidence_written_bytes =
+                    congestion.delivery_evidence_written_bytes;
+                self.last_delivery_evidence_cancelled_bytes =
+                    congestion.delivery_evidence_cancelled_bytes;
+                self.delivery_evidence_pending_ack_bytes =
+                    congestion.delivery_evidence_pending_ack_bytes;
             }
             Some(path_epoch) if path_epoch == congestion.path_epoch => {}
             Some(_) => {
@@ -80,6 +87,10 @@ impl QuicPathMetricTracker {
                     path_epoch: Some(congestion.path_epoch),
                     last_delivery_evidence_written_bytes: congestion
                         .delivery_evidence_written_bytes,
+                    last_delivery_evidence_cancelled_bytes: congestion
+                        .delivery_evidence_cancelled_bytes,
+                    delivery_evidence_pending_ack_bytes: congestion
+                        .delivery_evidence_pending_ack_bytes,
                     #[cfg(feature = "lab-diagnostics")]
                     last_lost_bytes: Some(congestion.lost_bytes),
                     ..Self::default()
@@ -129,6 +140,10 @@ impl QuicPathMetricTracker {
             .delivery_evidence_written_bytes
             .saturating_sub(self.last_delivery_evidence_written_bytes);
         self.last_delivery_evidence_written_bytes = congestion.delivery_evidence_written_bytes;
+        let delivery_evidence_cancelled_delta = congestion
+            .delivery_evidence_cancelled_bytes
+            .saturating_sub(self.last_delivery_evidence_cancelled_bytes);
+        self.last_delivery_evidence_cancelled_bytes = congestion.delivery_evidence_cancelled_bytes;
         #[cfg(feature = "lab-diagnostics")]
         let newly_lost_bytes = {
             let delta = self
@@ -192,9 +207,10 @@ impl QuicPathMetricTracker {
             .timed_non_app_limited_acked_bytes
             .unwrap_or(0)
             .min(non_app_limited_acked_bytes);
-        let delivery_evidence_pending_before_ack = self.delivery_evidence_pending_ack_bytes;
-        let delivery_evidence_newly_acked_bytes =
-            newly_acked_bytes.min(delivery_evidence_pending_before_ack);
+        let delivery_evidence_newly_acked_bytes = congestion
+            .delivery_evidence_newly_acked_bytes
+            .unwrap_or(0)
+            .min(newly_acked_bytes);
         let timed_non_app_limited_delivery_evidence_bytes =
             timed_non_app_limited_acked_bytes.min(delivery_evidence_newly_acked_bytes);
         let carrier_ack_elapsed = congestion
@@ -206,10 +222,11 @@ impl QuicPathMetricTracker {
         // carrier-clock denominator and therefore cannot enter the rate model.
         if delivery_evidence_newly_acked_bytes > 0 {
             self.ack_derived_data_seen = true;
-            self.delivery_evidence_pending_ack_bytes = self
-                .delivery_evidence_pending_ack_bytes
-                .saturating_sub(delivery_evidence_newly_acked_bytes);
         }
+        self.delivery_evidence_pending_ack_bytes = self
+            .delivery_evidence_pending_ack_bytes
+            .saturating_sub(delivery_evidence_newly_acked_bytes)
+            .saturating_sub(delivery_evidence_cancelled_delta);
         // Product evidence is separate from connection-wide pending/flight
         // counters, which still include framing and carrier control bytes.
         let carrier_committed_bytes = self
@@ -410,8 +427,8 @@ impl QuicPathMetricTracker {
 }
 
 #[cfg(test)]
-#[path = "estimator_lifecycle_test.rs"]
+#[path = "tests_estimator_lifecycle.rs"]
 mod lifecycle_tests;
 #[cfg(test)]
-#[path = "estimator_rate_test.rs"]
+#[path = "tests_estimator_rate.rs"]
 mod rate_tests;

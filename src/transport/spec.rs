@@ -747,5 +747,5 @@ impl std::fmt::Display for PathSpecParseError {
 impl std::error::Error for PathSpecParseError {}
 
 #[cfg(test)]
-#[path = "spec_test.rs"]
+#[path = "tests_spec.rs"]
 mod tests;

@@ -243,6 +243,11 @@ pub(super) async fn handle_additional_path_open_result(
                 }
             }
         }
+        Err(RuntimeError::ReliablePathAttachmentRefused) => {
+            // Attachment refusal is stream-local and says nothing about the
+            // health of the authenticated carrier.
+            None
+        }
         Err(err) if relay_path_open_error_is_retryable(additional_path_open.key.underlay, &err) => {
             // Preserve global health fencing. A later open becomes eligible
             // only after independent path evidence reactivates the carrier.
@@ -794,5 +799,5 @@ pub(in crate::runtime) fn reliable_relay_product_stall_deadline(
 }
 
 #[cfg(test)]
-#[path = "lifecycle_test.rs"]
+#[path = "tests_lifecycle.rs"]
 mod tests;

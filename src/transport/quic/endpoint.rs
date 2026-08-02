@@ -255,7 +255,6 @@ impl Connection {
             SendStream {
                 stream: stream.send,
                 native: native_send,
-                connection: self.connection.clone(),
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
                 known_datagram_flows: known_datagram_flows.clone(),
@@ -281,7 +280,6 @@ impl Connection {
             SendStream {
                 stream: stream.send,
                 native: native_send,
-                connection: self.connection.clone(),
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
                 known_datagram_flows: known_datagram_flows.clone(),
@@ -364,6 +362,11 @@ impl Connection {
             timed_non_app_limited_acked_bytes: snapshot.timed_non_app_limited_acked_bytes,
             non_app_limited_ack_elapsed: snapshot.non_app_limited_ack_elapsed,
             delivery_evidence_written_bytes: self.telemetry.delivery_evidence_written_bytes(),
+            delivery_evidence_cancelled_bytes: self.telemetry.delivery_evidence_cancelled_bytes(),
+            delivery_evidence_pending_ack_bytes: self
+                .telemetry
+                .delivery_evidence_pending_ack_bytes(),
+            delivery_evidence_newly_acked_bytes: snapshot.delivery_evidence_newly_acked_bytes,
             delivery_sample_count: snapshot.delivery_sample_count,
             non_app_limited_delivery_sample_count: snapshot.non_app_limited_delivery_sample_count,
             timed_non_app_limited_delivery_sample_count: snapshot
@@ -446,5 +449,5 @@ fn varint_saturating(value: u64) -> VarInt {
 }
 
 #[cfg(test)]
-#[path = "endpoint_test.rs"]
+#[path = "tests_endpoint.rs"]
 mod tests;

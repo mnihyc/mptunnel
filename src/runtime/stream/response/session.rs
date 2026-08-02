@@ -153,5 +153,5 @@ impl Drop for ServerSessionRegistration {
 }
 
 #[cfg(test)]
-#[path = "session_test.rs"]
+#[path = "tests_session.rs"]
 mod tests;

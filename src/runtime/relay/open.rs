@@ -194,6 +194,11 @@ pub(in crate::runtime) async fn open_remote_stream(
         .await
         {
             Ok(opened) => return Ok(opened),
+            Err(err @ RuntimeError::ReliablePathAttachmentRefused) => {
+                // Refusal is scoped to this stream attachment. Try another
+                // candidate without withdrawing the healthy carrier.
+                last_retryable_error = Some(err);
+            }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
                 mark_reliable_initial_open_retryable_failure(context, key);
                 last_retryable_error = Some(err);
@@ -576,5 +581,5 @@ pub(in crate::runtime) fn relay_error_is_tcp_path_failure<T>(
 }
 
 #[cfg(test)]
-#[path = "open_test.rs"]
+#[path = "tests_open.rs"]
 mod tests;

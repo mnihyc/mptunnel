@@ -27,6 +27,9 @@ openssl rand -hex 32 > mpp-credential.key
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -subj "/CN=server.example" \
   -addext "subjectAltName=DNS:server.example" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth" \
   -keyout server-private-key.pem -out server-certificate.pem
 ```
 

@@ -427,5 +427,5 @@ impl RequestTcpCapacityController {
 }
 
 #[cfg(test)]
-#[path = "tcp_capacity_test.rs"]
+#[path = "tests_tcp_capacity.rs"]
 mod tests;

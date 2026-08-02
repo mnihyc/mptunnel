@@ -655,6 +655,8 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayBalancerConfig {
+    /// The operator-facing `[[balancers]].name`, compiled once into a typed
+    /// reference. It is not a generated ordinal or an MPP wire identifier.
     pub id: BalancerId,
     pub generation: u64,
     pub spec: GatewayBalancerSpec,
@@ -1341,7 +1343,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "{actual} paths configured, limit is {limit}")
             }
             Self::PathNameInvalid => {
-                write!(f, "path name must be canonical Product name text")
+                write!(f, "path name must use canonical configuration-name text")
             }
             Self::DuplicatePathName(name) => {
                 write!(f, "duplicate path name {name:?}")
@@ -1386,16 +1388,13 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "outbound connect timeout must be greater than zero")
             }
             Self::InboundNameInvalid => {
-                write!(f, "inbound name must be canonical Product name text")
+                write!(f, "inbound name must use canonical configuration-name text")
             }
             Self::DuplicateInboundName(name) => {
                 write!(f, "duplicate inbound name {name:?}")
             }
             Self::LocalIngressRoutingRequired => {
-                write!(
-                    f,
-                    "local inbounds require a compiled Product routing policy"
-                )
+                write!(f, "local inbounds require a compiled routing policy")
             }
             Self::ProductPolicy(error) => write!(f, "{error}"),
             Self::ServerDestinationAcl(error) => {
@@ -1436,5 +1435,5 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
-#[path = "model_test.rs"]
+#[path = "tests_model.rs"]
 mod tests;

@@ -106,5 +106,5 @@ impl std::fmt::Display for HttpConnectClientError {
 impl std::error::Error for HttpConnectClientError {}
 
 #[cfg(test)]
-#[path = "http_connect_test.rs"]
+#[path = "tests_http_connect.rs"]
 mod tests;

@@ -353,5 +353,5 @@ impl Drop for RequiredServiceReadiness {
 }
 
 #[cfg(test)]
-#[path = "readiness_test.rs"]
+#[path = "tests_readiness.rs"]
 mod tests;

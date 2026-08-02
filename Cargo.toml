@@ -1,6 +1,7 @@
 [package]
 name = "mptunnel"
-version = "0.1.4"
+version = "0.1.5"
+authors = ["mnihyc"]
 edition = "2024"
 description = "Encrypted multipath proxy and tunnel"
 license = "Apache-2.0"

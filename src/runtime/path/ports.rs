@@ -5,7 +5,7 @@
 //! reinjection, and attachment behavior.
 
 use super::commands::ReliablePathCommandSender;
-use super::tcp::server_service::ServerTcpCarrierDemandSubscription;
+use super::tcp::server::service::ServerTcpCarrierDemandSubscription;
 use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;

@@ -500,5 +500,5 @@ pub(super) fn spawn_quic_path_reader(
 }
 
 #[cfg(test)]
-#[path = "io_test.rs"]
+#[path = "tests_io.rs"]
 mod tests;

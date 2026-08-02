@@ -100,6 +100,14 @@ matrix_good_jitter="${MPTUNNEL_LAB_MATRIX_GOOD_JITTER:-5ms}"
 matrix_poor_jitter="${MPTUNNEL_LAB_MATRIX_POOR_JITTER:-60ms}"
 matrix_good_loss="${MPTUNNEL_LAB_MATRIX_GOOD_LOSS:-1.00%}"
 matrix_poor_loss="${MPTUNNEL_LAB_MATRIX_POOR_LOSS:-15.00%}"
+scale_seed="${MPTUNNEL_LAB_SCALE_SEED:-mptunnel-scale-links}"
+
+scale_subnet_prefixes=(
+  172.31.10 172.31.15 172.31.16 172.31.20 172.31.30
+  172.31.41 172.31.42 172.31.43 172.31.44 172.31.45
+  172.31.51 172.31.52 172.31.53 172.31.54 172.31.55
+  172.31.56 172.31.57 172.31.58 172.31.59 172.31.60
+)
 
 blackhole_loss="${MPTUNNEL_LAB_BLACKHOLE_LOSS:-100%}"
 spike_fat_rate="${MPTUNNEL_LAB_SPIKE_FAT_RATE:-20mbit}"
@@ -125,18 +133,14 @@ interface_for_subnet() {
     | awk -v prefix="$subnet_prefix" '$4 ~ "^" prefix "\\." {print $2; exit}'
 }
 
-apply_profile() {
-  local subnet_prefix="$1"
-  local rate="$2"
-  local delay="$3"
-  local jitter="$4"
-  local loss="$5"
-  local iface limit_packets
-
-  iface="$(interface_for_subnet "$subnet_prefix")"
-  if [[ -z "$iface" ]]; then
-    return 0
-  fi
+apply_profile_to_interface() {
+  local operation="$1"
+  local iface="$2"
+  local rate="$3"
+  local delay="$4"
+  local jitter="$5"
+  local loss="$6"
+  local limit_packets
 
   limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
     netem_limit_packets "$rate" "$delay" "$jitter"
@@ -148,20 +152,54 @@ apply_profile() {
 
   case "$jitter" in
     0|0ms|0us|0ns|0s)
-      tc qdisc replace dev "$iface" root netem \
+      tc qdisc "$operation" dev "$iface" root netem \
         limit "$limit_packets" \
         rate "$rate" \
         delay "$delay" \
         loss "$loss"
       ;;
     *)
-      tc qdisc replace dev "$iface" root netem \
+      tc qdisc "$operation" dev "$iface" root netem \
         limit "$limit_packets" \
         rate "$rate" \
         delay "$delay" "$jitter" distribution normal \
         loss "$loss"
       ;;
   esac
+}
+
+apply_profile() {
+  local subnet_prefix="$1"
+  local rate="$2"
+  local delay="$3"
+  local jitter="$4"
+  local loss="$5"
+  local iface
+
+  iface="$(interface_for_subnet "$subnet_prefix")"
+  if [[ -z "$iface" ]]; then
+    return 0
+  fi
+
+  apply_profile_to_interface replace "$iface" "$rate" "$delay" "$jitter" "$loss"
+}
+
+apply_scale_profile() {
+  local operation="$1"
+  local subnet_prefix="$2"
+  local rate="$3"
+  local delay="$4"
+  local jitter="$5"
+  local loss="$6"
+  local iface
+
+  iface="$(interface_for_subnet "$subnet_prefix")"
+  if [[ -z "$iface" ]]; then
+    echo "scale topology is missing subnet ${subnet_prefix}.0/24" >&2
+    return 1
+  fi
+
+  apply_profile_to_interface "$operation" "$iface" "$rate" "$delay" "$jitter" "$loss"
 }
 
 apply_profile_all() {
@@ -175,6 +213,46 @@ apply_profile_all() {
   apply_profile "172.31.16" "$rate" "$delay" "$jitter" "$loss"
   apply_profile "172.31.20" "$rate" "$delay" "$jitter" "$loss"
   apply_profile "172.31.30" "$rate" "$delay" "$jitter" "$loss"
+}
+
+apply_scale_epoch() {
+  local epoch="$1"
+  local direction="$2"
+  local rate_band="$3"
+  local operation profile_json pid failed
+  local -a profile_pids=()
+  if [[ "$epoch" == "0" ]]; then
+    operation="replace"
+  else
+    # Preserve in-flight packets while changing the declared path condition.
+    # Replacing the qdisc would inject an undeclared simultaneous link reset.
+    operation="change"
+  fi
+  profile_json="$(python3 /workspace/lab/path_variation.py profiles \
+    --seed "$scale_seed" \
+    --epoch "$epoch" \
+    --direction "$direction" \
+    --rate-band "$rate_band")"
+  while IFS=$'\t' read -r subnet_prefix rate delay jitter loss; do
+    apply_scale_profile \
+      "$operation" "$subnet_prefix" "$rate" "$delay" "$jitter" "$loss" &
+    profile_pids+=("$!")
+  done < <(python3 /workspace/lab/path_variation.py profiles \
+    --seed "$scale_seed" \
+    --epoch "$epoch" \
+    --direction "$direction" \
+    --rate-band "$rate_band" \
+    --format tsv)
+  failed=0
+  for pid in "${profile_pids[@]}"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
+  if [[ "$failed" != "0" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$profile_json"
 }
 
 apply_tcp_per_flow_qos() {
@@ -272,7 +350,8 @@ clear_profile() {
 show_profile() {
   ip -o -4 addr show scope global | while read -r _ iface _ addr _; do
     case "$addr" in
-      172.31.10.*|172.31.15.*|172.31.16.*|172.31.20.*|172.31.30.*)
+      172.31.10.*|172.31.15.*|172.31.16.*|172.31.20.*|172.31.30.*|\
+      172.31.4[1-5].*|172.31.5[1-9].*|172.31.60.*)
         echo "$iface $addr"
         tc -s -d qdisc show dev "$iface"
         ;;
@@ -342,6 +421,26 @@ case "$mode" in
   tcp-shared-bottleneck)
     apply_tcp_shared_bottleneck "172.31.20" "$tcp_shared_bottleneck_rate"
     ;;
+  asymmetric-client)
+    # Upload egress: the balanced link is high-capacity and the low-latency
+    # link is constrained. The server mode reverses these capacities.
+    apply_profile "172.31.10" "20mbit" "40ms" "0ms" "0%"
+    apply_profile "172.31.15" "200mbit" "40ms" "0ms" "0%"
+    ;;
+  asymmetric-server)
+    # Download egress: the low-latency link is high-capacity and the balanced
+    # link is constrained.
+    apply_profile "172.31.10" "200mbit" "40ms" "0ms" "0%"
+    apply_profile "172.31.15" "20mbit" "40ms" "0ms" "0%"
+    ;;
+  scale-*-epoch-*-client|scale-*-epoch-*-server)
+    if [[ "$mode" =~ ^scale-(access|gigabit|multi-gigabit)-epoch-([0-9]+)-(client|server)$ ]]; then
+      apply_scale_epoch "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}"
+    else
+      echo "invalid scale epoch mode: $mode" >&2
+      exit 2
+    fi
+    ;;
   matrix-b*)
     bits="${mode#matrix-}"
     if [[ "$bits" != b[01][01][01] ]]; then
@@ -395,17 +494,15 @@ case "$mode" in
     apply_profile "172.31.30" "$spike_poor_rate" "$spike_poor_delay" "$spike_poor_jitter" "$spike_poor_loss"
     ;;
   unconstrained|unconstrained-all|clear)
-    clear_profile "172.31.10"
-    clear_profile "172.31.15"
-    clear_profile "172.31.16"
-    clear_profile "172.31.20"
-    clear_profile "172.31.30"
+    for subnet_prefix in "${scale_subnet_prefixes[@]}"; do
+      clear_profile "$subnet_prefix"
+    done
     ;;
   show)
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

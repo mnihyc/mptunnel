@@ -6,7 +6,7 @@ plus MPTUNNEL's performance-critical congestion-control patch. The upstream
 MIT and Apache-2.0 licenses are included unchanged.
 
 The local patch keeps Quinn's public congestion-controller boundary while
-aligning its experimental BBR implementation with the delivery-rate and pacing
+aligning its BBR implementation with the delivery-rate and pacing
 model used by the reference algorithm. The semantic deviations from upstream
 0.11.16 are:
 
@@ -28,9 +28,11 @@ model used by the reference algorithm. The semantic deviations from upstream
   the first RTT sample instead of entering ProbeRTT on the first useful ACK.
 
 The added BBR, bandwidth-estimator, pacer, and path-lifecycle tests cover these
-changes. No unrelated upstream source file differs from 0.11.16. The 0.11.16
-refresh first applies upstream's rand 0.10 and dependency baseline, then ports
-the MPTUNNEL delta across the overlapping BBR and connection plumbing files.
+changes. No unrelated non-test behavior differs from 0.11.16. Test bodies are
+mechanically extracted into `tests_<owner>.rs` files, with matching path
+declarations, to follow the repository-wide test layout. The 0.11.16 refresh
+first applies upstream's rand 0.10 and dependency baseline, then ports the
+MPTUNNEL delta across the overlapping BBR and connection plumbing files.
 
 The exact full-source mirror is deliberate: the required delivery, ACK/loss,
 pacing, and network-path hooks cross private Quinn internals and cannot be

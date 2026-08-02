@@ -665,5 +665,5 @@ fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[path = "config_test.rs"]
+#[path = "tests_config.rs"]
 mod tests;

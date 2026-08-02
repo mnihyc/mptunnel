@@ -296,5 +296,5 @@ pub(crate) fn path_pto_ms(path: PathSnapshot) -> f64 {
 }
 
 #[cfg(test)]
-#[path = "policy_test.rs"]
+#[path = "tests_policy.rs"]
 mod tests;

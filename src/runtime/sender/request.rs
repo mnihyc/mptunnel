@@ -56,7 +56,7 @@ mod multipath;
 mod scheduling;
 mod tcp_capacity;
 #[cfg(test)]
-#[path = "request/test_support_test.rs"]
+#[path = "request/tests_test_support.rs"]
 pub(super) mod test_support;
 
 // Ownership boundary:
@@ -1412,5 +1412,5 @@ fn reserve_request_frame_with_mode<'a>(
 }
 
 #[cfg(test)]
-#[path = "request_test.rs"]
+#[path = "tests_request.rs"]
 mod tests;

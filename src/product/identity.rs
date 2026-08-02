@@ -444,5 +444,5 @@ impl std::fmt::Display for CredentialAdmissionError {
 impl std::error::Error for CredentialAdmissionError {}
 
 #[cfg(test)]
-#[path = "identity_test.rs"]
+#[path = "tests_identity.rs"]
 mod tests;

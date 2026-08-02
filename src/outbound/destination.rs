@@ -257,7 +257,7 @@ pub enum DestinationAuthorizationError {
 impl std::fmt::Display for DestinationAuthorizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Target(error) => write!(formatter, "invalid Product destination: {error}"),
+            Self::Target(error) => write!(formatter, "invalid destination: {error}"),
             Self::Acl(error) => write!(formatter, "destination denied: {error}"),
             Self::TargetChanged => {
                 formatter.write_str("destination authorizer changed the normalized flow")

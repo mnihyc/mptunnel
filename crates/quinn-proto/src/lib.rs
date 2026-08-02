@@ -31,6 +31,7 @@ pub mod coding;
 mod constant_time;
 mod range_set;
 #[cfg(all(test, any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")))]
+#[path = "tests/tests_lib.rs"]
 mod tests;
 pub mod transport_parameters;
 mod varint;

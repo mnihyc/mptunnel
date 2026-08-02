@@ -1,4 +1,4 @@
-//! Deterministic multipath experiments over virtual time and path snapshots.
+//! Deterministic multipath simulations over virtual time and path snapshots.
 //!
 //! The harness shares production scoring primitives but does not represent
 //! deployed sender queues, carrier recovery, or end-to-end performance proof.
@@ -425,5 +425,5 @@ fn failover_gap_ms(attempts: &[SimulatedChunkAttempt], failure_ms: f64) -> Optio
 }
 
 #[cfg(test)]
-#[path = "simulator_test.rs"]
+#[path = "tests_simulator.rs"]
 mod tests;

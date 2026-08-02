@@ -1394,5 +1394,5 @@ impl From<&ResponseSenderPathTarget> for ResponseDispatchTarget {
 }
 
 #[cfg(test)]
-#[path = "attachment_test.rs"]
+#[path = "tests_attachment.rs"]
 mod tests;

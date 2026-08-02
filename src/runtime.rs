@@ -112,9 +112,9 @@ use node::run_path_probe_service as run_client_path_service;
 #[cfg(test)]
 use node::server::run as run_server;
 #[cfg(test)]
-use path::tcp::client::*;
+use path::tcp::client::connection::*;
 #[cfg(test)]
-use path::tcp::client_connection::*;
+use path::tcp::client::*;
 #[cfg(test)]
 use path::tcp::server::*;
 #[cfg(test)]
@@ -129,5 +129,5 @@ use stream::*;
 use tun_l4::*;
 
 #[cfg(test)]
-#[path = "runtime_test.rs"]
+#[path = "tests_runtime.rs"]
 mod tests;

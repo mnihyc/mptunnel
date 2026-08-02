@@ -619,5 +619,5 @@ fn response_external_ordering_debt_bytes(
 }
 
 #[cfg(test)]
-#[path = "scheduling_test.rs"]
+#[path = "tests_scheduling.rs"]
 mod tests;

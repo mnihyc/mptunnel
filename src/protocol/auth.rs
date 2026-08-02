@@ -289,5 +289,5 @@ fn verify_tag(mac: HmacSha256, tag: AuthTag) -> bool {
 }
 
 #[cfg(test)]
-#[path = "auth_test.rs"]
+#[path = "tests_auth.rs"]
 mod tests;

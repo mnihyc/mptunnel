@@ -455,7 +455,7 @@ runtime. Runtime changes require focused tests plus matched end-to-end labs:
 - upload and download;
 - latency-sensitive and sustained bulk demand;
 - TCP-only, QUIC-only, and mixed carriers; and
-- shaped, unconstrained, fault, and separately recorded real-Internet cohorts.
+- shaped, unconstrained, fault, and separately recorded real-Internet runs.
 
 Diagnostics establish causality. Instrumentation-free matched rows establish
 performance. Historical rows from incompatible wire versions are references

@@ -4,17 +4,27 @@
 //! connection, stream, receive, capacity, and writer state remain with their
 //! runtime owners.
 
-use super::client_datagram::ClientTcpDatagramOpenCancellation;
-pub(in crate::runtime) use super::client_datagram::{
+mod capacity;
+pub(in crate::runtime) mod connection;
+mod datagram;
+mod receive;
+pub(super) mod session;
+pub(super) mod state;
+mod stream;
+pub(in crate::runtime) mod validation;
+mod writer;
+
+use self::datagram::ClientTcpDatagramOpenCancellation;
+pub(in crate::runtime) use self::datagram::{
     ClientTcpDatagramAttachment, ClientTcpDatagramInbound,
 };
-use super::client_session::{
+use self::session::{
     connect_client_tcp_path, publish_client_tcp_replacement_connection_committed,
     run_client_tcp_path_session, run_client_tcp_path_session_with_connection,
 };
-pub(in crate::runtime) use super::client_state::ClientTcpPathSessionRuntime;
-use super::client_stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
-use super::client_validation::ClientTcpValidationAdmission;
+pub(in crate::runtime) use self::state::ClientTcpPathSessionRuntime;
+use self::stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
+use self::validation::ClientTcpValidationAdmission;
 #[cfg(test)]
 use super::group::ClientTcpCarrierReservation;
 use super::service::{ClientTcpCarrierAdmission, ClientTcpServerToClientAdmission};

@@ -14,10 +14,18 @@
   <a class="skip-link" href="#main-content">Skip to content</a>
 
   <header class="topbar">
-    <div class="topbar__brand" aria-label="mptunnel dashboard">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">mptunnel</span>
-      <span class="brand-surface">Dashboard</span>
+    <div class="topbar__start">
+      <button id="sidebar-toggle" class="icon-button" type="button"
+              aria-controls="dashboard-navigation" aria-expanded="true"
+              title="Hide navigation">
+        <span class="menu-icon" aria-hidden="true"></span>
+        <span class="sr-only">Toggle navigation</span>
+      </button>
+      <div class="topbar__brand" aria-label="mptunnel dashboard">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">mptunnel</span>
+        <span class="brand-surface">Dashboard</span>
+      </div>
     </div>
 
     <div class="topbar__status" aria-label="Dashboard connection status">
@@ -31,11 +39,21 @@
     <div class="topbar__actions">
       <label class="refresh-control" for="refresh-interval">
         <span>Auto refresh</span>
-        <select id="refresh-interval">
+        <select id="refresh-interval" aria-label="Auto refresh">
           <option value="1000">1 second</option>
           <option value="5000" selected>5 seconds</option>
           <option value="30000">30 seconds</option>
           <option value="0">Manual only</option>
+        </select>
+      </label>
+      <label class="refresh-control" for="chart-window">
+        <span>Chart history</span>
+        <select id="chart-window" aria-label="Chart history">
+          <option value="900000" selected>15 minutes</option>
+          <option value="3600000">1 hour</option>
+          <option value="21600000">6 hours</option>
+          <option value="86400000">24 hours</option>
+          <option value="0">Forever</option>
         </select>
       </label>
       <button id="access-button" class="button button--quiet" type="button">Access</button>
@@ -43,8 +61,10 @@
     </div>
   </header>
 
-  <nav class="tabs-shell" aria-label="Dashboard sections">
-    <div id="dashboard-tabs" class="tabs" role="tablist" aria-orientation="horizontal">
+  <div id="app-shell" class="app-shell">
+  <nav id="dashboard-navigation" class="tabs-shell" aria-label="Dashboard sections">
+    <p class="sidebar-label">Monitor</p>
+    <div id="dashboard-tabs" class="tabs" role="tablist" aria-orientation="vertical">
       <button id="tab-overview" class="tab is-active" type="button" role="tab"
               aria-selected="true" aria-controls="panel-overview" tabindex="0"
               data-tab="overview">Overview</button>
@@ -71,22 +91,23 @@
 
     <section id="panel-overview" class="tab-panel" role="tabpanel"
              aria-labelledby="tab-overview" data-panel="overview">
-      <div class="section-heading">
+      <div class="section-heading section-heading--overview">
         <div>
-          <p class="eyebrow">Runtime overview</p>
-          <h1>Current operation</h1>
+          <p class="eyebrow">Runtime</p>
+          <h1>Overview</h1>
+          <p class="section-description">Live connections, transport health, traffic, and configured operating bounds.</p>
         </div>
         <p id="overview-timestamp" class="section-meta">No sample</p>
       </div>
 
       <div class="kpi-grid" aria-label="Current key metrics">
         <article class="kpi">
-          <p class="kpi__label">To peer</p>
+          <p class="kpi__label">Upload speed</p>
           <p id="kpi-to-rate" class="kpi__value">--</p>
           <p id="kpi-to-total" class="kpi__detail">-- transferred</p>
         </article>
         <article class="kpi">
-          <p class="kpi__label">From peer</p>
+          <p class="kpi__label">Download speed</p>
           <p id="kpi-from-rate" class="kpi__value">--</p>
           <p id="kpi-from-total" class="kpi__detail">-- transferred</p>
         </article>
@@ -116,16 +137,24 @@
         <article class="chart-tool" aria-labelledby="traffic-chart-title">
           <header class="chart-tool__header">
             <div>
-              <p class="eyebrow">Last five minutes</p>
-              <h2 id="traffic-chart-title">Forwarded traffic</h2>
+              <p id="traffic-chart-window" class="eyebrow">Building 15 minute history</p>
+              <h2 id="traffic-chart-title">Transfer speed</h2>
             </div>
-            <div class="chart-legend" aria-label="Traffic chart legend">
-              <span><i class="legend-line legend-line--to" aria-hidden="true"></i>To peer</span>
-              <span><i class="legend-line legend-line--from" aria-hidden="true"></i>From peer</span>
+            <div class="chart-tool__tools">
+              <div class="chart-mode" role="group" aria-label="Traffic chart metric">
+                <button id="chart-mode-speed" class="chart-mode__button is-active" type="button"
+                        aria-pressed="true">Speed</button>
+                <button id="chart-mode-total" class="chart-mode__button" type="button"
+                        aria-pressed="false">Total</button>
+              </div>
+              <div class="chart-legend" aria-label="Traffic chart legend">
+                <span><i class="legend-line legend-line--to" aria-hidden="true"></i>Upload</span>
+                <span><i class="legend-line legend-line--from" aria-hidden="true"></i>Download</span>
+              </div>
             </div>
           </header>
           <div class="canvas-frame">
-            <canvas id="traffic-chart" aria-label="Forwarded traffic rate history"></canvas>
+            <canvas id="traffic-chart" aria-label="Transfer speed history"></canvas>
             <p id="traffic-chart-empty" class="canvas-empty">Waiting for traffic samples</p>
           </div>
         </article>
@@ -133,7 +162,7 @@
         <article class="chart-tool" aria-labelledby="flows-chart-title">
           <header class="chart-tool__header">
             <div>
-              <p class="eyebrow">Last five minutes</p>
+              <p id="flows-chart-window" class="eyebrow">Building 15 minute history</p>
               <h2 id="flows-chart-title">Active flows</h2>
             </div>
             <div class="chart-legend" aria-label="Active flows chart legend">
@@ -147,50 +176,244 @@
         </article>
       </div>
 
+      <section class="data-section data-section--wide overview-connections"
+               aria-labelledby="overview-connections-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="overview-connections-title">Inbound connections</h2>
+            <p class="section-meta">Visible active logical streams and datagram associations.</p>
+          </div>
+          <span id="overview-connections-count" class="badge badge--neutral">0 active</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--connections">
+            <thead>
+              <tr>
+                <th scope="col">Type</th>
+                <th scope="col">Inbound</th>
+                <th scope="col">Connection</th>
+                <th scope="col">Network</th>
+                <th scope="col">Destination</th>
+                <th scope="col">Outbound</th>
+                <th scope="col">Activity</th>
+                <th scope="col">Traffic</th>
+              </tr>
+            </thead>
+            <tbody id="overview-connections-body"></tbody>
+          </table>
+        </div>
+        <div id="overview-connections-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No active inbound connections</h3>
+          <p>Configured listeners remain visible in the inbound services table below.</p>
+        </div>
+      </section>
+
       <div class="overview-grid">
-        <section class="data-section" aria-labelledby="traffic-breakdown-title">
-          <div class="data-section__header">
-            <h2 id="traffic-breakdown-title">Traffic breakdown</h2>
-          </div>
-          <div class="table-wrap">
-            <table class="compact-table">
-              <thead>
-                <tr>
-                  <th scope="col">Class</th>
-                  <th scope="col">To peer</th>
-                  <th scope="col">From peer</th>
-                  <th scope="col">Active</th>
-                  <th scope="col">Completed</th>
-                  <th scope="col">Failed</th>
-                </tr>
-              </thead>
-              <tbody id="traffic-breakdown-body"></tbody>
-            </table>
-          </div>
-        </section>
+        <div class="overview-grid__primary">
+          <section class="data-section" aria-labelledby="traffic-breakdown-title">
+            <div class="data-section__header">
+              <h2 id="traffic-breakdown-title">Traffic breakdown</h2>
+            </div>
+            <div class="table-wrap">
+              <table class="compact-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Class</th>
+                    <th scope="col">Upload</th>
+                    <th scope="col">Download</th>
+                    <th scope="col">Opened</th>
+                    <th scope="col">Active</th>
+                    <th scope="col">Completed</th>
+                    <th scope="col">Failed</th>
+                  </tr>
+                </thead>
+                <tbody id="traffic-breakdown-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="data-section" aria-labelledby="admission-title">
+            <div class="data-section__header">
+              <h2 id="admission-title">Admission and limits</h2>
+            </div>
+            <div class="table-wrap">
+              <table class="compact-table compact-table--admission">
+                <thead>
+                  <tr>
+                    <th scope="col">Resource</th>
+                    <th scope="col">Current</th>
+                    <th scope="col">Limit</th>
+                    <th scope="col">Rejected</th>
+                  </tr>
+                </thead>
+                <tbody id="admission-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
 
         <section class="data-section" aria-labelledby="services-title">
           <div class="data-section__header">
             <h2 id="services-title">Services</h2>
           </div>
           <dl id="services-list" class="metric-list"></dl>
-          <div id="inbounds-wrap" class="inbounds-wrap" hidden>
-            <h3>Local inbounds</h3>
-            <ul id="inbounds-list" class="plain-list"></ul>
-          </div>
-          <div id="outbounds-wrap" class="inbounds-wrap" hidden>
-            <h3>Outbounds</h3>
-            <ul id="outbounds-list" class="plain-list"></ul>
-          </div>
         </section>
       </div>
+
+      <section class="data-section data-section--wide" aria-labelledby="inbound-services-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="inbound-services-title">Inbound services</h2>
+            <p class="section-meta">Configured listeners and visible active-flow detail.</p>
+          </div>
+          <span id="inbound-services-count" class="badge badge--neutral">0 configured</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--inventory">
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Protocol</th>
+                <th scope="col">Listen / interface</th>
+                <th scope="col">Target</th>
+                <th scope="col">Authentication</th>
+                <th scope="col">Shown</th>
+                <th scope="col">Shown I/O</th>
+              </tr>
+            </thead>
+            <tbody id="inbound-services-body"></tbody>
+          </table>
+        </div>
+        <div id="inbound-services-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No local inbound services</h3>
+          <p>MPP carrier listeners and outbound services are summarized separately.</p>
+        </div>
+      </section>
+
+      <section class="data-section data-section--wide" aria-labelledby="overview-sessions-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="overview-sessions-title">MPP sessions</h2>
+            <p class="section-meta">Authenticated peers, carrier membership, and active flow ownership.</p>
+          </div>
+          <span id="overview-sessions-count" class="badge badge--neutral">0 sessions</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--sessions">
+            <thead>
+              <tr>
+                <th scope="col">State</th>
+                <th scope="col">Session</th>
+                <th scope="col">Service</th>
+                <th scope="col">Carriers</th>
+                <th scope="col">References</th>
+                <th scope="col">Reliable flows</th>
+                <th scope="col">Datagram flows</th>
+              </tr>
+            </thead>
+            <tbody id="overview-sessions-body"></tbody>
+          </table>
+        </div>
+        <div id="overview-sessions-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No authenticated MPP sessions</h3>
+          <p>The runtime can still serve local direct or proxy outbounds.</p>
+        </div>
+      </section>
+
+      <section class="data-section data-section--wide" aria-labelledby="overview-paths-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="overview-paths-title">Path health and capacity</h2>
+            <p class="section-meta">Live transport metrics, ownership, and configured TCP carrier bounds.</p>
+          </div>
+          <span id="overview-paths-count" class="badge badge--neutral">0 paths</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--paths-complete">
+            <thead>
+              <tr>
+                <th scope="col">State</th>
+                <th scope="col">Path</th>
+                <th scope="col">Service / session</th>
+                <th scope="col">Carrier / bounds</th>
+                <th scope="col">Usage / direction</th>
+                <th scope="col">RTT / jitter</th>
+                <th scope="col">Delivery / pacing</th>
+                <th scope="col">Loss / ECN</th>
+                <th scope="col">Queue / flight / limit</th>
+                <th scope="col">Evidence</th>
+                <th scope="col">Flows</th>
+              </tr>
+            </thead>
+            <tbody id="overview-paths-body"></tbody>
+          </table>
+        </div>
+        <div id="overview-paths-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No configured or connected paths</h3>
+        </div>
+      </section>
+
+      <section class="data-section data-section--wide" aria-labelledby="outbound-services-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="outbound-services-title">Outbound services</h2>
+            <p class="section-meta">Configured egress and visible active-flow detail.</p>
+          </div>
+          <span id="outbound-services-count" class="badge badge--neutral">0 configured</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--inventory">
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Protocol</th>
+                <th scope="col">Networks</th>
+                <th scope="col">Shown</th>
+                <th scope="col">Shown I/O</th>
+              </tr>
+            </thead>
+            <tbody id="outbound-services-body"></tbody>
+          </table>
+        </div>
+        <div id="outbound-services-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No configured outbound services</h3>
+        </div>
+      </section>
+
+      <section class="data-section data-section--wide" aria-labelledby="overview-balancers-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="overview-balancers-title">Balancer readiness</h2>
+            <p class="section-meta">Current selection policy, member readiness, flow load, and probe bounds.</p>
+          </div>
+          <span id="overview-balancers-count" class="badge badge--neutral">0 configured</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--inventory">
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Strategy</th>
+                <th scope="col">Members</th>
+                <th scope="col">Load</th>
+                <th scope="col">Probe</th>
+              </tr>
+            </thead>
+            <tbody id="overview-balancers-body"></tbody>
+          </table>
+        </div>
+        <div id="overview-balancers-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No balancers configured</h3>
+          <p>Routes select concrete outbounds directly.</p>
+        </div>
+      </section>
     </section>
 
     <section id="panel-balancers" class="tab-panel" role="tabpanel"
              aria-labelledby="tab-balancers" data-panel="balancers" hidden>
       <div class="section-heading">
         <div>
-          <p class="eyebrow">Product egress</p>
+          <p class="eyebrow">Outbound selection</p>
           <h1>Balancers</h1>
         </div>
         <p class="section-meta">Failover occurs before flow commit. Actions affect this runtime
@@ -242,13 +465,14 @@
           <h2>Authenticated MPP sessions</h2>
         </div>
         <div class="table-wrap table-wrap--records">
-          <table class="records-table">
+          <table class="records-table records-table--sessions">
             <thead>
               <tr>
                 <th scope="col">State</th>
                 <th scope="col">Session</th>
                 <th scope="col">Service</th>
                 <th scope="col">Carriers</th>
+                <th scope="col">References</th>
                 <th scope="col">Reliable flows</th>
                 <th scope="col">Datagram flows</th>
               </tr>
@@ -267,19 +491,19 @@
           <h2>Path inventory</h2>
         </div>
         <div class="table-wrap table-wrap--records">
-          <table class="records-table">
+          <table class="records-table records-table--paths-complete">
             <thead>
               <tr>
                 <th scope="col">State</th>
                 <th scope="col">Path</th>
-                <th scope="col">Service</th>
-                <th scope="col">Carrier</th>
-                <th scope="col">Usage</th>
-                <th scope="col">RTT</th>
-                <th scope="col">Delivery</th>
-                <th scope="col">Loss</th>
-                <th scope="col">Queue</th>
-                <th scope="col">In flight</th>
+                <th scope="col">Service / session</th>
+                <th scope="col">Carrier / bounds</th>
+                <th scope="col">Usage / direction</th>
+                <th scope="col">RTT / jitter</th>
+                <th scope="col">Delivery / pacing</th>
+                <th scope="col">Loss / ECN</th>
+                <th scope="col">Queue / flight / limit</th>
+                <th scope="col">Evidence</th>
                 <th scope="col">Flows</th>
               </tr>
             </thead>
@@ -312,16 +536,14 @@
           <table class="records-table">
             <thead>
               <tr>
-                <th scope="col">Kind</th>
-                <th scope="col">Flow</th>
-                <th scope="col">Origin</th>
-                <th scope="col">Egress</th>
-                <th scope="col">Session</th>
-                <th scope="col">Target</th>
-                <th scope="col">Age</th>
-                <th scope="col">Idle</th>
-                <th scope="col">To peer</th>
-                <th scope="col">From peer</th>
+                <th scope="col">Type</th>
+                <th scope="col">Inbound</th>
+                <th scope="col">Connection</th>
+                <th scope="col">Network</th>
+                <th scope="col">Destination</th>
+                <th scope="col">Outbound</th>
+                <th scope="col">Activity</th>
+                <th scope="col">Traffic</th>
               </tr>
             </thead>
             <tbody id="flows-body"></tbody>
@@ -403,6 +625,7 @@
       </div>
     </section>
   </main>
+  </div>
 
   <div id="sr-status" class="sr-only" role="status" aria-live="polite"></div>
 

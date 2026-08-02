@@ -417,5 +417,5 @@ fn next_nonzero(next: &mut u64) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "peer_status_test.rs"]
+#[path = "tests_peer_status.rs"]
 mod tests;

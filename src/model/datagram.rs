@@ -97,5 +97,5 @@ impl DatagramReceiveWindow {
 }
 
 #[cfg(test)]
-#[path = "datagram_test.rs"]
+#[path = "tests_datagram.rs"]
 mod tests;

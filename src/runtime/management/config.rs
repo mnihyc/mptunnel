@@ -320,5 +320,5 @@ fn map_store_error(error: ConfigStoreError) -> ManagementHttpError {
 }
 
 #[cfg(test)]
-#[path = "config_test.rs"]
+#[path = "tests_config.rs"]
 mod tests;

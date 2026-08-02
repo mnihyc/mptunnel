@@ -1,7 +1,7 @@
 //! Simulator-private queueing and scheduling hypotheses.
 //!
 //! DRR, virtual backlog, tail mode, close-ETA duplication, and shared-bottleneck
-//! suspicion live here so experiments cannot masquerade as runtime mechanisms.
+//! suspicion live here so simulations cannot masquerade as runtime mechanisms.
 
 use crate::protocol::PathId;
 use crate::scheduler::{
@@ -38,10 +38,10 @@ pub(super) struct SchedulerDecision {
     pub(super) estimated_completion_ms: f64,
 }
 
-/// Queueing model used only by deterministic experiments.
+/// Queueing model used only by deterministic simulations.
 ///
 /// Deployed senders own their carrier queues and admission state. The
-/// simulator keeps a compact virtual queue here so experiments can model
+/// simulator keeps a compact virtual queue here so simulations can model
 /// fairness, aggregation, and failure without creating a second runtime.
 #[derive(Debug, Default)]
 pub(super) struct HeterogeneousScheduler {
@@ -396,5 +396,5 @@ fn path_rtt_samples_overlap(path: PathSnapshot, other: PathSnapshot) -> bool {
 }
 
 #[cfg(test)]
-#[path = "scheduling_test.rs"]
+#[path = "tests_scheduling.rs"]
 mod tests;

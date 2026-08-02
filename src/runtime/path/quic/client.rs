@@ -837,6 +837,11 @@ async fn read_client_udp_stream_open_accept(
                 stream_id: reset_stream_id,
                 reason,
             } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+            Frame::StreamDetach {
+                stream_id: detached_stream_id,
+            } if detached_stream_id == stream_id => {
+                return Err(RuntimeError::ReliablePathAttachmentRefused);
+            }
             Frame::PathStatus {
                 path_id: status_path_id,
                 sequence,
@@ -864,7 +869,7 @@ async fn read_client_udp_stream_open_accept(
 }
 
 #[cfg(test)]
-#[path = "client_test.rs"]
+#[path = "tests_client.rs"]
 mod tests;
 
 async fn open_client_udp_datagram_stream(

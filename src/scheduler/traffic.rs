@@ -52,5 +52,5 @@ pub(crate) fn cyclic_cursor_distance(position: usize, cursor: usize, len: usize)
 }
 
 #[cfg(test)]
-#[path = "traffic_test.rs"]
+#[path = "tests_traffic.rs"]
 mod tests;

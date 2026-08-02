@@ -501,5 +501,5 @@ impl std::os::windows::io::AsRawSocket for CarrierSocket {
 }
 
 #[cfg(test)]
-#[path = "carrier_network_test.rs"]
+#[path = "tests_carrier_network.rs"]
 mod tests;

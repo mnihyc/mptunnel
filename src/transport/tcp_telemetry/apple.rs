@@ -93,5 +93,5 @@ fn snapshot_from_connection_info(
 }
 
 #[cfg(test)]
-#[path = "apple_test.rs"]
+#[path = "tests_apple.rs"]
 mod tests;

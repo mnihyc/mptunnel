@@ -7,7 +7,7 @@ use super::io::{
 };
 use super::server_writer::drain_server_udp_reliable_commands;
 use crate::model::capacity::RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET;
-use crate::protocol::{Frame, PathId, ResetReason, SessionId, StreamId, TargetAddr};
+use crate::protocol::{Frame, PathId, SessionId, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommandReceivers, ReliablePathCommandSender, recv_reliable_path_command,
@@ -94,13 +94,8 @@ pub(super) async fn handle_server_udp_reliable_stream(
         context.mux_limits,
         context.codec_limits,
     ));
-    let _output_detach_guard = ServerUdpReliableOutputDetachGuard {
-        streams: context.reliable_streams.clone(),
-        path_registration: path_registration.clone(),
-        stream_id,
-    };
     let mut path_proofs = PathProofTracker::from_limits(context.mux_limits);
-    match context
+    let accept_existing = match context
         .reliable_streams
         .open_or_attach(ServerStreamOpenRequest {
             session_id,
@@ -119,24 +114,12 @@ pub(super) async fn handle_server_udp_reliable_stream(
         })
         .await?
     {
-        ServerStreamOpenOutcome::New => {}
-        ServerStreamOpenOutcome::Existing => {
-            write_udp_stream_accept(
-                &mut send,
-                &context,
-                &path_registration,
-                stream_id,
-                &mut path_proofs,
-            )
-            .await?;
-        }
+        ServerStreamOpenOutcome::New => false,
+        ServerStreamOpenOutcome::Existing => true,
         ServerStreamOpenOutcome::DuplicateLiveIgnored => {
             udp_path_write_frame(
                 &mut send,
-                &Frame::StreamReset {
-                    stream_id,
-                    reason: ResetReason::Refused,
-                },
+                &Frame::StreamDetach { stream_id },
                 context.codec_limits,
             )
             .await?;
@@ -146,16 +129,31 @@ pub(super) async fn handle_server_udp_reliable_stream(
         ServerStreamOpenOutcome::Rejected => {
             udp_path_write_frame(
                 &mut send,
-                &Frame::StreamReset {
-                    stream_id,
-                    reason: ResetReason::Refused,
-                },
+                &Frame::StreamDetach { stream_id },
                 context.codec_limits,
             )
             .await?;
             let _ = udp_path_finish_stream(&mut send).await;
             return Ok(());
         }
+    };
+    // Arm cleanup only after this native stream owns the attachment. A refused
+    // duplicate has no attachment to detach and must leave the existing owner
+    // untouched.
+    let _output_detach_guard = ServerUdpReliableOutputDetachGuard {
+        streams: context.reliable_streams.clone(),
+        path_registration: path_registration.clone(),
+        stream_id,
+    };
+    if accept_existing {
+        write_udp_stream_accept(
+            &mut send,
+            &context,
+            &path_registration,
+            stream_id,
+            &mut path_proofs,
+        )
+        .await?;
     }
     run_server_udp_reliable_stream_loop(
         send,
@@ -433,29 +431,16 @@ async fn run_server_udp_reliable_stream_loop(
                                     "QUIC UDP path reannouncement opened duplicate stream",
                                 ));
                             }
-                            ServerStreamOpenOutcome::DuplicateLiveIgnored => {
+                            ServerStreamOpenOutcome::DuplicateLiveIgnored
+                            | ServerStreamOpenOutcome::Rejected => {
                                 udp_path_write_frame(
                                     &mut send,
-                                    &Frame::StreamReset {
-                                        stream_id,
-                                        reason: ResetReason::Refused,
-                                    },
+                                    &Frame::StreamDetach { stream_id },
                                     context.codec_limits,
                                 )
                                 .await?;
                                 let _ = udp_path_finish_stream(&mut send).await;
                                 return Ok(());
-                            }
-                            ServerStreamOpenOutcome::Rejected => {
-                                udp_path_write_frame(
-                                    &mut send,
-                                    &Frame::StreamReset {
-                                        stream_id,
-                                        reason: ResetReason::Refused,
-                                    },
-                                    context.codec_limits,
-                                )
-                                .await?;
                             }
                         }
                         continue;
@@ -593,5 +578,5 @@ async fn run_server_udp_reliable_stream_loop(
 }
 
 #[cfg(test)]
-#[path = "server_stream_test.rs"]
+#[path = "tests_server_stream.rs"]
 mod tests;

@@ -328,5 +328,5 @@ pub(in crate::runtime) struct PathJoinReplayKey {
 }
 
 #[cfg(test)]
-#[path = "server_context_test.rs"]
+#[path = "tests_server_context.rs"]
 mod tests;

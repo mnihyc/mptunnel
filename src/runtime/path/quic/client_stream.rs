@@ -278,6 +278,9 @@ async fn handle_client_udp_stream_input(
                 .await
                 .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
         }
+        Frame::StreamDetach {
+            stream_id: detached_stream_id,
+        } if detached_stream_id == stream_id => return Err(RuntimeError::ReliablePathRetired),
         Frame::PathStatus {
             path_id: status_path_id,
             sequence,
@@ -327,5 +330,5 @@ pub(super) fn apply_client_udp_path_status(
 }
 
 #[cfg(test)]
-#[path = "client_stream_test.rs"]
+#[path = "tests_client_stream.rs"]
 mod tests;

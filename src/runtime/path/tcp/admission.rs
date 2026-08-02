@@ -228,5 +228,5 @@ fn decode_prelude(encoded: &[u8; TCP_ADMISSION_PRELUDE_LEN]) -> Option<DecodedPr
 }
 
 #[cfg(test)]
-#[path = "admission_test.rs"]
+#[path = "tests_admission.rs"]
 mod tests;

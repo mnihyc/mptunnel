@@ -131,5 +131,5 @@ pub(crate) fn stream_ack_contiguous_frontier(ranges: &[OffsetRange]) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "frame_test.rs"]
+#[path = "tests_frame.rs"]
 mod tests;

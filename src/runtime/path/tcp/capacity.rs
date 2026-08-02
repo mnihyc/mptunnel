@@ -586,5 +586,5 @@ fn portable_tcp_receipt_metrics(path_id: PathId, direction: PathMetricDirection)
 }
 
 #[cfg(test)]
-#[path = "capacity_test.rs"]
+#[path = "tests_capacity.rs"]
 mod tests;

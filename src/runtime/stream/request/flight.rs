@@ -742,5 +742,5 @@ struct RequestFlight {
 }
 
 #[cfg(test)]
-#[path = "flight_test.rs"]
+#[path = "tests_flight.rs"]
 mod tests;

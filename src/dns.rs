@@ -3389,7 +3389,7 @@ impl std::fmt::Display for DnsRuntimeError {
                 )
             }
             Self::ProductAtCapacity { rejection } => {
-                write!(formatter, "Product DNS admission rejected: {rejection}")
+                write!(formatter, "DNS work admission rejected: {rejection}")
             }
             Self::Timeout { plan, domain } => {
                 write!(formatter, "DNS plan {plan} timed out resolving {domain}")
@@ -3425,5 +3425,5 @@ impl std::fmt::Display for DnsRuntimeError {
 impl std::error::Error for DnsRuntimeError {}
 
 #[cfg(test)]
-#[path = "dns_test.rs"]
+#[path = "tests_dns.rs"]
 mod tests;

@@ -420,9 +420,9 @@ impl ResponseStreamBinding {
 }
 
 #[cfg(test)]
-#[path = "response_test.rs"]
+#[path = "tests_response.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "response/test_support_test.rs"]
+#[path = "response/tests_test_support.rs"]
 mod test_support;

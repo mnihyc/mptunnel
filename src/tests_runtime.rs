@@ -1,0 +1,3641 @@
+use super::*;
+use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
+use crate::outbound::OutboundConfig;
+use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
+use crate::protocol::{PathPurpose, PathUsage};
+use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
+use crate::runtime::path::commands::{
+    reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
+    reliable_path_writer_frame_queue_for_payload,
+    reliable_path_writer_should_coalesce_partial_bulk_run,
+};
+use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
+use crate::runtime::path::{
+    ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerLocalPath,
+    ServerLocalPathProperties, ServerStreamOpenRequest, ServerStreamPathAttachment,
+};
+use crate::runtime::relay::lifecycle::{
+    reliable_relay_receive_hole_reinjection_active,
+    reliable_relay_receive_hole_reinjection_deadline, reliable_relay_response_stall_watch_bytes,
+    reliable_relay_stall_progress_anchor, reliable_relay_stall_watch_active,
+};
+use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
+use crate::transport::Endpoint;
+use crate::transport::tcp::bind_listener;
+use tokio::io::duplex;
+
+fn security() -> ClientSecurityConfig {
+    ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    )
+}
+
+fn server_security() -> ServerSecurityConfig {
+    ServerSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    )
+}
+
+#[derive(Default)]
+struct CountingCarrierNetworkProvider {
+    socket_count: std::sync::atomic::AtomicUsize,
+    socket_identities: std::sync::Mutex<Vec<crate::transport::CarrierPathIdentity>>,
+}
+
+impl CountingCarrierNetworkProvider {
+    fn socket_count(&self) -> usize {
+        self.socket_count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn socket_identities(&self) -> Vec<crate::transport::CarrierPathIdentity> {
+        self.socket_identities
+            .lock()
+            .expect("socket identities lock")
+            .clone()
+    }
+}
+
+impl crate::transport::CarrierNetworkProvider for CountingCarrierNetworkProvider {
+    fn resolve<'a>(
+        &'a self,
+        request: crate::transport::CarrierResolutionRequest<'a>,
+    ) -> crate::transport::CarrierResolutionFuture<'a> {
+        <crate::transport::SystemCarrierNetworkProvider as crate::transport::CarrierNetworkProvider>::resolve(
+            &crate::transport::SystemCarrierNetworkProvider,
+            request,
+        )
+    }
+
+    fn create_socket(
+        &self,
+        request: crate::transport::CarrierSocketRequest<'_>,
+    ) -> std::io::Result<crate::transport::CarrierSocket> {
+        self.socket_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.socket_identities
+            .lock()
+            .expect("socket identities lock")
+            .push(request.identity);
+        crate::transport::CarrierSocket::system(request)
+    }
+}
+
+async fn ping_client_udp_stream(
+    stream: &mut crate::runtime::path::quic::client::ClientUdpDatagramStream,
+) {
+    let nonce = random_u64().expect("probe nonce");
+    crate::runtime::path::quic::io::udp_path_write_frame(
+        &mut stream.send,
+        &Frame::Ping { nonce },
+        stream.runtime.codec_limits,
+    )
+    .await
+    .expect("write UDP stream ping");
+    loop {
+        match stream.frames.recv().await.expect("UDP stream response") {
+            Ok(Frame::Pong {
+                nonce: received_nonce,
+            }) if received_nonce == nonce => break,
+            Ok(Frame::SessionReady | Frame::PathStatus { .. }) => {}
+            Ok(frame) => panic!("unexpected UDP stream frame: {frame:?}"),
+            Err(err) => panic!("UDP stream failed before pong: {err}"),
+        }
+    }
+    crate::runtime::path::quic::io::udp_path_finish_stream(&mut stream.send)
+        .await
+        .expect("finish UDP ping stream");
+}
+
+fn server_carrier_identity(
+    registration: &ServerCarrierPathRegistration,
+) -> ServerCarrierPathIdentity {
+    ServerCarrierPathIdentity {
+        session_id: registration.session_id(),
+        underlay: registration.underlay(),
+        path_id: registration.path_id(),
+        path_instance_id: registration.path_instance_id(),
+    }
+}
+
+fn udp_candidate_indices(
+    context: &ClientPathContext,
+    payload_bytes: usize,
+    ttl_ms: u32,
+) -> Vec<usize> {
+    context
+        .ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms)
+        .into_iter()
+        .map(|candidate| candidate.path_index)
+        .collect()
+}
+
+async fn recv_emitted_tcp_path_command(
+    receivers: &mut ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
+    let command = recv_reliable_path_command(receivers).await;
+    if let Some(command) = &command {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(command));
+    }
+    command
+}
+
+fn server_runtime(outbound: OutboundConfig) -> ServerIdentityRuntime {
+    new_identity_runtime(
+        Vec::new(),
+        outbound,
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        server_security(),
+        MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+    )
+}
+
+#[test]
+fn tun_udp_dns_target_uses_configured_matching_resolver() {
+    let tun = TunL4Config {
+        dns_resolvers: vec![
+            "[2606:4700:4700::1111]:5353".parse().expect("resolver"),
+            "1.1.1.1:5353".parse().expect("resolver"),
+        ],
+        ..TunL4Config::default()
+    };
+
+    assert_eq!(
+        tun_udp_target_for_remote("8.8.8.8:53".parse().expect("remote"), &tun),
+        "1.1.1.1:5353".parse().expect("resolver")
+    );
+    assert_eq!(
+        tun_udp_target_for_remote("[2001:4860:4860::8888]:53".parse().expect("remote"), &tun),
+        "[2606:4700:4700::1111]:5353".parse().expect("resolver")
+    );
+    assert_eq!(
+        tun_udp_target_for_remote("8.8.8.8:443".parse().expect("remote"), &tun),
+        "8.8.8.8:443".parse().expect("remote")
+    );
+}
+
+#[test]
+fn socks5_udp_relay_preserves_control_address_family() {
+    let v4 = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let v6 = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+
+    assert_eq!(socks5_udp_relay_bind_addr(v4), SocketAddr::new(v4, 0));
+    assert_eq!(socks5_udp_relay_bind_addr(v6), SocketAddr::new(v6, 0));
+}
+
+#[test]
+fn socks5_udp_association_is_owned_by_the_tcp_peer_and_one_udp_port() {
+    let control_ip = "192.0.2.10".parse().expect("control IP");
+    let wildcard = TargetAddr::Ip("0.0.0.0:0".parse().expect("wildcard endpoint"));
+    let mut binding = Socks5UdpPeerBinding::new(control_ip, &wildcard).expect("wildcard binding");
+
+    assert!(!binding.accept("192.0.2.11:40000".parse().expect("foreign peer")));
+    assert!(binding.accept("192.0.2.10:40001".parse().expect("first peer")));
+    assert!(binding.accept("192.0.2.10:40001".parse().expect("same peer")));
+    assert!(!binding.accept("192.0.2.10:40002".parse().expect("changed port")));
+
+    let explicit = TargetAddr::Ip("192.0.2.10:41000".parse().expect("explicit endpoint"));
+    let mut explicit_binding =
+        Socks5UdpPeerBinding::new(control_ip, &explicit).expect("explicit binding");
+    assert!(!explicit_binding.accept("192.0.2.10:40999".parse().expect("wrong port")));
+    assert!(explicit_binding.accept("192.0.2.10:41000".parse().expect("declared peer")));
+
+    let foreign = TargetAddr::Ip("192.0.2.11:41000".parse().expect("foreign endpoint"));
+    assert!(Socks5UdpPeerBinding::new(control_ip, &foreign).is_err());
+    let domain = TargetAddr::Domain {
+        host: "client.example".to_string(),
+        port: 41000,
+    };
+    assert!(Socks5UdpPeerBinding::new(control_ip, &domain).is_err());
+}
+
+#[test]
+fn tun_tcp_accept_tasks_share_the_configured_core_stream_ceiling() {
+    let limits = MuxLimits {
+        max_streams: 37,
+        ..MuxLimits::default()
+    };
+
+    assert_eq!(tun_tcp_flow_limit(limits), 37);
+}
+
+async fn reserve_tcp_path() -> PathSpec {
+    let port = reserve_process_unique_tcp_port().await;
+    format!("tcp://127.0.0.1:{port}").parse().expect("path")
+}
+
+async fn reserve_tcp_path_with_query(query: &str) -> PathSpec {
+    let port = reserve_process_unique_tcp_port().await;
+    format!("tcp://127.0.0.1:{port}?{query}")
+        .parse()
+        .expect("path")
+}
+
+async fn reserve_process_unique_tcp_port() -> u16 {
+    loop {
+        let probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve tcp port");
+        let port = probe.local_addr().expect("reserved tcp addr").port();
+        let inserted = reserved_test_ports()
+            .lock()
+            .expect("reserved test ports lock")
+            .insert(port);
+        drop(probe);
+        if inserted {
+            return port;
+        }
+    }
+}
+
+async fn reserve_process_unique_udp_port() -> u16 {
+    loop {
+        let probe = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("reserve udp port");
+        let port = probe.local_addr().expect("reserved udp addr").port();
+        let inserted = reserved_test_ports()
+            .lock()
+            .expect("reserved test ports lock")
+            .insert(port);
+        drop(probe);
+        if inserted {
+            return port;
+        }
+    }
+}
+
+fn reserved_test_ports() -> &'static std::sync::Mutex<std::collections::HashSet<u16>> {
+    static PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    PORTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+async fn spawn_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    spawn_echo_target_count(1).await
+}
+
+async fn spawn_echo_target_count(count: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+    let addr = listener.local_addr().expect("target addr");
+    let handle = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        for _ in 0..count {
+            let (mut stream, _) = listener.accept().await.expect("target accept");
+            connections.spawn(async move {
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).await.expect("target read");
+                assert_eq!(&buf, b"ping");
+                stream.write_all(b"pong").await.expect("target write");
+                stream.shutdown().await.expect("target shutdown");
+            });
+        }
+        while let Some(connection) = connections.join_next().await {
+            connection.expect("target connection");
+        }
+    });
+    (addr, handle)
+}
+
+async fn spawn_udp_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    spawn_udp_echo_target_count(1).await
+}
+
+async fn spawn_udp_echo_target_count(count: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
+    let addr = socket.local_addr().expect("target addr");
+    let handle = tokio::spawn(async move {
+        let mut buf = [0u8; 16];
+        for _ in 0..count {
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
+            assert_eq!(&buf[..len], b"ping");
+            socket.send_to(b"pong", peer).await.expect("target send");
+        }
+    });
+    (addr, handle)
+}
+
+async fn spawn_udp_reordered_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("target bind"));
+    let addr = socket.local_addr().expect("target addr");
+    let handle = tokio::spawn(async move {
+        let mut delayed = tokio::task::JoinSet::new();
+        let mut buf = [0u8; 16];
+        for _ in 0..2 {
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
+            match &buf[..len] {
+                b"slow" => {
+                    let socket = socket.clone();
+                    delayed.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        socket
+                            .send_to(b"slow-pong", peer)
+                            .await
+                            .expect("target delayed send");
+                    });
+                }
+                b"fast" => {
+                    socket
+                        .send_to(b"fast-pong", peer)
+                        .await
+                        .expect("target fast send");
+                }
+                payload => panic!("unexpected UDP payload: {payload:?}"),
+            }
+        }
+        while let Some(result) = delayed.join_next().await {
+            result.expect("delayed target response");
+        }
+    });
+    (addr, handle)
+}
+
+async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+    let proxy: Endpoint = listener
+        .local_addr()
+        .expect("proxy addr")
+        .to_string()
+        .parse()
+        .expect("proxy endpoint");
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("proxy accept");
+        let mut greeting = [0u8; 3];
+        stream
+            .read_exact(&mut greeting)
+            .await
+            .expect("proxy greeting");
+        assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+        stream.write_all(&[0x05, 0x00]).await.expect("proxy method");
+
+        let mut request = [0u8; 10];
+        stream
+            .read_exact(&mut request)
+            .await
+            .expect("udp associate request");
+        assert_eq!(
+            request.as_slice(),
+            crate::outbound::socks5::udp_associate_request(
+                "0.0.0.0:0".parse().expect("client endpoint")
+            )
+            .expect("expected request")
+        );
+
+        let relay = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp relay bind");
+        let relay_addr = relay.local_addr().expect("relay addr");
+        stream
+            .write_all(&socks5::connect_reply(Socks5Reply::Succeeded, relay_addr))
+            .await
+            .expect("associate reply");
+
+        let mut packet = [0u8; 512];
+        let (len, peer) = relay.recv_from(&mut packet).await.expect("udp relay recv");
+        let (datagram, consumed) =
+            socks5::parse_udp_datagram(&packet[..len]).expect("udp relay packet");
+        assert_eq!(consumed, len);
+        let TargetAddr::Domain { host, port } = datagram.target else {
+            panic!("server must delegate the canonical domain to its SOCKS5 outbound");
+        };
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 53);
+        assert_eq!(datagram.payload, Bytes::from_static(b"ping"));
+        let response = socks5::udp_datagram(&TargetAddr::Domain { host, port }, b"pong")
+            .expect("udp relay response");
+        relay
+            .send_to(&response, peer)
+            .await
+            .expect("udp relay send");
+    });
+    (proxy, handle)
+}
+
+async fn spawn_server_path(
+    outbound: OutboundConfig,
+) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    spawn_server_path_count(outbound, 1).await
+}
+
+async fn spawn_server_path_count(
+    outbound: OutboundConfig,
+    count: usize,
+) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let local_path = ServerLocalPath::new(0, path.clone());
+    let handle = tokio::spawn(async move {
+        let ServerIdentityRuntime {
+            paths,
+            reliable_relay,
+        } = server_runtime(outbound);
+        let relay = tokio::spawn(reliable_relay.run());
+        let result = async {
+            let mut sessions = tokio::task::JoinSet::new();
+            for _ in 0..count {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let session_context = paths.clone();
+                let local_path = local_path.clone();
+                sessions.spawn(async move {
+                    handle_server_path(stream, local_path, session_context).await
+                });
+            }
+            while let Some(session) = sessions.join_next().await {
+                session.map_err(RuntimeError::TaskJoin)??;
+            }
+            Ok(())
+        }
+        .await;
+        relay.abort();
+        let _ = relay.await;
+        result
+    });
+    (path, handle)
+}
+
+async fn spawn_reliable_relay_heartbeat_blackhole(
+    hold_after_ping: Duration,
+) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let security = server_security();
+        let mut framed = EncryptedFramedStream::accept(
+            stream,
+            &crate::transport::encrypted::test_server_tls_config(),
+            CodecLimits::default(),
+        )
+        .await
+        .expect("initialize encrypted stream");
+        let exporter = framed.tcp_admission_exporter()?;
+        let encoded = framed.read_tcp_admission().await?;
+        let authenticated = crate::runtime::path::tcp::admission::authenticate_prelude(
+            &security,
+            crate::runtime::path::authentication::ProductCredentialAdmission::from_security(
+                &security,
+            ),
+            &encoded,
+            &exporter,
+        )?
+        .ok_or(RuntimeError::Protocol("invalid TCP admission prelude"))?;
+        let joined = authenticated
+            .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
+            .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
+        let path_id = joined.path_id;
+        match framed.read_frame().await? {
+            Frame::PathStatus {
+                path_id: status_path_id,
+                sequence: 0,
+                ..
+            } if status_path_id == path_id => {}
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "invalid initial TCP path usage advertisement",
+                ));
+            }
+        }
+        let resources = ResourceLimits::default();
+        framed.write_frame(&Frame::SessionReady).await?;
+        framed
+            .write_frame(&Frame::PathStatus {
+                path_id,
+                sequence: 0,
+                usage: crate::protocol::PathUsage::Available,
+            })
+            .await?;
+        framed.flush().await?;
+
+        let stream_id = loop {
+            match framed.read_frame().await? {
+                Frame::OpenStream { stream_id, .. } => break stream_id,
+                Frame::PathMetrics { .. } => {}
+                _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
+            }
+        };
+
+        framed
+            .write_frame(&Frame::StreamMaxData {
+                stream_id,
+                max_offset: resources.max_stream_window_bytes,
+            })
+            .await?;
+        framed.flush().await?;
+
+        loop {
+            match framed.read_frame().await? {
+                Frame::Ping { .. } => {
+                    tokio::time::sleep(hold_after_ping).await;
+                    return Ok(());
+                }
+                Frame::StreamAck {
+                    stream_id: ack_stream_id,
+                    ..
+                }
+                | Frame::StreamData {
+                    stream_id: ack_stream_id,
+                    ..
+                }
+                | Frame::StreamFin {
+                    stream_id: ack_stream_id,
+                    ..
+                }
+                | Frame::StreamMaxData {
+                    stream_id: ack_stream_id,
+                    ..
+                } if ack_stream_id == stream_id => {}
+                Frame::PathProofData {
+                    path_id: proof_path_id,
+                    proof_id,
+                    payload,
+                } if proof_path_id == path_id => {
+                    framed
+                        .write_frame(&Frame::PathProofAck {
+                            path_id,
+                            proof_id,
+                            payload_bytes: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+                        })
+                        .await?;
+                    framed.flush().await?;
+                }
+                Frame::PathMetrics { .. } => {}
+                Frame::SessionClose { .. } => return Ok(()),
+                _ => return Err(RuntimeError::Protocol("unexpected heartbeat test frame")),
+            }
+        }
+    });
+    (path, handle)
+}
+
+async fn spawn_notified_server_path(
+    path: PathSpec,
+    marker: u8,
+    outbound: OutboundConfig,
+    accepted: mpsc::Sender<u8>,
+) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
+    let listener = bind_listener(&path).await.expect("bind");
+    let local_path = ServerLocalPath::new(0, path.clone());
+    tokio::spawn(async move {
+        let ServerIdentityRuntime {
+            paths,
+            reliable_relay,
+        } = server_runtime(outbound);
+        let relay = tokio::spawn(reliable_relay.run());
+        let (stream, _) = listener.accept().await.expect("accept");
+        let _ = accepted.send(marker).await;
+        let result = handle_server_path(stream, local_path, paths).await;
+        relay.abort();
+        let _ = relay.await;
+        result
+    })
+}
+
+async fn reserve_udp_path() -> PathSpec {
+    let port = reserve_process_unique_udp_port().await;
+    format!("udp://127.0.0.1:{port}").parse().expect("path")
+}
+
+async fn spawn_udp_server_path(
+    outbound: OutboundConfig,
+) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    let path = reserve_udp_path().await;
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay,
+    } = server_runtime(outbound);
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind udp path");
+    let local_path = ServerLocalPath::new(0, path.clone());
+    let server = tokio::spawn(async move {
+        tokio::select! {
+            result = run_server_udp_listener(endpoint, local_path, paths) => result,
+            result = reliable_relay.run() => result,
+        }
+    });
+    (path, server)
+}
+
+async fn quic_admission_with_existing_registration(
+    registered_underlay: UnderlayProtocol,
+    principal: crate::product::PrincipalPermit,
+) -> (Result<Option<Duration>, RuntimeError>, Option<PathUsage>) {
+    let path = reserve_udp_path().await;
+    let client = ClientPathContext::new(vec![path.clone()], security(), ResourceLimits::default())
+        .expect("client context");
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay: _,
+    } = server_runtime(OutboundConfig::Direct);
+    let existing = paths
+        .reliable_streams
+        .register_carrier_path(
+            client.session_id,
+            registered_underlay,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+            principal,
+        )
+        .expect("pre-register carrier");
+    let server_context = paths.clone();
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind UDP endpoint");
+    let local_path = ServerLocalPath::new(0, path);
+    let server = tokio::spawn(run_server_udp_listener(endpoint, local_path, paths));
+
+    let result = client.udp_sessions[0]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let peer_usage = client.peer_path_usage(UnderlayProtocol::Udp, 0);
+    let snapshot = server_context.reliable_streams.management_snapshot();
+    assert_eq!(snapshot.paths.len(), 1);
+    assert_eq!(snapshot.paths[0].session_id, client.session_id);
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].reference_count, 1);
+
+    drop(client);
+    drop(existing);
+    server.abort();
+    let _ = server.await;
+    (result, peer_usage)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_duplicate_carrier_rejection_precedes_readiness() {
+    let (result, peer_usage) = quic_admission_with_existing_registration(
+        UnderlayProtocol::Udp,
+        crate::product::PrincipalPermit::for_test("test-peer"),
+    )
+    .await;
+    assert!(result.is_err(), "duplicate carrier received readiness");
+    assert_eq!(peer_usage, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_session_principal_rejection_precedes_readiness() {
+    let (result, peer_usage) = quic_admission_with_existing_registration(
+        UnderlayProtocol::Tcp,
+        crate::product::PrincipalPermit::for_test("different-peer"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "different-principal carrier received readiness"
+    );
+    assert_eq!(peer_usage, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_validation_purpose_is_rejected_before_replay_and_readiness() {
+    let path = reserve_udp_path().await;
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay: _,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_context = paths.clone();
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind UDP endpoint");
+    let local_path = ServerLocalPath::new(0, path.clone());
+    let server = tokio::spawn(run_server_udp_listener(endpoint, local_path, paths));
+
+    let resources = ResourceLimits::default();
+    let codec_limits = CodecLimits::from(resources);
+    let mux_limits = crate::mux::MuxLimits::from(resources);
+    let client_security = security();
+    let client_tls = crate::transport::encrypted::test_client_tls_config();
+    let selector = crate::transport::quic::QuicCandidateSelector::derive(
+        client_security.credential.id().as_str(),
+        client_security.credential.secret().as_bytes(),
+    );
+    let client_endpoint = crate::transport::quic::Endpoint::bind_client(
+        "0.0.0.0:0".parse().expect("client bind address"),
+        &client_tls,
+        selector,
+        mux_limits,
+    )
+    .await
+    .expect("bind client endpoint");
+    let remote = path
+        .endpoint
+        .first_endpoint()
+        .authority()
+        .parse()
+        .expect("server address");
+    let session_id = SessionId(71);
+    let path_id = PathId(7);
+    let [session_hello, session_auth, ordinary_join] =
+        crate::runtime::path::authentication::ClientPathAuthenticationFrames::for_session(
+            &client_security,
+            path_id,
+            UnderlayProtocol::Udp,
+            session_id,
+        )
+        .expect("client authentication")
+        .into_array();
+    let Frame::PathJoin {
+        session_id: joined_session_id,
+        credential_id,
+        path_id: joined_path_id,
+        underlay,
+        nonce,
+        issued_at_unix_secs,
+        ..
+    } = ordinary_join.clone()
+    else {
+        unreachable!("client authentication emits PATH_JOIN");
+    };
+    let authenticator = crate::protocol::auth::SessionAuthenticator::new(
+        client_security.credential.secret().as_bytes(),
+    )
+    .expect("authenticator");
+    let validation_join = Frame::PathJoin {
+        session_id: joined_session_id,
+        credential_id: credential_id.clone(),
+        path_id: joined_path_id,
+        underlay,
+        purpose: PathPurpose::Validation,
+        nonce,
+        issued_at_unix_secs,
+        auth_tag: authenticator.path_join_tag(
+            joined_session_id,
+            &credential_id,
+            joined_path_id,
+            underlay,
+            PathPurpose::Validation,
+            nonce,
+            issued_at_unix_secs,
+        ),
+    };
+    let path_status = Frame::PathStatus {
+        path_id,
+        sequence: 0,
+        usage: PathUsage::Available,
+    };
+
+    let rejected_connection = client_endpoint
+        .connect(remote)
+        .await
+        .expect("connect validation carrier");
+    let (mut rejected_send, mut rejected_recv) = rejected_connection
+        .open_bi()
+        .await
+        .expect("open validation control stream");
+    crate::transport::quic::write_frames(
+        &mut rejected_send,
+        &[
+            session_hello.clone(),
+            session_auth.clone(),
+            validation_join,
+            path_status.clone(),
+        ],
+        codec_limits,
+    )
+    .await
+    .expect("write validation admission");
+    let rejection = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::transport::quic::read_frame(&mut rejected_recv, codec_limits),
+    )
+    .await
+    .expect("validation admission decision");
+    assert!(
+        rejection.is_err(),
+        "QUIC validation purpose received readiness"
+    );
+    let rejected_snapshot = server_context.reliable_streams.management_snapshot();
+    assert!(rejected_snapshot.paths.is_empty());
+    assert!(rejected_snapshot.sessions.is_empty());
+    rejected_connection.close();
+
+    let ordinary_connection = client_endpoint
+        .connect(remote)
+        .await
+        .expect("connect ordinary carrier");
+    let (mut ordinary_send, mut ordinary_recv) = ordinary_connection
+        .open_bi()
+        .await
+        .expect("open ordinary control stream");
+    crate::transport::quic::write_frames(
+        &mut ordinary_send,
+        &[
+            session_hello,
+            session_auth,
+            ordinary_join,
+            path_status.clone(),
+        ],
+        codec_limits,
+    )
+    .await
+    .expect("write ordinary admission");
+    assert_eq!(
+        crate::transport::quic::read_frame(&mut ordinary_recv, codec_limits)
+            .await
+            .expect("ordinary readiness"),
+        Frame::SessionReady
+    );
+    assert_eq!(
+        crate::transport::quic::read_frame(&mut ordinary_recv, codec_limits)
+            .await
+            .expect("ordinary path status"),
+        path_status
+    );
+    let accepted_snapshot = server_context.reliable_streams.management_snapshot();
+    assert_eq!(accepted_snapshot.paths.len(), 1);
+    assert_eq!(accepted_snapshot.paths[0].session_id, session_id);
+    assert_eq!(accepted_snapshot.paths[0].path_id, path_id);
+
+    ordinary_connection.close();
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_readiness_follows_committed_carrier_registration() {
+    let path = reserve_udp_path().await;
+    let client = ClientPathContext::new(vec![path.clone()], security(), ResourceLimits::default())
+        .expect("client context");
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay: _,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_context = paths.clone();
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind UDP endpoint");
+    let local_path = ServerLocalPath::new(0, path);
+    let server = tokio::spawn(run_server_udp_listener(endpoint, local_path, paths));
+
+    assert!(
+        client.udp_sessions[0]
+            .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("prepare accepted carrier")
+            .is_some()
+    );
+    let snapshot = server_context.reliable_streams.management_snapshot();
+    assert_eq!(snapshot.paths.len(), 1);
+    assert_eq!(snapshot.paths[0].session_id, client.session_id);
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].session_id, client.session_id);
+    assert_eq!(snapshot.sessions[0].reference_count, 1);
+    assert_eq!(
+        client.peer_path_usage(UnderlayProtocol::Udp, 0),
+        Some(PathUsage::Available)
+    );
+
+    drop(client);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_udp_listener_accepts_probe_after_noise() {
+    let bind_path = reserve_udp_path().await;
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let endpoint = bind_server_udp_endpoint(&bind_path, &paths)
+        .await
+        .expect("bind udp");
+    let local_path = ServerLocalPath::new(0, bind_path.clone());
+    let server_addr = endpoint.local_addr().expect("udp server addr");
+    let server = tokio::spawn(async move {
+        tokio::select! {
+            result = run_server_udp_listener(endpoint, local_path, paths) => result,
+            result = reliable_relay.run() => result,
+        }
+    });
+
+    let noise = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("noise udp bind");
+    noise
+        .send_to(b"not a udp carrier packet", server_addr)
+        .await
+        .expect("send noise");
+
+    let path = format!("udp://{server_addr}")
+        .parse::<PathSpec>()
+        .expect("client path");
+    let resources = ResourceLimits::default();
+    let mut session = UdpDatagramClientSession::open(
+        &path,
+        0,
+        security(),
+        resources.into(),
+        resources.into(),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("open udp datagram session");
+    session
+        .ping_until(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .expect("udp ping");
+    session.close().await.expect("finish UDP probe stream");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_probe_prepares_and_reuses_the_durable_carrier() {
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
+    let resources = ResourceLimits::default();
+    let provider = Arc::new(CountingCarrierNetworkProvider::default());
+    let context = ClientPathContext::new_with_carrier_network(
+        vec![crate::config::ClientPathConfig {
+            name: "path-1".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: path,
+            security: security(),
+        }],
+        resources,
+        None,
+        5,
+        provider.clone(),
+    )
+    .expect("client path context");
+
+    probe_udp_client_path(&context, 0, Duration::from_secs(2))
+        .await
+        .expect("prepare cold UDP path")
+        .expect("cold UDP path publishes native RTT");
+    assert_eq!(provider.socket_count(), 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut product_stream = context.udp_sessions[0]
+        .open_datagram_stream(deadline)
+        .await
+        .expect("open durable UDP carrier stream");
+    let product_instance = product_stream.path_instance_id;
+    ping_client_udp_stream(&mut product_stream).await;
+    assert_eq!(provider.socket_count(), 1);
+
+    let observation = probe_udp_client_path(&context, 0, Duration::from_secs(2))
+        .await
+        .expect("observe durable UDP carrier");
+    assert!(
+        observation.is_none(),
+        "a ready carrier does not manufacture fresh liveness evidence"
+    );
+    assert_eq!(provider.socket_count(), 1);
+    assert_eq!(
+        provider.socket_identities(),
+        vec![crate::transport::CarrierPathIdentity {
+            group_ordinal: 5,
+            path_ordinal: 0,
+        }],
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut reused_stream = context.udp_sessions[0]
+        .open_datagram_stream(deadline)
+        .await
+        .expect("reuse durable UDP carrier");
+    assert_eq!(reused_stream.path_instance_id, product_instance);
+    assert_eq!(provider.socket_count(), 1);
+    ping_client_udp_stream(&mut reused_stream).await;
+
+    server.abort();
+    let _ = server.await;
+}
+
+async fn drive_socks5_echo_client<S>(client: &mut S, target_addr: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    client
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("auth request");
+    let mut auth_response = [0u8; 2];
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.read_exact(&mut auth_response),
+    )
+    .await
+    .expect("auth timeout")
+    .expect("auth response");
+    assert_eq!(auth_response, [0x05, 0x00]);
+
+    let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+    match target_addr {
+        SocketAddr::V4(addr) => {
+            connect.extend_from_slice(&addr.ip().octets());
+            connect.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        SocketAddr::V6(_) => panic!("expected IPv4 test target"),
+    }
+    client.write_all(&connect).await.expect("connect");
+
+    let mut response = [0u8; 10];
+    client.read_exact(&mut response).await.expect("reply");
+    assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+
+    client.write_all(b"ping").await.expect("payload write");
+    client.shutdown().await.expect("client shutdown");
+    let mut payload = [0u8; 4];
+    client.read_exact(&mut payload).await.expect("payload read");
+    assert_eq!(&payload, b"pong");
+}
+
+#[test]
+fn reliable_relay_sender_queue_budget_is_resource_gated() {
+    let mut mux_limits = MuxLimits {
+        max_payload_bytes: 64 * 1024,
+        max_ack_ranges: 256,
+        max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
+        max_stream_window_bytes: 1024 * 1024,
+        max_repair_bytes: 1024 * 1024,
+        max_reorder_bytes: 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
+        max_datagram_queue_bytes: 1024 * 1024,
+        max_path_flight_bytes: 32 * 1024,
+        max_reliable_relay_chunk_bytes: 32 * 1024,
+        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
+    };
+    let send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    let queue_limit =
+        reliable_relay_sender_queue_limit(mux_limits, mux_limits.max_path_flight_bytes);
+
+    assert!(reliable_relay_can_read_into_sender_queue(
+        &send_stream,
+        &sender_queue,
+        queue_limit
+    ));
+    assert_eq!(
+        reliable_relay_sender_queue_read_budget(
+            &send_stream,
+            &sender_queue,
+            queue_limit,
+            64 * 1024
+        ),
+        32 * 1024
+    );
+
+    sender_queue.push_data(Bytes::from(vec![0u8; 8 * 1024]));
+    assert_eq!(
+        reliable_relay_sender_queue_read_budget(
+            &send_stream,
+            &sender_queue,
+            queue_limit,
+            64 * 1024
+        ),
+        24 * 1024
+    );
+    assert!(!reliable_relay_can_read_product_source(
+        true,
+        true,
+        &send_stream,
+        &sender_queue,
+        queue_limit
+    ));
+    assert!(reliable_relay_can_read_product_source(
+        true,
+        false,
+        &send_stream,
+        &sender_queue,
+        queue_limit
+    ));
+
+    sender_queue.push_data(Bytes::from(vec![0u8; 24 * 1024]));
+    assert!(!reliable_relay_can_read_into_sender_queue(
+        &send_stream,
+        &sender_queue,
+        queue_limit
+    ));
+    assert_eq!(
+        reliable_relay_sender_queue_read_budget(
+            &send_stream,
+            &sender_queue,
+            queue_limit,
+            64 * 1024
+        ),
+        0
+    );
+
+    sender_queue.pop_front();
+    assert!(reliable_relay_can_read_into_sender_queue(
+        &send_stream,
+        &sender_queue,
+        queue_limit
+    ));
+    assert_eq!(
+        reliable_relay_sender_queue_read_budget(
+            &send_stream,
+            &sender_queue,
+            queue_limit,
+            64 * 1024
+        ),
+        8 * 1024
+    );
+
+    mux_limits.max_path_flight_bytes = 64 * 1024;
+    let larger_queue_limit =
+        reliable_relay_sender_queue_limit(mux_limits, mux_limits.max_path_flight_bytes);
+    assert_eq!(
+        reliable_relay_sender_queue_read_budget(
+            &send_stream,
+            &sender_queue,
+            larger_queue_limit,
+            16 * 1024
+        ),
+        16 * 1024
+    );
+}
+
+#[test]
+fn reliable_relay_sender_queue_prioritizes_only_critical_reinjection_lane() {
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from_static(b"ordinary"));
+    queue.push_reinjection(Frame::StreamData {
+        stream_id: StreamId(9),
+        offset: 0,
+        payload: Bytes::from_static(b"reinjection"),
+    });
+
+    let (lane, work) = queue.pop_front().expect("owner data");
+    assert_eq!(lane, ReliableWorkClass::Data);
+    assert_eq!(work.payload_bytes, b"ordinary".len());
+    assert_eq!(queue.data_bytes(), 0);
+
+    queue.push_data(Bytes::from_static(b"ordinary"));
+    queue.push_critical_reinjection_with_cause(
+        Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 0,
+            payload: Bytes::from_static(b"reinjection"),
+        },
+        RelaySendCause::AckGapReinjection,
+    );
+    let (lane, work) = queue.pop_front().expect("critical reinjection work");
+    assert_eq!(lane, ReliableWorkClass::Reinjection);
+    assert!(matches!(
+        work.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            frame: Frame::StreamData { .. },
+            cause: RelaySendCause::AckGapReinjection,
+        }
+    ));
+    assert_eq!(queue.data_bytes(), b"ordinary".len());
+}
+
+#[tokio::test]
+async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes() {
+    let stream_id = StreamId(42);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            MuxLimits::default(),
+        ),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(7), stream_id);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), TrafficClass::Throughput);
+
+    assert!(sender.queued_send_ready());
+    let dispatch = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("dispatch response bytes");
+
+    assert_eq!(dispatch.lane, ReliableWorkClass::Data);
+    assert_eq!(dispatch.payload_bytes, b"response".len());
+    assert_eq!(
+        dispatch.selected_path,
+        Some(CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        })
+    );
+    assert_eq!(send_stream.next_offset(), b"response".len() as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: id,
+            offset: 0,
+            payload,
+            ..
+        })) if id == stream_id && payload == Bytes::from_static(b"response")
+    ));
+}
+
+#[tokio::test]
+async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
+    let stream_id = StreamId(52);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(64);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: mux_limits.max_stream_window_bytes,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(3),
+            commands,
+            mux_limits,
+        ),
+        frames: frame_rx.into(),
+    };
+    let startup_snapshot = path_stream.send_path_snapshot(TrafficClass::Throughput, 1);
+    let startup_quantum =
+        adaptive_reliable_relay_chunk_bytes(startup_snapshot, TrafficClass::Throughput, mux_limits);
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
+    let mut sender = ServerResponseSenderService::new(SessionId(52), stream_id);
+    sender.enqueue_data_for_lane(
+        Bytes::from(vec![0x5a; PATH_OPEN_SCORE_BYTES * 4]),
+        TrafficClass::Throughput,
+    );
+
+    let mut ack_end = 0_u64;
+    while ack_end < PATH_OPEN_SCORE_BYTES as u64 {
+        let dispatch = sender
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                TrafficClass::Throughput,
+                mux_limits,
+            )
+            .expect("dispatch fixed response quantum");
+        ack_end = ack_end.saturating_add(dispatch.payload_bytes as u64);
+        let _ = recv_emitted_tcp_path_command(&mut receivers).await;
+    }
+    path_stream.release_normalized_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: ack_end,
+    }]);
+
+    let learned = path_stream
+        .send_path_snapshot(TrafficClass::Throughput, startup_quantum)
+        .expect("fixed output exposes learned path model");
+    assert!(learned.product_progress_rate_bps.is_some());
+    assert!(
+        !learned.has_durable_product_progress,
+        "one small ACK batch exposes a rate without graduating product authority"
+    );
+    assert!(
+        adaptive_reliable_relay_chunk_bytes(Some(learned), TrafficClass::Throughput, mux_limits)
+            >= startup_quantum
+    );
+}
+
+#[test]
+fn client_snapshot_separates_product_progress_from_native_carrier_evidence() {
+    let path: PathSpec = "udp://127.0.0.1:1".parse().expect("UDP path");
+    let sample_floor =
+        (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64);
+    let mut observation = ClientPathObservation {
+        measured_rate_bps: Some(100_000_000.0),
+        product_delivery_rate_bps: Some(100_000_000.0),
+        delivery_samples: 1,
+        product_delivery_sample_bytes: sample_floor - 1,
+        carrier_inflight_limit_bytes: sample_floor,
+        ..ClientPathObservation::default()
+    };
+
+    let point_rate = path_snapshot(&path, 0, observation);
+    assert!(point_rate.product_progress_rate_bps.is_some());
+    assert!(!point_rate.has_durable_product_progress);
+    assert!(!bulk_candidate_has_bulk_rate_evidence(&path, observation));
+
+    let mut native_observation = ClientPathObservation {
+        carrier_delivery_rate_bps: Some(117_000_000.0),
+        carrier_delivery_samples: 1,
+        carrier_delivery_sample_bytes: sample_floor - 1,
+        carrier_ack_derived_data_seen: true,
+        carrier_app_limited: false,
+        carrier_bulk_proof_expires_at: Some(Instant::now() + Duration::from_secs(1)),
+        ..ClientPathObservation::default()
+    };
+    assert!(!bulk_candidate_has_bulk_rate_evidence(
+        &path,
+        native_observation
+    ));
+    native_observation.carrier_delivery_sample_bytes = sample_floor;
+    let native = path_snapshot(&path, 0, native_observation);
+    assert!(!native.has_durable_product_progress);
+    assert!(bulk_candidate_has_bulk_rate_evidence(
+        &path,
+        native_observation
+    ));
+    assert!(path_model_confidence(native_observation) < 1.0);
+
+    observation.product_delivery_sample_bytes = sample_floor;
+    let durable = path_snapshot(&path, 0, observation);
+    assert!(durable.has_durable_product_progress);
+    assert!(bulk_candidate_has_bulk_rate_evidence(&path, observation));
+}
+
+#[test]
+fn data_plane_failure_invalidates_durable_product_and_native_window_authority() {
+    let path: PathSpec = "udp://127.0.0.1:2".parse().expect("UDP path");
+    let sample_floor = 7 * 1024 * 1024_u64;
+    let mut health = ClientPathHealthRecord::default();
+    health.carrier_inflight_limit_bytes = sample_floor;
+    health.carrier_delivery_rate_bps = Some(500_000_000.0);
+    health.carrier_delivery_sample_bytes = sample_floor;
+    health.carrier_delivery_samples = 32;
+    health.mark_product_delivery(
+        PathRateSample::new(sample_floor, Duration::from_millis(360)).expect("rate sample"),
+    );
+    let before_failure = health.observation_at(Instant::now());
+    assert!(path_snapshot(&path, 0, before_failure).has_durable_product_progress);
+
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    health.install_peer_usage(path_instance_id, 0, crate::protocol::PathUsage::Available);
+    assert!(health.mark_data_plane_failure(path_instance_id, Instant::now(), false));
+    let after_failure = health.observation_at(Instant::now());
+    assert_eq!(after_failure.state, SchedulerPathState::Suspect);
+    assert!(after_failure.product_delivery_rate_bps.is_none());
+    assert_eq!(after_failure.product_delivery_sample_bytes, 0);
+    assert!(after_failure.carrier_delivery_rate_bps.is_none());
+    assert_eq!(after_failure.carrier_inflight_limit_bytes, 0);
+    assert_eq!(after_failure.carrier_delivery_samples, 0);
+    assert_eq!(after_failure.carrier_delivery_sample_bytes, 0);
+    assert!(!after_failure.carrier_ack_derived_data_seen);
+    assert!(!path_snapshot(&path, 0, after_failure).has_durable_product_progress);
+}
+
+#[test]
+fn fixed_output_graduates_fragmented_product_acks_at_exact_sample_floor() {
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let output =
+        ReliablePathStreamOutput::fixed(UnderlayProtocol::Udp, PathId(4), commands, mux_limits);
+    let sample_bytes =
+        usize::try_from(reliable_path_startup_sample_limit_bytes(mux_limits)).unwrap();
+    let frame = Frame::StreamData {
+        stream_id: StreamId(53),
+        offset: 0,
+        payload: Bytes::from(vec![0x5b; sample_bytes]),
+    };
+    let ReliablePathStreamOutput::Fixed(fixed) = &output else {
+        panic!("expected fixed output");
+    };
+    fixed.record_original_flight(&frame);
+    let ack_fragment_bytes = MIN_RATE_SAMPLE_BYTES / 2;
+    let mut start = 0_u64;
+    while start < sample_bytes as u64 {
+        let end = start
+            .saturating_add(ack_fragment_bytes)
+            .min(sample_bytes as u64);
+        output.release_normalized_acked_ranges(&[OffsetRange { start, end }]);
+        start = end;
+    }
+
+    let snapshot = output
+        .send_path_snapshot(TrafficClass::Throughput, 1)
+        .expect("fixed output exposes learned path model");
+    assert!(snapshot.product_progress_rate_bps.is_none());
+    assert!(snapshot.has_durable_product_progress);
+}
+
+#[test]
+fn fixed_response_output_inherits_path_startup_evidence() {
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(64);
+    let mut startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
+    startup.pacing_rate_bps = 500_000_000.0;
+    startup.data_level_limit_bytes =
+        data_level_service_window_bytes(startup, TrafficClass::Throughput, mux_limits).ceil()
+            as u64;
+    startup.confidence = 1.0;
+    let output = ReliablePathStreamOutput::fixed_with_snapshot(startup, commands, mux_limits);
+
+    let inherited = output
+        .send_path_snapshot(TrafficClass::Throughput, 1)
+        .expect("fixed output exposes startup path model");
+    let default = PathSnapshot::new(
+        PathId(9),
+        UnderlayProtocol::Tcp,
+        default_path_srtt_ms(),
+        default_path_rate_bps(),
+    );
+
+    assert_eq!(inherited.id, startup.id);
+    assert_eq!(inherited.underlay, startup.underlay);
+    assert_eq!(inherited.delivery_rate_bps, startup.delivery_rate_bps);
+    assert_eq!(inherited.srtt_ms, startup.srtt_ms);
+    assert_eq!(
+        adaptive_reliable_relay_chunk_bytes(Some(inherited), TrafficClass::Throughput, mux_limits),
+        adaptive_reliable_relay_chunk_bytes(Some(default), TrafficClass::Throughput, mux_limits),
+        "TCP throughput startup uses the bounded MPP feed quantum before path-rate evidence is measured"
+    );
+}
+
+#[test]
+fn fixed_response_output_keeps_product_flight_out_of_carrier_flight() {
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(64);
+    let mut startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
+    startup.pacing_rate_bps = 500_000_000.0;
+    startup.data_level_limit_bytes =
+        data_level_service_window_bytes(startup, TrafficClass::Throughput, mux_limits).ceil()
+            as u64;
+    startup.confidence = 1.0;
+    let output = ReliablePathStreamOutput::fixed_with_snapshot(startup, commands, mux_limits);
+    let frame = Frame::StreamData {
+        stream_id: StreamId(9),
+        offset: 0,
+        payload: Bytes::from(vec![0x33; PATH_OPEN_SCORE_BYTES]),
+    };
+    let ReliablePathStreamOutput::Fixed(fixed) = &output else {
+        panic!("expected fixed output");
+    };
+    fixed.record_original_flight(&frame);
+
+    let snapshot = output
+        .send_path_snapshot(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
+        .expect("fixed output exposes path model");
+
+    assert_eq!(snapshot.bytes_in_flight, 0);
+    assert_eq!(
+        snapshot.data_level_bytes_in_flight,
+        PATH_OPEN_SCORE_BYTES as u64
+    );
+    assert!(
+        adaptive_reliable_relay_chunk_bytes(Some(snapshot), TrafficClass::Throughput, mux_limits)
+            > MIN_RELIABLE_SERVICE_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
+        "product STREAM_ACK debt must not collapse TCP carrier send quantum to 2*MSS"
+    );
+}
+
+#[tokio::test]
+async fn server_response_sender_slices_large_reads_to_service_quantum() {
+    let stream_id = StreamId(42);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(16);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: mux_limits.max_stream_window_bytes,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Udp,
+            PathId(0),
+            commands,
+            mux_limits,
+        ),
+        frames: frame_rx.into(),
+    };
+    let quantum = adaptive_reliable_relay_chunk_bytes(
+        path_stream.send_path_snapshot(TrafficClass::Throughput, 1),
+        TrafficClass::Throughput,
+        mux_limits,
+    );
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
+    let mut sender = ServerResponseSenderService::new(SessionId(17), stream_id);
+    let queued_bytes = mux_limits.max_reliable_relay_chunk_bytes;
+    sender.enqueue_data_for_lane(
+        Bytes::from(vec![0x5a; queued_bytes]),
+        TrafficClass::Throughput,
+    );
+
+    let dispatch = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            mux_limits,
+        )
+        .expect("dispatch first service quantum");
+
+    assert_eq!(dispatch.lane, ReliableWorkClass::Data);
+    assert_eq!(dispatch.payload_bytes, quantum);
+    assert_eq!(sender.data_bytes(), queued_bytes - quantum);
+    assert_eq!(send_stream.next_offset(), quantum as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: id,
+            offset: 0,
+            payload,
+            ..
+        })) if id == stream_id && payload.len() == quantum
+    ));
+}
+
+#[tokio::test]
+async fn server_response_sender_promotes_remaining_data_at_dispatch() {
+    let stream_id = StreamId(142);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(16);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: mux_limits.max_stream_window_bytes,
+        lane: TrafficClass::Latency,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            mux_limits,
+        ),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
+    let mut sender = ServerResponseSenderService::new(SessionId(142), stream_id);
+    let latency_quantum = adaptive_reliable_relay_chunk_bytes(
+        path_stream.send_path_snapshot(TrafficClass::Latency, 1),
+        TrafficClass::Latency,
+        mux_limits,
+    );
+    let promoted_remainder = latency_quantum * 2;
+    sender.enqueue_data_for_lane(
+        Bytes::from(vec![0x5a; latency_quantum * 3]),
+        TrafficClass::Latency,
+    );
+
+    let first = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Latency,
+            mux_limits,
+        )
+        .expect("dispatch first latency slice");
+    assert_eq!(first.payload_bytes, latency_quantum);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        })) if payload.len() == latency_quantum
+    ));
+
+    let second = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            mux_limits,
+        )
+        .expect("remaining bytes adopt the promoted dispatch lane");
+    assert_eq!(second.payload_bytes, promoted_remainder);
+    assert!(
+        matches!(
+            recv_emitted_tcp_path_command(&mut receivers).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset,
+                payload,
+                ..
+            })) if offset == latency_quantum as u64 && payload.len() == promoted_remainder
+        ),
+        "staged response bytes must adopt live bulk pacing without splitting OriginalData across carrier priority queues"
+    );
+}
+
+#[tokio::test]
+async fn server_response_sender_dispatches_final_fin_after_queued_data() {
+    let stream_id = StreamId(49);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            MuxLimits::default(),
+        ),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(49), stream_id);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
+    sender.enqueue_final_control_frame(Frame::StreamFin {
+        stream_id,
+        final_offset: b"ordinary".len() as u64,
+    });
+
+    let data_dispatch = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("dispatch ordinary data first");
+    assert_eq!(data_dispatch.lane, ReliableWorkClass::Data);
+
+    let fin_dispatch = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("dispatch final FIN after data");
+    assert_eq!(fin_dispatch.lane, ReliableWorkClass::Control);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: id,
+            offset: 0,
+            payload,
+            ..
+        })) if id == stream_id && payload == Bytes::from_static(b"ordinary")
+    ));
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamFin {
+            stream_id: id,
+            final_offset,
+        })) if id == stream_id && final_offset == b"ordinary".len() as u64
+    ));
+}
+
+#[tokio::test]
+async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
+    let stream_id = StreamId(44);
+    let (commands, receivers) = reliable_path_command_channels(1);
+    drop(receivers);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            MuxLimits::default(),
+        ),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(9), stream_id);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), TrafficClass::Throughput);
+
+    assert_eq!(sender.bytes(), b"response".len());
+    assert!(
+        sender
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                TrafficClass::Throughput,
+                MuxLimits::default()
+            )
+            .is_err()
+    );
+    assert_eq!(sender.bytes(), b"response".len());
+    assert_eq!(sender.data_bytes(), b"response".len());
+    assert_eq!(send_stream.next_offset(), 0);
+    assert_eq!(send_stream.reinjection_bytes(), 0);
+}
+
+#[tokio::test]
+async fn server_response_sender_blocks_when_switchable_outputs_detach() {
+    let stream_id = StreamId(45);
+    let session_id = SessionId(10);
+    let (commands, _receivers) = reliable_path_command_channels(4);
+    let binding = ResponseStreamBinding::new(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(0),
+        commands.clone(),
+        TrafficClass::Throughput,
+    );
+    binding.detach(
+        CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        },
+        &commands,
+    );
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Switchable(binding),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(session_id, stream_id);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), TrafficClass::Throughput);
+
+    let err = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect_err("detached switchable output should block, not close product stream");
+
+    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
+    assert_eq!(sender.bytes(), b"response".len());
+    assert_eq!(sender.data_bytes(), b"response".len());
+    assert_eq!(send_stream.next_offset(), 0);
+    assert_eq!(send_stream.reinjection_bytes(), 0);
+}
+
+#[tokio::test]
+async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
+    let stream_id = StreamId(46);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"already queued"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("prefill carrier data queue");
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            MuxLimits::default(),
+        ),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(11), stream_id);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), TrafficClass::Throughput);
+
+    let err = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect_err("full carrier queue should be sender-service backpressure");
+
+    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
+    assert_eq!(sender.bytes(), b"later".len());
+    assert_eq!(sender.data_bytes(), b"later".len());
+    assert_eq!(send_stream.next_offset(), 0);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"already queued")
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_emitted_tcp_path_command(&mut receivers)
+        )
+        .await
+        .is_err(),
+        "blocked dispatch must not enqueue another STREAM_DATA frame"
+    );
+}
+
+#[tokio::test]
+async fn response_binding_duplicate_live_path_rejects_fresh_output() {
+    let stream_id = StreamId(47);
+    let session_id = SessionId(12);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(4);
+    let binding = ResponseStreamBinding::new(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(0),
+        first_commands,
+        TrafficClass::Throughput,
+    );
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(4);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Udp,
+            PathId(0),
+            second_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
+    );
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Switchable(binding),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(session_id, stream_id);
+    sender.enqueue_data_for_lane(
+        Bytes::from_static(b"same-path-live"),
+        TrafficClass::Throughput,
+    );
+
+    sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("rejecting a duplicate live output must keep the existing output usable");
+
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut first_receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"same-path-live")
+    ));
+    let duplicate_output = tokio::time::timeout(
+        Duration::from_millis(20),
+        recv_emitted_tcp_path_command(&mut second_receivers),
+    )
+    .await;
+    assert!(
+        !matches!(duplicate_output, Ok(Some(_))),
+        "duplicate live attach must not redirect response data to a fresh carrier output"
+    );
+}
+
+#[tokio::test]
+async fn response_binding_duplicate_closed_path_replaces_output() {
+    let stream_id = StreamId(48);
+    let session_id = SessionId(13);
+    let (first_commands, first_receivers) = reliable_path_command_channels(4);
+    let binding = ResponseStreamBinding::new(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(0),
+        first_commands,
+        TrafficClass::Throughput,
+    );
+    drop(first_receivers);
+
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(4);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Udp,
+            PathId(0),
+            second_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::ReplacedClosedOutput
+    );
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Switchable(binding),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(session_id, stream_id);
+    sender.enqueue_data_for_lane(
+        Bytes::from_static(b"same-path-closed"),
+        TrafficClass::Throughput,
+    );
+
+    sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("closed same-path output should be replaced by the new carrier output");
+
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut second_receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"same-path-closed")
+    ));
+}
+
+fn server_test_bulk_path_metrics(path_id: PathId, delivery_rate_bps: u64) -> PathMetrics {
+    PathMetrics {
+        path_id,
+        underlay: UnderlayProtocol::Tcp,
+        direction: PathMetricDirection::ServerToClient,
+        metric_epoch: metric_epoch_now(),
+        metric_age_us: 0,
+        srtt_us: 20_000,
+        rttvar_us: 1_000,
+        jitter_us: 1_000,
+        delivery_rate_bps,
+        pacing_rate_bps: delivery_rate_bps,
+        loss_ppm: 0,
+        ecn_ppm: 0,
+        loss_observed: false,
+        ecn_observed: false,
+        bytes_in_flight: 0,
+        queue_bytes: 0,
+        inflight_limit_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
+        inflight_hi_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
+        confidence_ppm: 1_000_000,
+        app_limited: false,
+        has_ack_derived_data_sample: true,
+        data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        data_sample_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
+    }
+}
+
+#[test]
+fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let session_id = SessionId(14);
+    let stream_id = StreamId(49);
+    let path_id = PathId(0);
+    let old_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+    let (old_commands, old_receivers) = reliable_path_command_channels(8);
+    let accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: old_path_registration.clone(),
+                commands: old_commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("open response stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected a new response stream"),
+    };
+    let stream = accepted.stream();
+    let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+        panic!("expected switchable output");
+    };
+    let binding = binding.clone();
+    registry.record_local_path_metrics(
+        server_carrier_identity(&old_path_registration),
+        server_test_bulk_path_metrics(path_id, 200_000_000),
+        false,
+    );
+    assert!(
+        binding
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
+            .first()
+            .is_some_and(|entry| entry.observation.has_bulk_rate_evidence)
+    );
+    drop(old_receivers);
+    let old_path_identity = server_carrier_identity(&old_path_registration);
+    drop(old_path_registration);
+
+    let new_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+    let (new_commands, _new_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: target.clone(),
+                lane: TrafficClass::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: new_path_registration.clone(),
+                    commands: new_commands,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                },
+                mux_limits: MuxLimits::default(),
+            },)
+            .expect("replace closed response output"),
+        ServerReliableStreamOpen::Existing
+    ));
+    registry.record_local_path_metrics(
+        old_path_identity,
+        server_test_bulk_path_metrics(path_id, 300_000_000),
+        false,
+    );
+
+    let targets =
+        binding.sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES);
+    assert_eq!(targets.len(), 1);
+    assert!(
+        !targets[0].observation.has_bulk_rate_evidence,
+        "cached metrics from the closed carrier must not prove its replacement"
+    );
+}
+
+#[test]
+fn carrier_metrics_retire_after_last_publication_lease() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let session_id = SessionId(15);
+    let path_id = PathId(0);
+    let registration = registry.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
+    let sampler_registration = registration.clone();
+
+    registry.record_local_path_metrics(
+        server_carrier_identity(&registration),
+        PathMetrics {
+            underlay: UnderlayProtocol::Udp,
+            ..server_test_bulk_path_metrics(path_id, 200_000_000)
+        },
+        false,
+    );
+    assert_eq!(registry.management_snapshot().paths.len(), 1);
+
+    drop(registration);
+    assert_eq!(registry.management_snapshot().paths.len(), 1);
+
+    registry.record_local_path_metrics(
+        server_carrier_identity(&sampler_registration),
+        PathMetrics {
+            underlay: UnderlayProtocol::Udp,
+            ..server_test_bulk_path_metrics(path_id, 300_000_000)
+        },
+        false,
+    );
+    drop(sampler_registration);
+    assert!(
+        registry.management_snapshot().paths.is_empty(),
+        "cached evidence must retire when the last task lease ends"
+    );
+}
+
+#[tokio::test]
+async fn server_response_sender_uses_bounded_cross_path_reordering_after_path_loss() {
+    let stream_id = StreamId(45);
+    let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(4);
+    let tcp_commands_for_detach = tcp_commands.clone();
+    let binding = ResponseStreamBinding::new(
+        SessionId(10),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        tcp_commands,
+        TrafficClass::Throughput,
+    );
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(4);
+    binding.attach(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        udp_commands,
+        TrafficClass::Throughput,
+    );
+    let lower_owner_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    binding.record_original_flight(
+        lower_owner_key,
+        &Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"x"),
+        },
+    );
+    binding.record_original_flight(
+        lower_owner_key,
+        &Frame::StreamData {
+            stream_id,
+            offset: 1,
+            payload: Bytes::from_static(b"y"),
+        },
+    );
+    binding.release_normalized_acked_ranges(&[OffsetRange { start: 1, end: 2 }]);
+    binding.detach(lower_owner_key, &tcp_commands_for_detach);
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Switchable(binding),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    send_stream
+        .send_data(Bytes::from_static(b"xy"))
+        .expect("advance response sender past the lower ACK-hole byte");
+    let mut sender = ServerResponseSenderService::new(SessionId(10), stream_id);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), TrafficClass::Throughput);
+
+    let dispatched = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("the live path may carry data within the receiver reorder budget");
+
+    assert_eq!(
+        dispatched.selected_path.map(|key| key.underlay),
+        Some(UnderlayProtocol::Udp)
+    );
+    assert_eq!(sender.bytes(), 0);
+    assert_eq!(sender.data_bytes(), 0);
+    assert_eq!(send_stream.next_offset(), 2 + b"later".len() as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut udp_receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 2,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"later")
+    ));
+}
+
+#[tokio::test]
+async fn server_response_sender_dispatches_reinjection_before_data() {
+    let stream_id = StreamId(43);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            MuxLimits::default(),
+        ),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(8), stream_id);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
+    assert!(
+        sender
+            .enqueue_reinjection_frame_with_priority(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 64,
+                    payload: Bytes::from_static(b"reinjection"),
+                },
+                MuxLimits::default(),
+                true,
+            )
+            .is_some()
+    );
+
+    let reinjection_dispatch = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("dispatch reinjection");
+    assert_eq!(reinjection_dispatch.lane, ReliableWorkClass::Reinjection);
+    assert_eq!(send_stream.next_offset(), 0);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 64,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"reinjection")
+    ));
+
+    let data_dispatch = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        )
+        .expect("dispatch ordinary data");
+    assert_eq!(data_dispatch.lane, ReliableWorkClass::Data);
+    assert_eq!(send_stream.next_offset(), b"ordinary".len() as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"ordinary")
+    ));
+}
+
+#[test]
+fn reliable_stream_frame_queue_tracks_relay_chunk_byte_budget() {
+    let mux_limits = MuxLimits {
+        max_payload_bytes: 1024 * 1024,
+        max_ack_ranges: 256,
+        max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
+        max_stream_window_bytes: 16 * 1024 * 1024,
+        max_repair_bytes: 16 * 1024 * 1024,
+        max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
+        max_datagram_queue_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
+        max_reliable_relay_chunk_bytes: 256 * 1024,
+        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
+    };
+
+    assert_eq!(
+        reliable_stream_frame_queue(mux_limits),
+        (mux_limits.max_reorder_bytes / mux_limits.max_reliable_relay_chunk_bytes)
+            + reliable_path_priority_headroom_frames()
+    );
+}
+
+#[test]
+fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
+    let mux_limits = MuxLimits {
+        max_payload_bytes: 1024 * 1024,
+        max_ack_ranges: 256,
+        max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
+        max_stream_window_bytes: 16 * 1024 * 1024,
+        max_repair_bytes: 16 * 1024 * 1024,
+        max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
+        max_datagram_queue_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
+        max_reliable_relay_chunk_bytes: 256 * 1024,
+        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
+    };
+
+    let stream_payload_queue = reliable_stream_frame_queue(mux_limits);
+    let packet_payload_queue = reliable_stream_frame_queue_for_payload(mux_limits, 1200);
+
+    assert_eq!(stream_payload_queue, 68);
+    assert_eq!(
+        packet_payload_queue,
+        mux_limits.max_reorder_bytes / 1200 + reliable_path_priority_headroom_frames()
+    );
+    assert!(packet_payload_queue > stream_payload_queue);
+}
+
+#[test]
+fn reliable_path_and_tcp_command_queues_follow_carrier_backpressure_models() {
+    let mux_limits = MuxLimits {
+        max_payload_bytes: 1024 * 1024,
+        max_ack_ranges: 256,
+        max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
+        max_stream_window_bytes: 16 * 1024 * 1024,
+        max_repair_bytes: 16 * 1024 * 1024,
+        max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
+        max_datagram_queue_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
+        max_reliable_relay_chunk_bytes: 256 * 1024,
+        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
+    };
+    let frame_payload =
+        reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits)
+            .min(mux_limits.max_reliable_relay_chunk_bytes)
+            .min(mux_limits.max_payload_bytes)
+            .max(1);
+    let expected_queue = (mux_limits.max_path_flight_bytes.div_ceil(frame_payload)
+        + reliable_path_priority_headroom_frames())
+    .min(reliable_path_writer_frame_queue_for_payload(
+        mux_limits,
+        frame_payload,
+    ));
+    assert_eq!(reliable_path_command_queue(mux_limits), expected_queue);
+
+    let resources = ResourceLimits {
+        max_streams: 65_536,
+        max_quic_concurrent_bidi_streams: 65_536,
+        max_path_flight_bytes: mux_limits.max_path_flight_bytes,
+        max_reliable_relay_chunk_bytes: mux_limits.max_reliable_relay_chunk_bytes,
+        ..ResourceLimits::default()
+    };
+    assert_eq!(tcp_session_command_queue(resources), expected_queue);
+}
+
+#[test]
+fn reliable_path_command_queue_tracks_actual_payload_quantum() {
+    let mux_limits = MuxLimits {
+        max_payload_bytes: 1024 * 1024,
+        max_ack_ranges: 256,
+        max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
+        max_stream_window_bytes: 16 * 1024 * 1024,
+        max_repair_bytes: 16 * 1024 * 1024,
+        max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
+        max_datagram_queue_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
+        max_reliable_relay_chunk_bytes: 256 * 1024,
+        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
+    };
+
+    let stream_payload_queue = reliable_path_command_queue(mux_limits);
+    let packet_payload_queue = reliable_path_command_queue_for_payload(mux_limits, 1200);
+
+    let tcp_frame_payload =
+        reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits)
+            .min(mux_limits.max_reliable_relay_chunk_bytes)
+            .min(mux_limits.max_payload_bytes)
+            .max(1);
+    assert_eq!(
+        stream_payload_queue,
+        (mux_limits.max_path_flight_bytes.div_ceil(tcp_frame_payload)
+            + reliable_path_priority_headroom_frames())
+        .min(reliable_path_writer_frame_queue_for_payload(
+            mux_limits,
+            tcp_frame_payload,
+        ))
+    );
+    assert_eq!(
+        packet_payload_queue,
+        (mux_limits.max_path_flight_bytes.div_ceil(1200)
+            + reliable_path_priority_headroom_frames())
+        .min(reliable_path_writer_frame_queue_for_payload(
+            mux_limits, 1200,
+        ))
+    );
+    assert!(packet_payload_queue > stream_payload_queue);
+}
+
+#[test]
+fn reliable_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
+    let mux_limits = MuxLimits::default();
+    let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
+    let threshold = reliable_flow_bulk_threshold_bytes(Some(path), mux_limits);
+    let high_bdp_path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 300_000_000.0);
+    let high_bdp_threshold = reliable_flow_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
+    let high_bdp =
+        ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0)).ceil() as u64;
+    let mut state = ReliableRelayFlowDemandTracker::new();
+
+    assert!(
+        threshold
+            >= reliable_relay_scheduler_quantum_cap(
+                Some(path),
+                TrafficClass::Throughput,
+                mux_limits
+            ) as u64
+    );
+    assert_eq!(high_bdp_threshold, high_bdp);
+
+    let small_flow_bytes =
+        (relay_lane_startup_chunk_bytes(TrafficClass::Throughput, mux_limits) as u64 / 2).max(1);
+    let before = state.refresh(
+        ReliableRelayFlowSignals::new(small_flow_bytes, 0),
+        Some(path),
+        mux_limits,
+    );
+    assert_eq!(before.lane, TrafficClass::Latency);
+    assert!(!before.promoted_to_throughput);
+
+    let after = state.refresh(
+        ReliableRelayFlowSignals::new(threshold, 0),
+        Some(path),
+        mux_limits,
+    );
+    assert_eq!(after.lane, TrafficClass::Throughput);
+    assert!(after.promoted_to_throughput);
+
+    let steady = state.refresh(
+        ReliableRelayFlowSignals::new(threshold.saturating_mul(2), 0),
+        Some(path),
+        mux_limits,
+    );
+    assert_eq!(steady.lane, TrafficClass::Throughput);
+    assert!(!steady.promoted_to_throughput);
+}
+
+#[test]
+fn path_writer_coalesces_partial_bulk_run_without_delaying_full_or_empty_runs() {
+    let mux_limits = MuxLimits::default();
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
+
+    assert!(
+        reliable_path_writer_should_coalesce_partial_bulk_run(
+            1,
+            64 * 1024,
+            byte_budget,
+            item_budget
+        ),
+        "a single queued bulk frame should yield once so the producer can enqueue the rest of its service burst"
+    );
+    assert!(
+        !reliable_path_writer_should_coalesce_partial_bulk_run(0, 0, byte_budget, item_budget),
+        "an empty writer run must not spin"
+    );
+    assert!(
+        !reliable_path_writer_should_coalesce_partial_bulk_run(
+            item_budget,
+            64 * 1024,
+            byte_budget,
+            item_budget
+        ),
+        "a full item-budget writer run should flush immediately"
+    );
+    assert!(
+        !reliable_path_writer_should_coalesce_partial_bulk_run(
+            1,
+            byte_budget,
+            byte_budget,
+            item_budget
+        ),
+        "a full byte-budget writer run should flush immediately"
+    );
+}
+
+#[test]
+fn carrier_writer_run_batches_multiple_product_service_quanta() {
+    let mux_limits = MuxLimits::default();
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
+
+    assert!(byte_budget > MAX_RELIABLE_SERVICE_QUANTUM_BYTES);
+    assert!(byte_budget <= mux_limits.max_payload_bytes);
+}
+
+#[test]
+fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
+    let payload = Bytes::from(vec![0x5a; MAX_RELIABLE_SERVICE_QUANTUM_BYTES]);
+    let frames = [
+        Frame::DatagramData {
+            flow_id: DatagramFlowId(1),
+            datagram_id: DatagramId(1),
+            ttl_ms: 1_000,
+            payload: payload.clone(),
+        },
+        Frame::PathProofData {
+            path_id: PathId(1),
+            proof_id: 1,
+            payload: payload.clone(),
+        },
+        Frame::PathCapacityData {
+            path_id: PathId(1),
+            measurement_id: 1,
+            payload,
+        },
+    ];
+
+    for frame in frames {
+        assert!(
+            reliable_path_command_writer_run_bytes(&ReliablePathCommand::SendFrame(frame))
+                >= MAX_RELIABLE_SERVICE_QUANTUM_BYTES + crate::protocol::codec::FRAME_HEADER_LEN,
+        );
+    }
+    let ack = Frame::StreamAck {
+        stream_id: StreamId(1),
+        complete: false,
+        ranges: (0..MuxLimits::default().max_ack_ranges)
+            .map(|index| OffsetRange {
+                start: (index as u64) * 2,
+                end: (index as u64) * 2 + 1,
+            })
+            .collect(),
+    };
+    assert!(
+        reliable_path_command_writer_run_bytes(&ReliablePathCommand::SendFrame(ack))
+            > MuxLimits::default().max_ack_ranges * 16
+    );
+}
+
+#[test]
+fn capacity_frames_require_explicit_typed_carrier_commands() {
+    let frames = [
+        (
+            Frame::PathCapacityData {
+                path_id: PathId(3),
+                measurement_id: 9,
+                payload: Bytes::from_static(b"carrier-capacity"),
+            },
+            TrafficClass::Throughput,
+            b"carrier-capacity".len(),
+        ),
+        (
+            Frame::PathCapacityFinish {
+                path_id: PathId(3),
+                measurement_id: 9,
+                payload_bytes: 16,
+            },
+            TrafficClass::Throughput,
+            0,
+        ),
+        (
+            Frame::PathCapacityReceipt {
+                path_id: PathId(3),
+                measurement_id: 9,
+                received_payload_bytes: 16,
+            },
+            TrafficClass::Control,
+            0,
+        ),
+    ];
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    for (frame, expected_lane, expected_pacing_bytes) in frames {
+        assert!(reliable_path_frame_requires_capacity_command(&frame));
+        assert_eq!(
+            reliable_path_effective_frame_lane(&frame, TrafficClass::Throughput),
+            expected_lane
+        );
+        assert_eq!(
+            reliable_path_frame_pacing_bytes(&frame),
+            expected_pacing_bytes
+        );
+        assert_eq!(reliable_stream_frame_extent(&frame), None);
+        assert!(matches!(
+            commands.try_enqueue_admitted_frame(frame, TrafficClass::Throughput),
+            Err(RuntimeError::Protocol(_))
+        ));
+    }
+}
+
+#[test]
+fn reliable_stream_recv_progress_resend_tracks_received_state() {
+    let mux_limits = MuxLimits::default();
+    let mut recv_stream = ReliableRecvStream::new(StreamId(21), mux_limits);
+    let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, 30_000_000.0);
+    let cross_continent = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 900.0, 300_000_000.0);
+
+    assert!(!reliable_relay_recv_progress_resend_active(
+        &recv_stream,
+        true,
+        Some(UnderlayProtocol::Udp),
+    ));
+
+    recv_stream
+        .receive_data(1024, Bytes::from_static(b"late"))
+        .expect("out-of-order data");
+    assert!(reliable_relay_recv_progress_resend_active(
+        &recv_stream,
+        true,
+        Some(UnderlayProtocol::Udp),
+    ));
+    assert!(reliable_relay_recv_progress_resend_active(
+        &recv_stream,
+        true,
+        Some(UnderlayProtocol::Tcp),
+    ));
+    assert!(!reliable_relay_recv_progress_resend_active(
+        &recv_stream,
+        false,
+        Some(UnderlayProtocol::Udp),
+    ));
+
+    let mut contiguous = ReliableRecvStream::new(StreamId(22), mux_limits);
+    contiguous
+        .receive_data(0, Bytes::from_static(b"head"))
+        .expect("contiguous data");
+    assert!(reliable_relay_recv_progress_resend_active(
+        &contiguous,
+        true,
+        Some(UnderlayProtocol::Udp),
+    ));
+    assert!(!reliable_relay_recv_progress_resend_active(
+        &contiguous,
+        true,
+        Some(UnderlayProtocol::Tcp),
+    ));
+
+    let low_interval = reliable_stream_recv_progress_interval(Some(low_latency));
+    let high_interval = reliable_stream_recv_progress_interval(Some(cross_continent));
+    assert_eq!(
+        low_interval,
+        (transport_pto_from_snapshot(Some(low_latency)) / 2).max(QUIC_TIMER_GRANULARITY)
+    );
+    assert!(high_interval >= low_interval);
+    assert_eq!(
+        high_interval,
+        (transport_pto_from_snapshot(Some(cross_continent)) / 2).max(QUIC_TIMER_GRANULARITY)
+    );
+}
+
+#[test]
+fn sender_service_retry_delay_is_ack_paced_not_one_millisecond_spin() {
+    let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, 30_000_000.0);
+    let cross_continent = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 900.0, 300_000_000.0);
+
+    assert!(
+        reliable_stream_recv_progress_interval(Some(cross_continent)) > Duration::from_millis(100)
+    );
+    let low_retry = sender_service_retry_delay(Some(low_latency));
+    let high_retry = sender_service_retry_delay(Some(cross_continent));
+    assert!(
+        low_retry > QUIC_TIMER_GRANULARITY,
+        "blocked sender retry must not spin at timer granularity"
+    );
+    assert!(
+        high_retry >= low_retry,
+        "higher RTT paths should not retry more aggressively than low-latency paths"
+    );
+    assert!(
+        high_retry <= QUIC_MAX_ACK_DELAY,
+        "retry remains capped so missed capacity notifications do not stall the sender"
+    );
+}
+
+#[test]
+fn reliable_recv_progress_batches_max_data_updates() {
+    let mux_limits = MuxLimits {
+        max_payload_bytes: 1024,
+        max_reliable_relay_chunk_bytes: 1024,
+        max_path_flight_bytes: 4096,
+        max_stream_window_bytes: 4096,
+        max_repair_bytes: 4096,
+        max_reorder_bytes: 4096,
+        ..MuxLimits::default()
+    };
+    let mut recv_stream = ReliableRecvStream::new(StreamId(22), mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+    let window =
+        reliable_stream_advertised_window_bytes(None, TrafficClass::Throughput, mux_limits);
+    let step = reliable_stream_max_data_update_bytes(window, mux_limits);
+
+    assert_eq!(step, 1024);
+    assert!(progress.should_send_max_data(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false
+    ));
+    assert!(!progress.should_send_max_data(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false
+    ));
+
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0x11; 512]))
+        .expect("half-step data");
+    assert!(!progress.should_send_max_data(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false
+    ));
+
+    recv_stream
+        .receive_data(512, Bytes::from(vec![0x22; 512]))
+        .expect("full-step data");
+    assert!(progress.should_send_max_data(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false
+    ));
+    assert!(progress.should_send_max_data(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        true
+    ));
+}
+
+#[test]
+fn reliable_recv_progress_batches_bulk_acks_by_reinjection_release_cadence() {
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 16,
+        max_stream_window_bytes: 64 * 1024,
+        max_repair_bytes: 64 * 1024,
+        max_reorder_bytes: 64 * 1024,
+        max_path_flight_bytes: 64 * 1024,
+        max_reliable_relay_chunk_bytes: 64 * 1024,
+        ..MuxLimits::default()
+    };
+    let mut recv_stream = ReliableRecvStream::new(StreamId(23), mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+    let ack_step = reliable_stream_ack_update_bytes(None, TrafficClass::Throughput, mux_limits);
+
+    assert_eq!(ack_step, mux_limits.max_repair_bytes as u64 / 4);
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0x11; 1024]))
+        .expect("first data");
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
+    let first_generation = progress.ack_generation();
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        true,
+    ));
+    assert_eq!(
+        progress.ack_generation(),
+        first_generation,
+        "forced publication of unchanged cumulative state reuses its fence"
+    );
+
+    recv_stream
+        .receive_data(1024, Bytes::from(vec![0x22; 1024]))
+        .expect("below ack step");
+    assert!(!progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
+
+    recv_stream
+        .receive_data(2048, Bytes::from(vec![0x33; ack_step as usize]))
+        .expect("past ack step");
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
+}
+
+#[test]
+fn reliable_recv_progress_acks_reorder_gap_without_waiting_for_bulk_step() {
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 16,
+        max_stream_window_bytes: 64 * 1024,
+        max_repair_bytes: 64 * 1024,
+        max_reorder_bytes: 64 * 1024,
+        max_path_flight_bytes: 64 * 1024,
+        max_reliable_relay_chunk_bytes: 64 * 1024,
+        ..MuxLimits::default()
+    };
+    let mut recv_stream = ReliableRecvStream::new(StreamId(24), mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0x11; 1024]))
+        .expect("first data");
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
+
+    recv_stream
+        .receive_data(8192, Bytes::from(vec![0x22; 1024]))
+        .expect("out-of-order data");
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
+}
+
+#[test]
+fn reliable_recv_progress_acks_reinjection_horizon_advancement() {
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 16,
+        max_stream_window_bytes: 256 * 1024,
+        max_repair_bytes: 256 * 1024,
+        max_reorder_bytes: 256 * 1024,
+        max_path_flight_bytes: 256 * 1024,
+        max_reliable_relay_chunk_bytes: 64 * 1024,
+        ..MuxLimits::default()
+    };
+    let mut recv_stream = ReliableRecvStream::new(StreamId(25), mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0x11; 1024]))
+        .expect("head");
+    recv_stream
+        .receive_data(8192, Bytes::from(vec![0x22; 1024]))
+        .expect("first tail");
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
+
+    recv_stream
+        .receive_data(9216, Bytes::from(vec![0x33; 1024]))
+        .expect("small tail extension");
+    assert!(
+        !progress.should_send_ack(
+            &recv_stream,
+            None,
+            TrafficClass::Throughput,
+            mux_limits,
+            false,
+        ),
+        "small same-range horizon movement should be batched"
+    );
+
+    let ack_step = reliable_stream_ack_update_bytes(None, TrafficClass::Throughput, mux_limits);
+    assert!(
+        ack_step > 1024,
+        "test expects a bulk ACK step larger than one small chunk"
+    );
+    recv_stream
+        .receive_data(10240, Bytes::from(vec![0x44; ack_step as usize]))
+        .expect("meaningful tail extension");
+    assert!(
+        progress.should_send_ack(
+            &recv_stream,
+            None,
+            TrafficClass::Throughput,
+            mux_limits,
+            false,
+        ),
+        "meaningful reinjection horizon advancement must be ACKed even when range count is unchanged"
+    );
+}
+
+#[test]
+fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_reinjectionable_work() {
+    let mux_limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(StreamId(11), mux_limits);
+    let mut recv_stream = ReliableRecvStream::new(StreamId(11), mux_limits);
+
+    assert!(!reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        false,
+        TrafficClass::Latency,
+        false,
+        mux_limits
+    ));
+    assert!(!reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        true,
+        TrafficClass::Latency,
+        false,
+        mux_limits
+    ));
+
+    send_stream
+        .send_data(Bytes::from_static(b"request"))
+        .expect("request data");
+    assert!(reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        true,
+        TrafficClass::Latency,
+        false,
+        mux_limits
+    ));
+    send_stream
+        .apply_ack(&[crate::protocol::OffsetRange { start: 0, end: 7 }])
+        .expect("ACK assigned stream bytes");
+    assert!(!reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        true,
+        TrafficClass::Latency,
+        false,
+        mux_limits
+    ));
+    assert!(reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        true,
+        TrafficClass::Latency,
+        true,
+        mux_limits
+    ));
+
+    recv_stream
+        .receive_data(0, Bytes::from_static(b"response"))
+        .expect("response data");
+    assert!(!reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        true,
+        TrafficClass::Latency,
+        false,
+        mux_limits
+    ));
+    assert!(reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        true,
+        TrafficClass::Throughput,
+        false,
+        mux_limits
+    ));
+    assert!(!reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        false,
+        TrafficClass::Throughput,
+        true,
+        mux_limits
+    ));
+
+    let response_watch_bytes = reliable_relay_response_stall_watch_bytes(mux_limits);
+    assert_eq!(
+        response_watch_bytes,
+        reliable_relay_buffer_len(mux_limits) as u64
+    );
+    let current_offset = recv_stream.next_offset();
+    let fill_bytes = response_watch_bytes.saturating_sub(current_offset);
+    let first_fill = fill_bytes.min(mux_limits.max_payload_bytes as u64) as usize;
+    recv_stream
+        .receive_data(current_offset, Bytes::from(vec![0u8; first_fill]))
+        .expect("first sustained response data");
+    let remaining = response_watch_bytes.saturating_sub(recv_stream.next_offset());
+    if remaining > 0 {
+        recv_stream
+            .receive_data(
+                recv_stream.next_offset(),
+                Bytes::from(vec![0u8; remaining as usize]),
+            )
+            .expect("second sustained response data");
+    }
+    assert!(reliable_relay_stall_watch_active(
+        &send_stream,
+        &recv_stream,
+        true,
+        TrafficClass::Latency,
+        false,
+        mux_limits
+    ));
+}
+
+#[test]
+fn stream_ack_gap_reinjection_waits_for_persistent_gap_on_reliable_carriers() {
+    let mux_limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(StreamId(31), mux_limits);
+    send_stream
+        .send_data(Bytes::from_static(b"aaaa"))
+        .expect("first chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"bbbb"))
+        .expect("missing chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"cccc"))
+        .expect("later chunk");
+    let ranges = [
+        OffsetRange { start: 0, end: 4 },
+        OffsetRange { start: 8, end: 12 },
+    ];
+
+    assert!(
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, false, false,)
+            .is_empty(),
+        "a single reliable carrier must not replay product bytes over itself"
+    );
+    assert!(
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, false, true,)
+            .is_empty(),
+        "a single reliable carrier owns ordinary packet-loss recovery"
+    );
+    assert!(
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, false,)
+            .is_empty(),
+        "fresh multipath ACK gaps wait for persistent product-hole evidence"
+    );
+    let persistent_gap_reinjections =
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, true);
+    assert_eq!(
+        persistent_gap_reinjections.len(),
+        1,
+        "multipath reinjection may reinject authoritative product gaps over another path"
+    );
+    assert!(matches!(
+        &persistent_gap_reinjections[0],
+        Frame::StreamData {
+            offset: 4,
+            payload,
+            ..
+        } if payload.as_ref() == b"bbbb"
+    ));
+    assert!(
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, false, false, false,)
+            .is_empty(),
+        "non-authoritative ACK snapshots must not infer missing holes"
+    );
+}
+
+#[test]
+fn ack_gap_reinjection_prefers_authoritative_gap_before_frontier_tail() {
+    let mux_limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(StreamId(32), mux_limits);
+    send_stream
+        .send_data(Bytes::from_static(b"aaaa"))
+        .expect("first chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"bbbb"))
+        .expect("second chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"cccc"))
+        .expect("third chunk");
+
+    let ranges = [OffsetRange { start: 4, end: 12 }];
+    let _ = send_stream.apply_ack(&ranges);
+    let reinjections =
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, true);
+
+    assert_eq!(reinjections.len(), 1);
+    assert!(matches!(
+        &reinjections[0],
+        Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        } if payload.as_ref() == b"aaaa"
+    ));
+}
+
+#[test]
+fn ack_gap_reinjection_ignores_contiguous_unacked_original_tail() {
+    let mux_limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(StreamId(33), mux_limits);
+    send_stream
+        .send_data(Bytes::from_static(b"aaaa"))
+        .expect("first chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"bbbb"))
+        .expect("second chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"cccc"))
+        .expect("third chunk");
+
+    let ranges = [OffsetRange { start: 0, end: 4 }];
+    let _ = send_stream.apply_ack(&ranges);
+    let reinjections =
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, 6, true, true, true);
+
+    assert!(
+        reinjections.is_empty(),
+        "contiguous unacked owner tail is retained carrier flight, not ACK-gap reinjection"
+    );
+}
+
+#[test]
+fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
+    let mux_limits = MuxLimits::default();
+    let mut recv_stream = ReliableRecvStream::new(StreamId(12), mux_limits);
+    let last_delivery = Instant::now();
+    let control_progress = last_delivery + Duration::from_secs(30);
+
+    assert_eq!(
+        reliable_relay_stall_progress_anchor(
+            control_progress,
+            last_delivery,
+            last_delivery,
+            &recv_stream,
+            true,
+            TrafficClass::Latency,
+            false,
+            mux_limits,
+        ),
+        control_progress
+    );
+
+    let response_watch_bytes = reliable_relay_response_stall_watch_bytes(mux_limits);
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0u8; response_watch_bytes as usize]))
+        .expect("sustained response data");
+
+    assert_eq!(
+        reliable_relay_stall_progress_anchor(
+            control_progress,
+            last_delivery,
+            last_delivery,
+            &recv_stream,
+            true,
+            TrafficClass::Latency,
+            false,
+            mux_limits,
+        ),
+        last_delivery
+    );
+
+    let reinjection_progress = control_progress + Duration::from_secs(1);
+    assert_eq!(
+        reliable_relay_stall_progress_anchor(
+            control_progress,
+            last_delivery,
+            reinjection_progress,
+            &recv_stream,
+            true,
+            TrafficClass::Latency,
+            false,
+            mux_limits,
+        ),
+        reinjection_progress
+    );
+}
+
+#[test]
+fn tcp_receive_hole_reinjection_tracks_buffered_ordering_gap() {
+    let mux_limits = MuxLimits::default();
+    let mut recv_stream = ReliableRecvStream::new(StreamId(14), mux_limits);
+
+    assert!(!reliable_relay_receive_hole_reinjection_active(
+        &recv_stream,
+        true
+    ));
+    recv_stream
+        .receive_data(0, Bytes::from_static(b"head"))
+        .expect("initial response data");
+    assert!(!reliable_relay_receive_hole_reinjection_active(
+        &recv_stream,
+        true
+    ));
+
+    let out_of_order = recv_stream
+        .receive_data(8, Bytes::from_static(b"tail"))
+        .expect("out-of-order response data");
+    assert!(out_of_order.delivered.is_empty());
+    assert!(reliable_relay_receive_hole_reinjection_active(
+        &recv_stream,
+        true
+    ));
+    assert!(!reliable_relay_receive_hole_reinjection_active(
+        &recv_stream,
+        false
+    ));
+
+    let hole_fill = recv_stream
+        .receive_data(4, Bytes::from_static(b"gap!"))
+        .expect("hole fill response data");
+    assert_eq!(hole_fill.delivered.len(), 2);
+    assert!(!reliable_relay_receive_hole_reinjection_active(
+        &recv_stream,
+        true
+    ));
+}
+
+#[test]
+fn tcp_receive_hole_reinjection_deadline_is_progress_signal_not_path_victim_policy() {
+    let now = Instant::now();
+    let mut path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, 100_000_000.0);
+    path.jitter_ms = 5.0;
+    path.carrier_inflight_limit_bytes = 1_000_000;
+
+    let deadline = reliable_relay_receive_hole_reinjection_deadline(
+        now,
+        now - Duration::from_secs(1),
+        Some(path),
+    );
+
+    assert!(
+        deadline > tokio::time::Instant::from_std(now),
+        "receive-hole handling schedules ACK/progress reinjection; path failure is owned by carrier/stall evidence"
+    );
+}
+
+#[test]
+fn observed_udp_datagram_loss_prefers_alternative_for_next_realtime_packet() {
+    let resources = ResourceLimits::default();
+    let context = ClientPathContext::new(
+        vec![
+            "udp://127.0.0.1:10000?srtt-ms=20&rate-mbps=200"
+                .parse()
+                .expect("path"),
+            "udp://127.0.0.1:10001?srtt-ms=30&rate-mbps=200"
+                .parse()
+                .expect("path"),
+        ],
+        security(),
+        resources,
+    )
+    .expect("context");
+    let association = UdpDatagramClientAssociation::new(context.clone());
+    let payload_bytes = 512;
+    let ttl_ms = 1_000;
+    let candidates = context.ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms);
+    assert_eq!(
+        association.select_path_candidate(&candidates, &HashSet::new(), payload_bytes, ttl_ms),
+        Some(0),
+        "the lower-ETA realtime datagram path starts as the best path"
+    );
+
+    context.mark_udp_path_feedback(
+        0,
+        UdpDatagramPathObservation {
+            rtt: Duration::from_millis(20),
+            jitter: Duration::ZERO,
+            loss_rate: 1.0,
+            rate_sample: None,
+        },
+    );
+
+    assert_eq!(
+        association.select_path_candidate(&candidates, &HashSet::new(), payload_bytes, ttl_ms),
+        Some(1),
+        "explicit carrier delivery loss should move the next realtime packet to the alternate path"
+    );
+}
+
+#[test]
+fn switchable_stream_demand_updates_from_local_sender_metrics() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let path_registration =
+        registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(0));
+    let (commands, _rx) = reliable_path_command_channels(4);
+    let mut accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id: SessionId(1),
+            stream_id: StreamId(7),
+            target: target.clone(),
+            lane: TrafficClass::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("open stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::Existing => panic!("expected new stream"),
+        ServerReliableStreamOpen::DuplicateLiveIgnored => {
+            panic!("new active stream must not be treated as duplicate")
+        }
+        ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
+    };
+    let mut stream = accepted.take_stream();
+    assert_eq!(stream.current_lane(), TrafficClass::Latency);
+    let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+        panic!("expected switchable binding");
+    };
+    let binding = binding.clone();
+
+    stream.set_lane(TrafficClass::Throughput);
+
+    assert_eq!(stream.current_lane(), TrafficClass::Throughput);
+    assert_eq!(binding.lane(), TrafficClass::Throughput);
+}
+
+#[test]
+fn server_registry_ignores_active_duplicate_same_path_input_without_output_replacement() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let session_id = SessionId(1);
+    let stream_id = StreamId(17);
+    let first_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Udp, PathId(0));
+    let (first_commands, _first_rx) = reliable_path_command_channels(4);
+    let opened = registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first_path_registration.clone(),
+                commands: first_commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("open stream");
+    let _accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new stream"),
+    };
+
+    let (duplicate_commands, _duplicate_rx) = reliable_path_command_channels(4);
+    let duplicate = registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first_path_registration.clone(),
+                commands: duplicate_commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("duplicate live attach should be handled");
+
+    assert!(matches!(
+        duplicate,
+        ServerReliableStreamOpen::DuplicateLiveIgnored
+    ));
+    assert_eq!(registry.management_snapshot().active_streams, 1);
+}
+
+#[test]
+fn server_response_output_inherits_open_path_startup_metrics() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let path = "tcp://127.0.0.1:10000?srtt-ms=20&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("path spec");
+    let initial_metrics =
+        path_startup_metrics(&path, PathId(0), PathMetricDirection::ServerToClient);
+    let path_registration = registry.register_carrier_path_with_local_properties(
+        SessionId(1),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties {
+            config_ordinal: 0,
+            policy: path.metadata.policy,
+            initial_metrics: Some(initial_metrics),
+        },
+    );
+    let (commands, _rx) = reliable_path_command_channels(4);
+    assert!(
+        !initial_metrics.app_limited,
+        "configured startup rate hints are advisory priors, not app-limited samples"
+    );
+    let accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id: SessionId(1),
+            stream_id: StreamId(8),
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("open stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::Existing => panic!("expected new stream"),
+        ServerReliableStreamOpen::DuplicateLiveIgnored => {
+            panic!("new active stream must not be treated as duplicate")
+        }
+        ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
+    };
+    let stream = accepted.stream();
+    let snapshot = stream
+        .send_path_snapshot(TrafficClass::Throughput, 1)
+        .expect("switchable output exposes seeded path model");
+
+    assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps());
+    assert_eq!(snapshot.srtt_ms, 20.0);
+    assert!(
+        adaptive_reliable_relay_chunk_bytes(
+            Some(snapshot),
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        ) > MIN_RELIABLE_SERVICE_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
+        "server response bytes keep the bulk feed quantum while startup metrics remain measurement-only rate hints"
+    );
+
+    let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+        panic!("expected switchable output");
+    };
+    binding.record_original_flight(
+        CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        },
+        &Frame::StreamData {
+            stream_id: stream.stream_id,
+            offset: 0,
+            payload: Bytes::from(vec![0x22; PATH_OPEN_SCORE_BYTES]),
+        },
+    );
+    let with_product_flight = stream
+        .send_path_snapshot(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
+        .expect("switchable output exposes path model");
+    assert_eq!(with_product_flight.bytes_in_flight, 0);
+    assert_eq!(
+        with_product_flight.data_level_bytes_in_flight,
+        PATH_OPEN_SCORE_BYTES as u64
+    );
+    assert!(
+        adaptive_reliable_relay_chunk_bytes(
+            Some(with_product_flight),
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+        ) > MIN_RELIABLE_SERVICE_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
+        "product flight is admission/reinjection state, not carrier queue pressure"
+    );
+}
+
+#[test]
+fn server_reliable_registry_opens_an_unknown_stream_on_any_live_path() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let path_registration =
+        registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(1));
+    let (commands, _rx) = reliable_path_command_channels(4);
+    let opened = registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id: SessionId(1),
+            stream_id: StreamId(99),
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("neutral stream open should be handled");
+    let _accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("unknown neutral stream must open on its first live path"),
+    };
+    assert_eq!(registry.management_snapshot().active_streams, 1);
+}
+
+#[test]
+fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let (commands, _rx) = reliable_path_command_channels(4);
+    let session_id = SessionId(1);
+    let stream_id = StreamId(100);
+    let first_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(0));
+    let opened = registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first_path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("active open should be handled");
+    let _accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected active stream open"),
+    };
+    registry.close(session_id, stream_id);
+
+    let (commands, _rx) = reliable_path_command_channels(4);
+    let replacement_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(1));
+    let reopened = registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: replacement_path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("closed-stream reopen should be handled");
+    assert!(matches!(reopened, ServerReliableStreamOpen::Rejected));
+    assert_eq!(registry.management_snapshot().active_streams, 0);
+}
+
+#[tokio::test]
+async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
+    let (tcp_tx, mut tcp_rx) = reliable_path_command_channels(4);
+    let binding = ResponseStreamBinding::new(
+        SessionId(1),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        tcp_tx,
+        TrafficClass::Latency,
+    );
+    let (udp_tx, mut udp_rx) = reliable_path_command_channels(4);
+    binding.attach(
+        UnderlayProtocol::Udp,
+        PathId(0),
+        udp_tx,
+        TrafficClass::Throughput,
+    );
+
+    binding.close_stream(StreamId(7)).await;
+
+    match recv_reliable_path_command(&mut tcp_rx)
+        .await
+        .expect("tcp close command")
+    {
+        ReliablePathCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
+        _ => panic!("expected TCP close stream command"),
+    }
+    match recv_reliable_path_command(&mut udp_rx)
+        .await
+        .expect("udp close command")
+    {
+        ReliablePathCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
+        _ => panic!("expected UDP close stream command"),
+    }
+}
+
+#[path = "runtime/tests/tests_datagram.rs"]
+mod datagram;
+#[path = "runtime/tests/tests_integration.rs"]
+mod integration;
+#[path = "runtime/tests/tests_peer_status_e2e.rs"]
+mod peer_status_e2e;
+#[path = "runtime/tests/tests_security.rs"]
+mod security;

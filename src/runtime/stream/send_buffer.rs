@@ -200,5 +200,5 @@ impl Drop for StreamSendBufferReservation {
 }
 
 #[cfg(test)]
-#[path = "send_buffer_test.rs"]
+#[path = "tests_send_buffer.rs"]
 mod tests;

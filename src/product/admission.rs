@@ -727,5 +727,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "admission_test.rs"]
+#[path = "tests_admission.rs"]
 mod tests;

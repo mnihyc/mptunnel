@@ -313,5 +313,5 @@ impl std::fmt::Display for ResourceLimitError {
 impl std::error::Error for ResourceLimitError {}
 
 #[cfg(test)]
-#[path = "performance_test.rs"]
+#[path = "tests_performance.rs"]
 mod tests;

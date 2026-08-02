@@ -1556,5 +1556,5 @@ impl ClientPathContext {
 }
 
 #[cfg(test)]
-#[path = "service_test.rs"]
+#[path = "tests_service.rs"]
 mod tests;

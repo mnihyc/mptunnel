@@ -280,7 +280,7 @@ fn dns_runtime_unavailable() -> ManagementHttpError {
     ManagementHttpError::new(
         409,
         "Conflict",
-        "this runtime generation has no configured Product DNS service",
+        "this runtime generation has no configured DNS service",
     )
 }
 

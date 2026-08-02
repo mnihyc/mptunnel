@@ -1885,5 +1885,5 @@ impl std::fmt::Display for CliConfigError {
 impl std::error::Error for CliConfigError {}
 
 #[cfg(test)]
-#[path = "cli_test.rs"]
+#[path = "tests_cli.rs"]
 mod tests;

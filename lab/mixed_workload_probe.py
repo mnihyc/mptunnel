@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import ipaddress
 import json
 import os
@@ -8,6 +9,7 @@ import struct
 import sys
 import threading
 import time
+from collections import Counter
 
 DEFAULT_INTERVAL_SECONDS = 0.2
 INTERVAL_TRIM_DISCARD_EACH_END = 3
@@ -20,6 +22,11 @@ def attempt_has_response_budget(now, workload_deadline_at, timeout):
 
 def small_http_response_budget_seconds(args):
     return min(args.timeout, args.small_response_budget_ms / 1000.0)
+
+
+def browser_full_load_response_timeout_seconds(args):
+    """Keep saturation completion independent from the periodic batch SLA."""
+    return args.timeout
 
 
 def parse_host_port(value):
@@ -200,9 +207,11 @@ def connect_target(args, target, timeout):
     return connect_socks5(args.proxy, target, timeout)
 
 
-def http_get(args, target, path, timeout, chunk_bytes):
+def http_get(args, target, path, timeout, chunk_bytes, connected=None):
     started = time.monotonic()
     sock, target_host, target_port = connect_target(args, target, timeout)
+    if connected is not None:
+        connected()
     with sock:
         request = (
             f"GET {path} HTTP/1.1\r\n"
@@ -228,6 +237,11 @@ def http_get(args, target, path, timeout, chunk_bytes):
     if content_length is not None and body_bytes != content_length:
         raise OSError(f"incomplete HTTP body: {body_bytes} of {content_length}")
     return status, body_bytes, elapsed
+
+
+def concurrent_http_get(start_barrier, args, target, path, timeout, chunk_bytes):
+    start_barrier.wait(timeout=timeout)
+    return http_get(args, target, path, timeout, chunk_bytes)
 
 
 def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
@@ -414,38 +428,80 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
 def small_http_worker(args, started_at, bulk_ready, result):
     latencies = []
     failures = 0
+    failure_reasons = Counter()
     attempts = 0
     response_bytes = 0
+    batch_latencies = []
+    batch_deadline_misses = 0
+    batch_sizes = []
+    batch_start_offsets_ms = []
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
     worker_started = time.monotonic()
     deadline = workload_deadline(started_at, args)
     response_budget = small_http_response_budget_seconds(args)
-    while time.monotonic() < deadline:
-        started = time.monotonic()
-        if not attempt_has_response_budget(started, deadline, response_budget):
-            break
-        attempts += 1
-        remaining = max(0.1, min(args.timeout, deadline - started))
-        try:
-            status, body_bytes, _ = http_get(
-                args,
-                args.http_target,
-                args.small_path,
-                remaining,
-                args.chunk_bytes,
+    next_batch_at = worker_started
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.small_batch_size
+    ) as executor:
+        while time.monotonic() < deadline:
+            if args.small_batch_period_ms > 0:
+                sleep_s = min(
+                    max(0.0, next_batch_at - time.monotonic()),
+                    max(0.0, deadline - time.monotonic()),
+                )
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+            batch_started = time.monotonic()
+            if not attempt_has_response_budget(
+                batch_started, deadline, response_budget
+            ):
+                break
+            batch_size = args.small_batch_size
+            batch_sizes.append(batch_size)
+            batch_start_offsets_ms.append((batch_started - worker_started) * 1000.0)
+            attempts += batch_size
+            remaining = max(
+                0.1,
+                min(args.timeout, response_budget, deadline - batch_started),
             )
-            if not 200 <= status < 400:
-                failures += 1
+            start_barrier = threading.Barrier(batch_size)
+            futures = [
+                executor.submit(
+                    concurrent_http_get,
+                    start_barrier,
+                    args,
+                    args.http_target,
+                    args.small_path,
+                    remaining,
+                    args.chunk_bytes,
+                )
+                for _ in range(batch_size)
+            ]
+            for future in futures:
+                try:
+                    status, body_bytes, elapsed = future.result()
+                    if not 200 <= status < 400:
+                        failures += 1
+                        failure_reasons[f"http_status_{status}"] += 1
+                    else:
+                        response_bytes += body_bytes
+                        latencies.append(elapsed * 1000.0)
+                except Exception as exc:
+                    failures += 1
+                    failure_reasons[f"{type(exc).__name__}: {exc}"] += 1
+            batch_elapsed_ms = (time.monotonic() - batch_started) * 1000.0
+            batch_latencies.append(batch_elapsed_ms)
+            if batch_elapsed_ms > args.small_response_budget_ms:
+                batch_deadline_misses += 1
+
+            if args.small_batch_period_ms > 0:
+                next_batch_at += args.small_batch_period_ms / 1000.0
+                sleep_s = 0.0
             else:
-                response_bytes += body_bytes
-                latencies.append((time.monotonic() - started) * 1000.0)
-        except Exception:
-            failures += 1
-        if args.small_interval_ms > 0:
-            sleep_s = min(
-                args.small_interval_ms / 1000.0,
-                max(0.0, deadline - time.monotonic()),
-            )
+                sleep_s = min(
+                    args.small_interval_ms / 1000.0,
+                    max(0.0, deadline - time.monotonic()),
+                )
             if sleep_s > 0:
                 time.sleep(sleep_s)
     result.update(
@@ -455,10 +511,142 @@ def small_http_worker(args, started_at, bulk_ready, result):
             "small_count": attempts,
             "small_ok": len(latencies),
             "small_fail": failures,
+            "small_failure_reasons": dict(sorted(failure_reasons.items())),
             "small_response_bytes": response_bytes,
+            "small_batch_size": args.small_batch_size,
+            "small_batch_period_ms": args.small_batch_period_ms,
+            "small_response_budget_ms": args.small_response_budget_ms,
+            "small_batch_count": len(batch_latencies),
+            "small_batch_sizes": batch_sizes,
+            "small_batch_start_offsets_ms": [
+                round(value, 3) for value in batch_start_offsets_ms
+            ],
+            "small_batch_start_intervals_ms": [
+                round(right - left, 3)
+                for left, right in zip(
+                    batch_start_offsets_ms, batch_start_offsets_ms[1:]
+                )
+            ],
+            "small_batch_deadline_misses": batch_deadline_misses,
+            "small_batch_p50_ms": percentile(batch_latencies, 0.50),
+            "small_batch_p95_ms": percentile(batch_latencies, 0.95),
+            "small_batch_max_ms": max(batch_latencies)
+            if batch_latencies
+            else None,
             "small_p50_ms": percentile(latencies, 0.50),
             "small_p95_ms": percentile(latencies, 0.95),
             "small_max_ms": max(latencies) if latencies else None,
+        }
+    )
+
+
+def browser_full_load_worker(args, started_at, bulk_ready, result):
+    bulk_ready.wait(timeout=min(args.timeout, 10.0))
+    worker_started = time.monotonic()
+    admission_deadline = workload_deadline(started_at, args)
+    # Periodic browser batches have a per-batch deadline. Saturation instead
+    # keeps exactly `concurrency` requests in flight for the admission window,
+    # then lets every accepted request finish under the general probe timeout.
+    # Reusing the batch deadline here would manufacture rejected requests when
+    # a healthy, progressing transfer outlives one batch period.
+    response_timeout = browser_full_load_response_timeout_seconds(args)
+    concurrency = args.small_batch_size
+    start_barrier = threading.Barrier(concurrency)
+    active_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    def run_slot():
+        nonlocal active, peak_active
+        started = 0
+        accepted = 0
+        completed = 0
+        response_bytes = 0
+        latencies = []
+        failures = Counter()
+        start_barrier.wait(timeout=response_timeout)
+        while time.monotonic() < admission_deadline:
+            started += 1
+            with active_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+
+            def mark_accepted():
+                nonlocal accepted
+                accepted += 1
+
+            try:
+                status, body_bytes, elapsed = http_get(
+                    args,
+                    args.http_target,
+                    args.small_path,
+                    response_timeout,
+                    args.chunk_bytes,
+                    connected=mark_accepted,
+                )
+                if not 200 <= status < 400:
+                    failures[f"http_status_{status}"] += 1
+                else:
+                    completed += 1
+                    response_bytes += body_bytes
+                    latencies.append(elapsed * 1000.0)
+            except Exception as exc:
+                failures[f"{type(exc).__name__}: {exc}"] += 1
+            finally:
+                with active_lock:
+                    active -= 1
+        return {
+            "started": started,
+            "accepted": accepted,
+            "completed": completed,
+            "response_bytes": response_bytes,
+            "latencies": latencies,
+            "failures": failures,
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        slots = [executor.submit(run_slot) for _ in range(concurrency)]
+        slot_results = [slot.result() for slot in slots]
+
+    elapsed = time.monotonic() - worker_started
+    started = sum(slot["started"] for slot in slot_results)
+    accepted = sum(slot["accepted"] for slot in slot_results)
+    completed = sum(slot["completed"] for slot in slot_results)
+    response_bytes = sum(slot["response_bytes"] for slot in slot_results)
+    latencies = [
+        latency for slot in slot_results for latency in slot["latencies"]
+    ]
+    failures = Counter()
+    for slot in slot_results:
+        failures.update(slot["failures"])
+    failed = sum(failures.values())
+    load_window = args.load_duration if args.load_duration > 0 else args.timeout
+    result.update(
+        {
+            "small_start_s": worker_started - started_at,
+            "small_time_s": elapsed,
+            "small_count": started,
+            "small_ok": completed,
+            "small_fail": failed,
+            "small_failure_reasons": dict(sorted(failures.items())),
+            "small_response_bytes": response_bytes,
+            "browser_connections_started": started,
+            "browser_connections_accepted": accepted,
+            "browser_connections_completed": completed,
+            "browser_connections_rejected": started - accepted,
+            "browser_connections_incomplete": accepted - completed,
+            "browser_peak_concurrency": peak_active,
+            "browser_concurrency_limit": concurrency,
+            "browser_load_window_s": load_window,
+            "browser_completed_connections_per_second": completed / elapsed
+            if elapsed > 0
+            else 0.0,
+            "browser_payload_goodput_mbps": response_bytes * 8 / elapsed / 1_000_000
+            if elapsed > 0
+            else 0.0,
+            "browser_p50_ms": percentile(latencies, 0.50),
+            "browser_p95_ms": percentile(latencies, 0.95),
+            "browser_max_ms": max(latencies) if latencies else None,
         }
     )
 
@@ -830,26 +1018,60 @@ def udp_worker(args, started_at, bulk_ready, result):
 
 
 def build_record(args, bulk, small, interactive, udp):
-    bulk_ok = bulk.get("bulk_status") == "ok"
+    browser_only = getattr(args, "browser_only", False)
+    browser_full_load = getattr(args, "browser_full_load", False)
+    bulk_ok = browser_only or bulk.get("bulk_status") == "ok"
     small_attempts = small.get("small_count", 0)
-    small_ok = small_attempts > 0 and small.get("small_fail", 0) == 0
+    small_batch_count = small.get("small_batch_count", 0)
+    small_batch_sizes = small.get("small_batch_sizes", [])
+    small_batch_shape_ok = (
+        small_batch_count > 0
+        and len(small_batch_sizes) == small_batch_count
+        and all(size == args.small_batch_size for size in small_batch_sizes)
+    )
+    small_ok = (
+        small_attempts > 0
+        and small.get("small_fail", 0) == 0
+        and small_batch_shape_ok
+        and (
+            not args.require_small_response_budget
+            or small.get("small_batch_deadline_misses", 0) == 0
+        )
+    )
     interactive_expected = interactive.get("interactive_count", 0)
     interactive_ok = (
-        not args.tcp_echo_target
+        browser_only
+        or not args.tcp_echo_target
         or (interactive_expected > 0 and interactive.get("interactive_fail", 0) == 0)
     )
     udp_attempts = udp.get("udp_count", 0)
-    udp_ok = udp_attempts > 0 and udp.get("udp_received", 0) == udp_attempts
-    status = (
-        "ok"
-        if bulk_ok and small_ok and interactive_ok and udp_ok
-        else "loss"
-        if bulk_ok
-        else "fail"
+    udp_ok = browser_only or (
+        udp_attempts > 0 and udp.get("udp_received", 0) == udp_attempts
     )
+    if browser_full_load:
+        completed = small.get("browser_connections_completed", 0)
+        started = small.get("browser_connections_started", 0)
+        accepted = small.get("browser_connections_accepted", 0)
+        peak = small.get("browser_peak_concurrency", 0)
+        if started <= 0 or accepted <= 0 or completed <= 0 or peak != args.small_batch_size:
+            status = "fail"
+        elif small.get("small_fail", 0) == 0 and started == accepted == completed:
+            status = "ok"
+        else:
+            status = "fail"
+    elif not bulk_ok or (args.require_small_response_budget and not small_ok):
+        status = "fail"
+    elif small_ok and interactive_ok and udp_ok:
+        status = "ok"
+    else:
+        status = "loss"
     record = {
         "case": args.label,
-        "protocol": "mixed",
+        "protocol": "browser-load"
+        if browser_full_load
+        else "browser"
+        if browser_only
+        else "mixed",
         "status": status,
         "mode": args.mode,
         "target": args.http_target,
@@ -884,7 +1106,7 @@ def main():
     parser.add_argument("--mode", choices=("socks5", "direct"), default="socks5")
     parser.add_argument("--proxy", default="127.0.0.1:1080")
     parser.add_argument("--http-target", required=True)
-    parser.add_argument("--udp-target", required=True)
+    parser.add_argument("--udp-target")
     parser.add_argument("--tcp-echo-target")
     parser.add_argument("--bulk-path", default="/large.bin")
     parser.add_argument("--small-path", default="/small.bin")
@@ -895,6 +1117,11 @@ def main():
     parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--small-response-budget-ms", type=int, default=2500)
     parser.add_argument("--small-interval-ms", type=int, default=100)
+    parser.add_argument("--small-batch-size", type=int, default=1)
+    parser.add_argument("--small-batch-period-ms", type=int, default=0)
+    parser.add_argument("--require-small-response-budget", action="store_true")
+    parser.add_argument("--browser-only", action="store_true")
+    parser.add_argument("--browser-full-load", action="store_true")
     parser.add_argument("--udp-payload-bytes", type=int, default=512)
     parser.add_argument("--udp-timeout-ms", type=int, default=2500)
     parser.add_argument("--udp-interval-ms", type=int, default=20)
@@ -903,6 +1130,16 @@ def main():
     parser.add_argument("--tcp-echo-interval-ms", type=int, default=500)
     parser.add_argument("--started-file")
     args = parser.parse_args()
+    if not args.browser_only and not args.udp_target:
+        parser.error("--udp-target is required unless --browser-only is used")
+    if args.browser_full_load and not args.browser_only:
+        parser.error("--browser-full-load requires --browser-only")
+    if args.small_batch_size < 1:
+        parser.error("--small-batch-size must be positive")
+    if args.small_batch_period_ms < 0:
+        parser.error("--small-batch-period-ms must be non-negative")
+    if args.small_response_budget_ms < 1:
+        parser.error("--small-response-budget-ms must be positive")
 
     started_at = time.monotonic()
     write_started_file(args.started_file)
@@ -912,34 +1149,54 @@ def main():
     small = {}
     interactive = {}
     udp = {}
-    threads = [
-        threading.Thread(
-            target=bulk_worker,
-            args=(args, started_at, interactive_ready, bulk_ready, bulk),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=small_http_worker,
-            args=(args, started_at, bulk_ready, small),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=interactive_tcp_worker,
-            args=(args, started_at, interactive_ready, interactive),
-            daemon=True,
-        ),
-        threading.Thread(target=udp_worker, args=(args, started_at, bulk_ready, udp), daemon=True),
-    ]
+    if args.browser_only:
+        bulk_ready.set()
+        interactive_ready.set()
+        threads = [
+            threading.Thread(
+                target=browser_full_load_worker
+                if args.browser_full_load
+                else small_http_worker,
+                args=(args, started_at, bulk_ready, small),
+                daemon=True,
+            )
+        ]
+    else:
+        threads = [
+            threading.Thread(
+                target=bulk_worker,
+                args=(args, started_at, interactive_ready, bulk_ready, bulk),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=small_http_worker,
+                args=(args, started_at, bulk_ready, small),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=interactive_tcp_worker,
+                args=(args, started_at, interactive_ready, interactive),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=udp_worker,
+                args=(args, started_at, bulk_ready, udp),
+                daemon=True,
+            ),
+        ]
     for thread in threads:
         thread.start()
-    for thread in threads:
-        thread.join(timeout=args.timeout + 5.0)
-    print(
-        json.dumps(
-            build_record(args, bulk, small, interactive, udp), separators=(",", ":")
+    join_timeout = args.timeout + 5.0
+    if args.browser_full_load:
+        load_window = args.load_duration if args.load_duration > 0 else args.timeout
+        join_timeout = (
+            load_window + browser_full_load_response_timeout_seconds(args) + 5.0
         )
-    )
-    return 0 if bulk.get("bulk_status") == "ok" else 1
+    for thread in threads:
+        thread.join(timeout=join_timeout)
+    record = build_record(args, bulk, small, interactive, udp)
+    print(json.dumps(record, separators=(",", ":")))
+    return 0 if record["status"] != "fail" else 1
 
 
 if __name__ == "__main__":

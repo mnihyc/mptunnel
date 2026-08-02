@@ -166,5 +166,5 @@ impl std::fmt::Display for DatagramError {
 impl std::error::Error for DatagramError {}
 
 #[cfg(test)]
-#[path = "datagram_test.rs"]
+#[path = "tests_datagram.rs"]
 mod tests;

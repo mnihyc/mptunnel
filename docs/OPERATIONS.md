@@ -143,6 +143,12 @@ is reserved for an application or active-probe destination authority, while
 MPP security and named carrier paths belong to each MPP inbound/outbound
 rather than to a global path role.
 
+Each MPP outbound selects one credential with `credential_id`; each MPP
+inbound accepts one or more credentials with `credential_ids`. Separate MPP
+outbounds may select separate credentials. The outbound's `tls_server_name`
+is the authenticated TLS identity for all of its TCP and QUIC carriers, while
+the pinned certificate identifies the exact accepted server leaf.
+
 `tcp-forward` and `udp-forward` local inbounds require explicit non-zero
 listeners and one canonical `target`. TCP overload is closed immediately at
 `max_connections`; UDP silently drops new sources at `max_associations`,
@@ -216,15 +222,14 @@ probing one concrete port cannot validate an externally published range, and
 runtime carrier selection remains authoritative.
 
 Every port in an outbound carrier range must forward or redirect to the same
-fixed server listener. Ranged QUIC carriers change destination port every five
-minutes by default while retaining the authenticated QUIC connection; use the
-ranged `udp://` path query `port-hop-interval-ms` to select 5000 milliseconds
-or longer. A new host-protected socket is created for each change, the
-established server IP is retained, and another change is not attempted until
-traffic returns through the new port. A failed local rebind keeps the current
-socket. An unreachable forwarded port is a deployment failure and native QUIC
-idle/failure handling owns reconnection. Ranged TCP paths choose a port only
-when a new TCP carrier is established.
+fixed server listener. `port-hop-interval-ms` is accepted on ranged TCP and
+QUIC paths, defaults to five minutes, and has a 5000 ms minimum. QUIC uses a
+fresh protected socket while retaining the authenticated native connection;
+native QUIC migration and validation remain authoritative. TCP creates a new
+carrier at an exact Product-quiescent boundary and retires the predecessor in
+order. It never transfers native transport state or closes active work to meet
+the interval. `tcp-carriers=MIN-MAX` applies only to TCP outbound paths and
+defaults to `1-3`; server listener paths reject this client capacity policy.
 
 Each check is `PASS`, `WARN`, `FAIL`, or `INFO`. Invalid configuration,
 invalid target VPN configuration, or a failed explicitly requested
@@ -479,6 +484,9 @@ transmission modes and not desired memory occupancy.
 | `max_stream_window_bytes` | 64 MiB | per-direction MPP receive window shared across attachments |
 | `max_repair_bytes` | 64 MiB | retained MPP data available for reinjection |
 | `max_reorder_bytes` | 64 MiB | receive-hole and ordering-debt envelope |
+| `max_reinjection_cache_chunks` | 65,536 | repair cache entries |
+| `max_reorder_buffer_chunks` | 65,536 | reorder buffer entries |
+| `max_retained_receive_ranges` | 65,536 | receive range entries |
 | `max_datagram_queue_bytes` | 16 MiB | MPP datagram burst envelope |
 | `max_path_flight_bytes` | 64 MiB | per-path MPP-flight ceiling |
 | `max_reliable_relay_chunk_bytes` | 512 KiB | local read-buffer ceiling |
@@ -710,7 +718,7 @@ under `[inbounds.admission]`; these limits never derive from Core capacity.
 ## Installed files
 
 Download the archive for the operating system and architecture listed in the
-root [README](../README.md#install), use the digest reported by GitHub when
+root [README](../README.md#release-assets), use the digest reported by GitHub when
 independent verification is needed, and keep its example configurations beside
 the operator's own protected configuration.
 
@@ -723,5 +731,4 @@ API persists a replacement configuration.
 The Windows archive keeps its architecture-matched `wintun.dll` beside the
 executable. macOS and Android archives are command-line artifacts and require
 the host integrations described in [Platform lifecycle](PLATFORM.md) for a
-full device VPN. Contributors can find the fixed build and release procedure
-in [Build and CI](CI.md).
+full device VPN.

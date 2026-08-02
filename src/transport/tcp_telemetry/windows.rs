@@ -80,5 +80,5 @@ fn snapshot_from_tcp_info(info: &TCP_INFO_v0) -> Option<TcpNativeSnapshot> {
 }
 
 #[cfg(test)]
-#[path = "windows_test.rs"]
+#[path = "tests_windows.rs"]
 mod tests;

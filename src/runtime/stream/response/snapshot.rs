@@ -414,5 +414,5 @@ pub(super) fn server_output_confidence(entry: &ResponseStreamOutputEntry) -> f64
 }
 
 #[cfg(test)]
-#[path = "snapshot_test.rs"]
+#[path = "tests_snapshot.rs"]
 mod tests;

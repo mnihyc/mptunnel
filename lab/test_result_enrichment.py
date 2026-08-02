@@ -291,7 +291,7 @@ class ResultEnrichmentTests(unittest.TestCase):
             "CASE_FILTER_VALUE": "mptunnel_tcp_*",
             "OBJECT_MIB": "4096",
             "LOAD_DURATION_SECONDS": "10",
-            "UPLOAD_DRAIN_TIMEOUT_SECONDS": "5",
+            "UPLOAD_COMPLETION_TIMEOUT_SECONDS": "5",
             "BULK_CONNECTIONS": "1",
             "FAILOVER_AFTER_SECONDS": "2",
             "FAILOVER_PROFILE": "fat",

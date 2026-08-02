@@ -1158,5 +1158,5 @@ impl PathDeliveryStats {
 }
 
 #[cfg(test)]
-#[path = "model_test.rs"]
+#[path = "tests_model.rs"]
 mod tests;

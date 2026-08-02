@@ -638,7 +638,7 @@ fn peer_path_status_with_id(
 }
 
 #[cfg(test)]
-#[path = "set_test.rs"]
+#[path = "tests_set.rs"]
 mod tests;
 
 fn peer_path_status(

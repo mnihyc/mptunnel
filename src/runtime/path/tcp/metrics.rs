@@ -481,5 +481,5 @@ fn bytes_per_second_to_bits(rate: u64) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "metrics_test.rs"]
+#[path = "tests_metrics.rs"]
 mod tests;

@@ -3295,5 +3295,5 @@ impl std::error::Error for ConfigFileError {
 }
 
 #[cfg(test)]
-#[path = "file_test.rs"]
+#[path = "tests_file.rs"]
 mod tests;

@@ -18,7 +18,7 @@ use crate::mux::stream::ReliableSendStream;
 use crate::protocol::{OffsetRange, TcpCarrierValidationResult};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::reliable_path_command_queue;
-use crate::runtime::path::tcp::server_service::{
+use crate::runtime::path::tcp::server::service::{
     ResponseProductAckReceipt, ServerTcpCarrierObservation, ServerTcpCarrierOutputInstance,
     ServerTcpCarrierValidationAdmission, ServerTcpCarrierValidationOffer,
     ServerTcpValidationController, ServerTcpValidationEvent, candidate_original_release_progress,

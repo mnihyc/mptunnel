@@ -1918,5 +1918,5 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
 }
 
 #[cfg(test)]
-#[path = "queue_test.rs"]
+#[path = "tests_queue.rs"]
 mod tests;

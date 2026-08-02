@@ -310,5 +310,5 @@ pub(in crate::runtime) fn reliable_relay_bulk_path_open_threshold_bytes(
 }
 
 #[cfg(test)]
-#[path = "flow_test.rs"]
+#[path = "tests_flow.rs"]
 mod tests;

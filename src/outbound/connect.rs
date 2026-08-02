@@ -1496,5 +1496,5 @@ impl std::error::Error for OutboundConnectError {
 }
 
 #[cfg(test)]
-#[path = "connect_test.rs"]
+#[path = "tests_connect.rs"]
 mod tests;

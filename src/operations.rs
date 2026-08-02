@@ -1100,7 +1100,7 @@ impl std::fmt::Display for OperationError {
             }
             Self::CliConfig(error) => error.fmt(formatter),
             Self::NoProductRouting => {
-                formatter.write_str("configuration has no local Product routing policy")
+                formatter.write_str("configuration has no local routing policy")
             }
             Self::RoutePolicy(error) => write!(formatter, "failed to compile routing: {error}"),
             Self::RouteInput(error) => write!(formatter, "invalid route input: {error}"),
@@ -1170,5 +1170,5 @@ impl std::error::Error for OperationError {
 }
 
 #[cfg(test)]
-#[path = "operations_test.rs"]
+#[path = "tests_operations.rs"]
 mod tests;

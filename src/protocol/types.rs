@@ -404,5 +404,5 @@ pub enum ResetReason {
 }
 
 #[cfg(test)]
-#[path = "types_test.rs"]
+#[path = "tests_types.rs"]
 mod tests;

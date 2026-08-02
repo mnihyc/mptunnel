@@ -108,6 +108,11 @@ async fn attach_relay_path_candidates(
                     Err(err) => return Err(err),
                 }
             }
+            Err(err @ RuntimeError::ReliablePathAttachmentRefused) => {
+                // The server refused this attachment, not the carrier. Keep
+                // global path health intact and consider the next candidate.
+                last_retryable_error = Some(err);
+            }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
                 context.mark_relay_path_failure(key.underlay, key.index);
                 last_retryable_error = Some(err);
@@ -383,5 +388,5 @@ pub(in crate::runtime) fn reliable_relay_additional_path_open_payload_bytes(
 }
 
 #[cfg(test)]
-#[path = "remote_test.rs"]
+#[path = "tests_remote.rs"]
 mod tests;

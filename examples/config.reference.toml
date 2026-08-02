@@ -21,8 +21,8 @@ console = true          # standard error
 # file = "logs/mptunnel.log"
 flow_events = false     # opt-in destination-bearing flow open/close records
 
-# Global credentials use protocol credential and principal identities. MPP
-# inbounds and outbounds reference credentials by `credential_id`.
+# Global credentials use protocol credential and principal identities. Each
+# MPP outbound uses `credential_id`; an MPP inbound accepts `credential_ids`.
 # File references are resolved relative to this TOML document. Environment
 # references use:
 # secret = { from = "environment", variable = "MPTUNNEL_HOME_KEY" }.
@@ -87,6 +87,9 @@ max_quic_concurrent_bidi_streams = 65536
 max_stream_window_bytes = 67108864
 max_repair_bytes = 67108864
 max_reorder_bytes = 67108864
+max_reinjection_cache_chunks = 65536
+max_reorder_buffer_chunks = 65536
+max_retained_receive_ranges = 65536
 max_datagram_queue_bytes = 16777216
 max_path_flight_bytes = 67108864
 max_reliable_relay_chunk_bytes = 524288
@@ -122,12 +125,13 @@ default_dns_plan = "system"
 
 [[dns.upstreams]]
 name = "system"
-transport = "system"
+transport = "system" # system, udp, tcp, udp-tcp, tls, https, or quic
 
 [[dns.plans]]
 name = "system"
 upstreams = ["system"]
-ip_strategy = "ipv4-and-ipv6"
+ip_strategy = "ipv4-and-ipv6" # ipv4-only, ipv6-only, ipv4-then-ipv6,
+# ipv6-then-ipv4, ipv4-and-ipv6, or ipv6-and-ipv4
 security = "allow-plaintext"
 upstream_strategy = "ordered"
 # For plans with at least two upstreams, use `upstream_strategy = "race"` and
@@ -180,10 +184,15 @@ prefetch_max_ms = 30000
 # recovery_ttl_ms = 120000
 #
 # [[dns.rules]]
-# name = "private-zone"
-# suffix = "corp.example"
+# name = "private-host"
+# exact = "router.corp.example"
 # dns_plan = "system"
-# explanation = "private names use the host resolver"
+# explanation = "private host uses the host resolver"
+#
+# [[dns.rules]]
+# name = "private-zone"
+# suffix = "corp.example" # Exactly one of exact or suffix.
+# dns_plan = "system"
 #
 # Exact immutable host overrides never leak unmatched record types upstream.
 # [[dns.hosts]]
@@ -297,12 +306,11 @@ paths = [
 # listener.
 #
 # Ranged QUIC paths periodically move the same authenticated connection to
-# another port in the set. The default interval is five minutes; override it
-# with `port-hop-interval-ms=<u32>` (minimum 5000). Each replacement uses a
-# fresh host-protected socket but retains the established server IP, QUIC
-# connection, streams, and MPP carrier identity. The next interval begins only
-# after traffic returns through the selected port. Ranged TCP paths select a
-# port only for each new TCP carrier.
+# another port in the set. Ranged TCP paths use the same interval to make a
+# configured-minimum carrier eligible for quiescent make-before-break
+# replacement. The default is five minutes; override it with
+# `port-hop-interval-ms=<u32>` (minimum 5000). TCP never migrates native state
+# or closes an active carrier to meet an interval.
 #
 # Carrier URI query reference (startup hints are replaced by live evidence;
 # policy flags remain operator constraints):
@@ -311,11 +319,12 @@ paths = [
 #   jitter-ms=<u32>
 #   rate-bps|rate-kbps|rate-mbps=<u64>, or rate=unknown|unlimited
 #   datagram-payload-limit=512..65000
-#   port-hop-interval-ms=5000..4294967295 (ranged udp:// only)
+#   tcp-carriers=MIN-MAX (tcp:// only; default 1-3)
+#   port-hop-interval-ms=5000..4294967295 (ranged tcp:// or udp://)
 #   backup, expensive, bulk-allowed, probe-only, no-udp
 # Boolean flags may omit a value or use canonical true/false. Server bind
-# paths reject `source-ip` and port ranges, and udp:// paths cannot set
-# no-udp=true.
+# paths reject `source-ip`, `tcp-carriers`, and port ranges; udp:// paths cannot
+# set no-udp=true.
 path_probe_interval_ms = 10000
 path_probe_timeout_ms = 2000
 
@@ -345,8 +354,11 @@ generation = 1
 #
 # [[routing.destination_acl.rules]]
 # name = "allow-home-service"
-# effect = "allow-restricted"
+# effect = "allow-restricted" # deny, allow, or allow-restricted
 # domain_exact = ["router.home.arpa"]
+# domain_suffix = ["home.arpa"]
+# domain_keyword = ["router"]
+# domain_regex = ["^router[0-9]+\\.home\\.arpa$"]
 # destination_cidrs = ["192.168.1.0/24"]
 # destination_ports = [443]
 # networks = ["tcp"]
@@ -378,13 +390,25 @@ generation = 1
 # with every other nonempty match category.
 # [[routing.rules]]
 # name = "signed-policy"
+# domain_exact = ["service.example"]
+# domain_suffix = ["example"]
+# domain_keyword = ["service"]
+# domain_regex = ["^service[0-9]+\\.example$"]
 # domain_rule_set_ids = ["geo-public"]
+# destination_cidrs = ["203.0.113.0/24"]
 # destination_rule_set_ids = ["geo-public"]
+# source_cidrs = ["10.0.0.0/8"]
+# destination_ports = [443, "8000-8999"]
+# source_ports = [1024, "49152-65535"]
+# networks = ["tcp", "udp"]
 # inbounds = ["local-socks"]
 # principal_ids = ["family"]
 # stages = ["post-resolution"]
-# action = "outbound"
+# action = "outbound" # outbound, balancer, reject, or drop
 # outbound = "edge-mpp"
+# balancer = "edge-balancer" # Alternative to outbound with action = "balancer".
+# dns_plan = "system"
+# traffic_intent = "throughput" # interactive, throughput, realtime, or background
 # explanation = "route signed domain and network policy through the edge"
 
 [[routing.rules]]
@@ -396,6 +420,11 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 
 # A second independent MPP leaf can join the edge-balancer routing example
 # below; it keeps its own session, carrier set, and performance policy.
+# [[credentials]]
+# credential_id = "secondary-2026"
+# principal_id = "secondary"
+# secret = { from = "file", path = "secondary-mpp-credential.key" }
+#
 # [[outbounds]]
 # name = "edge-mpp-secondary"
 # protocol = "mpp"
@@ -429,6 +458,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # ]
 # outbound = "direct-egress"
 # balancer = "egress-fallback" # Alternative: remove outbound before enabling.
+# dns_plan = "system"
 #
 # [inbounds.performance]
 # extra_traffic_hint_percent = 5
@@ -451,6 +481,10 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # [[inbounds.destination_acl.rules]]
 # name = "allow-private-service"
 # effect = "allow-restricted"
+# domain_exact = ["service.corp.example"]
+# domain_suffix = ["corp.example"]
+# domain_keyword = ["service"]
+# domain_regex = ["^service[0-9]+\\.corp\\.example$"]
 # destination_cidrs = ["10.0.0.0/8"]
 # destination_ports = [443, "8000-8999"]
 # networks = ["tcp", "udp"]

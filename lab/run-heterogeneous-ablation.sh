@@ -54,7 +54,6 @@ large_http_path="${MPTUNNEL_LAB_LARGE_HTTP_PATH:-/large.bin}"
 small_http_path="${MPTUNNEL_LAB_SMALL_HTTP_PATH:-/small.bin}"
 small_object_kib="${MPTUNNEL_LAB_SMALL_OBJECT_KIB:-32}"
 load_duration_seconds="${MPTUNNEL_LAB_LOAD_DURATION_SECONDS:-30}"
-upload_drain_timeout_seconds="${MPTUNNEL_LAB_UPLOAD_DRAIN_TIMEOUT_SECONDS:-1}"
 bulk_connections="${MPTUNNEL_LAB_BULK_CONNECTIONS:-2}"
 tcp_carrier_qos_cohort="${MPTUNNEL_LAB_TCP_CARRIER_QOS_COHORT:-0}"
 tcp_carrier_qos_duration_seconds=30
@@ -64,6 +63,17 @@ tcp_carrier_qos_object_mib=4096
 tcp_carrier_qos_http_path="/tcp-carrier-qos.bin"
 tcp_per_flow_qos_rate="${MPTUNNEL_LAB_TCP_PER_FLOW_QOS_RATE:-500mbit}"
 tcp_shared_bottleneck_rate="${MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE:-200mbit}"
+scale_seed="${MPTUNNEL_LAB_SCALE_SEED:-mptunnel-scale-links}"
+scale_epoch_seconds=6
+scale_epoch_count=5
+scale_load_duration_seconds=$((scale_epoch_seconds * scale_epoch_count + 15))
+scale_rate_bands=(access gigabit multi-gigabit)
+browser_batch_size=10
+browser_batch_period_ms=3000
+browser_batch_deadline_ms=3000
+browser_load_concurrency=20
+browser_load_duration_seconds=60
+browser_load_path="/browser.bin"
 proxy_port="${PROXY_PORT:-1080}"
 baseline_proxy_port="${BASELINE_PROXY_PORT:-1090}"
 server_port="${SERVER_PORT:-7443}"
@@ -84,13 +94,19 @@ curl_timeout="${CURL_TIMEOUT_SECONDS:-120}"
 upload_process_timeout_seconds="$(
   LOAD_DURATION_SECONDS="$load_duration_seconds" \
   CURL_TIMEOUT_SECONDS="$curl_timeout" \
-  UPLOAD_DRAIN_TIMEOUT_SECONDS="$upload_drain_timeout_seconds" \
     python3 -c 'import math, os
 load = float(os.environ["LOAD_DURATION_SECONDS"])
 timeout = float(os.environ["CURL_TIMEOUT_SECONDS"])
-drain = max(0.0, float(os.environ["UPLOAD_DRAIN_TIMEOUT_SECONDS"]))
 active = timeout if load <= 0 else min(load, timeout)
-print(max(1, math.ceil(active + drain + 10.0)))'
+print(max(1, math.ceil(active + timeout + 10.0)))'
+)"
+scale_upload_process_timeout_seconds="$(
+  LOAD_DURATION_SECONDS="$scale_load_duration_seconds" \
+  CURL_TIMEOUT_SECONDS="$curl_timeout" \
+    python3 -c 'import math, os
+load = float(os.environ["LOAD_DURATION_SECONDS"])
+timeout = float(os.environ["CURL_TIMEOUT_SECONDS"])
+print(max(1, math.ceil(load + timeout + 10.0)))'
 )"
 mptcp_evidence_interval_seconds="${MPTUNNEL_LAB_MPTCP_EVIDENCE_INTERVAL_SECONDS:-1.0}"
 mptcp_evidence_max_duration_seconds="${MPTUNNEL_LAB_MPTCP_EVIDENCE_MAX_DURATION_SECONDS:-$((upload_process_timeout_seconds + 5))}"
@@ -388,6 +404,7 @@ exec_netem() {
     -e MPTUNNEL_LAB_MATRIX_POOR_JITTER="${MPTUNNEL_LAB_MATRIX_POOR_JITTER:-60ms}" \
     -e MPTUNNEL_LAB_MATRIX_GOOD_LOSS="${MPTUNNEL_LAB_MATRIX_GOOD_LOSS:-1.00%}" \
     -e MPTUNNEL_LAB_MATRIX_POOR_LOSS="${MPTUNNEL_LAB_MATRIX_POOR_LOSS:-15.00%}" \
+    -e MPTUNNEL_LAB_SCALE_SEED="$scale_seed" \
     -e MPTUNNEL_LAB_BLACKHOLE_LOSS="${MPTUNNEL_LAB_BLACKHOLE_LOSS:-100%}" \
     -e MPTUNNEL_LAB_SPIKE_FAT_RATE="${MPTUNNEL_LAB_SPIKE_FAT_RATE:-20mbit}" \
     -e MPTUNNEL_LAB_SPIKE_FAT_DELAY="${MPTUNNEL_LAB_SPIKE_FAT_DELAY:-900ms}" \
@@ -532,7 +549,7 @@ write_run_manifest() {
   CASE_FILTER_VALUE="$case_filter" \
   OBJECT_MIB="$object_mib" \
   LOAD_DURATION_SECONDS="$load_duration_seconds" \
-  UPLOAD_DRAIN_TIMEOUT_SECONDS="$upload_drain_timeout_seconds" \
+  UPLOAD_COMPLETION_TIMEOUT_SECONDS="$curl_timeout" \
   BULK_CONNECTIONS="$bulk_connections" \
   FAILOVER_AFTER_SECONDS="$failover_after" \
   FAILOVER_PROFILE="$failover_profile" \
@@ -785,11 +802,26 @@ server_config_toml() {
     "tcp://172.31.16.20:${server_port}" \
     "tcp://172.31.20.20:${server_port}" \
     "tcp://172.31.30.20:${server_port}" \
+    "tcp://172.31.41.20:${server_port}" \
+    "tcp://172.31.42.20:${server_port}" \
+    "tcp://172.31.43.20:${server_port}" \
+    "tcp://172.31.44.20:${server_port}" \
+    "tcp://172.31.45.20:${server_port}" \
     "udp://172.31.10.20:${server_port}" \
     "udp://172.31.15.20:${server_port}" \
     "udp://172.31.16.20:${server_port}" \
     "udp://172.31.20.20:${server_port}" \
-    "udp://172.31.30.20:${server_port}")"
+    "udp://172.31.30.20:${server_port}" \
+    "udp://172.31.51.20:${server_port}" \
+    "udp://172.31.52.20:${server_port}" \
+    "udp://172.31.53.20:${server_port}" \
+    "udp://172.31.54.20:${server_port}" \
+    "udp://172.31.55.20:${server_port}" \
+    "udp://172.31.56.20:${server_port}" \
+    "udp://172.31.57.20:${server_port}" \
+    "udp://172.31.58.20:${server_port}" \
+    "udp://172.31.59.20:${server_port}" \
+    "udp://172.31.60.20:${server_port}")"
   resources="$(resource_config_toml)"
   management="$(management_config_toml "$server_management_token_path")"
   if [[ -n "$resources" ]]; then
@@ -1687,7 +1719,7 @@ run_unproxied_upload_probe_case() {
   set +e
   local output probe_stderr
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}' --target '${target}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}' --target '${target}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
   freeze_target_tcp_sink
   observer_freeze_exit_code="$?"
@@ -1718,18 +1750,16 @@ run_tcp_upload_probe_case() {
     python3 - \
       "$probe_timeout" \
       "$probe_load_duration" \
-      "$upload_drain_timeout_seconds" \
       "$synchronized_start" <<'PY'
 import math
 import sys
 
 setup_timeout = float(sys.argv[1])
 load_duration = float(sys.argv[2])
-drain_timeout = max(0.0, float(sys.argv[3]))
-synchronized = sys.argv[4].lower() in {"1", "true", "yes"}
+synchronized = sys.argv[3].lower() in {"1", "true", "yes"}
 active = setup_timeout if load_duration <= 0 else min(load_duration, setup_timeout)
 setup = setup_timeout if synchronized else 0.0
-print(max(1, math.ceil(setup + active + drain_timeout + 10.0)))
+print(max(1, math.ceil(setup + active + setup_timeout + 10.0)))
 PY
   )"
   restart_target_tcp_sink
@@ -1738,7 +1768,7 @@ PY
   set +e
   local output probe_stderr
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${probe_workers}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --parallel-uploads '${probe_workers}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
   freeze_target_tcp_sink
   observer_freeze_exit_code="$?"
@@ -1923,9 +1953,22 @@ cleanup() {
 
 apply_netem() {
   local mode="$1"
-  exec_netem client "$mode"
-  exec_netem server "$mode"
-  exec_netem target "$mode"
+  if [[ "$mode" =~ ^scale-(access|gigabit|multi-gigabit)-epoch-0$ ]]; then
+    prepare_path_variation_initial_epoch "${BASH_REMATCH[1]}"
+    exec_netem target clear >/dev/null
+  else
+    exec_netem client "$mode"
+    exec_netem server "$mode"
+    exec_netem target "$mode"
+  fi
+}
+
+apply_asymmetric_netem() {
+  exec_netem client clear >/dev/null
+  exec_netem server clear >/dev/null
+  exec_netem target clear >/dev/null
+  exec_netem client asymmetric-client >/dev/null
+  exec_netem server asymmetric-server >/dev/null
 }
 
 apply_failover_blackhole() {
@@ -2234,7 +2277,7 @@ start_target_services() {
   if flag_enabled "$tcp_carrier_qos_cohort"; then
     exec_in target "truncate -s '${tcp_carrier_qos_object_mib}M' '/tmp/mptunnel-lab${tcp_carrier_qos_http_path}'"
   fi
-  exec_in target "dd if=/dev/zero of=/tmp/mptunnel-lab/small.bin bs=1K count='${small_object_kib}' status=none && printf 'mptunnel lab target\\n' >/tmp/mptunnel-lab/index.html"
+  exec_in target "dd if=/dev/zero of=/tmp/mptunnel-lab/small.bin bs=1K count='${small_object_kib}' status=none && truncate -s 1M '/tmp/mptunnel-lab${browser_load_path}' && printf 'mptunnel lab target\\n' >/tmp/mptunnel-lab/index.html"
   exec_in target "if [ -f /tmp/mptunnel-http.pid ]; then kill \$(cat /tmp/mptunnel-http.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-http.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-udp-echo.pid ]; then kill \$(cat /tmp/mptunnel-udp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-udp-echo.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-tcp-echo.pid ]; then kill \$(cat /tmp/mptunnel-tcp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-tcp-echo.pid; fi"
@@ -2430,7 +2473,7 @@ run_baseline_upload_probe_case() {
   telemetry_pid="$case_telemetry_pid"
   set +e
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}-upload' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}-upload' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   exit_code="$?"
   freeze_target_tcp_sink
   observer_freeze_exit_code="$?"
@@ -2726,7 +2769,7 @@ run_mptcp_baseline_upload_case() {
   start_mptcp_evidence "$case_name"
   set +e
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol 'mptcp-upload' --mptcp --target 172.31.10.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol 'mptcp-upload' --mptcp --target 172.31.10.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   exit_code="$?"
   freeze_target_tcp_sink
   observer_freeze_exit_code="$?"
@@ -2997,6 +3040,363 @@ run_mixed_flapping_case() {
   append_mixed_probe_result "$case_name" "$exit_code" "$output" "$flapping_metadata_json" "$probe_stderr" 1
 }
 
+prepare_path_variation_initial_epoch() {
+  local rate_band="$1"
+  local client_pid server_pid client_exit_code server_exit_code
+
+  set +e
+  exec_netem client "scale-${rate_band}-epoch-0-client" >/dev/null &
+  client_pid="$!"
+  exec_netem server "scale-${rate_band}-epoch-0-server" >/dev/null &
+  server_pid="$!"
+  wait "$client_pid"
+  client_exit_code="$?"
+  wait "$server_pid"
+  server_exit_code="$?"
+  set -e
+  if [[ "$client_exit_code" != "0" || "$server_exit_code" != "0" ]]; then
+    echo "failed to establish the ${rate_band} initial path conditions" >&2
+    return 1
+  fi
+}
+
+run_path_variation_schedule() {
+  local trace_file="$1"
+  local rate_band="$2"
+  local origin_ms event_start_ms client_start_ms client_end_ms
+  local server_start_ms server_end_ms hold_deadline_ms
+  local client_profiles server_profiles client_exit_code server_exit_code
+  local client_profiles_file server_profiles_file client_pid server_pid epoch preconditioned
+
+  : > "$trace_file"
+  origin_ms="$(monotonic_milliseconds)"
+  for ((epoch = 0; epoch < scale_epoch_count; epoch++)); do
+    event_start_ms="$(($(monotonic_milliseconds) - origin_ms))"
+    client_start_ms="$(($(monotonic_milliseconds) - origin_ms))"
+    server_start_ms="$(($(monotonic_milliseconds) - origin_ms))"
+    if [[ "$epoch" == "0" ]]; then
+      preconditioned=1
+      client_profiles="$(python3 "$script_dir/path_variation.py" profiles --seed "$scale_seed" --epoch "$epoch" --direction client --rate-band "$rate_band")"
+      server_profiles="$(python3 "$script_dir/path_variation.py" profiles --seed "$scale_seed" --epoch "$epoch" --direction server --rate-band "$rate_band")"
+      client_exit_code=0
+      server_exit_code=0
+      client_end_ms="$(($(monotonic_milliseconds) - origin_ms))"
+      server_end_ms="$client_end_ms"
+    else
+      preconditioned=0
+      client_profiles_file="$(mktemp "${trace_file}.client.XXXXXX")"
+      server_profiles_file="$(mktemp "${trace_file}.server.XXXXXX")"
+      set +e
+      exec_netem client "scale-${rate_band}-epoch-${epoch}-client" > "$client_profiles_file" &
+      client_pid="$!"
+      exec_netem server "scale-${rate_band}-epoch-${epoch}-server" > "$server_profiles_file" &
+      server_pid="$!"
+      wait "$client_pid"
+      client_exit_code="$?"
+      client_end_ms="$(($(monotonic_milliseconds) - origin_ms))"
+      wait "$server_pid"
+      server_exit_code="$?"
+      server_end_ms="$(($(monotonic_milliseconds) - origin_ms))"
+      set -e
+      client_profiles="$(<"$client_profiles_file")"
+      server_profiles="$(<"$server_profiles_file")"
+      rm -f -- "$client_profiles_file" "$server_profiles_file"
+    fi
+
+    CLIENT_PROFILES="$client_profiles" \
+    SERVER_PROFILES="$server_profiles" \
+    python3 - \
+      "$epoch" \
+      "$event_start_ms" \
+      "$client_start_ms" \
+      "$client_end_ms" \
+      "$client_exit_code" \
+      "$server_start_ms" \
+      "$server_end_ms" \
+      "$server_exit_code" \
+      "$preconditioned" <<'PY' >> "$trace_file"
+import json
+import os
+import sys
+
+
+def profiles(name):
+    try:
+        value = json.loads(os.environ.get(name, ""))
+    except json.JSONDecodeError:
+        value = []
+    return value
+
+
+fields = [int(value) for value in sys.argv[1:]]
+print(
+    json.dumps(
+        {
+            "epoch": fields[0],
+            "event_start_offset_ms": fields[1],
+            "client_apply_start_offset_ms": fields[2],
+            "client_apply_end_offset_ms": fields[3],
+            "client_exit_code": fields[4],
+            "server_apply_start_offset_ms": fields[5],
+            "server_apply_end_offset_ms": fields[6],
+            "server_exit_code": fields[7],
+            "preconditioned": bool(fields[8]),
+            "client_profiles": profiles("CLIENT_PROFILES"),
+            "server_profiles": profiles("SERVER_PROFILES"),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+)
+PY
+    if [[ "$client_exit_code" != "0" || "$server_exit_code" != "0" ]]; then
+      return 1
+    fi
+    hold_deadline_ms="$(($(monotonic_milliseconds) + scale_epoch_seconds * 1000))"
+    while (( $(monotonic_milliseconds) < hold_deadline_ms )); do
+      sleep 0.05
+    done
+  done
+}
+
+path_variation_metadata() {
+  local trace_file="$1"
+  local rate_band="$2"
+  python3 "$script_dir/path_variation.py" metadata \
+    --seed "$scale_seed" \
+    --rate-band "$rate_band" \
+    --trace "$trace_file" \
+    --expected-epochs "$scale_epoch_count"
+}
+
+attach_path_variation_metadata() {
+  local output="$1"
+  local metadata="$2"
+  local schedule_exit_code="$3"
+  ROW="$output" METADATA="$metadata" SCHEDULE_EXIT_CODE="$schedule_exit_code" \
+    python3 - <<'PY'
+import json
+import os
+
+try:
+    row = json.loads(os.environ.get("ROW", ""))
+except json.JSONDecodeError:
+    row = {"status": "fail", "raw_output": os.environ.get("ROW", "")}
+try:
+    metadata = json.loads(os.environ.get("METADATA", ""))
+except json.JSONDecodeError as exc:
+    metadata = {"trace_complete": False, "trace_error": str(exc)}
+schedule_exit_code = int(os.environ.get("SCHEDULE_EXIT_CODE", "1"))
+metadata["schedule_exit_code"] = schedule_exit_code
+row["path_variation"] = metadata
+if schedule_exit_code != 0 or not metadata.get("trace_complete", False):
+    row.setdefault("probe_status_before_path_variation_validation", row.get("status"))
+    row["status"] = "fail"
+    row["failure_reason"] = "path variation schedule was incomplete"
+print(json.dumps(row, separators=(",", ":"), sort_keys=True))
+PY
+}
+
+wait_for_case_probe() {
+  local status_file="$1"
+  local probe_pid_file="$2"
+  local probe_duration_seconds="${3:-$scale_load_duration_seconds}"
+  local deadline=$((SECONDS + probe_duration_seconds + 20))
+  while [[ ! -f "$status_file" ]] && (( SECONDS < deadline )); do
+    sleep 0.05
+  done
+  if [[ ! -f "$status_file" ]]; then
+    exec_in client "probe_pid=\$(cat '${probe_pid_file}' 2>/dev/null || true); if [ -n \"\$probe_pid\" ]; then pkill -TERM -P \"\$probe_pid\" >/dev/null 2>&1 || true; kill \"\$probe_pid\" >/dev/null 2>&1 || true; fi; true"
+    printf '124\n' > "$status_file"
+  fi
+}
+
+run_browser_probe_case() {
+  local case_name="$1"
+  local object_path="$2"
+  local probe_duration_seconds="$3"
+  shift 3
+  local probe_arguments="$*"
+  local output_file="/tmp/${case_name}.out"
+  local error_file="/tmp/${case_name}.err"
+  local probe_pid_file="/tmp/${case_name}.pid"
+  local started_file="/tmp/${case_name}.started"
+  local status_relative=".tmp/lab/${case_name}-${timestamp}-$$.status"
+  local status_file="${repo_root}/${status_relative}"
+  local status_container_file="/workspace/${status_relative}"
+  local telemetry_pid output probe_stderr exit_code
+  local probe_process_timeout_seconds
+  local probe_wait_timeout_seconds
+
+  probe_process_timeout_seconds="$((probe_duration_seconds + 15))"
+  if [[ " ${probe_arguments} " == *" --browser-full-load "* ]]; then
+    probe_process_timeout_seconds="$(
+      LOAD_DURATION_SECONDS="$probe_duration_seconds" \
+      COMPLETION_TIMEOUT_SECONDS="$curl_timeout" \
+        python3 -c 'import math, os
+load = float(os.environ["LOAD_DURATION_SECONDS"])
+completion = float(os.environ["COMPLETION_TIMEOUT_SECONDS"])
+print(max(1, math.ceil(load + completion + 10.0)))'
+    )"
+  fi
+  probe_wait_timeout_seconds="$((probe_process_timeout_seconds + 5))"
+
+  start_client "$case_name" "$tcp_all $udp_all"
+  exec_in client "rm -f '${output_file}' '${error_file}' '${probe_pid_file}' '${started_file}'"
+  rm -f "$status_file" "${status_file}.tmp"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  exec_in client "(set +e; timeout ${probe_process_timeout_seconds}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --browser-only --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --small-path '${object_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${probe_duration_seconds}' ${probe_arguments} --started-file '${started_file}' > '${output_file}' 2> '${error_file}'; probe_exit=\$?; printf '%s\n' \"\$probe_exit\" > '${status_container_file}.tmp'; mv '${status_container_file}.tmp' '${status_container_file}') & echo \$! > '${probe_pid_file}'"
+  wait_for_case_probe "$status_file" "$probe_pid_file" "$probe_wait_timeout_seconds"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  output="$(exec_in client "cat '${output_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -c '${log_tail_bytes}' '${error_file}' 2>/dev/null || true")"
+  exit_code="$(cat "$status_file" 2>/dev/null || echo 124)"
+  append_mixed_probe_result "$case_name" "$exit_code" "$output" "" "$probe_stderr" 1
+  rm -f "$status_file" "${status_file}.tmp"
+}
+
+run_browser_batch_case() {
+  run_browser_probe_case \
+    "mptunnel_browser_concurrent_batches" \
+    "$small_http_path" \
+    "$load_duration_seconds" \
+    --small-response-budget-ms "$browser_batch_deadline_ms" \
+    --small-batch-size "$browser_batch_size" \
+    --small-batch-period-ms "$browser_batch_period_ms" \
+    --require-small-response-budget
+}
+
+run_browser_full_load_case() {
+  run_browser_probe_case \
+    "mptunnel_browser_full_load" \
+    "$browser_load_path" \
+    "$browser_load_duration_seconds" \
+    --browser-full-load \
+    --small-batch-size "$browser_load_concurrency"
+}
+
+run_varying_links_download_case() {
+  local rate_band="$1"
+  local rate_band_label="${rate_band//-/_}"
+  local case_name="mptunnel_twenty_varying_links_${rate_band_label}_download"
+  local output_file="/tmp/${case_name}.out"
+  local error_file="/tmp/${case_name}.err"
+  local probe_pid_file="/tmp/${case_name}.pid"
+  local started_file="/tmp/${case_name}.started"
+  local status_relative=".tmp/lab/${case_name}-${timestamp}-$$.status"
+  local status_file="${repo_root}/${status_relative}"
+  local status_container_file="/workspace/${status_relative}"
+  local trace_file="${result_dir}/path-variation-${case_name}.jsonl"
+  local telemetry_pid output probe_stderr exit_code schedule_exit_code
+  local metadata metadata_exit_code
+
+  start_client_with_netem "$case_name" "scale-${rate_band}-epoch-0" "$mixed_scale_all"
+  exec_in client "rm -f '${output_file}' '${error_file}' '${probe_pid_file}' '${started_file}'"
+  rm -f "$status_file" "${status_file}.tmp" "$trace_file"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  exec_in client "(set +e; timeout $((scale_load_duration_seconds + 15))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${scale_load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > '${output_file}' 2> '${error_file}'; probe_exit=\$?; printf '%s\n' \"\$probe_exit\" > '${status_container_file}.tmp'; mv '${status_container_file}.tmp' '${status_container_file}') & echo \$! > '${probe_pid_file}'"
+  if exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"; then
+    set +e
+    run_path_variation_schedule "$trace_file" "$rate_band"
+    schedule_exit_code="$?"
+    set -e
+  else
+    schedule_exit_code=124
+  fi
+  wait_for_case_probe "$status_file" "$probe_pid_file"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  output="$(exec_in client "cat '${output_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -c '${log_tail_bytes}' '${error_file}' 2>/dev/null || true")"
+  exit_code="$(cat "$status_file" 2>/dev/null || echo 124)"
+  set +e
+  metadata="$(path_variation_metadata "$trace_file" "$rate_band")"
+  metadata_exit_code="$?"
+  set -e
+  if [[ "$metadata_exit_code" != "0" && "$schedule_exit_code" == "0" ]]; then
+    schedule_exit_code="$metadata_exit_code"
+  fi
+  output="$(attach_path_variation_metadata "$output" "$metadata" "$schedule_exit_code")"
+  append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  rm -f "$status_file" "${status_file}.tmp"
+  apply_netem apply
+}
+
+run_varying_links_upload_case() {
+  local rate_band="$1"
+  local rate_band_label="${rate_band//-/_}"
+  local case_name="mptunnel_twenty_varying_links_${rate_band_label}_upload"
+  local output_file="/tmp/${case_name}.out"
+  local error_file="/tmp/${case_name}.err"
+  local probe_pid_file="/tmp/${case_name}.pid"
+  local started_file="/tmp/${case_name}.started"
+  local status_relative=".tmp/lab/${case_name}-${timestamp}-$$.status"
+  local status_file="${repo_root}/${status_relative}"
+  local status_container_file="/workspace/${status_relative}"
+  local trace_file="${result_dir}/path-variation-${case_name}.jsonl"
+  local telemetry_pid output probe_stderr exit_code schedule_exit_code
+  local metadata metadata_exit_code observer_started_ns observer_stopped_ns
+  local observer_elapsed_seconds observer_freeze_exit_code
+
+  start_client_with_netem "$case_name" "scale-${rate_band}-epoch-0" "$mixed_scale_all"
+  restart_target_tcp_sink
+  exec_in client "rm -f '${output_file}' '${error_file}' '${probe_pid_file}' '${started_file}'"
+  rm -f "$status_file" "${status_file}.tmp" "$trace_file"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  observer_started_ns="$(monotonic_time_ns)"
+  exec_in client "(set +e; timeout ${scale_upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${scale_load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > '${output_file}' 2> '${error_file}'; probe_exit=\$?; printf '%s\n' \"\$probe_exit\" > '${status_container_file}.tmp'; mv '${status_container_file}.tmp' '${status_container_file}') & echo \$! > '${probe_pid_file}'"
+  if exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"; then
+    set +e
+    run_path_variation_schedule "$trace_file" "$rate_band"
+    schedule_exit_code="$?"
+    set -e
+  else
+    schedule_exit_code=124
+  fi
+  wait_for_case_probe "$status_file" "$probe_pid_file" "$scale_upload_process_timeout_seconds"
+  set +e
+  freeze_target_tcp_sink
+  observer_freeze_exit_code="$?"
+  set -e
+  observer_stopped_ns="$(monotonic_time_ns)"
+  observer_elapsed_seconds="$(elapsed_seconds_between_ns "$observer_started_ns" "$observer_stopped_ns")"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  output="$(exec_in client "cat '${output_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -c '${log_tail_bytes}' '${error_file}' 2>/dev/null || true")"
+  exit_code="$(cat "$status_file" 2>/dev/null || echo 124)"
+  set +e
+  metadata="$(path_variation_metadata "$trace_file" "$rate_band")"
+  metadata_exit_code="$?"
+  set -e
+  if [[ "$metadata_exit_code" != "0" && "$schedule_exit_code" == "0" ]]; then
+    schedule_exit_code="$metadata_exit_code"
+  fi
+  output="$(attach_path_variation_metadata "$output" "$metadata" "$schedule_exit_code")"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 1 "tcp-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code"
+  rm -f "$status_file" "${status_file}.tmp"
+  apply_netem apply
+}
+
+run_asymmetric_download_case() {
+  local case_name="$1"
+  shift
+  start_client_with_netem "$case_name" unconstrained "$@"
+  apply_asymmetric_netem
+  run_tcp_download_probe_case "$case_name"
+  apply_netem apply
+}
+
+run_asymmetric_upload_case() {
+  local case_name="$1"
+  shift
+  start_client_with_netem "$case_name" unconstrained "$@"
+  apply_asymmetric_netem
+  run_tcp_upload_probe_case "$case_name"
+  apply_netem apply
+}
+
 netem_mode_for_equal_profile() {
   local ideal_path="$1"
   case "$ideal_path" in
@@ -3263,7 +3663,7 @@ run_upload_failover_case() {
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${probe_failover_after}' --failover-marker-file '${failover_marker_file}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
+  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${probe_failover_after}' --failover-marker-file '${failover_marker_file}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   wait_for_tcp_failover_trigger "$case_name" "$failover_marker_file" client "$failover_client_address"
   apply_failover_blackhole
@@ -3322,7 +3722,7 @@ run_upload_latency_spike_case() {
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-spike.out 2>/tmp/mptunnel-upload-spike.err; echo \$? >/tmp/mptunnel-upload-spike.status) & echo \$! >/tmp/mptunnel-upload-spike.pid"
+  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-spike.out 2>/tmp/mptunnel-upload-spike.err; echo \$? >/tmp/mptunnel-upload-spike.status) & echo \$! >/tmp/mptunnel-upload-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_latency_spike_fat
@@ -3404,6 +3804,23 @@ udp_all="${udp_lowlat} ${udp_balanced} ${udp_mildloss} ${udp_fat} ${udp_poor}"
 tcp_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_mildloss} ${tcp_endpoint_fat} ${tcp_endpoint_poor}"
 udp_equal_all="${udp_endpoint_lowlat} ${udp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
 mixed_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
+tcp_scale_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_mildloss} ${tcp_endpoint_fat} ${tcp_endpoint_poor} \
+--path 'tcp://172.31.41.20:${server_port}' \
+--path 'tcp://172.31.42.20:${server_port}' \
+--path 'tcp://172.31.43.20:${server_port}' \
+--path 'tcp://172.31.44.20:${server_port}' \
+--path 'tcp://172.31.45.20:${server_port}'"
+udp_scale_all="--path 'udp://172.31.51.20:${server_port}' \
+--path 'udp://172.31.52.20:${server_port}' \
+--path 'udp://172.31.53.20:${server_port}' \
+--path 'udp://172.31.54.20:${server_port}' \
+--path 'udp://172.31.55.20:${server_port}' \
+--path 'udp://172.31.56.20:${server_port}' \
+--path 'udp://172.31.57.20:${server_port}' \
+--path 'udp://172.31.58.20:${server_port}' \
+--path 'udp://172.31.59.20:${server_port}' \
+--path 'udp://172.31.60.20:${server_port}'"
+mixed_scale_all="${tcp_scale_all} ${udp_scale_all}"
 
 if should_run_case "direct_low_latency"; then
   run_unproxied_download_probe_case "direct_low_latency" "tcp" "172.31.10.30:8080"
@@ -3509,6 +3926,44 @@ fi
 if should_run_case "baseline_mptcp_tcp_multipath_equal_fat_upload"; then
   run_mptcp_baseline_upload_case "baseline_mptcp_tcp_multipath_equal_fat_upload" ideal-all-fat
 fi
+
+if should_run_case "mptunnel_tcp_single_asymmetric_download_reference"; then
+  run_asymmetric_download_case \
+    "mptunnel_tcp_single_asymmetric_download_reference" \
+    "$tcp_endpoint_lowlat"
+fi
+if should_run_case "mptunnel_tcp_multipath_asymmetric_download"; then
+  run_asymmetric_download_case \
+    "mptunnel_tcp_multipath_asymmetric_download" \
+    "$tcp_endpoint_lowlat $tcp_endpoint_balanced"
+fi
+if should_run_case "mptunnel_tcp_single_asymmetric_upload_reference"; then
+  run_asymmetric_upload_case \
+    "mptunnel_tcp_single_asymmetric_upload_reference" \
+    "$tcp_endpoint_balanced"
+fi
+if should_run_case "mptunnel_tcp_multipath_asymmetric_upload"; then
+  run_asymmetric_upload_case \
+    "mptunnel_tcp_multipath_asymmetric_upload" \
+    "$tcp_endpoint_lowlat $tcp_endpoint_balanced"
+fi
+if should_run_case "mptunnel_browser_concurrent_batches"; then
+  run_browser_batch_case
+fi
+if should_run_case "mptunnel_browser_full_load"; then
+  run_browser_full_load_case
+fi
+for scale_rate_band in "${scale_rate_bands[@]}"; do
+  scale_rate_band_label="${scale_rate_band//-/_}"
+  scale_download_case="mptunnel_twenty_varying_links_${scale_rate_band_label}_download"
+  scale_upload_case="mptunnel_twenty_varying_links_${scale_rate_band_label}_upload"
+  if should_run_case "$scale_download_case"; then
+    run_varying_links_download_case "$scale_rate_band"
+  fi
+  if should_run_case "$scale_upload_case"; then
+    run_varying_links_upload_case "$scale_rate_band"
+  fi
+done
 
 if should_run_case "mptunnel_tcp_single_low_latency"; then
   start_client "tcp_single_low_latency" "$tcp_lowlat"
@@ -3923,7 +4378,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 if failed:
     for line_number, case, status in failed:
         print(
-            f"failed experiment row {line_number}: {case} status={status}",
+            f"failed lab result row {line_number}: {case} status={status}",
             file=sys.stderr,
         )
 if failed and fail_on_bad_status:

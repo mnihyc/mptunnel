@@ -33,6 +33,7 @@ upstreams = ["system"]
 # listen = ["127.0.0.1:7600"]
 # token = { from = "file", path = "management-token.key" }
 # dashboard = true
+# allow_peer_diagnostics = false
 
 [[inbounds]]
 name = "mpp-listener"

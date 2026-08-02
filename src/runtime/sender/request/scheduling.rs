@@ -2259,5 +2259,5 @@ fn relay_path_snapshot_for_bulk_choice(
 }
 
 #[cfg(test)]
-#[path = "scheduling_test.rs"]
+#[path = "tests_scheduling.rs"]
 mod tests;

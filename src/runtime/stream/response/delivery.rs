@@ -1504,5 +1504,5 @@ pub(in crate::runtime::stream) fn product_flights_have_recent_reinjection_overla
 }
 
 #[cfg(test)]
-#[path = "delivery_test.rs"]
+#[path = "tests_delivery.rs"]
 mod tests;

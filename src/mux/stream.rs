@@ -1243,9 +1243,9 @@ impl std::fmt::Display for StreamError {
 impl std::error::Error for StreamError {}
 
 #[cfg(test)]
-#[path = "stream_test.rs"]
+#[path = "tests_stream.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "recv_flow_control_test.rs"]
+#[path = "tests_recv_flow_control.rs"]
 mod recv_flow_control_tests;

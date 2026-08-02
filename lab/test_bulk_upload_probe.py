@@ -158,7 +158,6 @@ def probe_args(server, parallel_uploads=1):
         load_duration=0.08,
         parallel_uploads=parallel_uploads,
         interval_seconds=0.02,
-        drain_timeout=0.1,
         started_file=None,
     )
 
@@ -219,8 +218,11 @@ class BulkUploadProbeTests(unittest.TestCase):
         )
         self.assertEqual(result["complete_streams"], 0)
         self.assertEqual(result["failed_streams"], 1)
-        self.assertEqual(result["upload_probe_errors"], [])
-        self.assertTrue(result["upload_ack_accounting_valid"])
+        self.assertEqual(
+            result["upload_probe_errors"],
+            ["stream 0: TimeoutError: upload sink terminal acknowledgement timed out"],
+        )
+        self.assertFalse(result["upload_ack_accounting_valid"])
 
     def test_no_receiver_confirmation_is_fail(self):
         result, _stream_total = scripted_upload("none")
@@ -232,8 +234,11 @@ class BulkUploadProbeTests(unittest.TestCase):
         self.assertEqual(result["upload_goodput_mbps"], 0)
         self.assertEqual(result["complete_streams"], 0)
         self.assertEqual(result["failed_streams"], 1)
-        self.assertEqual(result["upload_probe_errors"], [])
-        self.assertTrue(result["upload_ack_accounting_valid"])
+        self.assertEqual(
+            result["upload_probe_errors"],
+            ["stream 0: TimeoutError: upload sink terminal acknowledgement timed out"],
+        )
+        self.assertFalse(result["upload_ack_accounting_valid"])
 
     def test_final_total_must_exactly_match_local_acceptance(self):
         result, stream_total = scripted_upload("mismatched-final")
@@ -273,7 +278,7 @@ class BulkUploadProbeTests(unittest.TestCase):
             _args,
             _started,
             _load_deadline,
-            _drain_deadline,
+            _completion_deadline,
             state,
             lock,
             _payload,
@@ -542,7 +547,7 @@ class BulkUploadProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be combined with a proxy"):
             connect_target(args, deadline=time.monotonic() + 1.0)
 
-    def test_workers_share_one_load_and_drain_deadline(self):
+    def test_workers_share_one_load_and_completion_deadline(self):
         server = SimpleNamespace(server_address=("127.0.0.1", 9))
         args = probe_args(server, parallel_uploads=3)
         observed_deadlines = []
@@ -551,13 +556,13 @@ class BulkUploadProbeTests(unittest.TestCase):
             _args,
             _started,
             load_deadline,
-            drain_deadline,
+            completion_deadline,
             _state,
             lock,
             _payload,
         ):
             with lock:
-                observed_deadlines.append((load_deadline, drain_deadline))
+                observed_deadlines.append((load_deadline, completion_deadline))
             return {
                 "complete": False,
                 "confirmed_bytes": 0,
@@ -571,9 +576,9 @@ class BulkUploadProbeTests(unittest.TestCase):
 
         self.assertEqual(len(observed_deadlines), 3)
         self.assertEqual(len(set(observed_deadlines)), 1)
-        load_deadline, drain_deadline = observed_deadlines[0]
+        load_deadline, completion_deadline = observed_deadlines[0]
         self.assertAlmostEqual(
-            drain_deadline - load_deadline, args.drain_timeout, places=6
+            completion_deadline - load_deadline, args.timeout, places=6
         )
         self.assertEqual(result["streams"], 3)
         self.assertEqual(result["failed_streams"], 3)
@@ -586,7 +591,7 @@ class BulkUploadProbeTests(unittest.TestCase):
             _args,
             _started,
             _load_deadline,
-            _drain_deadline,
+            _completion_deadline,
             state,
             lock,
             _payload,

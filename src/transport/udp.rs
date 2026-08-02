@@ -191,5 +191,5 @@ impl std::error::Error for UdpTransportError {
 }
 
 #[cfg(test)]
-#[path = "udp_test.rs"]
+#[path = "tests_udp.rs"]
 mod tests;

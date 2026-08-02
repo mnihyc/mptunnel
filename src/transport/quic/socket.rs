@@ -406,5 +406,5 @@ impl quinn::UdpPoller for PortableUdpPoller {
 }
 
 #[cfg(test)]
-#[path = "socket_test.rs"]
+#[path = "tests_socket.rs"]
 mod tests;

@@ -840,5 +840,5 @@ async fn send_server_datagram_realtime_frame_until(
 }
 
 #[cfg(test)]
-#[path = "server_test.rs"]
+#[path = "tests_server.rs"]
 mod tests;

@@ -49,9 +49,7 @@ impl ProductDnsCarrierNetworkProvider {
 
     fn install(&self, dns: DnsGeneration) -> Result<(), RuntimeError> {
         self.dns.set(dns).map_err(|_| {
-            RuntimeError::Protocol(
-                "Product DNS was installed more than once for one runtime generation",
-            )
+            RuntimeError::Protocol("DNS was installed more than once for one runtime generation")
         })
     }
 }
@@ -67,7 +65,7 @@ impl CarrierNetworkProvider for ProductDnsCarrierNetworkProvider {
             let dns = self.dns.get().cloned().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
-                    "Product DNS is not installed for this runtime generation",
+                    "DNS is not installed for this runtime generation",
                 )
             })?;
             let addresses = dns
@@ -77,7 +75,7 @@ impl CarrierNetworkProvider for ProductDnsCarrierNetworkProvider {
                     std::io::Error::new(
                         std::io::ErrorKind::AddrNotAvailable,
                         format!(
-                            "Product DNS could not resolve carrier {}: {error}",
+                            "DNS could not resolve carrier {}: {error}",
                             endpoint.authority()
                         ),
                     )
@@ -86,7 +84,7 @@ impl CarrierNetworkProvider for ProductDnsCarrierNetworkProvider {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AddrNotAvailable,
                     format!(
-                        "Product DNS returned no addresses for carrier {}",
+                        "DNS returned no addresses for carrier {}",
                         endpoint.authority()
                     ),
                 ));
@@ -490,5 +488,5 @@ pub(super) fn map_runtime_service_result(
 }
 
 #[cfg(test)]
-#[path = "node_test.rs"]
+#[path = "tests_node.rs"]
 mod tests;

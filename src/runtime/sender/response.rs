@@ -9,7 +9,7 @@ mod multipath;
 mod scheduling;
 mod service;
 #[cfg(test)]
-#[path = "response/test_support_test.rs"]
+#[path = "response/tests_test_support.rs"]
 pub(super) mod test_support;
 
 use crate::model::path::CarrierPathKey;

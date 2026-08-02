@@ -878,5 +878,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "telemetry_test.rs"]
+#[path = "tests_telemetry.rs"]
 mod tests;

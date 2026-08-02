@@ -1046,5 +1046,5 @@ impl ClientPathHealthRecord {
 }
 
 #[cfg(test)]
-#[path = "health_test.rs"]
+#[path = "tests_health.rs"]
 mod tests;

@@ -4,11 +4,11 @@
 //! that has not passed directional validation has no entry, actor, queue, or
 //! health state.
 
-use super::client_session::{
+use super::client::session::{
     ClientTcpRetainedSessionStart, run_client_tcp_path_session_with_retained_stream,
 };
-use super::client_state::ClientTcpPathConnection;
-use super::client_validation::ClientTcpValidationHandoff;
+use super::client::state::ClientTcpPathConnection;
+use super::client::validation::ClientTcpValidationHandoff;
 use super::service::{ClientTcpCarrierService, ClientTcpRetainedDirectionValidationLease};
 use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
@@ -625,7 +625,7 @@ pub(in crate::runtime) async fn adopt_server_to_client_retained_carrier(
             "retained S2C TCP carrier handoff has no acknowledged publication",
         ));
     };
-    let super::client_validation::ClientTcpServerToClientRetainedPreparation {
+    let super::client::validation::ClientTcpServerToClientRetainedPreparation {
         commands,
         command_receivers,
         publication,
@@ -734,5 +734,5 @@ pub(in crate::runtime) async fn adopt_server_to_client_retained_carrier(
 }
 
 #[cfg(test)]
-#[path = "retained_test.rs"]
+#[path = "tests_retained.rs"]
 mod tests;

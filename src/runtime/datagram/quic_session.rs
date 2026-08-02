@@ -537,7 +537,7 @@ fn apply_client_udp_datagram_path_status(
 }
 
 #[cfg(test)]
-#[path = "quic_session_test.rs"]
+#[path = "tests_quic_session.rs"]
 mod tests;
 
 /// Opens the QUIC path stream and records only carrier-open latency here.

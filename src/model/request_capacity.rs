@@ -16,7 +16,7 @@ use crate::scheduler::PathSnapshot;
 use std::time::Duration;
 
 #[cfg(test)]
-#[path = "request_capacity_test.rs"]
+#[path = "tests_request_capacity.rs"]
 mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4,13 +4,21 @@
 //! the long-lived session actor, keeping unauthenticated sockets out of product
 //! and scheduling state.
 
+mod datagram;
+mod evidence;
+pub(in crate::runtime) mod service;
+mod session;
+mod stream;
+mod validation;
+mod writer;
+
+use self::evidence::ServerTcpEvidenceState;
+use self::session::{ServerTcpPathAdmission, ServerTcpPathSession};
+use self::validation::{ServerTcpValidationAdmission, ServerTcpValidationSession};
+use self::writer::ServerTcpWriter;
 use super::admission::authenticate_prelude;
 use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader};
 use super::metrics::TcpMetricPublisher;
-use super::server_evidence::ServerTcpEvidenceState;
-use super::server_session::{ServerTcpPathAdmission, ServerTcpPathSession};
-use super::server_validation::{ServerTcpValidationAdmission, ServerTcpValidationSession};
-use super::server_writer::ServerTcpWriter;
 use crate::protocol::{Frame, PathPurpose, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerLocalPathProperties;

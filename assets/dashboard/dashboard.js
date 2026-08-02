@@ -7,12 +7,15 @@
   const BALANCER_ACTION_ENDPOINT = "/api/v2/balancers/actions";
   const EXPECTED_SCHEMA = "mptunnel.management.v5";
   const TOKEN_STORAGE_KEY = "mptunnel.dashboard.bearer";
+  const NAVIGATION_STORAGE_KEY = "mptunnel.dashboard.navigation-collapsed";
   const REFRESH_STORAGE_KEY = "mptunnel.dashboard.refresh-interval-ms";
+  const CHART_WINDOW_STORAGE_KEY = "mptunnel.dashboard.chart-window-ms";
   const REFRESH_INTERVALS_MS = [0, 1000, 5000, 30000];
+  const CHART_WINDOWS_MS = [0, 900000, 3600000, 21600000, 86400000];
   const DEFAULT_REFRESH_INTERVAL_MS = 5000;
+  const DEFAULT_CHART_WINDOW_MS = 900000;
   const REQUEST_TIMEOUT_MS = 8000;
   const MIN_STALE_AFTER_MS = 6500;
-  const MAX_CHART_SAMPLES = 300;
 
   const elements = {
     notice: byId("notice"),
@@ -23,7 +26,10 @@
     freshnessLabel: byId("freshness-label"),
     refreshButton: byId("refresh-button"),
     refreshInterval: byId("refresh-interval"),
+    chartWindow: byId("chart-window"),
     accessButton: byId("access-button"),
+    appShell: byId("app-shell"),
+    sidebarToggle: byId("sidebar-toggle"),
     srStatus: byId("sr-status"),
     overviewTimestamp: byId("overview-timestamp"),
     balancersTabCount: byId("balancers-tab-count"),
@@ -38,19 +44,39 @@
     sessionsEmpty: byId("sessions-empty"),
     flowsBody: byId("flows-body"),
     flowsEmpty: byId("flows-empty"),
+    overviewConnectionsBody: byId("overview-connections-body"),
+    overviewConnectionsEmpty: byId("overview-connections-empty"),
+    overviewConnectionsCount: byId("overview-connections-count"),
+    overviewSessionsBody: byId("overview-sessions-body"),
+    overviewSessionsEmpty: byId("overview-sessions-empty"),
+    overviewSessionsCount: byId("overview-sessions-count"),
+    overviewPathsBody: byId("overview-paths-body"),
+    overviewPathsEmpty: byId("overview-paths-empty"),
+    overviewPathsCount: byId("overview-paths-count"),
     trafficBreakdownBody: byId("traffic-breakdown-body"),
     servicesList: byId("services-list"),
-    inboundsWrap: byId("inbounds-wrap"),
-    inboundsList: byId("inbounds-list"),
-    outboundsWrap: byId("outbounds-wrap"),
-    outboundsList: byId("outbounds-list"),
+    admissionBody: byId("admission-body"),
+    inboundServicesBody: byId("inbound-services-body"),
+    inboundServicesEmpty: byId("inbound-services-empty"),
+    inboundServicesCount: byId("inbound-services-count"),
+    outboundServicesBody: byId("outbound-services-body"),
+    outboundServicesEmpty: byId("outbound-services-empty"),
+    outboundServicesCount: byId("outbound-services-count"),
+    overviewBalancersBody: byId("overview-balancers-body"),
+    overviewBalancersEmpty: byId("overview-balancers-empty"),
+    overviewBalancersCount: byId("overview-balancers-count"),
     balancerList: byId("balancer-list"),
     balancersEmpty: byId("balancers-empty"),
     balancerActionState: byId("balancer-action-state"),
     trafficChart: byId("traffic-chart"),
     trafficChartEmpty: byId("traffic-chart-empty"),
+    trafficChartWindow: byId("traffic-chart-window"),
+    trafficChartTitle: byId("traffic-chart-title"),
+    chartModeSpeed: byId("chart-mode-speed"),
+    chartModeTotal: byId("chart-mode-total"),
     flowsChart: byId("flows-chart"),
     flowsChartEmpty: byId("flows-chart-empty"),
+    flowsChartWindow: byId("flows-chart-window"),
     peerCapability: byId("peer-capability"),
     peerAllowBadge: byId("peer-allow-badge"),
     peerSessionSelect: byId("peer-session-select"),
@@ -91,6 +117,11 @@
     authenticationGeneration: 0,
     authenticationRefreshPending: false,
     refreshIntervalMs: readStoredRefreshInterval(),
+    chartWindowMs: readStoredChartWindow(),
+    chartSamples: [],
+    chartSampleTimestamps: new Set(),
+    trafficChartMode: "speed",
+    navigationCollapsed: readStoredNavigationCollapsed(),
     refreshTimer: null,
     refreshCycleRunning: false,
     fetching: false,
@@ -161,6 +192,60 @@
     }
   }
 
+  function normalizeChartWindow(value) {
+    if (value === null || value === undefined || value === "") {
+      return DEFAULT_CHART_WINDOW_MS;
+    }
+    const interval = Number(value);
+    return CHART_WINDOWS_MS.includes(interval) ? interval : DEFAULT_CHART_WINDOW_MS;
+  }
+
+  function readStoredChartWindow() {
+    try {
+      return normalizeChartWindow(window.sessionStorage.getItem(CHART_WINDOW_STORAGE_KEY));
+    } catch (_error) {
+      return DEFAULT_CHART_WINDOW_MS;
+    }
+  }
+
+  function storeChartWindow(interval) {
+    try {
+      window.sessionStorage.setItem(CHART_WINDOW_STORAGE_KEY, String(interval));
+    } catch (_error) {
+      // The selected history window still works for this page when storage is unavailable.
+    }
+  }
+
+  function readStoredNavigationCollapsed() {
+    try {
+      return window.localStorage.getItem(NAVIGATION_STORAGE_KEY) === "true";
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function storeNavigationCollapsed(collapsed) {
+    try {
+      window.localStorage.setItem(NAVIGATION_STORAGE_KEY, collapsed ? "true" : "false");
+    } catch (_error) {
+      // The navigation remains usable for this page when storage is unavailable.
+    }
+  }
+
+  function renderNavigationState() {
+    elements.appShell.classList.toggle("is-sidebar-collapsed", state.navigationCollapsed);
+    elements.sidebarToggle.setAttribute("aria-expanded", state.navigationCollapsed ? "false" : "true");
+    elements.sidebarToggle.title = state.navigationCollapsed ? "Show navigation" : "Hide navigation";
+    window.requestAnimationFrame(drawCharts);
+  }
+
+  function toggleNavigation() {
+    state.navigationCollapsed = !state.navigationCollapsed;
+    storeNavigationCollapsed(state.navigationCollapsed);
+    renderNavigationState();
+    announce(state.navigationCollapsed ? "Navigation hidden" : "Navigation shown");
+  }
+
   function clearToken() {
     state.bearerToken = "";
     state.tokenPersistencePending = false;
@@ -202,8 +287,10 @@
     return cell;
   }
 
-  function appendMetric(list, label, value) {
-    list.append(createElement("dt", "", label), createElement("dd", "", value));
+  function appendMetric(list, label, value, title) {
+    const description = createElement("dd", "", value);
+    if (title) description.title = title;
+    list.append(createElement("dt", "", label), description);
   }
 
   function asArray(value) {
@@ -229,6 +316,10 @@
     } catch (_error) {
       return 0n;
     }
+  }
+
+  function unsignedDecimal(value) {
+    return unsignedBigInt(value).toString();
   }
 
   function formatBigQuantity(value, units, base) {
@@ -258,6 +349,38 @@
     return formatBigQuantity(value, ["", "K", "M", "B", "T", "Q"], 1000).trim();
   }
 
+  function shortRevision(value) {
+    const revision = formatIdentifier(value);
+    if (revision === "--" || revision.length <= 20) return revision;
+    if (revision.startsWith("sha256:")) return revision.slice(0, 19) + "…";
+    return revision.slice(0, 19) + "…";
+  }
+
+  function summarizeFlowIo(flows) {
+    return asArray(flows).reduce(function (summary, flowValue) {
+      const io = asObject(asObject(flowValue).io);
+      summary.toPeer += unsignedBigInt(io.to_peer_bytes);
+      summary.fromPeer += unsignedBigInt(io.from_peer_bytes);
+      summary.toPeerPackets += unsignedBigInt(io.to_peer_packets);
+      summary.fromPeerPackets += unsignedBigInt(io.from_peer_packets);
+      summary.count += 1;
+      return summary;
+    }, { count: 0, toPeer: 0n, fromPeer: 0n, toPeerPackets: 0n, fromPeerPackets: 0n });
+  }
+
+  function trafficCell(summary) {
+    const content = createElement("div");
+    content.append(createElement("span", "cell-primary", formatBytes(summary.toPeer.toString()) + " upload"));
+    content.append(createElement("span", "cell-secondary", formatBytes(summary.fromPeer.toString()) + " download"));
+    content.append(createElement(
+      "span",
+      "cell-secondary",
+      formatCount(summary.toPeerPackets.toString()) + " / " +
+        formatCount(summary.fromPeerPackets.toString()) + " packets"
+    ));
+    return content;
+  }
+
   function formatBitRate(value) {
     const rate = Math.max(0, finiteNumber(value));
     const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps", "Pbps"];
@@ -275,13 +398,38 @@
     return numberText + " " + units[index];
   }
 
-  function formatChartRate(value) {
-    const rate = Math.max(0, finiteNumber(value));
-    if (rate >= 1e12) return (rate / 1e12).toFixed(rate >= 1e13 ? 0 : 1) + "T";
-    if (rate >= 1e9) return (rate / 1e9).toFixed(rate >= 1e10 ? 0 : 1) + "G";
-    if (rate >= 1e6) return (rate / 1e6).toFixed(rate >= 1e7 ? 0 : 1) + "M";
-    if (rate >= 1e3) return (rate / 1e3).toFixed(rate >= 1e4 ? 0 : 1) + "K";
-    return Math.round(rate).toString();
+  function formatByteSpeed(value) {
+    const bytesPerSecond = Math.max(0, finiteNumber(value)) / 8;
+    const units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s", "PB/s"];
+    let scaled = bytesPerSecond;
+    let index = 0;
+    while (scaled >= 1000 && index < units.length - 1) {
+      scaled /= 1000;
+      index += 1;
+    }
+    return (index === 0 ? Math.round(scaled).toString() : scaled.toFixed(2)) + " " + units[index];
+  }
+
+  function formatChartSpeed(value) {
+    const bytesPerSecond = Math.max(0, finiteNumber(value)) / 8;
+    if (bytesPerSecond >= 1e12) return (bytesPerSecond / 1e12).toFixed(bytesPerSecond >= 1e13 ? 0 : 1) + " TB/s";
+    if (bytesPerSecond >= 1e9) return (bytesPerSecond / 1e9).toFixed(bytesPerSecond >= 1e10 ? 0 : 1) + " GB/s";
+    if (bytesPerSecond >= 1e6) return (bytesPerSecond / 1e6).toFixed(bytesPerSecond >= 1e7 ? 0 : 1) + " MB/s";
+    if (bytesPerSecond >= 1e3) return (bytesPerSecond / 1e3).toFixed(bytesPerSecond >= 1e4 ? 0 : 1) + " KB/s";
+    return Math.round(bytesPerSecond) + " B/s";
+  }
+
+  function formatChartBytes(value) {
+    const bytes = Math.max(0, finiteNumber(value));
+    const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let scaled = bytes;
+    let index = 0;
+    while (scaled >= 1024 && index < units.length - 1) {
+      scaled /= 1024;
+      index += 1;
+    }
+    if (index === 0) return Math.round(scaled) + " B";
+    return scaled.toFixed(scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2) + " " + units[index];
   }
 
   function formatDuration(milliseconds) {
@@ -486,6 +634,7 @@
         return false;
       }
       state.status = validateStatus(responses[0]);
+      mergeChartSamples(asArray(asObject(state.status.traffic).trends));
       state.health = validateHealth(responses[1]);
       state.lastReceivedAt = Date.now();
       state.lastError = null;
@@ -619,9 +768,6 @@
     } else if (sampleAge > staleAfterMs()) {
       setConnection("stale", "Stale", freshness);
       setNotice("stale", "Runtime status is stale. The last received sample remains visible.", true);
-    } else if (state.fetching) {
-      setConnection("loading", "Refreshing", freshness);
-      setNotice("loading", "Refreshing runtime status", true);
     } else if (state.health && !state.health.ready) {
       const blocker = asArray(state.health.readiness_blockers)[0];
       setConnection("error", "Not ready", freshness);
@@ -650,6 +796,12 @@
     renderKpis();
     renderTrafficBreakdown();
     renderServices();
+    renderAdmission();
+    renderOverviewConnections();
+    renderServiceInventories();
+    renderOverviewSessions();
+    renderOverviewPaths();
+    renderOverviewBalancers();
     renderBalancers();
     renderPaths();
     renderSessions();
@@ -675,9 +827,9 @@
     const activePaths = finiteNumber(summary.active_paths);
     const livePathCount = activePaths;
 
-    replaceText(elements.kpiToRate, formatBitRate(rates.to_peer_bps));
+    replaceText(elements.kpiToRate, formatByteSpeed(rates.to_peer_bps));
     replaceText(elements.kpiToTotal, formatBytes(total.to_peer_bytes) + " transferred");
-    replaceText(elements.kpiFromRate, formatBitRate(rates.from_peer_bps));
+    replaceText(elements.kpiFromRate, formatByteSpeed(rates.from_peer_bps));
     replaceText(elements.kpiFromTotal, formatBytes(total.from_peer_bytes) + " transferred");
     replaceText(elements.kpiActiveFlows, formatCount(summary.active_flows));
     replaceText(
@@ -690,10 +842,15 @@
       elements.kpiPathDetail,
       String(finiteNumber(summary.configured_path_count)) + " configured / " +
         String(finiteNumber(summary.suspect_paths)) + " suspect / " +
-        String(finiteNumber(summary.failed_paths)) + " failed"
+        String(finiteNumber(summary.failed_paths)) + " failed / " +
+        String(finiteNumber(summary.disabled_paths)) + " disabled"
     );
     replaceText(elements.kpiQueue, formatBytes(summary.queue_bytes));
-    replaceText(elements.kpiFlight, formatBytes(summary.bytes_in_flight) + " in flight");
+    replaceText(
+      elements.kpiFlight,
+      formatBytes(summary.bytes_in_flight) + " native / " +
+        formatBytes(summary.data_level_bytes_in_flight) + " data in flight"
+    );
     replaceText(elements.kpiPathRate, formatBitRate(summary.path_delivery_rate_bps));
     replaceText(elements.kpiPathPacing, formatBitRate(summary.path_pacing_rate_bps) + " pacing");
   }
@@ -710,8 +867,15 @@
       const flows = asObject(kind.flows);
       const row = createElement("tr");
       appendCell(row, "Class", entry[0], "cell-primary");
-      appendCell(row, "To peer", formatBytes(io.to_peer_bytes));
-      appendCell(row, "From peer", formatBytes(io.from_peer_bytes));
+      const toPeer = createElement("div");
+      toPeer.append(createElement("span", "cell-primary", formatBytes(io.to_peer_bytes)));
+      toPeer.append(createElement("span", "cell-secondary", formatCount(io.to_peer_packets) + " packets"));
+      appendCell(row, "Upload", toPeer);
+      const fromPeer = createElement("div");
+      fromPeer.append(createElement("span", "cell-primary", formatBytes(io.from_peer_bytes)));
+      fromPeer.append(createElement("span", "cell-secondary", formatCount(io.from_peer_packets) + " packets"));
+      appendCell(row, "Download", fromPeer);
+      appendCell(row, "Opened", formatCount(flows.opened));
       appendCell(row, "Active", formatCount(flows.active));
       appendCell(row, "Completed", formatCount(flows.completed));
       appendCell(row, "Failed", formatCount(flows.failed));
@@ -721,48 +885,254 @@
 
   function renderServices() {
     const services = asObject(state.status.services);
+    const health = asObject(state.health);
+    const listeners = asObject(health.listeners);
+    const healthSessions = asObject(health.sessions);
+    const healthBalancers = asObject(health.balancers);
+    const healthDns = asObject(health.dns);
     elements.servicesList.replaceChildren();
+    appendMetric(elements.servicesList, "Runtime", titleCase(health.status || health.phase || "unknown"));
+    appendMetric(elements.servicesList, "Phase", titleCase(health.phase));
+    appendMetric(elements.servicesList, "Ready", health.ready ? "Yes" : "No");
+    appendMetric(elements.servicesList, "Degraded", health.degraded ? "Yes" : "No");
+    if (asArray(health.readiness_blockers).length > 0) {
+      appendMetric(elements.servicesList, "Readiness blockers", asArray(health.readiness_blockers).map(titleCase).join(", "));
+    }
+    if (asArray(health.degraded_reasons).length > 0) {
+      appendMetric(elements.servicesList, "Degraded reasons", asArray(health.degraded_reasons).map(titleCase).join(", "));
+    }
+    if (health.failure) appendMetric(elements.servicesList, "Failure", String(health.failure));
+    appendMetric(elements.servicesList, "Started", formatRelative(state.status.started_unix_ms));
+    appendMetric(elements.servicesList, "Uptime", formatDuration(state.status.uptime_ms));
+    appendMetric(
+      elements.servicesList,
+      "Listeners",
+      formatCount(listeners.management) + " management / " +
+        formatCount(listeners.local_inbounds) + " local / " +
+        formatCount(listeners.mpp_path_listeners) + " MPP"
+    );
+    appendMetric(
+      elements.servicesList,
+      "MPP sessions",
+      formatCount(healthSessions.connected_mpp_outbounds) + " connected / " +
+        formatCount(healthSessions.authenticated) + " authenticated"
+    );
     appendMetric(elements.servicesList, "MPP outbounds", formatCount(services.mpp_outbounds));
     appendMetric(elements.servicesList, "MPP inbounds", formatCount(services.mpp_inbounds));
     appendMetric(elements.servicesList, "Local inbounds", formatCount(services.local_inbounds));
     appendMetric(elements.servicesList, "Outbounds", formatCount(services.outbounds));
     appendMetric(elements.servicesList, "Native outbounds", formatCount(services.local_outbounds));
-    appendMetric(elements.servicesList, "Balancers", formatCount(services.balancers));
+    appendMetric(
+      elements.servicesList,
+      "Balancers",
+      formatCount(services.balancers) + " configured / " +
+        formatCount(healthBalancers.unavailable) + " unavailable"
+    );
     appendMetric(elements.servicesList, "Path listeners", formatCount(services.configured_path_listeners));
-    appendMetric(elements.servicesList, "Uptime", formatDuration(state.status.uptime_ms));
+    appendMetric(
+      elements.servicesList,
+      "DNS",
+      health.dns === null || health.dns === undefined
+        ? "Not configured"
+        : formatCount(healthDns.plans) + " plans / " + formatCount(healthDns.failed_plans) + " failed"
+    );
+    if (health.desired_revision || health.active_revision || health.runtime_revision) {
+      const revisions = [health.desired_revision, health.active_revision, health.runtime_revision]
+        .map(formatIdentifier);
+      const aligned = revisions.every(function (revision) { return revision === revisions[0]; });
+      appendMetric(
+        elements.servicesList,
+        "Config revisions",
+        aligned
+          ? "Aligned · " + shortRevision(revisions[0])
+          : revisions.map(shortRevision).join(" / "),
+        "Desired: " + revisions[0] + "\nActive: " + revisions[1] + "\nRuntime: " + revisions[2]
+      );
+    }
+    appendMetric(elements.servicesList, "Admission generation", formatIdentifier(asObject(state.status.admission).owner_generation));
     appendMetric(elements.servicesList, "Schema", String(state.status.schema || "--"));
+  }
 
+  function renderAdmission() {
+    const admission = asObject(state.status.admission);
+    const limits = asObject(admission.limits);
+    const rejections = asObject(admission.rejections);
+    const rows = [
+      ["Live flows", admission.live_flows, limits.max_live_flows, rejections.global_live_flows],
+      ["Concurrent work", admission.concurrent_work, limits.max_concurrent_work, rejections.global_concurrent_work],
+      ["DNS work", admission.dns_work, limits.max_dns_work, rejections.dns_work],
+      ["Principal scopes", admission.tracked_principals, limits.max_live_flows_per_principal, rejections.principal_live_flows],
+      [
+        "Outbound scopes",
+        admission.tracked_outbounds,
+        formatCount(limits.max_live_flows_per_outbound) + " flows / " + formatCount(limits.max_connects_per_outbound) + " connects",
+        formatCount(rejections.outbound_live_flows) + " flows / " + formatCount(rejections.outbound_connects) + " connects"
+      ],
+      [
+        "Target scopes",
+        admission.tracked_targets,
+        formatCount(limits.max_live_flows_per_target) + " flows / " + formatCount(limits.max_connects_per_target) + " connects",
+        formatCount(rejections.target_live_flows) + " flows / " + formatCount(rejections.target_connects) + " connects"
+      ]
+    ];
+    elements.admissionBody.replaceChildren();
+    rows.forEach(function (entry) {
+      const row = createElement("tr");
+      appendCell(row, "Resource", entry[0], "cell-primary");
+      appendCell(row, "Current", formatCount(entry[1]));
+      appendCell(row, "Limit", typeof entry[2] === "string" && entry[2].includes(" /") ? entry[2] : formatCount(entry[2]));
+      appendCell(row, "Rejected", typeof entry[3] === "string" && entry[3].includes(" /") ? entry[3] : formatCount(entry[3]));
+      elements.admissionBody.append(row);
+    });
+  }
+
+  function createConnectionRow(flowValue) {
+    const flow = asObject(flowValue);
+    const row = createElement("tr");
+    appendCell(row, "Type", badge(titleCase(flow.flow_kind), flow.flow_kind === "datagram" ? "warning" : "neutral"));
+
+    const inbound = createElement("div");
+    inbound.append(createElement("span", "cell-primary", flow.inbound || "Unknown inbound"));
+    inbound.append(createElement("span", "cell-secondary", titleCase(flow.inbound_kind)));
+    appendCell(row, "Inbound", inbound);
+
+    const connection = createElement("div");
+    connection.append(createElement("span", "cell-mono", formatIdentifier(flow.flow_id)));
+    connection.append(createElement(
+      "span",
+      "cell-secondary cell-mono",
+      flow.session_id ? "session " + formatIdentifier(flow.session_id) : "local"
+    ));
+    appendCell(row, "Connection", connection);
+    appendCell(row, "Network", String(flow.network || "--").toUpperCase());
+    appendCell(row, "Destination", flow.target ? String(flow.target) : "Multiple targets");
+
+    const egress = createElement("div");
+    egress.append(createElement("span", "cell-primary", flow.outbound || "Pending selection"));
+    if (flow.balancer) egress.append(createElement("span", "cell-secondary", "via " + flow.balancer));
+    appendCell(row, "Outbound", egress);
+
+    const activity = createElement("div");
+    activity.append(createElement("span", "cell-primary", formatDuration(flow.age_ms) + " old"));
+    activity.append(createElement("span", "cell-secondary", formatDuration(flow.idle_ms) + " idle"));
+    appendCell(row, "Activity", activity);
+
+    appendCell(row, "Traffic", trafficCell(summarizeFlowIo([flow])));
+    return row;
+  }
+
+  function renderOverviewConnections() {
+    const flows = asArray(state.status.flows);
+    const summary = asObject(state.status.summary);
+    const diagnostics = asObject(state.status.diagnostics);
+    const overflow = unsignedBigInt(diagnostics.active_flow_detail_overflow);
+    elements.overviewConnectionsBody.replaceChildren();
+    flows.forEach(function (flow) {
+      elements.overviewConnectionsBody.append(createConnectionRow(flow));
+    });
+    elements.overviewConnectionsEmpty.hidden = flows.length !== 0;
+    const total = formatCount(summary.active_flows);
+    const shown = formatCount(flows.length);
+    elements.overviewConnectionsCount.textContent = overflow > 0n
+      ? shown + " shown / " + total + " active"
+      : total + " active";
+    elements.overviewConnectionsCount.className = "badge " + (overflow > 0n ? "badge--warning" : "badge--neutral");
+  }
+
+  function renderServiceInventories() {
     const inbounds = asArray(state.status.local_inbounds);
-    elements.inboundsList.replaceChildren();
-    elements.inboundsWrap.hidden = inbounds.length === 0;
+    const flows = asArray(state.status.flows);
+    const hiddenFlows = unsignedBigInt(asObject(state.status.diagnostics).active_flow_detail_overflow);
+    elements.inboundServicesBody.replaceChildren();
+    elements.inboundServicesEmpty.hidden = inbounds.length !== 0;
+    elements.inboundServicesCount.textContent = hiddenFlows > 0n
+      ? formatCount(inbounds.length) + " configured · " + formatCount(hiddenFlows.toString()) + " flows hidden"
+      : formatCount(inbounds.length) + " configured";
+    elements.inboundServicesCount.className = "badge " + (hiddenFlows > 0n ? "badge--warning" : "badge--neutral");
     inbounds.forEach(function (inbound) {
-      const row = createElement("li");
-      const name = createElement("strong", "", inbound.name || titleCase(inbound.protocol));
-      const details = [];
-      details.push(titleCase(inbound.protocol));
-      if (asArray(inbound.listen).length > 0) details.push(asArray(inbound.listen).join(", "));
-      if (inbound.interface_name) details.push(String(inbound.interface_name));
-      if (inbound.auth_required) details.push("authenticated");
-      row.append(name, createElement("span", "", details.join(" / ")));
-      elements.inboundsList.append(row);
+      const row = createElement("tr");
+      const inboundFlows = flows.filter(function (flow) { return String(flow.inbound || "") === String(inbound.name || ""); });
+      appendCell(row, "Name", inbound.name || titleCase(inbound.protocol), "cell-primary");
+      appendCell(row, "Protocol", titleCase(inbound.protocol));
+      const listeners = asArray(inbound.listen).map(String);
+      if (inbound.interface_name) listeners.push("interface " + inbound.interface_name);
+      appendCell(row, "Listen / interface", listeners.join(", ") || "Host-provided");
+      appendCell(row, "Target", inbound.target || "Routed per connection");
+      appendCell(row, "Authentication", inbound.auth_required ? badge("Required", "success") : badge("None", "neutral"));
+      appendCell(row, "Shown", formatCount(inboundFlows.length));
+      appendCell(row, "Shown I/O", trafficCell(summarizeFlowIo(inboundFlows)));
+      elements.inboundServicesBody.append(row);
     });
 
     const outbounds = asArray(state.status.outbounds);
-    elements.outboundsList.replaceChildren();
-    elements.outboundsWrap.hidden = outbounds.length === 0;
+    elements.outboundServicesBody.replaceChildren();
+    elements.outboundServicesEmpty.hidden = outbounds.length !== 0;
+    elements.outboundServicesCount.textContent = hiddenFlows > 0n
+      ? formatCount(outbounds.length) + " configured · " + formatCount(hiddenFlows.toString()) + " flows hidden"
+      : formatCount(outbounds.length) + " configured";
+    elements.outboundServicesCount.className = "badge " + (hiddenFlows > 0n ? "badge--warning" : "badge--neutral");
     outbounds.forEach(function (outbound) {
-      const row = createElement("li");
-      const details = [
-        titleCase(outbound.protocol),
-        asArray(outbound.networks).map(function (network) {
-          return String(network).toUpperCase();
-        }).join(" + ")
-      ].filter(Boolean);
-      row.append(
-        createElement("strong", "", outbound.name || "Outbound"),
-        createElement("span", "", details.join(" / "))
+      const row = createElement("tr");
+      const outboundFlows = flows.filter(function (flow) { return String(flow.outbound || "") === String(outbound.name || ""); });
+      appendCell(row, "Name", outbound.name || "Outbound", "cell-primary");
+      appendCell(row, "Protocol", titleCase(outbound.protocol));
+      appendCell(
+        row,
+        "Networks",
+        asArray(outbound.networks).map(function (network) { return String(network).toUpperCase(); }).join(" + ") || "--"
       );
-      elements.outboundsList.append(row);
+      appendCell(row, "Shown", formatCount(outboundFlows.length));
+      appendCell(row, "Shown I/O", trafficCell(summarizeFlowIo(outboundFlows)));
+      elements.outboundServicesBody.append(row);
+    });
+  }
+
+  function renderOverviewBalancers() {
+    const balancers = asArray(state.status.balancers).map(asObject);
+    elements.overviewBalancersBody.replaceChildren();
+    elements.overviewBalancersEmpty.hidden = balancers.length !== 0;
+    elements.overviewBalancersCount.textContent = formatCount(balancers.length) + " configured";
+    balancers.forEach(function (balancer) {
+      const row = createElement("tr");
+      appendCell(row, "Name", balancer.name || "Balancer", "cell-primary");
+
+      const strategy = createElement("div");
+      strategy.append(createElement("span", "cell-primary", titleCase(balancer.strategy)));
+      strategy.append(createElement(
+        "span",
+        "cell-secondary",
+        balancer.manual_outbound ? "pinned to " + balancer.manual_outbound : "automatic / generation " + formatIdentifier(balancer.generation)
+      ));
+      appendCell(row, "Strategy", strategy);
+
+      const members = createElement("div");
+      members.append(createElement("span", "cell-primary", formatCount(balancer.ready_members) + " ready"));
+      members.append(createElement(
+        "span",
+        "cell-secondary",
+        formatCount(balancer.draining_members) + " draining / " + formatCount(balancer.unavailable_members) + " unavailable"
+      ));
+      appendCell(row, "Members", members);
+
+      const load = createElement("div");
+      load.append(createElement("span", "cell-primary", formatCount(balancer.active_flows) + " active"));
+      load.append(createElement("span", "cell-secondary", formatCount(balancer.pending_flows) + " pending"));
+      appendCell(row, "Load", load);
+
+      const probeValue = asObject(balancer.probe);
+      const probe = createElement("div");
+      if (balancer.probe) {
+        probe.append(createElement("span", "cell-primary", String(probeValue.target || "--")));
+        probe.append(createElement(
+          "span",
+          "cell-secondary",
+          formatDuration(probeValue.interval_ms) + " interval / " + formatDuration(probeValue.timeout_ms) + " timeout"
+        ));
+      } else {
+        probe.append(createElement("span", "cell-primary", "Disabled"));
+      }
+      appendCell(row, "Probe", probe);
+      elements.overviewBalancersBody.append(row);
     });
   }
 
@@ -975,98 +1345,167 @@
     return path && path.manual_disabled ? "disabled" : String(path && path.state ? path.state : "unknown").toLowerCase();
   }
 
+  function pathPolicyLabel(policyValue) {
+    const policy = asObject(policyValue);
+    const restrictions = [];
+    if (policy.backup) restrictions.push("backup");
+    if (policy.expensive) restrictions.push("expensive");
+    if (policy.bulk_allowed === false) restrictions.push("no bulk");
+    if (policy.probe_only) restrictions.push("probe only");
+    if (policy.no_udp) restrictions.push("no UDP");
+    return restrictions.join(", ") || "ordinary";
+  }
+
+  function createPathRow(pathValue) {
+    const path = asObject(pathValue);
+    const row = createElement("tr");
+    appendCell(row, "State", stateIndicator(pathEffectiveState(path)));
+
+    const identity = createElement("div");
+    identity.append(createElement("span", "cell-primary", formatIdentifier(path.path)));
+    identity.append(createElement("span", "cell-secondary", path.endpoint || "No network endpoint"));
+    identity.append(createElement(
+      "span",
+      "cell-secondary cell-mono",
+      "path " + formatIdentifier(path.path_id) + " / instance " + formatIdentifier(path.path_instance_id)
+    ));
+    appendCell(row, "Path", identity);
+
+    const service = createElement("div");
+    service.append(createElement("span", "cell-primary", serviceLabel(path)));
+    service.append(createElement("span", "cell-secondary", titleCase(path.service) + " / session " + formatIdentifier(path.session_id)));
+    appendCell(row, "Service / session", service);
+
+    const carrier = createElement("div");
+    carrier.append(createElement("span", "cell-primary", carrierLabel(path.underlay)));
+    if (path.underlay === "tcp") {
+      carrier.append(createElement(
+        "span",
+        "cell-secondary",
+        "carrier " + formatIdentifier(path.tcp_carrier_ordinal) + " / bounds " +
+          formatIdentifier(path.tcp_carriers_min) + "-" + formatIdentifier(path.tcp_carriers_max)
+      ));
+    } else {
+      carrier.append(createElement("span", "cell-secondary", "UDP underlay"));
+    }
+    appendCell(row, "Carrier / bounds", carrier);
+
+    const usage = createElement("div");
+    if (path.usage) usage.append(stateIndicator(path.usage));
+    else usage.append(createElement("span", "cell-primary", "--"));
+    usage.append(createElement(
+      "span",
+      "cell-secondary",
+      [
+        path.direction ? titleCase(path.direction) : "",
+        path.source ? titleCase(path.source) : "",
+        pathPolicyLabel(path.policy)
+      ].filter(Boolean).join(" / ")
+    ));
+    appendCell(row, "Usage / direction", usage);
+
+    const rtt = createElement("div");
+    rtt.append(createElement("span", "cell-primary", formatRtt(path.srtt_ms)));
+    rtt.append(createElement("span", "cell-secondary", "jitter " + formatRtt(path.jitter_ms)));
+    appendCell(row, "RTT / jitter", rtt);
+
+    const delivery = createElement("div");
+    delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
+    delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps) + " pacing"));
+    appendCell(row, "Delivery / pacing", delivery);
+
+    const loss = createElement("div");
+    loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
+    loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm) + " ECN"));
+    appendCell(row, "Loss / ECN", loss);
+
+    const flight = createElement("div");
+    flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes) + " queued"));
+    flight.append(createElement(
+      "span",
+      "cell-secondary",
+      formatBytes(path.bytes_in_flight) + " native / " + formatBytes(path.data_level_bytes_in_flight) + " data"
+    ));
+    flight.append(createElement("span", "cell-secondary", formatBytes(path.inflight_limit_bytes) + " limit"));
+    appendCell(row, "Queue / flight / limit", flight);
+
+    const evidence = createElement("div");
+    evidence.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm) + " confidence"));
+    evidence.append(createElement(
+      "span",
+      "cell-secondary",
+      formatCount(path.delivery_samples) + " samples / " + formatBytes(path.data_sample_bytes)
+    ));
+    evidence.append(createElement(
+      "span",
+      "cell-secondary",
+      (path.last_delivery_age_ms === undefined ? "no delivery age" : formatDuration(path.last_delivery_age_ms) + " since delivery") +
+        (path.app_limited ? " / application limited" : "")
+    ));
+    appendCell(row, "Evidence", evidence);
+
+    const flows = createElement("div");
+    flows.append(createElement("span", "cell-primary", formatCount(path.active_flows)));
+    flows.append(createElement("span", "cell-secondary", formatCount(path.active_latency_sensitive_flows) + " latency sensitive"));
+    appendCell(row, "Flows", flows);
+    return row;
+  }
+
+  function renderPathRows(body, empty, paths) {
+    body.replaceChildren();
+    empty.hidden = paths.length !== 0;
+    paths.forEach(function (path) { body.append(createPathRow(path)); });
+  }
+
+  function renderOverviewPaths() {
+    const paths = asArray(state.status.paths);
+    renderPathRows(elements.overviewPathsBody, elements.overviewPathsEmpty, paths);
+    elements.overviewPathsCount.textContent = formatCount(paths.length) + " paths";
+  }
+
   function renderPaths() {
     const underlayFilter = elements.pathUnderlayFilter.value;
     const stateFilter = elements.pathStateFilter.value;
     const paths = asArray(state.status.paths).filter(function (path) {
       const underlayMatches = underlayFilter === "all" || path.underlay === underlayFilter;
-      const currentState = pathEffectiveState(path);
-      const stateMatches = stateFilter === "all" || currentState === stateFilter;
+      const stateMatches = stateFilter === "all" || pathEffectiveState(path) === stateFilter;
       return underlayMatches && stateMatches;
     });
-    elements.pathsBody.replaceChildren();
-    elements.pathsEmpty.hidden = paths.length !== 0;
-    paths.forEach(function (path) {
-      const row = createElement("tr");
-      const currentState = pathEffectiveState(path);
-      appendCell(row, "State", stateIndicator(currentState));
+    renderPathRows(elements.pathsBody, elements.pathsEmpty, paths);
+  }
 
-      const identity = createElement("div");
-      identity.append(createElement("span", "cell-primary", formatIdentifier(path.path)));
-      identity.append(createElement(
-        "span",
-        "cell-secondary",
-        path.endpoint || (path.path_id ? "Protocol path " + formatIdentifier(path.path_id) : "--")
-      ));
-      appendCell(row, "Path", identity);
+  function createSessionRow(sessionValue) {
+    const session = asObject(sessionValue);
+    const row = createElement("tr");
+    appendCell(row, "State", stateIndicator(session.state));
+    appendCell(row, "Session", formatIdentifier(session.session_id), "cell-mono");
+    appendCell(row, "Service", serviceLabel(session));
+    appendCell(row, "Carriers", formatCount(session.carrier_count));
+    appendCell(row, "References", session.reference_count === undefined ? "--" : formatCount(session.reference_count));
+    const countSuffix = session.active_flow_counts_complete === false ? "+" : "";
+    appendCell(row, "Reliable flows", formatCount(session.active_reliable_flows) + countSuffix);
+    appendCell(row, "Datagram flows", formatCount(session.active_datagram_flows) + countSuffix);
+    return row;
+  }
 
-      const service = createElement("div");
-      service.append(createElement("span", "cell-primary", serviceLabel(path)));
-      service.append(createElement("span", "cell-secondary", titleCase(path.service)));
-      appendCell(row, "Service", service);
-
-      const carrier = createElement("div");
-      carrier.append(createElement("span", "cell-primary", carrierLabel(path.underlay)));
-      carrier.append(createElement("span", "cell-secondary", path.underlay === "udp" ? "UDP underlay" : "TCP underlay"));
-      appendCell(row, "Carrier", carrier);
-
-      appendCell(row, "Usage", path.usage ? stateIndicator(path.usage) : "--");
-
-      const rtt = createElement("div");
-      rtt.append(createElement("span", "cell-primary", formatRtt(path.srtt_ms)));
-      rtt.append(createElement("span", "cell-secondary", "jitter " + formatRtt(path.jitter_ms)));
-      appendCell(row, "RTT", rtt);
-
-      const delivery = createElement("div");
-      delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
-      delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps) + " pacing"));
-      appendCell(row, "Delivery", delivery);
-
-      const loss = createElement("div");
-      loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
-      loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm) + " ECN"));
-      appendCell(row, "Loss", loss);
-
-      appendCell(row, "Queue", formatBytes(path.queue_bytes));
-
-      const flight = createElement("div");
-      flight.append(createElement("span", "cell-primary", formatBytes(path.bytes_in_flight)));
-      flight.append(createElement("span", "cell-secondary", formatBytes(path.data_level_bytes_in_flight) + " data level"));
-      appendCell(row, "In flight", flight);
-
-      const flows = createElement("div");
-      flows.append(createElement("span", "cell-primary", formatCount(path.active_flows)));
-      flows.append(createElement("span", "cell-secondary", formatCount(path.active_latency_sensitive_flows) + " latency sensitive"));
-      appendCell(row, "Flows", flows);
-      elements.pathsBody.append(row);
-    });
+  function renderOverviewSessions() {
+    const sessions = asArray(state.status.sessions);
+    elements.overviewSessionsBody.replaceChildren();
+    elements.overviewSessionsEmpty.hidden = sessions.length !== 0;
+    sessions.forEach(function (session) { elements.overviewSessionsBody.append(createSessionRow(session)); });
+    elements.overviewSessionsCount.textContent = formatCount(sessions.length) + " sessions";
   }
 
   function renderSessions() {
     const query = elements.sessionFilter.value.trim().toLowerCase();
     const sessions = asArray(state.status.sessions).filter(function (session) {
       if (!query) return true;
-      return [
-        session.state,
-        session.session_id,
-        session.service,
-        session.service_name,
-        session.service_index
-      ].some(function (value) { return String(value === undefined || value === null ? "" : value).toLowerCase().includes(query); });
+      return [session.state, session.session_id, session.service, session.service_name, session.service_index]
+        .some(function (value) { return String(value === undefined || value === null ? "" : value).toLowerCase().includes(query); });
     });
     elements.sessionsBody.replaceChildren();
     elements.sessionsEmpty.hidden = sessions.length !== 0;
-    sessions.forEach(function (session) {
-      const row = createElement("tr");
-      appendCell(row, "State", stateIndicator(session.state));
-      appendCell(row, "Session", formatIdentifier(session.session_id), "cell-mono");
-      appendCell(row, "Service", serviceLabel(session));
-      appendCell(row, "Carriers", formatCount(session.carrier_count));
-      const countSuffix = session.active_flow_counts_complete === false ? "+" : "";
-      appendCell(row, "Reliable flows", formatCount(session.active_reliable_flows) + countSuffix);
-      appendCell(row, "Datagram flows", formatCount(session.active_datagram_flows) + countSuffix);
-      elements.sessionsBody.append(row);
-    });
+    sessions.forEach(function (session) { elements.sessionsBody.append(createSessionRow(session)); });
 
     const flows = asArray(state.status.flows).filter(function (flow) {
       if (!query) return true;
@@ -1085,37 +1524,7 @@
     elements.flowsBody.replaceChildren();
     elements.flowsEmpty.hidden = flows.length !== 0;
     flows.forEach(function (flow) {
-      const row = createElement("tr");
-      appendCell(row, "Kind", badge(titleCase(flow.flow_kind), flow.flow_kind === "datagram" ? "warning" : "neutral"));
-      appendCell(row, "Flow", formatIdentifier(flow.flow_id), "cell-mono");
-      const origin = createElement("div");
-      origin.append(createElement("span", "cell-primary", flow.inbound || "Unknown inbound"));
-      origin.append(createElement(
-        "span",
-        "cell-secondary",
-        [titleCase(flow.inbound_kind), String(flow.network || "").toUpperCase()]
-          .filter(Boolean)
-          .join(" / ")
-      ));
-      appendCell(row, "Origin", origin);
-      const egress = createElement("div");
-      egress.append(createElement("span", "cell-primary", flow.outbound || "Pending selection"));
-      if (flow.balancer) {
-        egress.append(createElement(
-          "span",
-          "cell-secondary",
-          "via " + flow.balancer
-        ));
-      }
-      appendCell(row, "Egress", egress);
-      appendCell(row, "Session", formatIdentifier(flow.session_id), "cell-mono");
-      appendCell(row, "Target", flow.target ? String(flow.target) : "Multiple targets");
-      appendCell(row, "Age", formatDuration(flow.age_ms));
-      appendCell(row, "Idle", formatDuration(flow.idle_ms));
-      const io = asObject(flow.io);
-      appendCell(row, "To peer", formatBytes(io.to_peer_bytes));
-      appendCell(row, "From peer", formatBytes(io.from_peer_bytes));
-      elements.flowsBody.append(row);
+      elements.flowsBody.append(createConnectionRow(flow));
     });
   }
 
@@ -1376,18 +1785,19 @@
     const context = surface.context;
     const width = surface.width;
     const height = surface.height;
-    const padding = { top: 14, right: 12, bottom: 29, left: 50 };
-    const plotWidth = Math.max(1, width - padding.left - padding.right);
-    const plotHeight = Math.max(1, height - padding.top - padding.bottom);
     const values = [];
     series.forEach(function (line) {
       samples.forEach(function (sample) { values.push(Math.max(0, finiteNumber(line.value(sample)))); });
     });
     const maximum = niceMaximum(values.length > 0 ? Math.max.apply(null, values) : 0, options.integerOnly);
+    context.font = "11px ui-sans-serif, system-ui, sans-serif";
+    const axisWidth = Math.ceil(context.measureText(options.axisLabel(maximum)).width);
+    const padding = { top: 14, right: 12, bottom: 29, left: Math.max(50, axisWidth + 10) };
+    const plotWidth = Math.max(1, width - padding.left - padding.right);
+    const plotHeight = Math.max(1, height - padding.top - padding.bottom);
 
     context.fillStyle = "#ffffff";
     context.fillRect(0, 0, width, height);
-    context.font = "11px ui-sans-serif, system-ui, sans-serif";
     context.textBaseline = "middle";
     context.lineWidth = 1;
 
@@ -1443,22 +1853,168 @@
     });
   }
 
+  function compactTrendSample(sample) {
+    const value = asObject(sample);
+    const timestamp = finiteNumber(value.timestamp_unix_ms);
+    if (timestamp <= 0) return null;
+    return {
+      timestamp_unix_ms: timestamp,
+      to_peer_bps: finiteNumber(value.to_peer_bps),
+      from_peer_bps: finiteNumber(value.from_peer_bps),
+      to_peer_bytes: unsignedDecimal(value.to_peer_bytes),
+      from_peer_bytes: unsignedDecimal(value.from_peer_bytes),
+      active_flows: finiteNumber(value.active_flows)
+    };
+  }
+
+  function totalTrafficPlot(samples) {
+    if (samples.length === 0) {
+      return { samples: [], axisLabel: formatChartBytes };
+    }
+    let baseline = null;
+    samples.forEach(function (sample) {
+      [sample.to_peer_bytes, sample.from_peer_bytes].forEach(function (value) {
+        const amount = unsignedBigInt(value);
+        baseline = baseline === null || amount < baseline ? amount : baseline;
+      });
+    });
+    let maximumOffset = 0n;
+    samples.forEach(function (sample) {
+      [sample.to_peer_bytes, sample.from_peer_bytes].forEach(function (value) {
+        const offset = unsignedBigInt(value) - baseline;
+        if (offset > maximumOffset) maximumOffset = offset;
+      });
+    });
+    let scale = 1n;
+    const maximumPlotInteger = 1000000000000n;
+    while (maximumOffset / scale > maximumPlotInteger) scale *= 1024n;
+    const scaleNumber = Number(scale);
+    function plottedOffset(value) {
+      const offset = unsignedBigInt(value) - baseline;
+      return Number(offset / scale) + Number(offset % scale) / scaleNumber;
+    }
+    return {
+      samples: samples.map(function (sample) {
+        return {
+          timestamp_unix_ms: sample.timestamp_unix_ms,
+          to_peer_bytes: plottedOffset(sample.to_peer_bytes),
+          from_peer_bytes: plottedOffset(sample.from_peer_bytes)
+        };
+      }),
+      axisLabel: function (value) {
+        const plotted = BigInt(Math.max(0, Math.round(finiteNumber(value))));
+        return formatBytes((baseline + plotted * scale).toString());
+      }
+    };
+  }
+
+  function trimChartSamples() {
+    if (state.chartWindowMs === 0 || state.chartSamples.length === 0) return;
+    const newest = state.chartSamples[state.chartSamples.length - 1].timestamp_unix_ms;
+    const cutoff = newest - state.chartWindowMs;
+    let removeCount = 0;
+    while (
+      removeCount < state.chartSamples.length &&
+      state.chartSamples[removeCount].timestamp_unix_ms < cutoff
+    ) {
+      removeCount += 1;
+    }
+    if (removeCount > 0) {
+      state.chartSamples.slice(0, removeCount).forEach(function (sample) {
+        state.chartSampleTimestamps.delete(sample.timestamp_unix_ms);
+      });
+      state.chartSamples.splice(0, removeCount);
+    }
+  }
+
+  function mergeChartSamples(samples) {
+    let requiresSort = false;
+    let newest = state.chartSamples.length > 0
+      ? state.chartSamples[state.chartSamples.length - 1].timestamp_unix_ms
+      : 0;
+    asArray(samples).forEach(function (sample) {
+      const compact = compactTrendSample(sample);
+      if (!compact || state.chartSampleTimestamps.has(compact.timestamp_unix_ms)) return;
+      if (compact.timestamp_unix_ms < newest) requiresSort = true;
+      newest = Math.max(newest, compact.timestamp_unix_ms);
+      state.chartSamples.push(compact);
+      state.chartSampleTimestamps.add(compact.timestamp_unix_ms);
+    });
+    if (requiresSort) {
+      state.chartSamples.sort(function (left, right) {
+        return left.timestamp_unix_ms - right.timestamp_unix_ms;
+      });
+    }
+    trimChartSamples();
+  }
+
+  function chartWindowName() {
+    if (state.chartWindowMs === 0) return "all retained history";
+    if (state.chartWindowMs === 900000) return "15 minutes";
+    if (state.chartWindowMs === 3600000) return "1 hour";
+    if (state.chartWindowMs === 21600000) return "6 hours";
+    return "24 hours";
+  }
+
+  function chartWindowAdjective() {
+    if (state.chartWindowMs === 900000) return "15-minute";
+    if (state.chartWindowMs === 3600000) return "1-hour";
+    if (state.chartWindowMs === 21600000) return "6-hour";
+    return "24-hour";
+  }
+
+  function renderChartWindowLabel() {
+    const samples = state.chartSamples;
+    const count = samples.length;
+    let label;
+    if (state.chartWindowMs === 0) {
+      label = "All retained history";
+    } else {
+      const span = count > 1
+        ? samples[count - 1].timestamp_unix_ms - samples[0].timestamp_unix_ms
+        : 0;
+      label = span >= state.chartWindowMs * 0.99
+        ? "Last " + chartWindowName()
+        : "Building " + chartWindowAdjective() + " history";
+    }
+    const detail = label + " · " + formatCount(count) + (count === 1 ? " point" : " points");
+    replaceText(elements.trafficChartWindow, detail);
+    replaceText(elements.flowsChartWindow, detail);
+  }
+
   function drawCharts() {
     if (!state.status || state.selectedTab !== "overview") return;
-    const trends = asArray(asObject(state.status.traffic).trends).slice(-MAX_CHART_SAMPLES);
-    const rateHasData = trends.length > 1 && trends.some(function (sample) {
-      return finiteNumber(sample.to_peer_bps) > 0 || finiteNumber(sample.from_peer_bps) > 0;
+    const trends = state.chartSamples;
+    renderChartWindowLabel();
+    const speedMode = state.trafficChartMode === "speed";
+    const totalPlot = speedMode ? null : totalTrafficPlot(trends);
+    const trafficTrends = speedMode ? trends : totalPlot.samples;
+    const trafficHasData = trends.length > 1 && trends.some(function (sample) {
+      return speedMode
+        ? finiteNumber(sample.to_peer_bps) > 0 || finiteNumber(sample.from_peer_bps) > 0
+        : unsignedBigInt(sample.to_peer_bytes) > 0n || unsignedBigInt(sample.from_peer_bytes) > 0n;
     });
-    elements.trafficChartEmpty.hidden = rateHasData;
+    elements.trafficChartEmpty.hidden = trafficHasData;
     elements.flowsChartEmpty.hidden = trends.length > 0;
+    replaceText(elements.trafficChartTitle, speedMode ? "Transfer speed" : "Total traffic");
+    elements.chartModeSpeed.classList.toggle("is-active", speedMode);
+    elements.chartModeSpeed.setAttribute("aria-pressed", speedMode ? "true" : "false");
+    elements.chartModeTotal.classList.toggle("is-active", !speedMode);
+    elements.chartModeTotal.setAttribute("aria-pressed", speedMode ? "false" : "true");
     drawLineChart(
       elements.trafficChart,
-      trends,
+      trafficTrends,
       [
-        { color: "#2563b9", value: function (sample) { return sample.to_peer_bps; } },
-        { color: "#198754", value: function (sample) { return sample.from_peer_bps; } }
+        {
+          color: "#2563b9",
+          value: function (sample) { return speedMode ? sample.to_peer_bps : sample.to_peer_bytes; }
+        },
+        {
+          color: "#198754",
+          value: function (sample) { return speedMode ? sample.from_peer_bps : sample.from_peer_bytes; }
+        }
       ],
-      { integerOnly: false, axisLabel: formatChartRate }
+      { integerOnly: false, axisLabel: speedMode ? formatChartSpeed : totalPlot.axisLabel }
     );
     drawLineChart(
       elements.flowsChart,
@@ -1467,11 +2023,12 @@
       { integerOnly: true, axisLabel: function (value) { return Math.round(value).toString(); } }
     );
     const rates = asObject(asObject(state.status.traffic).rates);
-    elements.trafficChart.setAttribute(
-      "aria-label",
-      "Forwarded traffic history. Current to peer " + formatBitRate(rates.to_peer_bps) +
-        ", from peer " + formatBitRate(rates.from_peer_bps) + "."
-    );
+    const total = asObject(asObject(state.status.traffic).total);
+    elements.trafficChart.setAttribute("aria-label", speedMode
+      ? "Transfer speed history. Current upload " + formatByteSpeed(rates.to_peer_bps) +
+        ", download " + formatByteSpeed(rates.from_peer_bps) + "."
+      : "Total traffic history. Uploaded " + formatBytes(total.to_peer_bytes) +
+        ", downloaded " + formatBytes(total.from_peer_bytes) + ".");
     elements.flowsChart.setAttribute(
       "aria-label",
       "Active flow history. Current active flows " + formatCount(asObject(state.status.summary).active_flows) + "."
@@ -1528,6 +2085,25 @@
     );
   }
 
+  function selectChartWindow(value) {
+    state.chartWindowMs = normalizeChartWindow(value);
+    elements.chartWindow.value = String(state.chartWindowMs);
+    storeChartWindow(state.chartWindowMs);
+    trimChartSamples();
+    window.requestAnimationFrame(drawCharts);
+    announce(
+      state.chartWindowMs === 0
+        ? "Chart history set to retain all available samples"
+        : "Chart history set to " + chartWindowName()
+    );
+  }
+
+  function selectTrafficChartMode(mode) {
+    state.trafficChartMode = mode === "total" ? "total" : "speed";
+    window.requestAnimationFrame(drawCharts);
+    announce(state.trafficChartMode === "speed" ? "Showing transfer speed" : "Showing total traffic");
+  }
+
   function bindEvents() {
     Array.from(document.querySelectorAll("[role='tab'][data-tab]")).forEach(function (tab) {
       tab.addEventListener("click", function () { switchTab(tab.dataset.tab, false); });
@@ -1537,9 +2113,19 @@
     elements.refreshInterval.addEventListener("change", function () {
       selectRefreshInterval(elements.refreshInterval.value);
     });
+    elements.chartWindow.addEventListener("change", function () {
+      selectChartWindow(elements.chartWindow.value);
+    });
+    elements.chartModeSpeed.addEventListener("click", function () {
+      selectTrafficChartMode("speed");
+    });
+    elements.chartModeTotal.addEventListener("click", function () {
+      selectTrafficChartMode("total");
+    });
     elements.accessButton.addEventListener("click", function () {
       showAuthDialog(state.bearerToken ? "Replace the bearer token saved for this dashboard address." : "Enter the token configured for this endpoint.");
     });
+    elements.sidebarToggle.addEventListener("click", toggleNavigation);
     elements.pathUnderlayFilter.addEventListener("change", renderPaths);
     elements.pathStateFilter.addEventListener("change", renderPaths);
     elements.balancerList.addEventListener("click", function (event) {
@@ -1623,7 +2209,9 @@
 
   function initialize() {
     bindEvents();
+    renderNavigationState();
     elements.refreshInterval.value = String(state.refreshIntervalMs);
+    elements.chartWindow.value = String(state.chartWindowMs);
     switchTab("overview", false);
     updateConnectionState();
     refreshNow("initial");

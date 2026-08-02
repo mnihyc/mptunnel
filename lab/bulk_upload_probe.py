@@ -301,7 +301,7 @@ def upload_one_stream(
     args,
     started,
     load_deadline,
-    drain_deadline,
+    completion_deadline,
     state,
     lock,
     payload,
@@ -324,10 +324,10 @@ def upload_one_stream(
     with sock:
         if start_anchor is not None:
             measurement_duration = max(0.0, load_deadline - started)
-            drain_duration = max(0.0, drain_deadline - load_deadline)
+            completion_timeout = max(0.0, completion_deadline - load_deadline)
             started = start_anchor.wait(connection_deadline)
             load_deadline = started + measurement_duration
-            drain_deadline = load_deadline + drain_duration
+            completion_deadline = load_deadline + completion_timeout
         sock.setblocking(False)
         while time.monotonic() < load_deadline:
             remaining = load_deadline - time.monotonic()
@@ -367,18 +367,27 @@ def upload_one_stream(
         except OSError:
             pass
 
-        while stream_state["final_total"] is None and time.monotonic() < drain_deadline:
+        while stream_state["final_total"] is None:
+            remaining = completion_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("upload sink terminal acknowledgement timed out")
             readable, _, _ = select.select(
-                [sock], [], [], max(0.0, drain_deadline - time.monotonic())
+                [sock], [], [], remaining
             )
             if not readable:
-                break
+                raise TimeoutError("upload sink terminal acknowledgement timed out")
             try:
                 response = sock.recv(4096)
             except BlockingIOError:
                 continue
             if not response:
-                break
+                if stream_state["response_buffer"]:
+                    raise RuntimeError(
+                        "upload sink ended with a partial acknowledgement"
+                    )
+                raise RuntimeError(
+                    "upload sink closed before terminal acknowledgement"
+                )
             consume_acknowledgements(response, started, state, lock, stream_state)
 
     if stream_state["response_buffer"]:
@@ -399,8 +408,8 @@ def interval_upload(args):
     load_duration = args.load_duration if args.load_duration > 0 else args.timeout
     measurement_duration = min(load_duration, args.timeout)
     load_deadline = started + measurement_duration
-    drain_timeout = max(0.0, getattr(args, "drain_timeout", 1.0))
-    drain_deadline = load_deadline + drain_timeout
+    completion_timeout = max(0.0, args.timeout)
+    completion_deadline = load_deadline + completion_timeout
     expected_streams = max(1, args.parallel_uploads)
     synchronized_start = bool(getattr(args, "synchronized_start", False))
     start_anchor = (
@@ -453,7 +462,7 @@ def interval_upload(args):
                     args,
                     started,
                     load_deadline,
-                    drain_deadline,
+                    completion_deadline,
                     state,
                     lock,
                     payload,
@@ -463,7 +472,7 @@ def interval_upload(args):
                     args,
                     started,
                     load_deadline,
-                    drain_deadline,
+                    completion_deadline,
                     state,
                     lock,
                     payload,
@@ -543,7 +552,7 @@ def interval_upload(args):
         "exit_code": 0 if status != "fail" else 1,
         "mode": "duration-upload",
         "load_duration_s": round(load_duration, 6),
-        "drain_timeout_s": round(drain_timeout, 6),
+        "completion_timeout_s": round(completion_timeout, 6),
         "parallel_uploads": expected_streams,
         "time_s": round(elapsed, 6),
         "goodput_mbps": round(goodput, 3),
@@ -624,7 +633,6 @@ def main():
     parser.add_argument(
         "--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS
     )
-    parser.add_argument("--drain-timeout", type=float, default=1.0)
     parser.add_argument("--started-file")
     args = parser.parse_args()
     try:

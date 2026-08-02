@@ -554,5 +554,5 @@ impl PathRateSample {
 }
 
 #[cfg(test)]
-#[path = "capacity_test.rs"]
+#[path = "tests_capacity.rs"]
 mod tests;

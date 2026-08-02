@@ -322,5 +322,5 @@ fn tun_device_probe() -> String {
 }
 
 #[cfg(test)]
-#[path = "platform_test.rs"]
+#[path = "tests_platform.rs"]
 mod tests;

@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESULT_SCHEMA_VERSION = 1
-RUN_MANIFEST_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 2
+RUN_MANIFEST_SCHEMA_VERSION = 3
 MPTUNNEL_PROTOCOL_VERSION = 5
 MPTUNNEL_CARRIER_PRESENTATION = (
     "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297"
@@ -355,8 +355,8 @@ def write_run_manifest(
         "workload": {
             "object_mib": int(env["OBJECT_MIB"]),
             "load_duration_seconds": float(env["LOAD_DURATION_SECONDS"]),
-            "upload_drain_timeout_seconds": float(
-                env["UPLOAD_DRAIN_TIMEOUT_SECONDS"]
+            "upload_completion_timeout_seconds": float(
+                env["UPLOAD_COMPLETION_TIMEOUT_SECONDS"]
             ),
             "bulk_connections": int(env["BULK_CONNECTIONS"]),
             "failover_after_seconds": float(env["FAILOVER_AFTER_SECONDS"]),

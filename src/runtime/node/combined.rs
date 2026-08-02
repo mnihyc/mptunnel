@@ -129,7 +129,7 @@ pub(super) async fn run(
 
     if !local_ingresses.is_empty() {
         let policy = product_policy.as_ref().ok_or(RuntimeError::Protocol(
-            "node local inbounds are missing Product policy",
+            "node local inbounds are missing routing policy",
         ))?;
         let router = ClientIngressRouter::new(policy, outbound_registry.clone())?;
         if let Err(error) = client::spawn_ingresses(

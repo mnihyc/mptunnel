@@ -30,7 +30,7 @@ use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::proof::PathProofObservation;
-use crate::runtime::path::tcp::server_service::{
+use crate::runtime::path::tcp::server::service::{
     ServerTcpCarrierDemandSubscription, ServerTcpCarrierService, ServerTcpCarrierWorkloadLease,
 };
 use crate::runtime::path::{
@@ -2882,5 +2882,5 @@ impl Default for ServerReliableStreamRegistry {
 }
 
 #[cfg(test)]
-#[path = "registry_test.rs"]
+#[path = "tests_registry.rs"]
 mod tests;

@@ -1,25 +1,16 @@
 # Performance evidence
 
-This page records the bounded release evidence for MPTUNNEL v0.1.4 and MPP
-v5. It is deliberately narrower than a claim that one tunnel wins on every
-network. Rates depend on path conditions, workload, host capacity, direction,
-and native TCP or QUIC behavior.
+This page records retained bounded evidence for MPTUNNEL and MPP v5. It is
+deliberately narrower than a claim that one tunnel wins on every network.
+Rates depend on path conditions, workload, host capacity, direction, and
+native TCP or QUIC behavior.
 
 ## Measurement contract
 
-The local runner builds the release profile without optional features and runs
-client, server, and target in isolated Docker namespaces. It records the exact
-binary hashes, source state, configuration, qdisc state, interface counters,
-per-second container and optional management telemetry, application delivery,
-and target-confirmed upload bytes. The standard sustained workload uses two
-flows and a 30-second delivery window; disruption rows use a 20-second mixed or
-reliable workload.
-
-All values below are GNU/Linux observations on one host. The source trees were
-clean for the retained release cohorts, but the formal host gate rejected the
-rows because one unrelated Docker container was running. They are therefore
-useful matched regression and capability evidence, not publication-grade
-cross-host benchmarks, Internet-speed guarantees, or SLAs.
+All values are delivered-goodput observations from isolated GNU/Linux
+containers on one host. Sustained runs use two flows for 30 seconds; disruption
+runs use 20 seconds. Compare products only within the same stated conditions.
+Results are capability evidence, not Internet-speed guarantees or SLAs.
 
 ## Single-path competitors
 
@@ -29,41 +20,40 @@ path hints disabled. Upload values are target-confirmed goodput within the
 standard one-second drain and may be lower bounds when delivery remained in
 flight at the boundary.
 
-| System | Carrier | Download | Upload |
+| System | Carrier | Download (Mbps) | Upload (Mbps) |
 | --- | --- | ---: | ---: |
-| Direct | TCP | 231.521 Mbps | 240.939 Mbps |
-| Xray 26.3.27, VMess | TCP | 219.529 Mbps | 240.849 Mbps |
-| MPTUNNEL | MPP/TCP | 151.722 Mbps | 162.267 Mbps |
-| Hysteria2 2.10.0 | QUIC | 114.506 Mbps | 117.541 Mbps |
-| MPTUNNEL | MPP/QUIC | 212.704 Mbps | 207.649 Mbps |
+| Direct | TCP | 231.521 | ≥240.939 |
+| Xray 26.3.27, VMess | TCP | 219.529 | ≥240.849 |
+| MPTUNNEL | MPP/TCP | 151.722 | ≥162.267 |
+| Hysteria2 2.10.0 | QUIC | 114.506 | ≥117.541 |
+| MPTUNNEL | MPP/QUIC | 212.704 | ≥207.649 |
 
-The cohort does not support a universal single-path TCP win over Xray. It does
-show MPP/QUIC ahead of the matched Hysteria2 row in both directions. MPTUNNEL's
-main performance purpose is independent-path aggregation and recovery while
-one Product flow remains intact.
+The matched run does not support a universal single-path TCP win over Xray.
+MPP/QUIC's download was ahead of the matched Hysteria2 row. The upload values
+are lower bounds and do not establish a final ratio. MPTUNNEL's main
+performance purpose is independent-path aggregation and recovery while one
+Product flow remains intact.
 
 ## Equal-path aggregation
 
-The release Core was guarded on five equal 500 Mbps paths with 180 ms one-way
-delay, 20 ms jitter, and no configured loss.
+Five equal 500 Mbps paths used 180 ms one-way delay, 20 ms jitter, and no
+configured loss.
 
-| MPP carrier | Download | Upload | Observation |
-| --- | ---: | ---: | --- |
-| TCP | 834.364 Mbps | 649.766 Mbps | download and upload completed |
-| QUIC | 648.493 Mbps | 738.113 Mbps | download completed; upload is a receiver-confirmed lower bound at the normal drain boundary |
+| MPP carrier | Download (Mbps) | Upload (Mbps) |
+| --- | ---: | ---: |
+| TCP | 834.364 | 649.766 |
+| QUIC | 648.493 | ≥738.113 |
 
-An earlier same-condition MPP v5 cohort measured kernel MPTCP at 168.085 Mbps
+Both directions completed. The QUIC upload is a receiver-confirmed lower
+bound at the normal drain boundary.
+
+An earlier same-condition MPP v5 run measured kernel MPTCP at 168.085 Mbps
 download and 450.738 Mbps upload, while MPP/TCP measured 875.187 and 617.392
-Mbps. The later release Core remained in the 834/650 Mbps range. Because the
-MPTCP row was not rerun beside the final binary, this report does not invent a
-final ratio from separate invocations.
+Mbps. The later MPTUNNEL measurement remained in the 834/650 Mbps range.
+Because the MPTCP row was not rerun beside the later MPTUNNEL run, this report
+does not invent a final ratio from separate invocations.
 
-The isolated 776.116 Mbps QUIC download peak also did not become a release
-target. Back-to-back execution on the same host placed the retained historical
-binary at 671.356 Mbps and the current binary at 648.493 Mbps, with maximum
-ordered gaps of 0.350 and 0.314 seconds. That 3.4% difference is consistent
-with run variation and does not prove a Core regression. There is no retained
-independent Multipath QUIC implementation in the lab, so no external MPQUIC
+There is no matched independent multipath QUIC baseline, so no external MPQUIC
 ranking is claimed.
 
 ## Adaptive TCP carriers
@@ -74,40 +64,76 @@ and is retained only when complete before/assisted/after evidence proves added
 service. Native TCP ACKs, elapsed time, source address, interface identity, and
 peer claims cannot grant expansion.
 
-In the fixed 100 Mbps per-native-flow QoS cohort, `1-1` versus `1-3` measured:
+In the fixed 100 Mbps per-native-flow QoS run, `1-1` versus `1-3` measured:
 
-| Direction | `1-1` | `1-3` |
+| Direction | `1-1` (Mbps) | `1-3` (Mbps) |
 | --- | ---: | ---: |
-| Download | 75.246 Mbps | 133.130 Mbps |
-| Upload | 75.675 Mbps | 139.136 Mbps |
+| Download | 75.246 | 133.130 |
+| Upload | 75.675 | 139.136 |
 
 At one shared 200 Mbps bottleneck, adjacent download was 158.424 versus
 150.129 Mbps and upload was 158.748 versus 159.831 Mbps. The controller did not
-treat a second TCP session as useful aggregate capacity. These paired cohorts
+treat a second TCP session as useful aggregate capacity. These paired runs
 validate demand-driven expansion and no-gain settlement; they do not encode a
 fixed speed or percentage threshold into production.
 
+With 10 TCP and 10 QUIC endpoints configured, every endpoint started one
+carrier. Each TCP endpoint retained its independent `1-3` range, but no second
+carrier was opened where completed delivery did not prove useful added
+service. The configured maximum is never an eager connection target.
+
+## Scale and short connections
+
+Twenty-carrier measurements used five independently seeded
+bandwidth, latency, jitter, and loss epochs:
+
+| Mbps/path | Download (Mbps) | Upload (Mbps) | Complete |
+| ---: | ---: | ---: | ---: |
+| 30–100 | 344.534 | 210.378 | 2/2 |
+| 300–1,000 | 1,178.811 | 609.004 | 2/2 |
+| 3,000–10,000 | 2,261.932 | 670.693 | 2/2 |
+
+The traces prove schedule execution and flow completion, not an artificial
+configured-rate target or universal optimal-path claim. Complementary
+200/20 and 20/200 Mbps links placed 91.5% of download bytes on the faster
+download direction. A separate exact-accounting upload check placed 86.6% on
+the faster upload direction; that value confirms path-use direction, not
+comparative throughput.
+
+Short-connection measurements:
+
+| Pattern | Concurrent | KiB | Window (s) | Complete | Reject/incomplete | Max (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 s batches | 10 | 32 | 30 | 90/90 | 0/0 | 1.263 |
+| Closed loop | 20 | 1,024 | 60 | 570/570 | 0/0 | — |
+
+These checks establish bounded completion and accounting. They are not blended
+into the matched competitor speed results.
+
 ## Disruption and migration
 
-The final normal-build release gates produced:
+Retained disruption runs produced:
 
-| Case | Reliable goodput | Product result |
-| --- | ---: | --- |
-| QUIC ranged-port migration, unconstrained download | 2459.750 Mbps | complete, 0.030 s maximum read gap |
-| QUIC ranged-port migration, unconstrained upload | 2498.275 Mbps | complete and target-confirmed |
-| Mixed TCP+QUIC, balanced-path blackhole | 257.755 Mbps | 40/40 echo, 151/153 datagrams, 0.777 s maximum bulk gap |
-| Mixed TCP+QUIC, severe fat-path latency change | 199.210 Mbps | 40/40 echo, 145/147 datagrams, 1.293 s maximum bulk gap |
-| TCP multipath, balanced-path blackhole | 181.261 / 243.518 Mbps down/up | reliable flow retained |
-| TCP multipath, severe fat-path latency change | 280.085 / 245.656 Mbps down/up | reliable flow retained |
-| Seeded mixed condition handover | 224.069 Mbps | persistent echo 32/32, small transfers 47/47, datagrams 134/134, 0.717 s maximum bulk gap |
+| Case | ↓/↑ Mbps | Echo | Short | Datagram | Gap (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| QUIC hop ↓ | 2459.750/— | — | — | — | 0.030 |
+| QUIC hop ↑ | —/2498.275 | — | — | — | — |
+| Mixed blackhole | 257.755/— | 40/40 | — | 151/153 | 0.777 |
+| Mixed latency | 199.210/— | 40/40 | — | 145/147 | 1.293 |
+| TCP blackhole | 181.261/243.518 | — | — | — | — |
+| TCP latency | 280.085/245.656 | — | — | — | — |
+| Mixed handover | 224.069/— | 32/32 | 47/47 | 134/134 | 0.717 |
 
-The condition-handover fixture treats each event as a complete epoch: restore
+Every reliable flow completed or remained attached. The QUIC upload was
+target-confirmed.
+
+The condition-handover run treats each event as a complete epoch: restore
 the recorded baseline, then apply one selected condition. This models a link
 recovering while another link changes instead of accidentally accumulating an
-unbounded total outage. A separate durable integration test removes every
-carrier for five seconds and proves that the same reliable stream reattaches;
-the packaged acceptance suite separately proves offline new-flow rejection and
-client/server process restart recovery.
+unbounded total outage. A separate recovery check removes every carrier for
+five seconds and proves that the same reliable stream reattaches. During a
+total outage, new flows were rejected; separate runs recovered after client
+and server process restarts.
 
 Port hopping does not move MPP state between TCP connections. QUIC uses native
 connection migration and retains its authenticated connection; TCP selects a
@@ -121,32 +147,11 @@ collectors retain one-second physical and logical rates. Short zero/spike
 delivery buckets can be application buffering or ACK release rather than a
 carrier failure. Diagnose a suspected flap with the ordered-delivery gap,
 native/interface service, MPP Data ACK progress, queue and flight ownership,
-qdisc drops, and path lifecycle together.
+interface drops, and path lifecycle together.
 
-An isolated movement around five percent is ordinary observation variance,
-not a pass threshold or a hard regression cap. A larger movement is rerun
-beside the exact retained binary and accepted or rejected from causal evidence.
-No timing, carrier count, or congestion parameter is tuned merely to pass one
-fixture.
-
-## Reproduce
-
-Run the maintained local contract from the repository root:
-
-```bash
-python3 lab/validate_performance_declaration.py --check-registry
-python3 -m unittest discover --start-directory lab --pattern 'test_*.py'
-cargo test --locked --manifest-path lab/benchmarks/Cargo.toml
-
-CASE_FILTER='direct_cross_continent_high_bandwidth,baseline_vmess_tcp_single_cross_continent_high_bandwidth,baseline_hysteria2_udp_single_cross_continent_high_bandwidth,mptunnel_tcp_single_cross_continent_high_bandwidth,mptunnel_udp_stream_single_cross_continent_high_bandwidth,mptunnel_tcp_multipath_equal_fat,mptunnel_udp_stream_multipath_equal_fat' \
-MPTUNNEL_LAB_OBJECT_MIB=4096 \
-MPTUNNEL_LAB_USE_PATH_HINTS=0 \
-lab/run-heterogeneous-ablation.sh
-```
-
-The runner creates one ignored directory under `.tmp/lab/results/` containing
-the JSONL row and all evidence needed to decide comparability. See
-[LAB.md](LAB.md) for case selection and matching rules.
+An isolated movement around five percent can be ordinary observation variance,
+not a pass threshold or a hard regression cap. Production contains no fixed
+Mbps or percentage target.
 
 ## Limits
 
@@ -161,5 +166,5 @@ This report does not prove:
 - security of the custom MPP protocol.
 
 MPTUNNEL uses portable Product and MPP evidence as its correctness fallback;
-native platform telemetry is optional. Cross-platform builds and package
-contents are separate release gates.
+native platform telemetry is optional. Packaged targets are build-verified
+separately from GNU/Linux performance measurements.

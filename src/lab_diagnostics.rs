@@ -552,5 +552,5 @@ fn env_flag_value(value: &str) -> bool {
 }
 
 #[cfg(all(test, feature = "lab-diagnostics"))]
-#[path = "lab_diagnostics_test.rs"]
+#[path = "tests_lab_diagnostics.rs"]
 mod tests;

@@ -11,6 +11,49 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T10:55:11+08:00: non-cumulative condition-handover lab restored
+
+- Name: complete link-condition epochs for the mixed disruption fixture
+- Category: Performance methodology and release-gate correctness
+- State: accepted; no Product, Core, RFC, timing, or parameter change was
+  required
+- Reproduced fixture defect:
+  - each seeded event changed one qdisc but retained every mutation from prior
+    events, so some random histories silently accumulated blackholes or severe
+    spikes across all configured carriers;
+  - the case nevertheless required a persistent echo request with a five-second
+    application deadline to survive that accidental all-link outage; and
+  - passing seeds had avoided the cumulative outage while failing seeds had
+    created it, explaining the apparent run-to-run protocol instability.
+- Clean correction:
+  - every event is now one complete condition epoch: restore the declared
+    baseline, then apply the selected condition;
+  - the default schedule contains baseline recovery plus one-link spike and
+    blackhole conditions, so changing history cannot transform handover into a
+    different total-outage experiment;
+  - the evidence metadata records the transition model, and the existing trace
+    still records exact selected modes, dwell periods, command timing, and
+    command results; and
+  - complete outage/restore remains a distinct lifecycle contract, including
+    the durable five-second same-flow reattachment test and packaged
+    offline/restart acceptance.
+- Causal evidence:
+  - with the exact formerly failing seed, ordered mode sequence, and hold
+    sequence, the cumulative fixture delivered `99.385` Mbit/s, disconnected
+    the persistent echo flow after 9/31 successes, lost 12.5% of datagrams, and
+    had a 2.633-second maximum bulk gap;
+  - the corrected epoch fixture delivered `199.128` Mbit/s, kept the same echo
+    flow alive for 29/29 requests, completed all 38 small transfers, lost 1.8%
+    of datagrams during faults, and bounded the maximum bulk gap to 0.784
+    seconds; and
+  - both traces completed with zero command failures and the same selected
+    schedule digest `272b801d6b21742674caa7b4bf63b445852e553317e37c3f134020518d1d841a`.
+- Verification: focused flapping/runner contract tests pass (29 tests), Bash
+  syntax, ShellCheck apart from its pre-existing dynamic-source information,
+  formatting, and whitespace checks pass.
+- Evidence: `./.tmp/lab/results/v014-reverted-final-disruption-matrix` and
+  `./.tmp/lab/results/v014-flapping-epoch-fix-causal`.
+
 ## 2026-08-02T10:41:00+08:00: request recovery timing change rejected by disruption A/B
 
 - Name: request-side Data-ACK recovery epoch review

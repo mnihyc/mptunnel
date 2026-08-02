@@ -65,8 +65,10 @@ Do not combine these cohorts in one performance claim:
 - **Shaped**: Docker paths with explicit rate, delay, jitter, and loss.
 - **Unconstrained**: Docker paths with netem cleared. This is not the public
   Internet and is not a wire-speed guarantee.
-- **Fault**: blackhole, latency-spike, saturation, and deterministic flapping
-  experiments.
+- **Fault**: blackhole, latency-spike, saturation, and deterministic condition
+  handover experiments. Each default handover epoch restores the recorded
+  baseline before changing one selected link, so history cannot silently
+  accumulate into a different all-link-outage experiment.
 - **Protocol family**: TCP-only, QUIC-only, and mixed TCP+QUIC reliable streams
   exercise distinct carrier controllers.
 - **Work direction**: upload and download have different ownership and host I/O
@@ -246,9 +248,12 @@ matrix may keep realistic application concurrency, but it is not a per-carrier
 congestion-control comparison when those counts differ. Use a separate
 single-flow control before attributing such a difference to MPP scheduling.
 
-For flapping A/B comparisons, preserve `MPTUNNEL_LAB_FLAP_SEED`, ordered modes,
-hold bounds, and netem overrides. The seed fixes the intended schedule, not
-packet-level random loss, Docker command latency, or application progress.
+For condition-handover A/B comparisons, preserve `MPTUNNEL_LAB_FLAP_SEED`,
+ordered modes, hold bounds, and netem overrides. The seed fixes the intended
+schedule, not packet-level random loss, Docker command latency, or application
+progress. Every event is a complete baseline-then-selected-condition epoch;
+the default conditions change at most one link. Complete carrier outage and
+restoration are separate lifecycle tests.
 Require a complete trace and compare actual transition offsets.
 
 ## Download accounting

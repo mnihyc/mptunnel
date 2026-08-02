@@ -320,6 +320,16 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn("trap '' TTOU TTIN TSTP", flapper)
         self.assertIn(") </dev/null &", flapper)
 
+    def test_flapper_uses_complete_non_cumulative_condition_epochs(self):
+        flapper = SCRIPT.split("start_random_flapping() {", 1)[1].split(
+            "\n}\n\nshould_run_case()", 1
+        )[0]
+
+        self.assertIn("exec_netem client apply", flapper)
+        self.assertIn('exec_netem client "$mode"', flapper)
+        self.assertIn("exec_netem server apply", flapper)
+        self.assertIn('exec_netem server "$mode"', flapper)
+
     def test_equal_fat_mptcp_cases_match_bulk_and_exact_upload_contracts(self):
         download = SCRIPT.split("run_mptcp_baseline_case() {", 1)[1].split(
             "\n}\n\nrun_mptcp_baseline_upload_case()", 1

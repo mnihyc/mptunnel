@@ -12,6 +12,7 @@ from typing import Iterable, Iterator
 
 
 GENERATOR_ID = "sha256-counter-v1"
+TRANSITION_MODEL = "baseline-then-selected-condition"
 MODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SUPPORTED_MODES = {
     "apply",
@@ -224,6 +225,7 @@ def build_metadata(
     )
     profile = {
         "generator": GENERATOR_ID,
+        "transition_model": TRANSITION_MODEL,
         "configured_modes": modes,
         "min_hold_seconds": min_seconds,
         "max_hold_seconds": max_seconds,
@@ -245,6 +247,7 @@ def build_metadata(
     metadata: dict[str, object] = {
         "schema_version": 1,
         "generator": GENERATOR_ID,
+        "transition_model": TRANSITION_MODEL,
         "schedule_profile_sha256": schedule_profile_sha256,
         "schedule_id_sha256": schedule_id_sha256,
         "seed": seed,

@@ -284,7 +284,7 @@ saturate_fat_bandwidth="${MPTUNNEL_LAB_SATURATE_FAT_BANDWIDTH:-450M}"
 saturate_poor_bandwidth="${MPTUNNEL_LAB_SATURATE_POOR_BANDWIDTH:-45M}"
 flap_min_seconds="${MPTUNNEL_LAB_FLAP_MIN_SECONDS:-1}"
 flap_max_seconds="${MPTUNNEL_LAB_FLAP_MAX_SECONDS:-4}"
-flap_modes="${MPTUNNEL_LAB_FLAP_MODES:-apply-lowlat,apply-balanced,apply-fat,apply-poor,spike-lowlat,spike-balanced,spike-fat,spike-poor,blackhole-lowlat,blackhole-balanced,blackhole-fat,blackhole-poor}"
+flap_modes="${MPTUNNEL_LAB_FLAP_MODES:-apply,spike-lowlat,spike-balanced,spike-fat,spike-poor,blackhole-lowlat,blackhole-balanced,blackhole-fat,blackhole-poor}"
 flap_seed="${MPTUNNEL_LAB_FLAP_SEED:-}"
 flap_seed_source=""
 flapper_pid=""
@@ -2099,14 +2099,20 @@ start_random_flapping() {
       fi
       event_start_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
       client_apply_start_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
-      if exec_netem client "$mode" >/dev/null 2>&1; then
+      # One event is one complete condition epoch. Restore the declared
+      # baseline before applying the selected condition so random history
+      # cannot silently turn the default single-link handover case into an
+      # unbounded cumulative all-link outage.
+      if exec_netem client apply >/dev/null 2>&1 \
+        && exec_netem client "$mode" >/dev/null 2>&1; then
         client_command_exit_code=0
       else
         client_command_exit_code=$?
       fi
       client_apply_end_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
       server_apply_start_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
-      if exec_netem server "$mode" >/dev/null 2>&1; then
+      if exec_netem server apply >/dev/null 2>&1 \
+        && exec_netem server "$mode" >/dev/null 2>&1; then
         server_command_exit_code=0
       else
         server_command_exit_code=$?

@@ -9,6 +9,7 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
     BulkAdmissionCheck, BulkCandidatePosition,
     bulk_candidate_admission_suppression_with_completion_backlog,
+    bulk_contiguous_frontier_can_accept_enqueue,
 };
 use crate::model::capacity::data_level_service_window_bytes;
 use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
@@ -101,7 +102,12 @@ pub(super) fn response_ordinary_saturation_observation(
         .collect::<SmallVec<[&ResponseSenderPathTarget; 4]>>();
     if eligible.is_empty()
         || eligible.iter().any(|target| {
-            target.can_enqueue_stream_data(TrafficClass::Throughput)
+            (target.can_enqueue_stream_data(TrafficClass::Throughput)
+                && bulk_contiguous_frontier_can_accept_enqueue(
+                    response_completion_snapshot(target),
+                    payload_bytes,
+                    mux_limits,
+                ))
                 || target.observation.original_data_in_flight_bytes == 0
                 || target.observation.snapshot.active_latency_sensitive_flows != 0
         })
@@ -272,8 +278,9 @@ pub(super) fn select_response_data_path_with_payload(
                 let key = target.observation.key;
                 let owns_lower_frontier =
                     lower_owner == Some((key, target.observation.incarnation));
-                let position = if owns_lower_frontier || (lower_owner.is_none() && key == lead_key)
-                {
+                let position = if owns_lower_frontier {
+                    BulkCandidatePosition::ContiguousFrontier
+                } else if lower_owner.is_none() && key == lead_key {
                     BulkCandidatePosition::FirstPath
                 } else {
                     BulkCandidatePosition::AdditionalPath
@@ -283,10 +290,12 @@ pub(super) fn select_response_data_path_with_payload(
                 } else {
                     (lead_snapshot, lead_eta_ms)
                 };
-                // Every unproven path may own only one bounded startup flight
-                // until exact Data ACKs prove progress. Owning the contiguous
-                // frontier changes reorder debt, not Data Sequence credit.
-                let has_data_level_credit = snapshot.has_durable_product_progress
+                // Every unproven additional path may own only one bounded
+                // startup flight until exact Data ACKs prove progress. The
+                // contiguous owner instead remains governed by shared Product
+                // credit and its native carrier.
+                let has_data_level_credit = owns_lower_frontier
+                    || snapshot.has_durable_product_progress
                     || target
                         .observation
                         .original_data_in_flight_bytes
@@ -303,7 +312,7 @@ pub(super) fn select_response_data_path_with_payload(
                 // earliest opportunity.
                 let suppression = if lane.is_latency_sensitive()
                     || (single_live_path
-                        && position == BulkCandidatePosition::FirstPath
+                        && position != BulkCandidatePosition::AdditionalPath
                         && snapshot.active_latency_sensitive_flows == 0)
                 {
                     None

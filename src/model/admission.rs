@@ -3,8 +3,8 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, RELIABLE_PIPE_WINDOW_BDPS,
-    reliable_unproven_path_startup_flight_limit_bytes,
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, RELIABLE_PIPE_WINDOW_BDPS, data_level_service_window_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_unproven_path_startup_flight_limit_bytes,
 };
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
@@ -87,7 +87,10 @@ pub(crate) fn bulk_striping_admitted_candidates(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkCandidatePosition {
+    /// First-ranked candidate when no exact lower Data Sequence owner exists.
     FirstPath,
+    /// Exact owner of the lowest outstanding original Data Sequence range.
+    ContiguousFrontier,
     AdditionalPath,
 }
 
@@ -382,7 +385,7 @@ fn bulk_path_acquiring_native_capacity(candidate: PathSnapshot) -> bool {
 fn bulk_completion_horizon_applies(check: BulkAdmissionCheck) -> bool {
     // Additional carriers already use ECF against the sender-owned completion
     // backlog. Only the leading owner can need a separate lower-offset horizon.
-    check.position == BulkCandidatePosition::FirstPath && check.stream_ordering_debt_bytes > 0
+    check.position != BulkCandidatePosition::AdditionalPath && check.stream_ordering_debt_bytes > 0
 }
 
 #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
@@ -430,6 +433,14 @@ fn bulk_candidate_within_inflight_limit(
     let payload_bytes = check.payload_bytes;
     let mux_limits = check.mux_limits;
     let position = check.position;
+    // The exact contiguous-frontier owner follows carrier enqueue capacity,
+    // not its overlapping Product flight. Latency pressure retains the
+    // bounded Product horizon.
+    if position == BulkCandidatePosition::ContiguousFrontier
+        && !bulk_path_has_latency_pressure(candidate)
+    {
+        return bulk_contiguous_frontier_can_accept_enqueue(candidate, payload_bytes, mux_limits);
+    }
     if bulk_path_has_latency_pressure(candidate) {
         let inflight_limit = bulk_product_inflight_limit_bytes(
             candidate,
@@ -455,6 +466,50 @@ fn bulk_candidate_within_inflight_limit(
     );
     let committed = bulk_scheduler_inflight_debt_bytes(candidate, position);
     bulk_quantum_granular_limit_allows(committed, payload_bytes, inflight_limit, position)
+}
+
+/// Whether the exact contiguous-frontier carrier can accept another original
+/// data quantum without installing a second congestion controller.
+///
+/// A native congestion window makes carrier queue plus native flight the
+/// enqueue authority. The existing Product service window is the portable
+/// fallback when the underlay cannot expose native send credit.
+pub(crate) fn bulk_contiguous_frontier_can_accept_enqueue(
+    candidate: PathSnapshot,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> bool {
+    let payload_bytes_u64 = payload_bytes as u64;
+    let configured_ceiling = (mux_limits.max_path_flight_bytes as u64)
+        .max(payload_bytes_u64)
+        .max(1);
+    let (committed, limit) = if candidate.carrier_inflight_limit_bytes > 0 {
+        let committed = candidate
+            .queue_bytes
+            .saturating_add(candidate.bytes_in_flight);
+        let limit = candidate
+            .carrier_inflight_limit_bytes
+            .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits) as u64)
+            .min(configured_ceiling)
+            .max(payload_bytes_u64);
+        (committed, limit)
+    } else {
+        let committed = bulk_assigned_product_debt_bytes(candidate);
+        let portable_limit = if candidate.data_level_limit_bytes > 0 {
+            candidate.data_level_limit_bytes.max(payload_bytes_u64)
+        } else {
+            data_level_service_window_bytes(candidate, TrafficClass::Throughput, mux_limits)
+                .ceil()
+                .max(payload_bytes_u64 as f64) as u64
+        };
+        (committed, portable_limit.min(configured_ceiling))
+    };
+    bulk_quantum_granular_limit_allows(
+        committed,
+        payload_bytes,
+        limit,
+        BulkCandidatePosition::ContiguousFrontier,
+    )
 }
 
 fn bulk_quantum_granular_limit_allows(
@@ -619,7 +674,7 @@ fn bulk_scheduler_inflight_debt_bytes(
     candidate: PathSnapshot,
     position: BulkCandidatePosition,
 ) -> u64 {
-    if position == BulkCandidatePosition::FirstPath {
+    if position != BulkCandidatePosition::AdditionalPath {
         return bulk_assigned_product_debt_bytes(candidate);
     }
     bulk_product_reorder_debt_bytes(candidate)
@@ -634,11 +689,11 @@ fn bulk_assigned_product_debt_bytes(candidate: PathSnapshot) -> u64 {
         .max(candidate.queue_bytes)
 }
 
-fn bulk_first_path_has_latency_pressure(
+fn bulk_leading_path_has_latency_pressure(
     candidate: PathSnapshot,
     position: BulkCandidatePosition,
 ) -> bool {
-    position == BulkCandidatePosition::FirstPath && bulk_path_has_latency_pressure(candidate)
+    position != BulkCandidatePosition::AdditionalPath && bulk_path_has_latency_pressure(candidate)
 }
 
 fn bulk_path_has_latency_pressure(candidate: PathSnapshot) -> bool {
@@ -671,7 +726,7 @@ fn bulk_total_reorder_debt_bytes(
     stream_ordering_debt_bytes: u64,
 ) -> u64 {
     let path_debt = match position {
-        BulkCandidatePosition::FirstPath => 0,
+        BulkCandidatePosition::FirstPath | BulkCandidatePosition::ContiguousFrontier => 0,
         BulkCandidatePosition::AdditionalPath => bulk_product_reorder_debt_bytes(candidate),
     };
     path_debt.saturating_add(stream_ordering_debt_bytes)
@@ -716,17 +771,19 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
     stream_ordering_debt_bytes: u64,
 ) -> u64 {
     match position {
-        BulkCandidatePosition::FirstPath if stream_ordering_debt_bytes == 0 => {
-            if bulk_first_path_has_latency_pressure(candidate, position) {
+        BulkCandidatePosition::FirstPath | BulkCandidatePosition::ContiguousFrontier
+            if stream_ordering_debt_bytes == 0 =>
+        {
+            if bulk_leading_path_has_latency_pressure(candidate, position) {
                 bulk_scheduling_horizon_bytes(payload_bytes, mux_limits) as u64
             } else {
                 bulk_reorder_window_bytes(payload_bytes, mux_limits) as u64
             }
         }
-        BulkCandidatePosition::FirstPath => {
+        BulkCandidatePosition::FirstPath | BulkCandidatePosition::ContiguousFrontier => {
             let reorder_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
             if stream_ordering_debt_bytes > 0
-                && bulk_first_path_has_latency_pressure(candidate, position)
+                && bulk_leading_path_has_latency_pressure(candidate, position)
             {
                 let service_horizon =
                     bulk_scheduling_horizon_bytes(payload_bytes, mux_limits) as u64;

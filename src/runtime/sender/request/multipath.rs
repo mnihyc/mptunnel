@@ -457,6 +457,7 @@ impl RequestMultipathController {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn latest_unacked_ranges_for_path_instance(
         &self,
         instance: RelayPathInstance,
@@ -484,7 +485,7 @@ impl RequestMultipathController {
             .collect()
     }
 
-    pub(super) fn stale_path_recovery_state(
+    pub(super) fn path_recovery_state(
         &self,
         remotes: &ReliableRelayRemoteSet,
         original_path: RelayPathInstance,
@@ -511,18 +512,6 @@ impl RequestMultipathController {
             .filter(|path| !path.stream.output_is_terminally_closed())
             .map(|path| path.instance())
             .collect()
-    }
-
-    pub(super) fn record_missing_owner_reinjection_attempts(
-        &mut self,
-        instances: &[RelayPathInstance],
-        attempted_at: Instant,
-    ) {
-        for instance in instances {
-            self.request
-                .missing_owner_reinjection_attempts
-                .insert(*instance, attempted_at);
-        }
     }
 
     pub(super) fn mark_path_stale(&mut self, instance: RelayPathInstance) -> bool {
@@ -1505,9 +1494,6 @@ impl RequestMultipathController {
         let mut delivered_data =
             smallvec::SmallVec::<[RequestOwnerAckProgress<RelayPathInstance>; 4]>::new();
         for release in released {
-            self.request
-                .missing_owner_reinjection_attempts
-                .remove(&release.instance);
             context.release_relay_path_inflight(release.instance, release.bytes);
             if release.path_proving {
                 if let Some(progress) = delivered_data
@@ -1705,32 +1691,17 @@ impl RequestMultipathController {
             .collect()
     }
 
-    pub(super) fn unreported_missing_owner_instances(
-        &mut self,
+    pub(super) fn request_recovery_original_paths(
+        &self,
         remotes: &ReliableRelayRemoteSet,
-        retry_after: Duration,
     ) -> Vec<RelayPathInstance> {
-        let owner_instances = self.request.flights.original_transmission_instances();
-        self.request
-            .missing_owner_reinjection_attempts
-            .retain(|instance, _| {
-                owner_instances.contains(instance)
-                    && !remotes.contains_flight_owner_instance(*instance)
-            });
-        let now = Instant::now();
-        owner_instances
-            .into_iter()
-            .filter(|instance| {
-                !remotes.contains_flight_owner_instance(*instance)
-                    && self
-                        .request
-                        .missing_owner_reinjection_attempts
-                        .get(instance)
-                        .is_none_or(|attempt| {
-                            now.saturating_duration_since(*attempt) >= retry_after
-                        })
-            })
-            .collect()
+        let mut instances = self.stale_original_paths(remotes);
+        for instance in self.request.flights.original_transmission_instances() {
+            if !remotes.contains_flight_owner_instance(instance) && !instances.contains(&instance) {
+                instances.push(instance);
+            }
+        }
+        instances
     }
 
     pub(super) fn release_all(&mut self, context: &ClientPathContext) {

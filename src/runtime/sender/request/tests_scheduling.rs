@@ -401,6 +401,23 @@ fn ordinary_saturation_rejects_non_rfc_and_transient_blocks() {
         .is_none(),
         "an eligible ordinary enqueue means the demand is not saturated",
     );
+    let mut native_saturated = enqueue_available;
+    let snapshot = native_saturated.shared_snapshot.as_mut().expect("snapshot");
+    snapshot.bytes_in_flight = snapshot.carrier_inflight_limit_bytes;
+    snapshot.queue_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64;
+    assert!(
+        check(
+            &scheduling_observation([native_saturated]),
+            &proposed,
+            &flights,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+            &no_stale_paths,
+        )
+        .is_some(),
+        "native queue and flight saturation is ordinary enqueue saturation",
+    );
     assert!(
         check(
             &observation,
@@ -598,11 +615,10 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
     let challenger = instance(UnderlayProtocol::Udp, 0, 30);
     let owner = instance(UnderlayProtocol::Udp, 1, 31);
     let mut owner_path = observed_path(owner, 10.0, 500_000_000.0);
-    owner_path
-        .shared_snapshot
-        .as_mut()
-        .expect("snapshot")
-        .jitter_ms = 2.0;
+    let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("snapshot");
+    owner_snapshot.jitter_ms = 2.0;
+    owner_snapshot.data_level_limit_bytes = PAYLOAD_BYTES as u64;
+    owner_snapshot.data_level_bytes_in_flight = (2 * PAYLOAD_BYTES) as u64;
     let mut challenger_path = observed_path(challenger, 8.0, 500_000_000.0);
     challenger_path
         .shared_snapshot
@@ -616,7 +632,7 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
     assert_eq!(
         choose_bulk(&observation, &flights, Some(&evidence)),
         BulkRelayPathChoice::Selected(owner),
-        "the exact lower-flight owner should remain the lead inside measured jitter",
+        "the exact lower-flight owner remains native-work-conserving inside measured jitter",
     );
 }
 

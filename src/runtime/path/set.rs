@@ -512,6 +512,14 @@ impl ClientPathContext {
         })
     }
 
+    /// Resolves the configured endpoint name shared by every minimum or
+    /// elastic carrier member in that endpoint's group.
+    pub(in crate::runtime) fn tcp_path_name(&self, path_index: usize) -> Option<&str> {
+        self.tcp_config_index(path_index)
+            .and_then(|config_index| self.tcp_path_names.get(config_index))
+            .map(String::as_str)
+    }
+
     pub(in crate::runtime) fn tcp_path_config_ordinal(&self, path_index: usize) -> Option<usize> {
         self.tcp_path_ordinals.get(path_index).copied().or_else(|| {
             self.tcp_carrier_groups

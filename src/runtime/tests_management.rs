@@ -415,6 +415,54 @@ fn client_status_exposes_named_inventory_without_credentials() {
 }
 
 #[test]
+fn status_projects_retained_elastic_tcp_carriers() {
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    );
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![ClientPathConfig {
+            name: "primary".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: "tcp://127.0.0.1:443?tcp-carriers=1-3"
+                .parse()
+                .expect("path"),
+            security,
+        }],
+        ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
+    )
+    .expect("context");
+    {
+        let mut health = context.health().lock().expect("health");
+        let record = health.new_tcp_elastic_record();
+        assert!(health.insert_tcp_elastic_record(1, record));
+    }
+    let target = ManagementTarget {
+        clients: vec![context],
+        servers: Vec::new(),
+        inventory: ProductRuntimeInventory::default(),
+        product_telemetry: RuntimeTelemetry::new(8),
+        state: ManagementState::new("node"),
+        config_control: None,
+        gateway_control: None,
+        dns: None,
+        product_admission: ProductAdmission::default(),
+        generation: RuntimeGenerationControl::new(),
+    };
+
+    target.refresh_sample_snapshot();
+    let status = target.snapshot();
+    assert_eq!(status.summary.configured_path_count, 1);
+    assert_eq!(status.summary.path_count, 2);
+    assert_eq!(status.paths.len(), 2);
+    assert_eq!(status.paths[1].path, "primary");
+    assert_eq!(status.paths[1].tcp_carrier_ordinal, Some(2));
+    assert_eq!(status.paths[1].tcp_carriers_min, Some(1));
+    assert_eq!(status.paths[1].tcp_carriers_max, Some(3));
+}
+
+#[test]
 fn status_separates_sessions_flows_and_exclusive_path_states() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),

@@ -244,7 +244,7 @@ fn explicit_data_level_service_window_preserves_bounded_carrier_feed_headroom() 
 }
 
 #[test]
-fn tcp_frontier_owner_obeys_data_sequence_service_window() {
+fn first_ranked_tcp_candidate_obeys_data_sequence_service_window() {
     let mux_limits = MuxLimits {
         max_path_flight_bytes: 64 * 1024 * 1024,
         max_reorder_bytes: 64 * 1024 * 1024,
@@ -275,7 +275,7 @@ fn tcp_frontier_owner_obeys_data_sequence_service_window() {
             stream_ordering_debt_bytes: 0,
         }),
         None,
-        "the contiguous TCP owner remains schedulable within measured service credit"
+        "the first-ranked TCP candidate remains schedulable within measured service credit"
     );
 
     active.snapshot.data_level_bytes_in_flight = service_window;
@@ -291,7 +291,7 @@ fn tcp_frontier_owner_obeys_data_sequence_service_window() {
             stream_ordering_debt_bytes: 0,
         }),
         Some("inflight_limit"),
-        "contiguous ownership cannot mint Data Sequence credit beyond the service window"
+        "ranking cannot mint Data Sequence credit beyond the service window"
     );
 
     active.snapshot.data_level_bytes_in_flight = service_window;
@@ -313,7 +313,7 @@ fn tcp_frontier_owner_obeys_data_sequence_service_window() {
 }
 
 #[test]
-fn quic_frontier_owner_obeys_data_sequence_service_window() {
+fn first_ranked_quic_candidate_obeys_data_sequence_service_window() {
     let mux_limits = MuxLimits {
         max_path_flight_bytes: 64 * 1024 * 1024,
         max_reorder_bytes: 64 * 1024 * 1024,
@@ -339,7 +339,7 @@ fn quic_frontier_owner_obeys_data_sequence_service_window() {
             stream_ordering_debt_bytes: 0,
         }),
         None,
-        "the contiguous QUIC owner may feed within its data-level service window"
+        "the first-ranked QUIC candidate may feed within its data-level service window"
     );
 
     active.snapshot.data_level_bytes_in_flight = service_window;
@@ -355,7 +355,7 @@ fn quic_frontier_owner_obeys_data_sequence_service_window() {
             stream_ordering_debt_bytes: 0,
         }),
         Some("inflight_limit"),
-        "native QUIC backpressure and Data Sequence ownership remain separate bounded resources"
+        "native QUIC backpressure and ranked Data Sequence admission remain separate resources"
     );
 
     active.snapshot.data_level_limit_bytes = service_window * 2;
@@ -372,6 +372,148 @@ fn quic_frontier_owner_obeys_data_sequence_service_window() {
         }),
         None,
         "measured Data ACK service growth must reopen QUIC placement without fixed path classification"
+    );
+}
+
+#[test]
+fn contiguous_frontier_uses_native_send_authority_without_a_second_inflight_controller() {
+    let mux_limits = MuxLimits {
+        max_path_flight_bytes: 64 * 1024 * 1024,
+        max_reorder_bytes: 64 * 1024 * 1024,
+        max_stream_window_bytes: 64 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let payload = 64 * 1024;
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let mut active = candidate(0, 10.0, 50.0, 80.0);
+        active.key.underlay = underlay;
+        active.snapshot.underlay = underlay;
+        active.snapshot.has_durable_product_progress = true;
+        active.snapshot.carrier_inflight_limit_bytes = 512 * 1024;
+        active.snapshot.data_level_limit_bytes = 1024 * 1024;
+        active.snapshot.data_level_bytes_in_flight = 4 * 1024 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: active.snapshot,
+                best_eta_ms: active.eta_ms,
+                candidate_snapshot: active.snapshot,
+                candidate_eta_ms: active.eta_ms,
+                payload_bytes: payload,
+                mux_limits,
+                position: BulkCandidatePosition::ContiguousFrontier,
+                stream_ordering_debt_bytes: 0,
+            }),
+            None,
+            "the exact frontier owner is governed by shared credit and native backpressure"
+        );
+
+        active.snapshot.queue_bytes = 512 * 1024;
+        active.snapshot.bytes_in_flight = 512 * 1024;
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: active.snapshot,
+                best_eta_ms: active.eta_ms,
+                candidate_snapshot: active.snapshot,
+                candidate_eta_ms: active.eta_ms,
+                payload_bytes: payload,
+                mux_limits,
+                position: BulkCandidatePosition::ContiguousFrontier,
+                stream_ordering_debt_bytes: 0,
+            }),
+            Some("inflight_limit"),
+            "native queue plus flight remains the exact carrier enqueue boundary"
+        );
+    }
+}
+
+#[test]
+fn contiguous_frontier_uses_the_product_service_fallback_without_native_credit() {
+    let mux_limits = MuxLimits::default();
+    let payload = 64 * 1024;
+    let mut active = candidate(0, 10.0, 50.0, 80.0);
+    active.snapshot.has_durable_product_progress = true;
+    active.snapshot.carrier_inflight_limit_bytes = 0;
+    active.snapshot.data_level_limit_bytes = 8 * 1024 * 1024;
+    active.snapshot.data_level_bytes_in_flight = 4 * 1024 * 1024;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::ContiguousFrontier,
+            stream_ordering_debt_bytes: 0,
+        }),
+        None,
+        "the runtime-derived portable service limit remains authoritative"
+    );
+
+    active.snapshot.data_level_bytes_in_flight = mux_limits.max_path_flight_bytes as u64;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::ContiguousFrontier,
+            stream_ordering_debt_bytes: 0,
+        }),
+        Some("inflight_limit"),
+        "the transport-neutral Product window remains the bounded fallback"
+    );
+}
+
+#[test]
+fn contiguous_frontier_retains_shared_reorder_and_latency_pressure_bounds() {
+    let mux_limits = MuxLimits {
+        max_path_flight_bytes: 64 * 1024 * 1024,
+        max_reorder_bytes: 1024 * 1024,
+        max_stream_window_bytes: 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let payload = 64 * 1024;
+    let mut active = candidate(0, 10.0, 50.0, 80.0);
+    active.snapshot.has_durable_product_progress = true;
+    active.snapshot.carrier_inflight_limit_bytes = 512 * 1024;
+    active.snapshot.data_level_limit_bytes = 1024 * 1024;
+    active.snapshot.data_level_bytes_in_flight = 1024 * 1024;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::ContiguousFrontier,
+            stream_ordering_debt_bytes: mux_limits.max_reorder_bytes as u64,
+        }),
+        Some("reorder_budget"),
+        "frontier ownership cannot extend the shared receive-hole envelope"
+    );
+
+    active.snapshot.active_latency_sensitive_flows = 1;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::ContiguousFrontier,
+            stream_ordering_debt_bytes: 0,
+        }),
+        Some("inflight_limit"),
+        "latency pressure keeps the bounded Product horizon"
     );
 }
 

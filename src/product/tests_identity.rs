@@ -48,11 +48,11 @@ fn shared_secret_accepts_uuid_and_derives_master_material() {
 
 #[test]
 fn rotation_overlap_preserves_principal_while_revocation_is_credential_scoped() {
-    let old_id = CredentialId::parse("home-2026-a").expect("credential ID");
-    let next_id = CredentialId::parse("home-2026-b").expect("credential ID");
+    let old_id = CredentialId::parse("home-primary").expect("credential ID");
+    let next_id = CredentialId::parse("home-next").expect("credential ID");
     let catalog = CredentialCatalog::compile([
-        credential("home-2026-a", "home", 1, None, true, 30),
-        credential("home-2026-b", "home", 2, None, false, 30),
+        credential("home-primary", "home", 1, None, true, 30),
+        credential("home-next", "home", 2, None, false, 30),
     ])
     .expect("credential catalog");
     let authority = catalog

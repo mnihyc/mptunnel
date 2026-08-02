@@ -283,14 +283,14 @@ fn control_frames_round_trip_auth_and_path_metrics() {
 
     round_trip(Frame::SessionAuth {
         session_id: SessionId(42),
-        credential_id: "home-2026".to_string(),
+        credential_id: "home-client".to_string(),
         nonce,
         issued_at_unix_secs: 1_735_689_600,
         auth_tag,
     });
     round_trip(Frame::PathJoin {
         session_id: SessionId(42),
-        credential_id: "home-2026".to_string(),
+        credential_id: "home-client".to_string(),
         path_id: PathId(3),
         underlay: UnderlayProtocol::Udp,
         purpose: PathPurpose::Ordinary,
@@ -358,7 +358,7 @@ fn control_frames_round_trip_auth_and_path_metrics() {
 fn credential_ids_are_bounded_canonical_wire_names() {
     let frame = Frame::SessionAuth {
         session_id: SessionId(42),
-        credential_id: "home-2026".to_string(),
+        credential_id: "home-client".to_string(),
         nonce: AuthNonce([7; 16]),
         issued_at_unix_secs: 1_735_689_600,
         auth_tag: AuthTag([9; 32]),

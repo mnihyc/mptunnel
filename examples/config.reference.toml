@@ -27,7 +27,7 @@ flow_events = false     # opt-in destination-bearing flow open/close records
 # references use:
 # secret = { from = "environment", variable = "MPTUNNEL_HOME_KEY" }.
 [[credentials]]
-credential_id = "home-2026"
+credential_id = "home-client"
 principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
 # expires_at_unix_secs = 1798761600
@@ -333,7 +333,7 @@ path_probe_timeout_ms = 2000
 extra_traffic_hint_percent = 5
 
 [outbounds.security]
-credential_id = "home-2026"
+credential_id = "home-client"
 # TLS identity is independent from the MPP authentication credential and is
 # shared by the TCP and QUIC carriers in this path group. A path group with a
 # QUIC endpoint requires a DNS TLS identity because H3 authority is bound to
@@ -421,7 +421,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # A second independent MPP leaf can join the edge-balancer routing example
 # below; it keeps its own session, carrier set, and performance policy.
 # [[credentials]]
-# credential_id = "secondary-2026"
+# credential_id = "secondary-client"
 # principal_id = "secondary"
 # secret = { from = "file", path = "secondary-mpp-credential.key" }
 #
@@ -439,7 +439,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # extra_traffic_hint_percent = 5
 #
 # [outbounds.security]
-# credential_id = "secondary-2026"
+# credential_id = "secondary-client"
 # tls_server_name = "secondary.example.com"
 # tls_pinned_certificate_file = "secondary-server-cert.pem"
 # auth_freshness_window_seconds = 300
@@ -464,9 +464,9 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # extra_traffic_hint_percent = 5
 #
 # [inbounds.security]
-# credential_ids = ["home-2026"]
-# tls_certificate_chain_file = "server-cert-chain.pem"
-# tls_private_key_file = "server-private-key.pem"
+# credential_ids = ["home-client"]
+# tls_certificate_chain_file = "server-cert.pem"
+# tls_private_key_file = "server-key.pem"
 # auth_freshness_window_seconds = 300
 # authentication_timeout_ms = 5000
 # max_pending_authentications = 1024

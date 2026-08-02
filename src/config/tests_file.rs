@@ -1069,9 +1069,8 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
             .replace("REPLACE_ME", "0123456789abcdef0123456789abcdef")
             .replace("server.example.com", "mptunnel.test")
             .replace("REPLACE_WITH_SERVER_CERT.pem", TEST_CERTIFICATE_FILE)
-            .replace("server-cert-chain.pem", TEST_CERTIFICATE_FILE)
             .replace("server-cert.pem", TEST_CERTIFICATE_FILE)
-            .replace("server-private-key.pem", TEST_PRIVATE_KEY_FILE);
+            .replace("server-key.pem", TEST_PRIVATE_KEY_FILE);
         load_config_toml_str(&contents).expect("shipped configuration")
     };
 

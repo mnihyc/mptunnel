@@ -786,7 +786,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
     assert!(controller.mark_path_stale(tcp));
     assert_eq!(
         controller
-            .stale_path_recovery_state(&remotes, tcp, Duration::from_secs(60))
+            .path_recovery_state(&remotes, tcp, Duration::from_secs(60))
             .uncovered_ranges,
         vec![OffsetRange {
             start: 4096,
@@ -814,7 +814,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
     assert!(controller.path_is_stale(tcp));
     assert_eq!(
         controller
-            .stale_path_recovery_state(&remotes, tcp, Duration::from_secs(60))
+            .path_recovery_state(&remotes, tcp, Duration::from_secs(60))
             .uncovered_ranges,
         vec![OffsetRange {
             start: 4096,
@@ -858,7 +858,7 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
         .record_reinjection_frame_instance(udp, &frame);
     assert!(controller.mark_path_stale(tcp));
 
-    let recovery = controller.stale_path_recovery_state(&remotes, tcp, Duration::from_secs(1));
+    let recovery = controller.path_recovery_state(&remotes, tcp, Duration::from_secs(1));
     assert!(
         recovery.uncovered_ranges.is_empty(),
         "the current exact-range recovery copy suppresses a duplicate"
@@ -874,7 +874,7 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
         .age_reinjected_flights_for_test(Duration::from_secs(2));
     assert_eq!(
         controller
-            .stale_path_recovery_state(&remotes, tcp, Duration::from_secs(1))
+            .path_recovery_state(&remotes, tcp, Duration::from_secs(1))
             .uncovered_ranges,
         vec![OffsetRange {
             start: 0,
@@ -922,14 +922,42 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
     );
 
     assert_eq!(
-        controller.unreported_missing_owner_instances(&remotes, Duration::ZERO),
+        controller.request_recovery_original_paths(&remotes),
         vec![old_instance]
     );
-    controller.record_missing_owner_reinjection_attempts(&[old_instance], Instant::now());
-    assert!(
+    assert_eq!(
         controller
-            .unreported_missing_owner_instances(&remotes, Duration::from_secs(1))
-            .is_empty()
+            .path_recovery_state(&remotes, old_instance, Duration::from_secs(1))
+            .uncovered_ranges,
+        vec![OffsetRange {
+            start: 0,
+            end: 4096,
+        }],
+        "failure makes the exact unresolved original range immediately recoverable"
+    );
+
+    controller
+        .request
+        .flights
+        .record_reinjection_frame_instance(replacement, &frame);
+    let current_recovery =
+        controller.path_recovery_state(&remotes, old_instance, Duration::from_secs(1));
+    assert!(current_recovery.uncovered_ranges.is_empty());
+    assert!(current_recovery.retry_deadline.is_some());
+
+    controller
+        .request
+        .flights
+        .age_reinjected_flights_for_test(Duration::from_secs(2));
+    assert_eq!(
+        controller
+            .path_recovery_state(&remotes, old_instance, Duration::from_secs(1))
+            .uncovered_ranges,
+        vec![OffsetRange {
+            start: 0,
+            end: 4096,
+        }],
+        "an unresolved failed-owner range becomes eligible after its recovery interval"
     );
 
     controller.release_all(&context);
@@ -981,7 +1009,7 @@ async fn validation_attachment_owns_flight_without_entering_ordinary_scheduling(
     );
     assert!(
         controller
-            .unreported_missing_owner_instances(&remotes, Duration::ZERO)
+            .request_recovery_original_paths(&remotes)
             .is_empty(),
         "validation flight remains owned until its lifecycle settles",
     );
@@ -998,7 +1026,7 @@ async fn validation_attachment_owns_flight_without_entering_ordinary_scheduling(
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert_eq!(
-        controller.unreported_missing_owner_instances(&remotes, Duration::ZERO),
+        controller.request_recovery_original_paths(&remotes),
         vec![candidate],
         "settlement exposes unresolved candidate flight to normal recovery",
     );

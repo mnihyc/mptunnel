@@ -1056,6 +1056,31 @@ async fn tcp_validation_carrier_preserves_exact_c2s_authority_and_ordered_retire
     );
     write_validation_frames(
         &mut retained_carrier,
+        &[
+            Frame::PathCapacityData {
+                path_id: retained_path_id,
+                measurement_id: 1,
+                payload: Bytes::from_static(b"capacity"),
+            },
+            Frame::PathCapacityFinish {
+                path_id: retained_path_id,
+                measurement_id: 1,
+                payload_bytes: 8,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        read_validation_frame(&mut retained_carrier).await,
+        Frame::PathCapacityReceipt {
+            path_id: retained_path_id,
+            measurement_id: 1,
+            received_payload_bytes: 8,
+        },
+        "retained C2S authority admits ordinary request capacity evidence",
+    );
+    write_validation_frames(
+        &mut retained_carrier,
         &[Frame::StreamData {
             stream_id,
             offset: 6,

@@ -20,7 +20,8 @@ use crate::product::Network;
 use crate::protocol::{PeerPathState, TargetAddr, UnderlayProtocol};
 use crate::runtime::path::model::path_snapshot;
 use crate::runtime::path::{
-    AuthenticatedCarrierAvailability, ClientPathContext, ClientPathHealthRecord, ServerPathContext,
+    AuthenticatedCarrierAvailability, ClientPathContext, ClientPathHealth, ClientPathHealthRecord,
+    ServerPathContext,
 };
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusResult};
 use crate::runtime::telemetry::{ActiveProductFlowSnapshot, ProductFlowId, ProductFlowOriginKind};
@@ -497,17 +498,14 @@ fn collect_client(
             .saturating_add(context.udp_paths.len()),
     );
     let health = context.health().lock().expect("client path health lock");
-    paths.extend(client_path_set(
-        &context.tcp_path_names,
-        &context.tcp_paths,
-        &health.tcp,
-        UnderlayProtocol::Tcp,
+    paths.extend(client_tcp_path_set(
+        context,
+        &health,
         service_index,
         service_name.clone(),
         context.session_id.0,
         summary,
         now,
-        Some(context),
     ));
     paths.extend(client_path_set(
         &context.udp_path_names,
@@ -519,9 +517,40 @@ fn collect_client(
         context.session_id.0,
         summary,
         now,
-        None,
     ));
     drop(health);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn client_tcp_path_set(
+    context: &ClientPathContext,
+    health: &ClientPathHealth,
+    service_index: usize,
+    service_name: Option<String>,
+    session_id: u64,
+    summary: &mut NumericSummary,
+    now: Instant,
+) -> Vec<ManagementPathStatus> {
+    health
+        .tcp_records_with_indices()
+        .filter_map(|(index, record)| {
+            let spec = context.tcp_path_spec(index)?;
+            let path = context.tcp_path_name(index)?.to_string();
+            Some(client_path_status(
+                path,
+                spec,
+                record,
+                index,
+                UnderlayProtocol::Tcp,
+                service_index,
+                service_name.clone(),
+                session_id,
+                summary,
+                now,
+                Some(context),
+            ))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -535,81 +564,111 @@ fn client_path_set(
     session_id: u64,
     summary: &mut NumericSummary,
     now: Instant,
-    tcp_context: Option<&ClientPathContext>,
 ) -> Vec<ManagementPathStatus> {
+    assert_eq!(
+        specs.len(),
+        records.len(),
+        "client path specifications and health records must align"
+    );
     specs
         .iter()
+        .zip(records)
         .enumerate()
-        .map(|(index, spec)| {
+        .map(|(index, (spec, record))| {
             let path = names
                 .get(index)
                 .expect("client path names align with underlay-local path inventory")
                 .clone();
-            let observation = records
-                .get(index)
-                .map(|record| record.observation_at(now))
-                .unwrap_or_default();
-            let snapshot = path_snapshot(spec, index, observation);
-            let tcp_endpoint = tcp_context.and_then(|context| context.tcp_endpoint_for_path(index));
-            summary.add_path(snapshot, observation.manual_disabled);
-            ManagementPathStatus {
-                service: "mpp_outbound",
-                service_index,
-                service_name: service_name.clone(),
-                session_id: Some(session_id.to_string()),
+            client_path_status(
                 path,
-                underlay: underlay_name(underlay),
-                tcp_carrier_ordinal: tcp_context
-                    .and_then(|context| context.tcp_member_ordinal(index))
-                    .map(|ordinal| ordinal.saturating_add(1)),
-                tcp_carriers_min: tcp_endpoint.map(|endpoint| endpoint.range.min()),
-                tcp_carriers_max: tcp_endpoint.map(|endpoint| endpoint.range.max()),
-                path_id: Some(snapshot.id.0.to_string()),
-                path_instance_id: records
-                    .get(index)
-                    .and_then(ClientPathHealthRecord::path_instance_id)
-                    .map(|instance| instance.as_u64().to_string()),
-                endpoint: Some(path_endpoint(spec)),
-                state: if observation.manual_disabled {
-                    "disabled"
-                } else {
-                    path_state_name(snapshot.state)
-                },
-                manual_disabled: observation.manual_disabled,
-                usage: snapshot.peer_usage.map(path_usage_name),
-                policy: Some(snapshot.policy),
-                source: Some("local"),
-                direction: Some("client_to_server"),
-                srtt_ms: snapshot.srtt_ms,
-                jitter_ms: snapshot.jitter_ms,
-                delivery_rate_bps: (snapshot.delivery_rate_bps.round() as u64).to_string(),
-                pacing_rate_bps: (snapshot.pacing_rate_bps.round() as u64).to_string(),
-                loss_ppm: fraction_to_ppm(snapshot.loss_rate),
-                ecn_ppm: 0,
-                queue_bytes: snapshot.queue_bytes.to_string(),
-                bytes_in_flight: snapshot.bytes_in_flight.to_string(),
-                data_level_bytes_in_flight: snapshot.data_level_bytes_in_flight.to_string(),
-                inflight_limit_bytes: snapshot.carrier_inflight_limit_bytes.to_string(),
-                confidence_ppm: fraction_to_ppm(snapshot.confidence),
-                app_limited: snapshot.app_limited,
-                active_flows: snapshot.active_flows,
-                active_latency_sensitive_flows: snapshot.active_latency_sensitive_flows,
-                delivery_samples: observation
-                    .delivery_samples
-                    .saturating_add(observation.carrier_delivery_samples),
-                data_sample_bytes: observation
-                    .product_delivery_sample_bytes
-                    .saturating_add(observation.carrier_delivery_sample_bytes)
-                    .to_string(),
-                last_delivery_age_ms: age_ms(
-                    now,
-                    observation
-                        .last_delivery_at
-                        .max(observation.carrier_last_delivery_at),
-                ),
-            }
+                spec,
+                record,
+                index,
+                underlay,
+                service_index,
+                service_name.clone(),
+                session_id,
+                summary,
+                now,
+                None,
+            )
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn client_path_status(
+    path: String,
+    spec: &PathSpec,
+    record: &ClientPathHealthRecord,
+    index: usize,
+    underlay: UnderlayProtocol,
+    service_index: usize,
+    service_name: Option<String>,
+    session_id: u64,
+    summary: &mut NumericSummary,
+    now: Instant,
+    tcp_context: Option<&ClientPathContext>,
+) -> ManagementPathStatus {
+    let observation = record.observation_at(now);
+    let snapshot = path_snapshot(spec, index, observation);
+    let tcp_endpoint = tcp_context.and_then(|context| context.tcp_endpoint_for_path(index));
+    summary.add_path(snapshot, observation.manual_disabled);
+    ManagementPathStatus {
+        service: "mpp_outbound",
+        service_index,
+        service_name,
+        session_id: Some(session_id.to_string()),
+        path,
+        underlay: underlay_name(underlay),
+        tcp_carrier_ordinal: tcp_context
+            .and_then(|context| context.tcp_member_ordinal(index))
+            .map(|ordinal| ordinal.saturating_add(1)),
+        tcp_carriers_min: tcp_endpoint.map(|endpoint| endpoint.range.min()),
+        tcp_carriers_max: tcp_endpoint.map(|endpoint| endpoint.range.max()),
+        path_id: Some(snapshot.id.0.to_string()),
+        path_instance_id: record
+            .path_instance_id()
+            .map(|instance| instance.as_u64().to_string()),
+        endpoint: Some(path_endpoint(spec)),
+        state: if observation.manual_disabled {
+            "disabled"
+        } else {
+            path_state_name(snapshot.state)
+        },
+        manual_disabled: observation.manual_disabled,
+        usage: snapshot.peer_usage.map(path_usage_name),
+        policy: Some(snapshot.policy),
+        source: Some("local"),
+        direction: Some("client_to_server"),
+        srtt_ms: snapshot.srtt_ms,
+        jitter_ms: snapshot.jitter_ms,
+        delivery_rate_bps: (snapshot.delivery_rate_bps.round() as u64).to_string(),
+        pacing_rate_bps: (snapshot.pacing_rate_bps.round() as u64).to_string(),
+        loss_ppm: fraction_to_ppm(snapshot.loss_rate),
+        ecn_ppm: 0,
+        queue_bytes: snapshot.queue_bytes.to_string(),
+        bytes_in_flight: snapshot.bytes_in_flight.to_string(),
+        data_level_bytes_in_flight: snapshot.data_level_bytes_in_flight.to_string(),
+        inflight_limit_bytes: snapshot.carrier_inflight_limit_bytes.to_string(),
+        confidence_ppm: fraction_to_ppm(snapshot.confidence),
+        app_limited: snapshot.app_limited,
+        active_flows: snapshot.active_flows,
+        active_latency_sensitive_flows: snapshot.active_latency_sensitive_flows,
+        delivery_samples: observation
+            .delivery_samples
+            .saturating_add(observation.carrier_delivery_samples),
+        data_sample_bytes: observation
+            .product_delivery_sample_bytes
+            .saturating_add(observation.carrier_delivery_sample_bytes)
+            .to_string(),
+        last_delivery_age_ms: age_ms(
+            now,
+            observation
+                .last_delivery_at
+                .max(observation.carrier_last_delivery_at),
+        ),
+    }
 }
 
 fn collect_server(

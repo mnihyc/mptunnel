@@ -1432,7 +1432,7 @@
       "span",
       "cell-secondary",
       [
-        path.direction ? titleCase(path.direction) : "",
+        path.direction ? directionLabel(path.direction) : "",
         path.source ? titleCase(path.source) : "",
         pathPolicyLabel(path.policy)
       ].filter(Boolean).join(" / ")

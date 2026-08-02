@@ -519,6 +519,7 @@ impl RequestFlightLedger {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn latest_unacked_ranges_for_path_instance(
         &self,
         instance: RelayPathInstance,

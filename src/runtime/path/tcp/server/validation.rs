@@ -363,6 +363,40 @@ impl ServerTcpValidationSession {
             Frame::PathProofData { .. } | Frame::PathProofAck { .. } => {
                 Err(RuntimeError::Protocol("TCP path proof path mismatch"))
             }
+            Frame::PathCapacityData {
+                path_id,
+                measurement_id,
+                payload,
+            } if path_id == self.path_id
+                && matches!(
+                    self.lifecycle,
+                    ServerTcpValidationLifecycle::Retained { .. }
+                ) =>
+            {
+                self.evidence
+                    .handle_request_capacity_data(measurement_id, payload.len())?;
+                Ok(true)
+            }
+            Frame::PathCapacityFinish {
+                path_id,
+                measurement_id,
+                payload_bytes,
+            } if path_id == self.path_id
+                && matches!(
+                    self.lifecycle,
+                    ServerTcpValidationLifecycle::Retained { .. }
+                ) =>
+            {
+                let reply = self.evidence.handle_request_capacity_finish(
+                    self.path_id,
+                    measurement_id,
+                    payload_bytes,
+                )?;
+                self.write_frame(&reply).await
+            }
+            Frame::PathCapacityData { .. } | Frame::PathCapacityFinish { .. } => Err(
+                RuntimeError::Protocol("TCP capacity proof lacks retained C2S authority"),
+            ),
             Frame::Ping { nonce } => self.write_frame(&Frame::Pong { nonce }).await,
             Frame::PeerStatusRequest { request_id } => {
                 let response =
@@ -576,29 +610,42 @@ impl ServerTcpValidationSession {
         stream_id: StreamId,
         frame: Frame,
     ) -> Result<bool, RuntimeError> {
-        let binding = match &self.lifecycle {
+        let validation_binding = match &self.lifecycle {
             ServerTcpValidationLifecycle::ClientToServerActive(active)
                 if active.stream_id == stream_id =>
             {
-                &active.binding
+                Some(&active.binding)
             }
             ServerTcpValidationLifecycle::Retained {
                 validation_attachment: Some(binding),
-            } if binding.stream_id() == stream_id => binding,
+            } if binding.stream_id() == stream_id => None,
             _ => {
                 return Err(RuntimeError::Protocol(
                     "TCP validation stream frame has no directional authority",
                 ));
             }
         };
-        let frame = match binding.try_route_frame(frame) {
+        let frame = match if let Some(binding) = validation_binding {
+            binding.try_route_frame(frame)
+        } else {
+            self.context
+                .reliable_streams
+                .try_route_frame(&self.path_registration, stream_id, frame)
+        } {
             Ok(ServerStreamFrameRoute::Routed) => return Ok(true),
             Ok(ServerStreamFrameRoute::Backpressured(frame)) => frame,
             Err(RuntimeError::ReliablePathRetired) => return Ok(false),
             Err(error) => return Err(error),
         };
-        let route = binding.route_frame(frame);
-        match route.await {
+        let route = if let Some(binding) = validation_binding {
+            binding.route_frame(frame).await
+        } else {
+            self.context
+                .reliable_streams
+                .route_frame(&self.path_registration, stream_id, frame)
+                .await
+        };
+        match route {
             Ok(()) => Ok(true),
             Err(RuntimeError::ReliablePathRetired) => Ok(false),
             Err(error) => Err(error),

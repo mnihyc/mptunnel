@@ -15,8 +15,8 @@ use crate::model::admission::{
     BulkAdmissionCheck, BulkCandidatePosition, BulkPathCandidate,
     bulk_candidate_admission_suppression_with_completion_backlog,
     bulk_candidate_admission_suppression_with_ordering_debt, bulk_candidate_pipe_bytes,
-    bulk_reorder_window_bytes, bulk_scheduling_horizon_bytes, bulk_scheduling_window_bytes,
-    bulk_striping_admitted_candidates,
+    bulk_contiguous_frontier_can_accept_enqueue, bulk_reorder_window_bytes,
+    bulk_scheduling_horizon_bytes, bulk_scheduling_window_bytes, bulk_striping_admitted_candidates,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_inflight_bytes, data_level_service_window_bytes,
@@ -150,8 +150,15 @@ pub(super) fn request_ordinary_saturation_observation(
             let path = observation
                 .path_by_instance(ordinary.instance)
                 .expect("ordinary saturation instance came from this observation");
-            path.can_enqueue_stream_lane
-                || !path_flights.has_original_transmission_flights_for_instance(ordinary.instance)
+            !path_flights.has_original_transmission_flights_for_instance(ordinary.instance)
+                || (path.can_enqueue_stream_lane
+                    && path.shared_snapshot.is_some_and(|snapshot| {
+                        bulk_contiguous_frontier_can_accept_enqueue(
+                            snapshot,
+                            payload_bytes,
+                            observation.mux_limits,
+                        )
+                    }))
         })
     {
         return None;
@@ -1691,9 +1698,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
                 .unwrap_or(0);
             let owns_lower_frontier = lower_flight_owner == Some(key);
-            let position = if owns_lower_frontier
-                || (Some(key) == lead_key && cross_path_ordering_debt == 0)
-            {
+            let position = if owns_lower_frontier {
+                BulkCandidatePosition::ContiguousFrontier
+            } else if Some(key) == lead_key && cross_path_ordering_debt == 0 {
                 BulkCandidatePosition::FirstPath
             } else if lower_flight_owner.is_some() || lead_key.is_some() {
                 BulkCandidatePosition::AdditionalPath
@@ -1702,7 +1709,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             };
             let admission_ordering_debt = cross_path_ordering_debt;
             let (best_snapshot, best_eta_ms) =
-                if owns_lower_frontier && position == BulkCandidatePosition::FirstPath {
+                if position == BulkCandidatePosition::ContiguousFrontier {
                     (snapshot, score.eta_ms)
                 } else {
                     lead_baseline.unwrap_or((snapshot, score.eta_ms))

@@ -41,7 +41,6 @@ use crate::model::capacity::{
     reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::sender_service_retry_delay;
-use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::performance::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
@@ -540,26 +539,10 @@ where
                 ),
             );
         }
-        if request_membership_changed {
-            for failed_instance in sender.unreported_missing_owner_instances(
-                &remotes,
-                transport_pto_from_snapshot(path_snapshot),
-            ) {
-                if sender.enqueue_failed_path_reinjections(
-                    &mut sender_queue,
-                    context,
-                    &remotes,
-                    &send_stream,
-                    failed_instance,
-                ) {
-                    state.progress.sender_retry_at = None;
-                }
-            }
-        }
         let request_range_recovery_due =
             request_range_recovery_deadline.is_some_and(|deadline| deadline <= Instant::now());
         if request_recovery_dirty || request_range_recovery_due {
-            let request_recovery = sender.drive_stale_path_recovery(
+            let request_recovery = sender.drive_request_path_recovery(
                 &mut sender_queue,
                 context,
                 &remotes,
@@ -1059,15 +1042,14 @@ where
                             settled,
                             "C2S recovery must retire its exact validation attachment"
                         );
-                        let queued = sender.enqueue_failed_path_reinjections(
+                        let recovery = sender.drive_request_path_recovery(
                             &mut sender_queue,
                             context,
                             &remotes,
                             &send_stream,
-                            instance,
                         );
                         request_recovery_dirty = true;
-                        if queued {
+                        if recovery.queued {
                             state.progress.sender_retry_at = None;
                         }
                         c2s_tcp_validation = None;
@@ -1985,7 +1967,6 @@ where
                             context,
                             &mut remotes,
                             &mut send_stream,
-                            instance,
                         )
                         .await
                         {

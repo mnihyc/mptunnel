@@ -199,7 +199,4 @@ pub(in crate::runtime) struct RequestStreamState {
     /// Exact paths with outstanding data but no Data ACK progress over the
     /// connection-level persistence interval. Native path recovery continues.
     pub(in crate::runtime) stale_paths: HashSet<RelayPathInstance>,
-    /// Retry state only for an OriginalData owner whose exact attachment no
-    /// longer exists. Live stale attachments use exact-range flight epochs.
-    pub(in crate::runtime) missing_owner_reinjection_attempts: HashMap<RelayPathInstance, Instant>,
 }

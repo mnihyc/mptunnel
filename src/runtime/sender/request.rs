@@ -169,7 +169,7 @@ pub(in crate::runtime) struct RequestProductAckOutcome {
 }
 
 #[derive(Debug, Default)]
-pub(in crate::runtime) struct StaleRequestRecoveryOutcome {
+pub(in crate::runtime) struct RequestPathRecoveryOutcome {
     pub(in crate::runtime) queued: bool,
     pub(in crate::runtime) retry_deadline: Option<Instant>,
 }
@@ -394,15 +394,6 @@ impl RequestSenderService {
     ) -> usize {
         self.multipath
             .discard_resolved_stale_path_reinjections(sender_queue, remotes)
-    }
-
-    pub(in crate::runtime) fn unreported_missing_owner_instances(
-        &mut self,
-        remotes: &ReliableRelayRemoteSet,
-        retry_after: Duration,
-    ) -> Vec<RelayPathInstance> {
-        self.multipath
-            .unreported_missing_owner_instances(remotes, retry_after)
     }
 
     pub(in crate::runtime) fn mark_request_path_stale(
@@ -1222,59 +1213,46 @@ impl RequestSenderService {
         queued
     }
 
-    pub(in crate::runtime) fn enqueue_failed_path_reinjections(
+    pub(in crate::runtime) fn drive_request_path_recovery(
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         send_stream: &ReliableSendStream,
-        failed_instance: RelayPathInstance,
-    ) -> bool {
-        let ranges = self
-            .multipath
-            .latest_unacked_ranges_for_path_instance(failed_instance);
-        self.enqueue_path_data_for_reinjection(
-            sender_queue,
-            context,
-            remotes,
-            send_stream,
-            failed_instance.key,
-            &[failed_instance],
-            ranges,
-            RelaySendCause::PathFailureReinjection,
-        )
-    }
-
-    pub(in crate::runtime) fn drive_stale_path_recovery(
-        &mut self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        send_stream: &ReliableSendStream,
-    ) -> StaleRequestRecoveryOutcome {
-        let mut outcome = StaleRequestRecoveryOutcome::default();
-        for stale_instance in self.multipath.stale_original_paths(remotes) {
+    ) -> RequestPathRecoveryOutcome {
+        let mut outcome = RequestPathRecoveryOutcome::default();
+        for original_instance in self.multipath.request_recovery_original_paths(remotes) {
+            let original_snapshot = if remotes.contains_flight_owner_instance(original_instance) {
+                context.reliable_path_snapshot(original_instance.key)
+            } else {
+                context.reliable_path_snapshot_for_instance(original_instance)
+            };
             let retry_after = reliable_data_retransmission_interval(
-                Some(stale_instance.key.underlay),
-                context.reliable_path_snapshot(stale_instance.key),
+                Some(original_instance.key.underlay),
+                original_snapshot,
             );
             let recovery =
                 self.multipath
-                    .stale_path_recovery_state(remotes, stale_instance, retry_after);
+                    .path_recovery_state(remotes, original_instance, retry_after);
             outcome.retry_deadline = match (outcome.retry_deadline, recovery.retry_deadline) {
                 (Some(current), Some(deadline)) => Some(current.min(deadline)),
                 (None, deadline) => deadline,
                 (current, None) => current,
+            };
+            let cause = if remotes.contains_flight_owner_instance(original_instance) {
+                RelaySendCause::StalePathReinjection(original_instance)
+            } else {
+                RelaySendCause::PathFailureReinjection
             };
             outcome.queued |= self.enqueue_path_data_for_reinjection(
                 sender_queue,
                 context,
                 remotes,
                 send_stream,
-                stale_instance.key,
-                &[stale_instance],
+                original_instance.key,
+                &[original_instance],
                 recovery.uncovered_ranges,
-                RelaySendCause::StalePathReinjection(stale_instance),
+                cause,
             );
         }
         outcome
@@ -1331,10 +1309,6 @@ impl RequestSenderService {
                     queued_frame,
                 ),
             );
-        }
-        if queued && cause == RelaySendCause::PathFailureReinjection {
-            self.multipath
-                .record_missing_owner_reinjection_attempts(failed_instances, Instant::now());
         }
         queued
     }

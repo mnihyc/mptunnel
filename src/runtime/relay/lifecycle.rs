@@ -57,21 +57,14 @@ pub(in crate::runtime) async fn recover_reliable_relay_after_path_failure(
     context: &ClientPathContext,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
-    failed_instance: RelayPathInstance,
 ) -> Result<Option<bool>, RuntimeError> {
     if remotes.is_empty() {
         return Ok(None);
     }
 
     send_stream.update_max_offset(remotes.max_offset());
-    let reinjection_queued = sender.enqueue_failed_path_reinjections(
-        sender_queue,
-        context,
-        remotes,
-        send_stream,
-        failed_instance,
-    );
-    Ok(Some(reinjection_queued))
+    let recovery = sender.drive_request_path_recovery(sender_queue, context, remotes, send_stream);
+    Ok(Some(recovery.queued))
 }
 
 #[allow(clippy::too_many_arguments)]

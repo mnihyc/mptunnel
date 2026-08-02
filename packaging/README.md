@@ -19,18 +19,18 @@ executable when using the Windows packet-device integration.
 
 For a quick proxy-only trial, generate one credential file and a server TLS
 identity. Securely copy `mpp-credential.key` and the public
-`server-certificate.pem` to the client:
+`server-cert.pem` to the client:
 
 ```text
 umask 077
 openssl rand -hex 32 > mpp-credential.key
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -subj "/CN=server.example" \
-  -addext "subjectAltName=DNS:server.example" \
+  -subj "/CN=server.example.com" \
+  -addext "subjectAltName=DNS:server.example.com" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth" \
-  -keyout server-private-key.pem -out server-certificate.pem
+  -keyout server-key.pem -out server-cert.pem
 ```
 
 Start the server:
@@ -38,10 +38,10 @@ Start the server:
 ```text
 ./mptunnel --credential-secret-file ./mpp-credential.key \
   server \
-  --tls-certificate-chain ./server-certificate.pem \
-  --tls-private-key ./server-private-key.pem \
-  --bind-path tcp://0.0.0.0:4433 \
-  --bind-path udp://0.0.0.0:4433 \
+  --tls-certificate-chain ./server-cert.pem \
+  --tls-private-key ./server-key.pem \
+  --bind-path tcp://0.0.0.0:7443 \
+  --bind-path udp://0.0.0.0:7443 \
   --outbound-protocol direct
 ```
 
@@ -50,12 +50,12 @@ Start the client:
 ```text
 ./mptunnel --credential-secret-file ./mpp-credential.key \
   client \
-  --tls-server-name server.example \
-  --tls-pinned-certificate ./server-certificate.pem \
+  --tls-server-name server.example.com \
+  --tls-pinned-certificate ./server-cert.pem \
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
-  --path tcp://server.example:4433 \
-  --path udp://server.example:4433
+  --path tcp://server.example.com:7443 \
+  --path udp://server.example.com:7443
 ```
 
 For a persistent setup, copy `examples/client.toml` or

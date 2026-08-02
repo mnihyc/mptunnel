@@ -4864,3 +4864,222 @@ entry is authoritative.
 - Next: freeze the source candidate, run the existing comparable product and
   multipath lab cohort once, reconcile public numeric evidence, then execute
   the final release-quality matrix.
+
+## 2026-08-02T23:52:04+08:00: v0.1.6 performance and public evidence accepted
+
+- Name: adjacent competitor/multipath cohort and local processing-ceiling
+  diagnosis
+- Category: release performance acceptance and public documentation
+- State: accepted without a Core change; final package and release gates remain
+- Comparable shaped evidence:
+  - one invocation used clean commit `24fa1a2`, one prebuilt optimized binary,
+    two flows for 20 seconds, disabled path hints/diagnostics, and a valid host
+    snapshot with no external container load;
+  - MPP/QUIC completed at `240.475/180.017` Mbps on the 500 Mbps, 180 ms
+    one-way, 20 ms jitter, 1% loss path; Hysteria2 completed download at
+    `96.371` Mbps and retained an incomplete upload lower bound of `115.109`
+    Mbps;
+  - MPP/TCP completed at `123.628/103.307` Mbps on that single path; Xray
+    completed download at `209.203` Mbps, while its upload closed before
+    terminal target acknowledgement and was excluded from comparison; and
+  - on five equal 500 Mbps, 180 ms, zero-loss paths, MPP/TCP completed at
+    `732.433/508.562` Mbps, MPP/QUIC at `629.507/707.077` Mbps, and Linux MPTCP
+    at `302.101/434.432` Mbps.
+- Correctness and timing evidence:
+  - every MPTUNNEL row completed with exact receiver accounting, zero identity
+    residual, and zero reliable recovery gap;
+  - all five configured paths carried traffic, but shaped TCP upload placed
+    `97.7%` on two paths and is not represented as five-way aggregation; and
+  - qdisc evidence showed no unintended drop, overlimit, or retained backlog
+    in the equal-path cases.
+- Unshaped diagnosis:
+  - direct local bridge controls reached `20.452/22.325` Gbps;
+  - MPP/TCP reached `6.704/1.084` Gbps on one path and `4.014/1.665` Gbps on
+    five paths; MPP/QUIC reached `2.622/2.704` and `2.728/2.676` Gbps;
+  - all ten rows completed exactly with all multipath carriers used and no
+    recovery gap; and
+  - download and QUIC-upload rows approached the two-vCPU container cap;
+    TCP upload did not remain CPU-saturated, so its lower local ceiling is not
+    attributed to Docker CPU alone or converted into a production threshold.
+- Public result:
+  - README now puts the adjacent Xray, Hysteria2, MPTCP, and MPTUNNEL numbers
+    first, combines the Product and multipath explanation, and keeps table
+    cells to short labels and numeric values; and
+  - `docs/PERFORMANCE.md` retains the full matched interpretation, exact
+    partial-baseline boundary, unshaped ceiling, scale, continuity, and limits
+    without mixing cohorts into one ranking;
+  - quick-start host, port, certificate, and credential examples now match the
+    shipped TOML profiles, and their schema contract test passes; and
+  - source ownership and native host integration details moved from public
+    docs to persistent ignored `./docs-dev/` references.
+- Next: run the final bounded source/package workflow, freeze the documentation
+  commit, tag and publish `v0.1.6`, verify every immutable asset and
+  `version.json`, then clean generated caches before the requested follow-up.
+
+## 2026-08-03T00:56:34+08:00: default TCP range restored to exact local-ceiling completion
+
+- Name: exact failed-owner request recovery
+- Category: RFC lifecycle correctness and release performance
+- State: implemented and accepted by the focused model suite and clean default
+  `1-3` carrier lab; final release gates remain
+- Root cause:
+  - the request actor admitted one bounded recovery quantum when an exact
+    attachment disappeared, but its continuing range-recovery scan considered
+    only live stale attachments;
+  - a failed validation carrier could therefore leave a disjoint OriginalData
+    tail without the RFC-required repeat deadline; and
+  - the displayed `0.846 Gbps` failure was not the active transfer rate: the
+    client accepted `14,905,638,912` bytes in 20 seconds, then one stream spent
+    120 seconds awaiting completion with `36,362,391` bytes unresolved.
+- Clean correction:
+  - failed and live-stale OriginalData owners now share the existing exact-range
+    flight ledger, MPP recovery interval, queue/flight bounds, and actor wake;
+  - the redundant failed-owner attempt clock and membership-only recovery pass
+    were removed; and
+  - no RFC timer, threshold, scheduler, receive window, carrier range,
+    congestion controller, wire field, or platform branch changed.
+- Evidence:
+  - the source-equivalent fixed `1-1` isolation completed `2/2` exactly at
+    `6.001 Gbps`, proving the request data path already retained its historical
+    local ceiling;
+  - the corrected default `1-3` run delivered `16,140,075,008` bytes exactly,
+    completed `2/2` with zero failures, and reached `6.286 Gbps` over
+    `20.541 s`; and
+  - 56 focused request-sender tests pass, including exact attachment fencing,
+    disjoint-range eligibility, recovery-copy suppression, and repeat expiry.
+- Next: reconcile the public numeric performance evidence, run the bounded
+  source/package gates, publish and verify immutable `v0.1.6`, then clean
+  generated state before the separately requested follow-up.
+
+## 2026-08-03T02:52:30+08:00: contiguous-frontier service restored
+
+- Name: remove the redundant Product inflight controller from the exact
+  contiguous owner
+- Category: RFC conformance and multipath performance
+- State: implemented; focused model gates and adjacent five-path proof pass;
+  elastic and shaped representative gates remain
+- Practical root cause:
+  - the maintained five-TCP-path upload reproduced a mid-transfer fall from
+    `5.43 Gbps` to `0.43 Gbps` while all five carriers remained active, native
+    queues were empty, and native delivery estimates stayed high;
+  - after exact per-flow evidence matured, the scheduler replaced its startup
+    prior with a roughly `0.5-0.72 MiB` Product service window and applied that
+    path-local window to the exact lowest outstanding Data Sequence owner; and
+  - diagnostic decisions showed that owner rejected by `inflight_limit` even
+    with no native bytes in flight. No request-path staleness event occurred.
+- Clean correction:
+  - the admission model now distinguishes a first-ranked candidate from the
+    exact `ContiguousFrontier` owner derived from the flight ledger;
+  - without latency pressure, only that exact owner relies on shared MPP
+    credit, carrier enqueue capacity, and native TCP/QUIC control as required
+    by RFC Sections 10.3 and 15.1;
+  - shared reorder, completion, receive-credit, queue, configured-resource,
+    and latency-pressure bounds remain; every additional or merely ranked path
+    retains its existing Product window; and
+  - no timer, Mbps threshold, carrier range, congestion controller, recovery
+    rule, wire field, or platform branch changed.
+- Evidence:
+  - all `76` admission-model, `23` request-scheduler, and `34`
+    response-scheduler tests pass, including new transport-neutral frontier,
+    shared-reorder, and latency-pressure regressions; and
+  - the adjacent non-instrumented five-path upload completed exact accounting
+    at `5.446 Gbps`, versus `2.334 Gbps` before the correction, with interval
+    goodput remaining `2.684-8.070 Gbps` instead of collapsing below
+    `1 Gbps`; raw evidence is under
+    `./.tmp/lab/results/v016-tcp-multipath-frontier-fix/`.
+- Rejected alternative: ambiguous Data ACK release was not changed because
+  neither the trace nor the RFC permits treating duplicate delivery as exact
+  path-progress attribution.
+- Next: run one default elastic `1-3` proof and the bounded affected shaped
+  matrix, then freeze public evidence and execute release gates.
+
+## 2026-08-03T03:41:26+08:00: native enqueue boundary and final Core gate accepted
+
+- Name: exact-frontier service with adaptive TCP carrier expansion
+- Category: RFC conformance, neutral fallback, and release performance
+- State: accepted; the affected Core performance gate is closed and no further
+  model change is justified for v0.1.6
+- Final model:
+  - the exact lowest outstanding OriginalData owner is not throttled by its
+    overlapping Product Data-ACK flight;
+  - when native credit is available, disjoint carrier queue plus native flight
+    is checked against native congestion credit plus the existing bounded feed
+    quantum, so genuine enqueue saturation remains visible to RFC Section 15.1
+    elastic admission;
+  - when native credit is unavailable, the runtime-derived Product service
+    limit remains authoritative, with the existing derived service window used
+    only when that limit is absent; and
+  - first-ranked and additional paths retain the prior Product, startup, ECF,
+    reorder, latency, receive-credit, and configured-resource bounds. No wire
+    field, timer, Mbps or percentage threshold, congestion controller, carrier
+    range, or platform branch changed.
+- Adaptive range evidence:
+  - with a 100 Mbps per-native-TCP-flow limit, `1-1` delivered
+    `75.239/78.370` Mbps and `1-3` delivered `111.686/121.669` Mbps for
+    download/upload; the ranged endpoint retained two carriers and stopped
+    before three;
+  - with one shared 200 Mbps bottleneck, `1-1` delivered
+    `157.321/156.397` Mbps and `1-3` delivered `154.044/161.143` Mbps, staying
+    at the same aggregate ceiling without opening a third carrier; and
+  - all eight transfers completed exactly with zero failed requests or
+    streams. These measured rates are evidence, never production thresholds.
+- Regression evidence:
+  - unshaped five-path TCP upload completed exactly at `5.408 Gbps`, with zero
+    recovery gap, all five carriers active, and interval service remaining
+    healthy; the adjacent prior proof was `5.446 Gbps`;
+  - equal five-path TCP completed at `783.714/502.900` Mbps and QUIC at
+    `625.688/742.513` Mbps for download/upload, with zero failures and zero
+    reliable recovery gap; and
+  - the material TCP blackhole upload completed at `266.009` Mbps with zero
+    failed streams and a `0.865 s` recovery gap. Equal-path qdiscs recorded no
+    unintended drops or retained backlog.
+- Portability audit: the decision consumes only carrier-neutral snapshot
+  fields. Optional platform telemetry supplies native credit where available;
+  the corrected Product-service path remains the neutral fallback. An
+  independent boundary review found no remaining native/portable authority
+  inconsistency.
+- Evidence: focused admission/request/response tests pass. Raw affected runs
+  are under `./.tmp/lab/results/v016-tcp-carrier-qos-native-boundary/`,
+  `./.tmp/lab/results/v016-tcp-carrier-qos-native-boundary-download/`,
+  `./.tmp/lab/results/v016-native-boundary-unshaped-five-upload/`, and
+  `./.tmp/lab/results/v016-native-boundary-representative/`.
+- Next: run the bounded source, package, and release-quality workflow; freeze
+  the candidate; publish and independently verify immutable v0.1.6 assets.
+
+## 2026-08-03T03:47:20+08:00: v0.1.6 local release-quality gate accepted
+
+- Name: final source, Product, maintained dependency, and Linux package audit
+- Category: release verification
+- State: all local gates pass; the candidate is ready to commit and hand to
+  the authoritative native GitHub target matrix
+- Source gates:
+  - `cargo fmt --all -- --check` and warnings-denied all-target/all-feature
+    Clippy pass;
+  - the complete all-feature suite passes `1529` library tests, `2`
+    allocation regressions, and `6` daily-use Product acceptance tests;
+  - the maintained `quinn-proto` 0.11.16 suite passes `282` tests and `3`
+    doctests; and
+  - the deterministic benchmark crate passes `5` model/replay tests.
+- Product and release contracts:
+  - the performance registry validates `29` cells and `66` metrics;
+  - all `207` lab tests and all `9` release-archive tests pass;
+  - all `7` shell programs parse, dashboard JavaScript parses, and the version
+    gate self-test passes;
+  - shipped configuration documents parse against the strict current schema;
+    project-owned test files follow `tests_[file].rs`; and
+  - a separate static audit found no stale public version, prose-description
+    table, internal development vocabulary, root artifact, schema drift,
+    authorship mismatch, or release-inventory mismatch.
+- Linux package evidence:
+  - the documented local musl path built
+    `mptunnel-0.1.6-linux-amd64.tar.gz` with a static PIE amd64 binary reporting
+    `mptunnel 0.1.6`;
+  - archive verification passed with exactly the binary, `README.md`, client
+    and server TOML, and systemd service under one versioned directory; and
+  - no project license copy, third-party notice, checksum sidecar, Rust
+    metadata, or extra release file is present.
+- Immutability preflight: neither remote tag nor GitHub release `v0.1.6`
+  exists; the release version gate accepts `v0.1.6` above frozen `v0.1.5`.
+- Next: commit the exact candidate, remove the local release reminder without
+  committing it, tag once, push the commit and tag, and verify GitHub's native
+  seven-platform build plus `version.json` before cleaning generated state.

@@ -443,7 +443,9 @@ async fn run_client_tcp_path_session_inner(
                             Warn,
                             "tcp",
                             "peer_status_failed",
-                            "TCP peer status request failed: {err}"
+                            "TCP peer status request failed: path_index={} path_instance_id={} error={err}",
+                            runtime.path_index,
+                            connection.path_instance_id.as_u64(),
                         );
                         drop_connection = true;
                     }
@@ -489,7 +491,9 @@ async fn run_client_tcp_path_session_inner(
                                 Warn,
                                 "tcp",
                                 "session_frame_failed",
-                                "TCP path session frame handling failed: {err}"
+                                "TCP path session frame handling failed: path_index={} path_instance_id={} error={err}",
+                                runtime.path_index,
+                                connection.path_instance_id.as_u64(),
                             );
                             drop_connection = true;
                         } else if command_may_recv && !draining
@@ -515,7 +519,9 @@ async fn run_client_tcp_path_session_inner(
                                     Warn,
                                     "tcp",
                                     "session_command_failed",
-                                    "TCP path session command failed: {err}"
+                                    "TCP path session command failed: path_index={} path_instance_id={} error={err}",
+                                    runtime.path_index,
+                                    connection.path_instance_id.as_u64(),
                                 );
                                 drop_connection = true;
                             }
@@ -528,7 +534,9 @@ async fn run_client_tcp_path_session_inner(
                             Warn,
                             "tcp",
                             "session_read_failed",
-                            "TCP path session read failed: {err}"
+                            "TCP path session read failed: path_index={} path_instance_id={} error={err}",
+                            runtime.path_index,
+                            connection.path_instance_id.as_u64(),
                         );
                         drop_connection = true;
                     }
@@ -585,7 +593,9 @@ async fn run_client_tcp_path_session_inner(
                                 Warn,
                                 "tcp",
                                 "session_command_failed",
-                                "TCP path session command failed: {err}"
+                                "TCP path session command failed: path_index={} path_instance_id={} error={err}",
+                                runtime.path_index,
+                                connection.path_instance_id.as_u64(),
                             );
                             drop_connection = true;
                         }
@@ -609,7 +619,9 @@ async fn run_client_tcp_path_session_inner(
                         Warn,
                         "tcp",
                         "heartbeat_failed",
-                        "TCP path heartbeat failed: {err}"
+                        "TCP path heartbeat failed: path_index={} path_instance_id={} error={err}",
+                        runtime.path_index,
+                        connection.path_instance_id.as_u64(),
                     );
                     drop_connection = true;
                 }

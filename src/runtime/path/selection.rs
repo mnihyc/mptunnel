@@ -10,7 +10,7 @@ use crate::model::admission::{
     BulkPathCandidate, bulk_scheduling_horizon_bytes, bulk_striping_admitted_candidates,
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
-use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
+use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 use crate::model::tcp_carrier::TcpCarrierPolicyEpochs;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
@@ -721,6 +721,24 @@ impl ClientPathContext {
             UnderlayProtocol::Tcp => self.tcp_path_snapshot(key.index),
             UnderlayProtocol::Udp => self.udp_path_snapshot(key.index),
         }
+    }
+
+    pub(in crate::runtime) fn reliable_path_snapshot_for_instance(
+        &self,
+        instance: RelayPathInstance,
+    ) -> Option<PathSnapshot> {
+        let path = match instance.key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_path_spec(instance.key.index),
+            UnderlayProtocol::Udp => self.udp_paths.get(instance.key.index),
+        }?;
+        let observation = self
+            .state
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .path_record(instance.key)?
+            .observation_for_instance_at(instance.path_instance_id, Instant::now())?;
+        Some(path_snapshot(path, instance.key.index, observation))
     }
 
     pub(in crate::runtime) fn tcp_native_drain_observed(&self, index: usize) -> bool {

@@ -126,6 +126,29 @@ fn response_ordinary_saturation_requires_the_exact_rfc_boundary() {
         "an enqueue-capable ordinary carrier is not saturated",
     );
 
+    let mut native_saturated = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        20.0,
+        payload_bytes as u64,
+        16 * 1024 * 1024,
+        true,
+    );
+    native_saturated.observation.snapshot.bytes_in_flight = 16 * 1024 * 1024;
+    native_saturated.observation.snapshot.queue_bytes = payload_bytes as u64;
+    assert!(
+        response_ordinary_saturation_observation(
+            &saturation_observation(vec![native_saturated, backup.clone()]),
+            StreamId(40),
+            TrafficClass::Throughput,
+            payload_bytes,
+            MuxLimits::default(),
+            payload_bytes,
+        )
+        .is_some(),
+        "native queue and flight saturation is ordinary enqueue saturation",
+    );
+
     let mut latency_active = available;
     latency_active
         .observation
@@ -427,7 +450,7 @@ fn sole_survivor_cannot_extend_a_nonlive_cross_path_frontier_without_bound() {
 }
 
 #[test]
-fn clear_frontier_owner_obeys_product_service_window_with_two_live_paths() {
+fn clear_frontier_owner_remains_native_work_conserving_with_two_live_paths() {
     let mux_limits = MuxLimits::default();
     let product_flight = 2 * 1024 * 1024_u64;
     let mut owner = response_target(
@@ -439,8 +462,14 @@ fn clear_frontier_owner_obeys_product_service_window_with_two_live_paths() {
         true,
     );
     owner.observation.snapshot.data_level_limit_bytes = 1024 * 1024;
+    owner.observation.snapshot.bytes_in_flight = 0;
     let mut alternate = response_target(1, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, false);
     block_data_queue(&mut alternate);
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: product_flight,
+    }];
 
     assert_eq!(
         select_response_data_path(
@@ -448,29 +477,12 @@ fn clear_frontier_owner_obeys_product_service_window_with_two_live_paths() {
             TrafficClass::Throughput,
             64 * 1024,
             mux_limits,
-            &[],
+            &lower,
             product_flight as usize,
         )
         .map(|selected| selected.observation.key),
-        None,
-        "a clear frontier cannot assign more ordered bytes before product ACKs reopen its measured service window",
-    );
-
-    owner.observation.original_data_in_flight_bytes = 1024 * 1024 - 64 * 1024;
-    owner.observation.snapshot.data_level_bytes_in_flight =
-        owner.observation.original_data_in_flight_bytes;
-    assert_eq!(
-        select_response_data_path(
-            &[owner.clone(), alternate],
-            TrafficClass::Throughput,
-            64 * 1024,
-            mux_limits,
-            &[],
-            owner.observation.original_data_in_flight_bytes as usize,
-        )
-        .map(|selected| selected.observation.key),
         Some(owner.observation.key),
-        "product ACK headroom reopens one service quantum",
+        "the exact frontier owner is governed by shared credit and its native carrier",
     );
 }
 

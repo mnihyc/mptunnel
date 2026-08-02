@@ -26,26 +26,21 @@ diagnostics.
 
 Most proxies place a logical connection on one transport. MPTUNNEL maintains
 one Multipath Proxy Protocol (MPP) sequence across independent TCP and QUIC
-carriers, so one connection can use several links and survive losing one.
+carriers. Native transports keep their congestion control and loss recovery;
+MPP adds live path selection, exact Data ACKs, and bounded reinjection across
+them. One flow can therefore aggregate links and remain attached when a
+carrier disappears.
 
-- Healthy paths can serve one flow concurrently instead of only balancing
-  separate connections.
-- Exact Data ACKs and bounded reinjection preserve traffic across carrier loss.
-- Live delivery evidence selects paths; an IP address is not treated as link
-  quality or peer identity.
-- TCP and QUIC retain native congestion control, pacing, retransmission,
-  migration, and loss recovery.
-- One TCP endpoint defaults to a demand-driven `1-3` carrier range. Extra TCP
-  sessions are kept only when completed delivery proves useful added service.
+| System | Proxy | TUN | Route | DNS | TCP | QUIC | Multipath | Failover |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **MPTUNNEL** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Hysteria2 | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — |
+| Xray/V2Ray | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
+| MPTCP | — | — | — | — | ✓ | — | ✓ | ✓ |
 
-### Product and multipath model
-
-| System | Proxy/VPN | One-flow aggregation | TCP | QUIC | Cross-carrier recovery |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **MPTUNNEL** | Yes | Yes | Yes | Yes | Yes |
-| **Hysteria 2** | Yes | No | No | Yes | No |
-| **Xray/V2Ray** | Yes | No | Yes | Yes | No |
-| **MPTCP** | No | Yes | Yes | No | Yes |
+Live delivery—not a source IP—ranks eligible carriers. A TCP endpoint defaults
+to a demand-driven `1-3` carrier range; added sessions stay only when completed
+delivery proves useful service.
 
 Reference behavior is taken from the
 [Hysteria client modes and TUN documentation](https://v2.hysteria.network/docs/advanced/Full-Client-Config/),
@@ -57,82 +52,97 @@ Reference behavior is taken from the
 
 ## Performance
 
-Values are retained delivered-goodput observations on the same Linux/Docker
-host, not configured rates or an Internet-speed guarantee. Compare only rows
-within the same explicitly described run.
+All rates below are receiver-delivered goodput from the same Linux/Docker
+host. Product comparisons used two flows for 20 seconds.
 
-### Single-path baseline
+### One 500 Mbps path
 
-Each system used one 500 Mbps path with 180 ms one-way delay, 20 ms jitter,
-and 1% configured loss. The object, two-flow workload, and run duration were
-the same.
+180 ms one-way delay, 20 ms jitter, 1% loss.
 
-| System | Carrier | Download (Mbps) | Upload (Mbps) |
-| --- | --- | ---: | ---: |
-| Direct | TCP | 231.521 | ≥240.939 |
-| Xray 26.3.27 | VMess/TCP | 219.529 | ≥240.849 |
-| MPTUNNEL | MPP/TCP | 151.722 | ≥162.267 |
-| Hysteria2 2.10.0 | QUIC | 114.506 | ≥117.541 |
-| **MPTUNNEL** | **MPP/QUIC** | **212.704** | **≥207.649** |
+| System | Transport | Download (Mbps) | Upload (Mbps) | Directions |
+| --- | --- | ---: | ---: | ---: |
+| Direct | TCP | 198.820 | 220.405 | 2/2 |
+| Xray 26.3.27 | VMess/TCP | 209.203 | — | 1/2 |
+| **MPTUNNEL** | MPP/TCP | 123.628 | 103.307 | 2/2 |
+| Hysteria2 2.10.0 | QUIC | 96.371 | ≥115.109 | 1/2 |
+| **MPTUNNEL** | MPP/QUIC | **240.475** | **180.017** | 2/2 |
 
-MPP/QUIC delivered 85.8% more download goodput than the matched Hysteria2 row.
-The upload lower bounds were ≥207.649 and ≥117.541 Mbps respectively; they do
-not establish a final upload ratio. Xray was faster than MPP/TCP on this single
-path; MPTUNNEL does not claim otherwise. Its performance purpose is aggregation
-and continuity across independent carriers.
+MPP/QUIC delivered 2.50× Hysteria2's download goodput. MPP/TCP did not beat
+Xray on this lossy single path: direct and Xray gave each flow its own native
+TCP connection, while MPP/TCP initially shared one carrier. Its bounded range
+expands only when added delivery proves useful. Incomplete uploads are excluded
+from ratios.
 
-### Multipath aggregation
+### Five 500 Mbps paths
 
-The measurement used five equal 500 Mbps paths with 180 ms one-way delay,
-20 ms jitter, and no configured loss.
+180 ms one-way delay, 20 ms jitter, 0% loss per path.
 
-| System | Carrier | Download (Mbps) | Upload (Mbps) |
-| --- | --- | ---: | ---: |
-| **MPTUNNEL** | **MPP/TCP × 5** | **834.364** | **649.766** |
-| **MPTUNNEL** | **MPP/QUIC × 5** | **648.493** | **≥738.113** |
+| System | Transport | Paths | Download (Mbps) | Upload (Mbps) | Directions |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Linux MPTCP | TCP | 5 | 302.101 | 434.432 | 2/2 |
+| **MPTUNNEL** | MPP/TCP | 5 | **732.433** | **508.562** | 2/2 |
+| **MPTUNNEL** | MPP/QUIC | 5 | **629.507** | **707.077** | 2/2 |
 
-An earlier matched MPP-v5/MPTCP run measured:
+MPP/TCP delivered 2.42× MPTCP download goodput and 1.17× its upload goodput.
 
-| System | Carrier | Download (Mbps) | Upload (Mbps) |
-| --- | --- | ---: | ---: |
-| MPTUNNEL | MPP/TCP × 5 | 875.187 | 617.392 |
-| Linux MPTCP | TCP × 5 | 168.085 | 450.738 |
+### 20 links
 
-The current MPTUNNEL and earlier MPTCP results are not compared across runs.
+Ten TCP and ten QUIC links with varied bandwidth, latency, jitter, and loss.
 
-### Operating envelope
-
-Twenty-carrier runs used 10 TCP and 10 QUIC paths over five independently
-seeded bandwidth, latency, jitter, and loss epochs.
-
-| Mbps/path | Download (Mbps) | Upload (Mbps) | Complete |
+| Rate/link (Mbps) | Download (Mbps) | Upload (Mbps) | Directions |
 | ---: | ---: | ---: | ---: |
 | 30–100 | 344.534 | 210.378 | 2/2 |
 | 300–1,000 | 1,178.811 | 609.004 | 2/2 |
 | 3,000–10,000 | 2,261.932 | 670.693 | 2/2 |
 
-Complementary 200/20 and 20/200 Mbps links placed 91.5% of download traffic on
-the faster direction. Blackhole and latency transitions kept every reliable
-flow alive, delivered 296/300 datagrams, and bounded the maximum bulk gap to
-0.717–1.293 seconds. Five QUIC port hops passed 2/2 at
-2,459.750/2,498.275 Mbps. A five-second total carrier outage passed 1/1, and
-client/server restart recovery passed 2/2.
+Complementary 200/20 and 20/200 Mbps links placed 91.5% of download traffic and
+86.6% of upload traffic on the faster direction.
 
-| Pattern | Concurrent | KiB | Window (s) | Complete | Reject/incomplete | Max (s) |
+### Continuity
+
+| Condition | Download (Mbps) | Upload (Mbps) | TCP echo | HTTP | Datagrams | DL gap (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 3 s batches | 10 | 32 | 30 | 90/90 | 0/0 | 1.263 |
-| Closed loop | 20 | 1,024 | 60 | 570/570 | 0/0 | — |
+| QUIC port hop | 2,459.750 | 2,498.275 | — | — | — | 30 |
+| TCP+QUIC blackhole | 257.755 | — | 40/40 | — | 151/153 | 777 |
+| TCP+QUIC latency | 199.210 | — | 40/40 | — | 145/147 | 1,293 |
+| TCP+QUIC handover | 224.069 | — | 32/32 | 47/47 | 134/134 | 717 |
 
-The baseline tables compare only matched product runs. The larger scale and
-browser rows show completion under load and are not blended into cross-product
-speed claims. Measurements also cover datagrams, TUN, mixed load,
-bandwidth/latency/loss combinations, shared bottlenecks, adaptive TCP carriers,
-migration, failure, and recovery.
+A five-second total carrier outage passed 1/1. Client/server restart recovery
+passed 2/2.
+
+| Concurrency | Object (KiB) | Duration (s) | Requests | Rejected | Failed | Deadline (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 32 | 30 | 90/90 | 0 | 0 | 3,000 |
+| 20 | 1,024 | 60 | 570/570 | 0 | 0 | — |
+
+Every batched request met its three-second deadline. The 60-second run kept 20
+requests active and replaced each completed request immediately.
+
+### Local host ceiling
+
+No rate, delay, jitter, or loss was configured.
+
+| System | Transport | Endpoints | Download (Gbps) | Upload (Gbps) | Directions |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Direct | TCP | 1 | 15.153 | 23.364 | 2/2 |
+| Xray 26.3.27 | VMess/TCP | 1 | 8.261 | ≥7.251 | 1/2 |
+| **MPTUNNEL** | MPP/TCP | 1 | 6.844 | 6.673 | 2/2 |
+| **MPTUNNEL** | MPP/TCP | 5 | 5.453 | 5.999 | 2/2 |
+
+All proxy rows reached their host processing ceiling. MPP/TCP peaked near two
+CPU cores while performing encryption, framing, sequencing, scheduling, Data
+ACKs, flow control, and relay work. Extra unshaped endpoints add ordering work
+but no network capacity; independently shaped paths provide the aggregation
+gain above. The remaining local gap is implementation processing cost, not an
+MPP bandwidth threshold, congestion controller, or recovery timer.
+
+The product tables are matched comparisons. Scale, continuity, and load results
+show capability and are not direct product rankings.
 
 Production contains no fixed Mbps target or fixed percentage threshold.
 
-See [Performance evidence](docs/PERFORMANCE.md) for exact conditions,
-limitations, and interpretation.
+See [Performance evidence](docs/PERFORMANCE.md) for the full results and
+limits.
 
 ## How it works
 
@@ -166,12 +176,12 @@ and a separate TLS identity:
 umask 077
 openssl rand -hex 32 > mpp-credential.key
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -subj "/CN=server.example" \
-  -addext "subjectAltName=DNS:server.example" \
+  -subj "/CN=server.example.com" \
+  -addext "subjectAltName=DNS:server.example.com" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth" \
-  -keyout server-private-key.pem -out server-certificate.pem
+  -keyout server-key.pem -out server-cert.pem
 ```
 
 Start the server:
@@ -179,10 +189,10 @@ Start the server:
 ```bash
 mptunnel --credential-secret-file ./mpp-credential.key \
   server \
-  --tls-certificate-chain ./server-certificate.pem \
-  --tls-private-key ./server-private-key.pem \
-  --bind-path tcp://0.0.0.0:4433 \
-  --bind-path udp://0.0.0.0:4433 \
+  --tls-certificate-chain ./server-cert.pem \
+  --tls-private-key ./server-key.pem \
+  --bind-path tcp://0.0.0.0:7443 \
+  --bind-path udp://0.0.0.0:7443 \
   --outbound-protocol direct
 ```
 
@@ -191,12 +201,12 @@ Start the client:
 ```bash
 mptunnel --credential-secret-file ./mpp-credential.key \
   client \
-  --tls-server-name server.example \
-  --tls-pinned-certificate ./server-certificate.pem \
+  --tls-server-name server.example.com \
+  --tls-pinned-certificate ./server-cert.pem \
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
-  --path tcp://server.example:4433 \
-  --path udp://server.example:4433
+  --path tcp://server.example.com:7443 \
+  --path udp://server.example.com:7443
 ```
 
 For persistent operation, copy `examples/client.toml` or
@@ -240,12 +250,12 @@ See [the reference configuration](examples/config.reference.toml) and
 
 ## Platform support
 
-| Platform | Proxy | TUN | Integration |
+| Platform | Proxy | TUN | Backend |
 | --- | ---: | ---: | --- |
-| Linux amd64/arm64 | Yes | Managed | Native |
-| Windows amd64/arm64 | Yes | Managed | Wintun |
-| macOS amd64/arm64 | Yes | Host | Network Extension |
-| Android arm64 | Yes | Host | `VpnService` |
+| Linux amd64/arm64 | ✓ | ✓ | Native |
+| Windows amd64/arm64 | ✓ | ✓ | Wintun |
+| macOS amd64/arm64 | ✓ | ✓ | NE |
+| Android arm64 | ✓ | ✓ | `VpnService` |
 
 Linux is the primary performance platform. Windows builds and tests natively
 in GitHub Actions. macOS product VPN requires a signed Network Extension host;

@@ -478,7 +478,7 @@ transmission modes and not desired memory occupancy.
 | Field | Default |
 | --- | ---: |
 | `max_frame_bytes` | 1 MiB |
-| `max_payload_bytes` | frame − header |
+| `max_payload_bytes` | 1,048,512 B |
 | `max_ack_ranges` | 256 |
 | `max_paths` | 64 |
 | `max_streams` | 65,536 |
@@ -492,9 +492,12 @@ transmission modes and not desired memory occupancy.
 | `max_datagram_queue_bytes` | 16 MiB |
 | `max_path_flight_bytes` | 64 MiB |
 | `max_reliable_relay_chunk_bytes` | 512 KiB |
-| TCP heartbeat | 10 s / 30 s |
-| QUIC keep-alive / idle | 10 s / 30 s |
-| Outbound connect | 10 s |
+| `tcp_path_heartbeat_interval_ms` | 10,000 ms |
+| `tcp_path_heartbeat_timeout_ms` | 30,000 ms |
+| `quic_path_keep_alive_interval_ms` | 10,000 ms |
+| `quic_path_idle_timeout_ms` | 30,000 ms |
+
+Each proxy outbound has its own `connect_timeout_ms`; the default is 10,000 ms.
 
 `[admission]` is the independent Product envelope used before DNS, target
 connects, or other flow-opening I/O. Defaults are finite:

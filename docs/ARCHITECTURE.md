@@ -1,13 +1,11 @@
-# Architecture and ownership
+# Architecture
 
-This document maps the current source tree and design choices to the MPP
-protocol model. `RFC.md` is the wire and behavioral specification.
+This document explains how the Product layer, MPP Core, and native transports
+fit together. `RFC.md` is the wire and behavioral specification.
 
 Product routing, DNS, ingress, outbound, and operations stay above the MPP
 Core. Protocol sequencing, delivery, recovery, scheduling, and carrier
-lifecycle stay below that boundary. Internal owners remain modules in one
-application package; `crates/` contains only the pinned Quinn source mirror
-required by Cargo's path override.
+lifecycle stay below that boundary.
 
 ## Layer model
 
@@ -79,90 +77,6 @@ peer preference.
 is not a property or role of a link. A stream may move from latency-oriented to
 throughput-oriented work and back as its live demand changes without reopening
 the stream or relabeling a path.
-
-## Source owners
-
-A module exists when it owns a durable state machine, algorithm, protocol
-boundary, or adapter. File size alone does not earn a module.
-
-- `src/protocol/`: bounded MPP v5 codec, wire values, authentication, and
-  range semantics. It owns no sockets or scheduling policy.
-- `src/model/`: carrier-neutral identities, evidence, capacity, admission, ACK
-  clock, connection-flight, and work models. Pure TCP proof candidate
-  validation lives here; TCP runtime owns the measurement transaction.
-- `src/scheduler/`: pure eligibility and completion-time ranking over immutable
-  path snapshots. `src/simulator/` may reuse these formulas but owns only
-  simulator-private queues.
-- `src/transport/`: encryption, framing, endpoint resolution, TCP adapters,
-  the HTTP/3 presentation, its pre-parser candidate gate, the RFC 9297 adapter
-  over Quinn/QUIC, and optional native telemetry. Product credential authority
-  supplies the gate verifier; transport owns the opaque selector and parser
-  boundary. Neither owns MPP offsets or path placement.
-- `src/runtime/path/`: configured paths, health and metric publication, path
-  instances, command queues, proofs, selection, and typed ports.
-- `src/runtime/path/tcp/`: one client-local carrier group per configured TCP
-  endpoint, one session coordinator for its bounded members and elastic
-  reservations, and one actor per exact physical carrier. Each actor owns path
-  control, streams, datagrams, its reader/writer, heartbeats, optional socket
-  evidence, and TCP-specific capacity transactions.
-- `src/runtime/path/quic/`: Quinn connection and stream actors, datagrams,
-  native measurements, and native congestion-window publication.
-- `src/runtime/stream/`: MPP stream handles, connection-level receive
-  feedback, client request state and attachments, server registry, response
-  bindings, exact attachment lifetimes, and delivery.
-- `src/runtime/stream/request/`: request `attachment`, `state`, and `flight`
-  owners behind the narrow `request.rs` facade. MPP receive-window authority
-  remains in the shared mux stream model.
-- `src/runtime/sender/request/`: request queueing, scheduling, capacity intents,
-  multipath commit, and carrier dispatch.
-- `src/runtime/sender/response/`: response `service`, `scheduling`,
-  `multipath`, and `dispatch` phases. The service owns queued work; scheduling
-  is pure; multipath owns lifecycle planning; dispatch revalidates and enqueues.
-- `src/runtime/stream/response/`: response `ack_clock`, `attachment`,
-  `data_commit`, `delivery`, `diagnostics`, `evidence`, `session`,
-  and `snapshot` state. These are the response-state owners.
-- `src/runtime/relay/`: ingress/target I/O, carrier open/attach transactions,
-  failure recovery, and coordination with senders. The stream layer owns the
-  resulting membership set; sender does not import relay state or policy.
-- `src/runtime/datagram/`: MPP datagram associations, feedback, target
-  workers, shared SOCKS/TUN edge workers, and carrier-neutral selection.
-- `src/runtime/telemetry.rs`: exact logical product-byte, packet, and flow
-  accounting at ingress/target relay boundaries. It never counts carrier
-  retransmission, reinjection, or multipath copies.
-- `src/runtime/peer_status.rs`: bounded correlation for authenticated
-  peer-status requests. TCP and QUIC actors retain their own writer and metric
-  ownership; the broker owns neither carrier I/O nor scheduling evidence.
-- `src/runtime/management/`: cached typed snapshots, bounded HTTP transport,
-  explicit action controls, and embedded-dashboard delivery. Its one-second
-  sampler is the only reader of runtime observability owners on behalf of HTTP
-  requests. Balancer status reads detached Product snapshots, not carrier
-  metrics.
-- `src/product/dns.rs`: strict named DNS upstreams and plans,
-  exact/longest-suffix/default selection, encryption and recursion checks, and
-  bounded per-generation policy facts, including reserved-range FakeDNS pool
-  validation. It owns no sockets or caches.
-- `src/dns.rs`: the single DNS runtime owner. Each immutable generation owns
-  per-plan cache/coalescing limits, one total lookup deadline, and protected
-  literal-bootstrap UDP/TCP/DoT/DoH/DoQ connections. It also owns bounded
-  FakeDNS leases; a synthetic address is never reassigned to another domain in
-  the generation, and TUN recovers the domain once before routing. Named
-  stream DNS egress is injected by the outbound registry and never falls back
-  to direct; DoQ remains a direct/source-bound QUIC leaf and never enters the
-  MPP path scheduler.
-- `src/product/gateway.rs`: pure new-flow balancer selection, stickiness,
-  Product-owned health hysteresis/circuit state, drain/manual policy, and
-  counters. It cannot import scheduler, carrier, runtime, DNS, or platform
-  state.
-- `src/runtime/gateway.rs` and `src/runtime/outbound_registry.rs`: balancer
-  generation ownership, bounded active probes, passive open/flow outcomes,
-  total-deadline pre-commit retries, and leaf opening. A committed flow remains
-  bound to its selected leaf and is never replayed because a later outcome is
-  unhealthy.
-- `src/ingress/` and `src/outbound/`: local protocol parsing and remote target
-  connection policy respectively. Neither chooses MPP data paths.
-- `src/runtime/node/`: constructs client, server, or combined nodes and injects
-  typed ports between owners. The accepting listener carries its exact local
-  path policy and startup hints into server carrier registration.
 
 ## Reliable-stream data flow
 

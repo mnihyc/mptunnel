@@ -8,7 +8,7 @@
 level = "info"
 
 [[credentials]]
-credential_id = "home-2026"
+credential_id = "home-client"
 principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
 
@@ -51,7 +51,7 @@ paths = [
 ]
 
 [outbounds.security]
-credential_id = "home-2026"
+credential_id = "home-client"
 tls_server_name = "server.example.com"
 tls_pinned_certificate_file = "server-cert.pem"
 

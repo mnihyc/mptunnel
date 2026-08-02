@@ -3,10 +3,11 @@
 This document maps the current source tree and design choices to the MPP
 protocol model. `RFC.md` is the wire and behavioral specification.
 
-The clean Product/Core ownership boundary and remaining work are specified in
-`./docs/PRODUCT_PLAN.md` and `./docs/PERFORMANCE_PLAN.md`. Internal owners
-remain modules in one application package; `crates/` contains only the pinned
-Quinn source mirror required by Cargo's path override.
+Product routing, DNS, ingress, outbound, and operations stay above the MPP
+Core. Protocol sequencing, delivery, recovery, scheduling, and carrier
+lifecycle stay below that boundary. Internal owners remain modules in one
+application package; `crates/` contains only the pinned Quinn source mirror
+required by Cargo's path override.
 
 ## Layer model
 
@@ -51,7 +52,7 @@ resolved carrier IP addresses rather than freezing one selected port before
 host routes are published. This local locator selection does not change MPP
 path or carrier-instance identity.
 
-## Protocol-v4 model
+## MPP v5 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
 or attaching a stream does not assign a persistent primary, validation, or
@@ -84,7 +85,7 @@ the stream or relabeling a path.
 A module exists when it owns a durable state machine, algorithm, protocol
 boundary, or adapter. File size alone does not earn a module.
 
-- `src/protocol/`: bounded protocol-v4 codec, wire values, authentication, and
+- `src/protocol/`: bounded MPP v5 codec, wire values, authentication, and
   range semantics. It owns no sockets or scheduling policy.
 - `src/model/`: carrier-neutral identities, evidence, capacity, admission, ACK
   clock, connection-flight, and work models. Pure TCP proof candidate
@@ -99,9 +100,11 @@ boundary, or adapter. File size alone does not earn a module.
   boundary. Neither owns MPP offsets or path placement.
 - `src/runtime/path/`: configured paths, health and metric publication, path
   instances, command queues, proofs, selection, and typed ports.
-- `src/runtime/path/tcp/`: one shared actor per configured TCP path, including
-  path control, streams, datagrams, the single reader/writer, heartbeats,
-  optional socket evidence, and TCP-specific capacity transactions.
+- `src/runtime/path/tcp/`: one client-local carrier group per configured TCP
+  endpoint, one session coordinator for its bounded members and elastic
+  reservations, and one actor per exact physical carrier. Each actor owns path
+  control, streams, datagrams, its reader/writer, heartbeats, optional socket
+  evidence, and TCP-specific capacity transactions.
 - `src/runtime/path/quic/`: Quinn connection and stream actors, datagrams,
   native measurements, and native congestion-window publication.
 - `src/runtime/stream/`: MPP stream handles, connection-level receive
@@ -281,12 +284,16 @@ fence, not a duplicated ledger field. Replacing a carrier invalidates physical
 evidence, while detach and reattach invalidates that stream's ownership even if
 the carrier itself stayed live.
 
-One configured TCP path owns at most one live carrier actor and physical
-instance. That actor multiplexes path control, reliable-stream attachments, and
-datagram-flow attachments through one encrypted reader/writer and one
-`PATH_STATUS` sequence. `TrafficClass` changes priority and demand only.
-Product close or detach removes only its route or attachment; the actor alone
-owns path and session close.
+One configured TCP endpoint owns a bounded carrier group. Its durable minimum
+members and occupied elastic reservations never exceed the configured range;
+the Product default is `1-3`. Each exact physical carrier has its own actor,
+encrypted reader/writer, `PathId`, instance identity, attachments, queues,
+flight, evidence, and `PATH_STATUS` sequence. The session group owner alone
+reconciles missing minimum members. Capacity above the minimum has no ordinary
+Product authority until the bounded directional validation in RFC Section 7.2
+ends with an acknowledged `RETAIN`. `TrafficClass` changes priority and demand
+only. Product close or detach removes only its flow or attachment and cannot
+create, retain, replace, or close a carrier.
 
 Datagram failover keeps timing ownership below the carrier-neutral association.
 TCP and QUIC each derive a modeled pre-feedback response timeout from their own
@@ -452,4 +459,4 @@ runtime. Runtime changes require focused tests plus matched end-to-end labs:
 
 Diagnostics establish causality. Instrumentation-free matched rows establish
 performance. Historical rows from incompatible wire versions are references
-only and cannot prove protocol-v4 behavior.
+only and cannot prove MPP v5 behavior.

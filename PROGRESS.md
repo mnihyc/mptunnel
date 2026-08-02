@@ -2,14 +2,54 @@
 
 This is the authoritative execution and milestone ledger for the repository.
 Entries record verified work, evidence, open blockers, and the next bounded
-action. `docs/PRODUCT_PLAN.md` defines Product scope and acceptance;
-`docs/PERFORMANCE_PLAN.md` defines Core performance methodology and acceptance.
-Neither plan is a progress log, and status text in either plan does not
-supersede this file.
+action. Local development plans may live in the ignored `./docs-dev/`
+directory, but they are not progress logs and never supersede this file, the
+public product contract, or `RFC.md`.
 
 Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
+
+## 2026-08-02T11:13:34+08:00: v0.1.4 Product and release surface closed
+
+- Name: bounded v0.1.4 Product/documentation closure
+- Category: Product acceptance, public documentation, dependency and release
+  metadata
+- State: accepted for the final local and native-CI gates; no Product, Core,
+  protocol, scheduler, congestion, timing, carrier, or platform policy changed
+- Product evidence:
+  - `cargo test --locked --test product_daily_use_acceptance -- --nocapture`
+    passes all six packaged scenarios, covering local TCP/UDP forwarding,
+    SOCKS5 and MPP egress, ordered routing, DNS/ACL policy, balancers, runtime
+    validation/apply/persistence, offline new-flow rejection, process restart,
+    default `config.toml` loading, and structured log output/rotation;
+  - the dashboard retains a management token in same-origin local storage only
+    after successful authentication and forgets it explicitly or after server
+    rejection; and
+  - the public configuration vocabulary uses canonical resource `name` values
+    and noun-matched references (`inbounds`, `outbound`, `balancer`, and
+    `dns_plan`); `_id` remains reserved for protocol, principal, and signed
+    identities.
+- Repository and documentation closure:
+  - `Cargo.toml` and both maintained lockfiles identify version `0.1.4`;
+  - public README, architecture, lab, performance, operations, and code-layout
+    documents now describe MPP v5, current Product/Core ownership, bounded TCP
+    carrier groups, honest matched performance evidence, logging, dashboard
+    authentication, supported platforms, and the conventional release shape;
+  - internal version-development plans were removed from the public `docs/`
+    tree and retained locally under ignored `./docs-dev/`; `PROGRESS.md` remains
+    the sole progress ledger; and
+  - no tracked `third_party`, generated license report, `about.toml`, raw
+    distribution directory, or temporary test-data directory exists.
+- Dependency evidence: the maintained Quinn source remains pinned to newest
+  stable `quinn-proto` 0.11.16 and `quinn` 0.11.11. Its documented eight-file
+  production delta and upstream-refresh procedure remain intact; no dependency
+  or congestion-controller change is justified for this release.
+- Next bounded action: run the complete local source/package gate, commit the
+  exact candidate, require the unchanged native GitHub CI and non-publishing
+  Release Check matrices to pass, tag that commit as `v0.1.4`, verify the eight
+  published assets from scratch, and remove only generated scratch/build
+  caches.
 
 ## 2026-08-02T10:55:11+08:00: non-cumulative condition-handover lab restored
 
@@ -48,11 +88,35 @@ entry is authoritative.
     seconds; and
   - both traces completed with zero command failures and the same selected
     schedule digest `272b801d6b21742674caa7b4bf63b445852e553317e37c3f134020518d1d841a`.
+- Clean release-condition confirmation:
+  - clean commit `046977b` with the default condition set delivered `224.069`
+    Mbit/s, bounded its maximum bulk gap to 0.717 seconds, kept the existing
+    echo flow alive for 32/32 requests, completed 47/47 small transfers, and
+    delivered 134/134 datagrams;
+  - the complete seeded trace and one-second management/container telemetry
+    are retained, and no product source or release binary changed between the
+    preceding accepted Core gate and this run; and
+  - the host-validity gate remained false solely because one unrelated Docker
+    container was running, so this is local release engineering evidence and
+    is not presented as an independently reproducible public benchmark.
+- Adjacent QUIC regression check:
+  - the retained historical `952c61a4...` binary and current
+    `bc7bdac4...` binary were run back-to-back on the identical five-path,
+    500-Mbit/s, 180-ms one-way-delay, zero-loss profile;
+  - they delivered `671.356` and `648.493` Mbit/s with maximum ordered gaps of
+    0.350 and 0.314 seconds respectively, placing the current binary 3.4%
+    below that adjacent historical observation while improving its gap; and
+  - the historical binary itself did not reproduce its earlier isolated
+    `776.116` Mbit/s row. No QUIC, congestion, pacing, scheduler, recovery, or
+    parameter change is justified by the apparent peak-to-current difference.
 - Verification: focused flapping/runner contract tests pass (29 tests), Bash
   syntax, ShellCheck apart from its pre-existing dynamic-source information,
   formatting, and whitespace checks pass.
 - Evidence: `./.tmp/lab/results/v014-reverted-final-disruption-matrix` and
-  `./.tmp/lab/results/v014-flapping-epoch-fix-causal`.
+  `./.tmp/lab/results/v014-flapping-epoch-fix-causal`, and
+  `./.tmp/lab/results/v014-final-condition-handover`,
+  `./.tmp/lab/results/v014-quic-historical-current-host`, and
+  `./.tmp/lab/results/v014-quic-current-current-host`.
 
 ## 2026-08-02T10:41:00+08:00: request recovery timing change rejected by disruption A/B
 

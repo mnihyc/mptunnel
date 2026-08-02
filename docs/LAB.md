@@ -325,7 +325,7 @@ reinjection.
 
 ## Path and scheduling evidence
 
-Protocol-v4 diagnostics should be interpreted at the RFC boundary:
+MPP v5 diagnostics should be interpreted at the RFC boundary:
 
 - stream open proves neutral attachment, not path rank;
 - `PATH_STATUS` sequence and `Available`/`Backup` value prove peer preference,
@@ -399,14 +399,10 @@ different protocol or old result.
 
 ## Current release evidence
 
-The compact, release-candidate v0.1.2 evidence is recorded in
-[`docs/PERFORMANCE.md`](PERFORMANCE.md). It identifies the exact Core-frozen
-no-feature candidate and build inputs, records targeted TCP/QUIC five-path
-guards, and discloses the dirty-tree host-validity failure. Product-only edits
-after that cohort change the complete binary identity, so the eventual tagged
-binary still requires its own guard. The same document preserves the v0.1.1
-and v0.1.0 cohorts as historical references without rebinding their competitor
-or failover results to protocol v4.
+The compact MPP v5 release evidence is recorded in
+[`docs/PERFORMANCE.md`](PERFORMANCE.md). It separates adjacent competitor,
+aggregation, TCP carrier-validation, migration, and disruption cohorts and
+states the exact limitations of each.
 
 Generated `.tmp/lab/results/` directories are local evidence, not repository
 content. They are removed after their durable method, identities, exact rows,
@@ -420,9 +416,9 @@ correct the model before accepting the downgrade.
 
 An isolated throughput change around five percent is ordinary run-to-run noise
 unless repeated adjacent pairs and causal evidence establish otherwise. It is
-not a pass margin, regression cap, or universal gate. Apply the paired evidence
-method in `docs/PERFORMANCE_PLAN.md`; do not convert one convenient percentage
-into laboratory or production policy.
+not a pass margin, regression cap, or universal gate. Apply the matching rules
+above; do not convert one convenient percentage into laboratory or production
+policy.
 
 ## Iteration rule
 

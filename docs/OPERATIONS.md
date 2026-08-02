@@ -707,113 +707,20 @@ Local proxy inbounds separately bound total connections, connections per
 source IP, connections per principal, and their authentication/header deadline
 under `[inbounds.admission]`; these limits never derive from Core capacity.
 
-## Packaging
+## Installed files
 
-The fixed local-Linux and GitHub-native build sequence is documented in
-[`docs/CI.md`](CI.md). Linux development and runtime testing are local;
-Android, native macOS, and native Windows release builds are authoritative only
-on the GitHub matrix.
+Download the archive for the operating system and architecture listed in the
+root [README](../README.md#install), verify it against `SHA256SUMS`, and keep
+its example configurations beside the operator's own protected configuration.
 
-```bash
-packaging/package-release.sh --target x86_64-unknown-linux-musl
-pwsh packaging/package-release.ps1 -Target x86_64-pc-windows-msvc
-```
+The Linux archive includes a systemd unit that runs as `mptunnel` and permits
+writes below `/etc/mptunnel`. Create that directory, install `config.toml` as
+the service account, and keep referenced credentials and private keys readable
+only by that account. Directory write access is required when the management
+API persists a replacement configuration.
 
-The strict release contract maps build triples to user-facing names:
-
-| Rust build target | Public asset |
-| --- | --- |
-| `x86_64-unknown-linux-musl` | `mptunnel-linux-amd64.tar.gz` |
-| `aarch64-unknown-linux-musl` | `mptunnel-linux-arm64.tar.gz` |
-| `x86_64-pc-windows-msvc` | `mptunnel-windows-amd64.zip` |
-| `aarch64-pc-windows-msvc` | `mptunnel-windows-arm64.zip` |
-| `x86_64-apple-darwin` | `mptunnel-macos-amd64.zip` |
-| `aarch64-apple-darwin` | `mptunnel-macos-arm64.zip` |
-| `aarch64-linux-android` | `mptunnel-android-arm64.tar.gz` |
-
-Asset and extracted-directory names deliberately omit the version. This keeps
-latest-release URLs stable while the GitHub release and `mptunnel --version`
-remain authoritative for identity.
-
-Every archive contains exactly one product binary, a concise package README,
-`LICENSE`, and client/server TOML examples. Linux archives also contain a
-systemd service unit. Windows archives contain the pinned,
-architecture-matched Wintun DLL and its upstream license. macOS intentionally
-ships no privileged service definition. The Android archive contains the
-command-line core; it is not an APK, AAR, JNI bridge, or `VpnService`
-application.
-
-Linux release archives use musl targets and do not depend on a host glibc
-baseline. Packaging normalizes archive order, timestamps, ownership, modes, and
-metadata; rebuilding an unchanged staging tree yields identical archive bytes.
-Release CI inspects each exact file manifest, binary architecture, and dynamic
-dependency closure. macOS dependencies must stay under operating-system
-dylib/framework roots, Android `NEEDED` entries must match the explicit
-NDK/system allowlist, Windows imports must be operating-system/API-set DLLs
-with no dynamic MSVC/UCRT, and musl builds must be static. Wintun remains a
-bundled, checksum-pinned DLL that is loaded at runtime rather than a PE import.
-
-The packaged systemd unit runs as `mptunnel` and permits writes only below
-`/etc/mptunnel`. Create that directory and install `config.toml` as the
-`mptunnel:mptunnel` account before enabling the unit. Directory write access is
-required for the management API's atomic persistent-config replacement;
-referenced credential and TLS private-key files should remain mode `0600`.
-
-## Releases
-
-Stable tags must exactly match the `Cargo.toml` version. A new publication
-must also be newer than every published stable release; rerunning an existing
-published tag is an integrity-only path even after newer releases exist. A tag
-runs format, clippy, Rust and lab-contract tests, seven linked native/NDK
-target builds, deterministic packaging, provenance attestation, GitHub Release
-publication, and a fresh-download asset check. `Release Check` validates a
-proposed tag without publishing.
-
-Exactly eight files are public: the seven normalized archives and one sorted
-`SHA256SUMS` manifest. Per-target build uploads are private one-day GitHub
-Actions staging artifacts. Version/build evidence is a separate private
-Actions artifact, and GitHub attestations remain provenance records; neither
-is passed to `gh release create`. The publish job rejects missing, additional,
-raw CI, sidecar, or provenance files before publication. It preflights an
-existing tag and creates an absent draft, resumes only a byte-exact matching
-draft, or verifies an exact already-published release without changing it.
-Mismatches fail closed. Only a draft created by the current run is eligible for
-failure/cancellation cleanup; a public release is never edited or deleted.
-
-Release archives do not include the benchmark crate, Docker lab scripts,
-generated results, lab-only diagnostics, RFC/development documents, or raw CI
-evidence. The production binary is built as `--bin mptunnel` without the
-`lab-diagnostics` feature.
-
-### Remaining installer gaps
-
-- Linux ships a systemd unit, but not a distribution package, user/group
-  creation script, automatic upgrade, or uninstall/rollback command.
-- macOS ships a foreground CLI without a root-by-default service definition,
-  signed/notarized application, package installer, privileged helper, or
-  complete native packet-tunnel adapter.
-- Windows ships Wintun beside the executable, but not an MSI/MSIX installer,
-  code signature, Start-menu integration, native SCM wrapper, or validated
-  route/DNS service lifecycle.
-- Android ships only the clearly labelled arm64 host/core command-line
-  artifact. An APK/AAB, AAR/JNI API, sample `VpnService`, consent UI, and
-  lifecycle integration remain absent.
-
-## Verification policy
-
-Normal format, clippy, unit, integration, and target checks run on hosts without
-modifying networking. TUN, route, DNS, netem, blackhole, and privileged service
-experiments belong in Docker or a dedicated native test machine.
-
-Wine inside the shaped Docker client namespace can validate the Windows GNU
-executable's portable TCP and basic-UDP QUIC proxy behavior, throughput,
-aggregation, and failover.
-Keep that cohort labeled Linux/Wine: it does not validate Wintun, native
-Windows kernel scheduling, `SIO_TCP_INFO`, the optimized native QUIC UDP
-adapter, or native-host/real-Internet performance. Wine outside the shaped
-namespace remains suitable only for userspace startup, CLI, and configuration
-validation; neither form substitutes for the native Windows gates.
-
-Performance acceptance follows [`docs/LAB.md`](LAB.md). The compact current
-release evidence is [`docs/PERFORMANCE.md`](PERFORMANCE.md); generated historical
-result directories are not current proof and are not repository content.
+The Windows archive keeps its architecture-matched `wintun.dll` beside the
+executable. macOS and Android archives are command-line artifacts and require
+the host integrations described in [Platform lifecycle](PLATFORM.md) for a
+full device VPN. Contributors can find the fixed build and release procedure
+in [Build and CI](CI.md).

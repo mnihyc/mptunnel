@@ -3,9 +3,10 @@
 This is the maintained source-organization contract. `RFC.md` defines protocol
 behavior and `docs/ARCHITECTURE.md` maps current owners.
 
-The Product/Core ownership boundary and execution plan are in
-`docs/PRODUCT_PLAN.md` and `docs/PERFORMANCE_PLAN.md`. Internal owners remain
-modules in one application package; directory count is not an architecture.
+Product policy and operation remain above the MPP Core; protocol sequencing,
+delivery, recovery, scheduling, and carrier lifecycle remain below it.
+Internal owners are modules in one application package; directory count is not
+an architecture.
 
 ## Dependency direction
 
@@ -48,8 +49,11 @@ imports.
 - `PEER_STATUS_REQUEST` and `PEER_STATUS_RESPONSE` are bounded presentation
   frames on authenticated carrier control channels. Remote status must never
   enter local scheduling, health, capacity, or failover state.
-- One configured reliable TCP path has one live carrier actor. Priority classes
-  share that actor; extra physical carriers require distinct protocol identity.
+- One configured TCP endpoint has one bounded carrier group. Every live member
+  has a distinct actor, `PathId`, physical-instance fence, queue, flight, and
+  transport state. Configured-minimum members are reconciled by the session
+  owner; an elastic member receives directional ordinary-use authority only
+  through the RFC's acknowledged Product-validation transaction.
 - TCP and QUIC retain independent congestion, pacing, and recovery state.
 - Each reliable-stream direction owns independent DSN, Data ACK, and
   `STREAM_MAX_DATA` state. `STREAM_ACK` releases MPP ranges but grants no

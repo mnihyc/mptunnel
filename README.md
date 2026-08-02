@@ -8,10 +8,10 @@ layers.
 The shared Multipath Proxy Protocol (MPP) data layer provides directional data
 sequence numbers, Data ACKs, flow control, measured path selection,
 cross-path reinjection, and failover. The current source wire format is MPP v5
-and is not compatible with protocol v1 through v4. The stable v0.1.2 release
-uses MPP v4; measurements below identify that release protocol explicitly.
+and is not compatible with protocol v1 through v4. Release v0.1.4 uses this
+wire format without a legacy decoder or downgrade mode.
 
-> **Release status:** v0.1.2 is the current stable release. The protocol is
+> **Release status:** v0.1.4 is the current stable release. The protocol is
 > custom and has not received an independent security audit. Review the
 > [security and platform limitations](#security-and-limitations) before
 > exposing a deployment.
@@ -34,33 +34,34 @@ uses MPP v4; measurements below identify that release protocol explicitly.
   data-level reinjection.
 - Inspect paths, sessions, flows, and forwarded traffic through a local
   management API and embedded dashboard.
+- Send structured `off`/`error`/`warn`/`info` logs to the console, an
+  append-only file, or both, with destination-bearing flow events opt-in.
 
 ## Measured performance
 
-The Core-frozen v0.1.2 no-feature GNU/Linux candidate was guarded on five
-equal 500 Mbps, 180 ms one-way-delay paths with no configured loss. Each row
-used two concurrent flows for 30 seconds. Product-only edits followed this
-cohort, so these are not measurements of the eventual tagged executable.
+The v0.1.4 MPP v5 Core was measured with release-profile GNU/Linux binaries in
+an isolated Docker topology. On five equal 500 Mbps paths with 180 ms one-way
+delay and no configured loss, two 30-second flows delivered 834.364 Mbps over
+TCP and 648.493 Mbps over QUIC; receiver-confirmed upload measurements reached
+649.766 and 738.113 Mbps respectively. A matched rerun placed the retained
+historical and current QUIC binaries at 671.356 and 648.493 Mbps, so the current
+result did not reproduce a suspected regression.
 
-| Reliable carrier | Direction | Goodput | Result | Material path use |
-| --- | --- | ---: | --- | --- |
-| MPP over TCP | download | 799.384 Mbps | complete | five |
-| MPP over QUIC | download | 712.382 Mbps | complete | five |
-| MPP over QUIC | upload | 747.305 Mbps | receiver-confirmed lower bound; 1.027% drain tail | five |
-| MPP over TCP | upload | 559.969 Mbps | receiver-confirmed lower bound; 0.515% drain tail | two sustained owners |
+In the adjacent single-path 500 Mbps, 180 ms, 1% loss cohort, MPP/TCP measured
+151.722/162.267 Mbps download/upload versus Xray VMess at
+219.529/240.849 Mbps; MPP/QUIC measured 212.704/207.649 Mbps versus Hysteria2
+at 114.506/117.541 Mbps. MPTUNNEL therefore does not claim a universal
+single-path win: its advantage is the ability to aggregate and recover across
+independent TCP and QUIC carriers while retaining one Product flow.
 
-Ten-second-drain diagnostic reruns confirmed every locally accepted upload
-byte: 3,017,867,264 bytes over QUIC and 2,230,910,976 bytes over TCP. The
-extended drain is lifecycle evidence, not an acceptance setting. These
-dirty-tree, single-run Core guards establish scoped protocol correctness and
-aggregation behavior; they are not tagged-binary acceptance, matched
-competitive proof, or an Internet-speed guarantee. The historical v0.1.1
-comparison and failover cohorts remain documented separately and are not
-rebound to protocol v4.
-
-An isolated movement around five percent is ordinary measurement fluctuation,
-not a hard pass/fail threshold. Performance acceptance uses repeated paired
-evidence and has no universal percentage cap.
+The release disruption gate kept port-hopping QUIC above 2.4 Gbps on the local
+unconstrained topology, preserved reliable traffic through balanced-path
+blackholes and severe latency changes, and kept a persistent mixed-workload
+echo flow alive for 32/32 requests through seeded link-condition handovers.
+These are controlled local observations, not an Internet-speed guarantee or
+an SLA. The host-validity rule also rejected publication-grade comparison
+because one unrelated container was running. An isolated movement around five
+percent is treated as ordinary measurement variation, not a hard cap.
 
 See [Performance evidence](docs/PERFORMANCE.md) for methodology, representative
 measurements, failover results, and limitations.
@@ -68,7 +69,7 @@ measurements, failover results, and limitations.
 ## Install
 
 The current packaging workflow produces the obvious OS/architecture archives
-below plus one `SHA256SUMS` manifest. v0.1.2 uses these stable names; the
+below plus one `SHA256SUMS` manifest. v0.1.4 uses these stable names; the
 historical [v0.1.1 release](../../releases/tag/v0.1.1) keeps its immutable,
 versioned Rust-target filenames.
 
@@ -245,6 +246,9 @@ traffic rates and history, sanitized inbound/outbound inventory, sessions, and
 active flows with their origin and selected egress.
 Runtime data, health, and controls are authenticated under `/api/v2/`; only
 the static dashboard assets are public.
+After the first successful authentication, the dashboard keeps the token in
+same-origin browser local storage until **Forget token** is selected or the
+server rejects it, so routine refreshes do not prompt again.
 
 ![mptunnel management dashboard](docs/assets/dashboard.png)
 
@@ -352,9 +356,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 The Docker lab changes networking only inside its namespaces. See
 [Build and CI procedure](docs/CI.md), [Lab methodology](docs/LAB.md),
 [Developer benchmarks](docs/BENCHMARKS.md),
-[Code structure](docs/CODE_STRUCTURE.md),
-[Product plan](docs/PRODUCT_PLAN.md),
-[Performance/Core plan](docs/PERFORMANCE_PLAN.md), and
+[Code structure](docs/CODE_STRUCTURE.md), and
 [Release operations](docs/OPERATIONS.md). Contributions follow
 [CONTRIBUTING.md](CONTRIBUTING.md); report vulnerabilities through
 [SECURITY.md](SECURITY.md).

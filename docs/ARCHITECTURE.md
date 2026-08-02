@@ -120,8 +120,7 @@ boundary, or adapter. File size alone does not earn a module.
   is pure; multipath owns lifecycle planning; dispatch revalidates and enqueues.
 - `src/runtime/stream/response/`: response `ack_clock`, `attachment`,
   `data_commit`, `delivery`, `diagnostics`, `evidence`, `session`,
-  and `snapshot` state. These are the only current response
-  owners; deleted legacy wrapper modules are not part of the current tree.
+  and `snapshot` state. These are the response-state owners.
 - `src/runtime/relay/`: ingress/target I/O, carrier open/attach transactions,
   failure recovery, and coordination with senders. The stream layer owns the
   resulting membership set; sender does not import relay state or policy.

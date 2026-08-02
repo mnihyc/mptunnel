@@ -67,7 +67,8 @@ struct PeerStatusBrokerState {
 #[derive(Debug, Default)]
 struct PeerStatusSession {
     carriers: BTreeMap<u64, mpsc::Sender<u64>>,
-    last_selected_registration: Option<u64>,
+    preferred_registration: Option<u64>,
+    last_attempted_registration: Option<u64>,
     last_incoming_response_at: Option<Instant>,
     pending: Option<PendingPeerStatusRequest>,
     latest: Option<PeerStatusResult>,
@@ -222,15 +223,19 @@ impl PeerStatusBroker {
             });
             request_id
         };
-        let _guard = PendingRequestGuard {
+        let mut guard = PendingRequestGuard {
             broker: Arc::downgrade(&self.inner),
             session_id,
             request_id,
+            timed_out: false,
         };
         match tokio::time::timeout(self.inner.request_timeout, response_rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(PeerStatusRequestError::SessionUnavailable),
-            Err(_) => Err(PeerStatusRequestError::TimedOut),
+            Err(_) => {
+                guard.timed_out = true;
+                Err(PeerStatusRequestError::TimedOut)
+            }
         }
     }
 
@@ -254,6 +259,7 @@ impl PeerStatusBroker {
         else {
             return false;
         };
+        session.preferred_registration = Some(pending.registration_id);
         let result = PeerStatusResult {
             session_id,
             request_id,
@@ -285,6 +291,12 @@ impl PeerStatusBroker {
         let mut state = self.inner.state.lock().expect("peer status broker lock");
         let remove_session = if let Some(session) = state.sessions.get_mut(&session_id) {
             session.carriers.remove(&registration_id);
+            if session.preferred_registration == Some(registration_id) {
+                session.preferred_registration = None;
+            }
+            if session.last_attempted_registration == Some(registration_id) {
+                session.last_attempted_registration = None;
+            }
             if session
                 .pending
                 .as_ref()
@@ -370,6 +382,7 @@ struct PendingRequestGuard {
     broker: Weak<PeerStatusBrokerInner>,
     session_id: SessionId,
     request_id: u64,
+    timed_out: bool,
 }
 
 impl Drop for PendingRequestGuard {
@@ -384,6 +397,15 @@ impl Drop for PendingRequestGuard {
                 .as_ref()
                 .is_some_and(|pending| pending.request_id == self.request_id)
         {
+            if self.timed_out
+                && session.preferred_registration
+                    == session
+                        .pending
+                        .as_ref()
+                        .map(|pending| pending.registration_id)
+            {
+                session.preferred_registration = None;
+            }
             session.pending = None;
         }
     }
@@ -391,7 +413,16 @@ impl Drop for PendingRequestGuard {
 
 fn try_send_request(session: &mut PeerStatusSession, request_id: u64) -> Option<u64> {
     let registration_ids = session.carriers.keys().copied().collect::<Vec<_>>();
-    let start = session.last_selected_registration.map_or(0, |last| {
+    if let Some(preferred) = session.preferred_registration
+        && session
+            .carriers
+            .get(&preferred)
+            .is_some_and(|carrier| carrier.try_send(request_id).is_ok())
+    {
+        session.last_attempted_registration = Some(preferred);
+        return Some(preferred);
+    }
+    let start = session.last_attempted_registration.map_or(0, |last| {
         registration_ids.partition_point(|registration_id| *registration_id <= last)
     });
     for registration_id in registration_ids[start..]
@@ -399,11 +430,14 @@ fn try_send_request(session: &mut PeerStatusSession, request_id: u64) -> Option<
         .chain(registration_ids[..start].iter())
         .copied()
     {
+        if session.preferred_registration == Some(registration_id) {
+            continue;
+        }
         let Some(carrier) = session.carriers.get(&registration_id) else {
             continue;
         };
         if carrier.try_send(request_id).is_ok() {
-            session.last_selected_registration = Some(registration_id);
+            session.last_attempted_registration = Some(registration_id);
             return Some(registration_id);
         }
     }

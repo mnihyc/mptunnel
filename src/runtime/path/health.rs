@@ -333,6 +333,10 @@ impl ClientPathHealthRecord {
         self.wire_path_id
     }
 
+    pub(in crate::runtime) fn path_instance_id(&self) -> Option<CarrierPathInstanceId> {
+        self.path_instance_id
+    }
+
     pub(in crate::runtime) fn owns_path_instance(
         &self,
         path_instance_id: CarrierPathInstanceId,

@@ -40,7 +40,7 @@ Catch-all Android hosts must call `runtime::run_with_vpn_host_providers` with:
   `VpnService.protect` for the borrowed descriptor it receives.
 
 The same protector is applied exactly once to every carrier and
-MPTunnel-created native target/proxy/DNS TCP/UDP socket, after source binding
+MPTUNNEL-created native target/proxy/DNS TCP/UDP socket, after source binding
 and before connect or first send. Returning an error drops the socket and fails
 the egress attempt closed. Operating-system DNS policies are rejected before
 device or socket startup: OS resolver sockets are hidden from this callback and
@@ -296,8 +296,8 @@ During authenticated setup the peer advertises sequence-zero directional
 `PathUsage::{Available, Backup}`. This is separate from local path health.
 Ordinary scheduling considers available paths first and uses backup paths only
 when no eligible available choice exists. Metrics rank paths within the chosen
-set. The receiver accepts only strictly newer later sequences, but this release
-has no runtime control that originates a post-handshake preference change.
+set. The receiver accepts only strictly newer later sequences. Runtime control
+does not originate a post-handshake preference change.
 
 Management path controls change endpoint-local policy or lifecycle. They do not
 rewrite peer usage, forge transport evidence, or assign a fixed data path to a
@@ -450,9 +450,11 @@ codec-oversized complete snapshot returns `unavailable`; it is never truncated.
 The dashboard auto-refresh control applies one completion-driven cadence to
 both local status and the currently selected peer diagnostic request: 1 s,
 5 s, 30 s, or manual only. It never overlaps cycles. Peer requests occur only
-when the local endpoint advertises a connected diagnostic control session and
-the remote endpoint permits diagnosis; either client or server may be the
-requesting side. Manual mode sends no periodic local or peer request.
+when the local endpoint advertises a connected diagnostic control session;
+the returned `ok`, `disabled`, or `unavailable` code exposes the remote
+endpoint's decision. Either client or server may be the requesting side. The
+Overview and Diagnostics pages show whether this local endpoint will answer
+peer requests. Manual mode sends no periodic local or peer request.
 
 Path control uses `enabled`, `suspect`, `failed`, or `disabled`. Enabling clears
 the operator disable but leaves a path suspect until fresh carrier liveness

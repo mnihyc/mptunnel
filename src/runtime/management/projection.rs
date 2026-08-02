@@ -565,7 +565,10 @@ fn client_path_set(
                 tcp_carriers_min: tcp_endpoint.map(|endpoint| endpoint.range.min()),
                 tcp_carriers_max: tcp_endpoint.map(|endpoint| endpoint.range.max()),
                 path_id: Some(snapshot.id.0.to_string()),
-                path_instance_id: None,
+                path_instance_id: records
+                    .get(index)
+                    .and_then(ClientPathHealthRecord::path_instance_id)
+                    .map(|instance| instance.as_u64().to_string()),
                 endpoint: Some(path_endpoint(spec)),
                 state: if observation.manual_disabled {
                     "disabled"

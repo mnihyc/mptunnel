@@ -54,7 +54,7 @@ All public low-level runtime entry points reject process-managed TUN mode:
 built-in Linux/Windows management is owned by the application generation
 lifecycle, while Android/macOS hosts publish their own OS policy.
 
-Windows now has native primitives for:
+Windows has native primitives for:
 
 - explicit signed `wintun.dll` lookup, generation-GUID identity validation,
   adapter/session creation, MTU/address configuration, and async device handoff;
@@ -71,7 +71,7 @@ The Windows package must keep the signed architecture-matched `wintun.dll`
 beside `mptunnel.exe`, and the process needs rights to create the adapter and
 change routes/DNS.
 
-macOS now has a privileged-process slice for:
+macOS has a privileged-process slice for:
 
 - utun allocation, MTU/address configuration, and async device handoff without
   implicit routes;

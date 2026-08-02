@@ -635,6 +635,41 @@ impl ClientTcpPathSessionHandle {
         }
     }
 
+    /// Terminates only the currently published failed physical instance.
+    /// Stale failure reports cannot affect a replacement occupying this
+    /// configured-minimum member later.
+    pub(in crate::runtime) fn terminate_failed_instance(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        if self
+            .ready_carrier_instance
+            .compare_exchange(
+                path_instance_id.as_u64(),
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.ready_remote_port.store(0, Ordering::Release);
+        let mut member = self.member.lock().expect("TCP minimum member lock");
+        clear_terminal_tcp_predecessor(&mut member);
+        let Some(current) = member
+            .current
+            .as_ref()
+            .filter(|session| !session.terminal.load(Ordering::Acquire))
+        else {
+            return false;
+        };
+        current.commands.terminate_failed_path();
+        drop(member);
+        self.runtime.carrier_groups.publish_change();
+        true
+    }
+
     pub(in crate::runtime) fn can_plan_replacement(&self) -> bool {
         let mut member = self.member.lock().expect("TCP minimum member lock");
         clear_terminal_tcp_predecessor(&mut member);

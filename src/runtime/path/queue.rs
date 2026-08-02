@@ -369,6 +369,10 @@ impl ReliablePathCarrierLifecycle {
         }
     }
 
+    fn is_terminal(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_TERMINAL
+    }
+
     fn finish(&self) {
         if self
             .phase
@@ -400,6 +404,10 @@ pub(in crate::runtime) struct ReliablePathDrainSignal {
 impl ReliablePathDrainSignal {
     pub(in crate::runtime) async fn wait(&self) {
         self.metrics.lifecycle.wait_for_drain().await;
+    }
+
+    pub(in crate::runtime) fn is_terminal(&self) -> bool {
+        self.metrics.lifecycle.is_terminal()
     }
 }
 
@@ -682,6 +690,14 @@ impl ReliablePathCommandSender {
     /// preventing ordered control needed to settle work already admitted.
     pub(in crate::runtime) fn begin_path_drain(&self) {
         self.metrics.lifecycle.begin_drain();
+        self.metrics.capacity_released.notify_waiters();
+    }
+
+    /// Stops admission and wakes the carrier actor for immediate failure
+    /// settlement. Unlike planned drain, no failed physical connection is
+    /// retained to exchange ordered retirement frames.
+    pub(in crate::runtime) fn terminate_failed_path(&self) {
+        self.metrics.lifecycle.finish();
         self.metrics.capacity_released.notify_waiters();
     }
 

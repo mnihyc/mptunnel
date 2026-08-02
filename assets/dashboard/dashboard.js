@@ -53,6 +53,11 @@
     overviewPathsBody: byId("overview-paths-body"),
     overviewPathsEmpty: byId("overview-paths-empty"),
     overviewPathsCount: byId("overview-paths-count"),
+    overviewPeerContext: byId("overview-peer-context"),
+    overviewPeerState: byId("overview-peer-state"),
+    overviewPeerAllowBadge: byId("overview-peer-allow-badge"),
+    overviewPeerPathsBody: byId("overview-peer-paths-body"),
+    overviewPeerPathsEmpty: byId("overview-peer-paths-empty"),
     trafficBreakdownBody: byId("traffic-breakdown-body"),
     servicesList: byId("services-list"),
     admissionBody: byId("admission-body"),
@@ -497,6 +502,12 @@
     return underlay === "udp" ? "QUIC" : underlay === "tcp" ? "TCP" : titleCase(underlay);
   }
 
+  function directionLabel(direction) {
+    if (direction === "client_to_server") return "C→S";
+    if (direction === "server_to_client") return "S→C";
+    return "--";
+  }
+
   function serviceLabel(item) {
     const name = item && item.service_name ? String(item.service_name) : "";
     const service = titleCase(item && item.service ? item.service : "service");
@@ -602,6 +613,10 @@
     return Boolean(state.status) && Boolean(peerControl().supported) && Boolean(selectedPeerSession());
   }
 
+  function peerSurfaceVisible() {
+    return state.selectedTab === "overview" || state.selectedTab === "diagnostics";
+  }
+
   function updateRefreshControls() {
     const busy = refreshBusy();
     elements.refreshButton.disabled = busy;
@@ -680,7 +695,7 @@
     updateRefreshControls();
     try {
       const refreshed = await refreshStatus(source);
-      if (refreshed && !state.authenticationRequired && peerRequestSupported()) {
+      if (refreshed && !state.authenticationRequired && peerSurfaceVisible() && peerRequestSupported()) {
         await requestPeerStatus(source, true);
       }
     } finally {
@@ -870,11 +885,11 @@
       const toPeer = createElement("div");
       toPeer.append(createElement("span", "cell-primary", formatBytes(io.to_peer_bytes)));
       toPeer.append(createElement("span", "cell-secondary", formatCount(io.to_peer_packets)));
-      appendCell(row, "Upload bytes / packets", toPeer);
+      appendCell(row, "↑ B / pkt", toPeer);
       const fromPeer = createElement("div");
       fromPeer.append(createElement("span", "cell-primary", formatBytes(io.from_peer_bytes)));
       fromPeer.append(createElement("span", "cell-secondary", formatCount(io.from_peer_packets)));
-      appendCell(row, "Download bytes / packets", fromPeer);
+      appendCell(row, "↓ B / pkt", fromPeer);
       appendCell(row, "Opened", formatCount(flows.opened));
       appendCell(row, "Active", formatCount(flows.active));
       appendCell(row, "Completed", formatCount(flows.completed));
@@ -1017,7 +1032,7 @@
       activity.append(createElement("span", "cell-secondary", formatDuration(flow.idle_ms)));
     appendCell(row, "Age / idle", activity);
 
-    appendCell(row, "Upload / download / packets", trafficCell(summarizeFlowIo([flow])));
+    appendCell(row, "↑ / ↓ / pkt", trafficCell(summarizeFlowIo([flow])));
     return row;
   }
 
@@ -1034,7 +1049,7 @@
     const total = formatCount(summary.active_flows);
     const shown = formatCount(flows.length);
     elements.overviewConnectionsCount.textContent = overflow > 0n
-      ? shown + " shown / " + total + " active"
+      ? shown + " visible / " + total + " active"
       : total + " active";
     elements.overviewConnectionsCount.className = "badge " + (overflow > 0n ? "badge--warning" : "badge--neutral");
   }
@@ -1046,21 +1061,21 @@
     elements.inboundServicesBody.replaceChildren();
     elements.inboundServicesEmpty.hidden = inbounds.length !== 0;
     elements.inboundServicesCount.textContent = hiddenFlows > 0n
-      ? formatCount(inbounds.length) + " configured · " + formatCount(hiddenFlows.toString()) + " flows hidden"
-      : formatCount(inbounds.length) + " configured";
+      ? formatCount(inbounds.length) + " services · " + formatCount(hiddenFlows.toString()) + " hidden"
+      : formatCount(inbounds.length) + " services";
     elements.inboundServicesCount.className = "badge " + (hiddenFlows > 0n ? "badge--warning" : "badge--neutral");
     inbounds.forEach(function (inbound) {
       const row = createElement("tr");
       const inboundFlows = flows.filter(function (flow) { return String(flow.inbound || "") === String(inbound.name || ""); });
       appendCell(row, "Name", inbound.name || titleCase(inbound.protocol), "cell-primary");
-      appendCell(row, "Protocol", titleCase(inbound.protocol));
+      appendCell(row, "Proto", titleCase(inbound.protocol));
       const listeners = asArray(inbound.listen).map(String);
       if (inbound.interface_name) listeners.push(inbound.interface_name);
-      appendCell(row, "Listen / interface", listeners.join(", ") || "Host");
+      appendCell(row, "Listen", listeners.join(", ") || "Host");
       appendCell(row, "Target", inbound.target || "Route");
-      appendCell(row, "Authentication", inbound.auth_required ? badge("Required", "success") : badge("None", "neutral"));
-      appendCell(row, "Shown", formatCount(inboundFlows.length));
-      appendCell(row, "Upload / download / packets", trafficCell(summarizeFlowIo(inboundFlows)));
+      appendCell(row, "Auth", inbound.auth_required ? badge("Required", "success") : badge("None", "neutral"));
+      appendCell(row, "Flows", formatCount(inboundFlows.length));
+      appendCell(row, "↑ / ↓ / pkt ↑↓", trafficCell(summarizeFlowIo(inboundFlows)));
       elements.inboundServicesBody.append(row);
     });
 
@@ -1068,21 +1083,21 @@
     elements.outboundServicesBody.replaceChildren();
     elements.outboundServicesEmpty.hidden = outbounds.length !== 0;
     elements.outboundServicesCount.textContent = hiddenFlows > 0n
-      ? formatCount(outbounds.length) + " configured · " + formatCount(hiddenFlows.toString()) + " flows hidden"
-      : formatCount(outbounds.length) + " configured";
+      ? formatCount(outbounds.length) + " services · " + formatCount(hiddenFlows.toString()) + " hidden"
+      : formatCount(outbounds.length) + " services";
     elements.outboundServicesCount.className = "badge " + (hiddenFlows > 0n ? "badge--warning" : "badge--neutral");
     outbounds.forEach(function (outbound) {
       const row = createElement("tr");
       const outboundFlows = flows.filter(function (flow) { return String(flow.outbound || "") === String(outbound.name || ""); });
       appendCell(row, "Name", outbound.name || "Outbound", "cell-primary");
-      appendCell(row, "Protocol", titleCase(outbound.protocol));
+      appendCell(row, "Proto", titleCase(outbound.protocol));
       appendCell(
         row,
-        "Networks",
+        "Net",
         asArray(outbound.networks).map(function (network) { return String(network).toUpperCase(); }).join(" + ") || "--"
       );
-      appendCell(row, "Shown", formatCount(outboundFlows.length));
-      appendCell(row, "Upload / download / packets", trafficCell(summarizeFlowIo(outboundFlows)));
+      appendCell(row, "Flows", formatCount(outboundFlows.length));
+      appendCell(row, "↑ / ↓ / pkt ↑↓", trafficCell(summarizeFlowIo(outboundFlows)));
       elements.outboundServicesBody.append(row);
     });
   }
@@ -1105,7 +1120,7 @@
           ? "Manual / " + balancer.manual_outbound
           : "Auto / " + formatIdentifier(balancer.generation)
       ));
-      appendCell(row, "Strategy / generation", strategy);
+      appendCell(row, "Policy / gen", strategy);
 
       const members = createElement("div");
       members.append(createElement(
@@ -1115,7 +1130,7 @@
           formatCount(balancer.draining_members) + " / " +
           formatCount(balancer.unavailable_members)
       ));
-      appendCell(row, "Ready / drain / unavailable", members);
+      appendCell(row, "Ready / drain / down", members);
 
       const load = createElement("div");
       load.append(createElement(
@@ -1123,7 +1138,7 @@
         "cell-primary",
         formatCount(balancer.active_flows) + " / " + formatCount(balancer.pending_flows)
       ));
-      appendCell(row, "Active / pending", load);
+      appendCell(row, "Flows / pend", load);
 
       const probeValue = asObject(balancer.probe);
       const probe = createElement("div");
@@ -1137,7 +1152,7 @@
       } else {
         probe.append(createElement("span", "cell-primary", "--"));
       }
-      appendCell(row, "Probe / interval / timeout", probe);
+      appendCell(row, "Probe / int / to", probe);
       elements.overviewBalancersBody.append(row);
     });
   }
@@ -1206,7 +1221,20 @@
       const table = createElement("table", "records-table records-table--balancers");
       const head = createElement("thead");
       const headRow = createElement("tr");
-      ["Outbound", "Readiness", "Health", "Latency / source / age", "Active / pending", "Open / flow / probe / eject / recover", "Selection / error", "Actions"].forEach(function (label) {
+      [
+        "Outbound",
+        "Readiness",
+        "Health",
+        "RTT / src / age",
+        "Flows / pend",
+        "Open ok / err",
+        "Flow ok / err",
+        "Probe ok / err",
+        "Eject / recover",
+        "Select / open",
+        "Age / error",
+        "Actions"
+      ].forEach(function (label) {
         headRow.append(createElement("th", "", label));
       });
       head.append(headRow);
@@ -1244,49 +1272,50 @@
           ? "--"
           : titleCase(member.latency_source) + " / " + formatDuration(member.latency_age_ms);
         latency.append(createElement("span", "cell-secondary", observation));
-        appendCell(row, "Latency / source / age", latency);
+        appendCell(row, "RTT / src / age", latency);
 
         const load = createElement("div");
         load.append(createElement("span", "cell-primary", formatCount(member.active_flows) + " / " + formatCount(member.pending_flows)));
-        appendCell(row, "Active / pending", load);
+        appendCell(row, "Flows / pend", load);
 
         const counters = asObject(member.counters);
-        const outcomes = createElement("div");
-        outcomes.append(createElement(
-          "span",
-          "cell-primary",
+        appendCell(
+          row,
+          "Open ok / err",
           formatCount(counters.open_successes) + " / " + formatCount(counters.open_failures)
-        ));
-        outcomes.append(createElement(
-          "span",
-          "cell-secondary",
-          formatCount(counters.flow_successes) + "/" + formatCount(counters.flow_failures) +
-            " · " + formatCount(counters.probe_successes) + "/" + formatCount(counters.probe_failures)
-        ));
-        outcomes.append(createElement(
-          "span",
-          "cell-secondary",
+        );
+        appendCell(
+          row,
+          "Flow ok / err",
+          formatCount(counters.flow_successes) + " / " + formatCount(counters.flow_failures)
+        );
+        appendCell(
+          row,
+          "Probe ok / err",
+          formatCount(counters.probe_successes) + " / " + formatCount(counters.probe_failures)
+        );
+        appendCell(
+          row,
+          "Eject / recover",
           formatCount(counters.ejections) + " / " + formatCount(counters.recoveries)
-        ));
-        appendCell(row, "Open / flow / probe / eject / recover", outcomes);
+        );
 
-        const lastEvent = createElement("div");
-        lastEvent.append(createElement(
+        appendCell(
+          row,
+          "Select / open",
+          formatCount(counters.selections) + " / " + formatCount(counters.open_attempts)
+        );
+        const age = createElement(
           "span",
-          "cell-primary",
-          member.last_selection_reason
-            ? titleCase(member.last_selection_reason) + " / " + formatDuration(member.last_selected_age_ms)
-            : "--"
-        ));
-        lastEvent.append(createElement(
-          "span",
-          member.last_error ? "cell-secondary balancer-error" : "cell-secondary",
-          member.last_error
-            ? "Error / " + formatDuration(member.last_error_age_ms)
-            : formatCount(counters.selections) + " / " + formatCount(counters.open_attempts)
-        ));
-        if (member.last_error) lastEvent.title = String(member.last_error);
-        appendCell(row, "Selection / error", lastEvent);
+          member.last_error ? "cell-primary balancer-error" : "cell-primary",
+          (member.last_selection_reason ? formatDuration(member.last_selected_age_ms) : "--") +
+            " / " + (member.last_error ? formatDuration(member.last_error_age_ms) : "--")
+        );
+        age.title = [
+          member.last_selection_reason ? "Selection: " + titleCase(member.last_selection_reason) : "",
+          member.last_error ? "Error: " + String(member.last_error) : ""
+        ].filter(Boolean).join("\n");
+        appendCell(row, "Age / error", age);
 
         const actions = createElement("div", "balancer-actions balancer-actions--member");
         actions.append(
@@ -1356,10 +1385,10 @@
     const restrictions = [];
     if (policy.backup) restrictions.push("backup");
     if (policy.expensive) restrictions.push("expensive");
-    if (policy.bulk_allowed === false) restrictions.push("no bulk");
-    if (policy.probe_only) restrictions.push("probe only");
-    if (policy.no_udp) restrictions.push("no UDP");
-    return restrictions.join(", ") || "ordinary";
+    if (policy.bulk_allowed === false) restrictions.push("no-bulk");
+    if (policy.probe_only) restrictions.push("probe");
+    if (policy.no_udp) restrictions.push("no-udp");
+    return restrictions.join(", ") || "default";
   }
 
   function createPathRow(pathValue) {
@@ -1375,12 +1404,12 @@
       "cell-secondary cell-mono",
       formatIdentifier(path.path_id) + " / " + formatIdentifier(path.path_instance_id)
     ));
-    appendCell(row, "Path / instance", identity);
+    appendCell(row, "Path / inst", identity);
 
     const service = createElement("div");
     service.append(createElement("span", "cell-primary", serviceLabel(path)));
     service.append(createElement("span", "cell-secondary", titleCase(path.service) + " / " + formatIdentifier(path.session_id)));
-    appendCell(row, "Service / session", service);
+    appendCell(row, "Svc / sess", service);
 
     const carrier = createElement("div");
     carrier.append(createElement("span", "cell-primary", carrierLabel(path.underlay)));
@@ -1394,7 +1423,7 @@
     } else {
       carrier.append(createElement("span", "cell-secondary", "--"));
     }
-    appendCell(row, "Carrier / bounds", carrier);
+    appendCell(row, "Net / bounds", carrier);
 
     const usage = createElement("div");
     if (path.usage) usage.append(stateIndicator(path.usage));
@@ -1408,17 +1437,17 @@
         pathPolicyLabel(path.policy)
       ].filter(Boolean).join(" / ")
     ));
-    appendCell(row, "Usage / direction", usage);
+    appendCell(row, "Use / dir", usage);
 
     const rtt = createElement("div");
     rtt.append(createElement("span", "cell-primary", formatRtt(path.srtt_ms)));
     rtt.append(createElement("span", "cell-secondary", formatRtt(path.jitter_ms)));
-    appendCell(row, "RTT / jitter", rtt);
+    appendCell(row, "RTT / jit", rtt);
 
     const delivery = createElement("div");
     delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
     delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
-    appendCell(row, "Delivery / pacing", delivery);
+    appendCell(row, "Rate / pace", delivery);
 
     const loss = createElement("div");
     loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
@@ -1433,7 +1462,7 @@
       formatBytes(path.bytes_in_flight) + " / " + formatBytes(path.data_level_bytes_in_flight)
     ));
     flight.append(createElement("span", "cell-secondary", formatBytes(path.inflight_limit_bytes)));
-    appendCell(row, "Queue / native / data / limit", flight);
+    appendCell(row, "Queue / native / MPP / cap", flight);
 
     const evidence = createElement("div");
     evidence.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm)));
@@ -1446,14 +1475,14 @@
       "span",
       "cell-secondary",
       (path.last_delivery_age_ms === undefined ? "--" : formatDuration(path.last_delivery_age_ms)) +
-        (path.app_limited ? " / App-limited" : "")
+        " / " + (path.app_limited ? "1" : "0")
     ));
-    appendCell(row, "Confidence / samples / age", evidence);
+    appendCell(row, "Conf / n / bytes / age / app", evidence);
 
     const flows = createElement("div");
     flows.append(createElement("span", "cell-primary", formatCount(path.active_flows)));
     flows.append(createElement("span", "cell-secondary", formatCount(path.active_latency_sensitive_flows)));
-    appendCell(row, "Flows / latency", flows);
+    appendCell(row, "Flows / fast", flows);
     return row;
   }
 
@@ -1543,8 +1572,13 @@
     const control = peerControl();
     const peerSessions = asArray(diagnostics.peer_sessions).map(asObject);
 
-    elements.peerAllowBadge.className = "badge " + (diagnostics.peer_diagnostics_allowed ? "badge--success" : "badge--neutral");
-    elements.peerAllowBadge.textContent = diagnostics.peer_diagnostics_allowed ? "Incoming allowed" : "Incoming off";
+    const repliesAllowed = Boolean(diagnostics.peer_diagnostics_allowed);
+    const replyBadgeClass = "badge " + (repliesAllowed ? "badge--success" : "badge--neutral");
+    const replyBadgeText = repliesAllowed ? "Local replies on" : "Local replies off";
+    elements.peerAllowBadge.className = replyBadgeClass;
+    elements.peerAllowBadge.textContent = replyBadgeText;
+    elements.overviewPeerAllowBadge.className = replyBadgeClass;
+    elements.overviewPeerAllowBadge.textContent = replyBadgeText;
 
     elements.peerSessionSelect.replaceChildren();
     if (peerSessions.length === 0) {
@@ -1584,7 +1618,7 @@
     appendMetric(elements.diagnosticsMetrics, "Active flow detail overflow", formatCount(diagnostics.active_flow_detail_overflow));
     appendMetric(elements.diagnosticsMetrics, "Flow detail overflow total", formatCount(diagnostics.active_flow_detail_overflow_total));
     appendMetric(elements.diagnosticsMetrics, "Path control", asObject(asObject(state.status.controls).path).supported ? "Available" : "Unavailable");
-    appendMetric(elements.diagnosticsMetrics, "Peer responses", diagnostics.peer_diagnostics_allowed ? "Allowed" : "Disabled");
+    appendMetric(elements.diagnosticsMetrics, "Local peer replies", diagnostics.peer_diagnostics_allowed ? "On" : "Off");
 
     elements.diagnosticsNotes.replaceChildren();
     asArray(diagnostics.notes).forEach(function (note) {
@@ -1624,7 +1658,91 @@
       String(state.peerResult.service_name) === String(selectedSession.service_name)
       ? state.peerResult
       : null;
-    renderPeerResult(explicit || newestCachedPeerResult(selectedSession));
+    const result = explicit || newestCachedPeerResult(selectedSession);
+    renderPeerResult(result);
+    renderOverviewPeerResult(result, selectedSession);
+  }
+
+  function appendPeerPathRow(body, pathValue) {
+    const path = asObject(pathValue);
+    const row = createElement("tr");
+    appendCell(row, "State", stateIndicator(path.state));
+
+    const identity = createElement("div");
+    identity.append(createElement("span", "cell-primary cell-mono", formatIdentifier(path.path_id)));
+    identity.append(createElement("span", "cell-secondary cell-mono", formatIdentifier(path.metric_epoch)));
+    appendCell(row, "Path / epoch", identity);
+    appendCell(row, "Net", carrierLabel(path.underlay));
+
+    const useDirection = createElement("div");
+    useDirection.append(stateIndicator(path.usage));
+    useDirection.append(createElement("span", "cell-secondary", directionLabel(path.direction)));
+    appendCell(row, "Use / dir", useDirection);
+
+    const rtt = createElement("div");
+    rtt.append(createElement("span", "cell-primary", formatRttMicros(path.srtt_us)));
+    rtt.append(createElement(
+      "span",
+      "cell-secondary",
+      formatRttMicros(path.rttvar_us) + " / " + formatRttMicros(path.jitter_us)
+    ));
+    appendCell(row, "RTT / var / jit", rtt);
+
+    const delivery = createElement("div");
+    delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
+    delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
+    appendCell(row, "Rate / pace", delivery);
+
+    const loss = createElement("div");
+    loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
+    loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
+    appendCell(row, "Loss / ECN", loss);
+
+    const flight = createElement("div");
+    flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes)));
+    flight.append(createElement(
+      "span",
+      "cell-secondary",
+      formatBytes(path.bytes_in_flight) + " / " + formatBytes(path.inflight_limit_bytes)
+    ));
+    appendCell(row, "Queue / flight / cap", flight);
+
+    const samples = createElement("div");
+    samples.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm)));
+    samples.append(createElement(
+      "span",
+      "cell-secondary",
+      formatCount(path.data_sample_count) + " / " + formatBytes(path.data_sample_bytes) + " / " +
+        formatDuration(finiteNumber(path.metric_age_us) / 1000) + " / " + (path.app_limited ? "1" : "0")
+    ));
+    appendCell(row, "Conf / n / bytes / age / app", samples);
+    body.append(row);
+  }
+
+  function renderPeerPaths(body, empty, result) {
+    const paths = result ? asArray(result.paths) : [];
+    body.replaceChildren();
+    empty.hidden = paths.length !== 0;
+    paths.forEach(function (path) { appendPeerPathRow(body, path); });
+  }
+
+  function renderOverviewPeerResult(result, selectedSession) {
+    if (!result) {
+      elements.overviewPeerState.className = "badge badge--neutral";
+      elements.overviewPeerState.textContent = "No sample";
+      elements.overviewPeerContext.textContent = selectedSession
+        ? serviceLabel(selectedSession) + " / " + formatIdentifier(selectedSession.session_id)
+        : "No connected peer";
+      renderPeerPaths(elements.overviewPeerPathsBody, elements.overviewPeerPathsEmpty, null);
+      return;
+    }
+    const ok = String(result.code) === "ok";
+    elements.overviewPeerState.className = "badge " + (ok ? "badge--success" : "badge--warning");
+    elements.overviewPeerState.textContent = titleCase(result.code);
+    elements.overviewPeerContext.textContent =
+      serviceLabel(result) + " / " + formatIdentifier(result.session_id) + " / " +
+      formatRelative(result.received_unix_ms);
+    renderPeerPaths(elements.overviewPeerPathsBody, elements.overviewPeerPathsEmpty, result);
   }
 
   function renderPeerResult(result) {
@@ -1642,34 +1760,7 @@
     appendMetric(elements.peerResultSummary, "Request", formatIdentifier(result.request_id));
     appendMetric(elements.peerResultSummary, "Received", formatRelative(result.received_unix_ms));
 
-    const paths = asArray(result.paths);
-    elements.peerPathsBody.replaceChildren();
-    elements.peerPathsEmpty.hidden = paths.length !== 0;
-    paths.forEach(function (path) {
-      const row = createElement("tr");
-      appendCell(row, "State", stateIndicator(path.state));
-      appendCell(row, "Path", formatIdentifier(path.path_id), "cell-mono");
-      appendCell(row, "Carrier", carrierLabel(path.underlay));
-      appendCell(row, "Usage", stateIndicator(path.usage));
-
-      const rtt = createElement("div");
-      rtt.append(createElement("span", "cell-primary", formatRttMicros(path.srtt_us)));
-      rtt.append(createElement("span", "cell-secondary", formatRttMicros(path.jitter_us)));
-      appendCell(row, "RTT / jitter", rtt);
-
-      const delivery = createElement("div");
-      delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
-      delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
-      appendCell(row, "Delivery / pacing", delivery);
-
-      const loss = createElement("div");
-      loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
-      loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
-      appendCell(row, "Loss / ECN", loss);
-      appendCell(row, "Queue", formatBytes(path.queue_bytes));
-      appendCell(row, "In flight", formatBytes(path.bytes_in_flight));
-      elements.peerPathsBody.append(row);
-    });
+    renderPeerPaths(elements.peerPathsBody, elements.peerPathsEmpty, result);
   }
 
   async function requestPeerStatus(source, coordinated) {

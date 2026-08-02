@@ -24,7 +24,9 @@ Keep production modules aligned with the dependency and ownership boundaries
 in [the architecture](docs/ARCHITECTURE.md). Put Rust unit tests in sibling
 `tests_<owner>.rs` files or a dedicated test directory, and avoid case-specific
 constants or platform identity checks when a measured capability is the real
-distinction.
+distinction. Maintained upstream mirrors retain upstream file and test layout;
+do not reorganize foreign source merely to apply this repository's naming
+convention.
 
 Lab changes must preserve namespace isolation, receiver-confirmed upload
 accounting, binary/config identity, and explicit incomplete-result handling.

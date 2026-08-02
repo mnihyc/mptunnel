@@ -187,6 +187,7 @@ fn target_from_document(
         product_admission: crate::product::ProductAdmission::default(),
         generation: control.generation(),
     };
+    target.refresh_sample_snapshot();
     (directory, path, target, control)
 }
 

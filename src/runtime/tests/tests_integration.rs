@@ -1474,6 +1474,79 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fenced_tcp_data_plane_instance_is_replaced_by_minimum_reconciliation() {
+    let carrier_server = RangedTcpCarrierServer::spawn().await;
+    let client_path = format!(
+        "tcp://127.0.0.1:{}?tcp-carriers=1-1",
+        carrier_server.first_port
+    )
+    .parse::<PathSpec>()
+    .expect("client TCP path");
+    let context = ClientPathContext::new_with_carrier_network(
+        vec![ClientPathConfig {
+            name: "minimum".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: client_path,
+            security: security(),
+        }],
+        ResourceLimits::default(),
+        None,
+        0,
+        Arc::new(SystemCarrierNetworkProvider),
+    )
+    .expect("client carrier context");
+    let retry_interval = Duration::from_secs(2);
+    let path_service = tokio::spawn(run_client_path_service(
+        context.clone(),
+        retry_interval,
+        Duration::from_secs(2),
+    ));
+    wait_for_tcp_ready_count(&context, 1).await;
+    let initial_instance = context.tcp_sessions[0]
+        .connection_instance_id()
+        .expect("initial configured-minimum instance");
+
+    // A carrier that survives the existing connection-attempt churn gate is
+    // eligible for event-driven replacement after an exact data-plane fence.
+    tokio::time::sleep(retry_interval + Duration::from_millis(100)).await;
+
+    context.mark_relay_path_data_plane_failure(RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: initial_instance,
+        attachment_id: 1,
+    });
+    assert_eq!(
+        context.tcp_sessions[0].connection_instance_id(),
+        None,
+        "fenced physical instance must lose readiness immediately"
+    );
+
+    tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            let replacement = context.tcp_sessions[0].connection_instance_id();
+            let active = {
+                let health = context.health().lock().expect("client path health");
+                health.tcp[0].state == SchedulerPathState::Active
+                    && health.tcp[0].path_instance_id() == replacement
+            };
+            if replacement.is_some_and(|replacement| replacement != initial_instance) && active {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("configured minimum did not replace its stable fenced physical instance");
+
+    path_service.abort();
+    let _ = path_service.await;
+    carrier_server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_before_break() {
     let carrier_server = RangedTcpCarrierServer::spawn().await;
     let first_port = carrier_server.first_port;

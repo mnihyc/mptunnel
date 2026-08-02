@@ -457,7 +457,6 @@ struct HealthAssessment {
 }
 
 fn health_assessment(target: &ManagementTarget) -> HealthAssessment {
-    target.refresh_current_snapshot();
     let generation = target
         .config_control()
         .map(|control| control.generation_status())

@@ -4764,3 +4764,103 @@ entry is authoritative.
   capture is `docs/assets/dashboard.png`.
 - Next: run the complete release-quality workflow, commit the bounded follow-up,
   then run one exact clean-tree TCP upload gate before the authorized push.
+
+## 2026-08-02T21:48:42+08:00: v0.1.5 frozen; v0.1.6 audit boundaries established
+
+- Name: immutable v0.1.5 delivery and bounded documentation/observability repair
+- Category: release evidence, maintained dependency boundary, and Product
+  management presentation
+- State: v0.1.5 is released and independently verified; v0.1.6 corrections are
+  implemented locally and focused checks pass, with public evidence
+  reconciliation and final release gates still pending
+- Frozen v0.1.5 evidence:
+  - commit `6e2504b8c8b511786e11b473872eb9d217c766f8` is tagged `v0.1.5`;
+  - native CI run `30748787226` passed Linux amd64/arm64, Windows amd64/arm64,
+    macOS amd64/arm64, Android arm64, and source-quality jobs;
+  - release run `30749377077` published an immutable non-draft release with
+    seven versioned platform bundles plus `version.json`;
+  - every downloaded archive passed the release contract, archive-layout
+    contract, and GitHub asset-digest check; and
+  - the final clean committed-tree TCP upload gate completed 2/2 at 253.243
+    Mbps with a valid comparable host record.
+- v0.1.6 audit decisions:
+  - the repository test naming convention no longer rewrites the maintained
+    Quinn mirror: `./crates/quinn-proto/src` is restored byte-for-byte to the
+    accepted 0.11.16 baseline commit, which retains upstream layout plus the
+    eight production deviations and two MPTUNNEL BBR regressions;
+  - the standalone Quinn suite passes 282 tests and three doctests;
+  - Overview reuses the existing bounded peer-status result and now exposes
+    direction, RTT variance, pacing/flight limits, confidence, sample age, and
+    application-limited state with terse numeric cells;
+  - `allow_peer_diagnostics` is presented precisely as this endpoint's local
+    reply permission; automatic peer requests remain one selected session,
+    completion-driven, non-overlapping, and limited to Overview or Diagnostics;
+  - per-service active-flow projection is labeled `Flows shown` and its I/O is
+    explicitly bounded to the shown records, while aggregate traffic remains
+    exact; and
+  - health requests now read the sampler cache instead of recollecting full
+    Product/path/balancer state on every dashboard or probe request. Startup
+    seeds the cache and the existing one-second sampler remains authoritative.
+- Performance boundary: no RFC field, wire behavior, transport algorithm,
+  scheduler, congestion controller, pacing rule, carrier range, timer,
+  threshold, or platform branch changed. The health-cache change removes a
+  duplicate management read path and cannot reduce data-plane capacity.
+- Focused verification: formatting, dashboard JavaScript syntax, the durable
+  dashboard contract, the health cache-identity regression, whitespace, and
+  the standalone Quinn suite pass.
+- Evidence audit: all requested shaped/unshaped baselines, asymmetry,
+  20-carrier variation, browser load, blackhole, latency transition, flapping,
+  and port-hop topologies already exist. v0.1.6 will reuse them rather than add
+  duplicate cases; only clean comparable results may enter public tables.
+- Next: reconcile `README.md` and `docs/PERFORMANCE.md` around one concise
+  methodology and accepted numeric cohorts, diagnose the unshaped local host
+  ceiling without changing Core constants, then run the bounded v0.1.6 release
+  matrix.
+
+## 2026-08-02T23:00:38+08:00: v0.1.6 management and TCP failure lifecycles accepted
+
+- Name: stable diagnostics transport, exact failed-carrier replacement, and
+  final Overview presentation
+- Category: Product observability and carrier lifecycle correctness
+- State: implemented and verified with real Product traffic; the existing
+  evidence cohort and public performance synthesis remain before release
+- Clean model:
+  - peer-status requests retain the last successful carrier until that carrier
+    times out or unregisters, avoiding TCP bulk head-of-line delay without a
+    protocol, timeout, or data-scheduling change;
+  - an exact TCP instance already fenced by Product data-plane failure now
+    enters the existing terminal failure lifecycle, rather than the planned
+    `PATH_DRAIN` lifecycle that may validly wait for ordered peer settlement;
+  - actor termination drops the exact capacity reservation and wakes the
+    configured-minimum reconciler; stale instance reports cannot terminate a
+    replacement; and
+  - the existing connection-attempt interval remains the churn gate. No timer,
+    threshold, scheduler, congestion controller, carrier range, wire field, or
+    platform branch changed.
+- Practical evidence:
+  - one initial peer request selected the TCP carrier under concurrent bulk
+    load; after fallback selected QUIC, ten consecutive peer requests completed
+    in 2--7 ms, and a second run completed all ten in the same range;
+  - focused lifecycle and exact-instance tests pass, and the production-boundary
+    integration replaces a stable fenced TCP minimum instance inside 1.5 s;
+  - three concurrent 256 MiB SOCKS5 downloads kept both TCP and QUIC paths
+    active, with zero suspect or failed paths throughout sampled traffic; and
+  - the authenticated dashboard returned ten consecutive peer responses with
+    HTTP 200 while exposing both server-to-client TCP and QUIC path rows.
+- Presentation:
+  - Overview contains active inbound connections, current speeds, bounded
+    history, Product traffic, admission, services, sessions, local and peer
+    paths, outbounds, and balancers in one dense layout;
+  - table cells use numbers, units, identifiers, or short categorical states;
+    compound headings are abbreviated and expanded only through hover text;
+  - the accepted 1600-by-1000 screenshot contains three live connections, one
+    session, two active paths, changing speed, and no layout gap or overflow;
+    and
+  - the browser console reports zero errors and zero warnings after the stable
+    authenticated reload.
+- Verification: warnings-denied all-target/all-feature Clippy, JavaScript
+  syntax, formatting, whitespace, focused queue/registry/integration tests,
+  ten peer-status HTTP requests, and real browser inspection pass.
+- Next: freeze the source candidate, run the existing comparable product and
+  multipath lab cohort once, reconcile public numeric evidence, then execute
+  the final release-quality matrix.

@@ -365,6 +365,21 @@ async fn run_client_tcp_path_session_inner(
         tokio::select! {
             biased;
             _ = &mut drain_requested, if !draining => {
+                if drain_signal.is_terminal() {
+                    let error = RuntimeError::ReliablePathSessionClosed;
+                    fail_client_tcp_products(
+                        &mut state.streams,
+                        &mut state.datagrams,
+                        &error,
+                    );
+                    retire_failed_client_tcp_connection(
+                        &runtime,
+                        &mut state,
+                        &mut carrier_readiness,
+                    );
+                    actor_terminal.finish();
+                    return;
+                }
                 begin_client_tcp_path_drain(
                     connection,
                     &mut commands,

@@ -351,6 +351,32 @@ impl ClientTcpRetainedCarrierRegistry {
             commands.begin_path_drain();
         }
     }
+
+    /// Terminates only the fenced physical instance. A stale failure cannot
+    /// affect a later occupant of the same elastic slot.
+    pub(in crate::runtime) fn terminate_failed_instance(
+        &self,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let (commands, validation) = {
+            let mut carriers = self.carriers.lock().expect("retained TCP carrier lock");
+            let Some(carrier) = carriers.get_mut(&key.index) else {
+                return false;
+            };
+            if carrier.key != key
+                || carrier.path_instance_id != path_instance_id
+                || carrier.retiring
+            {
+                return false;
+            }
+            carrier.retiring = true;
+            (carrier.commands.clone(), carrier.validation.take())
+        };
+        drop(validation);
+        commands.terminate_failed_path();
+        true
+    }
 }
 
 fn tcp_carrier_direction_bit(direction: PathMetricDirection) -> u8 {

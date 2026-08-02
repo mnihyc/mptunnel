@@ -32,11 +32,9 @@ use crate::{
     frame::FrameStruct,
     transport_parameters::TransportParameters,
 };
-#[path = "tests_util.rs"]
 mod util;
 use util::*;
 
-#[path = "tests_token.rs"]
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]

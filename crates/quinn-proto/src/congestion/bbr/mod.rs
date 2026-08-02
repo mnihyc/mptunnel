@@ -699,7 +699,7 @@ fn calculate_min_window(current_mtu: u64) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "tests_bbr.rs"]
+#[path = "bbr_test.rs"]
 mod tests;
 
 // The gain used for the STARTUP, equal to 2/ln(2).

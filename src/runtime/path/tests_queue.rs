@@ -303,6 +303,21 @@ async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
     );
 }
 
+#[tokio::test]
+async fn failed_path_termination_fences_admission_and_signals_terminal() {
+    let (commands, receivers) = reliable_path_command_channels(1);
+    let signal = receivers.path_drain_signal();
+
+    commands.terminate_failed_path();
+    signal.wait().await;
+
+    assert!(signal.is_terminal());
+    assert!(matches!(
+        commands.try_reserve_admitted_frame(stream_data_frame(1, 1024), TrafficClass::Throughput),
+        Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
+    ));
+}
+
 #[test]
 fn control_and_ack_frames_never_use_throughput_lane() {
     let priority_frames = [

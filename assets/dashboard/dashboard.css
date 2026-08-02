@@ -874,6 +874,13 @@ h3 {
   text-align: left;
 }
 
+.header-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .table-wrap {
   width: 100%;
   overflow-x: auto;
@@ -923,7 +930,7 @@ tbody tr:hover td {
 }
 
 .records-table--peer {
-  min-width: 860px;
+  min-width: 1280px;
 }
 
 .cell-primary,

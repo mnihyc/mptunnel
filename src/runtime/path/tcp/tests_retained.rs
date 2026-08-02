@@ -270,3 +270,33 @@ fn endpoint_drain_revokes_placement_and_releases_validation_ownership() {
     drop(abandoned);
     assert!(remaining.settle_without_retain());
 }
+
+#[test]
+fn failed_instance_termination_is_exact_and_cannot_affect_a_replacement() {
+    let registry = registry();
+    let key = key(10);
+    let old_instance = instance(101);
+    let replacement = instance(102);
+    insert(
+        &registry,
+        5,
+        key,
+        old_instance,
+        PathMetricDirection::ClientToServer,
+    );
+
+    assert!(registry.terminate_failed_instance(key, old_instance));
+    assert!(!registry.direction_authorized(key, old_instance, PathMetricDirection::ClientToServer));
+    assert!(!registry.terminate_failed_instance(key, old_instance));
+
+    assert!(registry.remove(key, old_instance));
+    insert(
+        &registry,
+        5,
+        key,
+        replacement,
+        PathMetricDirection::ClientToServer,
+    );
+    assert!(!registry.terminate_failed_instance(key, old_instance));
+    assert!(registry.direction_authorized(key, replacement, PathMetricDirection::ClientToServer));
+}

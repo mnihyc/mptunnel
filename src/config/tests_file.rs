@@ -1063,24 +1063,38 @@ outbound = "mpp"
 }
 
 #[test]
-fn repository_root_config_is_one_valid_client_profile_after_secret_replacement() {
-    let contents = include_str!("../../examples/config.reference.toml")
-        .replace("REPLACE_ME", "0123456789abcdef0123456789abcdef")
-        .replace("server.example.com", "mptunnel.test")
-        .replace(
-            "REPLACE_WITH_SERVER_CERT.pem",
-            "mptunnel-test-certificate.pem",
-        );
-    let config = load_config_toml_str(&contents).expect("root client config");
+fn shipped_configuration_documents_match_the_runtime_schema() {
+    let load = |contents: &str| {
+        let contents = contents
+            .replace("REPLACE_ME", "0123456789abcdef0123456789abcdef")
+            .replace("server.example.com", "mptunnel.test")
+            .replace("REPLACE_WITH_SERVER_CERT.pem", TEST_CERTIFICATE_FILE)
+            .replace("server-cert-chain.pem", TEST_CERTIFICATE_FILE)
+            .replace("server-cert.pem", TEST_CERTIFICATE_FILE)
+            .replace("server-private-key.pem", TEST_PRIVATE_KEY_FILE);
+        load_config_toml_str(&contents).expect("shipped configuration")
+    };
 
-    assert_eq!(config.session, SessionConfig::default());
-    assert_eq!(config.resources, ResourceLimits::default());
-    let CommandConfig::Node(node) = config.command;
-    let clients = mpp_outbounds(&node);
-    assert_eq!(clients.len(), 1);
-    assert!(node.servers.is_empty());
-    assert_eq!(node.local_ingresses.len(), 2);
-    assert_eq!(clients[0].paths.len(), 2);
+    let reference = load(include_str!("../../examples/config.reference.toml"));
+    assert_eq!(reference.session, SessionConfig::default());
+    assert_eq!(reference.resources, ResourceLimits::default());
+    let CommandConfig::Node(reference) = reference.command;
+    assert!(reference.servers.is_empty());
+    assert_eq!(reference.local_ingresses.len(), 2);
+    assert_eq!(mpp_outbounds(&reference)[0].paths.len(), 2);
+
+    let client = load(include_str!("../../examples/client.toml"));
+    let CommandConfig::Node(client) = client.command;
+    assert!(client.servers.is_empty());
+    assert_eq!(client.local_ingresses.len(), 1);
+    assert_eq!(mpp_outbounds(&client)[0].paths.len(), 2);
+
+    let server = load(include_str!("../../examples/server.toml"));
+    let CommandConfig::Node(server) = server.command;
+    assert!(server.local_ingresses.is_empty());
+    assert_eq!(server.servers.len(), 1);
+    assert_eq!(server.servers[0].paths.len(), 2);
+    assert!(mpp_outbounds(&server).is_empty());
 }
 
 #[test]

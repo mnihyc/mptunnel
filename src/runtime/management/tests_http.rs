@@ -157,6 +157,17 @@ fn health_distinguishes_process_liveness_from_traffic_readiness() {
 }
 
 #[test]
+fn health_reads_the_sampler_snapshot_without_recollecting_runtime_state() {
+    let target = health_target(RuntimeGenerationControl::new());
+    let before = target.snapshot();
+
+    let _ = health_response(&target);
+
+    let after = target.snapshot();
+    assert!(Arc::ptr_eq(&before, &after));
+}
+
+#[test]
 fn failed_health_is_structured_and_never_ready() {
     let generation = RuntimeGenerationControl::new();
     generation.mark_failed("listener bind failed");
@@ -290,6 +301,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("state.health && state.health.degraded"));
     assert!(DASHBOARD_JS.contains("await refreshDashboard(\"poll\");"));
     assert!(DASHBOARD_JS.contains("await requestPeerStatus(source, true);"));
+    assert!(DASHBOARD_JS.contains("function peerSurfaceVisible()"));
     assert!(DASHBOARD_JS.contains("state.refreshTimer = window.setTimeout(async function ()"));
     assert!(DASHBOARD_JS.contains("state.refreshIntervalMs !== 0"));
 
@@ -308,6 +320,8 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         r#"id="inbound-services-body""#,
         r#"id="admission-body""#,
         r#"id="overview-paths-body""#,
+        r#"id="overview-peer-paths-body""#,
+        r#"id="overview-peer-allow-badge""#,
         r#"id="chart-mode-speed""#,
         r#"id="chart-mode-total""#,
     ] {
@@ -323,6 +337,10 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("function trimChartSamples()"));
     assert!(DASHBOARD_JS.contains("state.chartSamples.splice(0, removeCount);"));
     assert!(DASHBOARD_JS.contains("state.trafficChartMode === \"speed\""));
+    assert!(DASHBOARD_JS.contains("direction === \"server_to_client\""));
+    assert!(DASHBOARD_JS.contains("formatRttMicros(path.rttvar_us)"));
+    assert!(DASHBOARD_JS.contains("formatBytes(path.inflight_limit_bytes)"));
+    assert!(DASHBOARD_JS.contains("formatDuration(finiteNumber(path.metric_age_us) / 1000)"));
     assert!(!DASHBOARD_JS.contains("Refreshing runtime status"));
     assert!(DASHBOARD_JS.contains("window.localStorage.setItem(TOKEN_STORAGE_KEY, token);"));
     assert!(DASHBOARD_JS.contains("window.localStorage.setItem(NAVIGATION_STORAGE_KEY"));

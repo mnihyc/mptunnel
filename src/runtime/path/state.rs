@@ -979,8 +979,21 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn mark_relay_path_data_plane_failure(&self, path: RelayPathInstance) {
-        self.state
-            .mark_path_instance_data_plane_failure(path.key, path.path_instance_id);
+        if !self
+            .state
+            .mark_path_instance_data_plane_failure(path.key, path.path_instance_id)
+            || path.key.underlay != UnderlayProtocol::Tcp
+        {
+            return;
+        }
+
+        if let Some(session) = self.tcp_sessions.get(path.key.index)
+            && session.terminate_failed_instance(path.path_instance_id)
+        {
+            return;
+        }
+        self.tcp_retained_carriers
+            .terminate_failed_instance(path.key, path.path_instance_id);
     }
 
     pub(in crate::runtime) fn record_relay_path_send(

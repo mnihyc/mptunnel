@@ -186,3 +186,99 @@ async fn timed_out_request_releases_the_session_slot() {
     assert_eq!(result.code, PeerStatusCode::Unavailable);
     assert!(result.paths.is_empty());
 }
+
+#[tokio::test]
+async fn successful_control_carrier_is_retained_and_timeout_rotates_to_an_alternate() {
+    let broker = PeerStatusBroker::with_timeout(true, Duration::from_millis(20));
+    let mut first = broker.register(SessionId(9));
+    let mut second = broker.register(SessionId(9));
+
+    let initial = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(SessionId(9)).await })
+    };
+    let request_id = first.recv_request().await.expect("first carrier request");
+    assert!(first.receive_response(request_id, PeerStatusCode::Ok, vec![status(1)]));
+    initial
+        .await
+        .expect("request task")
+        .expect("initial result");
+
+    let timed_out = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(SessionId(9)).await })
+    };
+    let _ = first.recv_request().await.expect("preferred request");
+    assert_eq!(
+        timed_out.await.expect("request task"),
+        Err(PeerStatusRequestError::TimedOut)
+    );
+
+    let alternate = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(SessionId(9)).await })
+    };
+    let request_id = second
+        .recv_request()
+        .await
+        .expect("alternate carrier request");
+    assert!(second.receive_response(request_id, PeerStatusCode::Unavailable, vec![status(2)]));
+    let alternate = alternate
+        .await
+        .expect("request task")
+        .expect("alternate result");
+    assert_eq!(alternate.code, PeerStatusCode::Unavailable);
+    assert!(alternate.paths.is_empty());
+
+    let retained = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(SessionId(9)).await })
+    };
+    let request_id = second
+        .recv_request()
+        .await
+        .expect("retained carrier request");
+    assert!(second.receive_response(request_id, PeerStatusCode::Disabled, Vec::new()));
+    assert_eq!(
+        retained
+            .await
+            .expect("request task")
+            .expect("retained result")
+            .code,
+        PeerStatusCode::Disabled
+    );
+
+    let cancelled = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(SessionId(9)).await })
+    };
+    let _ = second
+        .recv_request()
+        .await
+        .expect("request before cancellation");
+    cancelled.abort();
+    assert!(
+        cancelled
+            .await
+            .expect_err("cancelled request task")
+            .is_cancelled()
+    );
+
+    let after_cancel = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(SessionId(9)).await })
+    };
+    let request_id = second
+        .recv_request()
+        .await
+        .expect("retained request after cancellation");
+    assert!(second.receive_response(request_id, PeerStatusCode::Ok, vec![status(3)]));
+    assert_eq!(
+        after_cancel
+            .await
+            .expect("request task")
+            .expect("result after cancellation")
+            .paths,
+        vec![status(3)]
+    );
+}

@@ -378,6 +378,7 @@ impl RequestMultipathController {
             });
         RequestDataAckGapObservation {
             has_live_original_path: original_path.is_some(),
+            original_assignment_at: original_flight.map(|(_, sent_at)| sent_at),
             original_underlay,
             original_path_timing,
             reinjection_target: reinjection_path

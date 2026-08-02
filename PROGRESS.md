@@ -11,6 +11,70 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T10:11:09+08:00: request Data-ACK recovery uses its retained flight epoch
+
+- Name: direction-neutral authoritative-gap recovery
+- Category: Core recovery lifecycle and disruption performance
+- State: causal correction accepted; execute the frozen lifecycle and
+  disruption release gates without further model changes
+- Reproduced defect:
+  - after the fat TCP path changed from 500 Mbit/s, 180 ms, 1% loss to
+    20 Mbit/s, 900 ms, 10% loss, the request owner retained four live
+    alternatives and about 2.3 MiB of exact unacknowledged Product data while
+    physical transmission collapsed;
+  - its complete, monotonic Data-ACK snapshot exposed the same missing range,
+    but the request data flow discarded the original assignment epoch and
+    armed a fresh full recovery interval from ACK observation; and
+  - the exact diagnostic run consequently delivered only 72.562 Mbit/s and
+    left one ordered receiver gap for 4.755 seconds. No reinjection service was
+    admitted during that plateau.
+- Clean correction:
+  - a complete Data-ACK frame is one authoritative snapshot; when a cumulative
+    publication requires multiple frames, the RFC already makes every frame
+    positive-only and incomplete, so publication fragmentation cannot create
+    a false omitted range;
+  - request recovery now carries the exact original-flight assignment epoch
+    through its existing immutable observation and applies the same existing
+    transport-derived Data-ACK loss threshold as response recovery;
+  - ACK silence continues to require the existing full MPP recovery interval,
+    and accepted repair remains bounded by retained ranges, measured alternate
+    completion, Product service credit, native enqueue capacity, and the
+    selected alternate's repeat interval; and
+  - no timing value, ratio, queue/resource limit, scheduler score, TCP carrier
+    range, native congestion controller, or platform-specific behavior changed.
+- Causal evidence:
+  - the same diagnostic transition delivered 265.850 Mbit/s, reduced the local
+    sender recovery gap from 3.545 to 0.190 seconds, and reduced the receiver's
+    maximum ordered gap from 4.755 to 2.099 seconds; accepted recovery service
+    is visible in 739 retained reinjection events and the approximate
+    client/payload traffic gap was 2.907%;
+  - a normal release run of the same transition delivered 252.024 Mbit/s with
+    a 1.845-second receiver gap and 4.079% approximate traffic gap, consistent
+    with the earlier healthy 238.262 Mbit/s repeat rather than the reproduced
+    72.562 Mbit/s failure; and
+  - the matched 30-second equal-fat stationary upload delivered 644.809
+    Mbit/s versus the clean 649.766 Mbit/s reference, a 0.76% difference inside
+    ordinary run variation. Both streams completed, the local recovery gap was
+    zero, and the approximate traffic gap was 1.436%.
+- Verification:
+  - the retained-flight identity regression and the shared transport-derived
+    loss-deadline regression pass;
+  - the all-feature suite passes 1,511 library tests, two allocation tests,
+    six packaged daily-use acceptance tests, and doctests;
+  - strict all-target/all-feature Clippy, formatting, and whitespace checks
+    pass; and
+  - evidence is retained under
+    `./.tmp/lab/results/v014-release-upload-spike-model-fix`,
+    `./.tmp/lab/results/v014-release-request-recovery-gate`, and
+    `./.tmp/lab/results/v014-release-request-recovery-equal-fat`. These rows
+    are causal local evidence rather than publishable benchmark claims because
+    the host-validity gate rejects the unrelated external host state and the
+    model-fix source was not yet committed.
+- Next: commit this bounded lifecycle correction, then run only the fixed
+  outage, process-restart, port-migration, ranged-TCP replacement, link-swap,
+  blackhole, and final product/release gates. A new Core change requires a
+  reproducible causal failure in one of those gates.
+
 ## 2026-08-02T09:41:03+08:00: apparent TCP regression rejected by matched-profile control
 
 - Name: historical-binary and immutable-path comparison

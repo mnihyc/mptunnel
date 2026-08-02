@@ -10,6 +10,45 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T12:30:19+08:00: release identity and immutable asset contract corrected
+
+- Name: compact versioned release contract
+- Category: Release packaging, metadata, documentation, and repository hygiene
+- State: accepted for subsequent releases; published v0.1.4 remains unchanged
+  and immutable
+- Root cause: the v0.1.2 packaging rewrite incorrectly treated `version.json`
+  as private workflow evidence and deliberately changed bundle filenames to
+  version-independent names. Neither change was required by the user-facing
+  cleanup request.
+- Corrected contract:
+  - every future release contains exactly seven versioned OS/architecture
+    bundles plus one public `version.json`;
+  - `version.json` retains schema, product, version, tag, and source commit
+    identity, then indexes all seven bundles by only `name` and immutable
+    tag-specific GitHub `download_url`; compiler-version and checksum fields
+    are excluded because GitHub supplies each asset digest;
+  - no separate checksum manifest or per-bundle checksum sidecar is produced;
+  - the project license is no longer duplicated inside every compact archive;
+    the Windows-only Wintun license remains beside its bundled DLL; and
+  - the publishing workflow requires an immutable published state and compares
+    a downloaded `version.json` byte-for-byte with the tag/repository identity
+    generated from the checked-out release source.
+- Evidence:
+  - all nine durable packaging contract tests pass;
+  - Ruff, Bash syntax, Actionlint, Prettier, and whitespace checks pass;
+  - an actual existing Linux release binary repackaged as
+    `mptunnel-0.1.4-linux-amd64.tar.gz` passes the deterministic verifier with
+    exactly five intended files and no project-license copy; and
+  - GitHub reports repository release immutability enabled and published
+    v0.1.4 as `immutable: true`; its original eight assets and tag were not
+    changed.
+- Cleanup: removed all ignored `./.tmp/`, root/Quinn/benchmark Cargo targets,
+  Python test/lint caches, and temporary Git worktrees. Preserved ignored
+  persistent `./docs-dev/` and `AGENTS.md`.
+- Next bounded action: commit this exact clean correction once. A published
+  release is never replaced; any corrected public bundle set requires a later
+  version.
+
 ## 2026-08-02T11:21:54+08:00: complete local v0.1.4 gate passed
 
 - Name: exact-source local release acceptance

@@ -169,7 +169,7 @@ fi
 dist_dir=".tmp/release/dist"
 stage="${dist_dir}/${package}"
 
-release_files=(packaging/README.md LICENSE)
+release_files=(packaging/README.md)
 release_examples=(examples/client.toml examples/server.toml)
 for release_file in "${release_files[@]}" "${release_examples[@]}"; do
   if [[ ! -f "$release_file" ]]; then
@@ -182,7 +182,6 @@ rm -rf "$stage"
 mkdir -p "$stage/examples"
 cp "$binary_path" "$stage/"
 cp packaging/README.md "$stage/README.md"
-cp LICENSE "$stage/"
 cp "${release_examples[@]}" "$stage/examples/"
 
 case "$target_os" in

@@ -1,8 +1,8 @@
 # MPTUNNEL release package
 
 Each archive contains one MPTUNNEL command-line binary, two editable
-client/server examples, and the project license. It is the same MPTUNNEL binary
-for client and server use. Windows archives additionally contain the signed
+client/server examples, and this package guide. It is the same MPTUNNEL binary
+for client and server use. Windows archives additionally contain the signed,
 architecture-matched Wintun runtime and its required license.
 
 ## First run
@@ -108,33 +108,26 @@ network, protect every carrier, target, proxy, and DNS socket before I/O, and
 use external TUN host mode. Low-level host-provider APIs reject process-managed
 TUN mode because they do not own OS route/DNS publication.
 
-## Downloads and checksums
+## Downloads
 
-Release assets use stable, version-independent names:
+Every release uses versioned bundle names:
 
-- `mptunnel-linux-amd64.tar.gz`
-- `mptunnel-linux-arm64.tar.gz`
-- `mptunnel-windows-amd64.zip`
-- `mptunnel-windows-arm64.zip`
-- `mptunnel-macos-amd64.zip`
-- `mptunnel-macos-arm64.zip`
-- `mptunnel-android-arm64.tar.gz`
+- `mptunnel-<version>-linux-amd64.tar.gz`
+- `mptunnel-<version>-linux-arm64.tar.gz`
+- `mptunnel-<version>-windows-amd64.zip`
+- `mptunnel-<version>-windows-arm64.zip`
+- `mptunnel-<version>-macos-amd64.zip`
+- `mptunnel-<version>-macos-arm64.zip`
+- `mptunnel-<version>-android-arm64.tar.gz`
 
-The release page supplies one `SHA256SUMS` manifest for those seven archives.
-On Linux, verify one downloaded archive with:
+The release's `version.json` records its schema, product, version, tag, source
+commit, and the exact name and tag-specific GitHub download URL of every
+bundle. GitHub supplies the digest for each uploaded asset. The extracted
+binary also reports its version with `--version`.
 
-```text
-asset=mptunnel-linux-amd64.tar.gz
-grep "  ${asset}$" SHA256SUMS | sha256sum -c -
-```
-
-On macOS, replace `sha256sum` with `shasum -a 256`. On Windows, compare
-`Get-FileHash <archive> -Algorithm SHA256` with the matching line in
-`SHA256SUMS`.
-
-The release page identifies the version. The extracted binary also reports it
-with `--version`; filenames deliberately remain stable so automated
-`releases/latest/download/...` links do not change shape.
+Once a draft is published, GitHub release immutability freezes its tag, title,
+notes, and assets. Corrections therefore use a new version rather than
+replacing an existing release.
 
 ## Important limits
 

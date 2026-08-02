@@ -68,10 +68,9 @@ measurements, failover results, and limitations.
 
 ## Install
 
-The current packaging workflow produces the obvious OS/architecture archives
-below plus one `SHA256SUMS` manifest. v0.1.4 uses these stable names; the
-historical [v0.1.1 release](../../releases/tag/v0.1.1) keeps its immutable,
-versioned Rust-target filenames.
+The current [v0.1.4 release](../../releases/tag/v0.1.4) is immutable and keeps
+the originally published OS/architecture asset names below. Published releases
+are never replaced.
 
 | Platform | Release asset |
 | --- | --- |
@@ -83,25 +82,17 @@ versioned Rust-target filenames.
 | macOS arm64 | `mptunnel-macos-arm64.zip` |
 | Android arm64 CLI | `mptunnel-android-arm64.tar.gz` |
 
-Release filenames intentionally omit the version so
-`releases/latest/download/<asset>` links remain stable. The release page and
-the binary's `--version` output identify the version.
+Subsequent releases use `mptunnel-<version>-<os>-<architecture>` bundle names
+and publish `version.json`, which lists the release version plus each bundle's
+name and immutable tag-specific download URL. GitHub displays the digest for
+each uploaded asset, and the binary reports its version with `--version`.
 
-Verify one downloaded Linux archive before extracting it:
-
-```bash
-asset=mptunnel-linux-amd64.tar.gz
-grep "  ${asset}$" SHA256SUMS | sha256sum -c -
-```
-
-On macOS, replace `sha256sum` with `shasum -a 256`. On Windows, compare
-`Get-FileHash <archive> -Algorithm SHA256` with the matching `SHA256SUMS`
-line. Each compact archive contains the binary, a package README, `LICENSE`,
-and usable client/server examples. Linux also includes a systemd unit and
-Windows includes its pinned Wintun DLL. The macOS archive intentionally ships
-no privileged service definition. The Android archive contains the command-line
-binary built by the pinned NDK lane; it is not an APK or a one-click
-`VpnService` application.
+Each compact archive contains the binary, a package README, and usable
+client/server examples. Linux also includes a systemd unit. Windows includes
+its pinned Wintun DLL and the DLL's required license. The macOS archive
+intentionally ships no privileged service definition. The Android archive
+contains the command-line binary built by the pinned NDK lane; it is not an APK
+or a one-click `VpnService` application.
 
 ## Quick start
 

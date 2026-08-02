@@ -5,23 +5,51 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import hashlib
 import json
 import pathlib
 import re
+import tomllib
 from collections.abc import Iterable
 
 
 PRODUCT = "mptunnel"
-CHECKSUM_MANIFEST = "SHA256SUMS"
+VERSION_ASSET = "version.json"
+REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[2]
+VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+REPOSITORY_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$"
+)
 COMMON_ARCHIVE_FILES = frozenset(
     {
-        "LICENSE",
         "README.md",
         "examples/client.toml",
         "examples/server.toml",
     }
 )
+
+
+class ReleaseContractError(ValueError):
+    """A release identity, target, asset set, or archive violated the contract."""
+
+
+def repository_package_version() -> str:
+    try:
+        manifest = tomllib.loads(
+            (REPOSITORY_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        )
+        version = manifest["package"]["version"]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        raise ReleaseContractError(
+            f"cannot read the MPTUNNEL package version: {error}"
+        ) from error
+    if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None:
+        raise ReleaseContractError(f"invalid MPTUNNEL package version: {version!r}")
+    return version
+
+
+PACKAGE_VERSION = repository_package_version()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -34,7 +62,7 @@ class ReleaseTarget:
 
     @property
     def slug(self) -> str:
-        parts = [PRODUCT, self.os, self.arch]
+        parts = [PRODUCT, PACKAGE_VERSION, self.os, self.arch]
         if self.variant is not None:
             parts.append(self.variant)
         return "-".join(parts)
@@ -68,6 +96,7 @@ class ReleaseTarget:
     def as_dict(self) -> dict[str, str | None]:
         return {
             "target": self.rust_target,
+            "version": PACKAGE_VERSION,
             "os": self.os,
             "arch": self.arch,
             "variant": self.variant,
@@ -92,10 +121,6 @@ if len(TARGET_BY_RUST_TRIPLE) != len(RELEASE_TARGETS):
     raise AssertionError("release target triples must be unique")
 
 
-class ReleaseContractError(ValueError):
-    """A release target, asset set, or checksum manifest violated the contract."""
-
-
 def target_for_rust_triple(rust_target: str) -> ReleaseTarget:
     try:
         return TARGET_BY_RUST_TRIPLE[rust_target]
@@ -111,7 +136,7 @@ def archive_asset_names() -> tuple[str, ...]:
 
 
 def public_asset_names() -> tuple[str, ...]:
-    return tuple(sorted((*archive_asset_names(), CHECKSUM_MANIFEST)))
+    return tuple(sorted((*archive_asset_names(), VERSION_ASSET)))
 
 
 def expected_directories(files: Iterable[str]) -> frozenset[str]:
@@ -122,14 +147,6 @@ def expected_directories(files: Iterable[str]) -> frozenset[str]:
             directories.add(parent.as_posix())
             parent = parent.parent
     return frozenset(directories)
-
-
-def file_sha256(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _inventory(directory: pathlib.Path) -> set[str]:
@@ -162,73 +179,138 @@ def _require_exact_inventory(directory: pathlib.Path, expected: set[str]) -> Non
         )
 
 
-CHECKSUM_LINE = re.compile(
-    r"^(?P<digest>[0-9a-f]{64})  (?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)$"
-)
-
-
-def read_checksum_manifest(path: pathlib.Path) -> dict[str, str]:
-    try:
-        lines = path.read_text(encoding="ascii").splitlines()
-    except (OSError, UnicodeError) as error:
-        raise ReleaseContractError(
-            f"cannot read checksum manifest {path}: {error}"
-        ) from error
-    if not lines:
-        raise ReleaseContractError("checksum manifest is empty")
-    checksums: dict[str, str] = {}
-    for line in lines:
-        match = CHECKSUM_LINE.fullmatch(line)
-        if match is None:
-            raise ReleaseContractError(f"invalid checksum manifest line: {line!r}")
-        name = match.group("name")
-        if name in checksums:
-            raise ReleaseContractError(f"duplicate checksum entry: {name}")
-        checksums[name] = match.group("digest")
-    if list(checksums) != sorted(checksums):
-        raise ReleaseContractError("checksum manifest entries are not sorted")
-    expected = set(archive_asset_names())
-    actual = set(checksums)
-    if actual != expected:
-        missing = expected - actual
-        extra = actual - expected
-        details = []
-        if missing:
-            details.append("missing: " + ", ".join(sorted(missing)))
-        if extra:
-            details.append("unexpected: " + ", ".join(sorted(extra)))
-        raise ReleaseContractError(
-            "checksum manifest inventory mismatch; " + "; ".join(details)
-        )
-    return checksums
-
-
-def write_checksum_manifest(directory: pathlib.Path) -> pathlib.Path:
-    manifest = directory / CHECKSUM_MANIFEST
-    if manifest.exists():
-        manifest.unlink()
-    _require_exact_inventory(directory, set(archive_asset_names()))
-    lines = [
-        f"{file_sha256(directory / name)}  {name}" for name in archive_asset_names()
+def version_metadata(*, tag: str, commit: str, repository: str) -> dict[str, object]:
+    expected_tag = f"v{PACKAGE_VERSION}"
+    if tag != expected_tag:
+        raise ReleaseContractError(f"release tag must be {expected_tag!r}, got {tag!r}")
+    if COMMIT_RE.fullmatch(commit) is None:
+        raise ReleaseContractError(f"invalid release commit: {commit!r}")
+    if REPOSITORY_RE.fullmatch(repository) is None:
+        raise ReleaseContractError(f"invalid GitHub repository: {repository!r}")
+    assets = [
+        {
+            "name": name,
+            "download_url": (
+                f"https://github.com/{repository}/releases/download/{tag}/{name}"
+            ),
+        }
+        for name in archive_asset_names()
     ]
-    manifest.write_text("\n".join(lines) + "\n", encoding="ascii", newline="\n")
-    return manifest
+    return {
+        "schema_version": 2,
+        "product": PRODUCT,
+        "version": PACKAGE_VERSION,
+        "tag": tag,
+        "commit": commit,
+        "assets": assets,
+    }
 
 
-def verify_public_assets(directory: pathlib.Path, *, with_checksums: bool) -> None:
-    expected = (
-        set(public_asset_names()) if with_checksums else set(archive_asset_names())
+def write_version_asset(
+    directory: pathlib.Path,
+    *,
+    tag: str,
+    commit: str,
+    repository: str,
+) -> pathlib.Path:
+    _require_exact_inventory(directory, set(archive_asset_names()))
+    path = directory / VERSION_ASSET
+    path.write_text(
+        json.dumps(
+            version_metadata(tag=tag, commit=commit, repository=repository),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
-    _require_exact_inventory(directory, expected)
-    if not with_checksums:
-        return
-    checksums = read_checksum_manifest(directory / CHECKSUM_MANIFEST)
-    for name, expected_digest in checksums.items():
-        actual_digest = file_sha256(directory / name)
-        if actual_digest != expected_digest:
+    return path
+
+
+def verify_version_asset(path: pathlib.Path) -> None:
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ReleaseContractError(
+            f"cannot read release version metadata {path}: {error}"
+        ) from error
+    expected_keys = {
+        "schema_version",
+        "product",
+        "version",
+        "tag",
+        "commit",
+        "assets",
+    }
+    if not isinstance(metadata, dict) or set(metadata) != expected_keys:
+        raise ReleaseContractError(
+            "release version metadata must contain exactly: "
+            + ", ".join(sorted(expected_keys))
+        )
+    expected_values = {
+        "schema_version": 2,
+        "product": PRODUCT,
+        "version": PACKAGE_VERSION,
+        "tag": f"v{PACKAGE_VERSION}",
+    }
+    for key, expected in expected_values.items():
+        if metadata[key] != expected:
             raise ReleaseContractError(
-                f"checksum mismatch for {name}: expected {expected_digest}, got {actual_digest}"
+                f"release version metadata {key!r} must be {expected!r}, "
+                f"got {metadata[key]!r}"
             )
+    if (
+        not isinstance(metadata["commit"], str)
+        or COMMIT_RE.fullmatch(metadata["commit"]) is None
+    ):
+        raise ReleaseContractError("release version metadata has an invalid commit")
+    assets = metadata["assets"]
+    if not isinstance(assets, list) or len(assets) != len(RELEASE_TARGETS):
+        raise ReleaseContractError(
+            "release version metadata must index exactly seven bundles"
+        )
+    expected_names = archive_asset_names()
+    actual_names: list[str] = []
+    repository: str | None = None
+    for asset in assets:
+        if not isinstance(asset, dict) or set(asset) != {"name", "download_url"}:
+            raise ReleaseContractError(
+                "each release bundle entry must contain only name and download_url"
+            )
+        name = asset["name"]
+        download_url = asset["download_url"]
+        if not isinstance(name, str) or not isinstance(download_url, str):
+            raise ReleaseContractError("release bundle name and URL must be strings")
+        suffix = f"/releases/download/v{PACKAGE_VERSION}/{name}"
+        github_prefix = "https://github.com/"
+        if not download_url.startswith(github_prefix) or not download_url.endswith(
+            suffix
+        ):
+            raise ReleaseContractError(
+                f"release bundle has an invalid tag-specific GitHub URL: {name}"
+            )
+        current_repository = download_url[len(github_prefix) : -len(suffix)]
+        if REPOSITORY_RE.fullmatch(current_repository) is None:
+            raise ReleaseContractError(
+                f"release bundle has an invalid GitHub repository URL: {name}"
+            )
+        if repository is None:
+            repository = current_repository
+        elif current_repository != repository:
+            raise ReleaseContractError(
+                "release bundle URLs do not use one GitHub repository"
+            )
+        actual_names.append(name)
+    if tuple(actual_names) != expected_names:
+        raise ReleaseContractError(
+            "release version metadata bundle inventory or order is invalid"
+        )
+
+
+def verify_public_assets(directory: pathlib.Path) -> None:
+    _require_exact_inventory(directory, set(public_asset_names()))
+    verify_version_asset(directory / VERSION_ASSET)
 
 
 def parse_args() -> argparse.Namespace:
@@ -245,21 +327,20 @@ def parse_args() -> argparse.Namespace:
 
     subparsers.add_parser("targets", help="list supported Rust target triples")
 
-    assets_parser = subparsers.add_parser(
-        "assets", help="list normalized public release assets"
-    )
-    assets_parser.add_argument("--without-checksums", action="store_true")
+    subparsers.add_parser("assets", help="list normalized public release assets")
 
-    write_parser = subparsers.add_parser(
-        "write-checksums", help="write the one public checksum manifest"
+    version_parser = subparsers.add_parser(
+        "write-version", help="write the public release version index"
     )
-    write_parser.add_argument("--directory", type=pathlib.Path, required=True)
+    version_parser.add_argument("--directory", type=pathlib.Path, required=True)
+    version_parser.add_argument("--tag", required=True)
+    version_parser.add_argument("--commit", required=True)
+    version_parser.add_argument("--repository", required=True)
 
     verify_parser = subparsers.add_parser(
         "verify-assets", help="verify an exact normalized release asset directory"
     )
     verify_parser.add_argument("--directory", type=pathlib.Path, required=True)
-    verify_parser.add_argument("--with-checksums", action="store_true")
     return parser.parse_args()
 
 
@@ -286,19 +367,18 @@ def main() -> None:
             for target in RELEASE_TARGETS:
                 print(target.rust_target)
         elif args.command == "assets":
-            names = (
-                archive_asset_names()
-                if args.without_checksums
-                else public_asset_names()
+            print("\n".join(public_asset_names()))
+        elif args.command == "write-version":
+            print(
+                write_version_asset(
+                    args.directory,
+                    tag=args.tag,
+                    commit=args.commit,
+                    repository=args.repository,
+                )
             )
-            print("\n".join(names))
-        elif args.command == "write-checksums":
-            print(write_checksum_manifest(args.directory))
         elif args.command == "verify-assets":
-            verify_public_assets(
-                args.directory,
-                with_checksums=args.with_checksums,
-            )
+            verify_public_assets(args.directory)
             print(f"verified release assets in {args.directory}")
         else:
             raise AssertionError(f"unhandled command: {args.command}")

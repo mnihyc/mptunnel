@@ -710,8 +710,9 @@ under `[inbounds.admission]`; these limits never derive from Core capacity.
 ## Installed files
 
 Download the archive for the operating system and architecture listed in the
-root [README](../README.md#install), verify it against `SHA256SUMS`, and keep
-its example configurations beside the operator's own protected configuration.
+root [README](../README.md#install), use the digest reported by GitHub when
+independent verification is needed, and keep its example configurations beside
+the operator's own protected configuration.
 
 The Linux archive includes a systemd unit that runs as `mptunnel` and permits
 writes below `/etc/mptunnel`. Create that directory, install `config.toml` as

@@ -134,7 +134,7 @@ try {
     $Package = $Contract.package
     $DistDir = ".tmp/release/dist"
     $Stage = Join-Path $DistDir $Package
-    $ReleaseFiles = @("packaging/README.md", "LICENSE")
+    $ReleaseFiles = @("packaging/README.md")
     $ReleaseExamples = @("examples/client.toml", "examples/server.toml")
     foreach ($ReleaseFile in $ReleaseFiles + $ReleaseExamples) {
         if (-not (Test-Path -PathType Leaf $ReleaseFile)) {
@@ -149,7 +149,6 @@ try {
     New-Item -ItemType Directory -Force $StageExamples | Out-Null
     Copy-Item $BinaryPath $Stage
     Copy-Item "packaging/README.md" (Join-Path $Stage "README.md")
-    Copy-Item "LICENSE" $Stage
     Copy-Item $ReleaseExamples $StageExamples
 
     $WintunArchive = Get-WintunArchive

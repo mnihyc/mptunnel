@@ -364,29 +364,20 @@ jobs:
           path: .tmp/ci/artifacts
           merge-multiple: true
 
-      - name: Assemble exact public assets and workflow version evidence
+      - name: Assemble exact public assets and version metadata
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
-          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          rust_version="$(rustc --version | awk '{print $2}')"
-          mkdir -p .tmp/ci/release-evidence
-          jq -n \
-            --arg version "$version" \
-            --arg tag "$RELEASE_TAG" \
-            --arg commit "$RELEASE_COMMIT" \
-            --arg rust "$rust_version" \
-            '{schema_version: 1, product: "mptunnel", version: $version, tag: $tag, commit: $commit, rust: $rust}' \
-            > .tmp/ci/release-evidence/version.json
+          python3 packaging/tools/release_contract.py write-version \
+            --directory .tmp/ci/artifacts \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --repository "$GITHUB_REPOSITORY"
 
           python3 packaging/tools/release_contract.py verify-assets \
             --directory .tmp/ci/artifacts
-          python3 packaging/tools/release_contract.py write-checksums \
-            --directory .tmp/ci/artifacts
-          python3 packaging/tools/release_contract.py verify-assets \
-            --directory .tmp/ci/artifacts --with-checksums
           python3 packaging/tools/release_contract.py assets > .tmp/ci/expected-assets.txt
 
       - name: Preflight existing release state
@@ -426,6 +417,7 @@ jobs:
           actual_title="$(jq -er .name "$response")"
           prerelease="$(jq -er .prerelease "$response")"
           state="$(jq -er 'if .draft then "draft" else "published" end' "$response")"
+          immutable="$(jq -er '.immutable // false' "$response")"
           [[ "$actual_tag" == "$RELEASE_TAG" ]] || {
             echo "existing release tag mismatch: $actual_tag" >&2
             exit 1
@@ -438,6 +430,10 @@ jobs:
             echo "existing release is unexpectedly marked as a prerelease" >&2
             exit 1
           }
+          if [[ "$state" == published && "$immutable" != true ]]; then
+            echo "published release is not immutable" >&2
+            exit 1
+          fi
 
           jq -r '.assets[].name' "$response" | sort > .tmp/ci/existing-assets.txt
           if [[ -n "$(uniq -d .tmp/ci/existing-assets.txt)" ]]; then
@@ -469,9 +465,16 @@ jobs:
             # reproducible-build assertions. Native PE/Mach-O metadata and
             # runner/toolchain updates can legitimately change a fresh
             # rebuild. Verify the exact public inventory and its downloaded
-            # checksum contract, then leave the release untouched.
+            # version index, bind that index to this tag commit and repository,
+            # then leave the release untouched.
             python3 packaging/tools/release_contract.py verify-assets \
-              --directory .tmp/ci/existing-release-download --with-checksums
+              --directory .tmp/ci/existing-release-download
+            cmp --silent \
+              .tmp/ci/artifacts/version.json \
+              .tmp/ci/existing-release-download/version.json || {
+                echo "published version.json differs from this tag identity" >&2
+                exit 1
+              }
           else
             # A partial draft is resumable only when every already-uploaded
             # byte matches this run's payload.
@@ -485,15 +488,6 @@ jobs:
             done < .tmp/ci/existing-assets.txt
           fi
           echo "state=${state}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload workflow release evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-evidence-${{ github.sha }}
-          path: .tmp/ci/release-evidence/version.json
-          if-no-files-found: error
-          retention-days: 30
-          include-hidden-files: true
 
       - name: Attest release archives
         if: steps.release_state.outputs.state != 'published'
@@ -567,7 +561,7 @@ jobs:
           mkdir -p .tmp/ci/release-download
           gh release download "$RELEASE_TAG" --dir .tmp/ci/release-download
           python3 packaging/tools/release_contract.py verify-assets \
-            --directory .tmp/ci/release-download --with-checksums
+            --directory .tmp/ci/release-download
           gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > .tmp/ci/published-assets.txt
           diff -u .tmp/ci/expected-assets.txt .tmp/ci/published-assets.txt
           while IFS= read -r asset_name; do
@@ -595,6 +589,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
             > .tmp/ci/published-release.json
           test "$(jq -r .draft .tmp/ci/published-release.json)" = false
+          test "$(jq -r .immutable .tmp/ci/published-release.json)" = true
           jq -r '.assets[].name' .tmp/ci/published-release.json | sort \
             > .tmp/ci/published-assets.txt
           diff -u .tmp/ci/expected-assets.txt .tmp/ci/published-assets.txt

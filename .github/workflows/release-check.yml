@@ -342,12 +342,16 @@ jobs:
           path: .tmp/ci/artifacts
           merge-multiple: true
 
-      - name: Verify normalized public inventory and checksums
+      - name: Verify normalized public inventory
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
+          python3 packaging/tools/release_contract.py write-version \
+            --directory .tmp/ci/artifacts \
+            --tag "$CANDIDATE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --repository "$GITHUB_REPOSITORY"
           python3 packaging/tools/release_contract.py verify-assets \
             --directory .tmp/ci/artifacts
-          python3 packaging/tools/release_contract.py write-checksums \
-            --directory .tmp/ci/artifacts
-          python3 packaging/tools/release_contract.py verify-assets \
-            --directory .tmp/ci/artifacts --with-checksums

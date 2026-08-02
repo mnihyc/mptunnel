@@ -34,8 +34,10 @@ For a local Linux release-package check:
 
 ```bash
 packaging/package-release.sh --target x86_64-unknown-linux-musl
+version="$(cargo metadata --locked --no-deps --format-version 1 | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 python3 packaging/tools/verify_release_archive.py \
-  --archive .tmp/release/dist/mptunnel-linux-amd64.tar.gz \
+  --archive ".tmp/release/dist/mptunnel-${version}-linux-amd64.tar.gz" \
   --target x86_64-unknown-linux-musl
 ```
 
@@ -83,15 +85,18 @@ That workflow:
 
 1. repeats the quality and native/NDK package matrix;
 2. transfers normalized archives through one-day Actions staging artifacts;
-3. creates exactly seven documented platform archives and one `SHA256SUMS`;
-4. excludes `version.json`, workflow logs, and raw Actions staging from release
-   assets, while publishing repository-bound provenance attestations;
+3. creates exactly seven versioned platform archives and one `version.json`;
+4. records the release identity and each bundle's name and tag-specific GitHub
+   URL in `version.json`, while GitHub supplies asset digests;
 5. creates a draft using only the eight allowlisted public files;
 6. downloads and verifies the draft from scratch; and
-7. publishes only after the exact-inventory and checksum checks pass.
+7. publishes only after the exact inventory and version index pass, at which
+   point GitHub release immutability freezes the tag, title, notes, and assets.
 
 Never upload the automatic Actions artifact ZIP, a target directory, raw build
-logs, `version.json`, or provenance sidecars as user-facing release assets.
+logs, a separate checksum manifest, or provenance sidecars as user-facing
+release assets. Never replace a published release; corrections require a new
+version.
 
 ## Sources of truth
 

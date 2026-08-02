@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import pathlib
 import re
 import shlex
@@ -13,13 +14,14 @@ import zipfile
 
 from build_release_archive import build_archive
 from release_contract import (
-    CHECKSUM_MANIFEST,
+    PACKAGE_VERSION,
     RELEASE_TARGETS,
+    VERSION_ASSET,
     ReleaseContractError,
     archive_asset_names,
     public_asset_names,
     verify_public_assets,
-    write_checksum_manifest,
+    write_version_asset,
 )
 from verify_release_archive import ReleaseArchiveError, verify_archive
 
@@ -40,6 +42,15 @@ def make_stage(root: pathlib.Path, target_index: int) -> pathlib.Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(f"{target.rust_target}:{relative}\n".encode())
     return stage
+
+
+def write_test_version_asset(root: pathlib.Path) -> pathlib.Path:
+    return write_version_asset(
+        root,
+        tag=f"v{PACKAGE_VERSION}",
+        commit="0" * 40,
+        repository="example/mptunnel",
+    )
 
 
 class ReleaseArchiveTests(unittest.TestCase):
@@ -84,24 +95,37 @@ class ReleaseArchiveTests(unittest.TestCase):
                     TEST_EPOCH,
                 )
 
-    def test_one_checksum_manifest_covers_exactly_seven_archives(self) -> None:
+    def test_public_inventory_has_version_metadata_and_seven_archives(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for name in archive_asset_names():
                 (root / name).write_bytes(f"archive:{name}\n".encode())
-            manifest = write_checksum_manifest(root)
-            self.assertEqual(manifest.name, CHECKSUM_MANIFEST)
+            version_asset = write_test_version_asset(root)
             self.assertEqual(len(archive_asset_names()), 7)
             self.assertEqual(len(public_asset_names()), 8)
-            self.assertFalse(
-                any(name.endswith(".sha256") for name in public_asset_names())
+            self.assertEqual(version_asset.name, VERSION_ASSET)
+            self.assertIn(VERSION_ASSET, public_asset_names())
+            self.assertNotIn("SHA256SUMS", public_asset_names())
+            self.assertTrue(
+                all(
+                    name.startswith(f"mptunnel-{PACKAGE_VERSION}-")
+                    for name in archive_asset_names()
+                )
             )
-            self.assertNotIn("version.json", public_asset_names())
-            verify_public_assets(root, with_checksums=True)
+            metadata = json.loads(version_asset.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(metadata),
+                {"schema_version", "product", "version", "tag", "commit", "assets"},
+            )
+            self.assertEqual(
+                [set(asset) for asset in metadata["assets"]],
+                [{"name", "download_url"}] * 7,
+            )
+            verify_public_assets(root)
 
             (root / "raw-actions-artifact.zip").write_bytes(b"private staging\n")
             with self.assertRaises(ReleaseContractError):
-                verify_public_assets(root, with_checksums=True)
+                verify_public_assets(root)
 
     def test_platform_helpers_are_explicit_and_non_overlapping(self) -> None:
         by_os = {target.os: target for target in RELEASE_TARGETS}
@@ -141,7 +165,6 @@ class ReleaseArchiveTests(unittest.TestCase):
             "packaging/service/systemd/mptunnel.service",
             "examples/client.toml",
             "examples/server.toml",
-            "LICENSE",
         )
         for relative in required_sources:
             with self.subTest(source=relative):
@@ -151,7 +174,8 @@ class ReleaseArchiveTests(unittest.TestCase):
             encoding="utf-8"
         )
         for asset in archive_asset_names():
-            self.assertIn(f"`{asset}`", package_readme)
+            documented = asset.replace(PACKAGE_VERSION, "<version>", 1)
+            self.assertIn(f"`{documented}`", package_readme)
         for target in RELEASE_TARGETS:
             self.assertNotIn(target.rust_target, package_readme)
 
@@ -161,15 +185,17 @@ class ReleaseArchiveTests(unittest.TestCase):
         )
         self.assertNotIn('gh release create "$RELEASE_TAG" artifacts/*', workflow)
         self.assertNotIn("dist/*.sha256", workflow)
+        self.assertNotIn("write-checksums", workflow)
+        self.assertNotIn("--with-checksums", workflow)
+        self.assertIn("write-version", workflow)
+        self.assertIn('--repository "$GITHUB_REPOSITORY"', workflow)
         self.assertIn("packaging/tools/release_contract.py verify-assets", workflow)
         self.assertIn('"${release_assets[@]}"', workflow)
         self.assertIn("Preflight existing release state", workflow)
         self.assertIn("state=absent", workflow)
         self.assertIn('"draft" else "published"', workflow)
         self.assertIn("immutable published release is a verification", workflow)
-        self.assertIn(
-            "Published artifacts are immutable release inputs", workflow
-        )
+        self.assertIn("Published artifacts are immutable release inputs", workflow)
         self.assertIn("existing draft asset differs from this build", workflow)
         self.assertIn("Complete matching draft payload", workflow)
         self.assertIn("missing-draft-assets.txt", workflow)
@@ -185,9 +211,9 @@ class ReleaseArchiveTests(unittest.TestCase):
         expected_targets = {target.rust_target for target in RELEASE_TARGETS}
         for name in ("ci.yml", "release-check.yml", "release.yml"):
             with self.subTest(workflow=name):
-                workflow = (
-                    REPOSITORY_ROOT / ".github/workflows" / name
-                ).read_text(encoding="utf-8")
+                workflow = (REPOSITORY_ROOT / ".github/workflows" / name).read_text(
+                    encoding="utf-8"
+                )
                 configured_targets = set(
                     re.findall(r"^\s+target:\s+(\S+)\s*$", workflow, re.MULTILINE)
                 )
@@ -213,9 +239,9 @@ class ReleaseArchiveTests(unittest.TestCase):
                         workflow,
                     )
 
-        ci_workflow = (
-            REPOSITORY_ROOT / ".github/workflows/ci.yml"
-        ).read_text(encoding="utf-8")
+        ci_workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("actions/upload-artifact", ci_workflow)
         self.assertNotIn("gh release", ci_workflow)
 

@@ -16,7 +16,7 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::timing::{
-    reliable_data_ack_gap_reinjection_deadline, reliable_data_retransmission_interval,
+    reliable_data_ack_recovery_deadline, reliable_data_retransmission_interval,
 };
 use crate::model::work::reliable_reinjection_service_limit_bytes;
 use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
@@ -433,8 +433,8 @@ pub(super) struct ClientDataAckReinjectionOutcome {
     pub(super) has_multipath_alternative: bool,
 }
 
-/// Evaluates retained authoritative Data ACK evidence against the exact
-/// original-flight assignment and one measured alternative.
+/// Evaluates retained Data ACK evidence. Request feedback may be fragmented
+/// across paths, so portable recovery requires one RTO/PTO of the same gap.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
 pub(super) fn evaluate_client_data_ack_reinjection(
@@ -488,10 +488,10 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         .or(reinjection.original_underlay)
         .or(path_snapshot.map(|snapshot| snapshot.underlay));
     let observed_at = Instant::now();
-    let candidate_gap_deadline = has_live_original_path
+    let candidate_recovery_deadline = has_live_original_path
         .then(|| {
-            reliable_data_ack_gap_reinjection_deadline(
-                reinjection.original_assignment_at,
+            reliable_data_ack_recovery_deadline(
+                Some(observed_at),
                 ack_gap_original_underlay,
                 original_path_timing,
                 reinjection.reinjection_completion,
@@ -502,9 +502,9 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         authoritative_ack_complete,
         authoritative_ack_ranges,
         has_multipath_reinjection_alternative,
-        candidate_gap_deadline,
+        candidate_recovery_deadline,
     );
-    let measured_reinjection_ready = candidate_gap_deadline.is_some()
+    let measured_reinjection_ready = candidate_recovery_deadline.is_some()
         && recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
     let reinjection_retry_after = reinjection_target.map_or_else(
         || reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing),

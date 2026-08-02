@@ -1931,10 +1931,13 @@ snapshot:
 These are MPP estimates. They do not read, reset, or replace a native TCP RTO
 or QUIC PTO.
 
-After a Data ACK transaction in either direction leaves a retained complete
-snapshot with an omitted range, it may authorize bounded repair on one
-measured alternate after the original flight exceeds the local MPP Data-ACK
-threshold:
+For request-direction feedback whose fragments may arrive on different
+carriers, the same lowest missing frontier waits one MPP recovery interval
+from its first authoritative observation.
+
+For response-direction feedback, a later MPP Data ACK event may authorize
+bounded repair on one measured alternate after the original flight exceeds the
+local MPP Data-ACK threshold:
 
 - `5/4 * SRTT` for TCP; or
 - `9/8 * SRTT` for QUIC;
@@ -1951,11 +1954,7 @@ authority: the selected TCP or QUIC sender remains the final enqueue, pacing,
 congestion, and recovery authority. These ratios are local approximations
 inspired by transport time-threshold loss detection; the TCP ratio is not RFC
 8985 RACK and the QUIC ratio is not QUIC's native RFC 9002 loss decision. ACK
-silence alone waits one MPP recovery interval. A multi-frame cumulative ACK
-publication consists only of positive, incomplete frames and cannot establish
-an omission; a complete snapshot is one authoritative transaction. Therefore
-the request and response directions use the same original-flight assignment
-epoch and Data-ACK loss threshold.
+silence alone waits one MPP recovery interval.
 
 When a persistent-gap reinjection attempt is accepted by a selected alternate,
 its repeat deadline is fixed from that alternate's observed MPP recovery

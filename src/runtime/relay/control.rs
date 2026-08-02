@@ -767,6 +767,14 @@ where
             state.progress.last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot),
         );
+        let recv_progress_resend_active = remotes.path_keys().len() > 1
+            && reliable_relay_recv_progress_resend_active(
+                &recv_stream,
+                state.endpoint.remote_open,
+                path_snapshot.map(|snapshot| snapshot.underlay),
+            );
+        let recv_progress_ack_update_pending =
+            state.endpoint.remote_open && state.progress.recv_progress.ack_update_pending();
         if state
             .progress
             .sender_retry_at
@@ -830,16 +838,8 @@ where
             .next_reinjection_deadline()
             .is_some_and(|deadline| deadline <= Instant::now());
         let inbound_frame_ready = deferred_remote_frame.is_some() || remotes.has_buffered_frame();
-        let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
-            sender_queue.is_empty(),
-            state.progress.sender_retry_at,
-        );
         let pending_remote_fin_ready =
             pending_stream_fin_ready(&recv_stream, state.endpoint.pending_remote_fin_offset);
-        let final_feedback_retry_blocked = pending_remote_fin_ready
-            && remotes.has_receive_feedback_output()
-            && state.progress.sender_retry_at.is_some();
-        let timed_carrier_retry_blocked = queued_send_blocked || final_feedback_retry_blocked;
         if !remotes.has_pending_stream_ack_publication() {
             stream_ack_capacity_wait = None;
         } else if stream_ack_capacity_wait.is_none() {
@@ -866,6 +866,29 @@ where
         }
         let max_data_publication_blocked = remotes.has_pending_max_data_publication();
         let has_max_data_capacity_wait = max_data_capacity_wait.is_some();
+        let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
+            sender_queue.is_empty(),
+            state.progress.sender_retry_at,
+        );
+        let final_feedback_retry_blocked = pending_remote_fin_ready
+            && remotes.has_receive_feedback_output()
+            && state.progress.sender_retry_at.is_some();
+        let pending_local_fin_ready = reliable_relay_can_send_pending_fin(
+            state.endpoint.pending_local_fin,
+            sender_queue.is_empty(),
+        );
+        let terminal_fin_replay_pending = stream_terminal_fin_replay_required(
+            state.endpoint.local_fin_sent,
+            state.endpoint.terminal_fin_replayed,
+            sender_queue.is_empty(),
+        );
+        // STREAM_FIN uses the ordered carrier lane, so a live carrier can
+        // temporarily reject it while previously accepted data drains. Keep
+        // terminal state pending and reuse the ordinary capacity/retry wakeup.
+        let terminal_control_retry_blocked = state.progress.sender_retry_at.is_some()
+            && (pending_local_fin_ready || terminal_fin_replay_pending);
+        let timed_carrier_retry_blocked =
+            queued_send_blocked || final_feedback_retry_blocked || terminal_control_retry_blocked;
         let queued_send_ready =
             !sender_queue.is_empty() && !queued_send_blocked && !inbound_frame_ready;
         let queued_send_retry_deadline = state
@@ -912,15 +935,9 @@ where
             && can_read_by_flow
             && prospective_read_budget > 0
             && !inbound_frame_ready;
-        let can_send_pending_fin = reliable_relay_can_send_pending_fin(
-            state.endpoint.pending_local_fin,
-            sender_queue.is_empty(),
-        );
-        let terminal_fin_replay_ready = stream_terminal_fin_replay_required(
-            state.endpoint.local_fin_sent,
-            state.endpoint.terminal_fin_replayed,
-            sender_queue.is_empty(),
-        );
+        let can_send_pending_fin = pending_local_fin_ready && !terminal_control_retry_blocked;
+        let terminal_fin_replay_ready =
+            terminal_fin_replay_pending && !terminal_control_retry_blocked;
         #[cfg(feature = "lab-diagnostics")]
         {
             if state.endpoint.local_open && !can_read_local {
@@ -1343,18 +1360,19 @@ where
                 state.progress.last_response_stall_reinjection_at = Instant::now();
                 state.progress.last_product_stall_attempt_at = Some(Instant::now());
             }
-            _ = tokio::time::sleep_until(recv_progress_deadline), if remotes.path_keys().len() > 1
-                && reliable_relay_recv_progress_resend_active(
-                    &recv_stream,
-                    state.endpoint.remote_open,
-                    path_snapshot.map(|snapshot| snapshot.underlay),
-                ) => {
+            _ = tokio::time::sleep_until(recv_progress_deadline), if recv_progress_resend_active
+                || recv_progress_ack_update_pending => {
+                let recv_progress_send = if recv_progress_resend_active {
+                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                } else {
+                    RelayRecvProgressSend::ack_only(path_snapshot, relay_lane)
+                };
                 match sender.send_recv_progress(
                     &mut remotes,
                     context,
                     &mut recv_stream,
                     &mut state.progress.recv_progress,
-                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                    recv_progress_send,
                 )
                 .await
                 {
@@ -1433,6 +1451,13 @@ where
                             Err(err) => break Err(err),
                         }
                     }
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        state.progress.sender_retry_at = Some(
+                            tokio::time::Instant::now()
+                                + sender_service_retry_delay(path_snapshot),
+                        );
+                        continue;
+                    }
                     Err(err) => break Err(err),
                 }
             }
@@ -1487,6 +1512,13 @@ where
                             Ok(_) => break Err(err),
                             Err(err) => break Err(err),
                         }
+                    }
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        state.progress.sender_retry_at = Some(
+                            tokio::time::Instant::now()
+                                + sender_service_retry_delay(path_snapshot),
+                        );
+                        continue;
                     }
                     Err(err) => break Err(err),
                 }
@@ -2206,6 +2238,12 @@ where
                                         Ok(_) => break Err(err),
                                         Err(err) => break Err(err),
                                     }
+                                }
+                                Err(RuntimeError::SenderServiceBlocked) => {
+                                    state.progress.sender_retry_at = Some(
+                                        tokio::time::Instant::now()
+                                            + sender_service_retry_delay(path_snapshot),
+                                    );
                                 }
                                 Err(err) => break Err(err),
                             }

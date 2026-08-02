@@ -370,13 +370,13 @@
 
   function trafficCell(summary) {
     const content = createElement("div");
-    content.append(createElement("span", "cell-primary", formatBytes(summary.toPeer.toString()) + " upload"));
-    content.append(createElement("span", "cell-secondary", formatBytes(summary.fromPeer.toString()) + " download"));
+    content.append(createElement("span", "cell-primary", formatBytes(summary.toPeer.toString())));
+    content.append(createElement("span", "cell-secondary", formatBytes(summary.fromPeer.toString())));
     content.append(createElement(
       "span",
       "cell-secondary",
       formatCount(summary.toPeerPackets.toString()) + " / " +
-        formatCount(summary.fromPeerPackets.toString()) + " packets"
+        formatCount(summary.fromPeerPackets.toString())
     ));
     return content;
   }
@@ -869,12 +869,12 @@
       appendCell(row, "Class", entry[0], "cell-primary");
       const toPeer = createElement("div");
       toPeer.append(createElement("span", "cell-primary", formatBytes(io.to_peer_bytes)));
-      toPeer.append(createElement("span", "cell-secondary", formatCount(io.to_peer_packets) + " packets"));
-      appendCell(row, "Upload", toPeer);
+      toPeer.append(createElement("span", "cell-secondary", formatCount(io.to_peer_packets)));
+      appendCell(row, "Upload bytes / packets", toPeer);
       const fromPeer = createElement("div");
       fromPeer.append(createElement("span", "cell-primary", formatBytes(io.from_peer_bytes)));
-      fromPeer.append(createElement("span", "cell-secondary", formatCount(io.from_peer_packets) + " packets"));
-      appendCell(row, "Download", fromPeer);
+      fromPeer.append(createElement("span", "cell-secondary", formatCount(io.from_peer_packets)));
+      appendCell(row, "Download bytes / packets", fromPeer);
       appendCell(row, "Opened", formatCount(flows.opened));
       appendCell(row, "Active", formatCount(flows.active));
       appendCell(row, "Completed", formatCount(flows.completed));
@@ -965,14 +965,14 @@
       [
         "Outbound scopes",
         admission.tracked_outbounds,
-        formatCount(limits.max_live_flows_per_outbound) + " flows / " + formatCount(limits.max_connects_per_outbound) + " connects",
-        formatCount(rejections.outbound_live_flows) + " flows / " + formatCount(rejections.outbound_connects) + " connects"
+        formatCount(limits.max_live_flows_per_outbound) + " / " + formatCount(limits.max_connects_per_outbound),
+        formatCount(rejections.outbound_live_flows) + " / " + formatCount(rejections.outbound_connects)
       ],
       [
         "Target scopes",
         admission.tracked_targets,
-        formatCount(limits.max_live_flows_per_target) + " flows / " + formatCount(limits.max_connects_per_target) + " connects",
-        formatCount(rejections.target_live_flows) + " flows / " + formatCount(rejections.target_connects) + " connects"
+        formatCount(limits.max_live_flows_per_target) + " / " + formatCount(limits.max_connects_per_target),
+        formatCount(rejections.target_live_flows) + " / " + formatCount(rejections.target_connects)
       ]
     ];
     elements.admissionBody.replaceChildren();
@@ -992,7 +992,7 @@
     appendCell(row, "Type", badge(titleCase(flow.flow_kind), flow.flow_kind === "datagram" ? "warning" : "neutral"));
 
     const inbound = createElement("div");
-    inbound.append(createElement("span", "cell-primary", flow.inbound || "Unknown inbound"));
+    inbound.append(createElement("span", "cell-primary", flow.inbound || "--"));
     inbound.append(createElement("span", "cell-secondary", titleCase(flow.inbound_kind)));
     appendCell(row, "Inbound", inbound);
 
@@ -1001,23 +1001,23 @@
     connection.append(createElement(
       "span",
       "cell-secondary cell-mono",
-      flow.session_id ? "session " + formatIdentifier(flow.session_id) : "local"
+      flow.session_id ? formatIdentifier(flow.session_id) : "Local"
     ));
     appendCell(row, "Connection", connection);
     appendCell(row, "Network", String(flow.network || "--").toUpperCase());
-    appendCell(row, "Destination", flow.target ? String(flow.target) : "Multiple targets");
+    appendCell(row, "Destination", flow.target ? String(flow.target) : "Multiple");
 
     const egress = createElement("div");
-    egress.append(createElement("span", "cell-primary", flow.outbound || "Pending selection"));
-    if (flow.balancer) egress.append(createElement("span", "cell-secondary", "via " + flow.balancer));
+    egress.append(createElement("span", "cell-primary", flow.outbound || "Pending"));
+    if (flow.balancer) egress.append(createElement("span", "cell-secondary", flow.balancer));
     appendCell(row, "Outbound", egress);
 
     const activity = createElement("div");
-    activity.append(createElement("span", "cell-primary", formatDuration(flow.age_ms) + " old"));
-    activity.append(createElement("span", "cell-secondary", formatDuration(flow.idle_ms) + " idle"));
-    appendCell(row, "Activity", activity);
+      activity.append(createElement("span", "cell-primary", formatDuration(flow.age_ms)));
+      activity.append(createElement("span", "cell-secondary", formatDuration(flow.idle_ms)));
+    appendCell(row, "Age / idle", activity);
 
-    appendCell(row, "Traffic", trafficCell(summarizeFlowIo([flow])));
+    appendCell(row, "Upload / download / packets", trafficCell(summarizeFlowIo([flow])));
     return row;
   }
 
@@ -1055,12 +1055,12 @@
       appendCell(row, "Name", inbound.name || titleCase(inbound.protocol), "cell-primary");
       appendCell(row, "Protocol", titleCase(inbound.protocol));
       const listeners = asArray(inbound.listen).map(String);
-      if (inbound.interface_name) listeners.push("interface " + inbound.interface_name);
-      appendCell(row, "Listen / interface", listeners.join(", ") || "Host-provided");
-      appendCell(row, "Target", inbound.target || "Routed per connection");
+      if (inbound.interface_name) listeners.push(inbound.interface_name);
+      appendCell(row, "Listen / interface", listeners.join(", ") || "Host");
+      appendCell(row, "Target", inbound.target || "Route");
       appendCell(row, "Authentication", inbound.auth_required ? badge("Required", "success") : badge("None", "neutral"));
       appendCell(row, "Shown", formatCount(inboundFlows.length));
-      appendCell(row, "Shown I/O", trafficCell(summarizeFlowIo(inboundFlows)));
+      appendCell(row, "Upload / download / packets", trafficCell(summarizeFlowIo(inboundFlows)));
       elements.inboundServicesBody.append(row);
     });
 
@@ -1082,7 +1082,7 @@
         asArray(outbound.networks).map(function (network) { return String(network).toUpperCase(); }).join(" + ") || "--"
       );
       appendCell(row, "Shown", formatCount(outboundFlows.length));
-      appendCell(row, "Shown I/O", trafficCell(summarizeFlowIo(outboundFlows)));
+      appendCell(row, "Upload / download / packets", trafficCell(summarizeFlowIo(outboundFlows)));
       elements.outboundServicesBody.append(row);
     });
   }
@@ -1101,23 +1101,29 @@
       strategy.append(createElement(
         "span",
         "cell-secondary",
-        balancer.manual_outbound ? "pinned to " + balancer.manual_outbound : "automatic / generation " + formatIdentifier(balancer.generation)
+        balancer.manual_outbound
+          ? "Manual / " + balancer.manual_outbound
+          : "Auto / " + formatIdentifier(balancer.generation)
       ));
-      appendCell(row, "Strategy", strategy);
+      appendCell(row, "Strategy / generation", strategy);
 
       const members = createElement("div");
-      members.append(createElement("span", "cell-primary", formatCount(balancer.ready_members) + " ready"));
       members.append(createElement(
         "span",
-        "cell-secondary",
-        formatCount(balancer.draining_members) + " draining / " + formatCount(balancer.unavailable_members) + " unavailable"
+        "cell-primary",
+        formatCount(balancer.ready_members) + " / " +
+          formatCount(balancer.draining_members) + " / " +
+          formatCount(balancer.unavailable_members)
       ));
-      appendCell(row, "Members", members);
+      appendCell(row, "Ready / drain / unavailable", members);
 
       const load = createElement("div");
-      load.append(createElement("span", "cell-primary", formatCount(balancer.active_flows) + " active"));
-      load.append(createElement("span", "cell-secondary", formatCount(balancer.pending_flows) + " pending"));
-      appendCell(row, "Load", load);
+      load.append(createElement(
+        "span",
+        "cell-primary",
+        formatCount(balancer.active_flows) + " / " + formatCount(balancer.pending_flows)
+      ));
+      appendCell(row, "Active / pending", load);
 
       const probeValue = asObject(balancer.probe);
       const probe = createElement("div");
@@ -1126,12 +1132,12 @@
         probe.append(createElement(
           "span",
           "cell-secondary",
-          formatDuration(probeValue.interval_ms) + " interval / " + formatDuration(probeValue.timeout_ms) + " timeout"
+          formatDuration(probeValue.interval_ms) + " / " + formatDuration(probeValue.timeout_ms)
         ));
       } else {
-        probe.append(createElement("span", "cell-primary", "Disabled"));
+        probe.append(createElement("span", "cell-primary", "--"));
       }
-      appendCell(row, "Probe", probe);
+      appendCell(row, "Probe / interval / timeout", probe);
       elements.overviewBalancersBody.append(row);
     });
   }
@@ -1200,7 +1206,7 @@
       const table = createElement("table", "records-table records-table--balancers");
       const head = createElement("thead");
       const headRow = createElement("tr");
-      ["Outbound", "Readiness", "Health", "Latency evidence", "Load", "Outcomes", "Last event", "Actions"].forEach(function (label) {
+      ["Outbound", "Readiness", "Health", "Latency / source / age", "Active / pending", "Open / flow / probe / eject / recover", "Selection / error", "Actions"].forEach(function (label) {
         headRow.append(createElement("th", "", label));
       });
       head.append(headRow);
@@ -1211,7 +1217,7 @@
 
         const identity = createElement("div");
         identity.append(createElement("span", "cell-primary", member.outbound || "--"));
-        identity.append(createElement("span", "cell-secondary", asArray(member.networks).map(titleCase).join(" + ") || "No networks"));
+        identity.append(createElement("span", "cell-secondary", asArray(member.networks).map(titleCase).join(" + ") || "--"));
         appendCell(row, "Outbound", identity);
 
         const readiness = createElement("div");
@@ -1221,10 +1227,10 @@
 
         const health = createElement("div");
         health.append(balancerBadge(member.health));
-        const freshness = titleCase(member.freshness) + (member.probe_in_flight ? " / probe running" : "");
+        const freshness = titleCase(member.freshness) + (member.probe_in_flight ? " / Probe" : "");
         health.append(createElement("span", "cell-secondary", freshness));
         if (member.cooldown_remaining_ms !== undefined) {
-          health.append(createElement("span", "cell-secondary", formatDuration(member.cooldown_remaining_ms) + " cooldown"));
+          health.append(createElement("span", "cell-secondary", formatDuration(member.cooldown_remaining_ms)));
         }
         appendCell(row, "Health", health);
 
@@ -1235,52 +1241,52 @@
           member.latency_ewma_us === undefined ? "--" : formatRtt(finiteNumber(member.latency_ewma_us) / 1000)
         ));
         const observation = member.latency_age_ms === undefined
-          ? "no latency sample"
-          : titleCase(member.latency_source) + " " + formatDuration(member.latency_age_ms) + " ago";
+          ? "--"
+          : titleCase(member.latency_source) + " / " + formatDuration(member.latency_age_ms);
         latency.append(createElement("span", "cell-secondary", observation));
-        appendCell(row, "Latency evidence", latency);
+        appendCell(row, "Latency / source / age", latency);
 
         const load = createElement("div");
-        load.append(createElement("span", "cell-primary", formatCount(member.active_flows) + " active"));
-        load.append(createElement("span", "cell-secondary", formatCount(member.pending_flows) + " pending"));
-        appendCell(row, "Load", load);
+        load.append(createElement("span", "cell-primary", formatCount(member.active_flows) + " / " + formatCount(member.pending_flows)));
+        appendCell(row, "Active / pending", load);
 
         const counters = asObject(member.counters);
         const outcomes = createElement("div");
         outcomes.append(createElement(
           "span",
           "cell-primary",
-          "open " + formatCount(counters.open_successes) + " ok / " + formatCount(counters.open_failures) + " failed"
+          formatCount(counters.open_successes) + " / " + formatCount(counters.open_failures)
         ));
         outcomes.append(createElement(
           "span",
           "cell-secondary",
-          "flow " + formatCount(counters.flow_successes) + "/" + formatCount(counters.flow_failures) +
-            " / probe " + formatCount(counters.probe_successes) + "/" + formatCount(counters.probe_failures)
+          formatCount(counters.flow_successes) + "/" + formatCount(counters.flow_failures) +
+            " · " + formatCount(counters.probe_successes) + "/" + formatCount(counters.probe_failures)
         ));
         outcomes.append(createElement(
           "span",
           "cell-secondary",
-          formatCount(counters.ejections) + " ejections / " + formatCount(counters.recoveries) + " recoveries"
+          formatCount(counters.ejections) + " / " + formatCount(counters.recoveries)
         ));
-        appendCell(row, "Outcomes", outcomes);
+        appendCell(row, "Open / flow / probe / eject / recover", outcomes);
 
         const lastEvent = createElement("div");
         lastEvent.append(createElement(
           "span",
           "cell-primary",
           member.last_selection_reason
-            ? titleCase(member.last_selection_reason) + " / " + formatDuration(member.last_selected_age_ms) + " ago"
-            : "Never selected"
+            ? titleCase(member.last_selection_reason) + " / " + formatDuration(member.last_selected_age_ms)
+            : "--"
         ));
         lastEvent.append(createElement(
           "span",
           member.last_error ? "cell-secondary balancer-error" : "cell-secondary",
           member.last_error
-            ? String(member.last_error) + " / " + formatDuration(member.last_error_age_ms) + " ago"
-            : formatCount(counters.selections) + " selections / " + formatCount(counters.open_attempts) + " attempts"
+            ? "Error / " + formatDuration(member.last_error_age_ms)
+            : formatCount(counters.selections) + " / " + formatCount(counters.open_attempts)
         ));
-        appendCell(row, "Last event", lastEvent);
+        if (member.last_error) lastEvent.title = String(member.last_error);
+        appendCell(row, "Selection / error", lastEvent);
 
         const actions = createElement("div", "balancer-actions balancer-actions--member");
         actions.append(
@@ -1363,17 +1369,17 @@
 
     const identity = createElement("div");
     identity.append(createElement("span", "cell-primary", formatIdentifier(path.path)));
-    identity.append(createElement("span", "cell-secondary", path.endpoint || "No network endpoint"));
+    identity.append(createElement("span", "cell-secondary", path.endpoint || "--"));
     identity.append(createElement(
       "span",
       "cell-secondary cell-mono",
-      "path " + formatIdentifier(path.path_id) + " / instance " + formatIdentifier(path.path_instance_id)
+      formatIdentifier(path.path_id) + " / " + formatIdentifier(path.path_instance_id)
     ));
-    appendCell(row, "Path", identity);
+    appendCell(row, "Path / instance", identity);
 
     const service = createElement("div");
     service.append(createElement("span", "cell-primary", serviceLabel(path)));
-    service.append(createElement("span", "cell-secondary", titleCase(path.service) + " / session " + formatIdentifier(path.session_id)));
+    service.append(createElement("span", "cell-secondary", titleCase(path.service) + " / " + formatIdentifier(path.session_id)));
     appendCell(row, "Service / session", service);
 
     const carrier = createElement("div");
@@ -1382,11 +1388,11 @@
       carrier.append(createElement(
         "span",
         "cell-secondary",
-        "carrier " + formatIdentifier(path.tcp_carrier_ordinal) + " / bounds " +
+        formatIdentifier(path.tcp_carrier_ordinal) + " / " +
           formatIdentifier(path.tcp_carriers_min) + "-" + formatIdentifier(path.tcp_carriers_max)
       ));
     } else {
-      carrier.append(createElement("span", "cell-secondary", "UDP underlay"));
+      carrier.append(createElement("span", "cell-secondary", "--"));
     }
     appendCell(row, "Carrier / bounds", carrier);
 
@@ -1406,48 +1412,48 @@
 
     const rtt = createElement("div");
     rtt.append(createElement("span", "cell-primary", formatRtt(path.srtt_ms)));
-    rtt.append(createElement("span", "cell-secondary", "jitter " + formatRtt(path.jitter_ms)));
+    rtt.append(createElement("span", "cell-secondary", formatRtt(path.jitter_ms)));
     appendCell(row, "RTT / jitter", rtt);
 
     const delivery = createElement("div");
     delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
-    delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps) + " pacing"));
+    delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
     appendCell(row, "Delivery / pacing", delivery);
 
     const loss = createElement("div");
     loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
-    loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm) + " ECN"));
+    loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
     appendCell(row, "Loss / ECN", loss);
 
     const flight = createElement("div");
-    flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes) + " queued"));
+    flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes)));
     flight.append(createElement(
       "span",
       "cell-secondary",
-      formatBytes(path.bytes_in_flight) + " native / " + formatBytes(path.data_level_bytes_in_flight) + " data"
+      formatBytes(path.bytes_in_flight) + " / " + formatBytes(path.data_level_bytes_in_flight)
     ));
-    flight.append(createElement("span", "cell-secondary", formatBytes(path.inflight_limit_bytes) + " limit"));
-    appendCell(row, "Queue / flight / limit", flight);
+    flight.append(createElement("span", "cell-secondary", formatBytes(path.inflight_limit_bytes)));
+    appendCell(row, "Queue / native / data / limit", flight);
 
     const evidence = createElement("div");
-    evidence.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm) + " confidence"));
+    evidence.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm)));
     evidence.append(createElement(
       "span",
       "cell-secondary",
-      formatCount(path.delivery_samples) + " samples / " + formatBytes(path.data_sample_bytes)
+      formatCount(path.delivery_samples) + " / " + formatBytes(path.data_sample_bytes)
     ));
     evidence.append(createElement(
       "span",
       "cell-secondary",
-      (path.last_delivery_age_ms === undefined ? "no delivery age" : formatDuration(path.last_delivery_age_ms) + " since delivery") +
-        (path.app_limited ? " / application limited" : "")
+      (path.last_delivery_age_ms === undefined ? "--" : formatDuration(path.last_delivery_age_ms)) +
+        (path.app_limited ? " / App-limited" : "")
     ));
-    appendCell(row, "Evidence", evidence);
+    appendCell(row, "Confidence / samples / age", evidence);
 
     const flows = createElement("div");
     flows.append(createElement("span", "cell-primary", formatCount(path.active_flows)));
-    flows.append(createElement("span", "cell-secondary", formatCount(path.active_latency_sensitive_flows) + " latency sensitive"));
-    appendCell(row, "Flows", flows);
+    flows.append(createElement("span", "cell-secondary", formatCount(path.active_latency_sensitive_flows)));
+    appendCell(row, "Flows / latency", flows);
     return row;
   }
 
@@ -1648,18 +1654,18 @@
 
       const rtt = createElement("div");
       rtt.append(createElement("span", "cell-primary", formatRttMicros(path.srtt_us)));
-      rtt.append(createElement("span", "cell-secondary", "jitter " + formatRttMicros(path.jitter_us)));
-      appendCell(row, "RTT", rtt);
+      rtt.append(createElement("span", "cell-secondary", formatRttMicros(path.jitter_us)));
+      appendCell(row, "RTT / jitter", rtt);
 
       const delivery = createElement("div");
       delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
-      delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps) + " pacing"));
-      appendCell(row, "Delivery", delivery);
+      delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
+      appendCell(row, "Delivery / pacing", delivery);
 
       const loss = createElement("div");
       loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
-      loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm) + " ECN"));
-      appendCell(row, "Loss", loss);
+      loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
+      appendCell(row, "Loss / ECN", loss);
       appendCell(row, "Queue", formatBytes(path.queue_bytes));
       appendCell(row, "In flight", formatBytes(path.bytes_in_flight));
       elements.peerPathsBody.append(row);

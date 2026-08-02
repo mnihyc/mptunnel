@@ -2017,6 +2017,7 @@ where
             recv_progress_observed_at
                 + reliable_stream_recv_progress_interval(request_feedback_path_snapshot),
         );
+        let recv_progress_ack_update_pending = remote_open && recv_progress.ack_update_pending();
         let has_tail_reinjection_alternative = path_stream.has_multipath_reinjection_alternative();
         let failed_original_tail_reinjection_ready =
             reliable_failed_original_tail_reinjection_ready(path_stream, &send_stream);
@@ -3001,7 +3002,7 @@ where
             response_sender_retry_at = None;
             continue;
         }
-        _ = tokio::time::sleep_until(recv_progress_deadline), if reliable_relay_recv_progress_timer_enabled(
+        _ = tokio::time::sleep_until(recv_progress_deadline), if (reliable_relay_recv_progress_timer_enabled(
                 request_feedback_underlay,
                 multipath_reinjection_alternative_available,
             )
@@ -3009,7 +3010,15 @@ where
                 &recv_stream,
                 remote_open,
                 Some(request_feedback_underlay),
-            ) => {
+            )) || recv_progress_ack_update_pending => {
+            let resend_progress = reliable_relay_recv_progress_timer_enabled(
+                    request_feedback_underlay,
+                    multipath_reinjection_alternative_available,
+                ) && reliable_relay_recv_progress_resend_active(
+                    &recv_stream,
+                    remote_open,
+                    Some(request_feedback_underlay),
+                );
             if enqueue_tcp_recv_progress(
                 path_stream,
                 &mut recv_stream,
@@ -3020,8 +3029,8 @@ where
                 relay_lane,
                 mux_limits,
                 true,
-                true,
-                true,
+                resend_progress,
+                resend_progress,
             ) {
                 response_sender_retry_at = None;
                 last_recv_progress_sent_at = Instant::now();

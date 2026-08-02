@@ -473,40 +473,40 @@ restart or configuration reload.
 Leave `[resources]` unset first. These values are safety envelopes, not manual
 transmission modes and not desired memory occupancy.
 
-| Field | Default | Purpose |
-| --- | ---: | --- |
-| `max_frame_bytes` | 1 MiB | hard MPP-frame cap |
-| `max_payload_bytes` | frame minus header room | MPP payload cap |
-| `max_ack_ranges` | 256 | sparse Data ACK range cap |
-| `max_paths` | 64 | registered path cap, not an aggregation target |
-| `max_streams` | 65,536 | logical MPP stream cap |
-| `max_quic_concurrent_bidi_streams` | 65,536 | QUIC stream concurrency envelope |
-| `max_stream_window_bytes` | 64 MiB | per-direction MPP receive window shared across attachments |
-| `max_repair_bytes` | 64 MiB | retained MPP data available for reinjection |
-| `max_reorder_bytes` | 64 MiB | receive-hole and ordering-debt envelope |
-| `max_reinjection_cache_chunks` | 65,536 | repair cache entries |
-| `max_reorder_buffer_chunks` | 65,536 | reorder buffer entries |
-| `max_retained_receive_ranges` | 65,536 | receive range entries |
-| `max_datagram_queue_bytes` | 16 MiB | MPP datagram burst envelope |
-| `max_path_flight_bytes` | 64 MiB | per-path MPP-flight ceiling |
-| `max_reliable_relay_chunk_bytes` | 512 KiB | local read-buffer ceiling |
-| TCP heartbeat | 10 s / 30 s | idle TCP carrier liveness |
-| QUIC keep-alive / idle timeout | 10 s / 30 s | native QUIC carrier liveness |
-| outbound connect timeout | 10 s | target/upstream dial bound |
+| Field | Default |
+| --- | ---: |
+| `max_frame_bytes` | 1 MiB |
+| `max_payload_bytes` | frame − header |
+| `max_ack_ranges` | 256 |
+| `max_paths` | 64 |
+| `max_streams` | 65,536 |
+| `max_quic_concurrent_bidi_streams` | 65,536 |
+| `max_stream_window_bytes` | 64 MiB |
+| `max_repair_bytes` | 64 MiB |
+| `max_reorder_bytes` | 64 MiB |
+| `max_reinjection_cache_chunks` | 65,536 |
+| `max_reorder_buffer_chunks` | 65,536 |
+| `max_retained_receive_ranges` | 65,536 |
+| `max_datagram_queue_bytes` | 16 MiB |
+| `max_path_flight_bytes` | 64 MiB |
+| `max_reliable_relay_chunk_bytes` | 512 KiB |
+| TCP heartbeat | 10 s / 30 s |
+| QUIC keep-alive / idle | 10 s / 30 s |
+| Outbound connect | 10 s |
 
 `[admission]` is the independent Product envelope used before DNS, target
 connects, or other flow-opening I/O. Defaults are finite:
 
-| Field | Default | Purpose |
-| --- | ---: | --- |
-| `max_live_flows` | 4,096 | all established and opening Product TCP/UDP flows |
-| `max_concurrent_work` | 512 | simultaneous outbound connect transactions |
-| `max_live_flows_per_principal` | 1,024 | one identity across local and authenticated remote inbounds |
-| `max_live_flows_per_outbound` | 3,072 | flows pinned to one selected outbound |
-| `max_connects_per_outbound` | 256 | in-progress connects through one outbound |
-| `max_live_flows_per_target` | 256 | flows to one normalized domain/IP and port |
-| `max_connects_per_target` | 32 | in-progress connects to one normalized target |
-| `max_dns_work` | 128 | cache-miss/refresh DNS work across all plans |
+| Field | Default |
+| --- | ---: |
+| `max_live_flows` | 4,096 |
+| `max_concurrent_work` | 512 |
+| `max_live_flows_per_principal` | 1,024 |
+| `max_live_flows_per_outbound` | 3,072 |
+| `max_connects_per_outbound` | 256 |
+| `max_live_flows_per_target` | 256 |
+| `max_connects_per_target` | 32 |
+| `max_dns_work` | 128 |
 
 SOCKS5, HTTP CONNECT, fixed forwarding, TUN, and authenticated MPP server
 opens share this one generation owner. Their listener/source/association

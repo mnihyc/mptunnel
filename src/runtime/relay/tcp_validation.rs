@@ -740,7 +740,7 @@ impl ClientC2sTcpValidation {
         let Some(validation_data) = self.validation_data.as_ref() else {
             return Ok(None);
         };
-        let dispatch = sender.dispatch_client_tcp_carrier_validation_data(
+        let dispatch = match sender.dispatch_client_tcp_carrier_validation_data(
             self.validation_id,
             self.candidate_instance,
             validation_data,
@@ -748,7 +748,11 @@ impl ClientC2sTcpValidation {
             send_stream,
             sender_queue,
             data_quantum_bytes,
-        )?;
+        ) {
+            Ok(dispatch) => dispatch,
+            Err(RuntimeError::SenderServiceBlocked) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let Some(dispatch) = dispatch else {
             if let Some(result) = self.validation.result() {
                 self.phase = TcpCarrierValidationPhase::Settled(result);

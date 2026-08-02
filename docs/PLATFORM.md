@@ -11,12 +11,12 @@ generic runtime. Packet-device construction, managed-device guards, target
 selection, and process-managed VPN generation lifecycles remain under
 `src/platform/`; `src/runtime/` only consumes the prepared providers.
 
-| Platform | Ownership | Activation | Status |
+| Platform | Owner | Activation | TUN |
 | --- | --- | --- | --- |
-| Linux | Process managed | Transactional prepare/publish | Implemented with exclusive TUN ownership, RPDB policy, exact route/DNS rollback, and `SO_MARK` native bypass |
-| Android | Host owned | `VpnService.establish()` returns an already-published device | Rust contract implemented; Android host integration required |
-| Windows | Process managed | Transactional prepare/publish | Built-in generation bridge: Wintun packet ownership, strict native-route snapshot, protected native sockets, IP Helper route/DNS publication, and exact reverse cleanup |
-| macOS | Host owned product VPN | Network Extension settings publication | Privileged utun factory, strict route snapshot, route-socket backend, and exact two-phase helper transaction exist; the supported packet-flow/DNS product adapter still requires Network Extension |
+| Linux | Process | Two-phase | Native |
+| Android | Host | Published | Adapter |
+| Windows | Process | Two-phase | Wintun |
+| macOS | Host | Published | Adapter |
 
 The API reports `HostIntegrationRequired`, `AdapterRequired`, `Unsupported`,
 or `TargetMismatch` precisely. It never silently downgrades managed operation
@@ -69,10 +69,7 @@ Windows now has native primitives for:
 
 The Windows package must keep the signed architecture-matched `wintun.dll`
 beside `mptunnel.exe`, and the process needs rights to create the adapter and
-change routes/DNS. GitHub MSVC lanes are authoritative for native compilation;
-native clean-machine tests must still cover privilege failure, interface loss,
-suspend/resume, and crash recovery. Those deployment/evidence requirements do
-not cause a wired capability to be reported as `AdapterRequired`.
+change routes/DNS.
 
 macOS now has a privileged-process slice for:
 
@@ -85,8 +82,8 @@ macOS now has a privileged-process slice for:
 That slice intentionally rejects DNS publication. Apple’s supported custom VPN
 boundary is an entitled `NEPacketTunnelProvider`, whose
 `setTunnelNetworkSettings` owns addresses, included/excluded routes, DNS, MTU,
-and packet flow. A first-party Network Extension host, signing/entitlements,
-runtime bridge, and native lifecycle tests remain required.
+and packet flow. A first-party Network Extension host with the required
+signing and entitlements remains necessary.
 
 macOS remains `AdapterRequired`: a restricted no-DNS privileged bridge would
 not provide the daily-use product contract and would blur the supported
@@ -99,5 +96,5 @@ not an Apple packet-flow bridge: the public `NEPacketTunnelFlow` API does not
 hand ownership of a TUN descriptor to Rust. A first-party macOS host therefore
 still needs a packet-flow adapter in addition to the existing lifecycle and
 socket-protection seams. Until that adapter, signing, entitlements, and native
-lifecycle evidence exist, the CLI reports every macOS managed-VPN capability
-as `adapter-required`.
+integration exist, the CLI reports every macOS managed-VPN capability as
+`adapter-required`.

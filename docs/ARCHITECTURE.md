@@ -444,19 +444,3 @@ lifetime. For response bulk readiness, locally sourced ACK-derived carrier
 evidence is authoritative for QUIC, while durable unambiguous Data ACK progress
 may additionally establish a per-flow TCP MPP rate. Peer metric hints do
 not mint either proof.
-
-## Evidence rule
-
-Deterministic simulator and benchmark gates test models, not the deployed
-runtime. Runtime changes require focused tests plus matched end-to-end labs:
-
-- single-path controls under the same topology and traffic conditions;
-- multipath aggregation and failover;
-- upload and download;
-- latency-sensitive and sustained bulk demand;
-- TCP-only, QUIC-only, and mixed carriers; and
-- shaped, unconstrained, fault, and separately recorded real-Internet runs.
-
-Diagnostics establish causality. Instrumentation-free matched rows establish
-performance. Historical rows from incompatible wire versions are references
-only and cannot prove MPP v5 behavior.

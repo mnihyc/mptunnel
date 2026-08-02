@@ -165,6 +165,7 @@ pub(in crate::runtime) struct ReliableRecvProgress {
     last_ack_range_count: usize,
     last_ack_largest_end: u64,
     last_ack_at: Option<Instant>,
+    ack_update_pending: bool,
 }
 
 impl ReliableRecvProgress {
@@ -178,6 +179,10 @@ impl ReliableRecvProgress {
 
     pub(in crate::runtime) fn last_ack_at(&self) -> Option<Instant> {
         self.last_ack_at
+    }
+
+    pub(in crate::runtime) fn ack_update_pending(&self) -> bool {
+        self.ack_update_pending
     }
 
     pub(in crate::runtime) fn should_send_ack(
@@ -201,6 +206,9 @@ impl ReliableRecvProgress {
             || reorder_bytes != self.last_ack_reorder_bytes
             || range_count != self.last_ack_range_count
             || largest_end != self.last_ack_largest_end;
+        if has_progress && cumulative_state_changed {
+            self.ack_update_pending = true;
+        }
         let ack_step = reliable_stream_ack_update_bytes(path, traffic_class, mux_limits);
         let horizon_advanced = largest_end.saturating_sub(self.last_ack_largest_end) >= ack_step;
         let reorder_delta = reorder_bytes.abs_diff(self.last_ack_reorder_bytes) as u64 >= ack_step;
@@ -229,6 +237,7 @@ impl ReliableRecvProgress {
             self.last_ack_range_count = range_count;
             self.last_ack_largest_end = largest_end;
             self.last_ack_at = Some(now);
+            self.ack_update_pending = false;
             true
         } else {
             false

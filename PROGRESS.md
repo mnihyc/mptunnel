@@ -4726,3 +4726,41 @@ entry is authoritative.
   single/equal-path download/upload matrix without instrumentation, and proceed
   directly to native GitHub CI, tag, immutable release verification, and
   requested generated-cache cleanup if it remains in the accepted range.
+
+## 2026-08-02T20:49:02+08:00: Terminal delivery and public table boundary accepted
+
+- Name: reliable terminal-state completion and concise operator tables
+- Category: release correctness, performance recovery, and presentation
+- State: implementation and representative labs accepted; final workflow gate
+  and one committed-tree TCP upload confirmation remain before push
+- Clean model:
+  - cumulative receive state below the byte cadence receives one publication at
+    the existing delayed Data ACK deadline, then clears its pending state;
+  - bounded carrier-queue backpressure retains client `STREAM_FIN` state and
+    reuses the existing capacity notification and retry deadline at all three
+    FIN publication sites;
+  - pre-mutation client TCP-validation reservation backpressure remains pending,
+    matching the existing server-to-client reservation boundary; and
+  - no wire field, timer, threshold, scheduler, congestion controller, carrier
+    range, transport parameter, or platform branch was added or changed.
+- Practical evidence:
+  - the previously incomplete TCP upload now completes 2/2 final targets at
+    263.474 Mbps over the exact 20-second, zero-loss frozen condition;
+  - the matched affected controls complete at 267.666 Mbps TCP single-path
+    download and 514.668 Mbps five-path TCP upload; and
+  - focused relay tests pass, including the durable sub-cadence ACK-tail
+    regression; two independent source-boundary audits report no blocker.
+- Product presentation:
+  - public Markdown tables contain compact fields and values without prose
+    description columns;
+  - dashboard table headers define compound metric order and data cells contain
+    short states, numbers, durations, or units instead of repeated descriptions;
+  - a live 1600-by-1000 capture with three connections, two paths, one session,
+    and changing speed has no console error, warning, or visible overflow; and
+  - internal evidence-process prose was removed from public architecture and
+    platform guidance while operator capability boundaries remain explicit.
+- Evidence: `git diff --check`, dashboard JavaScript syntax, four dashboard
+  contract tests, and the live browser inspection pass. The final accepted
+  capture is `docs/assets/dashboard.png`.
+- Next: run the complete release-quality workflow, commit the bounded follow-up,
+  then run one exact clean-tree TCP upload gate before the authorized push.

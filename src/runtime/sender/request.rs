@@ -228,6 +228,16 @@ impl RelayRecvProgressSend {
             force_max_data: false,
         }
     }
+
+    pub(in crate::runtime) fn ack_only(path: Option<PathSnapshot>, lane: TrafficClass) -> Self {
+        Self {
+            path,
+            lane,
+            force_ack: true,
+            publish_max_data: false,
+            force_max_data: false,
+        }
+    }
 }
 
 impl RequestSenderService {

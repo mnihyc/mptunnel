@@ -1141,6 +1141,12 @@ events. A newly accepted attachment starts without a fence and receives the
 retained latest state. This publication rule adds no timer, ACK threshold,
 receive window, congestion signal, or carrier-delivery attribution.
 
+Changed cumulative state that has not reached the byte cadence remains eligible
+for the existing delayed Data ACK deadline on every reliable underlay. Once
+that changed state is published, it no longer activates the deadline unless an
+existing feedback-resend rule applies. This adds no independent timer or
+threshold.
+
 When the cumulative range set fits one frame, that frame MAY be complete. When
 it requires multiple frames, every chunk MUST be incomplete positive evidence,
 and an attachment advances its generation fence only after every chunk was

@@ -195,8 +195,8 @@
                 <th scope="col">Network</th>
                 <th scope="col">Destination</th>
                 <th scope="col">Outbound</th>
-                <th scope="col">Activity</th>
-                <th scope="col">Traffic</th>
+                <th scope="col">Age / idle</th>
+                <th scope="col">Upload / download / packets</th>
               </tr>
             </thead>
             <tbody id="overview-connections-body"></tbody>
@@ -219,8 +219,8 @@
                 <thead>
                   <tr>
                     <th scope="col">Class</th>
-                    <th scope="col">Upload</th>
-                    <th scope="col">Download</th>
+                    <th scope="col">Upload bytes / packets</th>
+                    <th scope="col">Download bytes / packets</th>
                     <th scope="col">Opened</th>
                     <th scope="col">Active</th>
                     <th scope="col">Completed</th>
@@ -278,7 +278,7 @@
                 <th scope="col">Target</th>
                 <th scope="col">Authentication</th>
                 <th scope="col">Shown</th>
-                <th scope="col">Shown I/O</th>
+                <th scope="col">Upload / download / packets</th>
               </tr>
             </thead>
             <tbody id="inbound-services-body"></tbody>
@@ -333,16 +333,16 @@
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col">Path</th>
+                <th scope="col">Path / instance</th>
                 <th scope="col">Service / session</th>
                 <th scope="col">Carrier / bounds</th>
                 <th scope="col">Usage / direction</th>
                 <th scope="col">RTT / jitter</th>
                 <th scope="col">Delivery / pacing</th>
                 <th scope="col">Loss / ECN</th>
-                <th scope="col">Queue / flight / limit</th>
-                <th scope="col">Evidence</th>
-                <th scope="col">Flows</th>
+                <th scope="col">Queue / native / data / limit</th>
+                <th scope="col">Confidence / samples / age</th>
+                <th scope="col">Flows / latency</th>
               </tr>
             </thead>
             <tbody id="overview-paths-body"></tbody>
@@ -369,7 +369,7 @@
                 <th scope="col">Protocol</th>
                 <th scope="col">Networks</th>
                 <th scope="col">Shown</th>
-                <th scope="col">Shown I/O</th>
+                <th scope="col">Upload / download / packets</th>
               </tr>
             </thead>
             <tbody id="outbound-services-body"></tbody>
@@ -393,10 +393,10 @@
             <thead>
               <tr>
                 <th scope="col">Name</th>
-                <th scope="col">Strategy</th>
-                <th scope="col">Members</th>
-                <th scope="col">Load</th>
-                <th scope="col">Probe</th>
+                <th scope="col">Strategy / generation</th>
+                <th scope="col">Ready / drain / unavailable</th>
+                <th scope="col">Active / pending</th>
+                <th scope="col">Probe / interval / timeout</th>
               </tr>
             </thead>
             <tbody id="overview-balancers-body"></tbody>
@@ -495,16 +495,16 @@
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col">Path</th>
+                <th scope="col">Path / instance</th>
                 <th scope="col">Service / session</th>
                 <th scope="col">Carrier / bounds</th>
                 <th scope="col">Usage / direction</th>
                 <th scope="col">RTT / jitter</th>
                 <th scope="col">Delivery / pacing</th>
                 <th scope="col">Loss / ECN</th>
-                <th scope="col">Queue / flight / limit</th>
-                <th scope="col">Evidence</th>
-                <th scope="col">Flows</th>
+                <th scope="col">Queue / native / data / limit</th>
+                <th scope="col">Confidence / samples / age</th>
+                <th scope="col">Flows / latency</th>
               </tr>
             </thead>
             <tbody id="paths-body"></tbody>
@@ -542,8 +542,8 @@
                 <th scope="col">Network</th>
                 <th scope="col">Destination</th>
                 <th scope="col">Outbound</th>
-                <th scope="col">Activity</th>
-                <th scope="col">Traffic</th>
+                <th scope="col">Age / idle</th>
+                <th scope="col">Upload / download / packets</th>
               </tr>
             </thead>
             <tbody id="flows-body"></tbody>
@@ -599,9 +599,9 @@
                     <th scope="col">Path</th>
                     <th scope="col">Carrier</th>
                     <th scope="col">Usage</th>
-                    <th scope="col">RTT</th>
-                    <th scope="col">Delivery</th>
-                    <th scope="col">Loss</th>
+                    <th scope="col">RTT / jitter</th>
+                    <th scope="col">Delivery / pacing</th>
+                    <th scope="col">Loss / ECN</th>
                     <th scope="col">Queue</th>
                     <th scope="col">In flight</th>
                   </tr>

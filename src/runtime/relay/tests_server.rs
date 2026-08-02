@@ -3499,3 +3499,25 @@ fn tcp_multipath_progress_timer_stays_enabled_with_reinjection_alternatives() {
         false,
     ));
 }
+
+#[test]
+fn subthreshold_receive_tail_retains_one_existing_ack_deadline() {
+    let limits = MuxLimits::default();
+    let mut recv_stream = ReliableRecvStream::new(StreamId(25), limits);
+    let mut progress = ReliableRecvProgress::default();
+    recv_stream
+        .receive_data(0, Bytes::from_static(b"first"))
+        .expect("first validation input");
+    assert!(progress.should_send_ack(&recv_stream, None, TrafficClass::Throughput, limits, true,));
+    assert!(!progress.ack_update_pending());
+
+    recv_stream
+        .receive_data(5, Bytes::from_static(b"tail"))
+        .expect("validation tail");
+    assert!(
+        !progress.should_send_ack(&recv_stream, None, TrafficClass::Throughput, limits, false,)
+    );
+    assert!(progress.ack_update_pending());
+    assert!(progress.should_send_ack(&recv_stream, None, TrafficClass::Throughput, limits, true,));
+    assert!(!progress.ack_update_pending());
+}

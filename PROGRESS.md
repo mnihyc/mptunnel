@@ -11,6 +11,49 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T09:41:03+08:00: apparent TCP regression rejected by matched-profile control
+
+- Name: historical-binary and immutable-path comparison
+- Category: Core performance diagnosis and release-gate integrity
+- State: no Core change is justified; continue the frozen representative and
+  disruption release matrix from the clean source
+- Rejected diagnosis:
+  - the first clean-source preflight appeared to place single-path TCP at
+    `135.866-165.630` Mbit/s, below the earlier `293.678` Mbit/s result;
+  - the exact historical `952c61a44608...` executable produced only `154.606`
+    Mbit/s when rerun under the current low-result fixture, proving that neither
+    the demand-episode correction nor retained Data-ACK recovery created that
+    difference; and
+  - retained qdisc state and run manifests then exposed the incomparable
+    profiles: the historical run explicitly set the fat path to `0%` loss,
+    while the low-result fixtures used the maintained lab default of `1%`.
+- Matched-profile evidence:
+  - the current clean normal release binary delivered `285.871` Mbit/s under
+    the historical `500mbit`, `180ms`, `20ms`, `0%` fat-path profile, within
+    `2.7%` of the historical value and inside the explicitly accepted run
+    fluctuation rather than a performance downgrade;
+  - two clean-source diagnostic repeats under that same immutable profile
+    delivered `347.316` and `306.187` Mbit/s, and the additional TCP carrier
+    service was both admitted and productive; and
+  - the existing probe trace records 0.2-second Product delivery while the
+    existing management and container collectors record one-second path,
+    queue, flight, logical-progress, and physical-rate evidence. They show
+    buffered Product delivery bursts over a comparatively steadier physical
+    service rate; this is retained as diagnosis evidence, not converted into a
+    timing tweak or a new release threshold.
+- Decision:
+  - preserve the clean Product-demand and recovery lifecycles already proved
+    by deterministic regressions;
+  - compare performance only under identical recorded path conditions, and do
+    not treat the normal `1%`-loss profile as a regression against a `0%`-loss
+    historical control; and
+  - make no parameter, timing, congestion-control, scheduler, carrier-range,
+    or platform-specific change from this result.
+- Evidence: `./.tmp/lab/results/v014-tcp-single-normal-paired`,
+  `./.tmp/lab/results/v014-tcp-single-diagnostic`,
+  `./.tmp/lab/results/v014-tcp-single-diagnostic-2`, and
+  `./.tmp/worktrees/909de0a/.tmp/lab/results/old-909-current-host-tcp-single`.
+
 ## 2026-08-02T08:30:24+08:00: retained Data-ACK recovery lifecycle restored
 
 - Name: target-serviced persistent gaps with one directional stream owner

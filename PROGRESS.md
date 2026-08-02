@@ -11,6 +11,47 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-02T10:41:00+08:00: request recovery timing change rejected by disruption A/B
+
+- Name: request-side Data-ACK recovery epoch review
+- Category: Core performance safety and release-model closure
+- State: rejected and reverted; the established request recovery interval is
+  authoritative for v0.1.4
+- Candidate and causal check:
+  - the candidate reused the original request flight epoch when evaluating an
+    acknowledged gap, matching the response direction's retained-gap clock;
+  - it improved one extreme TCP upload diagnostic from `72.562` to `265.850`
+    Mbit/s and preserved matched stationary throughput within `0.76%`;
+  - however, the candidate's intended request ACK-gap recovery action was not
+    exercised in its failing mixed-carrier diagnostic: no client
+    `stream_ack_received` event made ACK-gap reinjection ready, and its only two
+    client reinjections were existing path-failure recovery; and
+  - therefore the isolated upload result did not prove that the proposed
+    lifecycle change caused the gain.
+- Disruption safety evidence:
+  - two clean normal candidate runs lost interactive progress after only one of
+    31 requests and delivered `109.835` and `100.525` Mbit/s; a third remained
+    functional at `189.183` Mbit/s;
+  - two clean controls at the preceding source remained functional at
+    `219.566` and `270.738` Mbit/s; and
+  - matched diagnostic runs strengthened the safety signal: the control served
+    29/31 interactive requests, whereas the candidate served 16/31 before
+    stalling. Both were rejected by the host-validity gate, so these are causal
+    engineering diagnostics rather than publishable benchmark claims.
+- Decision:
+  - reject the candidate rather than retain an unproved timing asymmetry fix
+    with a correlated disruption regression;
+  - preserve the established full request recovery interval and the already
+    accepted directional-owner data flow; and
+  - make no replacement timing, threshold, scheduler, congestion-control,
+    carrier-range, or platform-specific change. Continue directly to the
+    frozen release gates and product/documentation closure.
+- Evidence: `./.tmp/lab/results/v014-final-flapping-repeat-{1,2}`,
+  `./.tmp/lab/results/v014-flapping-request-recovery-diagnostic`,
+  `./.tmp/worktrees/cde7382/.tmp/lab/results/flapping-current-host-repeat`,
+  `./.tmp/worktrees/cde7382/.tmp/lab/results/flapping-current-host-diagnostic`,
+  and commit `584dd11`.
+
 ## 2026-08-02T09:41:03+08:00: apparent TCP regression rejected by matched-profile control
 
 - Name: historical-binary and immutable-path comparison

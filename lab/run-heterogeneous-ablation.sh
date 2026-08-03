@@ -3798,11 +3798,23 @@ start_target_services
 apply_netem apply
 start_server
 
-tcp_endpoint_lowlat="--path 'tcp://172.31.10.20:${server_port}'"
-tcp_endpoint_balanced="--path 'tcp://172.31.15.20:${server_port}'"
-tcp_endpoint_mildloss="--path 'tcp://172.31.16.20:${server_port}'"
-tcp_endpoint_fat="--path 'tcp://172.31.20.20:${server_port}'"
-tcp_endpoint_poor="--path 'tcp://172.31.30.20:${server_port}'"
+tcp_carrier_max="${MPTUNNEL_LAB_TCP_CARRIER_MAX:-}"
+tcp_carrier_query=""
+tcp_carrier_hint_query=""
+if [[ -n "$tcp_carrier_max" ]]; then
+  if [[ ! "$tcp_carrier_max" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MPTUNNEL_LAB_TCP_CARRIER_MAX must be a positive integer" >&2
+    exit 2
+  fi
+  tcp_carrier_query="?tcp-carriers=1-${tcp_carrier_max}"
+  tcp_carrier_hint_query="&tcp-carriers=1-${tcp_carrier_max}"
+fi
+
+tcp_endpoint_lowlat="--path 'tcp://172.31.10.20:${server_port}${tcp_carrier_query}'"
+tcp_endpoint_balanced="--path 'tcp://172.31.15.20:${server_port}${tcp_carrier_query}'"
+tcp_endpoint_mildloss="--path 'tcp://172.31.16.20:${server_port}${tcp_carrier_query}'"
+tcp_endpoint_fat="--path 'tcp://172.31.20.20:${server_port}${tcp_carrier_query}'"
+tcp_endpoint_poor="--path 'tcp://172.31.30.20:${server_port}${tcp_carrier_query}'"
 udp_endpoint_lowlat="--path 'udp://172.31.10.20:${server_port}'"
 udp_endpoint_balanced="--path 'udp://172.31.15.20:${server_port}'"
 udp_endpoint_mildloss="--path 'udp://172.31.16.20:${server_port}'"
@@ -3810,22 +3822,22 @@ udp_endpoint_fat="--path 'udp://172.31.20.20:${server_port}'"
 udp_endpoint_poor="--path 'udp://172.31.30.20:${server_port}'"
 
 if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]]; then
-  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80'"
-  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
-  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}?srtt-ms=160&rate-mbps=100'"
-  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500'"
-  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true'"
+  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80${tcp_carrier_hint_query}'"
+  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200${tcp_carrier_hint_query}'"
+  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}?srtt-ms=160&rate-mbps=100${tcp_carrier_hint_query}'"
+  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500${tcp_carrier_hint_query}'"
+  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true${tcp_carrier_hint_query}'"
   udp_lowlat="--path 'udp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80'"
   udp_balanced="--path 'udp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
   udp_mildloss="--path 'udp://172.31.16.20:${server_port}?srtt-ms=160&rate-mbps=100'"
   udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500'"
   udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true'"
 else
-  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}'"
-  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}'"
-  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}'"
-  tcp_fat="--path 'tcp://172.31.20.20:${server_port}'"
-  tcp_poor="--path 'tcp://172.31.30.20:${server_port}'"
+  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}${tcp_carrier_query}'"
+  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}${tcp_carrier_query}'"
+  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}${tcp_carrier_query}'"
+  tcp_fat="--path 'tcp://172.31.20.20:${server_port}${tcp_carrier_query}'"
+  tcp_poor="--path 'tcp://172.31.30.20:${server_port}${tcp_carrier_query}'"
   udp_lowlat="--path 'udp://172.31.10.20:${server_port}'"
   udp_balanced="--path 'udp://172.31.15.20:${server_port}'"
   udp_mildloss="--path 'udp://172.31.16.20:${server_port}'"
@@ -3837,7 +3849,7 @@ udp_all="${udp_lowlat} ${udp_balanced} ${udp_mildloss} ${udp_fat} ${udp_poor}"
 tcp_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_mildloss} ${tcp_endpoint_fat} ${tcp_endpoint_poor}"
 udp_equal_all="${udp_endpoint_lowlat} ${udp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
 mixed_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
-scale_tcp_carrier_max="${MPTUNNEL_LAB_SCALE_TCP_CARRIER_MAX:-}"
+scale_tcp_carrier_max="${MPTUNNEL_LAB_SCALE_TCP_CARRIER_MAX:-$tcp_carrier_max}"
 scale_tcp_carrier_query=""
 if [[ -n "$scale_tcp_carrier_max" ]]; then
   if [[ ! "$scale_tcp_carrier_max" =~ ^[1-9][0-9]*$ ]]; then

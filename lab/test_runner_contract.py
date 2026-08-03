@@ -421,6 +421,20 @@ class RunnerContractTests(unittest.TestCase):
             SCRIPT,
         )
 
+    def test_all_tcp_cohorts_can_override_carrier_ceiling(self):
+        self.assertIn(
+            'tcp_carrier_max="${MPTUNNEL_LAB_TCP_CARRIER_MAX:-}"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'tcp_carrier_hint_query="&tcp-carriers=1-${tcp_carrier_max}"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'scale_tcp_carrier_max="${MPTUNNEL_LAB_SCALE_TCP_CARRIER_MAX:-$tcp_carrier_max}"',
+            SCRIPT,
+        )
+
     def test_large_varying_and_asymmetric_cases_have_complete_topology_and_load(self):
         server = SCRIPT.split("server_config_toml() {", 1)[1].split(
             "\n}", 1

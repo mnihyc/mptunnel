@@ -1149,6 +1149,13 @@ async fn handle_disconnected_client_tcp_command(
                     }
                 }
                 Err(err) => {
+                    runtime
+                        .state
+                        .mark_tcp_path_establishment_failure_for_endpoint_generation(
+                            runtime.path_index,
+                            &runtime.endpoint_policy,
+                            endpoint_generation,
+                        );
                     let _ = response.send(ClientTcpOpenResponse::RejectedWithoutOpen(err));
                 }
             }
@@ -1217,6 +1224,13 @@ async fn handle_disconnected_client_tcp_command(
                     }
                 }
                 Err(err) => {
+                    runtime
+                        .state
+                        .mark_tcp_path_establishment_failure_for_endpoint_generation(
+                            runtime.path_index,
+                            &runtime.endpoint_policy,
+                            endpoint_generation,
+                        );
                     let _ = response.send(Err(err));
                 }
             }

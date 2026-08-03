@@ -530,13 +530,14 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         },
     );
     response_sender.record_delivered_data(128);
-    let outcome = enqueue_reliable_tail_reinjection(
+    let outcome = enqueue_reliable_tail_reinjection_with_ack_horizon(
         &mut response_sender,
         &path_stream,
         stream_id,
         &send_stream,
         &ack_ranges,
         true,
+        Some(128),
         None,
         TrafficClass::Latency,
         limits,

@@ -971,6 +971,16 @@ async fn recv_server_tcp_path_event(
                     return Ok(Some(ServerTcpPathEvent::PeerStatusRequest(request_id)));
                 }
             }
+            demand = async {
+                match carrier_demands.as_mut() {
+                    Some(demands) => demands.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(demand) = demand {
+                    return Ok(Some(ServerTcpPathEvent::CarrierDemand(demand)));
+                }
+            }
             frame = path_frames.recv() => {
                 return match frame {
                     Some(Ok(frame)) => Ok(Some(ServerTcpPathEvent::Frame(frame))),
@@ -981,16 +991,6 @@ async fn recv_server_tcp_path_event(
                     // and streams regardless of transport close ordering.
                     None => Ok(None),
                 };
-            }
-            demand = async {
-                match carrier_demands.as_mut() {
-                    Some(demands) => demands.changed().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(demand) = demand {
-                    return Ok(Some(ServerTcpPathEvent::CarrierDemand(demand)));
-                }
             }
             command = recv_reliable_path_command(commands_rx), if command_may_recv => {
                 match command {

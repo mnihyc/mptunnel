@@ -13,7 +13,9 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::sender::response::ServerResponseSenderService;
 use crate::runtime::stream::response::ResponseStreamBinding;
-use crate::runtime::stream::{FixedReliablePathOutput, ReliableRelayRemotePath};
+use crate::runtime::stream::{
+    FixedReliablePathOutput, ReliableRelayAttachOutcome, ReliableRelayRemotePath,
+};
 use crate::transport::PathSpec;
 use std::sync::Arc;
 
@@ -483,6 +485,95 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         ClientQueuedDispatch::PersistentReinjectionCancelled
     ));
     assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
+    let stream_id = StreamId(126);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10341", "udp://127.0.0.1:10342"]);
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, tcp_commands),
+        8,
+    );
+    consume_client_path_proof_for_test(&mut tcp_receivers);
+    let tcp = remotes.paths[0].instance();
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            udp_commands,
+        )),
+        ReliableRelayAttachOutcome::Attached
+    );
+    consume_client_path_proof_for_test(&mut udp_receivers);
+    seed_client_bulk_evidence_for_test(&context, tcp.key);
+    seed_client_bulk_evidence_for_test(
+        &context,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+    );
+
+    let limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let acknowledged = send_stream
+        .send_data(Bytes::from(vec![0x41; 64]))
+        .expect("acknowledged prefix");
+    let live_tail = send_stream
+        .send_data(Bytes::from(vec![0x42; 64]))
+        .expect("unacknowledged live tail");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(tcp, &acknowledged);
+    sender.record_original_frame_for_test(tcp, &live_tail);
+    let ack_ranges = [OffsetRange { start: 0, end: 64 }];
+    let _ = send_stream.apply_ack(&ack_ranges);
+
+    let recovery_interval =
+        reliable_relay_tail_reinjection_delay(context.reliable_path_snapshot(tcp.key));
+    tokio::time::sleep(recovery_interval + Duration::from_millis(10)).await;
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    assert!(sender.enqueue_tail_reinjection(
+        &mut sender_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        &ack_ranges,
+        true,
+        Some(send_stream.next_offset()),
+        64,
+        TrafficClass::Latency,
+    ));
+    assert!(matches!(
+        sender
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Latency,
+                &mut remotes,
+                &mut send_stream,
+                &mut sender_queue,
+                64,
+            )
+            .await
+            .expect("live tail dispatch"),
+        ClientQueuedDispatch::Reinjection { payload_bytes: 64 }
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut udp_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 64,
+            payload,
+            ..
+        })) if payload.as_ref() == [0x42; 64]
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut tcp_receivers).is_none(),
+        "the bounded probe must use the distinct live attachment"
+    );
 }
 
 #[tokio::test]

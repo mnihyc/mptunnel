@@ -967,17 +967,6 @@ impl ClientPathContext {
         );
     }
 
-    pub(in crate::runtime) fn mark_relay_path_failure(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-    ) {
-        match underlay {
-            UnderlayProtocol::Tcp => self.mark_tcp_path_failure(index),
-            UnderlayProtocol::Udp => self.mark_udp_path_failure(index),
-        }
-    }
-
     pub(in crate::runtime) fn mark_relay_path_data_plane_failure(&self, path: RelayPathInstance) {
         if !self
             .state
@@ -1169,6 +1158,7 @@ impl ClientPathContext {
         );
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_tcp_path_failure(&self, index: usize) {
         let now = Instant::now();
         let mut health = self.state.health.lock().expect("client path health lock");

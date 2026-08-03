@@ -65,7 +65,7 @@ use crate::runtime::path::tcp::server::service::{
 use crate::runtime::sender::{
     RelaySendCause, ResponseOrdinarySaturationObservation, ServerCarrierReadiness,
     ServerQueuedDispatch, ServerReinjectionOutputIdentity, ServerResponseSenderService,
-    emit_response_control_frame, reliable_relay_sender_queue_limit,
+    reliable_relay_sender_queue_limit,
 };
 use crate::runtime::stream::response::ResponseDataAckRecoveryCandidate;
 use crate::runtime::stream::{
@@ -240,21 +240,18 @@ async fn relay_accepted_stream(
         stream_id,
         target.clone(),
     );
-    if accepted.accept_opening_path().await.is_err()
-        && let Err(err) = emit_response_control_frame(
-            accepted.stream(),
-            Frame::StreamMaxData {
-                stream_id,
-                max_offset: reliable_stream_initial_advertised_window_bytes(
-                    accepted.stream().underlay,
-                    accepted.stream().lane,
-                    context.mux_limits,
-                ),
-            },
-        )
-    {
-        accepted.close().await;
-        return Err(err);
+    if accepted.accept_opening_path().await.is_err() {
+        // The opening carrier may disappear or its bounded control queue may
+        // close after admission. Retain shared receive credit in the logical
+        // stream so an existing or later attachment can publish it; opening
+        // settlement is not a stream-terminal error.
+        accepted
+            .stream()
+            .publish_max_data(reliable_stream_initial_advertised_window_bytes(
+                accepted.stream().underlay,
+                accepted.stream().lane,
+                context.mux_limits,
+            ));
     }
 
     let session_send_buffer = accepted.session_send_buffer();
@@ -1277,7 +1274,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 last_send_ack_ranges,
                 last_send_ack_frontier,
             )
-            && last_send_ack_horizon.is_some_and(|horizon| last_send_ack_frontier < horizon)
+            && last_send_ack_frontier < send_stream.next_offset()
             && path_stream.has_multipath_reinjection_alternative()
         {
             // A live carrier still owns native recovery. One MPP quantum is
@@ -1291,8 +1288,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             let tail_source_frames = send_stream.retransmission_frames_for_ranges(
                 &[OffsetRange {
                     start: last_send_ack_frontier,
-                    end: last_send_ack_horizon
-                        .expect("authoritative tail requires a snapshot horizon"),
+                    end: send_stream.next_offset(),
                 }],
                 tail_limit,
             );
@@ -2021,16 +2017,18 @@ where
         let has_tail_reinjection_alternative = path_stream.has_multipath_reinjection_alternative();
         let failed_original_tail_reinjection_ready =
             reliable_failed_original_tail_reinjection_ready(path_stream, &send_stream);
+        let contiguous_live_tail = stream_ack_is_authoritative_contiguous_prefix(
+            last_send_ack.complete(),
+            last_send_ack.ranges(),
+            last_send_ack_frontier,
+        ) && last_send_ack_frontier < send_stream.next_offset();
         let tail_reinjection_candidate = has_tail_reinjection_alternative
-            && last_send_ack.has_unacknowledged_extent(last_send_ack_frontier)
-            && (stream_ack_is_authoritative_contiguous_prefix(
-                last_send_ack.complete(),
-                last_send_ack.ranges(),
-                last_send_ack_frontier,
-            ) || stream_ack_ranges_expose_authoritative_gap(
-                last_send_ack.complete(),
-                last_send_ack.ranges(),
-            ));
+            && (contiguous_live_tail
+                || (last_send_ack.has_unacknowledged_extent(last_send_ack_frontier)
+                    && stream_ack_ranges_expose_authoritative_gap(
+                        last_send_ack.complete(),
+                        last_send_ack.ranges(),
+                    )));
         let tail_timer_active = reliable_relay_tail_reinjection_timer_active(
             send_stream.reinjection_bytes(),
             tail_reinjection_candidate,
@@ -3351,22 +3349,46 @@ where
                 final_offset: send_stream.next_offset(),
             };
             response_sender.enqueue_final_control_frame(frame);
-            match response_sender.dispatch_next(
-                path_stream,
-                &mut send_stream,
-                close.lane,
-                mux_limits,
-            ) {
-                Ok(dispatch) if dispatch.lane == ReliableWorkClass::Control => {
-                    close.sent = true;
-                }
-                Ok(_) => {
-                    result = Err(RuntimeError::Protocol(
-                        "server response sender dispatched non-control final close",
-                    ));
-                }
-                Err(err) => {
-                    result = Err(err);
+            while result.is_ok() && !close.sent {
+                match response_sender.dispatch_next(
+                    path_stream,
+                    &mut send_stream,
+                    close.lane,
+                    mux_limits,
+                ) {
+                    Ok(dispatch) if dispatch.lane == ReliableWorkClass::Control => {
+                        close.sent = true;
+                    }
+                    Ok(_) => {
+                        result = Err(RuntimeError::Protocol(
+                            "server response sender dispatched non-control final close",
+                        ));
+                    }
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        let capacity_notifies = path_stream.capacity_notifies();
+                        let has_capacity_notify = !capacity_notifies.is_empty();
+                        let retry_at = tokio::time::Instant::now()
+                            + sender_service_retry_delay(
+                                path_stream.send_path_snapshot(close.lane, 0),
+                            );
+                        tokio::select! {
+                            _ = wait_for_carrier_capacity_notifies(capacity_notifies), if has_capacity_notify => {}
+                            changed = async {
+                                match output_updates.as_mut() {
+                                    Some(updates) => updates.changed().await,
+                                    None => std::future::pending().await,
+                                }
+                            }, if output_updates.is_some() => {
+                                if changed.is_err() {
+                                    result = Err(RuntimeError::ReliablePathSessionClosed);
+                                }
+                            }
+                            _ = tokio::time::sleep_until(retry_at) => {}
+                        }
+                    }
+                    Err(err) => {
+                        result = Err(err);
+                    }
                 }
             }
         }

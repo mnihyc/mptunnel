@@ -1,7 +1,7 @@
 //! TCP carrier attachments for one product datagram association.
 
 use super::DatagramSessionEvent;
-use super::association::{DatagramPathSend, runtime_error_is_datagram_response_timeout};
+use super::association::DatagramPathSend;
 use super::policy::DatagramPathSendError;
 use super::tcp_session::TcpDatagramClientSession;
 use crate::model::capacity::{DATAGRAM_FEEDBACK_DELAY_BUDGET, TRANSPORT_TIMER_GRANULARITY};
@@ -58,7 +58,7 @@ impl TcpDatagramClientAssociation {
             )
             .await;
         if result.is_err() && !self.paths[position].connection_usable {
-            self.remove_path(path_index, false);
+            self.remove_path(path_index);
         }
         result
     }
@@ -112,12 +112,7 @@ impl TcpDatagramClientAssociation {
                 self.paths.push(session);
                 Ok(self.paths.len() - 1)
             }
-            Err(error) => {
-                if tcp_datagram_error_is_path_retryable(&error) {
-                    self.context.mark_tcp_path_failure(path_index);
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -181,7 +176,7 @@ impl TcpDatagramClientAssociation {
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
         let result = self.paths[position].handle_frame(frame).await;
         if result.is_err() {
-            self.remove_path(path_index, false);
+            self.remove_path(path_index);
         }
         result
     }
@@ -218,10 +213,10 @@ impl TcpDatagramClientAssociation {
     }
 
     pub(in crate::runtime) fn handle_receive_error(&mut self, path_index: usize) {
-        self.remove_path(path_index, false);
+        self.remove_path(path_index);
     }
 
-    fn remove_path(&mut self, path_index: usize, failed: bool) {
+    fn remove_path(&mut self, path_index: usize) {
         let Some(position) = self
             .paths
             .iter()
@@ -235,9 +230,6 @@ impl TcpDatagramClientAssociation {
             session.path_instance_id(),
             session.delivery_stats(),
         );
-        if failed {
-            self.context.mark_tcp_path_failure(path_index);
-        }
     }
 }
 
@@ -280,22 +272,4 @@ pub(in crate::runtime) fn tcp_datagram_path_open_timeout(
             .saturating_mul(path_open_pto_multiplier(snapshot))
             .min(remaining_ttl)
     }
-}
-
-pub(in crate::runtime) fn tcp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
-    if runtime_error_is_datagram_response_timeout(err) {
-        return false;
-    }
-    matches!(
-        err,
-        RuntimeError::Io(_)
-            | RuntimeError::Tcp(_)
-            | RuntimeError::Encrypted(_)
-            | RuntimeError::Auth(_)
-            | RuntimeError::RemoteClosed(_)
-            | RuntimeError::Protocol(_)
-            | RuntimeError::PathOpenTimedOut
-            | RuntimeError::PathHeartbeatTimeout
-            | RuntimeError::ReliablePathSessionClosed
-    )
 }

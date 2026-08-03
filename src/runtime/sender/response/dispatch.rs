@@ -226,6 +226,7 @@ pub(super) fn emit_response_frame_from_sender_service(
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) fn emit_response_control_frame(
     stream: &ReliablePathStream,
     frame: Frame,

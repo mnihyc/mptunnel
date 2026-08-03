@@ -150,7 +150,6 @@ pub(super) fn reliable_relay_queued_send_blocked_for_retry(
 // Keep the relay and stream owners visible across the asynchronous attach boundary.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_additional_path_open_result(
-    context: &ClientPathContext,
     stream_id: StreamId,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
@@ -166,12 +165,6 @@ pub(super) async fn handle_additional_path_open_result(
         Ok(opened) => {
             #[cfg(feature = "lab-diagnostics")]
             let lane = opened.stream().lane;
-            if matches!(mode, ReliableRelayAttachMode::Recovery)
-                && remotes.accepted_path_count() > 1
-            {
-                opened.close().await;
-                return None;
-            }
             if resend_fin
                 && let Err(err) =
                     opened
@@ -182,10 +175,6 @@ pub(super) async fn handle_additional_path_open_result(
                         })
             {
                 opened.close().await;
-                context.mark_relay_path_failure(
-                    additional_path_open.key.underlay,
-                    additional_path_open.key.index,
-                );
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = err;
                 #[cfg(feature = "lab-diagnostics")]
@@ -242,12 +231,8 @@ pub(super) async fn handle_additional_path_open_result(
             None
         }
         Err(err) if relay_path_open_error_is_retryable(additional_path_open.key.underlay, &err) => {
-            // Preserve global health fencing. A later open becomes eligible
-            // only after independent path evidence reactivates the carrier.
-            context.mark_relay_path_failure(
-                additional_path_open.key.underlay,
-                additional_path_open.key.index,
-            );
+            // Retryability controls only Product work reselection. The exact
+            // carrier actor independently owns carrier-instance failure.
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "relay_additional_path_open_failed",
@@ -262,10 +247,6 @@ pub(super) async fn handle_additional_path_open_result(
             None
         }
         Err(err) => {
-            context.mark_relay_path_failure(
-                additional_path_open.key.underlay,
-                additional_path_open.key.index,
-            );
             #[cfg(not(feature = "lab-diagnostics"))]
             let _ = &err;
             #[cfg(feature = "lab-diagnostics")]
@@ -287,7 +268,6 @@ pub(super) async fn handle_additional_path_open_result(
 // Keep the relay and stream owners visible across the asynchronous attach boundary.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_completed_additional_path_opens(
-    context: &ClientPathContext,
     stream_id: StreamId,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
@@ -311,7 +291,6 @@ pub(super) async fn drain_completed_additional_path_opens(
             continue;
         }
         attached |= handle_additional_path_open_result(
-            context,
             stream_id,
             remotes,
             send_stream,
@@ -757,13 +736,13 @@ pub(in crate::runtime) fn reliable_relay_product_stall_preserves_attached_path_s
 pub(in crate::runtime) fn reliable_relay_product_stall_should_try_alternate_attach(
     remotes: &ReliableRelayRemoteSet,
 ) -> bool {
-    reliable_relay_should_open_recovery_path(remotes)
+    remotes.accepted_path_count() <= 1 && !remotes.is_empty()
 }
 
 pub(in crate::runtime) fn reliable_relay_should_open_recovery_path(
     remotes: &ReliableRelayRemoteSet,
 ) -> bool {
-    remotes.accepted_path_count() <= 1 && !remotes.is_empty()
+    !remotes.is_empty()
 }
 
 pub(in crate::runtime) fn reliable_relay_response_stall_watch_bytes(mux_limits: MuxLimits) -> u64 {

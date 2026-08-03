@@ -2663,11 +2663,22 @@ run_hysteria2_baseline_upload_case() {
 
 configure_mptcp_endpoints() {
   local service="$1"
-  shift
-  if ! exec_in "$service" "ip mptcp limits set subflows 5 add_addr_accepted 5 && ip mptcp endpoint flush"; then
+  local role="$2"
+  shift 2
+  if ! exec_in "$service" "ip mptcp limits set subflows 4 add_addr_accepted 4 && ip mptcp endpoint flush"; then
     echo "${service}: could not set MPTCP limits and flush old endpoints" >&2
     return 1
   fi
+  case "$role" in
+    accept)
+      return 0
+      ;;
+    signal) ;;
+    *)
+      echo "${service}: unknown MPTCP endpoint role ${role}" >&2
+      return 2
+      ;;
+  esac
   local id=1
   local addr dev
   for addr in "$@"; do
@@ -2675,7 +2686,7 @@ configure_mptcp_endpoints() {
       echo "${service}: no interface owns requested MPTCP address ${addr}" >&2
       return 1
     fi
-    if ! exec_in "$service" "ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal subflow fullmesh 2>/dev/null || ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal"; then
+    if ! exec_in "$service" "ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal"; then
       echo "${service}: failed to add MPTCP endpoint ${addr} on ${dev} with id ${id}" >&2
       return 1
     fi
@@ -2696,13 +2707,18 @@ check_mptcp_baseline_case() {
     append_skipped_result "$case_name" "$protocol" "kernel MPTCP sockets unavailable"
     return 1
   fi
+  # The initial connection owns the .10 path. The target advertises the four
+  # remaining directly connected addresses, so the client route selects the
+  # matching local source for exactly four additional subflows. Advertising
+  # every address as signal+subflow+fullmesh would request a race-selected
+  # 5x5 mesh rather than the five-path topology this baseline measures.
   local endpoint_error
-  if ! endpoint_error="$(configure_mptcp_endpoints client 172.31.10.10 172.31.15.10 172.31.16.10 172.31.20.10 172.31.30.10 2>&1)"; then
+  if ! endpoint_error="$(configure_mptcp_endpoints client accept 2>&1)"; then
     endpoint_error="${endpoint_error//$'\n'/; }"
     append_skipped_result "$case_name" "$protocol" "client MPTCP endpoint configuration failed: ${endpoint_error: -1500}"
     return 1
   fi
-  if ! endpoint_error="$(configure_mptcp_endpoints target 172.31.10.30 172.31.15.30 172.31.16.30 172.31.20.30 172.31.30.30 2>&1)"; then
+  if ! endpoint_error="$(configure_mptcp_endpoints target signal 172.31.15.30 172.31.16.30 172.31.20.30 172.31.30.30 2>&1)"; then
     endpoint_error="${endpoint_error//$'\n'/; }"
     append_skipped_result "$case_name" "$protocol" "target MPTCP endpoint configuration failed: ${endpoint_error: -1500}"
     return 1
@@ -4092,6 +4108,18 @@ if should_run_case "mptunnel_tcp_single_poor_internet_upload"; then
 fi
 if should_run_case "mptunnel_tcp_single_unconstrained_upload"; then
   run_reliable_ideal_upload_case "mptunnel_tcp_single_unconstrained_upload" "unconstrained" "$tcp_endpoint_lowlat"
+fi
+if should_run_case "mptunnel_tcp_single_unconstrained_range_1_1_upload"; then
+  run_reliable_ideal_upload_case \
+    "mptunnel_tcp_single_unconstrained_range_1_1_upload" \
+    "unconstrained" \
+    "--path 'tcp://172.31.10.20:${server_port}?tcp-carriers=1-1'"
+fi
+if should_run_case "mptunnel_tcp_single_unconstrained_range_1_3_upload"; then
+  run_reliable_ideal_upload_case \
+    "mptunnel_tcp_single_unconstrained_range_1_3_upload" \
+    "unconstrained" \
+    "--path 'tcp://172.31.10.20:${server_port}?tcp-carriers=1-3'"
 fi
 
 if should_run_case "mptunnel_tcp_multipath_all_upload"; then

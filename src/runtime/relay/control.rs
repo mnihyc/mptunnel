@@ -25,7 +25,7 @@ use super::lifecycle::{
     spawn_reliable_relay_disconnected_path_open, spawn_reliable_relay_recovery_path_open,
     switch_reliable_relay_to_best_path,
 };
-use super::open::{ReliableRelayOpenSpec, relay_error_is_tcp_path_failure};
+use super::open::ReliableRelayOpenSpec;
 use super::remote::ReliableRelayAttachMode;
 use super::tcp_validation::{
     ClientC2sTcpValidation, ClientC2sTcpValidationAction, ClientS2cTcpValidation,
@@ -58,7 +58,7 @@ use crate::runtime::sender::{
     reliable_relay_sender_queue_limit, reliable_relay_sender_queue_read_budget,
 };
 use crate::runtime::stream::{
-    OpenedRemoteStream, ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    OpenedRemoteStream, ReliableRelayRemoteFrame, ReliableRelayRemoteSet,
     arm_carrier_capacity_notifies, wait_for_carrier_capacity_notifies,
 };
 use crate::runtime::stream::{
@@ -357,7 +357,6 @@ where
                         .pending_additional_path_opens
                         .remove(&additional_path_open.key);
                     let attached = handle_additional_path_open_result(
-                        context,
                         stream_id,
                         &mut remotes,
                         &mut send_stream,
@@ -434,7 +433,6 @@ where
         }
         if !state.recovery.pending_additional_path_opens.is_empty()
             && drain_completed_additional_path_opens(
-                context,
                 stream_id,
                 &mut remotes,
                 &mut send_stream,
@@ -1183,6 +1181,13 @@ where
                 continue;
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
+                let persistent_product_stall = state
+                    .progress
+                    .last_product_stall_attempt_at
+                    .is_some_and(|attempted_at| attempted_at >= stall_progress_anchor);
+                let reinjection_horizon = persistent_product_stall
+                    .then(|| send_stream.next_offset())
+                    .or_else(|| state.progress.last_send_ack.horizon());
                 let queued_existing_tail_reinjection = sender.enqueue_tail_reinjection(
                     &mut sender_queue,
                     context,
@@ -1190,11 +1195,23 @@ where
                     &send_stream,
                     state.progress.last_send_ack.ranges(),
                     state.progress.last_send_ack.complete(),
-                    state.progress.last_send_ack.horizon(),
+                    reinjection_horizon,
                     state.progress.last_send_ack_frontier,
                     relay_lane,
                 );
+                let recovery_open_spawned = persistent_product_stall
+                    && spawn_reliable_relay_recovery_path_open(
+                        context,
+                        &spec,
+                        relay_lane,
+                        &remotes,
+                        &send_stream,
+                        &state.recovery.excluded_paths,
+                        &mut state.recovery.pending_additional_path_opens,
+                        &additional_path_open_tx,
+                    );
                 if queued_existing_tail_reinjection
+                    || recovery_open_spawned
                     || reliable_relay_product_stall_preserves_attached_path_set(&remotes)
                 {
                     if queued_existing_tail_reinjection {
@@ -1219,10 +1236,12 @@ where
                     lab_diagnostic(
                         "client_product_stall_keeps_attached_path_set",
                         format_args!(
-                            "stream_id={} active_underlay={:?} attached_paths={} reinjection_bytes={} recv_reorder_bytes={} sent_offset={} cause=product_stall_only",
+                            "stream_id={} active_underlay={:?} attached_paths={} pending_opens={} recovery_open_spawned={} reinjection_bytes={} recv_reorder_bytes={} sent_offset={} cause=product_stall_only",
                             stream_id.0,
                             path_snapshot.map(|snapshot| snapshot.underlay),
                             remotes.path_keys().len(),
+                            state.recovery.pending_additional_path_opens.len(),
+                            recovery_open_spawned,
                             send_stream.reinjection_bytes(),
                             recv_stream.reorder_bytes(),
                             send_stream.next_offset(),
@@ -1720,7 +1739,6 @@ where
                     continue;
                 }
                 let attached_mode = handle_additional_path_open_result(
-                    context,
                     stream_id,
                     &mut remotes,
                     &mut send_stream,
@@ -1741,7 +1759,7 @@ where
                         &send_stream,
                         state.progress.last_send_ack.ranges(),
                         state.progress.last_send_ack.complete(),
-                        state.progress.last_send_ack.horizon(),
+                        Some(send_stream.next_offset()),
                         state.progress.last_send_ack_frontier,
                         relay_lane,
                     ) {
@@ -2340,7 +2358,6 @@ where
     };
 
     let _ = drain_completed_additional_path_opens(
-        context,
         stream_id,
         &mut remotes,
         &mut send_stream,
@@ -2355,11 +2372,6 @@ where
         &mut state.recovery.pending_additional_path_opens,
     );
 
-    let remaining_paths = remotes
-        .paths
-        .iter()
-        .map(ReliableRelayRemotePath::key)
-        .collect::<Vec<_>>();
     if result.is_ok() {
         for (instance, path_stats) in std::mem::take(&mut state.delivery.by_path) {
             context.mark_relay_path_delivery(instance, path_stats);
@@ -2399,11 +2411,6 @@ where
         );
     }
     sender.release_all(context);
-    for key in remaining_paths {
-        if relay_error_is_tcp_path_failure(&result) {
-            context.mark_relay_path_failure(key.underlay, key.index);
-        }
-    }
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_flush("multipath_stream_close");
     if result.is_ok() {

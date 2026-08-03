@@ -39,7 +39,6 @@ pub(super) fn response_reinjection_avoid_outputs(
     }
 }
 
-pub(in crate::runtime) use dispatch::emit_response_control_frame;
 pub(in crate::runtime) use scheduling::ResponseOrdinarySaturationObservation;
 pub(in crate::runtime) use service::{
     ServerCarrierReadiness, ServerQueuedDispatch, ServerResponseSenderService,

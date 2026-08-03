@@ -1105,16 +1105,16 @@ impl RequestSenderService {
         send_stream: &ReliableSendStream,
         last_send_ack_ranges: &[OffsetRange],
         last_send_ack_complete: bool,
-        last_send_ack_horizon: Option<u64>,
+        reinjection_horizon: Option<u64>,
         last_send_ack_frontier: u64,
         lane: TrafficClass,
     ) -> bool {
-        let Some(last_send_ack_horizon) = last_send_ack_horizon else {
+        let Some(reinjection_horizon) = reinjection_horizon else {
             return false;
         };
         if !last_send_ack_complete
             || last_send_ack_frontier == 0
-            || last_send_ack_frontier >= last_send_ack_horizon
+            || last_send_ack_frontier >= reinjection_horizon
             || send_stream.reinjection_bytes() == 0
             || !matches!(
                 last_send_ack_ranges,
@@ -1152,7 +1152,7 @@ impl RequestSenderService {
         let reinjection_frames = send_stream.retransmission_frames_for_ranges(
             &[OffsetRange {
                 start: last_send_ack_frontier,
-                end: last_send_ack_horizon,
+                end: reinjection_horizon.min(send_stream.next_offset()),
             }],
             reinjection_limit,
         );

@@ -229,7 +229,7 @@ async fn server_tcp_test_session(
 }
 
 #[tokio::test]
-async fn ready_server_tcp_actor_serializes_session_demand_ahead_of_bulk_work() {
+async fn ready_server_tcp_actor_serializes_session_demand_ahead_of_inbound_and_bulk_work() {
     let session_id = SessionId(204);
     let path_id = PathId(0);
     let (mut session, mut client_framed, commands, path_frames, _reliable_relay) =
@@ -256,6 +256,10 @@ async fn ready_server_tcp_actor_serializes_session_demand_ahead_of_bulk_work() {
         path_instance_id: CarrierPathInstanceId::from_raw(91),
         output_incarnation: 1,
     };
+    let mux_limits = session.context.mux_limits;
+    let actor = tokio::spawn(session.run());
+    tokio::task::yield_now().await;
+
     let demand = workload
         .try_issue_saturation_demand(
             ServerTcpCarrierSaturation {
@@ -266,17 +270,26 @@ async fn ready_server_tcp_actor_serializes_session_demand_ahead_of_bulk_work() {
                 }]
                 .into_boxed_slice(),
             },
-            session.context.mux_limits,
+            mux_limits,
         )
         .expect("current response carrier demand");
-
-    let actor = tokio::spawn(session.run());
+    path_frames
+        .try_send(Ok(Frame::Ping { nonce: 91 }))
+        .expect("queue concurrently ready inbound frame");
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
             .await
             .expect("current demand timeout")
             .expect("read current demand"),
         demand.into_frame(),
+        "a newly published carrier demand must not starve behind ready inbound Product feedback",
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+            .await
+            .expect("inbound reply timeout")
+            .expect("read inbound reply"),
+        Frame::Pong { nonce: 91 },
     );
 
     for nonce in 10..18 {

@@ -524,7 +524,7 @@ async fn capacity_reference_is_the_fastest_mature_attached_path() {
     assert_eq!(reference, udp);
     assert_eq!(model.rate_bps, 240_000_000.0);
 
-    context.mark_relay_path_failure(udp.key.underlay, udp.key.index);
+    context.mark_udp_path_failure(udp.key.index);
     assert_eq!(
         controller
             .request_capacity_reference(&context, &remotes)

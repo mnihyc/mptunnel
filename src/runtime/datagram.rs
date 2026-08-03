@@ -48,10 +48,7 @@ pub(super) use quic::{
     udp_datagram_path_open_timeout,
 };
 #[cfg(test)]
-pub(super) use tcp::{
-    tcp_datagram_error_is_path_retryable, tcp_datagram_path_open_timeout,
-    tcp_datagram_response_timeout,
-};
+pub(super) use tcp::{tcp_datagram_path_open_timeout, tcp_datagram_response_timeout};
 
 pub(in crate::runtime) const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 

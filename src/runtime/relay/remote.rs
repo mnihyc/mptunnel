@@ -102,7 +102,6 @@ async fn attach_relay_path_candidates(
                         }
                     }
                     Err(err) if reliable_path_error_is_migratable(&err) => {
-                        context.mark_relay_path_failure(key.underlay, key.index);
                         last_retryable_error = Some(err);
                     }
                     Err(err) => return Err(err),
@@ -114,7 +113,6 @@ async fn attach_relay_path_candidates(
                 last_retryable_error = Some(err);
             }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
-                context.mark_relay_path_failure(key.underlay, key.index);
                 last_retryable_error = Some(err);
             }
             Err(err) => return Err(err),

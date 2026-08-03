@@ -5083,3 +5083,175 @@ entry is authoritative.
 - Next: commit the exact candidate, remove the local release reminder without
   committing it, tag once, push the commit and tag, and verify GitHub's native
   seven-platform build plus `version.json` before cleaning generated state.
+
+## 2026-08-03T15:55:23+08:00: lossy TCP upload and attachment-liveness diagnosis
+
+- Name: forced two-carrier high-RTT upload causal audit
+- Category: Core performance and RFC conformance
+- State: root causes proven; no production model or parameter change accepted
+- Native-loss result:
+  - forced `2-2`, zero loss completed exact accounting at `331.371 Mbps`; the
+    two native TCP ACK totals differed by only `0.75%` and neither carrier
+    reported a retransmission-counter advance;
+  - changing only random loss to `1%` completed exact accounting at
+    `200.842 Mbps`; the ACK totals differed by `7.02%` and the two carriers
+    reported `26/40` intervals in which their native retransmission counters
+    advanced; and
+  - material native rate/window divergence began near `2.8 s`, about `6.7 s`
+    before mature scheduler diagnostics. Both carriers later recovered,
+    remained selectable for both streams, drained their queues, and finished
+    the logical flows within `2.11%`. This rejects permanent Product
+    starvation as the initiating cause and establishes independent native TCP
+    loss history as the primary lossy-run reduction.
+- Product-lifecycle discrepancy:
+  - on a live carrier, an additional `OPEN_STREAM` is written and flushed
+    through the carrier's existing TCP writer under a one-PTO live deadline;
+    expiration is then passed to `mark_tcp_path_failure`, classifying a
+    stream-local attachment delay as path health failure;
+  - a focused zero-loss upload reproduced three such timeouts at
+    `5.346/5.650/6.468 s` while the carriers remained non-app-limited with
+    substantial native queued work; cross-attachments completed only at
+    `6.191/7.654 s`;
+  - the paired download started cross-attachment at `1.646/1.739 s`, timed out
+    once per path, and completed at `3.517/3.790 s`. Upload is therefore
+    exposed more severely because attachment control shares the saturated
+    client-to-server writer, while the download's client-to-server direction
+    mostly carries control and acknowledgments; and
+  - management snapshots independently caught a live, queued carrier reported
+    as `failed` for roughly one second in both zero- and one-percent-loss runs.
+    This conflicts with the RFC separation of liveness, congestion, and
+    attachment state; a stream open or cancellation cannot classify carrier
+    capacity or substitute for exact native failure.
+- Correction boundary: retain established carrier liveness and directional
+  authority until exact native failure, ordered drain, or session close. A
+  configuration change fences new admission and begins ordered drain; it does
+  not directly revoke peer-direction authority. Treat an attachment deadline
+  as stream-local settlement and retry evidence, never global carrier failure.
+  Placement remains work-conserving
+  against current native enqueue credit and recent qualified Product service;
+  no fixed utilization percentage, Mbps threshold, tolerance timer, synthetic
+  congestion window, or unconditional extra carrier is justified.
+- Evidence: raw paired throughput traces are under
+  `./.tmp/lab/results/post-v016-forced-two-upload-zero-loss-diag/` and
+  `./.tmp/lab/results/post-v016-forced-two-upload-one-loss-diag/`; focused
+  attachment traces are under
+  `./.tmp/lab/results/post-v016-forced-two-upload-lifecycle-diag/` and
+  `./.tmp/lab/results/post-v016-forced-two-download-lifecycle-diag/`.
+- Next: align the smallest neutral implementation with the RFC's existing
+  lifecycle separation, then prove it with adjacent upload/download and
+  lossy/healthy cells. Do not change congestion control, Product flight caps,
+  carrier bounds, or timing constants as part of that correction.
+
+## 2026-08-03T16:42:55+08:00: attachment scope and carrier-failure ownership accepted
+
+- Name: exact carrier lifecycle boundary
+- Category: Core correctness and performance preservation
+- State: accepted; the practical misclassification is removed without a
+  congestion, timing, capacity, validation, or carrier-range change
+- RFC and ownership:
+  - an expired, cancelled, refused, or locally rejected pending attachment now
+    settles only that attachment and retains normal ordered `STREAM_DETACH`
+    settlement when its open may have entered the carrier writer;
+  - Product open/reselection code no longer publishes index-wide TCP or QUIC
+    carrier failure, clears exact-instance evidence, or marks every remaining
+    attachment when a logical stream ends with a retryable error;
+  - an established carrier's exact instance actor remains the only publisher
+    of data-plane failure; disconnected TCP actors publish pre-readiness dial,
+    authentication, or join failure through the existing endpoint-generation
+    fence; and
+  - refusal, expiry, and gradual drain remain distinct from immediate exact
+  native failure. No sibling attachment, endpoint-group carrier reservation,
+  proof, flight, queue, or delivery observation is mutated by a Product-local
+  timeout; the exact operation's scheduler-load lease is still settled.
+- Durable evidence:
+  - the new lifecycle regression gives a live exact TCP instance nonzero
+    flight, queue, qualified Product delivery, and path-proof evidence, then
+    injects an additional-attachment timeout and proves the complete health
+    and accounting tuple plus attachment membership is unchanged;
+  - all `153` relay tests pass, the exact native TLS carrier-loss migration
+    integration passes, and the complete default-feature suite passes `1522`
+    library tests, `2` allocation regressions, and `6` daily-use acceptance
+    tests;
+  - warnings-denied all-target/all-feature Clippy, formatting, shell parsing,
+    and whitespace gates pass.
+- Adjacent performance evidence (`500 Mbit/s`, about `333-360 ms` RTT, forced
+  two TCP carriers, two bulk streams, 20-second load):
+  - zero loss: `350.578 Mbps` download and `332.699 Mbps` upload; both exact
+    carrier instances stayed `active` in every management snapshot;
+  - one-percent random loss: `212.668 Mbps` upload with exact two-stream sink
+    accounting, versus the pre-correction `200.842 Mbps` control; both carrier
+    instances stayed `active` throughout;
+  - the healthy one-percent download replicate delivered `168.233 Mbps` with
+    both exact carrier instances continuously `active`. The first sample's
+    `13.802 Mbps` was rejected as a throughput sample because the initial pair
+    never became authenticated carrier instances: one pre-readiness record was
+    already `suspect`, both opens reached the unchanged `9.216 s` RFC-derived
+    establishment deadline, and the actor replaced them with healthy instances.
+    This is recorded as cold-establishment variance, not hidden as steady-state
+    carrier performance and not used to justify a timer tweak.
+- Capacity interpretation: the raw shaped ceiling is `500 Mbit/s`; independent
+  one-percent packet loss leaves an ideal retransmission-only ceiling below
+  roughly `495 Mbit/s` before TCP/IP headers, ACK traffic, recovery stalls, and
+  congestion response. RTT alone does not impose a lower ceiling when the
+  native windows cover the BDP, and there is no honest protocol-independent
+  exact TCP goodput target under random loss. The relevant acceptance control
+  is therefore the identical historical cell: the correction preserves the
+  healthy result and improves, rather than reduces, the measured lossy upload.
+- Scope intentionally unchanged: native congestion control, all RFC timing
+  equations, Product flight accounting, validation geometry, `1-3` default
+  carrier range, gradual no-gain withdrawal, and immediate exact carrier
+  failure remain as established.
+- Deferred, not silently altered: RFC section 15's wording around one
+  candidate per admission generation versus later unattempted endpoint groups
+  remains a separate elastic-expansion question. It was not involved in the
+  proven attachment failure and receives no speculative change here.
+- Reproducible evidence is under
+  `./.tmp/lab/results/post-attachment-scope-forced-two-fat-loss0/`,
+  `./.tmp/lab/results/post-attachment-scope-forced-two-fat-loss1/`, and
+  `./.tmp/lab/results/post-attachment-scope-forced-two-fat-loss1-download-replicate/`.
+
+## 2026-08-03T18:55:11+08:00: retained-tail disruption recovery accepted
+
+- Name: established-stream continuity after an attachment becomes silently
+  unusable
+- Category: RFC conformance and release performance acceptance
+- State: accepted; the clean candidate is frozen while the complete fresh
+  publication matrix runs
+- Proven gaps and corrections:
+  - a complete Data ACK snapshot remains authoritative for omissions below
+    its horizon, while retained bytes beyond that horizon now remain eligible
+    for the RFC Section 15.2 live-tail probe in both stream directions;
+  - response FIN and initial receive-credit publication remain retained Product
+    work when a carrier output is temporarily full, rather than escaping as a
+    terminal `SenderServiceBlocked` stream error;
+  - after one bounded recovery cycle on the current live attachments, continued
+    absence of Product progress may add one unattached authenticated configured
+    carrier, within the existing attachment and carrier bounds; and
+  - a successful recovery attachment is retained even when the logical stream
+    already has multiple attachments. Progress stops expansion. No source
+    address, interface, or inferred physical-link identity participates.
+- Scope unchanged: no congestion controller, native TCP/QUIC behavior, timing
+  equation, Mbps or percentage threshold, carrier range, wire field, or
+  platform branch changed.
+- Exact continuity evidence:
+  - clean source `a3e06a0` and optimized binary SHA-256
+    `248aca9d788c5402c92f1c1b06384f28642e40d6f901a5dcc414f1dc1ce67278`
+    ran the fixed-seed mixed TCP/QUIC handover;
+  - the established TCP echo completed `53/53` requests without disconnect,
+    bulk delivery remained live at `221.587 Mbps`, and the maximum bulk read
+    gap was `1.117 s`;
+  - one of `90` newly opened HTTP requests began inside a deliberate four-second
+    carrier blackhole and exceeded its independent `2.5 s` application budget
+    by `3 ms`; this is an expected operation-local deadline, not established
+    stream loss, and does not justify a transport timer or lifecycle patch;
+  - datagrams delivered `218/221`, consistent with their unreliable semantics
+    during injected blackholes; and
+  - the prior terminal `SenderServiceBlocked` warning did not recur.
+- Source evidence: all `1523` default-feature library tests pass, including
+  durable retained-tail, response symmetry, credit backpressure, and
+  multi-attachment recovery regressions. The clean handover bundle is under
+  `./.tmp/publication-candidate-20260803/.tmp/lab/results/publication-final-fixed-handover-v3/`.
+- Next: finish one non-duplicated fresh baseline, QoS, scale, asymmetry,
+  browser-load, continuity, and local-ceiling matrix from this exact binary;
+  replace every public measured output from those bundles, then run the final
+  documentation and source gates.

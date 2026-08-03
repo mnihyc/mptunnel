@@ -24,7 +24,7 @@ pub(in crate::runtime) use request::{
 #[cfg(not(test))]
 pub(in crate::runtime) use response::{
     ResponseOrdinarySaturationObservation, ServerCarrierReadiness, ServerQueuedDispatch,
-    ServerResponseSenderService, emit_response_control_frame,
+    ServerResponseSenderService,
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use work::{

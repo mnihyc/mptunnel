@@ -462,9 +462,6 @@ fn datagram_response_timeout_is_terminal_product_expiry() {
     assert!(!datagram_underlay_error_is_retryable(
         &RuntimeError::DatagramResponseTimedOut
     ));
-    assert!(!tcp_datagram_error_is_path_retryable(
-        &RuntimeError::DatagramResponseTimedOut
-    ));
     assert!(!udp_datagram_error_is_path_retryable(
         &RuntimeError::DatagramResponseTimedOut
     ));
@@ -476,9 +473,6 @@ fn datagram_response_timeout_is_terminal_product_expiry() {
         &RuntimeError::Protocol("other datagram protocol error")
     ));
     assert!(datagram_underlay_error_is_retryable(
-        &RuntimeError::PathOpenTimedOut
-    ));
-    assert!(tcp_datagram_error_is_path_retryable(
         &RuntimeError::PathOpenTimedOut
     ));
 }

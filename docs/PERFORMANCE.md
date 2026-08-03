@@ -17,16 +17,15 @@ Configured bandwidth is never reported as delivered throughput.
 
 | System | Transport | Download (Mbps) | Upload (Mbps) | Directions |
 | --- | --- | ---: | ---: | ---: |
-| Direct | TCP | 198.820 | 220.405 | 2/2 |
-| Xray 26.3.27 | VMess/TCP | 209.203 | — | 1/2 |
-| MPTUNNEL | MPP/TCP | 123.628 | 103.307 | 2/2 |
-| Hysteria2 2.10.0 | QUIC | 96.371 | ≥115.109 | 1/2 |
-| MPTUNNEL | MPP/QUIC | 240.475 | 180.017 | 2/2 |
+| Direct | TCP | 203.719 | 104.872 | 2/2 |
+| Xray 26.3.27 | VMess/TCP | 215.402 | ≥207.296 | 1/2 |
+| MPTUNNEL | MPP/TCP | 139.771 | 122.328 | 2/2 |
+| Hysteria2 2.10.0 | QUIC | 92.626 | ≥103.035 | 1/2 |
+| MPTUNNEL | MPP/QUIC | 244.596 | 229.631 | 2/2 |
 
-MPP/QUIC delivered 2.50× Hysteria2's download goodput. MPP/TCP did not beat
-Xray on this single path. Xray upload ended before receiver completion and is
-omitted. Hysteria2 upload is the receiver-confirmed lower bound shown above;
-neither incomplete upload is used for a ratio.
+MPP/QUIC delivered 2.64× Hysteria2's download goodput. MPP/TCP did not beat
+Xray on this single path. The Xray and Hysteria2 uploads are receiver-confirmed
+lower bounds; neither incomplete upload is used for a ratio.
 
 Single-path TCP still has native head-of-line recovery. MPP adds framing, Data
 ACKs, flow control, and relay work without gaining another link in this case.
@@ -38,13 +37,15 @@ Its advantage appears when independent capacity or continuity is available.
 
 | System | Transport | Paths | Download (Mbps) | Upload (Mbps) | Directions |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Linux MPTCP | TCP | 5 | 302.101 | 434.432 | 2/2 |
-| MPTUNNEL | MPP/TCP | 5 | 732.433 | 508.562 | 2/2 |
-| MPTUNNEL | MPP/QUIC | 5 | 629.507 | 707.077 | 2/2 |
+| Linux MPTCP | TCP | 5 | 257.275 | 194.296 | 2/2 |
+| MPTUNNEL | MPP/TCP | 5 | 726.106 | 533.922 | 2/2 |
+| MPTUNNEL | MPP/QUIC | 5 | 596.944 | 753.061 | 2/2 |
 
-MPP/TCP delivered 2.42× MPTCP download goodput and 1.17× its upload goodput.
-All MPTUNNEL rows completed with exact receiver accounting. No independent
-multipath QUIC product was available for a matched comparison.
+MPP/TCP delivered 2.82× MPTCP download goodput and 2.75× its upload goodput.
+The MPTCP topology used one initial path plus four aligned address pairs; all
+five carried payload. All MPTUNNEL rows completed with exact receiver
+accounting. No independent multipath QUIC product was available for a matched
+comparison.
 
 ## TCP carrier range
 
@@ -56,15 +57,15 @@ unused capacity through the normal carrier lifecycle.
 
 | Direction | `1-1` (Mbps) | `1-3` (Mbps) |
 | --- | ---: | ---: |
-| Download | 75.239 | 111.686 |
-| Upload | 78.370 | 121.669 |
+| Download | 74.944 | 119.684 |
+| Upload | 77.893 | 125.999 |
 
 ### Shared 200 Mbps bottleneck
 
 | Direction | `1-1` (Mbps) | `1-3` (Mbps) |
 | --- | ---: | ---: |
-| Download | 157.321 | 154.044 |
-| Upload | 156.397 | 161.143 |
+| Download | 158.644 | 158.920 |
+| Upload | 156.980 | 160.167 |
 
 The per-flow case retained two carriers and gained useful capacity. The shared
 bottleneck stayed at its aggregate ceiling; no third carrier was retained. No
@@ -74,8 +75,8 @@ Mbps or percentage value from these runs is a production threshold.
 
 | TCP range | Upload (Gbps) | Flows | Failed |
 | ---: | ---: | ---: | ---: |
-| `1-1` | 6.001 | 2/2 | 0 |
-| `1-3` | 6.286 | 2/2 | 0 |
+| `1-1` | 6.115 | 2/2 | 0 |
+| `1-3` | 6.933 | 2/2 | 0 |
 
 The default range preserves the fixed-carrier local ceiling while retaining
 the ability to expand under single-flow TCP shaping.
@@ -86,9 +87,9 @@ Ten TCP and ten QUIC links used varied bandwidth, latency, jitter, and loss.
 
 | Rate/link (Mbps) | Download (Mbps) | Upload (Mbps) | Directions |
 | ---: | ---: | ---: | ---: |
-| 30–100 | 344.534 | 210.378 | 2/2 |
-| 300–1,000 | 1,178.811 | 609.004 | 2/2 |
-| 3,000–10,000 | 2,261.932 | 670.693 | 2/2 |
+| 30–100 | 378.764 | 292.168 | 2/2 |
+| 300–1,000 | 1,395.311 | 610.051 | 2/2 |
+| 3,000–10,000 | 2,882.347 | 731.499 | 2/2 |
 
 Every configured endpoint started one carrier. TCP endpoints retained their
 independent `1-3` bounds, but a second carrier was not an eager target.
@@ -97,8 +98,8 @@ independent `1-3` bounds, but a second carrier was not an eager target.
 
 | Direction | Fast link (Mbps) | Slow link (Mbps) | Fast-link share (%) |
 | --- | ---: | ---: | ---: |
-| Download | 200 | 20 | 91.5 |
-| Upload | 200 | 20 | 86.6 |
+| Download | 200 | 20 | 90.0 |
+| Upload | 200 | 20 | 91.1 |
 
 Direction-specific delivery measurements, rather than source addresses, allow
 the preferred link to differ between upload and download.
@@ -107,12 +108,12 @@ the preferred link to differ between upload and download.
 
 | Condition | Download (Mbps) | Upload (Mbps) | TCP echo | HTTP | Datagrams | DL gap (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| QUIC port hop | 2,459.750 | 2,498.275 | — | — | — | 30 |
-| TCP+QUIC blackhole | 257.755 | — | 40/40 | — | 151/153 | 777 |
-| TCP+QUIC latency | 199.210 | — | 40/40 | — | 145/147 | 1,293 |
-| TCP blackhole | 181.261 | 243.518 | — | — | — | — |
+| QUIC port hop | 2,605.402 | 2,662.391 | — | — | — | 8 |
+| TCP+QUIC blackhole | 153.510 | — | 60/60 | 98/98 | 252/253 | 532 |
+| TCP+QUIC latency | 187.348 | — | 60/60 | 115/115 | 314/315 | 1,995 |
+| TCP blackhole | 275.157 | 302.570 | — | — | — | — |
 | TCP latency | 280.085 | 245.656 | — | — | — | — |
-| TCP+QUIC handover | 224.069 | — | 32/32 | 47/47 | 134/134 | 717 |
+| TCP+QUIC handover | 221.587 | — | 53/53 | 89/90 | 218/221 | 1,117 |
 
 | Event | Duration (s) | Existing flows | New flows |
 | --- | ---: | ---: | ---: |
@@ -125,12 +126,16 @@ connections were rejected while no outbound carrier was available. QUIC uses
 native connection migration; TCP establishes a fresh carrier and preserves
 the MPP stream through exact retained ranges.
 
+The handover HTTP miss began inside the deliberate four-second blackhole and
+reached its 2.5-second application deadline before service returned; its
+established TCP echo stream remained connected for all 53 exchanges.
+
 ## Short connections
 
 | Concurrency | Object (KiB) | Duration (s) | Requests | Rejected | Failed | Deadline (ms) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10 | 32 | 30 | 90/90 | 0 | 0 | 3,000 |
-| 20 | 1,024 | 60 | 570/570 | 0 | 0 | — |
+| 20 | 1,024 | 60 | 777/777 | 0 | 0 | — |
 
 The first run opened ten requests every three seconds. The second maintained
 twenty concurrent 1 MiB transfers for sixty seconds.
@@ -142,18 +147,18 @@ local container and host path, not a public Internet link.
 
 | System | Transport | Endpoints | Download (Gbps) | Upload (Gbps) | Directions |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Direct | TCP | 1 | 15.153 | 23.364 | 2/2 |
-| Xray 26.3.27 | VMess/TCP | 1 | 8.261 | ≥7.251 | 1/2 |
-| MPTUNNEL | MPP/TCP | 1 | 6.844 | 6.673 | 2/2 |
-| MPTUNNEL | MPP/TCP | 5 | 5.453 | 5.999 | 2/2 |
+| Direct | TCP | 1 | 23.334 | 23.048 | 2/2 |
+| Xray 26.3.27 | VMess/TCP | 1 | 8.525 | ≥7.197 | 1/2 |
+| MPTUNNEL | MPP/TCP | 1 | 6.915 | 6.933 | 2/2 |
+| MPTUNNEL | MPP/TCP | 5 | 5.726 | 6.011 | 2/2 |
 
-All proxy rows reached their host processing ceiling. MPP/TCP peaked near two
-CPU cores while performing encryption, framing, sequencing, scheduling, Data
-ACKs, flow control, and relay work. Adding unshaped endpoints adds ordering and
-carrier work without adding network capacity. Independently shaped paths
-provide the aggregation opportunity shown in the five-path results above. The
-remaining local gap is implementation processing cost, not a bandwidth
-threshold, congestion controller, or recovery timer.
+All proxy rows reached their host processing ceiling. MPP/TCP performs
+encryption, framing, sequencing, scheduling, Data ACKs, flow control, and relay
+work. Adding unshaped endpoints adds ordering and carrier work without adding
+network capacity. Independently shaped paths provide the aggregation
+opportunity shown in the five-path results above. The remaining local gap is
+implementation processing cost, not a bandwidth threshold, congestion
+controller, or recovery timer.
 
 ## Reading the results
 

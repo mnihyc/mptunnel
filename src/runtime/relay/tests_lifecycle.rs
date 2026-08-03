@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
-use crate::protocol::{PathId, TargetAddr};
+use crate::model::path::next_carrier_path_instance_id;
+use crate::protocol::{PathId, PathUsage, TargetAddr};
 use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
@@ -190,7 +191,10 @@ async fn product_stall_preserves_an_existing_multipath_attachment_set() {
     assert!(!reliable_relay_product_stall_should_try_alternate_attach(
         &remotes
     ));
-    assert!(!reliable_relay_should_open_recovery_path(&remotes));
+    assert!(
+        reliable_relay_should_open_recovery_path(&remotes),
+        "persistent stream-local recovery may add one unattached configured carrier"
+    );
     assert_eq!(remotes.path_instances(), membership);
 }
 
@@ -219,7 +223,7 @@ async fn product_stall_on_a_sole_carrier_requests_an_alternative() {
 }
 
 #[tokio::test]
-async fn product_stall_recovery_open_is_owned_by_a_pending_task() {
+async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
@@ -227,6 +231,7 @@ async fn product_stall_recovery_open_is_owned_by_a_pending_task() {
         [
             "tcp://127.0.0.1:11171",
             "udp://127.0.0.1:11172?srtt-ms=180&rate-mbps=500",
+            "tcp://127.0.0.1:11173?srtt-ms=40&rate-mbps=500",
         ]
         .into_iter()
         .map(|path| path.parse::<PathSpec>().expect("test path"))
@@ -246,8 +251,23 @@ async fn product_stall_recovery_open_is_owned_by_a_pending_task() {
         ),
         0,
     );
-    let remotes = ReliableRelayRemoteSet::new(opened, 4);
-    let send_stream = ReliableSendStream::new(StreamId(2), context.mux_limits);
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let (second_commands, _second_receivers) = reliable_path_command_channels(1);
+    assert_eq!(
+        remotes.attach_candidate(OpenedRemoteStream::pending(
+            test_stream(
+                StreamId(2),
+                UnderlayProtocol::Udp,
+                0,
+                second_commands,
+                TrafficClass::Latency,
+            ),
+            0,
+        )),
+        ReliableRelayAttachOutcome::Attached
+    );
+    assert_eq!(remotes.accepted_path_count(), 2);
+    let mut send_stream = ReliableSendStream::new(StreamId(2), context.mux_limits);
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip("127.0.0.1:9".parse().expect("test target")),
     };
@@ -266,10 +286,45 @@ async fn product_stall_recovery_open_is_owned_by_a_pending_task() {
     ));
     assert_eq!(pending.len(), 1);
     assert!(pending.contains_key(&RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
+        underlay: UnderlayProtocol::Tcp,
+        index: 1,
     }));
     cancel_pending_additional_path_opens(StreamId(2), &mut pending);
+
+    let third = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 1,
+    };
+    let (third_commands, _third_receivers) = reliable_path_command_channels(1);
+    let mut last_stream_progress_at = Instant::now();
+    assert!(matches!(
+        handle_additional_path_open_result(
+            StreamId(2),
+            &mut remotes,
+            &mut send_stream,
+            false,
+            RelayAdditionalPathOpenResult {
+                key: third,
+                generation: next_relay_additional_path_open_generation(),
+                mode: ReliableRelayAttachMode::Recovery,
+                result: Ok(OpenedRemoteStream::pending(
+                    test_stream(
+                        StreamId(2),
+                        UnderlayProtocol::Tcp,
+                        1,
+                        third_commands,
+                        TrafficClass::Latency,
+                    ),
+                    1,
+                )),
+            },
+            0,
+            &mut last_stream_progress_at,
+        )
+        .await,
+        Some(ReliableRelayAttachMode::Recovery)
+    ));
+    assert_eq!(remotes.accepted_path_count(), 3);
 }
 
 #[test]
@@ -335,6 +390,106 @@ async fn stale_additional_path_result_cannot_consume_replacement_open() {
         .handle
         .abort();
     assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn additional_attachment_timeout_preserves_live_carrier_health_and_work_accounting() {
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    );
+    let context = ClientPathContext::new(
+        ["tcp://127.0.0.1:11173", "tcp://127.0.0.1:11174"]
+            .into_iter()
+            .map(|path| path.parse::<PathSpec>().expect("test path"))
+            .collect(),
+        security,
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let candidate = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 1,
+    };
+    let candidate_instance = next_carrier_path_instance_id();
+    let before = {
+        let mut health = context.health().lock().expect("path health");
+        let record = health
+            .tcp_record_mut(candidate.index)
+            .expect("candidate record");
+        record.install_peer_usage(candidate_instance, 0, PathUsage::Available);
+        record.relay_bytes_in_flight = 65_536;
+        record.relay_queue_bytes = 131_072;
+        record.product_delivery_rate_bps = Some(250_000_000.0);
+        record.product_delivery_sample_bytes = 1_048_576;
+        record.path_proof_success = true;
+        (
+            record.eligibility_fingerprint(),
+            record.consecutive_failures,
+            record.failed_until,
+            record.active_flows,
+            record.relay_bytes_in_flight,
+            record.relay_queue_bytes,
+            record.product_delivery_rate_bps,
+            record.product_delivery_sample_bytes,
+            record.path_proof_success,
+        )
+    };
+
+    let stream_id = StreamId(5);
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    let opened = OpenedRemoteStream::pending(
+        test_stream(
+            stream_id,
+            UnderlayProtocol::Tcp,
+            0,
+            commands,
+            TrafficClass::Throughput,
+        ),
+        0,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let membership = remotes.path_instances();
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let mut last_stream_progress_at = Instant::now();
+
+    assert!(
+        handle_additional_path_open_result(
+            stream_id,
+            &mut remotes,
+            &mut send_stream,
+            false,
+            RelayAdditionalPathOpenResult {
+                key: candidate,
+                generation: next_relay_additional_path_open_generation(),
+                mode: ReliableRelayAttachMode::BulkStriping,
+                result: Err(RuntimeError::PathOpenTimedOut),
+            },
+            0,
+            &mut last_stream_progress_at,
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(remotes.path_instances(), membership);
+
+    let after = {
+        let health = context.health().lock().expect("path health");
+        let record = health
+            .tcp_record(candidate.index)
+            .expect("candidate record");
+        (
+            record.eligibility_fingerprint(),
+            record.consecutive_failures,
+            record.failed_until,
+            record.active_flows,
+            record.relay_bytes_in_flight,
+            record.relay_queue_bytes,
+            record.product_delivery_rate_bps,
+            record.product_delivery_sample_bytes,
+            record.path_proof_success,
+        )
+    };
+    assert_eq!(after, before);
 }
 
 #[test]

@@ -1075,6 +1075,15 @@ the pending attachment sends `STREAM_DETACH` on that carrier. `STREAM_RESET`
 is reserved for terminating the logical MPP stream and MUST NOT be used to
 refuse an additional attachment.
 
+Expiry, cancellation, or local rejection of a pending `OPEN_STREAM` settles
+only that exact attachment attempt. If the open may already have entered the
+carrier's ordered writer, settlement MUST preserve the normal
+`STREAM_DETACH` ordering. The sender MAY reselect another attachment, but the
+operation-local outcome MUST NOT by itself publish carrier-instance failure,
+revoke directional authority, discard exact-instance evidence, alter sibling
+attachments, or release the carrier's endpoint-group reservation. The exact
+operation's temporary scheduler-load reservation is settled normally.
+
 ### 8.2 Offset mapping and delivery
 
 `STREAM_DATA(stream_id, offset, payload)` maps its bytes to:
@@ -1225,6 +1234,19 @@ instances. Reattachment uses ordinary authenticated admission and attachment;
 no authority, attachment, transport evidence, queue, or flight transfers from
 a failed instance. Reconnect attempts MUST NOT extend any original retention
 deadline.
+
+Lack of Product progress while attachments remain live is stream-local
+recovery evidence, not carrier failure. The sender first evaluates retained
+ranges and the currently attached outputs. That first recovery cycle MUST NOT
+infer loss beyond the receiver's authoritative complete-ACK horizon. If no
+Product progress follows that bounded cycle, recovery MAY extend through the
+current retained send extent and MAY attach the same logical stream to one
+additional authenticated configured carrier that is not already attached. A
+new recovery attachment MAY immediately carry that retained extent. At most
+one such recovery attachment may be pending at a time; the configured
+attachment and carrier bounds still apply, and Product progress ends the
+expansion. This decision uses Product progress and exact attachment membership,
+not source address, interface, or an inferred physical-link identity.
 
 ### 8.7 Reinjection
 
@@ -1590,6 +1612,14 @@ carrier, or session according to the corrupted state. Authentication failure
 must not admit durable product state. A carrier failure invalidates only state
 owned by that carrier instance; a logical stream may continue on surviving
 attachments.
+
+An operation-local deadline, cancellation, refusal, or queue-admission
+failure MUST NOT by itself be escalated into carrier-instance failure. Such an
+outcome may settle or reselect the exact proposed operation, but MUST NOT by
+itself revoke directional authority, discard exact-instance evidence, alter
+sibling attachments, or release the carrier's endpoint-group reservation. The
+exact operation's temporary scheduler-load reservation is settled normally.
+Only an exact carrier-scoped terminal event may publish carrier failure.
 
 Failure publication MUST carry exact carrier-instance identity. A delayed
 status, ACK, measurement, or teardown from an older instance MUST NOT alter

@@ -65,16 +65,6 @@ pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
     }
 }
 
-pub(in crate::runtime) fn mark_reliable_initial_open_retryable_failure(
-    context: &ClientPathContext,
-    key: RelayPathKey,
-) {
-    match key.underlay {
-        UnderlayProtocol::Tcp => context.mark_tcp_path_failure(key.index),
-        UnderlayProtocol::Udp => context.mark_udp_path_failure(key.index),
-    }
-}
-
 async fn open_reliable_initial_attempt(
     context: &ClientPathContext,
     attempt: ReliableInitialOpenAttempt,
@@ -200,7 +190,6 @@ pub(in crate::runtime) async fn open_remote_stream(
                 last_retryable_error = Some(err);
             }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
-                mark_reliable_initial_open_retryable_failure(context, key);
                 last_retryable_error = Some(err);
             }
             Err(err) => return Err(err),
@@ -243,7 +232,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
         Ok(opened) => Ok(opened.with_load_lease(load_lease)),
         Err(err) if !matches!(err, RuntimeError::PathOpenTimedOut) => Err(err),
         Err(RuntimeError::PathOpenTimedOut) => {
-            context.mark_tcp_path_failure(path_index);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "reliable_stream_open_timeout",
@@ -563,21 +551,6 @@ pub(in crate::runtime) fn no_schedulable_reliable_path_error(
     } else {
         RuntimeError::NoSchedulableUdpPath
     }
-}
-
-pub(in crate::runtime) fn relay_error_is_tcp_path_failure<T>(
-    result: &Result<T, RuntimeError>,
-) -> bool {
-    matches!(
-        result,
-        Err(RuntimeError::PathHeartbeatTimeout)
-            | Err(RuntimeError::PathOpenTimedOut)
-            | Err(RuntimeError::ReliablePathSessionClosed)
-            | Err(RuntimeError::Tcp(_))
-            | Err(RuntimeError::Encrypted(_))
-            | Err(RuntimeError::RemoteClosed(_))
-            | Err(RuntimeError::Protocol(_))
-    )
 }
 
 #[cfg(test)]

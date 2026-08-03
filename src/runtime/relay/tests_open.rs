@@ -204,7 +204,6 @@ fn initial_open_retry_uses_fresh_stream_id() {
     let first_key = first.key;
     let first_stream_id = first.stream_id;
     drop(first);
-    context.mark_relay_path_failure(first_key.underlay, first_key.index);
 
     let second = reserve_reliable_initial_open_attempt(
         &context,
@@ -216,41 +215,4 @@ fn initial_open_retry_uses_fresh_stream_id() {
     .expect("second candidate");
     assert_ne!(first_stream_id, second.stream_id);
     assert_ne!(first_key, second.key);
-}
-
-#[test]
-fn retryable_initial_open_failure_cools_path_for_next_attempt() {
-    let context = ClientPathContext::new(
-        vec![
-            "tcp://127.0.0.1:10132?srtt-ms=20&rate-mbps=100"
-                .parse()
-                .expect("failed path"),
-            "tcp://127.0.0.1:10133?srtt-ms=80&rate-mbps=100"
-                .parse()
-                .expect("survivor path"),
-        ],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let failed = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let failed_lease = context
-        .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
-        .expect("failed-path reservation");
-    assert_eq!(failed_lease.key(), failed);
-    drop(failed_lease);
-    mark_reliable_initial_open_retryable_failure(&context, failed);
-
-    assert_eq!(
-        context
-            .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
-            .map(|lease| lease.key()),
-        Some(RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: 1,
-        })
-    );
 }

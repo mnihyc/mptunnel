@@ -31,9 +31,9 @@ use super::remote::ReliableRelayAttachMode;
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes,
-    adaptive_reliable_relay_chunk_bytes_with_frame_limit, adaptive_reliable_relay_inflight_bytes,
-    reliable_relay_buffer_len, reliable_relay_sender_dispatch_budget,
-    reliable_stream_initial_advertised_window_bytes,
+    adaptive_reliable_relay_chunk_bytes_with_frame_limit,
+    adaptive_reliable_stream_source_window_bytes, reliable_relay_buffer_len,
+    reliable_relay_sender_dispatch_budget, reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::sender_service_retry_delay;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
@@ -652,8 +652,11 @@ where
             context.mux_limits,
             remotes.max_frame_payload_bytes(context.mux_limits),
         );
-        let adaptive_inflight =
-            adaptive_reliable_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
+        let adaptive_inflight = adaptive_reliable_stream_source_window_bytes(
+            path_snapshot,
+            relay_lane,
+            context.mux_limits,
+        );
         let request_outstanding_limit = reliable_relay_request_outstanding_limit_bytes(
             relay_lane,
             adaptive_chunk,

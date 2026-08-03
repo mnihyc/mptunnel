@@ -2,7 +2,8 @@ use super::{
     MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT,
     RELIABLE_PIPE_WINDOW_BDPS, TcpCapacityProofCandidate, adaptive_reliable_relay_chunk_bytes,
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, adaptive_reliable_relay_inflight_bytes,
-    min_reliable_pipe_bytes, reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
+    adaptive_reliable_stream_source_window_bytes, min_reliable_pipe_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
     reliable_relay_scheduler_quantum_cap, reliable_relay_sender_dispatch_budget,
     reliable_startup_bdp_bytes, reliable_startup_send_quantum_bytes,
     reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
@@ -280,6 +281,26 @@ fn tcp_product_service_window_cannot_enlarge_native_congestion_credit() {
 
     assert_eq!(inflight, expected);
     assert!(inflight < mux_limits.max_path_flight_bytes);
+}
+
+#[test]
+fn shared_source_staging_is_not_owned_by_one_tcp_congestion_window() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 800.0, 4_000_000_000.0);
+    path.product_progress_rate_bps = Some(4_000_000_000.0);
+    path.has_durable_product_progress = true;
+    path.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
+
+    let path_limit =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    let source_window = adaptive_reliable_stream_source_window_bytes(
+        Some(path),
+        TrafficClass::Throughput,
+        mux_limits,
+    );
+
+    assert!(source_window > path_limit);
+    assert!(source_window <= mux_limits.max_path_flight_bytes);
 }
 
 #[test]

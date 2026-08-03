@@ -332,6 +332,31 @@ pub(crate) fn adaptive_reliable_relay_inflight_bytes(
     modeled.max(native_feed).min(cap)
 }
 
+/// Bounds connection-wide Product bytes staged before path assignment.
+///
+/// This window may cover work for several independently admitted outputs, so
+/// one selected output's native congestion window cannot own it. Staging
+/// grants no DSN range or carrier reservation: each eventual output remains
+/// bounded by [`adaptive_reliable_relay_inflight_bytes`] and native writer
+/// backpressure at commit.
+pub(crate) fn adaptive_reliable_stream_source_window_bytes(
+    path: Option<PathSnapshot>,
+    lane: TrafficClass,
+    mux_limits: MuxLimits,
+) -> usize {
+    let path_limit = adaptive_reliable_relay_inflight_bytes(path, lane, mux_limits);
+    if !lane.is_bulk() {
+        return path_limit;
+    }
+    let Some(path) = path else {
+        return path_limit;
+    };
+    let cap = mux_limits.max_path_flight_bytes.max(1);
+    let modeled =
+        (data_level_service_window_bytes(path, lane, mux_limits).ceil() as usize).clamp(1, cap);
+    modeled.max(path_limit).min(cap)
+}
+
 pub(crate) fn reliable_relay_sender_dispatch_budget(
     mux_limits: MuxLimits,
     lane: TrafficClass,

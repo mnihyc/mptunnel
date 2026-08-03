@@ -23,11 +23,11 @@ use crate::lab_diagnostics::{
 };
 use crate::model::admission::reliable_relay_source_staging_headroom;
 use crate::model::capacity::{
-    adaptive_reliable_relay_chunk_bytes_with_frame_limit, adaptive_reliable_relay_inflight_bytes,
-    adaptive_reliable_relay_reinjection_bytes, relay_lane_startup_chunk_bytes,
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
-    reliable_relay_sender_dispatch_budget, reliable_stream_advertised_window_bytes,
-    reliable_stream_initial_advertised_window_bytes,
+    adaptive_reliable_relay_chunk_bytes_with_frame_limit,
+    adaptive_reliable_relay_reinjection_bytes, adaptive_reliable_stream_source_window_bytes,
+    relay_lane_startup_chunk_bytes, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_relay_buffer_len, reliable_relay_sender_dispatch_budget,
+    reliable_stream_advertised_window_bytes, reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::{
     reliable_data_ack_gap_reinjection_deadline, reliable_data_ack_recovery_deadline,
@@ -1961,8 +1961,11 @@ where
             mux_limits,
             path_stream.max_frame_payload_bytes,
         );
-        let inflight_limit =
-            adaptive_reliable_relay_inflight_bytes(send_path_snapshot, relay_lane, mux_limits);
+        let inflight_limit = adaptive_reliable_stream_source_window_bytes(
+            send_path_snapshot,
+            relay_lane,
+            mux_limits,
+        );
         let sender_queue_limit = reliable_relay_sender_queue_limit(mux_limits, inflight_limit);
         let latency_startup_credit = response_flow_demand.latency_startup_credit_remaining_bytes(
             relay_lane,

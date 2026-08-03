@@ -1444,6 +1444,13 @@ observable, the portable bounded Product service window remains the fallback.
 Acquisition does not grant a new completion estimate or bypass shared
 receive-credit, reorder, queue, or configured flight bounds.
 
+Connection-wide source staging precedes DSN assignment and may contain bounded
+work for several independently admitted outputs. It is therefore governed by
+the shared stream, repair, reorder, and configured resource envelopes, not by
+one selected output's native congestion window. Staging grants no output
+ownership or carrier reservation; every assignment still passes the per-output
+admission and native writer checks above.
+
 TCP pool establishment is owned by Section 7.2 and is independent of
 instantaneous Product demand. A ready pool member enters the regular or backup
 placement set defined by Sections 7.2 and 7.3. It receives no fixed share and

@@ -153,7 +153,8 @@ third transport protocol.
   `maximum - 1`; each exact member actor independently owns its socket, wire
   ordering, readiness, drain, failure, and terminal release. Group identity,
   maximum, and member ordinals are local configuration state and are never sent
-  or inferred from locators.
+  or inferred from locators. Member ordinal zero is the configured endpoint's
+  primary member; greater ordinals are its correlated siblings.
 
 ## 4. Architecture and Authority
 
@@ -359,9 +360,9 @@ durable replay state.
 After accepting carrier authentication, `PATH_JOIN`, and sequence-zero
 `PATH_STATUS`, the receiver sends `SESSION_READY` and its own sequence-zero
 `PATH_STATUS`. Product stream or datagram work MUST NOT be admitted until the
-initiator has received both readiness frames. Every ready carrier is ordinary;
-directional usage remains the receiver preference in `PATH_STATUS`, not a
-carrier-admission phase.
+initiator has received both readiness frames. Every ready carrier may
+participate according to its directional usage; usage remains the receiver
+preference in `PATH_STATUS`, not a carrier-admission phase.
 
 Within a session, the wire label is `(underlay, path_id)`. The initiator
 selects `path_id`; the receiver treats it as opaque. The same numeric
@@ -649,11 +650,22 @@ The maximum is the healthy pool target and the hard bound on simultaneously
 establishing, ready, replacing, and draining physical carriers owned by the
 group. While the group and session are enabled, one client session owner
 reconciles durable member ordinals `0` through `MAX - 1` toward that target.
-Missing members MAY establish concurrently. Every connection performs a fresh TLS
-handshake, TCP admission prelude, `PATH_JOIN`, sequence-zero `PATH_STATUS`,
-and readiness exchange. Every ready member is an ordinary bidirectional
-carrier; no performance comparison or directional promotion transaction is
-required.
+Missing members MAY establish concurrently. Every connection performs a fresh
+TLS handshake, TCP admission prelude, `PATH_JOIN`, sequence-zero
+`PATH_STATUS`, and readiness exchange. No performance comparison or
+directional promotion transaction is required before readiness.
+
+Usage follows configured topology, not a measured-throughput threshold. When
+an MPP outbound contains one configured TCP carrier group, every ready member
+retains that endpoint's configured usage so the bounded pool can overcome
+per-flow policing or independent native TCP loss history. When the outbound
+contains multiple configured TCP groups, member ordinal zero of each group
+retains the endpoint's configured usage and greater member ordinals are locally
+reserved as `BACKUP`. The client advertises the same sibling preference for
+the peer direction. An endpoint explicitly configured as backup remains backup
+for every member. Thus separately configured endpoint primaries are considered
+before their correlated siblings without inferring a source address, interface,
+or physical bottleneck.
 
 One physical carrier consumes one group reservation and one session-unique TCP
 `PathId` from connection initiation. Pre-readiness connection,
@@ -677,11 +689,11 @@ Operation-local stream failure, cancellation, or timeout never owns pool
 capacity and never classifies another member as failed.
 
 Every ready member independently owns health, transport measurements, queues,
-attachments, native congestion control, and failure scope. The ordinary
-scheduler ranks those exact carriers from current directional completion
-evidence and may leave a redundant member idle. Pool membership never forces
-payload duplication and introduces no group-specific pacing or congestion
-controller.
+attachments, native congestion control, and failure scope. The scheduler
+ranks exact carriers within the regular or backup eligible set selected by
+Section 7.3 and may leave a redundant member idle. Pool membership never
+forces payload duplication and introduces no group-specific pacing or
+congestion controller.
 
 When eligible carriers otherwise have equal evidence, the client's configured-
 order fallback visits one member ordinal across every configured endpoint
@@ -691,13 +703,14 @@ evidence-free startup. The order is not link identity, capacity evidence, a
 traffic share, or a common-bottleneck inference; measured completion evidence
 remains authoritative.
 
-In healthy steady state, one group configured `3-3`, one group configured
-`1-3`, and three otherwise identical `1-1` groups expose the same three
-ordinary data-plane carriers. They differ only in local configuration and
-lifecycle policy: a pooled range shares endpoint enablement, credentials,
-and locator rotation, while three explicit endpoints remain independent
-control domains. Three omitted default ranges request three pools of three
-carriers, not one three-carrier pool.
+Because only `MAX` is effective, one group configured `3-3` and one group
+configured `1-3` expose the same three ready carriers. Three otherwise
+identical `1-1` groups instead expose three separately configured primaries:
+all three retain their configured usage, while siblings in a multi-group pool
+are backup capacity. A pooled range shares endpoint enablement, credentials,
+and locator rotation; explicit endpoints remain independent control domains.
+Three omitted default ranges request three pools of three carriers, not one
+three-carrier pool.
 
 Planned maintenance selects the earliest-due healthy member and rotates at most
 one member per group at a time. A successful replacement receives a fresh
@@ -1420,9 +1433,9 @@ Acquisition does not grant a new completion estimate or bypass shared
 receive-credit, reorder, queue, or configured flight bounds.
 
 TCP pool establishment is owned by Section 7.2 and is independent of
-instantaneous Product demand. A ready pool member enters the same ordinary
-placement set as every other ready carrier. It receives no fixed share and no
-special startup rate: acquisition is bounded by the existing unproven-path
+instantaneous Product demand. A ready pool member enters the regular or backup
+placement set defined by Sections 7.2 and 7.3. It receives no fixed share and
+no special startup rate: acquisition is bounded by the existing unproven-path
 flight, shared credit, queue, repair, and reorder rules above.
 
 The scheduler evaluates every exact carrier direction independently from
@@ -1606,9 +1619,9 @@ A conforming implementation preserves all of the following:
     `PathId` values and distinct carrier instances.
 19. Each TCP carrier group reconciles toward its configured healthy maximum
     without exceeding it; the reserved first range value changes no behavior.
-20. Every authenticated ready TCP pool member has ordinary bidirectional
-    Product authority. Pool membership never depends on one traffic direction
-    or a throughput comparison.
+20. Every authenticated ready TCP pool member has bidirectional Product
+    authority subject to directional `AVAILABLE`/`BACKUP` usage. Usage follows
+    configured endpoint topology and never a throughput comparison.
 21. Carrier presence never forces payload placement or duplication. The
     ordinary scheduler revalidates exact carrier health, usage, queue, flight,
     credit, and completion evidence before every commit.
@@ -1655,7 +1668,7 @@ can be less fair than one TCP flow. MPP cannot install coupled control above
 kernel TCP and does not claim coupled fairness or common-bottleneck detection.
 The configured pool maximum is therefore the explicit resource and concurrency
 policy; each member retains native TCP congestion-control authority and the
-ordinary completion scheduler may leave redundant members idle.
+usage-aware completion scheduler may leave redundant members idle.
 
 ### 17.2 QUIC
 

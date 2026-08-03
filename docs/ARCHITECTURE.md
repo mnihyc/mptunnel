@@ -37,10 +37,13 @@ connection-level flight ledger; only a `STREAM_ACK` for the MPP range does.
 
 Each configured QUIC path owns its authenticated native connection. Each TCP
 endpoint owns a bounded carrier group reconciled toward its configured maximum;
-every authenticated ready member is an ordinary Product carrier. Diagnostic
-reachability probes are isolated from those durable instances. TCP and QUIC
-keep their own handshake and liveness mechanics, while the path layer records
-only authenticated exchange timing as path RTT, not connection setup time.
+every authenticated member is ready for regular or backup scheduling. A lone
+TCP endpoint exposes its bounded members as regular capacity. With multiple
+configured TCP endpoints, each primary remains regular and its correlated
+siblings are ready backups. Diagnostic reachability probes are isolated from
+those durable instances. TCP and QUIC keep their own handshake and liveness
+mechanics, while the path layer records only authenticated exchange timing as
+path RTT, not connection setup time.
 
 Carrier bootstrap may select one concrete destination port from a configured
 inclusive set before resolution. Every address-family attempt for that

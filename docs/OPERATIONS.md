@@ -232,7 +232,10 @@ predecessor; at the full envelope it retires the predecessor first. It never
 transfers native transport state or closes active work to meet the interval.
 `tcp-carriers=MIN-MAX` applies only to TCP outbound paths and defaults to
 `1-3`; only `MAX` controls the current pool. `MIN` is obsolete and ignored.
-Server listener paths reject this client capacity policy.
+With one configured TCP endpoint, every member is regular capacity. With
+multiple TCP endpoints, each primary is regular and its additional ready
+members are backup capacity. Server listener paths reject this client capacity
+policy.
 
 Each check is `PASS`, `WARN`, `FAIL`, or `INFO`. Invalid configuration,
 invalid target VPN configuration, or a failed explicitly requested

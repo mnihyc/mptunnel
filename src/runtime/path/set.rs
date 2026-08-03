@@ -247,9 +247,14 @@ impl ClientPathContext {
         }
 
         // Preserve every configured endpoint's primary index, then append its
-        // remaining bounded pool members. Every healthy member is an ordinary
-        // bidirectional carrier; the configured scheduler decides whether it
-        // receives Product work.
+        // remaining bounded pool members. A lone TCP endpoint exposes every
+        // member as regular capacity: another native TCP flow is its only
+        // bounded response to per-flow policing or loss history. When distinct
+        // TCP endpoints exist, each primary remains regular while correlated
+        // siblings use the established MPTCP-style backup preference. This
+        // keeps them authenticated and ready without letting them displace an
+        // independent configured endpoint.
+        let has_distinct_tcp_endpoints = tcp_config_paths.len() > 1;
         let configured_tcp_path_names = tcp_path_names.clone();
         let configured_tcp_path_ordinals = tcp_path_ordinals.clone();
         let mut tcp_paths = tcp_config_paths.clone();
@@ -270,7 +275,9 @@ impl ClientPathContext {
         for group in &mut tcp_carrier_groups {
             for member_ordinal in 1..group.range.max() {
                 let path_index = tcp_paths.len();
-                tcp_paths.push(tcp_config_paths[group.config_index].clone());
+                let mut sibling = tcp_config_paths[group.config_index].clone();
+                sibling.metadata.policy.backup |= has_distinct_tcp_endpoints;
+                tcp_paths.push(sibling);
                 tcp_path_names.push(configured_tcp_path_names[group.config_index].clone());
                 tcp_path_ordinals.push(configured_tcp_path_ordinals[group.config_index]);
                 tcp_config_indices.push(group.config_index);
@@ -280,7 +287,6 @@ impl ClientPathContext {
         }
         // Context and carrier actors share one immutable configuration backing;
         // reconnecting a session must not deep-copy endpoint or secret material.
-        let tcp_config_paths = Arc::new(tcp_config_paths);
         let tcp_paths = Arc::new(tcp_paths);
         let tcp_path_names = Arc::new(tcp_path_names);
         let tcp_path_ordinals = Arc::new(tcp_path_ordinals);
@@ -321,7 +327,7 @@ impl ClientPathContext {
                     .endpoint_policy(config_index)
                     .expect("TCP carrier group must own endpoint policy");
                 ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-                    paths: tcp_config_paths.clone(),
+                    paths: tcp_paths.clone(),
                     config_index,
                     path_index,
                     path_id: None,

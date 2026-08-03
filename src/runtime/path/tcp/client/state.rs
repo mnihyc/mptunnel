@@ -129,7 +129,7 @@ impl ClientTcpPathSessionRuntime {
 
     pub(in crate::runtime) fn path(&self) -> &PathSpec {
         self.paths
-            .get(self.config_index)
+            .get(self.path_index)
             .expect("TCP session path inventory matches its index")
     }
 

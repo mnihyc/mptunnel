@@ -319,10 +319,14 @@ fn endpoint_only_startup_observation_for_scoring(
 }
 
 pub(in crate::runtime) fn path_is_endpoint_only(path: &PathSpec) -> bool {
+    let policy = path.metadata.policy;
     path.metadata.initial_srtt_ms.is_none()
         && path.metadata.initial_jitter_ms.is_none()
         && path.metadata.initial_rate == RateHint::Unknown
-        && path.metadata.policy == crate::model::path::PathPolicy::default()
+        && !policy.expensive
+        && policy.bulk_allowed
+        && !policy.probe_only
+        && !policy.no_udp
 }
 
 pub(in crate::runtime) fn configured_order_path_indices(

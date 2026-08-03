@@ -18,7 +18,8 @@ pub const DEFAULT_TCP_CARRIER_MAX: u16 = 3;
 ///
 /// The accepted `MIN-MAX` syntax retains the obsolete `MIN` value only as a
 /// validated grammar position. It has no runtime or protocol semantics. Each
-/// of the `MAX` members is an independently authenticated ordinary carrier.
+/// of the `MAX` members is an independently authenticated carrier; Section 7.2
+/// of `RFC.md` defines its directional usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCarrierRange {
     max: u16,

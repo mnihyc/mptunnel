@@ -67,6 +67,15 @@ fn tcp_carrier_groups_publish_every_bounded_pool_member() {
 
     assert_eq!(context.tcp_config_indices.as_slice(), [0, 1, 0, 0, 1]);
     assert_eq!(context.tcp_member_ordinals.as_slice(), [0, 0, 1, 2, 1]);
+    assert_eq!(
+        context
+            .tcp_paths
+            .iter()
+            .map(|path| path.metadata.policy.backup)
+            .collect::<Vec<_>>(),
+        [false, false, true, true, true],
+        "distinct endpoint primaries are regular and their siblings are ready backups"
+    );
     assert_eq!(context.tcp_endpoint(0).expect("primary").members, [0, 2, 3]);
     assert_eq!(context.tcp_endpoint(1).expect("secondary").members, [1, 4]);
     assert_eq!(
@@ -100,7 +109,8 @@ fn tcp_carrier_groups_publish_every_bounded_pool_member() {
 
     assert_eq!(
         context.automatic_bulk_path_count(UnderlayProtocol::Tcp, None),
-        5
+        2,
+        "automatic acquisition counts regular endpoint primaries before ready backups"
     );
     assert_eq!(
         context.ordered_tcp_path_indices(TrafficClass::Throughput, 64 * 1024),
@@ -162,6 +172,20 @@ fn tcp_carrier_groups_publish_every_bounded_pool_member() {
         ),
         Err(RuntimeError::PathIdOverflow)
     ));
+}
+
+#[test]
+fn single_tcp_endpoint_exposes_its_bounded_pool_as_regular_capacity() {
+    let context = tcp_path_test_context(1);
+
+    assert_eq!(context.tcp_member_ordinals.as_slice(), [0, 1, 2]);
+    assert!(
+        context
+            .tcp_paths
+            .iter()
+            .all(|path| !path.metadata.policy.backup),
+        "a lone endpoint has no distinct TCP primary to prefer over its bounded members"
+    );
 }
 
 #[test]

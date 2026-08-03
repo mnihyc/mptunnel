@@ -318,6 +318,17 @@ pub(crate) fn adaptive_reliable_relay_inflight_bytes(
     let carrier_limit = usize::try_from(path.carrier_inflight_limit_bytes).unwrap_or(usize::MAX);
     let native_feed =
         carrier_limit.saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
+    if path.underlay == UnderlayProtocol::Tcp {
+        // TCP's current congestion window owns unresolved per-path flight.
+        // Product completion evidence ranks the path but cannot enlarge that
+        // native window; one bounded feed quantum keeps the socket supplied.
+        // A smaller later window stops new placement but cannot revoke exact
+        // MPP flight that was already committed to this output.
+        let committed_flight = usize::try_from(path.data_level_bytes_in_flight)
+            .unwrap_or(usize::MAX)
+            .min(cap);
+        return native_feed.max(committed_flight).clamp(floor, cap);
+    }
     modeled.max(native_feed).min(cap)
 }
 

@@ -265,6 +265,24 @@ fn tcp_source_read_window_preserves_native_congestion_window_authority() {
 }
 
 #[test]
+fn tcp_product_service_window_cannot_enlarge_native_congestion_credit() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 800.0, 4_000_000_000.0);
+    path.product_progress_rate_bps = Some(4_000_000_000.0);
+    path.has_durable_product_progress = true;
+    path.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
+
+    let inflight =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    let expected = (path.carrier_inflight_limit_bytes as usize)
+        .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+        .max(reliable_relay_buffer_len(mux_limits));
+
+    assert_eq!(inflight, expected);
+    assert!(inflight < mux_limits.max_path_flight_bytes);
+}
+
+#[test]
 fn sender_dispatch_budget_batches_bounded_bulk_quanta() {
     let mux_limits = MuxLimits::default();
     let adaptive_chunk = 64 * 1024;

@@ -649,7 +649,10 @@ for send credit; it has no separate MPP calibration transaction. These proof
 states are not interchangeable. MPP Data ACK remains the carrier-neutral delivery authority;
 for response bulk admission, QUIC requires locally sourced ACK-derived carrier
 evidence, while durable unambiguous Data ACK progress may additionally establish
-a per-flow TCP MPP rate.
+a per-flow TCP MPP rate. While fresh, that exact rate may serve only as a
+demonstrated lower bound for native TCP carrier capacity. It is not multiplied
+across flows, does not lower a faster native observation, and remains divided
+among active Product flows.
 
 The adapter is optional. Older systems, unsupported kernels, restricted hosts,
 and compatibility layers that reject the socket query use the portable fallback

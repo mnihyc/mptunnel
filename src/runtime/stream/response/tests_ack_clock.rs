@@ -78,6 +78,28 @@ fn goodput_rolls_bytes_and_elapsed_across_data_ack_callbacks() {
 }
 
 #[test]
+fn goodput_sample_expires_on_the_supplied_transport_horizon() {
+    let started_at = Instant::now();
+    let mut evidence = ResponseAckClockRateEvidence::new(started_at);
+
+    let _ = evidence.observe(64 * 1024, started_at, started_at, started_at);
+    let sampled_at = started_at + Duration::from_millis(100);
+    let _ = evidence.observe(64 * 1024, started_at, started_at, sampled_at);
+
+    let horizon = Duration::from_millis(300);
+    assert!(
+        evidence
+            .fresh_goodput_sample(sampled_at + Duration::from_millis(299), horizon)
+            .is_some()
+    );
+    assert!(
+        evidence
+            .fresh_goodput_sample(sampled_at + horizon, horizon)
+            .is_none()
+    );
+}
+
+#[test]
 fn release_sample_requires_the_exact_output_incarnation() {
     let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let started_at = Instant::now();

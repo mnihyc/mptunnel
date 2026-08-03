@@ -18,6 +18,7 @@ use crate::model::capacity::{
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
+use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::mux::MuxLimits;
 use crate::protocol::{SessionId, UnderlayProtocol};
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
@@ -25,7 +26,7 @@ use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 impl ResponseStreamBinding {
@@ -303,7 +304,29 @@ pub(super) fn server_bulk_output_snapshot(
     let peer_rate = peer_hint
         .filter(|metrics| !metrics.metrics.app_limited)
         .map(server_path_metrics_estimate_rate_bps);
+    let fresh_tcp_product_rate = (entry.key.underlay == UnderlayProtocol::Tcp
+        && server_output_has_durable_product_ack_progress(entry, mux_limits))
+    .then(|| {
+        let rttvar_ms = liveness_metrics.map_or(srtt_ms / 8.0, |metrics| {
+            f64::from(metrics.metrics.rttvar_us) / 1000.0
+        });
+        let freshness_horizon = transport_rate_sample_freshness_horizon(
+            Duration::from_secs_f64(srtt_ms.max(0.001) / 1000.0),
+            Duration::from_secs_f64(rttvar_ms.max(0.0) / 1000.0),
+        );
+        entry
+            .tcp_product_rate_evidence
+            .and_then(|evidence| evidence.fresh_goodput_sample(Instant::now(), freshness_horizon))
+            .map(|sample| sample.rate_bps())
+    })
+    .flatten();
     let (rate_bps, rate_scope) = match entry.key.underlay {
+        UnderlayProtocol::Tcp if native_rate.is_some() => (
+            native_rate
+                .expect("guarded native rate")
+                .max(fresh_tcp_product_rate.unwrap_or(0.0)),
+            PathRateScope::PathCapacity,
+        ),
         _ if native_rate.is_some() => (
             native_rate.expect("guarded native rate"),
             PathRateScope::PathCapacity,

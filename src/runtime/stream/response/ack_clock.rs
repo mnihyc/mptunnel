@@ -70,6 +70,16 @@ impl ResponseAckClockRateEvidence {
             .flatten()
     }
 
+    pub(super) fn fresh_goodput_sample(
+        &self,
+        now: Instant,
+        freshness_horizon: Duration,
+    ) -> Option<PathRateSample> {
+        self.goodput_last_acked_at
+            .filter(|acked_at| now.saturating_duration_since(*acked_at) < freshness_horizon)
+            .and_then(|_| self.goodput_sample())
+    }
+
     #[cfg(test)]
     pub(super) fn observe(
         &mut self,

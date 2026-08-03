@@ -1067,9 +1067,13 @@ pipeline. A completion-time estimate MUST NOT add them as independent
 outstanding byte counts. Common connection-wide backlog MUST NOT be charged
 once per candidate carrier.
 
-Per-flow evidence MUST NOT be treated as shared carrier capacity. Only the
-directional sender may combine per-stream events into an aggregate conclusion,
-and only while the target demand, ordinary carrier membership and eligibility,
+Per-flow evidence MUST NOT be extrapolated into shared carrier capacity. A
+fresh durable Product delivery sample on one output MAY establish only the
+lower bound that the same carrier has just delivered at least that rate. It
+MUST NOT be scaled by flow count, used to infer unused or marginal capacity, or
+retained past the transport-rate freshness horizon. Only the directional
+sender may combine per-stream events into an aggregate conclusion, and only
+while the target demand, ordinary carrier membership and eligibility,
 concurrent Product workload, and local admission and resource policy remain
 unchanged. A configured rate is a startup prior, not measurement.
 
@@ -1078,6 +1082,14 @@ per-flow completion evidence is the fallback when qualified native capacity is
 unavailable; a Product sample that may itself have been limited by placement
 MUST NOT cap an otherwise qualified native carrier. This provenance order is
 identical in both stream directions and for every carrier underlay.
+
+For TCP response placement, exact durable MPP Data ACK progress MAY raise a
+fresh qualified native capacity observation to the demonstrated Product lower
+bound while both samples remain fresh. The resulting observation retains
+carrier-capacity scope: it is divided among active Product flows and remains
+subject to native send credit and backpressure. It does not replace the native
+congestion controller, authorize additional-output placement, or change the
+Data-ACK ownership rules in Section 15.
 
 A locator, interface, or route cannot establish carrier capacity, marginal
 benefit, or bottleneck identity.

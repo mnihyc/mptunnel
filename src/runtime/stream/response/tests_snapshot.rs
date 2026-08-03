@@ -1,4 +1,5 @@
 use super::super::ResponseStreamBinding;
+use super::super::ack_clock::ResponseAckClockRateEvidence;
 use super::super::attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use super::super::evidence::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_output_has_bulk_rate_evidence,
@@ -233,6 +234,43 @@ fn tcp_qualified_native_capacity_precedes_product_goodput() {
     assert_eq!(snapshot.carrier_delivery_rate_bps, Some(500_000_000.0));
     assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
     assert_eq!(snapshot.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
+}
+
+#[test]
+fn tcp_recent_product_goodput_is_a_native_capacity_floor() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    let sampled_at = Instant::now();
+    let started_at = sampled_at - Duration::from_millis(100);
+    let mut evidence = ResponseAckClockRateEvidence::new(started_at);
+    let _ = evidence.observe(64 * 1024, started_at, started_at, started_at);
+    let _ = evidence.observe(8 * 1024 * 1024, started_at, started_at, sampled_at);
+    let product_rate = evidence
+        .goodput_sample()
+        .expect("qualified product ACK sample")
+        .rate_bps();
+    entry.product_progress_rate_bps = Some(product_rate);
+    entry.delivery_rate_bps = Some(product_rate);
+    entry.tcp_product_rate_evidence = Some(evidence);
+    entry.original_data_acked_bytes =
+        reliable_path_startup_sample_limit_bytes(MuxLimits::default());
+    entry.local_path_metrics = Some(path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        12_000,
+        500_000_000,
+        600_000_000,
+    ));
+
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(snapshot.delivery_rate_bps, product_rate);
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, Some(500_000_000.0));
 }
 
 #[test]

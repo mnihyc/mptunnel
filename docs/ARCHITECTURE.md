@@ -356,5 +356,8 @@ receiver-confirmed receipt and optional exact-socket telemetry; request QUIC
 capacity uses fresh native packet-ACK-derived evidence and an independent proof
 lifetime. For response bulk readiness, locally sourced ACK-derived carrier
 evidence is authoritative for QUIC, while durable unambiguous Data ACK progress
-may additionally establish a per-flow TCP MPP rate. Peer metric hints do
-not mint either proof.
+may additionally establish a per-flow TCP MPP rate. A fresh exact TCP Product
+rate can only raise native carrier capacity to the rate already demonstrated on
+that carrier; it is never extrapolated, never lowers a native observation, and
+retains carrier-capacity scope so active-flow sharing still applies. Peer
+metric hints do not mint either proof.

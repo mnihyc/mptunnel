@@ -239,26 +239,6 @@ impl ReliableRelaySenderQueue {
             })
     }
 
-    pub(in crate::runtime) fn has_queued_reinjection_range_overlap(
-        &self,
-        ranges: &[crate::protocol::OffsetRange],
-    ) -> bool {
-        self.critical_reinjection
-            .iter()
-            .chain(self.reinjection.iter())
-            .any(|work| {
-                let ReliableRelayQueuedWorkKind::Reinjection { frame, .. } = &work.kind else {
-                    return false;
-                };
-                let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
-                    return false;
-                };
-                ranges
-                    .iter()
-                    .any(|range| start < range.end && range.start < end)
-            })
-    }
-
     pub(in crate::runtime) fn release_normalized_acked_reinjections(
         &mut self,
         ranges: &[OffsetRange],

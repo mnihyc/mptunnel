@@ -11,7 +11,6 @@ mod receive;
 pub(super) mod session;
 pub(super) mod state;
 mod stream;
-pub(in crate::runtime) mod validation;
 mod writer;
 
 use self::datagram::ClientTcpDatagramOpenCancellation;
@@ -24,23 +23,15 @@ use self::session::{
 };
 pub(in crate::runtime) use self::state::ClientTcpPathSessionRuntime;
 use self::stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
-use self::validation::ClientTcpValidationAdmission;
-#[cfg(test)]
-use super::group::ClientTcpCarrierReservation;
-use super::service::{ClientTcpCarrierAdmission, ClientTcpServerToClientAdmission};
-use crate::model::path::{
-    CarrierPathInstanceId, RelayPathInstance, RelayPathKey, next_carrier_path_instance_id,
-};
+use crate::model::path::CarrierPathInstanceId;
 use crate::performance::ResourceLimits;
-use crate::protocol::{PathId, StreamId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{PathId, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenDeadlines, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
     ReliablePathCommandSender, reliable_path_command_channels, reliable_path_command_queue,
 };
 use crate::scheduler::TrafficClass;
-#[cfg(test)]
-use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,7 +41,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
     ready_carrier_instance: Arc<AtomicU64>,
     ready_remote_port: Arc<AtomicU32>,
-    member: Arc<Mutex<ClientTcpMinimumMember>>,
+    member: Arc<Mutex<ClientTcpCarrierMember>>,
 }
 
 #[derive(Clone)]
@@ -60,14 +51,14 @@ struct ClientTcpPathSessionSlot {
     path_id: PathId,
 }
 
-struct ClientTcpMinimumMember {
+struct ClientTcpCarrierMember {
     current: Option<ClientTcpPathSessionSlot>,
     successor_establishing: bool,
     retiring_predecessor: Option<ClientTcpPathSessionSlot>,
 }
 
 struct ClientTcpSuccessorClaim {
-    member: Arc<Mutex<ClientTcpMinimumMember>>,
+    member: Arc<Mutex<ClientTcpCarrierMember>>,
     carrier_groups: Arc<super::group::ClientTcpCarrierGroups>,
     predecessor_path_id: PathId,
     committed: bool,
@@ -84,7 +75,7 @@ impl Drop for ClientTcpSuccessorClaim {
         if self.committed {
             return;
         }
-        let mut member = self.member.lock().expect("TCP minimum member lock");
+        let mut member = self.member.lock().expect("TCP carrier member lock");
         if member.current.as_ref().map(|slot| slot.path_id) == Some(self.predecessor_path_id) {
             member.successor_establishing = false;
         }
@@ -124,146 +115,12 @@ impl ClientTcpPathSessionHandle {
             runtime,
             ready_carrier_instance: Arc::new(AtomicU64::new(0)),
             ready_remote_port: Arc::new(AtomicU32::new(0)),
-            member: Arc::new(Mutex::new(ClientTcpMinimumMember {
+            member: Arc::new(Mutex::new(ClientTcpCarrierMember {
                 current: None,
                 successor_establishing: false,
                 retiring_predecessor: None,
             })),
         }
-    }
-
-    /// Binds one exact elastic reservation to this endpoint without exposing
-    /// a configured-minimum actor runtime to the admission coordinator.
-    pub(in crate::runtime) fn c2s_validation_admission(
-        &self,
-        admission: ClientTcpCarrierAdmission,
-        stream_id: StreamId,
-        attachment_id: u64,
-        open_deadline: tokio::time::Instant,
-    ) -> Result<ClientTcpValidationAdmission, RuntimeError> {
-        if admission.target().stream_id != stream_id {
-            return Err(RuntimeError::Protocol(
-                "TCP carrier validation admission belongs to another stream",
-            ));
-        }
-        let parts = admission.into_validation_parts();
-        let validation_id = parts.admission.validation_id();
-        let endpoint_generation = parts.admission.endpoint_generation();
-        let reservation = parts.reservation;
-        if reservation.config_index() != self.runtime.config_index {
-            return Err(RuntimeError::Protocol(
-                "TCP carrier validation reservation belongs to another endpoint",
-            ));
-        }
-        let path_index = reservation
-            .elastic_path_index()
-            .ok_or(RuntimeError::Protocol(
-                "TCP carrier validation reservation has no elastic path slot",
-            ))?;
-        Ok(ClientTcpValidationAdmission {
-            runtime: self.runtime.clone(),
-            service_admission: Some(parts.admission),
-            server_to_client_admission: None,
-            reservation,
-            endpoint_generation,
-            validation_id,
-            request_id: None,
-            direction: crate::protocol::PathMetricDirection::ClientToServer,
-            stream_id,
-            instance: RelayPathInstance {
-                key: RelayPathKey {
-                    underlay: UnderlayProtocol::Tcp,
-                    index: path_index,
-                },
-                path_instance_id: next_carrier_path_instance_id(),
-                attachment_id,
-            },
-            open_deadline,
-        })
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn c2s_validation_admission_for_test(
-        &self,
-        reservation: ClientTcpCarrierReservation,
-        endpoint_generation: u64,
-        validation_id: NonZeroU64,
-        stream_id: StreamId,
-        open_deadline: tokio::time::Instant,
-    ) -> Result<ClientTcpValidationAdmission, RuntimeError> {
-        if reservation.config_index() != self.runtime.config_index {
-            return Err(RuntimeError::Protocol(
-                "TCP carrier validation reservation belongs to another endpoint",
-            ));
-        }
-        Ok(ClientTcpValidationAdmission {
-            runtime: self.runtime.clone(),
-            service_admission: None,
-            server_to_client_admission: None,
-            reservation,
-            endpoint_generation,
-            validation_id,
-            request_id: None,
-            direction: crate::protocol::PathMetricDirection::ClientToServer,
-            stream_id,
-            instance: RelayPathInstance {
-                key: RelayPathKey {
-                    underlay: UnderlayProtocol::Tcp,
-                    index: self.runtime.path_index,
-                },
-                path_instance_id: next_carrier_path_instance_id(),
-                attachment_id: validation_id.get(),
-            },
-            open_deadline,
-        })
-    }
-
-    /// Binds one exact server-owned demand to a fresh locally-reserved
-    /// validation carrier. The peer request selects neither this endpoint nor
-    /// the elastic slot.
-    pub(in crate::runtime) fn s2c_validation_admission(
-        &self,
-        admission: ClientTcpServerToClientAdmission,
-        open_deadline: tokio::time::Instant,
-    ) -> Result<ClientTcpValidationAdmission, RuntimeError> {
-        let request_id = admission.request_id();
-        let validation_id = admission.validation_id();
-        let stream_id = admission.stream_id();
-        let config_index = admission.config_index();
-        let (service_admission, reservation) = admission.into_parts();
-        let endpoint_generation = service_admission.endpoint_generation();
-        if config_index != self.runtime.config_index
-            || reservation.config_index() != self.runtime.config_index
-        {
-            return Err(RuntimeError::Protocol(
-                "TCP carrier validation reservation belongs to another endpoint",
-            ));
-        }
-        let path_index = reservation
-            .elastic_path_index()
-            .ok_or(RuntimeError::Protocol(
-                "TCP carrier validation reservation has no elastic path slot",
-            ))?;
-        Ok(ClientTcpValidationAdmission {
-            runtime: self.runtime.clone(),
-            service_admission: None,
-            server_to_client_admission: Some(service_admission),
-            reservation,
-            endpoint_generation,
-            validation_id,
-            request_id: Some(request_id),
-            direction: crate::protocol::PathMetricDirection::ServerToClient,
-            stream_id,
-            instance: RelayPathInstance {
-                key: RelayPathKey {
-                    underlay: UnderlayProtocol::Tcp,
-                    index: path_index,
-                },
-                path_instance_id: next_carrier_path_instance_id(),
-                attachment_id: validation_id.get(),
-            },
-            open_deadline,
-        })
     }
 
     pub(in crate::runtime) async fn open_stream_with_deadlines(
@@ -475,7 +332,7 @@ impl ClientTcpPathSessionHandle {
         }
     }
 
-    /// Establishes and atomically promotes one planned minimum-member
+    /// Establishes and atomically publishes one planned carrier-member
     /// successor before ordering retirement of its predecessor.
     pub(in crate::runtime) async fn replace_connection_for_endpoint_generation(
         &self,
@@ -497,7 +354,7 @@ impl ClientTcpPathSessionHandle {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
         let (predecessor, mut successor_claim) = {
-            let mut member = self.member.lock().expect("TCP minimum member lock");
+            let mut member = self.member.lock().expect("TCP carrier member lock");
             clear_terminal_tcp_predecessor(&mut member);
             let current = member
                 .current
@@ -546,7 +403,7 @@ impl ClientTcpPathSessionHandle {
             .runtime
             .endpoint_policy
             .with_current(endpoint_generation, || {
-                let mut member = self.member.lock().expect("TCP minimum member lock");
+                let mut member = self.member.lock().expect("TCP carrier member lock");
                 if !member.successor_establishing
                     || member.current.as_ref().map(|slot| slot.path_id) != Some(predecessor.path_id)
                 {
@@ -561,7 +418,7 @@ impl ClientTcpPathSessionHandle {
                         let current = self.ready_carrier_instance.load(Ordering::Acquire);
                         assert!(
                             current == 0 || current == expected_instance.as_u64(),
-                            "minimum member cannot publish two concurrent successors"
+                            "carrier member cannot publish two concurrent successors"
                         );
                         self.ready_carrier_instance
                             .store(path_instance_id.as_u64(), Ordering::Release);
@@ -621,7 +478,7 @@ impl ClientTcpPathSessionHandle {
     pub(in crate::runtime) fn begin_path_drain(&self) {
         self.ready_carrier_instance.store(0, Ordering::Release);
         self.ready_remote_port.store(0, Ordering::Release);
-        let mut member = self.member.lock().expect("TCP minimum member lock");
+        let mut member = self.member.lock().expect("TCP carrier member lock");
         clear_terminal_tcp_predecessor(&mut member);
         if let Some(session) = member.current.as_ref()
             && !session.terminal.load(Ordering::Acquire)
@@ -637,7 +494,7 @@ impl ClientTcpPathSessionHandle {
 
     /// Terminates only the currently published failed physical instance.
     /// Stale failure reports cannot affect a replacement occupying this
-    /// configured-minimum member later.
+    /// durable carrier member later.
     pub(in crate::runtime) fn terminate_failed_instance(
         &self,
         path_instance_id: CarrierPathInstanceId,
@@ -655,7 +512,7 @@ impl ClientTcpPathSessionHandle {
             return false;
         }
         self.ready_remote_port.store(0, Ordering::Release);
-        let mut member = self.member.lock().expect("TCP minimum member lock");
+        let mut member = self.member.lock().expect("TCP carrier member lock");
         clear_terminal_tcp_predecessor(&mut member);
         let Some(current) = member
             .current
@@ -671,7 +528,7 @@ impl ClientTcpPathSessionHandle {
     }
 
     pub(in crate::runtime) fn can_plan_replacement(&self) -> bool {
-        let mut member = self.member.lock().expect("TCP minimum member lock");
+        let mut member = self.member.lock().expect("TCP carrier member lock");
         clear_terminal_tcp_predecessor(&mut member);
         !member.successor_establishing
             && member.retiring_predecessor.is_none()
@@ -681,8 +538,8 @@ impl ClientTcpPathSessionHandle {
                 .is_some_and(|slot| !slot.terminal.load(Ordering::Acquire))
     }
 
-    pub(in crate::runtime) fn can_establish_minimum(&self) -> bool {
-        let member = self.member.lock().expect("TCP minimum member lock");
+    pub(in crate::runtime) fn can_establish(&self) -> bool {
+        let member = self.member.lock().expect("TCP carrier member lock");
         member
             .current
             .as_ref()
@@ -712,7 +569,7 @@ impl ClientTcpPathSessionHandle {
         self.runtime
             .endpoint_policy
             .with_current(endpoint_generation, || {
-                let mut member = self.member.lock().expect("TCP minimum member lock");
+                let mut member = self.member.lock().expect("TCP carrier member lock");
                 clear_terminal_tcp_predecessor(&mut member);
                 let Some(current) = member
                     .current
@@ -772,7 +629,7 @@ impl ClientTcpPathSessionHandle {
     }
 
     fn current_ready_session_slot(&self) -> Option<(ClientTcpPathSessionSlot, u64)> {
-        let member = self.member.lock().expect("TCP minimum member lock");
+        let member = self.member.lock().expect("TCP carrier member lock");
         let current = member
             .current
             .as_ref()
@@ -785,7 +642,7 @@ impl ClientTcpPathSessionHandle {
     fn session_slot_is_current(&self, path_id: PathId) -> bool {
         self.member
             .lock()
-            .expect("TCP minimum member lock")
+            .expect("TCP carrier member lock")
             .current
             .as_ref()
             .is_some_and(|slot| slot.path_id == path_id && !slot.terminal.load(Ordering::Acquire))
@@ -799,7 +656,7 @@ impl ClientTcpPathSessionHandle {
         self.runtime
             .endpoint_policy
             .with_current(endpoint_generation, || {
-                let mut member = self.member.lock().expect("TCP minimum member lock");
+                let mut member = self.member.lock().expect("TCP carrier member lock");
                 if let Some(session) = member.current.as_ref()
                     && !session.terminal.load(Ordering::Acquire)
                 {
@@ -839,7 +696,7 @@ impl ClientTcpPathSessionHandle {
     }
 }
 
-fn clear_terminal_tcp_predecessor(member: &mut ClientTcpMinimumMember) {
+fn clear_terminal_tcp_predecessor(member: &mut ClientTcpCarrierMember) {
     if member
         .retiring_predecessor
         .as_ref()

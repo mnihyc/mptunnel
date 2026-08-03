@@ -143,132 +143,6 @@ fn request_dispatch_rejects_switchable_response_output() {
 }
 
 #[tokio::test]
-async fn blocked_request_dispatch_returns_only_exact_ordinary_saturation_evidence() {
-    let stream_id = StreamId(89);
-    let context = client_test_context();
-    let (commands, mut receivers) = reliable_path_command_channels(1);
-    let mut remotes =
-        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands.clone()), 4);
-    consume_client_path_proof_for_test(&mut receivers);
-    commands
-        .try_enqueue_admitted_frame(
-            Frame::StreamData {
-                stream_id: StreamId(890),
-                offset: 0,
-                payload: Bytes::from_static(b"occupied"),
-            },
-            TrafficClass::Throughput,
-        )
-        .expect("occupy the ordinary carrier data queue");
-    let owner = remotes.paths[0].instance();
-    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
-    let original = send_stream
-        .send_data(Bytes::from_static(b"original"))
-        .expect("retained unique-original flight");
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.record_original_frame_for_test(owner, &original);
-    let mut queue = ReliableRelaySenderQueue::default();
-    queue.push_data(Bytes::from_static(b"next"));
-
-    let dispatch = sender
-        .dispatch_client_queued_work(
-            &context,
-            TrafficClass::Throughput,
-            &mut remotes,
-            &mut send_stream,
-            &mut queue,
-            4,
-        )
-        .await
-        .expect("qualified saturation is returned by the blocked dispatch");
-    let ClientQueuedDispatch::OrdinarySaturation(observation) = dispatch else {
-        panic!("expected typed ordinary saturation");
-    };
-    assert_eq!(observation.stream_id, stream_id);
-    assert_eq!(
-        observation.stable.membership_generation,
-        remotes.membership_generation()
-    );
-    assert_eq!(
-        observation.stable.authority_class,
-        crate::protocol::PathUsage::Available
-    );
-    assert_eq!(
-        observation
-            .ordinary_services
-            .iter()
-            .map(|ordinary| ordinary.instance)
-            .collect::<Vec<_>>(),
-        vec![owner]
-    );
-    assert_eq!(queue.bytes(), 4, "blocked product work stays queued");
-    assert_eq!(
-        send_stream.next_offset(),
-        reliable_stream_frame_accounted_bytes(&original) as u64,
-        "the proposed unique range is rolled back before evidence is returned",
-    );
-
-    assert!(matches!(
-        try_recv_reliable_path_command(&mut receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
-            stream_id: StreamId(890),
-            ..
-        }))
-    ));
-    assert!(matches!(
-        sender
-            .dispatch_client_queued_work(
-                &context,
-                TrafficClass::Throughput,
-                &mut remotes,
-                &mut send_stream,
-                &mut queue,
-                4,
-            )
-            .await,
-        Ok(ClientQueuedDispatch::Data {
-            payload_bytes: 4,
-            ..
-        })
-    ));
-
-    let other_stream_id = StreamId(90);
-    let (other_commands, mut other_receivers) = reliable_path_command_channels(1);
-    let mut other_remotes = ReliableRelayRemoteSet::new(
-        opened_test_relay_stream(other_stream_id, 0, other_commands.clone()),
-        4,
-    );
-    consume_client_path_proof_for_test(&mut other_receivers);
-    other_commands
-        .try_enqueue_admitted_frame(
-            Frame::StreamData {
-                stream_id: StreamId(900),
-                offset: 0,
-                payload: Bytes::from_static(b"occupied"),
-            },
-            TrafficClass::Throughput,
-        )
-        .expect("occupy the other ordinary carrier data queue");
-    let mut other_sender = RequestSenderService::new(other_stream_id);
-    let mut other_stream = ReliableSendStream::new(other_stream_id, MuxLimits::default());
-    let mut other_queue = ReliableRelaySenderQueue::default();
-    other_queue.push_data(Bytes::from_static(b"first"));
-    assert!(matches!(
-        other_sender
-            .dispatch_client_queued_work(
-                &context,
-                TrafficClass::Throughput,
-                &mut other_remotes,
-                &mut other_stream,
-                &mut other_queue,
-                5,
-            )
-            .await,
-        Err(RuntimeError::SenderServiceBlocked)
-    ));
-}
-
-#[tokio::test]
 async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output() {
     let stream_id = StreamId(90);
     let context = client_test_context_with_paths(&[
@@ -600,7 +474,7 @@ async fn request_product_ack_preserves_exact_data_ack_progress_path() {
     )
     .expect("ACK assigned request data");
     let outcome = sender
-        .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack, false)
+        .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
         .expect("ACK does not exceed retained send chunks");
 
     assert_eq!(outcome.data_ack_progress_paths.as_slice(), &[owner]);

@@ -11,9 +11,7 @@ use crate::product::{
 use crate::protocol::auth::{
     PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator, TcpSessionAuthCheck,
 };
-use crate::protocol::{
-    AuthNonce, AuthTag, Frame, PathId, PathPurpose, SessionId, UnderlayProtocol,
-};
+use crate::protocol::{AuthNonce, AuthTag, Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{current_unix_secs, random_nonce};
 use crate::transport::quic::{QuicCandidateSelector, QuicCandidateVerifier};
@@ -190,7 +188,6 @@ impl ClientPathAuthenticationFrames {
             credential_id,
             path_id,
             underlay,
-            PathPurpose::Ordinary,
             path_nonce,
             issued_at_unix_secs,
         );
@@ -208,7 +205,6 @@ impl ClientPathAuthenticationFrames {
                 credential_id: credential_id.to_string(),
                 path_id,
                 underlay,
-                purpose: PathPurpose::Ordinary,
                 nonce: path_nonce,
                 issued_at_unix_secs,
                 auth_tag: path_tag,
@@ -401,7 +397,6 @@ impl AuthenticatedServerPathSession {
             credential_id,
             path_id,
             underlay,
-            purpose,
             nonce,
             issued_at_unix_secs,
             auth_tag,
@@ -417,7 +412,6 @@ impl AuthenticatedServerPathSession {
                 credential_id: self.credential_id.as_str(),
                 path_id,
                 underlay,
-                purpose,
                 nonce,
                 issued_at_unix_secs,
                 tag: auth_tag,
@@ -431,7 +425,6 @@ impl AuthenticatedServerPathSession {
             session_id,
             credential_id: self.credential_id,
             path_id,
-            purpose,
             nonce,
             issued_at_unix_secs,
             verified_at_unix_secs: now_unix_secs,
@@ -445,7 +438,6 @@ pub(in crate::runtime) struct AuthenticatedPathJoin {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) credential_id: CredentialId,
     pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) purpose: PathPurpose,
     pub(in crate::runtime) nonce: AuthNonce,
     pub(in crate::runtime) issued_at_unix_secs: u64,
     pub(in crate::runtime) verified_at_unix_secs: u64,

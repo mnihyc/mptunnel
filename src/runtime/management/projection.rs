@@ -624,7 +624,6 @@ fn client_path_status(
         tcp_carrier_ordinal: tcp_context
             .and_then(|context| context.tcp_member_ordinal(index))
             .map(|ordinal| ordinal.saturating_add(1)),
-        tcp_carriers_min: tcp_endpoint.map(|endpoint| endpoint.range.min()),
         tcp_carriers_max: tcp_endpoint.map(|endpoint| endpoint.range.max()),
         path_id: Some(snapshot.id.0.to_string()),
         path_instance_id: record
@@ -697,7 +696,6 @@ fn collect_server(
             path,
             underlay: underlay_name(spec.underlay),
             tcp_carrier_ordinal: None,
-            tcp_carriers_min: None,
             tcp_carriers_max: None,
             path_id: None,
             path_instance_id: None,
@@ -767,7 +765,6 @@ fn collect_server(
             path: configured_path,
             underlay: underlay_name(path.underlay),
             tcp_carrier_ordinal: None,
-            tcp_carriers_min: None,
             tcp_carriers_max: None,
             path_id: Some(path.path_id.0.to_string()),
             path_instance_id: Some(path.path_instance_id.as_u64().to_string()),

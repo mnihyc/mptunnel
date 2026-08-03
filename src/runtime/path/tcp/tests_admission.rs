@@ -51,30 +51,6 @@ fn fixed_tcp_prelude_authenticates_session_and_then_distinct_path_join() {
         .expect("separately authenticated PATH_JOIN");
     assert_eq!(joined.session_id, session_id);
     assert_eq!(joined.path_id, path_id);
-    assert_eq!(joined.purpose, PathPurpose::Ordinary);
-
-    let (validation_prelude, validation_join) =
-        ClientTcpPathAuthentication::for_session_with_purpose(
-            &client,
-            PathId(10),
-            session_id,
-            PathPurpose::Validation,
-            &exporter,
-        )
-        .expect("validation TCP admission")
-        .into_parts();
-    let validation = authenticate_prelude(
-        &server,
-        ProductCredentialAdmission::from_security(&server),
-        &validation_prelude,
-        &exporter,
-    )
-    .expect("server validation prelude")
-    .expect("valid validation prelude")
-    .authenticate_path_join(UnderlayProtocol::Tcp, validation_join)
-    .expect("validation path authentication")
-    .expect("authenticated validation PATH_JOIN");
-    assert_eq!(validation.purpose, PathPurpose::Validation);
 }
 
 #[test]

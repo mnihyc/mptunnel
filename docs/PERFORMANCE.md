@@ -47,39 +47,41 @@ five carried payload. All MPTUNNEL rows completed with exact receiver
 accounting. No independent multipath QUIC product was available for a matched
 comparison.
 
-## TCP carrier range
+## TCP carrier pool
 
-A TCP endpoint defaults to `1-3` carriers. It opens above the minimum only when
-current demand and completed delivery justify another session, and retires
-unused capacity through the normal carrier lifecycle.
+A TCP endpoint defaults to three ordinary carriers (currently spelled `1-3`).
+The maximum is the healthy target; live scheduling evidence decides which
+ready carriers receive traffic.
 
 ### 100 Mbps per TCP flow
 
-| Direction | `1-1` (Mbps) | `1-3` (Mbps) |
-| --- | ---: | ---: |
-| Download | 74.944 | 119.684 |
-| Upload | 77.893 | 125.999 |
+| Direction | `1-1` | `1-3` | `3-3` | 3 × `1-1` |
+| --- | ---: | ---: | ---: | ---: |
+| Download (Mbps) | 75.139 | 224.123 | 225.158 | 222.027 |
+| Upload (Mbps) | 77.518 | 215.666 | 218.047 | 220.080 |
 
 ### Shared 200 Mbps bottleneck
 
-| Direction | `1-1` (Mbps) | `1-3` (Mbps) |
-| --- | ---: | ---: |
-| Download | 158.644 | 158.920 |
-| Upload | 156.980 | 160.167 |
+| Direction | `1-1` | `1-3` | `3-3` | 3 × `1-1` |
+| --- | ---: | ---: | ---: | ---: |
+| Download (Mbps) | 154.469 | 159.751 | 165.378 | 151.656 |
+| Upload (Mbps) | 157.680 | 165.049 | 162.348 | 171.505 |
 
-The per-flow case retained two carriers and gained useful capacity. The shared
-bottleneck stayed at its aggregate ceiling; no third carrier was retained. No
-Mbps or percentage value from these runs is a production threshold.
+The three-carrier forms aggregate the per-flow limit and remain near the same
+aggregate ceiling when all carriers share one bottleneck. `1-3` and `3-3` are
+the same three-carrier pool in the current runtime. Three explicit one-carrier
+endpoints provide the corresponding topology control. No Mbps or percentage
+value from these runs is a production threshold.
 
 ### Unshaped request path
 
-| TCP range | Upload (Gbps) | Flows | Failed |
-| ---: | ---: | ---: | ---: |
-| `1-1` | 6.115 | 2/2 | 0 |
-| `1-3` | 6.933 | 2/2 | 0 |
+| Direction | `1-1` | `1-3` | `3-3` | 3 × `1-1` |
+| --- | ---: | ---: | ---: | ---: |
+| Download (Gbps) | 6.590 | 6.210 | 6.284 | 5.885 |
+| Upload (Gbps) | 6.557 | 6.630 | 6.351 | 6.691 |
 
-The default range preserves the fixed-carrier local ceiling while retaining
-the ability to expand under single-flow TCP shaping.
+All four forms reach the local processing ceiling. Ready pool members add no
+fixed traffic share, MPP pacing layer, or bandwidth threshold.
 
 ## 20 links
 
@@ -91,8 +93,9 @@ Ten TCP and ten QUIC links used varied bandwidth, latency, jitter, and loss.
 | 300–1,000 | 1,395.311 | 610.051 | 2/2 |
 | 3,000–10,000 | 2,882.347 | 731.499 | 2/2 |
 
-Every configured endpoint started one carrier. TCP endpoints retained their
-independent `1-3` bounds, but a second carrier was not an eager target.
+Each configured endpoint remains independently eligible. Live directional
+completion evidence, not source addresses or pool membership, decides which
+ready carriers receive traffic.
 
 ## Asymmetric links
 

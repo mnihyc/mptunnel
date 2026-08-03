@@ -74,7 +74,7 @@ fn session_auth_tag_verifies_and_detects_tampering() {
 }
 
 #[test]
-fn path_join_tag_covers_identity_underlay_purpose_nonce_and_freshness() {
+fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
     let auth = authenticator();
     let credential_id = "home-client";
     let nonce = AuthNonce([3; 16]);
@@ -84,7 +84,6 @@ fn path_join_tag_covers_identity_underlay_purpose_nonce_and_freshness() {
         credential_id,
         PathId(2),
         UnderlayProtocol::Udp,
-        PathPurpose::Ordinary,
         nonce,
         issued_at,
     );
@@ -93,7 +92,6 @@ fn path_join_tag_covers_identity_underlay_purpose_nonce_and_freshness() {
         credential_id,
         path_id: PathId(2),
         underlay: UnderlayProtocol::Udp,
-        purpose: PathPurpose::Ordinary,
         nonce,
         issued_at_unix_secs: issued_at,
         tag,
@@ -115,10 +113,6 @@ fn path_join_tag_covers_identity_underlay_purpose_nonce_and_freshness() {
         ..check
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
-        purpose: PathPurpose::Validation,
-        ..check
-    }));
-    assert!(!auth.verify_path_join(PathJoinAuthCheck {
         nonce: AuthNonce([4; 16]),
         ..check
     }));
@@ -135,16 +129,16 @@ fn path_join_tag_covers_identity_underlay_purpose_nonce_and_freshness() {
 }
 
 #[test]
-fn v5_auth_contexts_and_v1_tcp_prelude_have_stable_tags() {
+fn auth_contexts_and_tcp_prelude_have_stable_tags() {
     let auth = authenticator();
     let issued_at = 1_735_689_600;
 
     assert_eq!(
         auth.session_auth_tag(SessionId(9), "home-client", AuthNonce([1; 16]), issued_at,),
         AuthTag([
-            0x12, 0x5d, 0x9a, 0x8e, 0x53, 0x27, 0xb9, 0xae, 0x64, 0xc6, 0x0d, 0x7a, 0x1b, 0x96,
-            0x48, 0x51, 0x4b, 0x15, 0xd3, 0xe8, 0x1a, 0xd1, 0xe2, 0xd8, 0x80, 0xd6, 0xb8, 0x90,
-            0x64, 0x01, 0x9c, 0xd4,
+            0x7f, 0x21, 0x0a, 0xd0, 0x5f, 0xc5, 0xc7, 0xcd, 0x9d, 0xc5, 0xf8, 0x4c, 0x22, 0x3a,
+            0xcf, 0x0b, 0x0f, 0x0d, 0xa1, 0xd6, 0x85, 0x8b, 0x74, 0xe3, 0x14, 0xae, 0xfb, 0xb5,
+            0xb9, 0x70, 0xf9, 0x44,
         ])
     );
     assert_eq!(
@@ -153,14 +147,13 @@ fn v5_auth_contexts_and_v1_tcp_prelude_have_stable_tags() {
             "home-client",
             PathId(2),
             UnderlayProtocol::Udp,
-            PathPurpose::Ordinary,
             AuthNonce([3; 16]),
             issued_at,
         ),
         AuthTag([
-            0x3c, 0x03, 0x53, 0xa6, 0xbf, 0x48, 0x93, 0x13, 0xbf, 0x75, 0x0b, 0x6c, 0x1b, 0xac,
-            0xec, 0xd3, 0xfa, 0xd3, 0xf3, 0xff, 0x11, 0xb9, 0x79, 0x01, 0x76, 0x7f, 0xd7, 0xa4,
-            0x98, 0x2d, 0xce, 0x41,
+            0x0d, 0x86, 0x0d, 0xcf, 0x57, 0xea, 0xc2, 0xbd, 0x9d, 0xa0, 0x1b, 0xfe, 0xc3, 0x19,
+            0x2b, 0x8b, 0x77, 0xbf, 0x4b, 0x89, 0xa2, 0x9e, 0x42, 0x58, 0xe9, 0x4c, 0x7b, 0x9c,
+            0x68, 0xda, 0x0c, 0x70,
         ])
     );
     assert_eq!(

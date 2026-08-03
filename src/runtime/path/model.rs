@@ -230,18 +230,6 @@ pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_bulk_load
         && !endpoint_only_startup_has_latency_sensitive_load(observations)
 }
 
-pub(in crate::runtime) fn ordered_reliable_path_indices(
-    paths: &[PathSpec],
-    observations: &[ClientPathObservation],
-    lane: TrafficClass,
-    payload_bytes: usize,
-) -> Vec<usize> {
-    reliable_stream_startup_path_scores(paths, observations, lane, payload_bytes)
-        .into_iter()
-        .map(|(index, _)| index)
-        .collect()
-}
-
 pub(in crate::runtime) fn reliable_stream_startup_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
@@ -1090,10 +1078,8 @@ pub(super) fn reliable_reservation_should_use_endpoint_only_startup_order(
     tcp_observations: &[ClientPathObservation],
     udp_paths: &[PathSpec],
     udp_observations: &[ClientPathObservation],
-    lane: TrafficClass,
 ) -> bool {
-    lane.is_latency_sensitive()
-        && (!tcp_paths.is_empty() || !udp_paths.is_empty())
+    (!tcp_paths.is_empty() || !udp_paths.is_empty())
         && tcp_paths.iter().chain(udp_paths).all(path_is_endpoint_only)
         && !paths_have_sender_delivery_evidence(tcp_paths, tcp_observations)
         && !paths_have_sender_delivery_evidence(udp_paths, udp_observations)

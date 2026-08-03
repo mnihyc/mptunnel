@@ -198,7 +198,7 @@ fn snapshot_projects_only_flows_sharing_the_ordered_writer_queue() {
 }
 
 #[test]
-fn tcp_product_goodput_and_retained_native_capacity_keep_separate_scopes() {
+fn tcp_qualified_native_capacity_precedes_product_goodput() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
@@ -228,8 +228,8 @@ fn tcp_product_goodput_and_retained_native_capacity_keep_separate_scopes() {
 
     let snapshot =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(snapshot.delivery_rate_bps, 80_000_000.0);
-    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(snapshot.carrier_delivery_rate_bps, Some(500_000_000.0));
     assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
     assert_eq!(snapshot.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
@@ -445,7 +445,6 @@ fn best_live_path_uses_completion_score_including_command_queue() {
     clear.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
     let outputs = ResponseStreamOutputs {
         detaching: Vec::new(),
-        validation: None,
         entries: vec![queued, clear],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
@@ -482,7 +481,6 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
     backup.peer_usage = Some(PathUsage::Backup);
     let outputs = ResponseStreamOutputs {
         detaching: Vec::new(),
-        validation: None,
         entries: vec![backup, available],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
@@ -548,7 +546,6 @@ fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
     drop(closed_receivers);
     let outputs = ResponseStreamOutputs {
         detaching: Vec::new(),
-        validation: None,
         entries: vec![closed, live],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,

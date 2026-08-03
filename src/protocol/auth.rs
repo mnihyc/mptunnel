@@ -1,13 +1,13 @@
 //! Session and path-join authentication for the MPP wire protocol.
 
-use super::{AuthNonce, AuthTag, PathId, PathPurpose, SessionId, UnderlayProtocol};
+use super::{AuthNonce, AuthTag, PathId, SessionId, UnderlayProtocol};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel session auth v5";
-const PATH_JOIN_CONTEXT: &[u8] = b"mptunnel path join v5";
+const SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel session auth v6";
+const PATH_JOIN_CONTEXT: &[u8] = b"mptunnel path join v6";
 const TCP_SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel tcp session auth v1";
 const TCP_CARRIER_ROLE_CLIENT: u8 = 1;
 const TCP_DIRECTION_CLIENT_TO_SERVER: u8 = 1;
@@ -41,7 +41,6 @@ pub struct PathJoinAuthCheck<'a> {
     pub credential_id: &'a str,
     pub path_id: PathId,
     pub underlay: UnderlayProtocol,
-    pub purpose: PathPurpose,
     pub nonce: AuthNonce,
     pub issued_at_unix_secs: u64,
     pub tag: AuthTag,
@@ -157,7 +156,6 @@ impl SessionAuthenticator {
         credential_id: &str,
         path_id: PathId,
         underlay: UnderlayProtocol,
-        purpose: PathPurpose,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
     ) -> AuthTag {
@@ -167,7 +165,6 @@ impl SessionAuthenticator {
         update_credential_id(&mut mac, credential_id);
         update_path_id(&mut mac, path_id);
         update_underlay(&mut mac, underlay);
-        update_path_purpose(&mut mac, purpose);
         update_nonce(&mut mac, nonce);
         update_issued_at(&mut mac, issued_at_unix_secs);
         finalize_tag(mac)
@@ -187,7 +184,6 @@ impl SessionAuthenticator {
         update_credential_id(&mut mac, check.credential_id);
         update_path_id(&mut mac, check.path_id);
         update_underlay(&mut mac, check.underlay);
-        update_path_purpose(&mut mac, check.purpose);
         update_nonce(&mut mac, check.nonce);
         update_issued_at(&mut mac, check.issued_at_unix_secs);
         verify_tag(mac, check.tag)
@@ -248,14 +244,6 @@ fn update_underlay(mac: &mut HmacSha256, underlay: UnderlayProtocol) {
     let value = match underlay {
         UnderlayProtocol::Tcp => 1u8,
         UnderlayProtocol::Udp => 2u8,
-    };
-    mac.update(&[value]);
-}
-
-fn update_path_purpose(mac: &mut HmacSha256, purpose: PathPurpose) {
-    let value = match purpose {
-        PathPurpose::Ordinary => 1u8,
-        PathPurpose::Validation => 2u8,
     };
     mac.update(&[value]);
 }

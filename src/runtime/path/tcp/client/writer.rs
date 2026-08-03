@@ -66,7 +66,6 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
     let mut sent_items = 0usize;
     let mut wrote_frame = false;
     let mut terminal_stream_id = None;
-    let mut writer_boundary = None;
 
     loop {
         let Some(command) = next_command.take().or_else(|| {
@@ -243,19 +242,6 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 }
                 return Ok(());
             }
-            ReliablePathCommand::SendTcpCarrierValidationData { .. } => {
-                commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "ordinary client TCP path received carrier validation data",
-                ));
-            }
-            ReliablePathCommand::TcpCarrierValidationWriterBoundary {
-                validation_id: _,
-                completion,
-            } => {
-                writer_boundary = Some(completion);
-                break;
-            }
             ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
                 pending_frames.push(Frame::StreamReset { stream_id, reason });
                 commands.release_pending_command_bytes(pending_bytes);
@@ -332,12 +318,8 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
             sent_items >= item_budget,
         ),
     );
-    if wrote_frame || writer_boundary.is_some() {
+    if wrote_frame {
         connection.carrier.writer.flush().await?;
-    }
-    if let Some(completion) = writer_boundary {
-        commands.release_pending_command_bytes(0);
-        let _ = completion.send(Instant::now());
     }
     runtime.observe_sender_transport_state(connection, false);
     Ok(())
@@ -822,12 +804,6 @@ async fn handle_connected_client_tcp_command(
         ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
             "client TCP path received server capacity command",
         )),
-        ReliablePathCommand::SendTcpCarrierValidationData { .. } => Err(RuntimeError::Protocol(
-            "ordinary client TCP path received carrier validation data",
-        )),
-        ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. } => Err(
-            RuntimeError::Protocol("client TCP boundary bypassed the serialized writer"),
-        ),
         ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
             let reset = Frame::StreamReset { stream_id, reason };
             connection.carrier.writer.write_frame(&reset).await?;

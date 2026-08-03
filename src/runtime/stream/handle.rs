@@ -1,8 +1,8 @@
 use super::feedback::{StreamAckPublication, StreamMaxDataPublication};
 use super::response::{
     CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
-    ResponseProductAckOriginalRelease, ResponseStreamBinding,
-    product_flights_have_recent_reinjection_overlap, release_carrier_path_flight_ranges,
+    ResponseStreamBinding, product_flights_have_recent_reinjection_overlap,
+    release_carrier_path_flight_ranges,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
@@ -68,16 +68,6 @@ pub(in crate::runtime) enum ServerReliableStreamEvent {
         key: CarrierPathKey,
         path_instance_id: CarrierPathInstanceId,
         output_incarnation: u64,
-    },
-    /// Ordered completion of one validation-only input attachment. Reaching
-    /// this event proves that every preceding frame accepted from that exact
-    /// attachment has already been returned to, and applied by, the stream
-    /// actor. The sender is deliberately carried by the lifecycle event so a
-    /// closed actor also releases the retirement waiter.
-    ValidationInputDetached {
-        path_instance_id: CarrierPathInstanceId,
-        attachment_incarnation: u64,
-        completion: watch::Sender<bool>,
     },
 }
 
@@ -284,15 +274,6 @@ impl ReliablePathStream {
                             path_instance_id,
                             output_incarnation,
                         ),
-                        Some(ServerReliableStreamEvent::ValidationInputDetached {
-                            path_instance_id,
-                            attachment_incarnation,
-                            completion,
-                        }) => {
-                            debug_assert!(path_instance_id.as_u64() > 0);
-                            debug_assert!(attachment_incarnation > 0);
-                            completion.send_replace(true);
-                        }
                         None => return Err(RuntimeError::ReliablePathSessionClosed),
                     }
                 }
@@ -323,10 +304,7 @@ impl ReliablePathStream {
             ReliablePathStreamInput::Server { events, pending } => {
                 if matches!(
                     pending.front(),
-                    Some(
-                        ServerReliableStreamEvent::PathDetached { .. }
-                            | ServerReliableStreamEvent::ValidationInputDetached { .. }
-                    )
+                    Some(ServerReliableStreamEvent::PathDetached { .. })
                 ) {
                     return None;
                 }
@@ -335,10 +313,7 @@ impl ReliablePathStream {
                 }
                 match events.try_recv() {
                     Ok(ServerReliableStreamEvent::Frame(frame)) => Some(Ok(frame)),
-                    Ok(
-                        boundary @ (ServerReliableStreamEvent::PathDetached { .. }
-                        | ServerReliableStreamEvent::ValidationInputDetached { .. }),
-                    ) => {
+                    Ok(boundary @ ServerReliableStreamEvent::PathDetached { .. }) => {
                         pending.push_back(boundary);
                         None
                     }
@@ -554,17 +529,6 @@ impl ReliablePathStream {
         ranges: &[OffsetRange],
     ) -> ResponseDataAckRelease {
         self.output.release_normalized_acked_ranges(ranges)
-    }
-
-    pub(in crate::runtime) fn release_normalized_acked_ranges_with_originals(
-        &self,
-        ranges: &[OffsetRange],
-    ) -> (
-        ResponseDataAckRelease,
-        SmallVec<[ResponseProductAckOriginalRelease; 4]>,
-    ) {
-        self.output
-            .release_normalized_acked_ranges_with_originals(ranges)
     }
 
     pub(in crate::runtime) fn has_recent_reinjection_overlap(
@@ -1343,24 +1307,6 @@ impl ReliablePathStreamOutput {
                 ResponseDataAckRelease::default()
             }
             Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
-        }
-    }
-
-    pub(in crate::runtime) fn release_normalized_acked_ranges_with_originals(
-        &self,
-        ranges: &[OffsetRange],
-    ) -> (
-        ResponseDataAckRelease,
-        SmallVec<[ResponseProductAckOriginalRelease; 4]>,
-    ) {
-        match self {
-            Self::Fixed(fixed) => {
-                fixed.release_normalized_acked_ranges(ranges);
-                (ResponseDataAckRelease::default(), SmallVec::new())
-            }
-            Self::Switchable(binding) => {
-                binding.release_normalized_acked_ranges_with_originals(ranges)
-            }
         }
     }
 

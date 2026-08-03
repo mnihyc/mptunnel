@@ -90,6 +90,11 @@ fn path_specs_parse_tcp_and_udp() {
         ranged_tcp.tcp_carrier_range(),
         Some(TcpCarrierRange::new(1, 3).expect("default range"))
     );
+    assert_eq!(
+        TcpCarrierRange::new(1, 3).expect("obsolete minimum"),
+        TcpCarrierRange::new(3, 3).expect("same maximum"),
+        "obsolete MIN has no runtime meaning"
+    );
 
     let ranged_udp_with_interval = "udp://example.com:5000-5010?port-hop-interval-ms=45000"
         .parse::<PathSpec>()

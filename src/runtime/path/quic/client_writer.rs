@@ -154,34 +154,6 @@ pub(super) async fn drain_client_udp_stream_commands(
                     "client QUIC path received TCP capacity command",
                 ));
             }
-            ReliablePathCommand::SendTcpCarrierValidationData { .. } => {
-                commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "client QUIC path received TCP carrier validation data",
-                ));
-            }
-            ReliablePathCommand::TcpCarrierValidationWriterBoundary {
-                validation_id: _,
-                completion,
-            } => {
-                flush_client_udp_frame_batch(
-                    send,
-                    pending_frames,
-                    codec_limits,
-                    path_proofs,
-                    commands,
-                    &mut pending_frame_command_bytes,
-                    stream_id,
-                    carrier_frames,
-                    stream_frames,
-                    deferred_input,
-                    carrier_input_open,
-                )
-                .await?;
-                commands.release_pending_command_bytes(pending_bytes);
-                let _ = completion.send(std::time::Instant::now());
-                return Ok(false);
-            }
             ReliablePathCommand::ResetAndCloseStream {
                 stream_id: reset_stream_id,
                 reason,

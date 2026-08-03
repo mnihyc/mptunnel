@@ -6,8 +6,7 @@
 
 use super::ResponseStreamBinding;
 use super::attachment::{
-    ResponseSenderPathObservation, ResponseSenderPathTarget, ResponseStreamOutputEntry,
-    ResponseStreamOutputs,
+    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
 };
 use super::evidence::{
     server_output_has_bulk_rate_evidence, server_output_has_durable_product_ack_progress,
@@ -87,16 +86,8 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn sender_path_targets(
         &self,
         lane: TrafficClass,
-        payload_bytes: usize,
-    ) -> Vec<ResponseSenderPathTarget> {
-        self.sender_path_observation(lane, payload_bytes).targets
-    }
-
-    pub(in crate::runtime) fn sender_path_observation(
-        &self,
-        lane: TrafficClass,
         _payload_bytes: usize,
-    ) -> ResponseSenderPathObservation {
+    ) -> Vec<ResponseSenderPathTarget> {
         let mut outputs = self
             .outputs
             .lock()
@@ -145,18 +136,13 @@ impl ResponseStreamBinding {
                 }
             })
             .collect();
-        let observation = ResponseSenderPathObservation {
-            targets,
-            membership_generation: self.output_membership_generation.load(Ordering::Acquire),
-            ordinary_eligibility_generation: self.tcp_carrier_ordinary_eligibility_generation(),
-        };
         drop(outputs);
         if eligibility_changed {
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
             self.notify_update();
         }
-        observation
+        targets
     }
 
     pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {
@@ -318,13 +304,13 @@ pub(super) fn server_bulk_output_snapshot(
         .filter(|metrics| !metrics.metrics.app_limited)
         .map(server_path_metrics_estimate_rate_bps);
     let (rate_bps, rate_scope) = match entry.key.underlay {
-        UnderlayProtocol::Tcp if product_rate.is_some() => (
-            product_rate.expect("guarded product rate"),
-            PathRateScope::PerFlowGoodput,
-        ),
         _ if native_rate.is_some() => (
             native_rate.expect("guarded native rate"),
             PathRateScope::PathCapacity,
+        ),
+        UnderlayProtocol::Tcp if product_rate.is_some() => (
+            product_rate.expect("guarded product rate"),
+            PathRateScope::PerFlowGoodput,
         ),
         // During transport Startup, pacing ranks paths with available native
         // congestion credit but never grants completion-time authority. A

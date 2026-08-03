@@ -4,10 +4,7 @@
 //! module owns its reservation, proof, and rollback transaction.
 
 use super::commands::CapacityProbeCommandTicket;
-use super::health::{
-    ClientPathEligibilityFingerprint, ClientPathHealth, ClientPathHealthRecord,
-    RequestCapacityReconciliationView,
-};
+use super::health::{ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView};
 use super::model::{
     ClientPathObservation, PathDeliveryStats, UdpDatagramPathObservation,
     path_observation_is_idle_for_probe, path_records_have_schedulable_alternative,
@@ -19,7 +16,6 @@ use super::tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProbeSession, RequestTcpCapacityProofQuery,
 };
 use super::tcp::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
-use super::tcp::service::ClientTcpCarrierService;
 #[cfg(test)]
 use super::*;
 use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
@@ -47,7 +43,6 @@ pub(in crate::runtime) struct ClientTcpCarrierPublication {
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
-    tcp_carrier_service: Arc<ClientTcpCarrierService>,
     // Accessed only while `health` is locked so logical Product ownership and
     // physical replacement share one transaction boundary.
     active_product_flows: AtomicU64,
@@ -59,24 +54,12 @@ pub(in crate::runtime) struct ClientPathState {
 impl ClientPathState {
     pub(in crate::runtime) fn new(health: ClientPathHealth) -> Arc<Self> {
         let tcp_path_count = health.tcp.len();
-        Self::new_with_tcp_path_slot_count(health, tcp_path_count)
-    }
-
-    pub(in crate::runtime) fn new_with_tcp_path_slot_count(
-        health: ClientPathHealth,
-        tcp_path_slot_count: usize,
-    ) -> Arc<Self> {
-        assert!(
-            tcp_path_slot_count >= health.tcp.len(),
-            "TCP local path slot count covers configured-minimum members"
-        );
         Arc::new(Self {
             health: Mutex::new(health),
-            tcp_carrier_service: ClientTcpCarrierService::new(),
             active_product_flows: AtomicU64::new(0),
             next_reliable_stream_id: Mutex::new(0),
             next_datagram_flow_id: Mutex::new(0),
-            request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_slot_count),
+            request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
         })
     }
 
@@ -84,47 +67,7 @@ impl ClientPathState {
         &self.health
     }
 
-    pub(in crate::runtime) fn tcp_carrier_service(&self) -> &Arc<ClientTcpCarrierService> {
-        &self.tcp_carrier_service
-    }
-
-    fn publish_eligibility_change(
-        &self,
-        health: &mut ClientPathHealth,
-        before: ClientPathEligibilityFingerprint,
-        after: ClientPathEligibilityFingerprint,
-    ) {
-        self.publish_eligibility_change_if(health, before != after);
-    }
-
-    pub(super) fn publish_eligibility_change_if(
-        &self,
-        health: &mut ClientPathHealth,
-        changed: bool,
-    ) {
-        self.publish_tcp_carrier_policy_changes(health, changed, false);
-    }
-
-    pub(in crate::runtime) fn publish_tcp_carrier_policy_changes(
-        &self,
-        health: &mut ClientPathHealth,
-        ordinary_eligibility_changed: bool,
-        admission_policy_changed: bool,
-    ) {
-        if ordinary_eligibility_changed {
-            let _ = health.advance_tcp_carrier_ordinary_eligibility_generation();
-        }
-        if admission_policy_changed {
-            let _ = health.advance_tcp_carrier_admission_policy_generation();
-        }
-        if ordinary_eligibility_changed || admission_policy_changed {
-            self.tcp_carrier_service
-                .publish_policy_epochs(health.tcp_carrier_policy_epochs());
-        }
-    }
-
-    /// Applies one path mutation and advances the session eligibility epoch
-    /// only when its non-queue scheduling authority actually changed.
+    /// Applies one path mutation while owning the coherent health lock.
     pub(in crate::runtime) fn mutate_path_eligibility<R>(
         &self,
         key: RelayPathKey,
@@ -132,10 +75,7 @@ impl ClientPathState {
     ) -> Option<R> {
         let mut health = self.health.lock().expect("client path health lock");
         let record = health.path_record_mut(key)?;
-        let before = record.eligibility_fingerprint();
         let result = mutation(record);
-        let after = record.eligibility_fingerprint();
-        self.publish_eligibility_change(&mut health, before, after);
         Some(result)
     }
 
@@ -167,7 +107,7 @@ impl ClientPathState {
     }
 
     /// Publishes while the caller owns the matching endpoint-policy
-    /// commitment. This permits a minimum-member supervisor to swap its
+    /// commitment. This permits the carrier-group owner to swap its
     /// physical command owner in the same health transaction.
     pub(in crate::runtime) fn publish_tcp_peer_path_usage_committed(
         &self,
@@ -179,7 +119,6 @@ impl ClientPathState {
             .tcp
             .get_mut(publication.path_index)
             .expect("TCP carrier actor must have one health record");
-        let before = record.eligibility_fingerprint();
         record.install_tcp_peer_usage(
             publication.path_id,
             publication.path_instance_id,
@@ -189,59 +128,7 @@ impl ClientPathState {
         if let Some(readiness_rtt) = publication.readiness_rtt {
             record.mark_success(readiness_rtt);
         }
-        let after = record.eligibility_fingerprint();
-        self.publish_eligibility_change(&mut health, before, after);
         publish_readiness();
-    }
-
-    /// Publishes one retained elastic carrier into ordinary path health. A
-    /// reserved slot remains absent until this exact transaction commits.
-    pub(in crate::runtime) fn publish_retained_tcp_carrier(
-        &self,
-        publication: ClientTcpCarrierPublication,
-        publish_readiness: impl FnOnce(),
-    ) -> bool {
-        let mut health = self.health.lock().expect("client path health lock");
-        if health.tcp_record(publication.path_index).is_some() {
-            return false;
-        }
-        let mut record = health.new_tcp_elastic_record();
-        record.install_tcp_peer_usage(
-            publication.path_id,
-            publication.path_instance_id,
-            publication.peer_usage_sequence,
-            publication.peer_usage,
-        );
-        if let Some(readiness_rtt) = publication.readiness_rtt {
-            record.mark_success(readiness_rtt);
-        }
-        if !health.insert_tcp_elastic_record(publication.path_index, record) {
-            return false;
-        }
-        self.publish_eligibility_change_if(&mut health, true);
-        publish_readiness();
-        true
-    }
-
-    /// Removes only the retained elastic carrier that still owns the supplied
-    /// physical instance identity. A stale actor cannot erase a reused slot.
-    pub(in crate::runtime) fn remove_retained_tcp_carrier(
-        &self,
-        index: usize,
-        path_instance_id: CarrierPathInstanceId,
-    ) -> bool {
-        let mut health = self.health.lock().expect("client path health lock");
-        if !health
-            .tcp_record(index)
-            .is_some_and(|record| record.owns_path_instance(path_instance_id))
-        {
-            return false;
-        }
-        if health.remove_tcp_elastic_record(index).is_none() {
-            return false;
-        }
-        self.publish_eligibility_change_if(&mut health, true);
-        true
     }
 
     /// Commits a provisional TCP successor only while the predecessor still
@@ -265,7 +152,6 @@ impl ClientPathState {
         if !record.is_product_quiescent_for_instance(predecessor_instance_id) {
             return false;
         }
-        let before = record.eligibility_fingerprint();
         record.install_tcp_peer_usage(
             publication.path_id,
             publication.path_instance_id,
@@ -275,8 +161,6 @@ impl ClientPathState {
         if let Some(readiness_rtt) = publication.readiness_rtt {
             record.mark_success(readiness_rtt);
         }
-        let after = record.eligibility_fingerprint();
-        self.publish_eligibility_change(&mut health, before, after);
         publish_readiness();
         true
     }
@@ -313,10 +197,7 @@ impl ClientPathState {
         if !record.is_product_quiescent_for_instance(path_instance_id) {
             return false;
         }
-        let before = record.eligibility_fingerprint();
         record.begin_planned_retirement();
-        let after = record.eligibility_fingerprint();
-        self.publish_eligibility_change(&mut health, before, after);
         true
     }
 
@@ -351,10 +232,7 @@ impl ClientPathState {
                 .tcp
                 .get_mut(index)
                 .expect("TCP carrier actor must have one health record");
-            let before = record.eligibility_fingerprint();
             record.mark_failure(now, has_schedulable_alternative);
-            let after = record.eligibility_fingerprint();
-            self.publish_eligibility_change(&mut health, before, after);
         });
     }
 
@@ -403,12 +281,7 @@ impl ClientPathState {
         let Some(current) = health.path_record_mut(key) else {
             return false;
         };
-        let before = current.eligibility_fingerprint();
-        let changed =
-            current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative);
-        let after = current.eligibility_fingerprint();
-        self.publish_eligibility_change(&mut health, before, after);
-        changed
+        current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
     }
 
     pub(in crate::runtime) fn retire_path_instance_planned(
@@ -417,23 +290,10 @@ impl ClientPathState {
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
         let mut health = self.health.lock().expect("client path health lock");
-        if key.underlay == UnderlayProtocol::Tcp
-            && health
-                .tcp_elastic_record(key.index)
-                .is_some_and(|record| record.owns_path_instance(path_instance_id))
-        {
-            let removed = health.remove_tcp_elastic_record(key.index).is_some();
-            self.publish_eligibility_change_if(&mut health, removed);
-            return removed;
-        }
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
-        let before = record.eligibility_fingerprint();
-        let retired = record.retire_planned_instance(path_instance_id);
-        let after = record.eligibility_fingerprint();
-        self.publish_eligibility_change(&mut health, before, after);
-        retired
+        record.retire_planned_instance(path_instance_id)
     }
 
     pub(in crate::runtime) fn begin_path_instance_planned_retirement(
@@ -445,11 +305,7 @@ impl ClientPathState {
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
-        let before = record.eligibility_fingerprint();
-        let retiring = record.begin_planned_instance_retirement(path_instance_id);
-        let after = record.eligibility_fingerprint();
-        self.publish_eligibility_change(&mut health, before, after);
-        retiring
+        record.begin_planned_instance_retirement(path_instance_id)
     }
 
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_session(
@@ -682,15 +538,6 @@ impl Drop for RelayPathLoadLease {
 }
 
 impl ClientPathContext {
-    pub(in crate::runtime) fn publish_path_control_eligibility_change(
-        &self,
-        health: &mut ClientPathHealth,
-        changed: bool,
-    ) {
-        self.state
-            .publish_tcp_carrier_policy_changes(health, changed, false);
-    }
-
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         self.state.health()
     }
@@ -976,13 +823,9 @@ impl ClientPathContext {
             return;
         }
 
-        if let Some(session) = self.tcp_sessions.get(path.key.index)
-            && session.terminate_failed_instance(path.path_instance_id)
-        {
-            return;
+        if let Some(session) = self.tcp_sessions.get(path.key.index) {
+            session.terminate_failed_instance(path.path_instance_id);
         }
-        self.tcp_retained_carriers
-            .terminate_failed_instance(path.key, path.path_instance_id);
     }
 
     pub(in crate::runtime) fn record_relay_path_send(
@@ -1165,11 +1008,7 @@ impl ClientPathContext {
         let has_schedulable_alternative =
             health.tcp_records_have_schedulable_alternative(index, now);
         if let Some(current) = health.tcp_record_mut(index) {
-            let before = current.eligibility_fingerprint();
             current.mark_failure(now, has_schedulable_alternative);
-            let after = current.eligibility_fingerprint();
-            self.state
-                .publish_eligibility_change(&mut health, before, after);
         }
     }
 
@@ -1270,11 +1109,7 @@ impl ClientPathContext {
         let has_schedulable_alternative =
             path_records_have_schedulable_alternative(&health.udp, index, now);
         if let Some(current) = health.udp.get_mut(index) {
-            let before = current.eligibility_fingerprint();
             current.mark_failure(now, has_schedulable_alternative);
-            let after = current.eligibility_fingerprint();
-            self.state
-                .publish_eligibility_change(&mut health, before, after);
         }
     }
 }

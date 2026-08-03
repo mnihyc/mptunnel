@@ -1,6 +1,6 @@
 //! Session-owned TCP carrier groups.
 //!
-//! A group owns configured bounds, configured-minimum member identities, and
+//! A group owns its configured maximum, durable member identities, and
 //! endpoint establishment policy. Exact carrier actors retain ownership of
 //! sockets, wire ordering, Product attachments, and terminal failure.
 
@@ -11,7 +11,7 @@ use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::path_record_failure_cooldown;
 use crate::scheduler::PathState as SchedulerPathState;
 use crate::transport::TcpCarrierRange;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -86,9 +86,6 @@ pub(in crate::runtime) struct ClientTcpCarrierGroup {
     pub(in crate::runtime) config_index: usize,
     pub(in crate::runtime) range: TcpCarrierRange,
     pub(in crate::runtime) members: Vec<usize>,
-    /// Local path-key slots reserved for elastic instances. A slot has no
-    /// health record, actor, queue, or ordinary authority while unoccupied.
-    pub(in crate::runtime) elastic_slots: Vec<usize>,
     policy: Arc<ClientTcpEndpointPolicy>,
 }
 
@@ -102,7 +99,6 @@ impl ClientTcpCarrierGroup {
             config_index,
             range,
             members,
-            elastic_slots: Vec::new(),
             policy: ClientTcpEndpointPolicy::enabled(),
         }
     }
@@ -111,7 +107,6 @@ impl ClientTcpCarrierGroup {
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientTcpCarrierGroups {
     groups: Box<[ClientTcpCarrierGroup]>,
-    elastic_slot_owners: BTreeMap<usize, (usize, u16)>,
     resources: Mutex<ClientTcpCarrierResourceState>,
     changes: watch::Sender<()>,
 }
@@ -120,34 +115,24 @@ pub(in crate::runtime) struct ClientTcpCarrierGroups {
 struct ClientTcpCarrierResourceState {
     occupied_by_group: Box<[u16]>,
     occupied_path_ids: BTreeSet<u16>,
-    occupied_elastic_slots: BTreeSet<usize>,
     next_path_id: u16,
 }
 
 /// Exact physical-carrier reservation.
 ///
 /// The reservation starts immediately before connection initiation and stays
-/// owned by that one actor through readiness, validation or ordinary use, and
-/// ordered drain. Dropping it releases both the group envelope and wire ID.
+/// owned by that one actor through readiness, ordinary use, and ordered drain.
+/// Dropping it releases both the group envelope and wire ID.
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientTcpCarrierReservation {
     owner: Weak<ClientTcpCarrierGroups>,
     config_index: usize,
     path_id: PathId,
-    elastic_path_index: Option<usize>,
 }
 
 impl ClientTcpCarrierReservation {
     pub(in crate::runtime) fn path_id(&self) -> PathId {
         self.path_id
-    }
-
-    pub(in crate::runtime) fn config_index(&self) -> usize {
-        self.config_index
-    }
-
-    pub(in crate::runtime) fn elastic_path_index(&self) -> Option<usize> {
-        self.elastic_path_index
     }
 }
 
@@ -169,19 +154,13 @@ impl Drop for ClientTcpCarrierReservation {
                 resources.occupied_path_ids.remove(&self.path_id.0),
                 "TCP wire PathId reservation released once"
             );
-            if let Some(path_index) = self.elastic_path_index {
-                assert!(
-                    resources.occupied_elastic_slots.remove(&path_index),
-                    "TCP elastic local path slot released once"
-                );
-            }
         }
         owner.publish_change();
     }
 }
 
 #[derive(Clone, Copy)]
-pub(in crate::runtime) struct ClientTcpMinimumRetry {
+pub(in crate::runtime) struct ClientTcpMemberRetry {
     endpoint_generation: u64,
     not_before: tokio::time::Instant,
     hop_instance: Option<CarrierPathInstanceId>,
@@ -189,7 +168,7 @@ pub(in crate::runtime) struct ClientTcpMinimumRetry {
     replacement_port: Option<u16>,
 }
 
-impl ClientTcpMinimumRetry {
+impl ClientTcpMemberRetry {
     pub(in crate::runtime) fn new(now: tokio::time::Instant) -> Self {
         Self {
             endpoint_generation: 0,
@@ -209,29 +188,11 @@ impl ClientTcpCarrierGroups {
     pub(in crate::runtime) fn new(groups: Vec<ClientTcpCarrierGroup>) -> Arc<Self> {
         let (changes, _) = watch::channel(());
         let occupied_by_group = vec![0; groups.len()].into_boxed_slice();
-        let mut elastic_slot_owners = BTreeMap::new();
-        for group in &groups {
-            for (offset, &path_index) in group.elastic_slots.iter().enumerate() {
-                let member_ordinal = group
-                    .range
-                    .min()
-                    .checked_add(u16::try_from(offset).expect("TCP elastic slot ordinal fits u16"))
-                    .expect("TCP elastic member ordinal fits configured range");
-                assert!(
-                    elastic_slot_owners
-                        .insert(path_index, (group.config_index, member_ordinal))
-                        .is_none(),
-                    "TCP elastic local path slots are unique"
-                );
-            }
-        }
         Arc::new(Self {
             groups: groups.into_boxed_slice(),
-            elastic_slot_owners,
             resources: Mutex::new(ClientTcpCarrierResourceState {
                 occupied_by_group,
                 occupied_path_ids: BTreeSet::new(),
-                occupied_elastic_slots: BTreeSet::new(),
                 next_path_id: 0,
             }),
             changes,
@@ -240,28 +201,11 @@ impl ClientTcpCarrierGroups {
 
     /// Reserves one physical carrier and a concurrently unique TCP `PathId`.
     ///
-    /// Unoccupied configured maximum capacity has no actor, command queue,
-    /// health record, or protocol identity.
+    /// Every configured member has an actor and health identity; only a live
+    /// physical connection consumes this reservation.
     pub(in crate::runtime) fn reserve(
         self: &Arc<Self>,
         config_index: usize,
-    ) -> Option<ClientTcpCarrierReservation> {
-        self.reserve_inner(config_index, false)
-    }
-
-    /// Reserves the physical envelope, wire identity, and one unpublished
-    /// local path-key slot for an elastic candidate.
-    pub(in crate::runtime) fn reserve_elastic(
-        self: &Arc<Self>,
-        config_index: usize,
-    ) -> Option<ClientTcpCarrierReservation> {
-        self.reserve_inner(config_index, true)
-    }
-
-    fn reserve_inner(
-        self: &Arc<Self>,
-        config_index: usize,
-        elastic: bool,
     ) -> Option<ClientTcpCarrierReservation> {
         let group = self.get(config_index)?;
         let mut resources = self.resources.lock().expect("TCP carrier resource lock");
@@ -269,18 +213,6 @@ impl ClientTcpCarrierGroups {
         if occupied >= group.range.max() {
             return None;
         }
-
-        let elastic_path_index = if elastic {
-            Some(
-                group
-                    .elastic_slots
-                    .iter()
-                    .copied()
-                    .find(|slot| !resources.occupied_elastic_slots.contains(slot))?,
-            )
-        } else {
-            None
-        };
 
         let mut candidate = resources.next_path_id;
         let path_id = (0..=u16::MAX).find_map(|_| {
@@ -291,9 +223,6 @@ impl ClientTcpCarrierGroups {
         })?;
         resources.next_path_id = candidate;
         resources.occupied_path_ids.insert(path_id);
-        if let Some(path_index) = elastic_path_index {
-            resources.occupied_elastic_slots.insert(path_index);
-        }
         resources.occupied_by_group[config_index] = occupied + 1;
         drop(resources);
 
@@ -301,7 +230,6 @@ impl ClientTcpCarrierGroups {
             owner: Arc::downgrade(self),
             config_index,
             path_id: PathId(path_id),
-            elastic_path_index,
         })
     }
 
@@ -312,13 +240,6 @@ impl ClientTcpCarrierGroups {
             .occupied_by_group
             .get(config_index)
             .copied()
-    }
-
-    /// Resolves immutable configured ownership without consulting live
-    /// reservation state. Callers pair this metadata with active health or an
-    /// exact reservation owner before granting any carrier authority.
-    pub(in crate::runtime) fn elastic_path_owner(&self, path_index: usize) -> Option<(usize, u16)> {
-        self.elastic_slot_owners.get(&path_index).copied()
     }
 
     pub(in crate::runtime) fn iter(&self) -> std::slice::Iter<'_, ClientTcpCarrierGroup> {
@@ -351,7 +272,7 @@ impl ClientTcpCarrierGroups {
     pub(in crate::runtime) fn next_maintenance_at(
         &self,
         context: &ClientPathContext,
-        retry: &[ClientTcpMinimumRetry],
+        retry: &[ClientTcpMemberRetry],
     ) -> Option<tokio::time::Instant> {
         self.iter()
             .filter(|group| {
@@ -376,24 +297,24 @@ impl ClientTcpCarrierGroups {
             .min()
     }
 
-    /// Reconciles durable minimum capacity and planned ranged-port
-    /// replacement. Distinct missing members may establish concurrently; a
-    /// minimum member has at most one current establishment or successor.
+    /// Reconciles the bounded healthy target and planned ranged-port
+    /// replacement. Every missing member is an equivalent establishment
+    /// candidate and independent attempts may proceed concurrently.
     pub(in crate::runtime) async fn reconcile(
         &self,
         context: &ClientPathContext,
         connect_timeout: Duration,
         retry_interval: Duration,
-        retry: &mut [ClientTcpMinimumRetry],
+        retry: &mut [ClientTcpMemberRetry],
     ) {
         assert_eq!(
             retry.len(),
             context.tcp_sessions.len(),
-            "TCP minimum retry state must match configured members"
+            "TCP member retry state must match configured members"
         );
 
         let now = tokio::time::Instant::now();
-        let mut minimum_attempts = tokio::task::JoinSet::new();
+        let mut establishment_attempts = tokio::task::JoinSet::new();
         for group in self.iter() {
             let policy_snapshot = group.policy.snapshot();
             if !policy_snapshot.enabled {
@@ -430,7 +351,7 @@ impl ClientTcpCarrierGroups {
                 }
                 retry.hop_instance = None;
                 retry.hop_not_before = None;
-                if !session.can_establish_minimum() {
+                if !session.can_establish() {
                     continue;
                 }
                 if self.occupied(group.config_index).unwrap_or_default() >= group.range.max() {
@@ -446,7 +367,7 @@ impl ClientTcpCarrierGroups {
                 retry.not_before = now + retry_interval;
                 let session = session.clone();
                 let replacement_port = retry.replacement_port.take();
-                minimum_attempts.spawn(async move {
+                establishment_attempts.spawn(async move {
                     let deadline = tokio::time::Instant::now() + connect_timeout;
                     session
                         .prepare_connection_for_endpoint_generation_on_port(
@@ -459,23 +380,23 @@ impl ClientTcpCarrierGroups {
             }
         }
 
-        while let Some(attempt) = minimum_attempts.join_next().await {
+        while let Some(attempt) = establishment_attempts.join_next().await {
             match attempt {
                 Ok(Ok(_)) | Ok(Err(_)) => {}
                 Err(error) => {
                     crate::observability::process_event!(
                         Warn,
                         "tcp",
-                        "minimum_reconciliation_task_failed",
-                        "configured-minimum TCP carrier task failed: {error}"
+                        "pool_reconciliation_task_failed",
+                        "TCP carrier-pool establishment task failed: {error}"
                     );
                 }
             }
         }
 
-        // Optional port replacement is considered only after every durable
-        // minimum member is ready. It can therefore never consume a
-        // reservation needed to restore the configured minimum.
+        // Planned replacement is considered only after the complete healthy
+        // target is ready. The earliest-due member rotates first; a successful
+        // replacement receives a fresh deadline, so no ordinal remains old.
         let now = tokio::time::Instant::now();
         let mut replacement_attempts = tokio::task::JoinSet::new();
         for group in self.iter() {
@@ -491,10 +412,8 @@ impl ClientTcpCarrierGroups {
                 continue;
             }
 
-            // One planned replacement is initiated per group reconciliation.
-            // The successor publication or terminal predecessor release wakes
-            // the owner before another member can be considered.
-            for &path_index in &group.members {
+            let mut rotation_order = group.members.clone();
+            for &path_index in &rotation_order {
                 let session = context
                     .tcp_sessions
                     .get(path_index)
@@ -513,6 +432,29 @@ impl ClientTcpCarrierGroups {
                             .map(|interval| now + interval)
                     });
                 }
+            }
+            rotation_order.retain(|path_index| {
+                retry
+                    .get(*path_index)
+                    .is_some_and(|member| member.hop_not_before.is_some())
+            });
+            rotation_order.sort_by_key(|path_index| {
+                retry
+                    .get(*path_index)
+                    .and_then(|member| member.hop_not_before)
+            });
+
+            // One planned replacement is initiated per group reconciliation.
+            // The successor publication or terminal predecessor release wakes
+            // the owner before another due member can be considered.
+            for path_index in rotation_order {
+                let session = context
+                    .tcp_sessions
+                    .get(path_index)
+                    .expect("TCP group member must have one carrier actor");
+                let retry = retry
+                    .get_mut(path_index)
+                    .expect("TCP group member must have retry state");
                 let Some(hop_not_before) = retry.hop_not_before else {
                     continue;
                 };
@@ -648,25 +590,17 @@ impl ClientPathContext {
                     .expect("TCP group member must have one carrier actor")
                     .begin_path_drain();
             }
-            self.tcp_retained_carriers
-                .begin_endpoint_drain(config_index);
         }
-        let admission_policy_changed = group.policy.replace_enabled(enabled);
+        group.policy.replace_enabled(enabled);
         let mut health = self
             .health()
             .lock()
             .expect("client path health management lock");
         let now = std::time::Instant::now();
-        let mut ordinary_eligibility_changed = false;
-        for &index in group.members.iter().chain(&group.elastic_slots) {
-            let Some(record) = health.tcp_record_mut(index) else {
-                assert!(
-                    group.elastic_slots.contains(&index),
-                    "TCP configured-minimum member must have one health record"
-                );
-                continue;
-            };
-            let before = record.eligibility_fingerprint();
+        for &index in &group.members {
+            let record = health
+                .tcp_record_mut(index)
+                .expect("TCP pool member must have one health record");
             match state {
                 ClientTcpEndpointControlState::Enabled | ClientTcpEndpointControlState::Suspect => {
                     record.invalidate_path_proofs();
@@ -697,17 +631,11 @@ impl ClientPathContext {
                     record.relay_queue_bytes = 0;
                 }
             }
-            ordinary_eligibility_changed |= before != record.eligibility_fingerprint();
         }
-        self.state.publish_tcp_carrier_policy_changes(
-            &mut health,
-            ordinary_eligibility_changed,
-            admission_policy_changed,
-        );
         drop(health);
         drop(_policy_commitment);
 
-        // Control transitions wake the one configured-minimum reconciler.
+        // Control transitions wake the endpoint's bounded-pool reconciler.
         // Only Disabled forbids establishment; Failed remains health evidence.
         self.tcp_carrier_groups.publish_change();
     }

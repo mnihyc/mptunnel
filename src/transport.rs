@@ -31,7 +31,7 @@ pub use native_egress::{
 pub use native_egress::{LinuxMarkedNativeSocketConfigurator, LinuxSocketMarker};
 pub use spec::{
     CarrierEndpoint, CarrierEndpointParseError, CarrierPortSet,
-    DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS, DEFAULT_TCP_CARRIER_MAX, DEFAULT_TCP_CARRIER_MIN,
-    Endpoint, EndpointParseError, MIN_CARRIER_PORT_HOP_INTERVAL_MS, PathBinding, PathMetadata,
-    PathPolicy, PathSpec, PathSpecParseError, RateHint, TcpCarrierRange, TcpCarrierRangeError,
+    DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS, DEFAULT_TCP_CARRIER_MAX, Endpoint, EndpointParseError,
+    MIN_CARRIER_PORT_HOP_INTERVAL_MS, PathBinding, PathMetadata, PathPolicy, PathSpec,
+    PathSpecParseError, RateHint, TcpCarrierRange, TcpCarrierRangeError,
 };

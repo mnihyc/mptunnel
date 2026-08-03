@@ -315,9 +315,8 @@ fn credential_authority_retirements(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::runtime) struct PathJoinReplayKey {
     // PATH_JOIN is the completed authentication-flight replay identity: its
-    // MAC covers the session, credential, path, underlay, purpose, nonce, and
-    // issue time. Purpose is deliberately omitted here so one nonce remains
-    // one-use across both purposes. A replayed SESSION_AUTH cannot enter
+    // MAC covers the session, credential, path, underlay, nonce, and issue
+    // time. A replayed SESSION_AUTH cannot enter
     // runtime state without a valid PATH_JOIN, so admitting only after this key
     // verifies also avoids reserving replay capacity for incomplete handshakes.
     pub(in crate::runtime) session_id: SessionId,

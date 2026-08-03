@@ -10,6 +10,4 @@ pub(in crate::runtime) mod client;
 pub(in crate::runtime) mod group;
 pub(in crate::runtime) mod io;
 pub(in crate::runtime) mod metrics;
-pub(in crate::runtime) mod retained;
 pub(in crate::runtime) mod server;
-pub(in crate::runtime) mod service;

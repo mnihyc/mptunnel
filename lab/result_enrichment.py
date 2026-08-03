@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 RESULT_SCHEMA_VERSION = 2
 RUN_MANIFEST_SCHEMA_VERSION = 3
-MPTUNNEL_PROTOCOL_VERSION = 5
+MPTUNNEL_PROTOCOL_VERSION = 6
 MPTUNNEL_CARRIER_PRESENTATION = (
     "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297"
 )
@@ -251,7 +251,7 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
         )
     if carrier_presentation != MPTUNNEL_CARRIER_PRESENTATION:
         raise ValueError(
-            "mptunnel_carrier_presentation does not match the current v5 "
+            "mptunnel_carrier_presentation does not match the current v6 "
             "TCP/QUIC wire presentation"
         )
     if not isinstance(source_tree_dirty, bool):

@@ -6,9 +6,7 @@
 
 use crate::config::{ClientSecurityConfig, ServerSecurityConfig};
 use crate::protocol::auth::SessionAuthenticator;
-use crate::protocol::{
-    AuthNonce, AuthTag, Frame, PathId, PathPurpose, SessionId, UnderlayProtocol,
-};
+use crate::protocol::{AuthNonce, AuthTag, Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 #[cfg(test)]
 use crate::runtime::identity::random_session_id;
@@ -46,36 +44,13 @@ impl ClientTcpPathAuthentication {
         path_id: PathId,
         tls_exporter: &[u8; 32],
     ) -> Result<Self, RuntimeError> {
-        Self::for_session_with_purpose(
-            security,
-            path_id,
-            random_session_id()?,
-            PathPurpose::Ordinary,
-            tls_exporter,
-        )
+        Self::for_session(security, path_id, random_session_id()?, tls_exporter)
     }
 
-    #[cfg(test)]
     pub(in crate::runtime) fn for_session(
         security: &ClientSecurityConfig,
         path_id: PathId,
         session_id: SessionId,
-        tls_exporter: &[u8; 32],
-    ) -> Result<Self, RuntimeError> {
-        Self::for_session_with_purpose(
-            security,
-            path_id,
-            session_id,
-            PathPurpose::Ordinary,
-            tls_exporter,
-        )
-    }
-
-    pub(in crate::runtime) fn for_session_with_purpose(
-        security: &ClientSecurityConfig,
-        path_id: PathId,
-        session_id: SessionId,
-        purpose: PathPurpose,
         tls_exporter: &[u8; 32],
     ) -> Result<Self, RuntimeError> {
         let credential_id = security.credential.id().as_str();
@@ -100,7 +75,6 @@ impl ClientTcpPathAuthentication {
             credential_id,
             path_id,
             UnderlayProtocol::Tcp,
-            purpose,
             path_nonce,
             issued_at_unix_secs,
         );
@@ -117,7 +91,6 @@ impl ClientTcpPathAuthentication {
                 credential_id: credential_id.to_string(),
                 path_id,
                 underlay: UnderlayProtocol::Tcp,
-                purpose,
                 nonce: path_nonce,
                 issued_at_unix_secs,
                 auth_tag: path_tag,

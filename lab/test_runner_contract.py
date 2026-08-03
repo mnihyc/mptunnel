@@ -181,10 +181,16 @@ class RunnerContractTests(unittest.TestCase):
         )
         self.assertIn("tcp_carrier_qos_duration_seconds=30", SCRIPT)
         self.assertIn("tcp_carrier_qos_workers=3", SCRIPT)
-        self.assertIn("for qos_carrier_range in 1-1 1-3", qos_dispatch)
+        self.assertIn(
+            "for qos_topology in range_1_1 range_1_3 range_3_3 three_endpoints_1_1",
+            qos_dispatch,
+        )
         self.assertIn('"per_flow_qos:tcp-per-flow-qos"', qos_dispatch)
         self.assertIn('"shared_bottleneck:tcp-shared-bottleneck"', qos_dispatch)
-        self.assertIn("?tcp-carriers=${carrier_range}", qos_case)
+        self.assertIn('"unconstrained:unconstrained"', qos_dispatch)
+        self.assertIn("range_3_3)", qos_case)
+        self.assertIn("three_endpoints_1_1)", qos_case)
+        self.assertEqual(qos_case.count("?tcp-carriers=1-1"), 4)
         self.assertNotIn("tcp-carriers", server_config)
         self.assertIn("fixed", qos_case)
         self.assertIn("$tcp_carrier_qos_workers", qos_case)
@@ -378,6 +384,34 @@ class RunnerContractTests(unittest.TestCase):
         )
         self.assertIn(
             'run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_equal_fat_upload" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"',
+            SCRIPT,
+        )
+
+    def test_public_mixed_comparisons_use_matched_transport_pairs(self):
+        self.assertIn(
+            'start_client "reliable_mixed_single_cross_continent_high_bandwidth" "$tcp_fat $udp_fat"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'start_client "reliable_mixed_single_cross_continent_high_bandwidth_upload" "$tcp_fat $udp_fat"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'run_reliable_ideal_download_case "mptunnel_reliable_mixed_paired_multipath_equal_fat" "fat" "$tcp_equal_all $udp_equal_all"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'run_reliable_ideal_upload_case "mptunnel_reliable_mixed_paired_multipath_equal_fat_upload" "fat" "$tcp_equal_all $udp_equal_all"',
+            SCRIPT,
+        )
+
+    def test_single_tcp_local_ceiling_has_exact_one_carrier_control(self):
+        self.assertIn(
+            '"mptunnel_tcp_single_unconstrained_range_1_1"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"--path \'tcp://172.31.10.20:${server_port}?tcp-carriers=1-1\'"',
             SCRIPT,
         )
 

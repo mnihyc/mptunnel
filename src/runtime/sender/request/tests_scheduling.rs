@@ -1,10 +1,9 @@
 use super::{
     BulkRelayPathChoice, BulkRelayPathRequest, ObservedBulkPathCandidate,
-    ObservedOrdinaryPathChoice, RequestOrdinarySaturationCheck, RequestRelayPathObservation,
-    RequestRelaySchedulingObservation, RequestSchedulingState,
-    choose_bulk_relay_path_for_extent_avoiding, choose_observed_ordinary_data_path,
-    observed_request_ack_clock_measurement_transaction, relay_path_snapshot_for_bulk_choice,
-    request_ordinary_saturation_observation,
+    ObservedOrdinaryPathChoice, RequestRelayPathObservation, RequestRelaySchedulingObservation,
+    RequestSchedulingState, choose_bulk_relay_path_for_extent_avoiding,
+    choose_observed_ordinary_data_path, observed_request_ack_clock_measurement_transaction,
+    relay_path_snapshot_for_bulk_choice,
 };
 use crate::model::admission::BulkPathCandidate;
 use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
@@ -12,19 +11,15 @@ use crate::model::path::{
     CarrierPathInstanceId, RelayPathInstance, RelayPathKey, RelayPathProofEpoch,
 };
 use crate::model::request_evidence::RequestPerFlowRateModel;
-use crate::model::tcp_carrier::TcpCarrierPolicyEpochs;
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::ReliableRequestTcpPathEvidence;
-use crate::runtime::sender::RelaySendCause;
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestPathStates,
 };
 use crate::scheduler::{self, PathSnapshot, PathState, TrafficClass};
 use bytes::Bytes;
 use smallvec::SmallVec;
-use std::collections::HashSet;
-use std::num::NonZeroU64;
 use std::time::Instant;
 
 const PAYLOAD_BYTES: usize = 16 * 1024;
@@ -74,6 +69,7 @@ fn observed_path(
             attached_at: Instant::now(),
         }),
         config_ordinal: instance.key.index,
+        member_ordinal: 0,
     }
 }
 
@@ -103,6 +99,7 @@ fn scheduling_observation(
                     snapshot,
                 },
                 config_ordinal: path.config_ordinal,
+                member_ordinal: path.member_ordinal,
             })
         })
         .collect();
@@ -113,11 +110,6 @@ fn scheduling_observation(
         paths,
         global_bulk_candidates,
         latency_pressure: false,
-        tcp_carrier_policy_epochs: Some(TcpCarrierPolicyEpochs {
-            ordinary_eligibility_generation: NonZeroU64::new(1).expect("non-zero test generation"),
-            admission_policy_generation: NonZeroU64::new(1).expect("non-zero test generation"),
-            resource_policy_generation: NonZeroU64::new(1).expect("non-zero test generation"),
-        }),
     }
 }
 
@@ -133,26 +125,6 @@ fn original_flights(owner: RelayPathInstance) -> RequestFlightLedger {
     let mut flights = RequestFlightLedger::default();
     flights.record_original_frame_instance(owner, &data_frame(0, PAYLOAD_BYTES));
     flights
-}
-
-fn ordinary_saturation(
-    observation: &RequestRelaySchedulingObservation,
-    frame: &Frame,
-    flights: &RequestFlightLedger,
-    lane: TrafficClass,
-    cause: RelaySendCause,
-    avoid_instances: &[RelayPathInstance],
-    stale_paths: &HashSet<RelayPathInstance>,
-) -> Option<super::RequestOrdinarySaturationObservation> {
-    request_ordinary_saturation_observation(RequestOrdinarySaturationCheck {
-        observation,
-        lane,
-        frame,
-        cause,
-        avoid_instances,
-        path_flights: flights,
-        stale_paths,
-    })
 }
 
 #[derive(Default)]
@@ -283,227 +255,6 @@ fn ordinary_data_chooses_lowest_eta_independent_of_attachment_order() {
             "attachment order must not become scheduling authority",
         );
     }
-}
-
-#[test]
-fn ordinary_saturation_freezes_the_first_schedulable_authority_class() {
-    let first_available = instance(UnderlayProtocol::Tcp, 0, 70);
-    let second_available = instance(UnderlayProtocol::Udp, 0, 71);
-    let backup = instance(UnderlayProtocol::Tcp, 1, 72);
-    let mut first_path = observed_path(first_available, 30.0, 200_000_000.0);
-    let mut second_path = observed_path(second_available, 20.0, 300_000_000.0);
-    let mut backup_path = observed_path(backup, 10.0, 400_000_000.0);
-    first_path.can_enqueue_stream_lane = false;
-    second_path.can_enqueue_stream_lane = false;
-    backup_path.can_enqueue_stream_lane = false;
-    backup_path
-        .shared_snapshot
-        .as_mut()
-        .expect("backup snapshot")
-        .peer_usage = Some(PathUsage::Backup);
-    let mut observation = scheduling_observation([backup_path, second_path, first_path]);
-    observation.membership_generation = 37;
-    let mut flights = RequestFlightLedger::default();
-    flights.record_original_frame_instance(first_available, &data_frame(0, PAYLOAD_BYTES));
-    flights.record_original_frame_instance(
-        second_available,
-        &data_frame(PAYLOAD_BYTES as u64, PAYLOAD_BYTES),
-    );
-    let proposed = data_frame((2 * PAYLOAD_BYTES) as u64, PAYLOAD_BYTES);
-
-    let saturation = ordinary_saturation(
-        &observation,
-        &proposed,
-        &flights,
-        TrafficClass::Throughput,
-        RelaySendCause::StreamData,
-        &[],
-        &HashSet::new(),
-    )
-    .expect("every Available ordinary path owns original flight and is enqueue-blocked");
-    assert_eq!(saturation.stream_id, StreamId(7));
-    assert_eq!(saturation.stable.membership_generation, 37);
-    assert_eq!(saturation.stable.authority_class, PathUsage::Available);
-    assert_eq!(
-        saturation
-            .ordinary_services
-            .iter()
-            .map(|ordinary| ordinary.instance)
-            .collect::<Vec<_>>(),
-        vec![second_available, first_available],
-        "the frozen class preserves exact attachment membership while excluding Backup",
-    );
-
-    let mut regular_not_permitted = observation.paths[2];
-    regular_not_permitted
-        .shared_snapshot
-        .as_mut()
-        .expect("regular snapshot")
-        .policy
-        .bulk_allowed = false;
-    let backup_path = observation.paths[0];
-    let fallback = scheduling_observation([regular_not_permitted, backup_path]);
-    let mut backup_flight = RequestFlightLedger::default();
-    backup_flight.record_original_frame_instance(backup, &data_frame(0, PAYLOAD_BYTES));
-    let saturation = ordinary_saturation(
-        &fallback,
-        &data_frame(PAYLOAD_BYTES as u64, PAYLOAD_BYTES),
-        &backup_flight,
-        TrafficClass::Throughput,
-        RelaySendCause::StreamData,
-        &[],
-        &HashSet::new(),
-    )
-    .expect("Backup is the authority class only when no regular path is schedulable");
-    assert_eq!(saturation.stable.authority_class, PathUsage::Backup);
-    assert_eq!(
-        saturation
-            .ordinary_services
-            .iter()
-            .map(|ordinary| ordinary.instance)
-            .collect::<Vec<_>>(),
-        vec![backup]
-    );
-}
-
-#[test]
-fn ordinary_saturation_rejects_non_rfc_and_transient_blocks() {
-    let ordinary = instance(UnderlayProtocol::Tcp, 0, 73);
-    let mut blocked = observed_path(ordinary, 20.0, 200_000_000.0);
-    blocked.can_enqueue_stream_lane = false;
-    let mut observation = scheduling_observation([blocked]);
-    let mut flights = RequestFlightLedger::default();
-    flights.record_original_frame_instance(ordinary, &data_frame(0, PAYLOAD_BYTES));
-    let proposed = data_frame(PAYLOAD_BYTES as u64, PAYLOAD_BYTES);
-    let no_stale_paths = HashSet::new();
-    let check = |observation: &RequestRelaySchedulingObservation,
-                 frame: &Frame,
-                 flights: &RequestFlightLedger,
-                 lane: TrafficClass,
-                 cause: RelaySendCause,
-                 avoid: &[RelayPathInstance],
-                 stale: &HashSet<RelayPathInstance>| {
-        ordinary_saturation(observation, frame, flights, lane, cause, avoid, stale)
-    };
-
-    let mut enqueue_available = observation.paths[0];
-    enqueue_available.can_enqueue_stream_lane = true;
-    assert!(
-        check(
-            &scheduling_observation([enqueue_available]),
-            &proposed,
-            &flights,
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-            &[],
-            &no_stale_paths,
-        )
-        .is_none(),
-        "an eligible ordinary enqueue means the demand is not saturated",
-    );
-    let mut native_saturated = enqueue_available;
-    let snapshot = native_saturated.shared_snapshot.as_mut().expect("snapshot");
-    snapshot.bytes_in_flight = snapshot.carrier_inflight_limit_bytes;
-    snapshot.queue_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64;
-    assert!(
-        check(
-            &scheduling_observation([native_saturated]),
-            &proposed,
-            &flights,
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-            &[],
-            &no_stale_paths,
-        )
-        .is_some(),
-        "native queue and flight saturation is ordinary enqueue saturation",
-    );
-    assert!(
-        check(
-            &observation,
-            &proposed,
-            &RequestFlightLedger::default(),
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-            &[],
-            &no_stale_paths,
-        )
-        .is_none(),
-        "every authority-class member must already own target OriginalData",
-    );
-    observation.latency_pressure = true;
-    assert!(
-        check(
-            &observation,
-            &proposed,
-            &flights,
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-            &[],
-            &no_stale_paths,
-        )
-        .is_none(),
-        "latency pressure forbids non-failure expansion admission",
-    );
-    observation.latency_pressure = false;
-    for (lane, cause, avoid) in [
-        (
-            TrafficClass::Latency,
-            RelaySendCause::StreamData,
-            Vec::new(),
-        ),
-        (
-            TrafficClass::Throughput,
-            RelaySendCause::AckGapReinjection,
-            Vec::new(),
-        ),
-        (
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-            vec![ordinary],
-        ),
-    ] {
-        assert!(
-            check(
-                &observation,
-                &proposed,
-                &flights,
-                lane,
-                cause,
-                &avoid,
-                &no_stale_paths,
-            )
-            .is_none(),
-            "only primary Throughput placement without avoidance is eligible",
-        );
-    }
-    let stale_paths = HashSet::from([ordinary]);
-    assert!(
-        check(
-            &observation,
-            &proposed,
-            &flights,
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-            &[],
-            &stale_paths,
-        )
-        .is_none(),
-        "a stale scheduler path is not ordinary saturation",
-    );
-    assert!(
-        check(
-            &observation,
-            &data_frame(0, PAYLOAD_BYTES),
-            &flights,
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-            &[],
-            &no_stale_paths,
-        )
-        .is_none(),
-        "an already-owned range is not a fresh unique-original placement",
-    );
 }
 
 #[test]

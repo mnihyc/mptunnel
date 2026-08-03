@@ -4,40 +4,15 @@
 //! identity. The response binding revalidates that identity and the connection
 //! flight generation before publishing the carrier command.
 
-use super::scheduling::{
-    ResponseOrdinarySaturationObservation, response_ordinary_saturation_observation,
-    select_response_data_path_with_payload,
-};
+use super::scheduling::select_response_data_path_with_payload;
 use crate::model::path::CarrierPathKey;
-use crate::model::tcp_carrier::TcpCarrierStableGenerations;
 use crate::model::work::ReliableWorkClass;
 use crate::runtime::RuntimeError;
 use crate::runtime::stream::response::ResponseDispatchTarget;
 use crate::runtime::stream::{
     ReliablePathStream, ReliablePathStreamOutput, reliable_work_lane_to_carrier_lane,
 };
-use crate::scheduler::{self, TrafficClass};
-
-pub(super) enum ResponseMultipathPlanError {
-    OrdinarySaturation(Box<ResponseOrdinarySaturationObservation>),
-    Runtime(RuntimeError),
-}
-
-#[cfg(test)]
-impl ResponseMultipathPlanError {
-    fn into_runtime(self) -> RuntimeError {
-        match self {
-            Self::OrdinarySaturation(_) => RuntimeError::SenderServiceBlocked,
-            Self::Runtime(error) => error,
-        }
-    }
-}
-
-impl From<RuntimeError> for ResponseMultipathPlanError {
-    fn from(error: RuntimeError) -> Self {
-        Self::Runtime(error)
-    }
-}
+use crate::scheduler::TrafficClass;
 
 pub(super) enum ResponseDataDispatchTarget {
     Fixed {
@@ -80,8 +55,7 @@ pub(super) fn plan_response_data_dispatch_with_data_ack_outstanding_impl(
         payload_bytes,
         data_ack_outstanding_bytes,
     )
-    .map(|(_, target, _)| target)
-    .map_err(ResponseMultipathPlanError::into_runtime)
+    .map(|(_, target)| target)
 }
 
 pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
@@ -90,24 +64,16 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
     next_offset: u64,
     payload_bytes: usize,
     data_ack_outstanding_bytes: usize,
-) -> Result<
-    (
-        usize,
-        ResponseDataDispatchTarget,
-        Option<TcpCarrierStableGenerations>,
-    ),
-    ResponseMultipathPlanError,
-> {
+) -> Result<(usize, ResponseDataDispatchTarget), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
             let lane = reliable_work_lane_to_carrier_lane(ReliableWorkClass::Data, relay_lane);
             if !fixed.commands().can_enqueue_lane_now(lane) {
-                return Err(RuntimeError::SenderServiceBlocked.into());
+                return Err(RuntimeError::SenderServiceBlocked);
             }
             Ok((
                 payload_bytes,
                 ResponseDataDispatchTarget::Fixed { key: fixed.key() },
-                None,
             ))
         }
         ReliablePathStreamOutput::Switchable(binding) => {
@@ -116,46 +82,22 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
             // snapshot assembled across two generations.
             let expected_model_generation = binding.response_model_generation();
             let lower_flights = binding.lower_flights_before_offset(next_offset);
-            let observation = binding.sender_path_observation(relay_lane, payload_bytes);
+            let targets = binding.sender_path_targets(relay_lane, payload_bytes);
             let selection = select_response_data_path_with_payload(
-                &observation.targets,
+                &targets,
                 relay_lane,
                 payload_bytes,
                 binding.mux_limits(),
                 &lower_flights,
                 data_ack_outstanding_bytes,
-            );
-            let Some(selection) = selection else {
-                if let Some(saturation) = response_ordinary_saturation_observation(
-                    &observation,
-                    stream.stream_id,
-                    relay_lane,
-                    payload_bytes,
-                    binding.mux_limits(),
-                    data_ack_outstanding_bytes,
-                ) {
-                    return Err(ResponseMultipathPlanError::OrdinarySaturation(Box::new(
-                        saturation,
-                    )));
-                }
-                return Err(ResponseMultipathPlanError::Runtime(
-                    RuntimeError::SenderServiceBlocked,
-                ));
-            };
-            let authority_class =
-                if scheduler::path_is_backup(selection.target.observation.snapshot) {
-                    crate::protocol::PathUsage::Backup
-                } else {
-                    crate::protocol::PathUsage::Available
-                };
-            let tcp_carrier_stable = observation.tcp_carrier_stable_generations(authority_class);
+            )
+            .ok_or(RuntimeError::SenderServiceBlocked)?;
             Ok((
                 selection.payload_bytes,
                 ResponseDataDispatchTarget::Switchable {
                     target: selection.target.into(),
                     expected_model_generation,
                 },
-                tcp_carrier_stable,
             ))
         }
     }
@@ -163,7 +105,6 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
 
 /// Readiness observes the same queue and model as apply, but never reserves a
 /// carrier command or advances a connection generation.
-#[cfg(test)]
 pub(super) fn preview_response_data_payload_with_data_ack_outstanding(
     path_stream: &ReliablePathStream,
     relay_lane: TrafficClass,

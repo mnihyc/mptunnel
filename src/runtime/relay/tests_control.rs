@@ -7,14 +7,9 @@ use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
-use crate::runtime::sender::{
-    ProductWorkloadIdentity, RequestProductAckOriginalResolution, RequestProductAckReceipt,
-    RequestProductAckReceiptTarget,
-};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
 use bytes::Bytes;
-use std::num::NonZeroU64;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::sync::mpsc;
@@ -69,32 +64,21 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
     let last_stream_at_before = state.progress.last_stream_at;
     let frontier_before = state.progress.last_send_ack_frontier;
     let snapshot_before = state.progress.last_send_ack.clone();
-    let mut rejected_receipts = Vec::<RequestProductAckReceipt>::new();
-    let rejected = {
-        let mut sink = |receipt| rejected_receipts.push(receipt);
-        apply_client_stream_ack(
-            ClientStreamAckContext {
-                state: &mut state,
-                sender: &mut sender,
-                sender_queue: &mut sender_queue,
-                context: &context,
-                remotes: &remotes,
-                send_stream: &mut send_stream,
-                path_snapshot: None,
-                relay_lane: TrafficClass::Throughput,
-                product_ack_receipt: Some(RequestProductAckReceiptTarget {
-                    identity: ProductWorkloadIdentity {
-                        stream_id,
-                        lifecycle_generation: NonZeroU64::new(11).expect("nonzero generation"),
-                    },
-                    sink: &mut sink,
-                }),
-            },
-            stream_id,
-            true,
-            vec![OffsetRange { start: 4, end: 9 }],
-        )
-    };
+    let rejected = apply_client_stream_ack(
+        ClientStreamAckContext {
+            state: &mut state,
+            sender: &mut sender,
+            sender_queue: &mut sender_queue,
+            context: &context,
+            remotes: &remotes,
+            send_stream: &mut send_stream,
+            path_snapshot: None,
+            relay_lane: TrafficClass::Throughput,
+        },
+        stream_id,
+        true,
+        vec![OffsetRange { start: 4, end: 9 }],
+    );
 
     assert!(matches!(
         rejected,
@@ -113,11 +97,6 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
     assert_eq!(state.progress.last_stream_at, last_stream_at_before);
     assert_eq!(state.progress.last_send_ack_frontier, frontier_before);
     assert_eq!(state.progress.last_send_ack, snapshot_before);
-    assert!(
-        rejected_receipts.is_empty(),
-        "a rejected transaction has no completed receipt"
-    );
-
     let released = apply_client_stream_ack(
         ClientStreamAckContext {
             state: &mut state,
@@ -128,7 +107,6 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             send_stream: &mut send_stream,
             path_snapshot: None,
             relay_lane: TrafficClass::Throughput,
-            product_ack_receipt: None,
         },
         stream_id,
         true,
@@ -138,143 +116,6 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
     assert_eq!(released, 8);
     assert!(sender_queue.is_empty());
     assert_eq!(state.progress.last_send_ack.horizon(), Some(8));
-}
-
-#[tokio::test]
-async fn client_product_ack_receipt_is_one_complete_transaction() {
-    let stream_id = StreamId(902);
-    let path = "tcp://127.0.0.1:10902"
-        .parse::<PathSpec>()
-        .expect("test path");
-    let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
-        .expect("client context");
-    let limits = context.mux_limits;
-    let (commands, _receivers) = reliable_path_command_channels(8);
-    let (_frames_tx, frames_rx) = mpsc::channel(1);
-    let opened = OpenedRemoteStream::pending(
-        ReliablePathStream {
-            stream_id,
-            max_offset: limits.max_stream_window_bytes,
-            lane: TrafficClass::Throughput,
-            underlay: UnderlayProtocol::Tcp,
-            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
-            output: ReliablePathStreamOutput::fixed(
-                UnderlayProtocol::Tcp,
-                PathId(0),
-                commands,
-                limits,
-            ),
-            frames: frames_rx.into(),
-        },
-        0,
-    );
-    let remotes = ReliableRelayRemoteSet::new(opened, 8);
-    let owner = remotes.paths[0].instance();
-    let mut send_stream = ReliableSendStream::new(stream_id, limits);
-    let original = send_stream
-        .send_data(Bytes::from_static(b"abcdefgh"))
-        .expect("request range");
-    let repair = Frame::StreamData {
-        stream_id,
-        offset: 0,
-        payload: Bytes::from_static(b"abcd"),
-    };
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.record_original_frame_for_test(owner, &original);
-    sender.record_reinjection_frame_for_test(owner, &repair);
-    let mut sender_queue = ReliableRelaySenderQueue::default();
-    sender_queue.push_reinjection(repair);
-    let mut state = ClientRelayState::new();
-    let mut receipts = Vec::<RequestProductAckReceipt>::new();
-
-    let released = {
-        let mut sink = |receipt| receipts.push(receipt);
-        apply_client_stream_ack(
-            ClientStreamAckContext {
-                state: &mut state,
-                sender: &mut sender,
-                sender_queue: &mut sender_queue,
-                context: &context,
-                remotes: &remotes,
-                send_stream: &mut send_stream,
-                path_snapshot: None,
-                relay_lane: TrafficClass::Throughput,
-                product_ack_receipt: Some(RequestProductAckReceiptTarget {
-                    identity: ProductWorkloadIdentity {
-                        stream_id,
-                        lifecycle_generation: NonZeroU64::new(17).expect("nonzero generation"),
-                    },
-                    sink: &mut sink,
-                }),
-            },
-            stream_id,
-            true,
-            vec![OffsetRange { start: 0, end: 8 }],
-        )
-        .expect("complete ACK transaction")
-    };
-
-    assert_eq!(released, 8);
-    assert!(sender_queue.is_empty(), "ACK-owned repair was reconciled");
-    assert_eq!(receipts.len(), 1);
-    let receipt = &receipts[0];
-    assert_eq!(receipt.identity.stream_id, stream_id);
-    assert_eq!(receipt.identity.lifecycle_generation.get(), 17);
-    assert_eq!(receipt.completed_at, state.progress.last_stream_at);
-    assert_eq!(receipt.original_releases.len(), 2);
-    assert_eq!(
-        receipt.original_releases[0].range,
-        OffsetRange { start: 0, end: 4 }
-    );
-    assert_eq!(receipt.original_releases[0].bytes, 4);
-    assert_eq!(receipt.original_releases[0].instance, owner);
-    assert_eq!(
-        receipt.original_releases[0].resolution,
-        RequestProductAckOriginalResolution::Ambiguous,
-    );
-    assert_eq!(
-        receipt.original_releases[1].range,
-        OffsetRange { start: 4, end: 8 }
-    );
-    assert_eq!(receipt.original_releases[1].bytes, 4);
-    assert_eq!(receipt.original_releases[1].instance, owner);
-    assert_eq!(
-        receipt.original_releases[1].resolution,
-        RequestProductAckOriginalResolution::Unambiguous,
-    );
-
-    {
-        let mut sink = |receipt| receipts.push(receipt);
-        let duplicate = apply_client_stream_ack(
-            ClientStreamAckContext {
-                state: &mut state,
-                sender: &mut sender,
-                sender_queue: &mut sender_queue,
-                context: &context,
-                remotes: &remotes,
-                send_stream: &mut send_stream,
-                path_snapshot: None,
-                relay_lane: TrafficClass::Throughput,
-                product_ack_receipt: Some(RequestProductAckReceiptTarget {
-                    identity: ProductWorkloadIdentity {
-                        stream_id,
-                        lifecycle_generation: NonZeroU64::new(17).expect("nonzero generation"),
-                    },
-                    sink: &mut sink,
-                }),
-            },
-            stream_id,
-            true,
-            vec![OffsetRange { start: 0, end: 8 }],
-        )
-        .expect("subsumed ACK remains valid");
-        assert_eq!(duplicate, 0);
-    }
-    assert_eq!(
-        receipts.len(),
-        1,
-        "a subsumed ACK has no new completed Product transaction"
-    );
 }
 
 async fn closed_output_relay(

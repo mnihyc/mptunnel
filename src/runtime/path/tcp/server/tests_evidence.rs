@@ -213,12 +213,12 @@ fn path_proof_ack_validates_without_overwriting_native_metrics() {
             metric_age_us: 0,
             ..before
         },
-        "validation must not publish capacity, flight, queue, or congestion state",
+        "path proof must not publish capacity, flight, queue, or congestion state",
     );
     assert!(
         registration
             .path_validation_challenge(context.mux_limits)
             .is_none(),
-        "a successful ACK completes carrier validation",
+        "a successful ACK completes the path proof",
     );
 }

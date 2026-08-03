@@ -85,21 +85,6 @@ pub(in crate::runtime::path::tcp) struct ClientTcpPathStreamState {
     pub(in crate::runtime::path::tcp) pending_open: Option<ClientTcpPendingOpen>,
 }
 
-impl ClientTcpPathStreamState {
-    /// Adopts the exact stream binding already established by an acknowledged
-    /// directional TCP-carrier validation. No second `OPEN_STREAM` transaction
-    /// exists for this state.
-    pub(in crate::runtime::path::tcp) fn retained(
-        frames: mpsc::Sender<Result<Frame, RuntimeError>>,
-    ) -> Self {
-        Self {
-            open_attempt_id: next_client_tcp_open_attempt_id(),
-            frames,
-            pending_open: None,
-        }
-    }
-}
-
 pub(in crate::runtime::path::tcp) struct ClientTcpPendingOpen {
     response: oneshot::Sender<ClientTcpOpenResponse>,
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,

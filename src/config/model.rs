@@ -416,8 +416,8 @@ fn validate_product_policy_targets(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionConfig {
     /// Absolute Product resource-lifetime ceiling for carrierless stream
-    /// retention, graceful TCP carrier retirement, and admitted pre-retain
-    /// carrier validation. Healthy idle streams do not consume it.
+    /// retention and graceful TCP carrier retirement. Healthy idle streams do
+    /// not consume it.
     pub retention_timeout: Duration,
 }
 

@@ -3463,11 +3463,28 @@ run_reliable_ideal_upload_case() {
 run_tcp_carrier_qos_case() {
   local regime="$1"
   local netem_mode="$2"
-  local carrier_range="$3"
+  local topology="$3"
   local direction="$4"
-  local range_label="${carrier_range//-/_}"
-  local case_name="mptunnel_tcp_carrier_qos_${regime}_range_${range_label}_${direction}"
-  local endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=${carrier_range}'"
+  local case_name="mptunnel_tcp_carrier_qos_${regime}_${topology}_${direction}"
+  local endpoint
+  case "$topology" in
+    range_1_1)
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1'"
+      ;;
+    range_1_3)
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-3'"
+      ;;
+    range_3_3)
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=3-3'"
+      ;;
+    three_endpoints_1_1)
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1' --path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1' --path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1'"
+      ;;
+    *)
+      echo "unknown TCP carrier QoS topology: $topology" >&2
+      return 2
+      ;;
+  esac
 
   start_client_with_netem "$case_name" "$netem_mode" "$endpoint"
   case "$direction" in
@@ -4003,6 +4020,12 @@ fi
 if should_run_case "mptunnel_tcp_single_unconstrained"; then
   run_reliable_ideal_download_case "mptunnel_tcp_single_unconstrained" "unconstrained" "$tcp_endpoint_lowlat"
 fi
+if should_run_case "mptunnel_tcp_single_unconstrained_range_1_1"; then
+  run_reliable_ideal_download_case \
+    "mptunnel_tcp_single_unconstrained_range_1_1" \
+    "unconstrained" \
+    "--path 'tcp://172.31.10.20:${server_port}?tcp-carriers=1-1'"
+fi
 
 if should_run_case "mptunnel_tcp_multipath_all"; then
   start_client "tcp_multipath_all" "$tcp_all"
@@ -4050,6 +4073,10 @@ if should_run_case "mptunnel_reliable_mixed_single_balanced"; then
   start_client "reliable_mixed_single_balanced" "$tcp_balanced $udp_balanced"
   run_tcp_download_probe_case "mptunnel_reliable_mixed_single_balanced"
 fi
+if should_run_case "mptunnel_reliable_mixed_single_cross_continent_high_bandwidth"; then
+  start_client "reliable_mixed_single_cross_continent_high_bandwidth" "$tcp_fat $udp_fat"
+  run_tcp_download_probe_case "mptunnel_reliable_mixed_single_cross_continent_high_bandwidth"
+fi
 if should_run_case "mptunnel_reliable_mixed_single_unconstrained"; then
   run_reliable_ideal_download_case "mptunnel_reliable_mixed_single_unconstrained" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"
 fi
@@ -4063,6 +4090,9 @@ if should_run_case "mptunnel_reliable_mixed_multipath_all"; then
 fi
 if should_run_case "mptunnel_reliable_mixed_multipath_unconstrained"; then
   run_reliable_ideal_download_case "mptunnel_reliable_mixed_multipath_unconstrained" "unconstrained" "$tcp_equal_all $udp_equal_all"
+fi
+if should_run_case "mptunnel_reliable_mixed_paired_multipath_equal_fat"; then
+  run_reliable_ideal_download_case "mptunnel_reliable_mixed_paired_multipath_equal_fat" "fat" "$tcp_equal_all $udp_equal_all"
 fi
 
 for equal_profile in lowlat balanced fat unconstrained; do
@@ -4168,6 +4198,10 @@ if should_run_case "mptunnel_reliable_mixed_single_balanced_upload"; then
   start_client "reliable_mixed_single_balanced_upload" "$tcp_balanced $udp_balanced"
   run_tcp_upload_probe_case "mptunnel_reliable_mixed_single_balanced_upload"
 fi
+if should_run_case "mptunnel_reliable_mixed_single_cross_continent_high_bandwidth_upload"; then
+  start_client "reliable_mixed_single_cross_continent_high_bandwidth_upload" "$tcp_fat $udp_fat"
+  run_tcp_upload_probe_case "mptunnel_reliable_mixed_single_cross_continent_high_bandwidth_upload"
+fi
 if should_run_case "mptunnel_reliable_mixed_single_unconstrained_upload"; then
   run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_unconstrained_upload" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"
 fi
@@ -4186,6 +4220,9 @@ if should_run_case "mptunnel_reliable_mixed_multipath_all_upload"; then
 fi
 if should_run_case "mptunnel_reliable_mixed_multipath_unconstrained_upload"; then
   run_reliable_ideal_upload_case "mptunnel_reliable_mixed_multipath_unconstrained_upload" "unconstrained" "$tcp_equal_all $udp_equal_all"
+fi
+if should_run_case "mptunnel_reliable_mixed_paired_multipath_equal_fat_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_reliable_mixed_paired_multipath_equal_fat_upload" "fat" "$tcp_equal_all $udp_equal_all"
 fi
 
 for equal_profile in lowlat balanced fat unconstrained; do
@@ -4352,17 +4389,17 @@ done
 if flag_enabled "$tcp_carrier_qos_cohort"; then
   for qos_profile in \
     "per_flow_qos:tcp-per-flow-qos" \
-    "shared_bottleneck:tcp-shared-bottleneck"; do
+    "shared_bottleneck:tcp-shared-bottleneck" \
+    "unconstrained:unconstrained"; do
     IFS=':' read -r qos_regime qos_netem_mode <<< "$qos_profile"
     for qos_direction in download upload; do
-      for qos_carrier_range in 1-1 1-3; do
-        qos_range_label="${qos_carrier_range//-/_}"
-        qos_case_name="mptunnel_tcp_carrier_qos_${qos_regime}_range_${qos_range_label}_${qos_direction}"
+      for qos_topology in range_1_1 range_1_3 range_3_3 three_endpoints_1_1; do
+        qos_case_name="mptunnel_tcp_carrier_qos_${qos_regime}_${qos_topology}_${qos_direction}"
         if should_run_case "$qos_case_name"; then
           run_tcp_carrier_qos_case \
             "$qos_regime" \
             "$qos_netem_mode" \
-            "$qos_carrier_range" \
+            "$qos_topology" \
             "$qos_direction"
         fi
       done

@@ -4,25 +4,19 @@ use crate::config::{
     SessionConfig,
 };
 use crate::outbound::OutboundConfig;
-use crate::protocol::{
-    DatagramFlowId, DatagramId, PathUsage, SessionId, TcpCarrierValidationResult,
-};
+use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId};
 use crate::runtime::path::ServerLocalPath;
 use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
-use crate::runtime::relay::open::open_remote_stream;
-use crate::transport::{CarrierPathIdentity, SystemCarrierNetworkProvider};
+use crate::transport::SystemCarrierNetworkProvider;
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
-const TCP_VALIDATION_WIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn spawn_configured_tcp_minimum_reconciliation(
-    context: &ClientPathContext,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_tcp_pool_reconciliation(context: &ClientPathContext) -> tokio::task::JoinHandle<()> {
     let context = context.clone();
     tokio::spawn(async move {
         let now = tokio::time::Instant::now();
         let mut retry = vec![
-            crate::runtime::path::tcp::group::ClientTcpMinimumRetry::new(now);
+            crate::runtime::path::tcp::group::ClientTcpMemberRetry::new(now);
             context.tcp_sessions.len()
         ];
         context
@@ -452,7 +446,6 @@ fn client_context_with_session_retention(
         None,
         crate::runtime::path::ClientPathRuntimeOptions {
             session_retention_timeout: retention_timeout,
-            path_probe_timeout: crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
             path_group_ordinal: 0,
             carrier_network: Arc::new(SystemCarrierNetworkProvider),
             allow_peer_diagnostics: false,
@@ -544,7 +537,7 @@ async fn wait_for_tcp_ready_count(context: &ClientPathContext, expected: usize) 
         }
     })
     .await
-    .expect("configured-minimum TCP readiness did not converge");
+    .expect("bounded TCP carrier readiness did not converge");
 }
 
 async fn bind_contiguous_tcp_listener_pair() -> (u16, TcpListener, TcpListener) {
@@ -642,211 +635,9 @@ impl RangedTcpCarrierServer {
     }
 }
 
-/// Full production-boundary TCP listener used by the carrier-validation wire
-/// contract. Each accepted actor is returned to the test so protocol errors
-/// and task panics cannot disappear behind an accept loop.
-struct TcpValidationWireServer {
-    path: PathSpec,
-    paths: crate::runtime::path::ServerPathContext,
-    actors: mpsc::UnboundedReceiver<tokio::task::JoinHandle<Result<(), RuntimeError>>>,
-    listener: tokio::task::JoinHandle<Result<(), RuntimeError>>,
-    relay: tokio::task::JoinHandle<Result<(), RuntimeError>>,
-}
-
-impl TcpValidationWireServer {
-    async fn spawn() -> Self {
-        let path = reserve_tcp_path_with_query("tcp-carriers=1-3").await;
-        let listener = bind_listener(&path)
-            .await
-            .expect("bind validation TCP listener");
-        let local_path = ServerLocalPath::new(0, path.clone());
-        let ServerIdentityRuntime {
-            paths,
-            reliable_relay,
-        } = server_runtime(OutboundConfig::Direct);
-        let relay = tokio::spawn(reliable_relay.run());
-        let server_paths = paths.clone();
-        let (actors_tx, actors) = mpsc::unbounded_channel();
-        let listener = tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.map_err(RuntimeError::Io)?;
-                let local_path = local_path.clone();
-                let paths = server_paths.clone();
-                let actor =
-                    tokio::spawn(
-                        async move { handle_server_path(stream, local_path, paths).await },
-                    );
-                if actors_tx.send(actor).is_err() {
-                    return Ok(());
-                }
-            }
-        });
-        Self {
-            path,
-            paths,
-            actors,
-            listener,
-            relay,
-        }
-    }
-
-    async fn next_actor(&mut self) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
-        tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, async {
-            let actor = tokio::select! {
-                listener = &mut self.listener => {
-                    match listener {
-                        Ok(Ok(())) => panic!("validation TCP listener stopped unexpectedly"),
-                        Ok(Err(error)) => panic!("validation TCP listener failed: {error}"),
-                        Err(error) => panic!("validation TCP listener task failed: {error}"),
-                    }
-                }
-                actor = self.actors.recv() => actor.expect("validation TCP actor channel"),
-            };
-            // A one-field tuple keeps the timeout future's output from itself
-            // implementing Future; the enclosed JoinHandle remains owned by
-            // the caller for the later exact actor-settlement assertion.
-            (actor,)
-        })
-        .await
-        .expect("validation TCP accept timed out")
-        .0
-    }
-
-    async fn shutdown(mut self) {
-        self.listener.abort();
-        match self.listener.await {
-            Err(error) if error.is_cancelled() => {}
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => panic!("validation TCP listener failed: {error}"),
-            Err(error) => panic!("validation TCP listener task failed: {error}"),
-        }
-        self.relay.abort();
-        match self.relay.await {
-            Err(error) if error.is_cancelled() => {}
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => panic!("validation reliable relay failed: {error}"),
-            Err(error) => panic!("validation reliable relay task failed: {error}"),
-        }
-        self.actors.close();
-    }
-}
-
-async fn connect_validation_tcp_carrier(
-    context: &ClientPathContext,
-) -> (
-    crate::runtime::path::tcp::group::ClientTcpCarrierReservation,
-    ClientTcpCarrierConnection,
-) {
-    let config_index = context
-        .tcp_config_index(0)
-        .expect("validation TCP endpoint index");
-    let reservation = context
-        .tcp_carrier_groups
-        .reserve(config_index)
-        .expect("reserve validation TCP carrier");
-    let carrier = connect_reserved_validation_tcp_carrier(context, &reservation)
-        .await
-        .expect("connect validation TCP carrier");
-    (reservation, carrier)
-}
-
-async fn connect_reserved_validation_tcp_carrier(
-    context: &ClientPathContext,
-    reservation: &crate::runtime::path::tcp::group::ClientTcpCarrierReservation,
-) -> Result<ClientTcpCarrierConnection, RuntimeError> {
-    let carrier_network = SystemCarrierNetworkProvider;
-    let carrier = connect_client_tcp_carrier(
-        ClientTcpCarrierConnect {
-            path: context.tcp_paths.first().expect("validation TCP endpoint"),
-            path_id: reservation.path_id(),
-            purpose: PathPurpose::Validation,
-            carrier_identity: CarrierPathIdentity {
-                group_ordinal: 0,
-                path_ordinal: context.tcp_path_ordinals[0],
-            },
-            session_id: context.session_id,
-            security: context
-                .tcp_path_security(0)
-                .expect("validation TCP security"),
-            tls: context.tcp_path_tls(0).expect("validation TCP TLS"),
-            codec_limits: ResourceLimits::default().into(),
-            mux_limits: context.mux_limits,
-            carrier_network: &carrier_network,
-            remote_port: None,
-        },
-        tokio::time::Instant::now() + TCP_VALIDATION_WIRE_TIMEOUT,
-    )
-    .await?;
-    assert_eq!(carrier.path_id, reservation.path_id());
-    assert_eq!(carrier.purpose, PathPurpose::Validation);
-    Ok(carrier)
-}
-
-async fn write_validation_frames(carrier: &mut ClientTcpCarrierConnection, frames: &[Frame]) {
-    for frame in frames {
-        carrier
-            .writer
-            .write_frame(frame)
-            .await
-            .expect("write validation TCP frame");
-    }
-    carrier
-        .writer
-        .flush()
-        .await
-        .expect("flush validation TCP frames");
-}
-
-async fn read_validation_frame(carrier: &mut ClientTcpCarrierConnection) -> Frame {
-    tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, carrier.frames.recv())
-        .await
-        .expect("validation TCP response timed out")
-        .expect("validation TCP response stream ended")
-        .expect("read validation TCP response")
-}
-
-async fn assert_validation_actor_ok(actor: tokio::task::JoinHandle<Result<(), RuntimeError>>) {
-    tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, actor)
-        .await
-        .expect("validation TCP server actor did not finish")
-        .expect("validation TCP server actor task")
-        .expect("validation TCP server actor");
-}
-
-async fn assert_validation_actor_rejected(
-    actor: tokio::task::JoinHandle<Result<(), RuntimeError>>,
-) {
-    let error = tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, actor)
-        .await
-        .expect("rejected validation TCP server actor did not finish")
-        .expect("rejected validation TCP server actor task")
-        .expect_err("simultaneous unretained validation carrier was accepted");
-    assert!(matches!(error, RuntimeError::Protocol(_)));
-}
-
-async fn assert_target_payload(received: &mut mpsc::Receiver<Bytes>, expected: &'static [u8]) {
-    assert_eq!(
-        tokio::time::timeout(TCP_VALIDATION_WIRE_TIMEOUT, received.recv())
-            .await
-            .expect("validation target delivery timed out")
-            .expect("validation target delivery channel"),
-        Bytes::from_static(expected),
-    );
-}
-
-async fn abort_expected_server_actor(actor: tokio::task::JoinHandle<Result<(), RuntimeError>>) {
-    actor.abort();
-    match actor.await {
-        Err(error) if error.is_cancelled() => {}
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => panic!("ordinary TCP server actor failed: {error}"),
-        Err(error) => panic!("ordinary TCP server actor task failed: {error}"),
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id() {
-    let tcp_path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=100").await;
+    let tcp_path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=100&tcp-carriers=1-1").await;
     let udp_port = reserve_process_unique_udp_port().await;
     let udp_path = format!("udp://127.0.0.1:{udp_port}?srtt-ms=90&rate-mbps=400&backup=true")
         .parse::<PathSpec>()
@@ -915,286 +706,7 @@ async fn initial_path_probe_retains_tcp_carrier_without_stream_load() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tcp_validation_carrier_preserves_exact_c2s_authority_and_ordered_retirement() {
-    let mut server = TcpValidationWireServer::spawn().await;
-    let context = ClientPathContext::new(
-        vec![server.path.clone()],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("validation client context");
-    probe_client_paths(&context, Duration::from_secs(2)).await;
-    let ordinary_actor = server.next_actor().await;
-
-    let target_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind validation target");
-    let target_address = target_listener
-        .local_addr()
-        .expect("validation target address");
-    let (target_payload_tx, mut target_payload_rx) = mpsc::channel(3);
-    let (target_release_tx, target_release_rx) = oneshot::channel();
-    let target = tokio::spawn(async move {
-        let (mut stream, _) = target_listener
-            .accept()
-            .await
-            .expect("accept validation target");
-        for payload_bytes in [6_usize, 5, 8] {
-            let mut payload = vec![0_u8; payload_bytes];
-            stream
-                .read_exact(&mut payload)
-                .await
-                .expect("read validation target payload");
-            target_payload_tx
-                .send(Bytes::from(payload))
-                .await
-                .expect("publish validation target payload");
-        }
-        target_release_rx.await.expect("release validation target");
-        stream.shutdown().await.expect("shutdown validation target");
-    });
-    let remote = tokio::time::timeout(
-        FULL_STACK_RESPONSE_TIMEOUT,
-        open_remote_stream(
-            &context,
-            TargetAddr::Ip(target_address),
-            TrafficClass::Throughput,
-        ),
-    )
-    .await
-    .expect("open validation reference stream timed out")
-    .expect("open validation reference stream");
-    let stream_id = remote.stream().stream_id;
-    let ordinary_snapshot = server.paths.reliable_streams.management_snapshot();
-    assert_eq!(ordinary_snapshot.paths.len(), 1);
-    assert_eq!(ordinary_snapshot.active_streams, 1);
-
-    let (retained_reservation, mut retained_carrier) =
-        connect_validation_tcp_carrier(&context).await;
-    let retained_actor = server.next_actor().await;
-    let retained_path_id = retained_carrier.path_id;
-    assert_eq!(
-        server
-            .paths
-            .reliable_streams
-            .management_snapshot()
-            .paths
-            .len(),
-        2,
-        "validation readiness registers only the exact candidate lifetime",
-    );
-
-    let simultaneous_reservation = context
-        .tcp_carrier_groups
-        .reserve(0)
-        .expect("reserve simultaneous validation TCP carrier");
-    assert_ne!(
-        simultaneous_reservation.path_id(),
-        retained_path_id,
-        "simultaneous candidates own distinct wire identities"
-    );
-    let simultaneous =
-        connect_reserved_validation_tcp_carrier(&context, &simultaneous_reservation).await;
-    let simultaneous_actor = server.next_actor().await;
-    assert!(
-        simultaneous.is_err(),
-        "a second unretained validation carrier received readiness"
-    );
-    assert_validation_actor_rejected(simultaneous_actor).await;
-    drop(simultaneous);
-    drop(simultaneous_reservation);
-    assert_eq!(
-        context.tcp_carrier_groups.occupied(0),
-        Some(2),
-        "rejected candidate releases its exact client reservation"
-    );
-    assert_eq!(
-        server
-            .paths
-            .reliable_streams
-            .management_snapshot()
-            .paths
-            .len(),
-        2,
-        "rejected candidate never enters the server path inventory",
-    );
-
-    write_validation_frames(
-        &mut retained_carrier,
-        &[
-            Frame::TcpCarrierValidate {
-                validation_id: 1,
-                request_id: 0,
-                direction: PathMetricDirection::ClientToServer,
-                stream_id,
-            },
-            Frame::StreamData {
-                stream_id,
-                offset: 0,
-                payload: Bytes::from_static(b"retain"),
-            },
-        ],
-    )
-    .await;
-    write_validation_frames(
-        &mut retained_carrier,
-        &[Frame::TcpCarrierResult {
-            validation_id: 1,
-            direction: PathMetricDirection::ClientToServer,
-            result: TcpCarrierValidationResult::Retain,
-        }],
-    )
-    .await;
-    assert_eq!(
-        read_validation_frame(&mut retained_carrier).await,
-        Frame::TcpCarrierResultAck {
-            validation_id: 1,
-            direction: PathMetricDirection::ClientToServer,
-            result: TcpCarrierValidationResult::Retain,
-        },
-        "retained authority starts only at the exact result acknowledgment",
-    );
-    write_validation_frames(
-        &mut retained_carrier,
-        &[
-            Frame::PathCapacityData {
-                path_id: retained_path_id,
-                measurement_id: 1,
-                payload: Bytes::from_static(b"capacity"),
-            },
-            Frame::PathCapacityFinish {
-                path_id: retained_path_id,
-                measurement_id: 1,
-                payload_bytes: 8,
-            },
-        ],
-    )
-    .await;
-    assert_eq!(
-        read_validation_frame(&mut retained_carrier).await,
-        Frame::PathCapacityReceipt {
-            path_id: retained_path_id,
-            measurement_id: 1,
-            received_payload_bytes: 8,
-        },
-        "retained C2S authority admits ordinary request capacity evidence",
-    );
-    write_validation_frames(
-        &mut retained_carrier,
-        &[Frame::StreamData {
-            stream_id,
-            offset: 6,
-            payload: Bytes::from_static(b"-kept"),
-        }],
-    )
-    .await;
-    write_validation_frames(
-        &mut retained_carrier,
-        &[
-            Frame::StreamDetach { stream_id },
-            Frame::PathDrain {
-                path_id: retained_path_id,
-            },
-        ],
-    )
-    .await;
-    assert_eq!(
-        read_validation_frame(&mut retained_carrier).await,
-        Frame::PathClose {
-            path_id: retained_path_id,
-            reason: crate::protocol::CloseReason::Normal,
-        },
-        "PATH_CLOSE is the ordered suffix after retained-stream detach and drain",
-    );
-    assert_validation_actor_ok(retained_actor).await;
-    assert_target_payload(&mut target_payload_rx, b"retain").await;
-    assert_target_payload(&mut target_payload_rx, b"-kept").await;
-    drop(retained_carrier);
-    drop(retained_reservation);
-    assert_eq!(context.tcp_carrier_groups.occupied(0), Some(1));
-
-    let after_retain = server.paths.reliable_streams.management_snapshot();
-    assert_eq!(after_retain.paths.len(), 1);
-    assert_eq!(after_retain.active_streams, 1);
-
-    let (negative_reservation, mut negative_carrier) =
-        connect_validation_tcp_carrier(&context).await;
-    let negative_actor = server.next_actor().await;
-    let negative_path_id = negative_carrier.path_id;
-    write_validation_frames(
-        &mut negative_carrier,
-        &[
-            Frame::TcpCarrierValidate {
-                validation_id: 2,
-                request_id: 0,
-                direction: PathMetricDirection::ClientToServer,
-                stream_id,
-            },
-            Frame::StreamData {
-                stream_id,
-                offset: 11,
-                payload: Bytes::from_static(b"withdraw"),
-            },
-        ],
-    )
-    .await;
-    write_validation_frames(
-        &mut negative_carrier,
-        &[Frame::TcpCarrierResult {
-            validation_id: 2,
-            direction: PathMetricDirection::ClientToServer,
-            result: TcpCarrierValidationResult::NoGain,
-        }],
-    )
-    .await;
-    assert_eq!(
-        read_validation_frame(&mut negative_carrier).await,
-        Frame::TcpCarrierResultAck {
-            validation_id: 2,
-            direction: PathMetricDirection::ClientToServer,
-            result: TcpCarrierValidationResult::NoGain,
-        },
-    );
-    write_validation_frames(
-        &mut negative_carrier,
-        &[
-            Frame::StreamDetach { stream_id },
-            Frame::PathDrain {
-                path_id: negative_path_id,
-            },
-        ],
-    )
-    .await;
-    assert_eq!(
-        read_validation_frame(&mut negative_carrier).await,
-        Frame::PathClose {
-            path_id: negative_path_id,
-            reason: crate::protocol::CloseReason::Normal,
-        },
-        "a negative result remains bounded until the client-owned drain fence",
-    );
-    assert_validation_actor_ok(negative_actor).await;
-    assert_target_payload(&mut target_payload_rx, b"withdraw").await;
-    drop(negative_carrier);
-    drop(negative_reservation);
-    assert_eq!(context.tcp_carrier_groups.occupied(0), Some(1));
-
-    let after_negative = server.paths.reliable_streams.management_snapshot();
-    assert_eq!(after_negative.paths.len(), 1);
-    assert_eq!(after_negative.active_streams, 1);
-
-    target_release_tx
-        .send(())
-        .expect("release validation target");
-    target.await.expect("validation target task");
-    remote.close().await;
-    drop(context);
-    abort_expected_server_actor(ordinary_actor).await;
-    server.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
+async fn session_owner_reconciles_bounded_target_and_retires_disabled_group() {
     enum CarrierServerControl {
         Abort(usize),
     }
@@ -1257,20 +769,20 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
         Duration::from_secs(1),
     ));
 
-    wait_for_tcp_ready_count(&context, 2).await;
+    wait_for_tcp_ready_count(&context, 3).await;
     let initial_client_instances = context
         .tcp_sessions
         .iter()
         .map(|session| {
             session
                 .connection_instance_id()
-                .expect("configured-minimum carrier instance")
+                .expect("bounded-pool carrier instance")
         })
         .collect::<Vec<_>>();
     let initial = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = snapshot_context.reliable_streams.management_snapshot();
-            if snapshot.paths.len() == 2 {
+            if snapshot.paths.len() == 3 {
                 break snapshot;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1280,18 +792,24 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
     .expect("initial server carrier inventory");
     assert_eq!(
         initial.paths.len(),
-        2,
-        "unoccupied maximum capacity must stay absent"
+        3,
+        "the session owner must reconcile the configured healthy maximum"
     );
     assert!(
         initial
             .paths
             .iter()
             .all(|path| path.session_id == session_id),
-        "configured-minimum carriers must belong to one MPP session"
+        "bounded-pool carriers must belong to one MPP session"
     );
-    assert_ne!(
-        initial.paths[0].path_id, initial.paths[1].path_id,
+    assert_eq!(
+        initial
+            .paths
+            .iter()
+            .map(|path| path.path_id)
+            .collect::<HashSet<_>>()
+            .len(),
+        initial.paths.len(),
         "simultaneous TCP carriers require distinct wire labels"
     );
     let initial_instances = initial
@@ -1331,7 +849,7 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
     let replacement = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = snapshot_context.reliable_streams.management_snapshot();
-            if snapshot.paths.len() == 2
+            if snapshot.paths.len() == 3
                 && snapshot
                     .paths
                     .iter()
@@ -1363,8 +881,8 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
         .collect::<HashSet<_>>();
     assert_eq!(
         initial_pairs.intersection(&replacement_pairs).count(),
-        1,
-        "the unaffected configured-minimum carrier must remain exact"
+        2,
+        "the two unaffected bounded-pool carriers must remain exact"
     );
     assert_eq!(
         replacement
@@ -1443,7 +961,7 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
                 && client_instances
                     .iter()
                     .all(|instance| !stable_client_instances.contains(instance))
-                && server_paths.len() == 2
+                && server_paths.len() == 3
                 && server_paths
                     .iter()
                     .all(|path| !stable_server_instances.contains(&path.path_instance_id))
@@ -1454,14 +972,14 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
         }
     })
     .await
-    .expect("re-enable must finish old drains before restoring fresh minimum carriers");
+    .expect("re-enable must finish old drains before restoring the fresh bounded target");
     let restored_client_instances = context
         .tcp_sessions
         .iter()
         .map(|session| {
             session
                 .connection_instance_id()
-                .expect("re-enabled configured-minimum carrier")
+                .expect("re-enabled bounded-pool carrier")
         })
         .collect::<Vec<_>>();
     assert!(
@@ -1499,7 +1017,7 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_tcp_data_plane_instance_is_replaced_by_minimum_reconciliation() {
+async fn fenced_tcp_data_plane_instance_is_replaced_by_pool_reconciliation() {
     let carrier_server = RangedTcpCarrierServer::spawn().await;
     let client_path = format!(
         "tcp://127.0.0.1:{}?tcp-carriers=1-1",
@@ -1529,7 +1047,7 @@ async fn fenced_tcp_data_plane_instance_is_replaced_by_minimum_reconciliation() 
     wait_for_tcp_ready_count(&context, 1).await;
     let initial_instance = context.tcp_sessions[0]
         .connection_instance_id()
-        .expect("initial configured-minimum instance");
+        .expect("initial bounded-pool instance");
 
     // A carrier that survives the existing connection-attempt churn gate is
     // eligible for event-driven replacement after an exact data-plane fence.
@@ -1564,7 +1082,7 @@ async fn fenced_tcp_data_plane_instance_is_replaced_by_minimum_reconciliation() 
         }
     })
     .await
-    .expect("configured minimum did not replace its stable fenced physical instance");
+    .expect("pool reconciliation did not replace its stable fenced physical instance");
 
     path_service.abort();
     let _ = path_service.await;
@@ -1572,7 +1090,7 @@ async fn fenced_tcp_data_plane_instance_is_replaced_by_minimum_reconciliation() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_before_break() {
+async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescence() {
     let carrier_server = RangedTcpCarrierServer::spawn().await;
     let first_port = carrier_server.first_port;
     let second_port = first_port + 1;
@@ -1582,7 +1100,6 @@ async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_b
     .parse::<PathSpec>()
     .expect("ranged client TCP path");
     let snapshot_context = carrier_server.paths.clone();
-    let maximum_active = carrier_server.maximum_active.clone();
     let accepted = carrier_server.accepted.clone();
 
     let context = ClientPathContext::new_with_carrier_network(
@@ -1603,18 +1120,39 @@ async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_b
         Duration::from_secs(60),
         Duration::from_secs(2),
     ));
-    wait_for_tcp_ready_count(&context, 1).await;
-    let initial_server_path = tokio::time::timeout(Duration::from_secs(2), async {
+    wait_for_tcp_ready_count(&context, 3).await;
+    let initial_server = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = snapshot_context.reliable_streams.management_snapshot();
-            if snapshot.paths.len() == 1 {
-                break snapshot.paths[0];
+            if snapshot.paths.len() == 3 {
+                break snapshot;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("initial ranged server carrier inventory");
+    let initial_server_instances = initial_server
+        .paths
+        .iter()
+        .map(|path| path.path_instance_id)
+        .collect::<HashSet<_>>();
+    let initial_session_id = initial_server.paths[0].session_id;
+    let initial_members = context
+        .tcp_sessions
+        .iter()
+        .map(|session| {
+            (
+                session
+                    .connection_instance_id()
+                    .expect("initial bounded-pool instance"),
+                session
+                    .connection_remote_port()
+                    .expect("initial bounded-pool destination port"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(context.tcp_carrier_groups.occupied(0), Some(3));
 
     let target_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1640,12 +1178,11 @@ async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_b
     let product = tokio::spawn(handle_socks5_client_stream(product_server, context.clone()));
     open_socks5_tcp_tunnel(&mut product_client, target_addr).await;
 
-    let initial_instance = context.tcp_sessions[0]
-        .connection_instance_id()
-        .expect("initial ranged TCP carrier instance");
-    let initial_port = context.tcp_sessions[0]
-        .connection_remote_port()
-        .expect("initial ranged TCP carrier port");
+    {
+        let health = context.health().lock().expect("bounded-pool health");
+        assert_eq!(health.tcp[0].active_flows, 1);
+        assert!(health.tcp[1..].iter().all(|path| path.active_flows == 0));
+    }
 
     // The hop interval makes replacement eligible; it never permits an active
     // Product attachment to be moved between physical TCP instances.
@@ -1666,21 +1203,18 @@ async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_b
         assert_eq!(echoed, payload);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    assert_eq!(
-        context.tcp_sessions[0].connection_instance_id(),
-        Some(initial_instance),
-        "an overdue hop must not replace an active Product attachment"
-    );
-    assert_eq!(
-        context.tcp_sessions[0].connection_remote_port(),
-        Some(initial_port),
-        "an overdue hop must retain the active physical TCP connection"
-    );
-    assert_eq!(
-        maximum_active.load(std::sync::atomic::Ordering::Acquire),
-        1,
-        "replacement establishment must remain absent while Product work exists"
-    );
+    for (index, (initial_instance, initial_port)) in initial_members.iter().copied().enumerate() {
+        assert_eq!(
+            context.tcp_sessions[index].connection_instance_id(),
+            Some(initial_instance),
+            "planned rotation must preserve every carrier while Product ownership exists"
+        );
+        assert_eq!(
+            context.tcp_sessions[index].connection_remote_port(),
+            Some(initial_port),
+            "planned rotation must preserve every destination while Product ownership exists"
+        );
+    }
 
     product_client
         .shutdown()
@@ -1692,63 +1226,89 @@ async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_b
         .expect("Product relay");
     target.await.expect("target join");
 
-    // Releasing the exact Product owner publishes a lifecycle event. The
-    // already-overdue replacement therefore starts without waiting for the
-    // unrelated 60-second probe interval.
+    // Releasing the exact Product owner publishes a lifecycle event. An
+    // already-overdue member rotates without waiting for the unrelated
+    // 60-second probe interval.
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if context.tcp_sessions[0].connection_instance_id() != Some(initial_instance)
-                && context.tcp_sessions[0].connection_remote_port() != Some(initial_port)
-            {
+            let any_changed = context.tcp_sessions.iter().zip(&initial_members).any(
+                |(session, (instance, _))| session.connection_instance_id() != Some(*instance),
+            );
+            if any_changed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("Product-quiescent owner event did not initiate replacement");
+    .expect("Product-quiescent owner event did not rotate an overdue member");
 
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let all_ready = context
+                .tcp_sessions
+                .iter()
+                .all(ClientTcpPathSessionHandle::is_connection_ready);
+            let all_rotated = context.tcp_sessions.iter().zip(&initial_members).all(
+                |(session, (instance, port))| {
+                    session.connection_instance_id() != Some(*instance)
+                        && session.connection_remote_port() != Some(*port)
+                },
+            );
+            if all_ready && all_rotated && context.tcp_carrier_groups.occupied(0) == Some(3) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bounded pool did not fairly rotate every overdue member");
+    for (index, (initial_instance, _)) in initial_members.iter().enumerate() {
+        assert_ne!(
+            context.tcp_sessions[index].connection_instance_id(),
+            Some(*initial_instance),
+            "each overdue member must receive a fresh physical instance"
+        );
+    }
     assert!(
         accepted
             .iter()
             .all(|count| count.load(std::sync::atomic::Ordering::Acquire) > 0),
-        "the replacement must select the other configured destination port"
-    );
-    assert!(
-        maximum_active.load(std::sync::atomic::Ordering::Acquire) >= 2,
-        "a spare-capacity successor must coexist with its predecessor"
+        "planned rotation must visit both configured destination ports"
     );
 
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if context.tcp_carrier_groups.occupied(0) == Some(1) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("retired predecessor did not release its exact reservation");
-    let replacement_server_path = tokio::time::timeout(Duration::from_secs(2), async {
+    let final_server = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = snapshot_context.reliable_streams.management_snapshot();
-            if snapshot.paths.len() == 1
-                && snapshot.paths[0].path_instance_id != initial_server_path.path_instance_id
+            if snapshot.paths.len() == 3
+                && snapshot
+                    .paths
+                    .iter()
+                    .all(|path| !initial_server_instances.contains(&path.path_instance_id))
             {
-                break snapshot.paths[0];
+                break snapshot;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("replacement ranged server carrier inventory");
-    assert_eq!(
-        replacement_server_path.session_id, initial_server_path.session_id,
-        "a physical port replacement must preserve the MPP SessionId"
+    .expect("rotated ranged server carrier inventory");
+    assert!(
+        final_server
+            .paths
+            .iter()
+            .all(|path| path.session_id == initial_session_id),
+        "physical port rotation must preserve the MPP SessionId"
     );
-    assert_ne!(
-        replacement_server_path.path_id, initial_server_path.path_id,
-        "a make-before-break successor must reserve a distinct concurrent PathId"
+    assert_eq!(
+        final_server
+            .paths
+            .iter()
+            .map(|path| path.path_id)
+            .collect::<HashSet<_>>()
+            .len(),
+        3,
+        "the restored bounded pool must retain distinct live wire PathIds"
     );
 
     path_service.abort();
@@ -2235,8 +1795,10 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         stream.shutdown().await.expect("target shutdown");
     });
 
-    let low_latency_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=20").await;
-    let high_bandwidth_path = reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=300").await;
+    let low_latency_path =
+        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=20&tcp-carriers=1-1").await;
+    let high_bandwidth_path =
+        reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=300&tcp-carriers=1-1").await;
     let low_latency_listener = bind_listener(&low_latency_path)
         .await
         .expect("low-latency bind");
@@ -2595,7 +2157,7 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
         stream.shutdown().await.expect("target shutdown");
     });
 
-    let tcp_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=100").await;
+    let tcp_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=100&tcp-carriers=1-1").await;
     let udp_port = reserve_process_unique_udp_port().await;
     let udp_path = format!("udp://127.0.0.1:{udp_port}?srtt-ms=120&rate-mbps=100")
         .parse::<PathSpec>()
@@ -2620,7 +2182,7 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
     };
     let context = ClientPathContext::new(vec![tcp_path, udp_path.clone()], security(), resources)
         .expect("client context with default session retention");
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     wait_for_tcp_ready_count(&context, 1).await;
     let health_context = context.clone();
     let ingress_listener = TcpListener::bind("127.0.0.1:0")
@@ -2850,8 +2412,10 @@ fn tcp_path_activity_does_not_extend_pending_heartbeat_deadline() {
 #[tokio::test]
 async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     let (target_addr, target) = spawn_echo_target().await;
-    let high_latency_path = reserve_tcp_path_with_query("srtt-ms=200&rate-mbps=1000").await;
-    let low_latency_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=50").await;
+    let high_latency_path =
+        reserve_tcp_path_with_query("srtt-ms=200&rate-mbps=1000&tcp-carriers=1-1").await;
+    let low_latency_path =
+        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=50&tcp-carriers=1-1").await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let high_latency_server = spawn_notified_server_path(
         high_latency_path.clone(),
@@ -2953,9 +2517,12 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
 #[tokio::test]
 async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let (target_addr, target) = spawn_echo_target().await;
-    let no_bulk_low_latency_path =
-        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=1000&bulk-allowed=false").await;
-    let bulk_allowed_path = reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=100").await;
+    let no_bulk_low_latency_path = reserve_tcp_path_with_query(
+        "srtt-ms=10&rate-mbps=1000&bulk-allowed=false&tcp-carriers=1-1",
+    )
+    .await;
+    let bulk_allowed_path =
+        reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=100&tcp-carriers=1-1").await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let low_latency_server = spawn_notified_server_path(
         no_bulk_low_latency_path.clone(),
@@ -3045,7 +2612,7 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
 }
 
 #[tokio::test]
-async fn socks5_ingress_uses_ready_minimum_when_another_member_is_unavailable() {
+async fn socks5_ingress_uses_a_ready_carrier_while_another_endpoint_is_unavailable() {
     let (target_addr, target) = spawn_echo_target().await;
     let failed_path = reserve_tcp_path().await;
     let (working_path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
@@ -3613,7 +3180,7 @@ async fn tcp_datagram_send_and_receive_use_independent_direction_ids() {
     .await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -3819,7 +3386,7 @@ async fn socks5_udp_associate_relays_datagram_over_encrypted_tcp_path() {
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let health_context = context.clone();
     let (mut control_client, control_server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
@@ -3865,7 +3432,7 @@ async fn tcp_datagram_feedback_then_carrier_close_cancels_retry() {
         ResourceLimits::default(),
     )
     .expect("context");
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -3940,7 +3507,7 @@ async fn tcp_datagram_no_feedback_reinjects_same_identity_on_alternative() {
     );
     let expected_session_id = context.session_id;
     let health_context = context.clone();
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -4009,7 +3576,7 @@ async fn tcp_datagram_send_does_not_wait_for_feedback_or_target_response() {
     )
     .expect("context");
     let ttl_ms = 900;
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -4067,7 +3634,7 @@ async fn tcp_datagram_carrier_failure_reinjects_on_fallback() {
         ResourceLimits::default(),
     )
     .expect("context");
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -4144,7 +3711,7 @@ async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
     )
     .expect("context");
     let telemetry_context = context.clone();
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -4196,7 +3763,7 @@ async fn tcp_datagram_setup_consumes_the_original_absolute_ttl() {
     .await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -4248,7 +3815,7 @@ async fn tcp_datagram_carrier_setup_uses_remaining_ttl_for_same_family_fallback(
         ResourceLimits::default(),
     )
     .expect("context");
-    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    let _pool = spawn_tcp_pool_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");

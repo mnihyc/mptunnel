@@ -31,7 +31,7 @@ fn tcp_path_test_context(path_count: usize) -> ClientPathContext {
 }
 
 #[test]
-fn tcp_carrier_groups_publish_only_configured_minimum_members() {
+fn tcp_carrier_groups_publish_every_bounded_pool_member() {
     let primary_security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("primary security"),
     );
@@ -65,13 +65,13 @@ fn tcp_carrier_groups_publish_only_configured_minimum_members() {
     )
     .expect("TCP endpoint topology");
 
-    assert_eq!(context.tcp_config_indices.as_slice(), [0, 1, 1]);
-    assert_eq!(context.tcp_member_ordinals.as_slice(), [0, 0, 1]);
-    assert_eq!(context.tcp_endpoint(0).expect("primary").members, [0]);
-    assert_eq!(context.tcp_endpoint(1).expect("secondary").members, [1, 2]);
+    assert_eq!(context.tcp_config_indices.as_slice(), [0, 1, 0, 0, 1]);
+    assert_eq!(context.tcp_member_ordinals.as_slice(), [0, 0, 1, 2, 1]);
+    assert_eq!(context.tcp_endpoint(0).expect("primary").members, [0, 2, 3]);
+    assert_eq!(context.tcp_endpoint(1).expect("secondary").members, [1, 4]);
     assert_eq!(
         context.tcp_path_names.as_slice(),
-        ["primary", "secondary", "secondary"]
+        ["primary", "secondary", "primary", "primary", "secondary"]
     );
     assert_eq!(
         context.tcp_path_security(0).expect("primary security"),
@@ -79,29 +79,57 @@ fn tcp_carrier_groups_publish_only_configured_minimum_members() {
     );
     assert_eq!(
         context
-            .tcp_path_security(2)
+            .tcp_path_security(4)
             .expect("secondary sibling security"),
         &secondary_security
     );
     assert!(std::ptr::eq(
         context.tcp_path_security(1).expect("secondary security"),
         context
-            .tcp_path_security(2)
+            .tcp_path_security(4)
             .expect("secondary sibling security"),
     ));
     assert!(std::ptr::eq(
         context.tcp_path_tls(1).expect("secondary TLS"),
-        context.tcp_path_tls(2).expect("secondary sibling TLS"),
+        context.tcp_path_tls(4).expect("secondary sibling TLS"),
     ));
 
     let health = context.health().lock().expect("path health");
-    assert_eq!(health.tcp.len(), 3);
+    assert_eq!(health.tcp.len(), 5);
     drop(health);
 
     assert_eq!(
         context.automatic_bulk_path_count(UnderlayProtocol::Tcp, None),
-        3
+        5
     );
+    assert_eq!(
+        context.ordered_tcp_path_indices(TrafficClass::Throughput, 64 * 1024),
+        [0, 1, 2, 4, 3],
+        "every bounded member is an establishment candidate"
+    );
+    let establishment = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 2,
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("unestablished member can reserve its establishment transaction");
+    drop(establishment);
+    for path_index in 0..context.tcp_paths.len() {
+        context.state.publish_tcp_peer_path_usage_committed(
+            ClientTcpCarrierPublication {
+                path_index,
+                path_id: PathId(path_index as u16),
+                path_instance_id: next_carrier_path_instance_id(),
+                peer_usage_sequence: 0,
+                peer_usage: PathUsage::Available,
+                readiness_rtt: None,
+            },
+            || {},
+        );
+    }
     assert!(
         context
             .reserve_relay_path_load(
@@ -115,7 +143,7 @@ fn tcp_carrier_groups_publish_only_configured_minimum_members() {
     );
     assert_eq!(
         context.ordered_tcp_path_indices(TrafficClass::Throughput, 64 * 1024),
-        [0, 1, 2]
+        [0, 1, 2, 4, 3]
     );
 
     let bounded_resources = ResourceLimits {
@@ -137,21 +165,19 @@ fn tcp_carrier_groups_publish_only_configured_minimum_members() {
 }
 
 #[test]
-fn multiple_default_tcp_endpoints_start_at_their_minimum_and_reserve_their_maximum() {
+fn multiple_default_tcp_endpoints_publish_their_bounded_pool_target() {
     let context = tcp_path_test_context(3);
 
     let health = context.health().lock().expect("path health");
-    assert_eq!(health.tcp.len(), 3, "one minimum carrier per endpoint");
+    assert_eq!(health.tcp.len(), 9, "three bounded carriers per endpoint");
     drop(health);
 
     for config_index in 0..3 {
         let endpoint = context
             .tcp_endpoint(config_index)
             .expect("configured TCP endpoint group");
-        assert_eq!(endpoint.range.min(), 1);
         assert_eq!(endpoint.range.max(), 3);
-        assert_eq!(endpoint.members.len(), 1);
-        assert_eq!(endpoint.elastic_slots.len(), 2);
+        assert_eq!(endpoint.members.len(), 3);
     }
     assert_eq!(
         (0..3)
@@ -167,6 +193,25 @@ fn multiple_default_tcp_endpoints_start_at_their_minimum_and_reserve_their_maxim
             .sum::<usize>(),
         9,
         "three default endpoints reserve three bounded carrier slots each"
+    );
+    assert_eq!(
+        context.ordered_tcp_path_indices(TrafficClass::Throughput, 64 * 1024),
+        [0, 1, 2, 3, 5, 7, 4, 6, 8],
+        "equal-evidence startup visits every endpoint before a sibling tier"
+    );
+
+    let first = context
+        .reserve_reliable_stream_path(TrafficClass::Throughput, 64 * 1024, &[])
+        .expect("first flow path");
+    let second = context
+        .reserve_reliable_stream_path(TrafficClass::Throughput, 64 * 1024, &[])
+        .expect("second flow path");
+    let third = context
+        .reserve_reliable_stream_path(TrafficClass::Throughput, 64 * 1024, &[])
+        .expect("third flow path");
+    assert_eq!(
+        [first.key().index, second.key().index, third.key().index],
+        [0, 1, 2]
     );
 }
 

@@ -98,7 +98,6 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
         &context,
         SessionId(611),
         send_buffer,
-        None,
     ));
 
     assert!(

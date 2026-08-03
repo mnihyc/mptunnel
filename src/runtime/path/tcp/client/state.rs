@@ -5,7 +5,6 @@
 
 use super::super::capacity::RequestTcpCapacityProbeLease;
 use super::super::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
-use super::super::retained::ClientTcpRetainedCarrierRegistry;
 use super::connection::ClientTcpCarrierConnection;
 use crate::config::ClientSecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
@@ -67,27 +66,6 @@ impl ClientTcpPathConnection {
         }
     }
 
-    pub(in crate::runtime::path::tcp) fn new_with_path_proofs(
-        path_instance_id: CarrierPathInstanceId,
-        startup_snapshot: PathSnapshot,
-        startup_metrics: PathMetrics,
-        carrier: ClientTcpCarrierConnection,
-        peer_status: PeerStatusCarrier,
-        path_proofs: PathProofTracker,
-        mux_limits: MuxLimits,
-    ) -> Self {
-        let mut connection = Self::new(
-            path_instance_id,
-            startup_snapshot,
-            startup_metrics,
-            carrier,
-            peer_status,
-            mux_limits,
-        );
-        connection.path_proofs = path_proofs;
-        connection
-    }
-
     pub(in crate::runtime::path::tcp) fn record_outbound_activity(&mut self) {
         self.carrier.refresh_liveness();
     }
@@ -113,7 +91,6 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     /// reservation.
     pub(in crate::runtime) path_id: Option<PathId>,
     pub(in crate::runtime) remote_port: Option<u16>,
-    pub(in crate::runtime) purpose: crate::protocol::PathPurpose,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: Arc<Vec<ClientSecurityConfig>>,
@@ -131,7 +108,6 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) authenticated_carriers: AuthenticatedCarrierInventory,
     pub(in crate::runtime) endpoint_policy: Arc<ClientTcpEndpointPolicy>,
     pub(in crate::runtime) carrier_groups: Arc<ClientTcpCarrierGroups>,
-    pub(in crate::runtime) retained_carriers: Arc<ClientTcpRetainedCarrierRegistry>,
 }
 
 impl ClientTcpPathSessionRuntime {

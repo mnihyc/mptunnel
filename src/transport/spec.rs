@@ -12,29 +12,24 @@ use std::time::Duration;
 
 pub const DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 pub const MIN_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 1_000;
-pub const DEFAULT_TCP_CARRIER_MIN: u16 = 1;
 pub const DEFAULT_TCP_CARRIER_MAX: u16 = 3;
 
-/// Inclusive local concurrency bounds for one configured TCP endpoint.
+/// Local concurrency target for one configured TCP endpoint.
 ///
-/// These values never enter MPP frames. Each member remains an independently
-/// authenticated carrier with its own `PathId` and physical lifetime.
+/// The accepted `MIN-MAX` syntax retains the obsolete `MIN` value only as a
+/// validated grammar position. It has no runtime or protocol semantics. Each
+/// of the `MAX` members is an independently authenticated ordinary carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCarrierRange {
-    min: u16,
     max: u16,
 }
 
 impl TcpCarrierRange {
-    pub fn new(min: u16, max: u16) -> Result<Self, TcpCarrierRangeError> {
-        if min == 0 || min > max {
+    pub fn new(obsolete_min: u16, max: u16) -> Result<Self, TcpCarrierRangeError> {
+        if obsolete_min == 0 || obsolete_min > max {
             return Err(TcpCarrierRangeError);
         }
-        Ok(Self { min, max })
-    }
-
-    pub const fn min(self) -> u16 {
-        self.min
+        Ok(Self { max })
     }
 
     pub const fn max(self) -> u16 {
@@ -45,7 +40,6 @@ impl TcpCarrierRange {
 impl Default for TcpCarrierRange {
     fn default() -> Self {
         Self {
-            min: DEFAULT_TCP_CARRIER_MIN,
             max: DEFAULT_TCP_CARRIER_MAX,
         }
     }
@@ -56,7 +50,9 @@ pub struct TcpCarrierRangeError;
 
 impl std::fmt::Display for TcpCarrierRangeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("TCP carrier range must satisfy 1 <= MIN <= MAX <= 65535")
+        formatter.write_str(
+            "TCP carrier range must satisfy 1 <= MIN <= MAX <= 65535; MIN is obsolete and ignored",
+        )
     }
 }
 
@@ -316,7 +312,7 @@ pub struct PathMetadata {
     pub initial_rate: RateHint,
     /// Optional product datagram ceiling. QUIC owns transport PMTU discovery.
     pub max_datagram_payload_bytes: Option<usize>,
-    /// Explicit TCP concurrency bounds. Absence selects the Product default.
+    /// Explicit TCP concurrency target. Absence selects the Product default.
     pub tcp_carriers: Option<TcpCarrierRange>,
     /// Override for ranged TCP or QUIC destination-port replacement.
     pub port_hop_interval_ms: Option<u32>,
@@ -343,7 +339,8 @@ impl PathSpec {
     }
 
     /// A ranged QUIC carrier migrates in place. A ranged TCP carrier uses this
-    /// interval to schedule bounded make-before-break replacement.
+    /// interval to schedule bounded quiescent replacement; make-before-break
+    /// is possible only when the physical group envelope has spare capacity.
     pub fn port_hop_interval(&self) -> Option<Duration> {
         (!self.endpoint.ports().is_single()).then(|| {
             Duration::from_millis(u64::from(
@@ -559,25 +556,25 @@ fn parse_tcp_carrier_range(
     value: Option<&str>,
 ) -> Result<TcpCarrierRange, PathSpecParseError> {
     let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
-    let Some((min, max)) = value.split_once('-') else {
+    let Some((obsolete_min, max)) = value.split_once('-') else {
         return Err(PathSpecParseError::InvalidQueryParamValue(
             key.to_string(),
             value.to_string(),
         ));
     };
-    if min.is_empty() || max.is_empty() || max.contains('-') {
+    if obsolete_min.is_empty() || max.is_empty() || max.contains('-') {
         return Err(PathSpecParseError::InvalidQueryParamValue(
             key.to_string(),
             value.to_string(),
         ));
     }
-    let min = min.parse::<u16>().map_err(|_| {
+    let obsolete_min = obsolete_min.parse::<u16>().map_err(|_| {
         PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
     })?;
     let max = max.parse::<u16>().map_err(|_| {
         PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
     })?;
-    TcpCarrierRange::new(min, max)
+    TcpCarrierRange::new(obsolete_min, max)
         .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
 }
 

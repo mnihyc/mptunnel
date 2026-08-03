@@ -225,11 +225,14 @@ Every port in an outbound carrier range must forward or redirect to the same
 fixed server listener. `port-hop-interval-ms` is accepted on ranged TCP and
 QUIC paths, defaults to five minutes, and has a 5000 ms minimum. QUIC uses a
 fresh protected socket while retaining the authenticated native connection;
-native QUIC migration and validation remain authoritative. TCP creates a new
-carrier at an exact Product-quiescent boundary and retires the predecessor in
-order. It never transfers native transport state or closes active work to meet
-the interval. `tcp-carriers=MIN-MAX` applies only to TCP outbound paths and
-defaults to `1-3`; server listener paths reject this client capacity policy.
+native QUIC migration and validation remain authoritative. TCP waits for an
+exact Product-quiescent boundary and replaces only that member ordinal. With a
+spare physical reservation it may establish the successor before draining the
+predecessor; at the full envelope it retires the predecessor first. It never
+transfers native transport state or closes active work to meet the interval.
+`tcp-carriers=MIN-MAX` applies only to TCP outbound paths and defaults to
+`1-3`; only `MAX` controls the current pool. `MIN` is obsolete and ignored.
+Server listener paths reject this client capacity policy.
 
 Each check is `PASS`, `WARN`, `FAIL`, or `INFO`. Invalid configuration,
 invalid target VPN configuration, or a failed explicitly requested
@@ -585,16 +588,16 @@ capped by the absolute TTL. After feedback, the request is never replayed and
 its response may be awaited until that TTL. The guarantee is at-most-once target
 forwarding within retained MPP state, not end-to-end exactly-once UDP delivery.
 
-The first successful startup probe for each configured path retains its
-authenticated TCP or QUIC carrier for product use. Later probes use isolated
-connections; idle TCP heartbeats and native QUIC keep-alives own liveness on
-the retained instance. Together they detect reachability without placing
-diagnostic work in a product stream. Active failover additionally uses exact
-MPP progress, path-instance lifetime, PTO, and queue/flight evidence. A
-reconnect creates a new physical path instance; old flights and evidence
-cannot be inherited from its numeric path ID. A stream attachment incarnation
-is separate, so detach and reattach also cannot inherit ownership merely
-because the carrier stayed live.
+Configured QUIC paths retain their authenticated native connection, while each
+TCP endpoint reconciles its bounded group toward the configured maximum.
+Diagnostic probes use isolated connections; idle TCP heartbeats and native
+QUIC keep-alives own liveness on Product carriers. Together they detect
+reachability without placing diagnostic work in a Product stream. Active
+failover additionally uses exact MPP progress, path-instance lifetime, PTO,
+and queue/flight evidence. A reconnect creates a new physical path instance;
+old flights and evidence cannot be inherited from its numeric path ID. A
+stream attachment incarnation is separate, so detach and reattach also cannot
+inherit ownership merely because the carrier stayed live.
 
 When every carrier disappears, an established logical stream retains its MPP
 sequence, Data ACK, receive-window, FIN, and bounded repair/reorder state while

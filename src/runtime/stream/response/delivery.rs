@@ -3,10 +3,8 @@
 //! and packet recovery remain below it, while sender ranking remains above it.
 
 use super::ack_clock::apply_response_ack_clock_release_samples;
-use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputs};
-use super::{
-    ResponseProductAckOriginalRelease, ResponseProductAckOriginalResolution, ResponseStreamBinding,
-};
+use super::attachment::ResponseDispatchTarget;
+use super::{ResponseStreamBinding, ResponseStreamOutputs};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
@@ -60,15 +58,6 @@ pub(in crate::runtime) struct ResponseDataAckRecoveryCandidate {
 pub(in crate::runtime) struct ResponseDataAckRelease {
     /// Outputs with exact, unambiguous OriginalData progress.
     pub(in crate::runtime) path_progress_outputs: SmallVec<[ServerReinjectionOutputIdentity; 4]>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ResponseOriginalPathRelease {
-    key: CarrierPathKey,
-    output_incarnation: u64,
-    range: OffsetRange,
-    sent_at: Instant,
-    path_proving: bool,
 }
 
 impl CarrierPathFlight {
@@ -229,28 +218,6 @@ pub(in crate::runtime) fn response_latest_original_hole(
 }
 
 impl ResponseStreamBinding {
-    /// Exact unresolved unique-original flight owned by one unpublished S2C
-    /// validation output. Reinjections and ambiguous ownership never enter
-    /// this work-zero boundary.
-    pub(in crate::runtime) fn validation_candidate_original_flight_bytes(
-        &self,
-        identity: super::attachment::ResponseValidationOutputIdentity,
-    ) -> u64 {
-        self.flights
-            .lock()
-            .expect("server reliable stream flight lock")
-            .values()
-            .flatten()
-            .filter(|flight| {
-                flight.key == identity.key
-                    && flight.output_incarnation == identity.incarnation
-                    && flight.kind.is_original_transmission()
-            })
-            .fold(0_u64, |total, flight| {
-                total.saturating_add(u64::try_from(flight.bytes).unwrap_or(u64::MAX))
-            })
-    }
-
     pub(in crate::runtime) fn tail_reinjection_snapshot(
         &self,
         ack_frontier: u64,
@@ -630,12 +597,6 @@ impl ResponseStreamBinding {
             .iter()
             .chain(outputs.detaching.iter())
             .map(|entry| (entry.key, entry.incarnation))
-            .chain(
-                outputs
-                    .validation
-                    .iter()
-                    .map(|entry| (entry.key, entry.incarnation)),
-            )
             .collect::<Vec<_>>();
         drop(outputs);
         let flights = self
@@ -676,12 +637,6 @@ impl ResponseStreamBinding {
             .iter()
             .chain(outputs.detaching.iter())
             .map(|entry| (entry.key, entry.incarnation))
-            .chain(
-                outputs
-                    .validation
-                    .iter()
-                    .map(|entry| (entry.key, entry.incarnation)),
-            )
             .collect::<Vec<_>>();
         let flights = self
             .flights
@@ -743,25 +698,7 @@ impl ResponseStreamBinding {
         &self,
         ranges: &[OffsetRange],
     ) -> ResponseDataAckRelease {
-        self.release_normalized_acked_ranges_at_inner::<false, _>(ranges, Instant::now(), |_, _| {})
-    }
-
-    pub(in crate::runtime) fn release_normalized_acked_ranges_with_originals(
-        &self,
-        ranges: &[OffsetRange],
-    ) -> (
-        ResponseDataAckRelease,
-        SmallVec<[ResponseProductAckOriginalRelease; 4]>,
-    ) {
-        let mut originals = SmallVec::new();
-        let release = self.release_normalized_acked_ranges_at_inner::<true, _>(
-            ranges,
-            Instant::now(),
-            |outputs, captured| {
-                originals = response_product_ack_original_releases(outputs, captured);
-            },
-        );
-        (release, originals)
+        self.release_normalized_acked_ranges_at_inner(ranges, Instant::now())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -770,18 +707,14 @@ impl ResponseStreamBinding {
         ranges: &[OffsetRange],
         now: Instant,
     ) -> ResponseDataAckRelease {
-        self.release_normalized_acked_ranges_at_inner::<false, _>(ranges, now, |_, _| {})
+        self.release_normalized_acked_ranges_at_inner(ranges, now)
     }
 
-    fn release_normalized_acked_ranges_at_inner<const CAPTURE_ORIGINALS: bool, F>(
+    fn release_normalized_acked_ranges_at_inner(
         &self,
         ranges: &[OffsetRange],
         now: Instant,
-        mut capture_originals: F,
-    ) -> ResponseDataAckRelease
-    where
-        F: FnMut(&ResponseStreamOutputs, SmallVec<[ResponseOriginalPathRelease; 4]>),
-    {
+    ) -> ResponseDataAckRelease {
         if ranges.is_empty() {
             return ResponseDataAckRelease::default();
         }
@@ -793,14 +726,7 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        let released = if CAPTURE_ORIGINALS {
-            let (released, originals) =
-                release_carrier_path_flight_ranges_with_originals(&mut flights, ranges);
-            capture_originals(&outputs, originals);
-            released
-        } else {
-            release_carrier_path_flight_ranges(&mut flights, ranges)
-        };
+        let released = release_carrier_path_flight_ranges(&mut flights, ranges);
         if released.is_empty() {
             drop(flights);
             let ordering_update = self
@@ -1260,156 +1186,10 @@ impl ResponseStreamBinding {
     }
 }
 
-fn record_response_original_release_segments<F>(
-    flight: CarrierPathFlight,
-    start: u64,
-    end: u64,
-    ambiguous_intervals: &[(u64, u64)],
-    record: &mut F,
-) where
-    F: FnMut(CarrierPathFlight, OffsetRange, bool),
-{
-    let mut cursor = start;
-    let mut index = ambiguous_intervals.partition_point(|(_, interval_end)| *interval_end <= start);
-    while let Some(&(ambiguous_start, ambiguous_end)) = ambiguous_intervals.get(index) {
-        if ambiguous_start >= end {
-            break;
-        }
-        let ambiguous_start = ambiguous_start.max(cursor);
-        let ambiguous_end = ambiguous_end.min(end);
-        if cursor < ambiguous_start {
-            record(
-                flight,
-                OffsetRange {
-                    start: cursor,
-                    end: ambiguous_start,
-                },
-                flight.evidence_eligible,
-            );
-        }
-        if ambiguous_start < ambiguous_end {
-            record(
-                flight,
-                OffsetRange {
-                    start: ambiguous_start,
-                    end: ambiguous_end,
-                },
-                false,
-            );
-            cursor = ambiguous_end;
-        }
-        index += 1;
-    }
-    if cursor < end {
-        record(
-            flight,
-            OffsetRange { start: cursor, end },
-            flight.evidence_eligible,
-        );
-    }
-}
-
-fn response_product_ack_original_releases(
-    outputs: &ResponseStreamOutputs,
-    releases: SmallVec<[ResponseOriginalPathRelease; 4]>,
-) -> SmallVec<[ResponseProductAckOriginalRelease; 4]> {
-    let mut normalized = SmallVec::<[ResponseProductAckOriginalRelease; 4]>::new();
-    for release in releases {
-        let path_instance_id =
-            outputs.physical_instance_for_output(release.key, release.output_incarnation);
-        let resolution = if release.path_proving && path_instance_id.is_some() {
-            ResponseProductAckOriginalResolution::Unambiguous
-        } else {
-            ResponseProductAckOriginalResolution::Ambiguous
-        };
-        let mut range = release.range;
-        let mut index = 0;
-        while index < normalized.len() {
-            let current = normalized[index];
-            if current.key == release.key
-                && current.path_instance_id == path_instance_id
-                && current.output_incarnation == release.output_incarnation
-                && current.sent_at == release.sent_at
-                && current.resolution == resolution
-                && current.range.start <= range.end
-                && range.start <= current.range.end
-            {
-                range.start = range.start.min(current.range.start);
-                range.end = range.end.max(current.range.end);
-                normalized.remove(index);
-            } else {
-                index += 1;
-            }
-        }
-        normalized.push(ResponseProductAckOriginalRelease {
-            key: release.key,
-            path_instance_id,
-            output_incarnation: release.output_incarnation,
-            range,
-            bytes: flight_interval_bytes(range.start, range.end),
-            sent_at: release.sent_at,
-            resolution,
-        });
-    }
-    normalized.sort_unstable_by_key(|release| {
-        (
-            release.range.start,
-            release.range.end,
-            release.key.underlay,
-            release.key.path_id,
-            release
-                .path_instance_id
-                .map_or(0, |instance| instance.as_u64()),
-            release.output_incarnation,
-            release.sent_at,
-            match release.resolution {
-                ResponseProductAckOriginalResolution::Unambiguous => 0_u8,
-                ResponseProductAckOriginalResolution::Ambiguous => 1_u8,
-            },
-        )
-    });
-    normalized
-}
-
-fn release_carrier_path_flight_ranges_with_originals(
-    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
-    ranges: &[OffsetRange],
-) -> (
-    Vec<(u64, CarrierPathReleasedFlight)>,
-    SmallVec<[ResponseOriginalPathRelease; 4]>,
-) {
-    let mut originals = SmallVec::<[ResponseOriginalPathRelease; 4]>::new();
-    let released = release_carrier_path_flight_ranges_inner::<true, _>(
-        flights,
-        ranges,
-        |flight, range, path_proving| {
-            originals.push(ResponseOriginalPathRelease {
-                key: flight.key,
-                output_incarnation: flight.output_incarnation,
-                range,
-                sent_at: flight.sent_at,
-                path_proving,
-            });
-        },
-    );
-    (released, originals)
-}
-
 pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
     flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
     ranges: &[OffsetRange],
 ) -> Vec<(u64, CarrierPathReleasedFlight)> {
-    release_carrier_path_flight_ranges_inner::<false, _>(flights, ranges, |_, _, _| {})
-}
-
-fn release_carrier_path_flight_ranges_inner<const CAPTURE_ORIGINALS: bool, F>(
-    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
-    ranges: &[OffsetRange],
-    mut record_original: F,
-) -> Vec<(u64, CarrierPathReleasedFlight)>
-where
-    F: FnMut(CarrierPathFlight, OffsetRange, bool),
-{
     if ranges.is_empty() || flights.is_empty() {
         return Vec::new();
     }
@@ -1432,15 +1212,6 @@ where
             let bytes = flight_interval_bytes(acked_start, acked_end);
             if bytes == 0 {
                 continue;
-            }
-            if CAPTURE_ORIGINALS && flight.kind.is_original_transmission() {
-                record_response_original_release_segments(
-                    flight,
-                    acked_start,
-                    acked_end,
-                    &ambiguous_intervals,
-                    &mut record_original,
-                );
             }
             released.push((
                 acked_start,

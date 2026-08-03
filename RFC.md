@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 5
+# MPTunnel Multipath Proxy Protocol (MPP) Version 6
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 5: its wire format, carrier profiles,
+This document specifies MPP version 6: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 5 is identified by the frame header in Section 12. A peer MUST
+Wire version 6 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -148,54 +148,12 @@ third transport protocol.
   not a permanent carrier or attachment role.
 
 **TCP carrier group**
-: The client-local configured bounds and configured-minimum member identities
-  derived from one configured TCP endpoint within one MPP session. One session
-  owner reconciles those minimum members and actual elastic reservations; each
-  exact carrier actor owns its socket, wire ordering, readiness, drain, failure,
-  and terminal release. Group identity and local capacity ordinals are never
-  sent and cannot be reconstructed from locators. Unoccupied elastic capacity
-  is not a carrier, attachment, health record, or scheduling state.
-
-**Directional carrier validation**
-: Bounded admission of one elastic TCP carrier for one sender direction. It
-  carries finite validation work and grants no ordinary-use authority before
-  the exact `RETAIN` acknowledgment.
-
-**Directional ordinary-use authority**
-: Permission for ordinary `STREAM_DATA` or `DGRAM_DATA` placement on one exact
-  live TCP carrier in one direction. Configured-minimum TCP carriers receive it
-  on readiness; an elastic TCP carrier receives it only through an acknowledged
-  `RETAIN`. One bounded directional validation binding to one exact attachment
-  incarnation and its exact original work are the only pre-authority Product
-  exception. The binding may create the attachment when absent but never
-  creates a second live attachment for the same carrier and stream. Authority
-  is not receive credit, delivery acknowledgment, carrier health, or a
-  permanent attachment role.
-
-**Candidate flight bound**
-: The maximum unacknowledged unique-original Product bytes that one unproven
-  TCP candidate may own at once before it reaches the Data ACK startup sample
-  floor. It is the existing reliable unproven-path startup-flight bound and
-  remains subject to shared receive credit, path flight, repair, reorder, and
-  session-memory limits. After that floor, bounded validation placement uses
-  the ordinary mature-path flight and queue model.
-
-**Validation work**
-: The finite cumulative unique-original target bytes assigned to one TCP
-  candidate during one directional validation. It is not an amount that must
-  be simultaneously resident; outstanding flight, queued work, repair,
-  reorder debt, and memory MUST fit their stream and session resource
-  envelopes at every point.
-
-**Product service cohort**
-: One sender-side interval collected under one frozen directional comparison
-  key and placement mode. It opens after a fully processed target-stream Data
-  ACK at an exact serialized writer boundary and closes with the complete Data
-  ACK transaction that reaches its target-byte coverage. Target and aggregate
-  Product-service rates use identical wall boundaries and the greater of the
-  writer-boundary and Data-ACK-boundary spans. A cohort is ordinary-only or
-  candidate-assisted according to which carriers may receive unique-original
-  placement after its opening writer boundary.
+: The client-local bounded pool derived from one configured TCP endpoint within
+  one MPP session. The group owns durable member ordinals from zero through
+  `maximum - 1`; each exact member actor independently owns its socket, wire
+  ordering, readiness, drain, failure, and terminal release. Group identity,
+  maximum, and member ordinals are local configuration state and are never sent
+  or inferred from locators.
 
 ## 4. Architecture and Authority
 
@@ -293,8 +251,8 @@ validation, recovery, and path-dependent transport state; `PathId`, the carrier
 instance, its attachments, and all MPP state remain unchanged. This operation
 adds no MPP wire field. Changing a TCP destination port requires a new TCP
 connection and therefore a new carrier instance. TCP hopping follows the
-planned replacement and retained-elastic rules in Section 7.2; the maintenance
-interval never authorizes state transfer or aggressive retirement.
+bounded pool replacement rules in Section 7.2; the maintenance interval never
+authorizes state transfer or aggressive retirement.
 
 ## 5. Session and Carrier Establishment
 
@@ -338,7 +296,7 @@ two frames before `PATH_JOIN`.
 The `SESSION_AUTH` transcript is:
 
 ```text
-"mptunnel session auth v5" ||
+"mptunnel session auth v6" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 nonce:16B ||
@@ -361,10 +319,10 @@ issued_at_unix_secs:u64
 The common `PATH_JOIN` transcript is:
 
 ```text
-"mptunnel path join v5" ||
+"mptunnel path join v6" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
-path_id:u16 || underlay:u8 || purpose:u8 ||
+path_id:u16 || underlay:u8 ||
 nonce:16B ||
 issued_at_unix_secs:u64
 ```
@@ -374,7 +332,7 @@ The receiver MUST:
 - resolve the canonical credential ID;
 - reject an unknown, revoked, expired, or unauthorized credential;
 - validate timestamp freshness, session identity, credential identity,
-  `PathId`, underlay, purpose, nonce, and tag;
+  `PathId`, underlay, nonce, and tag;
 - reject replayed authentication and path-join nonces within the configured
   freshness boundary;
 - require `PATH_JOIN` identities to equal the carrier-authenticated
@@ -400,14 +358,10 @@ durable replay state.
 
 After accepting carrier authentication, `PATH_JOIN`, and sequence-zero
 `PATH_STATUS`, the receiver sends `SESSION_READY` and its own sequence-zero
-`PATH_STATUS`. `PATH_JOIN` purpose is `ORDINARY` or `VALIDATION`; QUIC requires
-`ORDINARY`. Product stream or datagram work MUST NOT be admitted until the
-initiator has received both readiness frames. A TCP `VALIDATION` carrier
-remains ineligible for ordinary Product attachment and placement after
-readiness until the exact directional `RETAIN` is acknowledged under
-Section 7.2. Its sole pre-authority exception is the exact directional
-validation binding and finite unique-original work defined by Sections 7.2
-and 15.1.
+`PATH_STATUS`. Product stream or datagram work MUST NOT be admitted until the
+initiator has received both readiness frames. Every ready carrier is ordinary;
+directional usage remains the receiver preference in `PATH_STATUS`, not a
+carrier-admission phase.
 
 Within a session, the wire label is `(underlay, path_id)`. The initiator
 selects `path_id`; the receiver treats it as opaque. The same numeric
@@ -481,22 +435,11 @@ After drain begins, both endpoints MUST make that carrier ineligible for new
 attachments and original placement while retaining receive, Data ACK,
 recovery, and ordered-control processing.
 
-Sending `PATH_DRAIN` at the client and receiving it at the server terminally
-cancels every unsettled validation on that carrier and stops new validation
-placement. A crossing result or acknowledgment has no authority and is
-discarded with the canceled validation. Existing bounded Product flight is
-still delivered or recovered, and its directional validation binding is
-cleared. An attachment created only for that validation is detached through
-the ordinary attachment lifecycle before the zero-work condition below can
-hold.
-
 The server sends `PATH_CLOSE` only after every earlier frame from the client
 has been applied and the exact carrier has no attachment, datagram
 binding, queued or retained frame, original or reinjected flight, pending Data
-ACK, path proof, capacity work, carrier validation, or queued or unprocessed
-carrier-demand frame. An applied session-level demand request does not belong
-to the carrier that conveyed it and does not pin that carrier. All server
-frames that complete carrier-owned work MUST precede
+ACK, path proof, or capacity work. All server frames that complete
+carrier-owned work MUST precede
 `PATH_CLOSE` in the TCP byte stream. The client treats receipt of
 `PATH_CLOSE`, not its own write completion or local emptiness, as the aggregate
 retirement acknowledgment. It removes the carrier only after applying every
@@ -512,16 +455,10 @@ exact native TCP carrier and enters ordinary exact-failure recovery; it does
 not synthesize `PATH_CLOSE`.
 
 The same configured duration is the Product resource-lifetime ceiling for
-carrierless stream retention, graceful carrier retirement, and admitted
-pre-retain validation settlement. These are independent absolute lifetimes;
-progress in one never restarts another. The duration is not carrier health,
-delivery, Product service, contraction, or performance evidence and cannot
-produce `RETAIN` or `NO_GAIN`.
-
-`TCP_CARRIER_DEMAND`, `TCP_CARRIER_VALIDATE`, `TCP_CARRIER_RESULT`, and
-`TCP_CARRIER_RESULT_ACK` are also valid only on ready TCP carriers. They
-coordinate bounded directional carrier validation in Sections 7.2 and 15.1;
-they never grant stream credit or delivery.
+carrierless stream retention and graceful carrier retirement. These are
+independent absolute lifetimes; progress in one never restarts another. The
+duration is not carrier health, delivery, Product service, or pool-sizing
+evidence.
 
 `PATH_CAPACITY_DATA`, `PATH_CAPACITY_FINISH`, and
 `PATH_CAPACITY_RECEIPT` are valid only on TCP carriers.
@@ -602,8 +539,8 @@ before buffering a declared record.
 QUIC native liveness and connection retirement remain transport-owned.
 `PING` and `PONG` on a QUIC request stream may prove MPP response-direction
 reachability, but they do not govern QUIC connection liveness or retirement.
-`PATH_DRAIN`, `PATH_CLOSE`, all `PATH_CAPACITY_*`, and all `TCP_CARRIER_*`
-frames are invalid on a QUIC carrier.
+`PATH_DRAIN`, `PATH_CLOSE`, and all `PATH_CAPACITY_*` frames are invalid on a
+QUIC carrier.
 
 ### 6.3 HTTP Datagrams
 
@@ -660,18 +597,16 @@ suspect, draining, failed, disabled, and cooldown are not peer scheduling
 values.
 
 Runtime-disable is client-local group admission control with a carrier-wide
-wire consequence. It suspends the configured minimum, forbids new
-establishment and validation, makes every group carrier locally ineligible for
-new original placement, and requests ordered retirement of every exact carrier
-in the group. Ordered `PATH_DRAIN` makes the peer stop new placement in its
-direction as well, cancels unsettled validation under Section 6.1, preserves
-ordinary delivery and recovery ownership for bounded existing flight, and
+wire consequence. It suspends pool reconciliation, forbids new establishment,
+makes every group carrier locally ineligible for new original placement, and
+requests ordered retirement of every exact carrier in the group. Ordered
+`PATH_DRAIN` makes the peer stop new placement in its direction as well,
+preserves delivery and recovery ownership for bounded existing flight, and
 ends at the exact `PATH_CLOSE` boundary. Disable therefore does not pretend
-that client-local policy can silently revoke server-to-client authority while
-keeping the carrier usable.
+that client-local policy can silently keep the carrier usable.
 
 Re-enabling creates a new establishment-policy generation and reconciles fresh
-configured-minimum carrier instances. It does not cancel or reuse a drain
+bounded-pool carrier instances. It does not cancel or reuse a drain
 already begun, and no attachment, authority, queue, flight, or evidence
 transfers from a disabled instance. An in-progress pre-readiness connection
 from an older policy generation cannot publish afterward.
@@ -683,13 +618,10 @@ Disable, removal, and re-add use the client-local group identity and MUST NOT
 use a source address, locator, interface, `PathId`, or peer `PATH_STATUS` as
 group identity.
 
-A bound change MUST NOT retroactively reclassify a live carrier. Increasing the
-minimum creates fresh minimum-member identities; decreasing it gracefully
-retires selected surplus minimum members. Decreasing the maximum below occupied
-physical reservations, or increasing the minimum while no reservation remains
-for the new member, remains unapplied until ordered retirement makes the bound
-reachable. No live carrier is hidden or force-closed merely to make
-configuration state appear applied.
+A maximum change MUST NOT retroactively reclassify a live carrier. Decreasing
+the maximum below occupied physical reservations remains unapplied until
+ordered retirement makes the target reachable. No live carrier is hidden or
+force-closed merely to make configuration state appear applied.
 
 Product FIN, detach, reset, or `DGRAM_CLOSE` retires only the corresponding
 product state. It does not implicitly retire a carrier.
@@ -704,319 +636,86 @@ Sending or accepting `SESSION_CLOSE` retires the complete MPP session
 identified by the carrying carrier. It MUST NOT be used for ordinary carrier
 drain, replacement, or failure.
 
-### 7.2 Bounded TCP carrier establishment
+### 7.2 Bounded TCP carrier pools
 
-A client MAY configure an inclusive minimum and maximum for one TCP carrier
-group. The minimum is durable ready capacity; capacity above it is elastic.
-Both bounds MUST be positive, the minimum MUST NOT exceed the maximum, and
-every establishing, ready, validating, retained, and draining carrier MUST fit
-the endpoint and session resource envelopes. The Product default is `1-3`;
-explicit bounds may differ within those envelopes.
+A client configures a TCP carrier group with the current `MIN-MAX` grammar;
+the Product default is `1-3`. `MIN` is obsolete: it is range-validated for the
+accepted grammar but has no protocol or runtime effect. Only `MAX` controls
+carrier count. A future revision may remove `MIN` or restore elastic behavior
+through a proven algorithm; this revision MUST NOT use it for establishment,
+scheduling, restoration, or retirement.
 
-One physical carrier consumes one group reservation and one `PathId` from
-connect initiation. A pre-readiness admission, connection, authentication, or
-policy-generation failure releases both. After readiness, only receipt of the
-exact ordered `PATH_CLOSE` or exact native failure releases them. Occupied
-reservations MUST NOT exceed the configured maximum. Unoccupied elastic
-capacity consumes no carrier, `PathId`, actor, attachment, queue, evidence, or
-health state.
+The maximum is the healthy pool target and the hard bound on simultaneously
+establishing, ready, replacing, and draining physical carriers owned by the
+group. While the group and session are enabled, one client session owner
+reconciles durable member ordinals `0` through `MAX - 1` toward that target.
+Missing members MAY establish concurrently. Every connection performs a fresh TLS
+handshake, TCP admission prelude, `PATH_JOIN`, sequence-zero `PATH_STATUS`,
+and readiness exchange. Every ready member is an ordinary bidirectional
+carrier; no performance comparison or directional promotion transaction is
+required.
 
-While the group and session are enabled, one client session owner reconciles
-the configured-minimum member identities with bounded connection attempts. A
-minimum member sends `PATH_JOIN` purpose `ORDINARY` and gains both-direction
-authority after authenticated readiness; it requires no performance
-validation. An elastic reservation sends purpose `VALIDATION` and is never
-promoted into a minimum-member identity. Distinct missing minimum members MAY
-establish concurrently, but one member has at most one establishment actor.
+One physical carrier consumes one group reservation and one session-unique TCP
+`PathId` from connection initiation. Pre-readiness connection,
+authentication, or policy-generation failure releases both. After readiness,
+only the exact ordered `PATH_CLOSE` or exact native failure releases them.
+The occupied set MUST NOT exceed the configured maximum.
 
-The member identity names durable configured capacity, not a physical
-connection. It normally has one current carrier instance. During a planned
-make-before-break replacement it may additionally have one provisional
-successor or one retiring predecessor, and both exact instances consume
-reservations. The successor can become current only at the old instance's
-exact Product-quiescent admission boundary. That commit atomically publishes
-the successor before the predecessor begins ordered retirement. No queue,
-attachment, flight, evidence, or authority is transferred between those exact
-instances.
+A member ordinal names durable configured pool capacity, not a physical
+connection. It normally owns one current exact carrier instance. A planned
+replacement may temporarily own a successor or retiring predecessor only while
+the total group envelope remains within the configured maximum. Successor
+publication and predecessor drain are exact-instance transitions; no
+attachment, queue, flight, transport evidence, or scheduling state transfers
+between them.
 
-Exact failure removes only the failed instance. Loss of a minimum member
-authorizes one replacement for that same member; loss of a retained elastic
-carrier does not. A stream open, close, cancellation, or waiter exit cannot own
-minimum reconciliation or classify group capacity. The peer observes the
-authenticated `PATH_JOIN` purpose but does not reconstruct client-local group
-identity, member identity, or bounds.
+Exact native failure removes only the failed instance and immediately wakes
+pool reconciliation. Restoration never waits for a throughput observation,
+source-address change, interface event, or application retry. Repeated
+connection attempts remain bounded by the existing establishment policy.
+Operation-local stream failure, cancellation, or timeout never owns pool
+capacity and never classifies another member as failed.
 
-Every additional TCP connection:
+Every ready member independently owns health, transport measurements, queues,
+attachments, native congestion control, and failure scope. The ordinary
+scheduler ranks those exact carriers from current directional completion
+evidence and may leave a redundant member idle. Pool membership never forces
+payload duplication and introduces no group-specific pacing or congestion
+controller.
 
-- is a new carrier instance with a fresh TLS connection, TCP prelude,
-  `PATH_JOIN`, sequence-zero `PATH_STATUS`, readiness exchange, and evidence;
-- uses the same `SessionId` and resolves to the same principal when it joins an
-  existing MPP session;
-- uses a `PathId` not concurrently used by another TCP carrier in that
-  session; and
-- retains independent attachments, queues, flight, transport evidence, and
-  failure scope even when its configured endpoint and locator set are shared.
+When eligible carriers otherwise have equal evidence, the client's configured-
+order fallback visits one member ordinal across every configured endpoint
+before visiting the next member ordinal. This prevents redundant members of an
+earlier endpoint from displacing distinct configured endpoints during
+evidence-free startup. The order is not link identity, capacity evidence, a
+traffic share, or a common-bottleneck inference; measured completion evidence
+remains authoritative.
 
-Exact carrier failure permits immediate replacement up to the configured
-minimum without first proving aggregate benefit. It MUST NOT open every
-remaining elastic slot as one failure reaction. Non-failure expansion above
-the minimum requires Section 15.1 validation. At most one unretained elastic
-carrier and one active directional validation may exist in an MPP session.
-The client starts no further elastic connection until the exact current
-validation is acknowledged and its candidate is retained or reaches
-`PATH_CLOSE` or exact native failure. A carrier already retained in one
-direction remains live after a negative result in the other direction and MAY
-later validate that direction while no other validation is active.
+In healthy steady state, one group configured `3-3`, one group configured
+`1-3`, and three otherwise identical `1-1` groups expose the same three
+ordinary data-plane carriers. They differ only in local configuration and
+lifecycle policy: a pooled range shares endpoint enablement, credentials,
+and locator rotation, while three explicit endpoints remain independent
+control domains. Three omitted default ranges request three pools of three
+carriers, not one three-carrier pool.
 
-Active validation is the Product measurement from admission of
-`TCP_CARRIER_VALIDATE` through result serialization. Waiting for the exact
-result acknowledgment is bounded settlement state on that carrier, not a
-second measurement or a globally synchronized active phase. One candidate is
-measured or awaiting settlement at a time. Settlement does not release an
-unretained candidate reservation or grant authority before the exact
-acknowledgment.
+Planned maintenance selects the earliest-due healthy member and rotates at most
+one member per group at a time. A successful replacement receives a fresh
+deadline, so no ordinal is systematically retained. With spare envelope
+capacity, replacement MAY be make-before-break. At the configured maximum,
+replacement waits for exact Product quiescence, fences that member from new
+placement, drains it, and re-establishes it without exceeding the bound.
+Failure handling remains immediate and is not delayed by planned retirement.
 
-An elastic candidate begins with no ordinary-use authority. An acknowledged
-`RETAIN` grants authority only for the measured sender direction and exact
-carrier instance. Authority never transfers to a replacement connection.
+A maximum change MUST preserve exact live-instance identity. Increasing it
+creates fresh member ordinals. Decreasing it drains surplus members in
+descending ordinal order. A change that cannot yet fit the physical envelope
+remains unapplied until ordered retirement reaches the requested maximum.
 
-Attachment membership and ordinary-use authority are independent. On TCP,
-every ordinary `STREAM_DATA` and `DGRAM_DATA` enqueue MUST revalidate authority
-for its sender direction. `STREAM_ACK`, `STREAM_MAX_DATA`, `STREAM_FIN`,
-`STREAM_RESET`, `STREAM_DETACH`, datagram feedback and close, and carrier
-lifecycle control MAY use a ready live attachment as their existing semantics
-require; doing so creates no ordinary-use authority in the opposite direction.
-
-On TCP, an `OPEN_STREAM` that creates a new stream or `OPEN_DGRAM_FLOW` that
-creates a new flow MUST use a carrier with ordinary-use authority in both
-directions. A carrier authorized in only one direction may subsequently attach
-that existing stream or flow and carry ordinary payload only in its authorized
-direction. After `TCP_CARRIER_VALIDATE`, a validation-purpose carrier MAY
-attach only the exact existing target stream named by that validation. The
-validation binds the measured direction to that exact attachment incarnation,
-creating the attachment if absent or using its one existing attachment. Only
-the exact current directional validation may reserve bounded unique-original
-work through that binding.
-Ordinary scheduling, new stream or flow creation, datagrams, reinjection, and
-the opposite direction remain prohibited before their respective acknowledged
-authority.
-
-A validation-only attachment is a live owner of the exact Product flight
-assigned through its directional validation binding. It MUST therefore remain
-in ordered-flight and failure-recovery ownership until that binding is settled
-or atomically converted to ordinary membership. It remains absent from
-ordinary scheduling membership throughout validation. Unresolved work on a
-live validation-only attachment is not missing-owner work; only exact native
-failure or settlement may expose it to ordinary recovery.
-
-The client owns physical TCP establishment because only it knows the
-configured carrier group and its bounds. The sender owns demand and delivery
-evidence for its direction:
-
-- client-to-server validation is driven by the client's aggregate sender
-  state and exact request Data ACK release; and
-- server-to-client validation is driven by the server's aggregate sender
-  state and exact response Data ACK release.
-
-Each sender direction owns its validation and bounded Product-service
-evidence. The named throughput stream supplies only the expansion demand and
-validation work. Only that sender may publish a verdict. It counts fully
-processed, unambiguous unique-original Data ACK release from the target and
-every Product stream in that direction.
-Candidate attribution additionally requires the exact directional validation
-binding, attachment incarnation, and original-flight owner. Native TCP ACKs,
-duplicated or reinjected bytes, capacity receipts, and peer metrics contribute
-no Product numerator.
-
-A validation result remains valid only while the exact candidate, target
-stream and attachment, demand class, ordinary carrier membership and
-eligibility, concurrent Product workload, and local admission and resource
-policy used by its comparison remain unchanged. Candidate establishment and
-its validation-only attachment are not ordinary membership or a new Product
-workload. A change to any comparison input makes an incomplete validation
-`WITHDRAWN`. No source address, interface, locator, peer metric, elapsed-time
-rule, or ACK silence substitutes for those sender-owned facts.
-
-For server-to-client demand, the server sends
-`TCP_CARRIER_DEMAND(request_id, stream_id)` on any ready TCP carrier in the
-session. No locator or client-local group identity is encoded. Request IDs are
-nonzero and strictly increase in one server-owned session sequence; after
-`u64::MAX`, the server sends no further demand in that session.
-`stream_id = none` withdraws the current request; a present stream supersedes
-every older request and names the one current response-demand target. It
-remains current until superseded, withdrawn, or the target no longer satisfies
-Section 15.1. Each exact candidate uses a fresh validation ID on its own
-carrier.
-Present-stream supersession is a wire ordering rule, not authority for local
-demand churn. Section 15.1 admission ownership does not publish a different
-target merely because that target also becomes saturated while an unchanged,
-not-yet-admitted request remains current.
-Because different TCP carriers may fail or reorder session-level delivery, an
-exact duplicate of the current request is idempotent, an older request is
-ignored, and reuse of the current ID with different presence or stream content
-is a protocol violation.
-
-The client MAY ignore the request and MUST independently check the current
-request ID, stream and session liveness, configured bounds, resources, and the
-one-candidate limit before establishing a candidate. It rechecks the exact
-local group admission, reservation, and policy when sending
-`TCP_CARRIER_VALIDATE` and at its role-specific result commitment points. The
-server independently rechecks its sender-owned comparison inputs when
-validation arrives. Neither endpoint reconstructs the other's configuration.
-A request grants no carrier, attachment, placement, receive credit, or byte
-budget. Repetition or supersession of peer requests cannot bypass the client's
-connection-rate, occupied-reservation, configured-maximum, or session resource
-bounds.
-
-After validation-purpose readiness and before creating or binding the target
-attachment, the client sends
-`TCP_CARRIER_VALIDATE(validation_id, request_id, direction, stream_id)` on
-the candidate carrier. The authenticated carrying connection is the candidate;
-no locator, `PathId`, group description, local comparison state, or carrier
-nonce is repeated. Client-issued `validation_id` values are nonzero and strictly
-increase across both directions of that exact candidate; after `u64::MAX`, the
-client starts no further validation on the instance. Client-to-server
-validation requires `request_id = 0`.
-Server-to-client validation requires the current nonzero demand request and
-its exact stream. Every other direction and request combination is a
-candidate-carrier protocol violation.
-
-Malformed, noncanonical, duplicate, or unauthorized references are protocol
-violations on the candidate. A well-formed reference that became stale
-because the exact carrier, target stream, demand request, or comparison input
-changed races harmlessly to `WITHDRAWN`; it is not a peer fault. Candidate
-Product placement additionally requires peer usage `AVAILABLE` for that
-direction. `BACKUP` preference is never bypassed to obtain a favorable result.
-
-Connection establishment remains subject to `path_probe_timeout_ms`.
-Admission of `TCP_CARRIER_VALIDATE` retains bounded sender and receiver state
-until the exact result acknowledgment, ordered drain, native failure, or
-session close. A sender MAY make an unsettled validation `WITHDRAWN` under its
-local resource policy and is the only endpoint that can serialize that result.
-A receiver that is also the carrier client cancels by ordered carrier drain. A
-receiver that is the carrier server cannot send `PATH_DRAIN` or a sender-owned
-result and therefore closes the exact candidate natively when its local state
-expires. If result signaling or client-owned drain cannot complete, exact
-native carrier failure remains the per-carrier terminal fallback;
-`SESSION_CLOSE` is never synthesized for this purpose. No local resource
-lifetime is known by the peer or used as delivery or performance evidence.
-
-The sender reports one result with
-`TCP_CARRIER_RESULT(validation_id, direction, result)` on the candidate
-carrier. `RETAIN` means the sender established the target-flow and session
-service conditions in Section 15.1. `NO_GAIN` means a complete validation did
-not establish both. `WITHDRAWN` means the validation became invalid,
-inconclusive, or expired and makes no capacity claim. Only the sender may emit
-a result, and serialization makes that result immutable: later demand or
-comparison-input changes do not create a second result or roll it back.
-
-The receiver accepts only an exact current result. If its candidate, direction,
-local admission policy, and bounded resource state permit the
-result, it atomically applies the local result and serializes
-`TCP_CARRIER_RESULT_ACK(validation_id, direction, result)` on the same
-candidate. The acknowledgment repeats all result fields exactly. Unknown,
-conflicting, duplicate, or noncanonical results and acknowledgments are
-candidate-carrier protocol errors. A canonical exact result or acknowledgment
-crossing a local policy change that requires candidate retirement, ordered
-drain, or native failure is discarded with that
-carrier; a local race does not turn the frame into a peer fault. When the
-receiver is the client, its local admission policy includes the exact
-group admission and reservation from validation. When the sender is the
-client, the same admission and reservation are rechecked at result
-serialization and acknowledgment acceptance.
-Admission of `TCP_CARRIER_VALIDATE` reserves the receiver's bounded
-result-and-acknowledgment state. Ordered drain cancels that state as specified
-in Section 6.1.
-
-For `RETAIN`, acknowledgment serialization commits the receiver's directional
-authority and converts the exact directional validation binding to ordinary
-authority on that attachment; acknowledgment receipt commits the sender's
-matching transition.
-The sender MUST NOT place work beyond the finite validation work or admit
-ordinary Product data on the candidate before receiving the exact
-acknowledgment. This same rule applies in both directions; no clock
-synchronization, cross-connection ordering, provisional rollback, or
-post-result withdrawal exists. A sender that does not receive its exact
-acknowledgment before candidate retirement obtains no ordinary authority.
-
-For `NO_GAIN` or `WITHDRAWN`, acknowledgment settles the validation without
-granting authority. New candidate placement is already stopped. The exact
-directional validation binding first resolves its bounded original flight
-through ordinary Data ACK or recovery, then clears. An attachment with no
-remaining authority or work detaches through its ordinary lifecycle. If no
-direction is already retained, the client sends `PATH_DRAIN` only after that
-zero-work boundary and holds the reservation until matching server
-`PATH_CLOSE` or exact native failure.
-Result, acknowledgment, authority transition, detachment, and any following
-drain share the exact carrier ordering. Cancellation of a local operation
-cannot omit or overtake that suffix.
-
-Acknowledged authority lasts only for the exact live instance and direction.
-Carrier drain, failure, or session close revokes it. Ending the measured demand
-does not. The client retains a carrier while either direction remains
-authorized; the other direction remains ineligible until separately validated.
-A retained elastic carrier never satisfies or replaces a configured-minimum
-member.
-
-Before its first acknowledged `RETAIN`, a candidate carries only readiness,
-bounded path proof, validation control, one exact target attachment with one
-directional validation binding, its bounded unique-original target work and
-Data ACK feedback, heartbeat, status, and lifecycle control. Invalidated,
-withdrawn, or no-gain validation stops new candidate placement immediately;
-existing flight remains governed by normal MPP delivery and recovery ownership.
-
-Retention does not permanently pin resources. Contraction is local carrier
-policy and is permitted only after the carrier is made ineligible for new
-placement, has no carrier-exclusive queued or in-flight Product work, active
-validation, or unsettled result, and another carrier has ordinary-use
-authority for every affected direction. Attachments are evacuated or detached
-through their normal ordered lifecycle; the client sends `PATH_DRAIN` after the
-local zero-work boundary and matching server `PATH_CLOSE` completes retirement.
-New demand after drain begins uses another carrier and does not reverse that
-retirement. This specification defines no idle interval for contraction.
-
-Changing the destination port of a TCP carrier creates a replacement carrier;
-it never migrates the existing TCP connection. Planned replacement MUST be
-make-before-break for a configured-minimum member when the resource envelopes
-have spare capacity: authenticate a provisional successor while the predecessor
-remains current, then revalidate the predecessor identity and exact
-Product-quiescent state at the same transaction that publishes the successor.
-If Product work was admitted during establishment, the provisional successor is
-discarded and the predecessor remains unchanged. A successful commit fences
-new attachment and original placement on the predecessor, publishes ordinary
-authority on the successor, has the client send `PATH_DRAIN` after the
-predecessor's preceding writer work, and waits for the server's `PATH_CLOSE`.
-
-Product quiescence is an exact session work-ownership state, not an idle timer
-or a traffic sample: the MPP session has no logical Product-flow owner, no
-carrier has admitted Product load, relay queue, or relay flight, and the old
-TCP instance still matches the configured-minimum member being replaced. A
-logical reliable or datagram Product flow retains its session owner through
-peer-direction traffic, retention, and recovery even when it temporarily has
-no attachment. Every Product open reserves path-load ownership before carrier
-I/O; its logical owner releases only when the complete Product flow becomes
-terminal. An idle attachment shell grants no Product-work ownership and is
-settled by the normal ordered drain. Logical Product ownership, path admission,
-and the replacement commit are serialized by the same path-state transaction.
-The configured hop interval only makes a replacement eligible for
-consideration; it proves neither quiescence nor usefulness.
-
-When no spare capacity exists, replacement waits for exact Product quiescence,
-fences and drains the predecessor within the configured maximum, then
-establishes the next carrier. It never closes an active carrier to satisfy a
-hop deadline. New demand during retirement uses another schedulable carrier or
-waits for minimum reconciliation; it does not reverse an ordered drain.
-
-The expansion verdict in Section 15.1 proves old-plus-candidate aggregate gain,
-not replacement equivalence. A retained elastic carrier is therefore never
-proactively replaced from that verdict. Port hopping for it takes effect after
-normal contraction or exact failure, when a later connection independently
-selects a port. No native transport state, carrier-attributed delivery
-evidence, flight, queue, attachment, validation evidence, or ordinary-use
-authority transfers to any replacement. Session-owned stream offsets, retained
-ranges, and MPP Data ACK state survive and may use the replacement only through
-ordinary authenticated reattachment.
-
+Idle ready members are event-driven and retain only their bounded socket,
+actor, TLS, heartbeat, and path state. An implementation MUST NOT create an
+unbounded number of carriers or use a fixed Mbps, percentage, source address,
+interface identity, or laboratory threshold to size the pool.
 ### 7.3 Directional usage
 
 `PATH_STATUS` contains:
@@ -1080,7 +779,7 @@ only that exact attachment attempt. If the open may already have entered the
 carrier's ordered writer, settlement MUST preserve the normal
 `STREAM_DETACH` ordering. The sender MAY reselect another attachment, but the
 operation-local outcome MUST NOT by itself publish carrier-instance failure,
-revoke directional authority, discard exact-instance evidence, alter sibling
+revoke carrier eligibility, discard exact-instance evidence, alter sibling
 attachments, or release the carrier's endpoint-group reservation. The exact
 operation's temporary scheduler-load reservation is settled normally.
 
@@ -1229,7 +928,7 @@ idle on a live attachment is not attachment loss.
 Loss of the last carrier is not `SESSION_CLOSE`. While the MPP session or any
 retained stream or datagram state remains within its original configured
 absolute retention lifetime, the client session service may establish
-configured-minimum replacements with the same `SessionId` and fresh carrier
+bounded-pool replacements with the same `SessionId` and fresh carrier
 instances. Reattachment uses ordinary authenticated admission and attachment;
 no authority, attachment, transport evidence, queue, or flight transfers from
 a failed instance. Reconnect attempts MUST NOT extend any original retention
@@ -1361,6 +1060,12 @@ and only while the target demand, ordinary carrier membership and eligibility,
 concurrent Product workload, and local admission and resource policy remain
 unchanged. A configured rate is a startup prior, not measurement.
 
+Fresh qualified native delivery evidence ranks carrier capacity. Product
+per-flow completion evidence is the fallback when qualified native capacity is
+unavailable; a Product sample that may itself have been limited by placement
+MUST NOT cap an otherwise qualified native carrier. This provenance order is
+identical in both stream directions and for every carrier underlay.
+
 A locator, interface, or route cannot establish carrier capacity, marginal
 benefit, or bottleneck identity.
 
@@ -1451,9 +1156,8 @@ carrier's authenticated `PathId`. One transaction may span multiple ordered
 `PATH_CAPACITY_DATA` frames within the frame and cumulative measurement bounds;
 `PATH_CAPACITY_FINISH` declares their exact cumulative payload and one matching
 receipt confirms it. Capacity evidence calibrates an already attached TCP
-output; it never establishes Product delivery or elastic-carrier retention.
-Before its first acknowledged `RETAIN`, a validation-purpose carrier MUST NOT
-carry capacity frames.
+output; it never establishes Product delivery, pool membership, or native
+congestion authority.
 
 Optional native telemetry may refine estimates. Every field is independently
 optional. Absence means unknown, never measured zero, and MUST NOT make a
@@ -1489,7 +1193,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        5
+4      version        6
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -1509,7 +1213,7 @@ frames.
 | 1 | `SESSION_HELLO` | `session_id:u64` |
 | 2 | `SESSION_READY` | none |
 | 3 | `SESSION_CLOSE` | `reason:u8` |
-| 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, underlay:u8, purpose:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
+| 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
 | 7 | `OPEN_STREAM` | `stream_id:u64, target, demand:u8` |
 | 8 | `STREAM_DATA` | `stream_id:u64, offset:u64, length:u32, bytes` |
 | 9 | `STREAM_ACK` | `stream_id:u64, complete:u8, count:u16, ranges[count]` |
@@ -1535,16 +1239,12 @@ frames.
 | 35 | `PATH_CAPACITY_RECEIPT` | `path_id:u16, measurement_id:u64, received_payload_bytes:u64` |
 | 36 | `PEER_STATUS_REQUEST` | `request_id:u64` |
 | 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]` |
-| 38 | `TCP_CARRIER_DEMAND` | `request_id:u64, present:u8, stream_id:u64 when present=1` |
-| 39 | `TCP_CARRIER_VALIDATE` | `validation_id:u64, request_id:u64, direction:u8, stream_id:u64` |
-| 40 | `TCP_CARRIER_RESULT` | `validation_id:u64, direction:u8, result:u8` |
-| 41 | `TCP_CARRIER_RESULT_ACK` | `validation_id:u64, direction:u8, result:u8` |
-
-Kinds 5, 6, 15, 19, 25, 26, 28, and 29 are reserved and MUST NOT be sent.
+Kinds 5, 6, 15, 19, 25, 26, 28, 29, and 38 through 41 are reserved and MUST
+NOT be sent.
 
 `SESSION_HELLO` and `SESSION_AUTH` are QUIC carrier-admission frames; TCP uses
-the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, kinds 33 through 35, and
-kinds 38 through 41 are TCP-only. Receiving a carrier-incompatible frame is a
+the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, and kinds 33 through 35
+are TCP-only. Receiving a carrier-incompatible frame is a
 protocol violation. `PATH_DRAIN` is client-to-server only; `PATH_CLOSE` is
 server-to-client only and requires a matching `PATH_DRAIN`.
 
@@ -1565,18 +1265,8 @@ digits, `.`, `_`, or `-`. Receivers reject rather than normalize noncanonical
 text.
 
 Demand values are latency `1`, throughput `2`, and realtime `3`. Underlay
-values are TCP `1` and UDP `2`. Path purposes are `ORDINARY = 1` and
-`VALIDATION = 2`. Every directional wire field, including metrics and TCP
-carrier validation, uses client-to-server `1` and server-to-client `2`.
-Boolean fields use `0` or `1`.
-
-TCP carrier result values are `RETAIN = 1`, `NO_GAIN = 2`, and
-`WITHDRAWN = 3`. A carrier demand presence value is canonical Boolean; an
-absent stream has only the withdrawal meaning in Section 7.2. `request_id` in
-`TCP_CARRIER_DEMAND` and
-`validation_id` in `TCP_CARRIER_VALIDATE`, `TCP_CARRIER_RESULT`, and
-`TCP_CARRIER_RESULT_ACK` MUST be nonzero. A zero validation `request_id` has
-the local-demand meaning defined in Section 7.2.
+values are TCP `1` and UDP `2`. Directional wire fields use client-to-server
+`1` and server-to-client `2`. Boolean fields use `0` or `1`.
 
 Usage values are `AVAILABLE = 0` and `BACKUP = 1`.
 
@@ -1600,11 +1290,10 @@ Endpoints MUST enforce configured bounds for:
 - carrier queues and flight;
 - datagram attempts, TTL, caches, fragments, and reassemblies;
 - proof, capacity, metric, and peer-status work;
-- TCP carrier demand requests, validations, candidate work, results,
-  acknowledgments, ordinary-use authority, and drain work;
-- TCP group-capacity reservations, minimum connection and reconnect attempts,
-  `PathId` allocation state, removal and bound-reduction drains, and
-  carrierless-session retention; and
+- TCP pool-member actors, reconciliation and reconnect attempts, group
+  reservations, `PathId` allocation, and drain work;
+- TCP group removal and bound-reduction drains and carrierless-session
+  retention; and
 - all teardown and no-attachment retention.
 
 A protocol violation closes the smallest safe scope: product flow, stream,
@@ -1616,7 +1305,7 @@ attachments.
 An operation-local deadline, cancellation, refusal, or queue-admission
 failure MUST NOT by itself be escalated into carrier-instance failure. Such an
 outcome may settle or reselect the exact proposed operation, but MUST NOT by
-itself revoke directional authority, discard exact-instance evidence, alter
+itself revoke carrier eligibility, discard exact-instance evidence, alter
 sibling attachments, or release the carrier's endpoint-group reservation. The
 exact operation's temporary scheduler-load reservation is settled normally.
 Only an exact carrier-scoped terminal event may publish carrier failure.
@@ -1652,8 +1341,8 @@ grant policy or capacity.
 
 ### 14.2 Malicious evidence and resource exhaustion
 
-Peer metrics, usage, TCP carrier demand, capacity receipts, TCP carrier
-results, and result acknowledgments are authenticated input. They MUST NOT:
+Peer metrics, usage, and capacity receipts are authenticated input. They MUST
+NOT:
 
 - grant receive credit;
 - release retained data;
@@ -1662,12 +1351,10 @@ results, and result acknowledgments are authenticated input. They MUST NOT:
 - bypass queue or flight bounds; or
 - transfer state to another carrier instance.
 
-A peer can request or retain only capacity inside the client's configured TCP
-carrier range and the session resource envelope. The client MUST bound request
-frequency, outstanding identifiers, validation work, and
-retained elastic carriers independently of peer input. A validation or result
-for a stale physical instance, validation, direction, target stream, demand
-state, comparison input, or client-owned group admission has no authority.
+A peer cannot select the client's TCP pool size or member identity. The client
+MUST bound every carrier group by its configured maximum and the session
+resource envelope independently of peer input. Input for a stale physical
+instance has no authority over a current member.
 
 Datagram replay windows, response caches, pending native datagrams,
 reassemblies, and target forwarding are bounded. Reused IDs with conflicting
@@ -1691,7 +1378,7 @@ carrier presentation defeats a source-aware classifier. Fixed private
 cleartext protocol markers are avoided, but authenticated tunneling—not
 traffic impersonation—is the security objective.
 
-## 15. MPTunnel Core Profile 5
+## 15. MPTunnel Core Profile 6
 
 This section specifies the transport-neutral Core policy used with the wire
 semantics above. It defines Core conformance, not peer interoperability.
@@ -1732,220 +1419,32 @@ observable, the portable bounded Product service window remains the fallback.
 Acquisition does not grant a new completion estimate or bypass shared
 receive-credit, reorder, queue, or configured flight bounds.
 
-Non-failure TCP carrier expansion is a local delayed-start policy. It MAY be
-considered only for throughput demand with fresh queued unique-original data
-when shared receive credit, assigned-offset, repair, reorder, and session
-resource bounds permit another original service quantum. In the first
-nonempty regular-or-backup authority class, every eligible ordinary carrier
-MUST already own original target work and no eligible ordinary carrier may
-accept the proposed enqueue. No latency or realtime work may be active in that
-session direction. Only a transition from successful ordinary placement to
-this condition admits an attempt; rechecking unchanged state, retained flight,
-reinjection, native buffer state, elapsed time, or ACK silence does not.
+TCP pool establishment is owned by Section 7.2 and is independent of
+instantaneous Product demand. A ready pool member enters the same ordinary
+placement set as every other ready carrier. It receives no fixed share and no
+special startup rate: acquisition is bounded by the existing unproven-path
+flight, shared credit, queue, repair, and reorder rules above.
 
-The throughput-demand episode is owned by the existing Product demand
-classifier, not by an implementation queue snapshot. Fresh queued
-unique-original data is required at the successful-placement-to-saturation
-transition, but draining that queue through successful ordinary placement does
-not end an already-established episode while the classifier still reports
-throughput demand. The episode ends only when the existing classifier observes
-the absence of queued or pending Product work and crosses its normal idle
-boundary. Implementations MUST NOT turn a momentary work-conserving queue drain
-into a new admission generation or use it to withdraw an otherwise unchanged
-comparison.
+The scheduler evaluates every exact carrier direction independently from
+current completion evidence. Qualified Product delivery may increase that
+carrier's useful service window; queue, flight, RTT, loss, backup preference,
+or inferior completion time may leave it without new Product work. Carrier
+presence is therefore not payload allocation, and an idle member does not
+cause duplicate transmission.
 
-Finite source admission while a reliable relay is latency-oriented is scoped
-to that direction's current Product demand episode. It MUST use the same
-adaptive byte boundary as unconditional throughput classification. When the
-classifier crosses its normal idle boundary, the new episode receives fresh
-bounded admission; the reliable stream's lifetime Data Sequence offset MUST
-NOT consume that credit. Queued unique-original data counts once when admitted,
-moving it from the sender queue into assigned offsets does not count it again,
-and pending delivery prevents the episode from being declared idle.
+The Core does not infer a common bottleneck or condition carrier membership or
+directional authority on transient comparative throughput samples. Such a
+comparison cannot reliably mature a new kernel TCP flow across the full
+supported bandwidth and RTT range, and it makes the physical pool depend on
+one transient traffic direction. The configured maximum is the explicit,
+bounded connection policy; native TCP congestion control and the ordinary
+completion scheduler remain the traffic policy.
 
-That transition creates one sender-owned admission generation for the
-continuous demand episode and its stable ordinary membership, authority,
-admission-policy, and resource-policy generations. Each eligible TCP carrier
-group may be attempted at most once in it. A new demand episode, or a change to
-one of those stable generations, creates fresh admission authority; a timer,
-ACK silence, queue or credit oscillation, repeated blocked observation,
-candidate result, or candidate connection failure does not.
-
-For server-to-client expansion, the sender serializes target selection with
-that admission authority. While a current present request has not reached
-exact validation admission, saturation from another target MUST NOT replace
-it. The current target or frozen generations changing may supersede or withdraw
-it as already specified. After the request reaches validation and that exact
-transaction settles or fails, another eligible target may be selected, but a
-comparison key already issued for a target workload MUST NOT be published
-again. The sender therefore retains one latest issued comparison key per live
-target workload. This state is bounded by the existing workload envelope and
-contains no timer, queue occupancy, or transport sample.
-
-One MPP session has at most one unretained elastic carrier and one directional
-validation at a time. The candidate authenticates with `PATH_JOIN` purpose
-`VALIDATION`, reaches readiness, and sends `TCP_CARRIER_VALIDATE`. It remains
-outside ordinary placement and may attach only the exact existing throughput
-stream named by that validation. Its unique-original validation work is finite
-and remains within the existing startup-flight, shared-credit, path-flight,
-repair, reorder, queue, stream, and session bounds. Ordinary carriers remain
-work-conserving, and every carrier retains native TCP congestion-control,
-pacing, and recovery authority. When an already-retained elastic carrier
-validates its other direction, it reuses the existing attachment; ordinary
-Product work in its authorized direction remains valid.
-
-Only unique-original Product bytes released by a fully processed MPP Data ACK
-contribute service evidence. Candidate attribution additionally requires the
-exact carrier instance, attachment incarnation, and original-flight ownership.
-Native TCP acknowledgments, capacity traffic, duplicated or reinjected bytes,
-peer metrics, locators, and source or interface identity contribute none.
-
-An elastic carrier receives `RETAIN` only when a bounded comparison under
-unchanged target demand, ordinary carrier membership and eligibility,
-concurrent Product workload, and local admission and resource policy
-establishes strict improvement in both target-flow and aggregate session
-Product service with the candidate. The same evidence qualification and bounds
-apply with and without the candidate.
-
-At admission the sender freezes one comparison key containing the session and
-direction, target stream and demand generation, exact candidate instance,
-exact ordinary instances and directional authority class, ordinary
-non-queue liveness and policy eligibility, complete active Product-workload
-identities and lifecycle generations, and local admission-policy and
-resource-policy generations. Any change to that key makes an incomplete
-comparison `WITHDRAWN`. Instantaneous enqueue capacity, receive credit, flight,
-queue occupancy, rate or other evidence value, source address, interface,
-locator, native transport sample, peer metric, and elapsed-time observation is
-not a key member. Continuous target demand and work-conserving ordinary
-placement are phase invariants instead.
-
-The sender derives the comparison geometry once, before candidate Product
-service, from four existing Core quantities:
-
-- `startup_coverage` is the reliable-path Data ACK startup sample floor;
-- `rate_window` is the reliable Data-ACK rate-coverage floor;
-- `measurement_envelope` is the existing reliable Product-measurement session
-  envelope: the minimum of path flight, repair, reorder, stream-window, and
-  session resource bounds; and
-- `ordinary_pipe` is the checked sum of each frozen ordinary carrier's
-  established throughput-lane data-level service window, namely two Product
-  BDPs with the existing service-quantum and minimum-pipe floors, rounded up
-  per carrier and limited once by `measurement_envelope`.
-
-All quantities MUST be positive. Overflow or an envelope smaller than one
-`rate_window` makes the attempt `WITHDRAWN`. `cohort_coverage` is the least
-whole number of `rate_window` units that covers
-`max(rate_window, ordinary_pipe)`. If that checked aligned value exceeds
-`measurement_envelope`, validation is unavailable; it MUST NOT be rounded down
-below the frozen ordinary pipe. This is a reuse of established scheduling and
-resource geometry, not a new byte constant, percentage, or transport
-parameter. Geometry is never recomputed from candidate results.
-
-Candidate assignment reuses the Core's existing reliable-path flight model.
-Before `startup_coverage` has been released by unambiguous candidate-owned
-Data ACK, unresolved candidate original work MUST NOT exceed the unproven-path
-startup-flight limit. Afterwards it MUST NOT exceed `measurement_envelope`,
-the existing mature TCP Product-flight ceiling when the carrier exports no
-native congestion window. Cumulative phase credit and instantaneous flight
-credit are both enforced at every assignment. Candidate placement remains
-work-conserving within those bounds; neither an entire phase credit nor the
-carrier command queue is a second congestion window.
-
-The comparison has four contiguous placement phases under the frozen key:
-
-1. An ordinary reference cohort covers at least `cohort_coverage` qualified
-   target bytes and at least `cohort_coverage` qualified ordinary-carrier
-   aggregate bytes while the target remains in the same continuous throughput-
-   demand episode and every eligible ordinary carrier remains work-conserving.
-   This phase begins only
-   after candidate readiness, validation admission, and key and geometry
-   freeze; the authenticated candidate remains Product-idle throughout it.
-2. Candidate startup assigns exactly `startup_coverage` cumulative
-   unique-original target bytes to the candidate under the candidate-flight
-   and shared resource bounds, splitting the final Product frame when needed.
-   All of that work MUST resolve through unambiguous candidate-owned original
-   Data ACK releases before the next phase. Native flight becoming empty does
-   not substitute for consumption of those ordered Product-ACK receipts.
-   Resolved repaired bytes do not contribute. These releases establish exact
-   provenance and startup maturity but enter no comparison cohort.
-3. A candidate-assisted cohort covers at least `cohort_coverage` qualified
-   target bytes and at least `cohort_coverage` qualified ordinary-carrier
-   aggregate bytes with ordinary carriers still work-conserving. Candidate-
-   attributed bytes do not satisfy the latter coverage. The candidate assigns
-   exactly one `cohort_coverage` and all of it MUST resolve through unambiguous
-   candidate-owned original Data ACK releases inside the assisted cohort.
-   Candidate cumulative validation work is bounded by the checked sum of
-   `startup_coverage` and `cohort_coverage`.
-4. New candidate placement stops. Confirmation begins only after the
-   candidate's validation queue, original flight, recovery work, and reorder
-   debt are zero. An ordinary confirmation cohort then covers at least
-   `cohort_coverage` qualified target bytes and `cohort_coverage` qualified
-   ordinary-carrier aggregate bytes with the candidate Product-idle and
-   ordinary carriers work-conserving.
-
-Every cohort is seeded after a fully processed target Data ACK at a serialized
-writer boundary. Every unique original released by a fully processed,
-unambiguous Data ACK transaction completed on or after both opening boundaries
-enters the cohort, including ordinary work assigned before the boundary whose
-Product service completes inside the measured ACK interval. Assignment time
-is not service time and has no cohort-membership authority; exact carrier
-provenance is used only for candidate attribution. The closing Data ACK
-transaction is indivisible: all qualified
-releases from that transaction remain in the closing cohort even when they
-exceed the nominal byte coverage.
-The writer span and Data-ACK span MUST yield a positive effective elapsed time.
-Each cohort records target service and aggregate service by every stream in the
-frozen directional workload over identical opening and closing timestamps.
-The aggregate minus exact candidate-attributed bytes MUST cover one complete
-`cohort_coverage`; this makes every comparison observe a causally eligible
-ordinary service pipe instead of allowing fast candidate startup work to close
-the assisted cohort before ordinary post-boundary work turns over.
-Duplicate, reinjected, ambiguous, unqualified, foreign-workload, or
-pre-boundary-completed releases may resolve ordinary state but contribute no
-comparison bytes. At every phase boundary all phase-owned candidate work is
-resolved before the next writer and Data-ACK boundaries are seeded.
-
-Rates are compared as exact nonnegative byte/time fractions. Floating-point
-rounding, EWMAs, percentage margins, configured rate hints, and native or peer
-acknowledgments have no verdict authority. Checked integer fraction comparison
-is used; overflow cannot become evidence. `RETAIN` requires all four strict
-whole-cohort comparisons:
-
-- assisted target-flow rate is greater than both reference and confirmation
-  target-flow rates; and
-- assisted aggregate-session rate is greater than both reference and
-  confirmation aggregate-session rates.
-
-Equality or failure of any comparison is not proven gain. Redistribution at
-one shared bottleneck may improve the target stream, but cannot retain the
-candidate without aggregate Product-service gain as well. The adjacent
-ordinary/assisted/ordinary shape rejects a phase-local transient that does not
-separate from both controls; it defines no per-window extrema or growing
-sample count. It makes no statistical or counterfactual claim about an
-external capacity change synchronized to the assisted phase.
-
-A complete comparison that does not establish both improvements is `NO_GAIN`.
-Ended demand, a changed comparison input, expiry, incomplete coverage, or
-ambiguous provenance is `WITHDRAWN`. Candidate connection establishment uses
-the existing `path_probe_timeout_ms`. Each endpoint starts an independent,
-absolute session-retention ceiling when it locally admits
-`TCP_CARRIER_VALIDATE`; progress never extends it and expiry grants no
-authority. Sender expiry before result serialization emits `WITHDRAWN` when
-the candidate remains writable, otherwise exact native failure settles it. A
-receiver-side client expiry starts ordered candidate drain; a receiver-side
-server expiry closes the exact candidate natively because the server cannot
-initiate `PATH_DRAIN` or a sender-owned result. Expiry after immutable result
-serialization retires the unacknowledged candidate without changing that
-result. This version defines no new timer, percentage, EWMA coefficient,
-statistical confidence threshold, or reopening interval.
-
-`NO_GAIN`, `WITHDRAWN`, candidate failure, and result settlement do not
-authorize another connection in the same admission generation. A later
-attempt requires fresh generation authority and remains subject to the
-connection-attempt rate, configured maximum, and session resource bounds.
-Waiting, polling, ACK silence, ordinary queue oscillation, or a locator,
-source, or interface change alone does not authorize it.
-
+No Mbps value, utilization percentage, source address, locator, interface
+identity, application flow count, laboratory condition, or fixed observation
+window may create, promote, or revoke a TCP pool member. Exact native failure
+changes liveness immediately; planned configuration and maintenance changes
+use the gradual lifecycle in Section 7.2.
 ### 15.2 Reinjection budget and timing
 
 Ordinary reinjection is limited by cumulative extra-traffic credit funded by a
@@ -2105,51 +1604,43 @@ A conforming implementation preserves all of the following:
     once.
 18. Simultaneous TCP carriers within one MPP session always have distinct
     `PathId` values and distinct carrier instances.
-19. Non-failure TCP carrier expansion is bounded, serialized, and retained
-    only by sender-owned, session-scoped, directional Product evidence released
-    by MPP Data ACK.
-20. Before its first acknowledged `RETAIN`, a TCP candidate owns at most one
-    target attachment with one directional validation binding and finite
-    validation-original work, but no ordinary placement authority.
-21. Ordinary-use authority in one direction grants no authority in the other.
+19. Each TCP carrier group reconciles toward its configured healthy maximum
+    without exceeding it; the reserved first range value changes no behavior.
+20. Every authenticated ready TCP pool member has ordinary bidirectional
+    Product authority. Pool membership never depends on one traffic direction
+    or a throughput comparison.
+21. Carrier presence never forces payload placement or duplication. The
+    ordinary scheduler revalidates exact carrier health, usage, queue, flight,
+    credit, and completion evidence before every commit.
 22. Server `PATH_CLOSE` is the ordered aggregate acknowledgment of a matching
     client `PATH_DRAIN`; local emptiness or write completion cannot replace it.
 23. `SESSION_CLOSE` retires the complete `SessionId`; carrier drain does not.
-24. Attachment membership and feedback capability alone grant no ordinary TCP
-    payload authority; validation placement requires its exact bounded
-    directional binding and validation work.
-25. In either direction, the exact `RETAIN` acknowledgment is received before
-    the sender may place ordinary Product payload on the candidate.
-26. Configured capacity that has not established a physical carrier is
-    not an eligible carrier, path attachment, or health state.
-27. One client session service reconciles each TCP carrier group; each exact
+24. Configured capacity without a physical carrier is only an establishment
+    candidate. It is not an authenticated carrier or path attachment and
+    publishes no physical evidence; Product data follows only authentication
+    and readiness.
+25. One client session owner reconciles each TCP carrier group; each exact
     carrier instance has its own wire lifecycle, while a stream never owns
     group capacity or replacement.
-28. A configured-minimum member identity is client-local and persists across
-    its successive replacement instances. A planned replacement permits only
-    the bounded current/successor/predecessor overlap and exact
-    Product-quiescent commit in Section 7.2.
-    Classification of each exact carrier instance as minimum or elastic is
-    immutable and is never inferred from a locator or peer path label.
-29. A disabled TCP carrier group establishes no carrier and grants no new
+26. A durable member ordinal persists across successive exact replacement
+    instances. A planned replacement permits only the bounded
+    current/successor/predecessor overlap in Section 7.2 and transfers no
+    attachment, queue, flight, authority, or evidence.
+27. A disabled TCP carrier group establishes no carrier and grants no new
     original placement. Every exact instance already in that group reaches
     terminal state through ordered carrier retirement; re-enable creates fresh
     instances and never cancels a drain already begun.
-
 ## 17. Relationship to Existing Standards
 
 ### 17.1 MPTCP
 
 RFC 8684 provides the established principles of stable data identity across
 subflows, a data-level acknowledgment distinct from transport ACKs, shared
-connection flow control, reinjection, and backup preference.
-Its Section 3.9.2 also leaves additional-subflow policy local while explicitly
-supporting delayed creation for short flows, buffered-demand input, rate
-limiting, and a total subflow bound. MPP therefore uses an actual blocked
-throughput placement and its configured carrier/resource bounds; it imports no
-universal subflow threshold. Section 3.3.8 motivates regular-to-backup
-transition. Section 2.6 permits one MPTCP subflow to close through ordinary TCP
-FIN/ACK without closing the MPTCP connection; MPP's ordered per-carrier wire
+connection flow control, reinjection, bounded path management, and backup
+preference. MPP uses an explicit configured carrier bound rather than a
+traffic-rate threshold. Section 3.3.8 motivates regular-to-backup transition.
+Section 2.6 permits one MPTCP subflow to close through ordinary TCP FIN/ACK
+without closing the MPTCP connection; MPP's ordered per-carrier wire
 transaction is independently defined as client `PATH_DRAIN` followed by server
 `PATH_CLOSE`.
 
@@ -2161,9 +1652,10 @@ cumulative DSS Data ACK. MPP carriers are not MPTCP subflows.
 
 RFC 6356 documents why independently controlled subflows sharing a bottleneck
 can be less fair than one TCP flow. MPP cannot install coupled control above
-kernel TCP, so an elastic TCP carrier is retained only after the bounded
-aggregate validation in Section 15.1. That validation establishes observed
-MPP service; it does not claim coupled fairness or identify a bottleneck.
+kernel TCP and does not claim coupled fairness or common-bottleneck detection.
+The configured pool maximum is therefore the explicit resource and concurrency
+policy; each member retains native TCP congestion-control authority and the
+ordinary completion scheduler may leave redundant members idle.
 
 ### 17.2 QUIC
 

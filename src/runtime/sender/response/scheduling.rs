@@ -9,142 +9,18 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
     BulkAdmissionCheck, BulkCandidatePosition,
     bulk_candidate_admission_suppression_with_completion_backlog,
-    bulk_contiguous_frontier_can_accept_enqueue,
 };
-use crate::model::capacity::data_level_service_window_bytes;
 use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
-use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, carrier_path_key_order};
+use crate::model::path::carrier_path_key_order;
 use crate::model::response::{
     CarrierPathFlightDebt, response_oldest_lower_flight_owner, response_ordering_debt_bytes,
 };
-use crate::model::tcp_carrier::TcpCarrierStableGenerations;
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, PathUsage, StreamId};
+use crate::protocol::Frame;
 use crate::runtime::sender::response::ResponseOutputIdentity;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
-use crate::runtime::stream::response::{ResponseSenderPathObservation, ResponseSenderPathTarget};
+use crate::runtime::stream::response::ResponseSenderPathTarget;
 use crate::scheduler::{self, TrafficClass};
-use smallvec::SmallVec;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ResponseOrdinaryOutputInstance {
-    pub(in crate::runtime) key: CarrierPathKey,
-    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) output_incarnation: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ResponseOrdinaryCarrierService {
-    pub(in crate::runtime) instance: ResponseOrdinaryOutputInstance,
-    pub(in crate::runtime) service_pipe_bytes: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::runtime) struct ResponseOrdinarySaturationObservation {
-    pub(in crate::runtime) stream_id: StreamId,
-    pub(in crate::runtime) stable: TcpCarrierStableGenerations,
-    pub(in crate::runtime) ordinary_services: SmallVec<[ResponseOrdinaryCarrierService; 4]>,
-}
-
-/// Recognizes only the RFC ordinary-carrier saturation transition. Dynamic
-/// transport evidence ranks the exact observation but never becomes stable
-/// admission authority.
-pub(super) fn response_ordinary_saturation_observation(
-    observation: &ResponseSenderPathObservation,
-    stream_id: StreamId,
-    lane: TrafficClass,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    connection_ordering_debt_bytes: usize,
-) -> Option<ResponseOrdinarySaturationObservation> {
-    if lane != TrafficClass::Throughput || payload_bytes == 0 {
-        return None;
-    }
-    let connection_window = u64::try_from(mux_limits.max_reorder_bytes)
-        .unwrap_or(u64::MAX)
-        .min(mux_limits.max_stream_window_bytes);
-    if u64::try_from(connection_ordering_debt_bytes).unwrap_or(u64::MAX) >= connection_window {
-        return None;
-    }
-
-    let eligible = observation
-        .targets
-        .iter()
-        .filter(|target| !target.observation.stale_for_original_data)
-        .filter(|target| {
-            scheduler::score_path(
-                response_completion_snapshot(target),
-                TrafficClass::Throughput,
-                payload_bytes,
-            )
-            .is_some()
-        })
-        .collect::<SmallVec<[&ResponseSenderPathTarget; 4]>>();
-    let authority_class = if eligible
-        .iter()
-        .any(|target| !scheduler::path_is_backup(target.observation.snapshot))
-    {
-        PathUsage::Available
-    } else if eligible
-        .iter()
-        .any(|target| scheduler::path_is_backup(target.observation.snapshot))
-    {
-        PathUsage::Backup
-    } else {
-        return None;
-    };
-    let eligible = eligible
-        .into_iter()
-        .filter(|target| {
-            scheduler::path_is_backup(target.observation.snapshot)
-                == (authority_class == PathUsage::Backup)
-        })
-        .collect::<SmallVec<[&ResponseSenderPathTarget; 4]>>();
-    if eligible.is_empty()
-        || eligible.iter().any(|target| {
-            (target.can_enqueue_stream_data(TrafficClass::Throughput)
-                && bulk_contiguous_frontier_can_accept_enqueue(
-                    response_completion_snapshot(target),
-                    payload_bytes,
-                    mux_limits,
-                ))
-                || target.observation.original_data_in_flight_bytes == 0
-                || target.observation.snapshot.active_latency_sensitive_flows != 0
-        })
-    {
-        return None;
-    }
-
-    let ordinary_services = eligible
-        .into_iter()
-        .filter_map(|target| {
-            let service_pipe = data_level_service_window_bytes(
-                response_completion_snapshot(target),
-                TrafficClass::Throughput,
-                mux_limits,
-            )
-            .ceil();
-            (service_pipe.is_finite() && service_pipe > 0.0).then_some(
-                ResponseOrdinaryCarrierService {
-                    instance: ResponseOrdinaryOutputInstance {
-                        key: target.observation.key,
-                        path_instance_id: target.observation.path_instance_id,
-                        output_incarnation: target.observation.incarnation,
-                    },
-                    service_pipe_bytes: service_pipe as u64,
-                },
-            )
-        })
-        .collect::<SmallVec<[ResponseOrdinaryCarrierService; 4]>>();
-    if ordinary_services.is_empty() {
-        return None;
-    }
-    Some(ResponseOrdinarySaturationObservation {
-        stream_id,
-        stable: observation.tcp_carrier_stable_generations(authority_class)?,
-        ordinary_services,
-    })
-}
 
 /// Selects the path for the next unique connection-data range.
 ///

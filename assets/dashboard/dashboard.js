@@ -1418,7 +1418,7 @@
         "span",
         "cell-secondary",
         formatIdentifier(path.tcp_carrier_ordinal) + " / " +
-          formatIdentifier(path.tcp_carriers_min) + "-" + formatIdentifier(path.tcp_carriers_max)
+          formatIdentifier(path.tcp_carriers_max)
       ));
     } else {
       carrier.append(createElement("span", "cell-secondary", "--"));

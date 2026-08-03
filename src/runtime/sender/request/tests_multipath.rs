@@ -3,7 +3,6 @@ use super::super::test_support::{
     opened_test_relay_stream_with_underlay, seed_client_bulk_evidence_for_test,
 };
 use super::*;
-use crate::model::path::next_carrier_path_instance_id;
 use crate::model::request_evidence::RequestPerFlowRateModel;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::runtime::path::commands::{
@@ -603,9 +602,8 @@ async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
         payload_bytes
     );
 
-    let (data_ack_progress_paths, original_releases) =
-        controller.apply_product_ack(&context, &remotes, &[range], Instant::now(), false);
-    assert!(original_releases.is_none());
+    let data_ack_progress_paths =
+        controller.apply_product_ack(&context, &remotes, &[range], Instant::now());
     assert!(
         data_ack_progress_paths.is_empty(),
         "a Data ACK cannot identify which duplicate delivered the range"
@@ -639,7 +637,7 @@ async fn product_ack_returns_the_exact_path_that_made_progress() {
         .flights
         .record_original_frame_instance(tcp, &frame);
 
-    let (data_ack_progress_paths, original_releases) = controller.apply_product_ack(
+    let data_ack_progress_paths = controller.apply_product_ack(
         &context,
         &remotes,
         &[OffsetRange {
@@ -647,9 +645,7 @@ async fn product_ack_returns_the_exact_path_that_made_progress() {
             end: payload_bytes as u64,
         }],
         Instant::now(),
-        false,
     );
-    assert!(original_releases.is_none());
 
     assert_eq!(data_ack_progress_paths.as_slice(), &[tcp]);
     assert!(
@@ -795,7 +791,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
         "the never-attempted second range remains immediately eligible"
     );
 
-    let (data_ack_progress_paths, original_releases) = controller.apply_product_ack(
+    let data_ack_progress_paths = controller.apply_product_ack(
         &context,
         &remotes,
         &[OffsetRange {
@@ -803,9 +799,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
             end: 4096,
         }],
         Instant::now(),
-        false,
     );
-    assert!(original_releases.is_none());
 
     assert!(
         data_ack_progress_paths.is_empty(),
@@ -958,77 +952,6 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
             end: 4096,
         }],
         "an unresolved failed-owner range becomes eligible after its recovery interval"
-    );
-
-    controller.release_all(&context);
-}
-
-#[tokio::test]
-async fn validation_attachment_owns_flight_without_entering_ordinary_scheduling() {
-    let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
-    let stream_id = StreamId(32);
-    let (ordinary_commands, _ordinary_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
-        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, ordinary_commands), 8);
-    let ordinary = remotes.paths[0].instance();
-    let reservation = remotes.reserve_attachment_incarnation();
-    let candidate = RelayPathInstance {
-        key: RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: 1,
-        },
-        path_instance_id: next_carrier_path_instance_id(),
-        attachment_id: reservation.attachment_id(),
-    };
-    let _reservation = remotes
-        .bind_validation_attachment(reservation, candidate)
-        .expect("bind validation-only request attachment");
-    assert_eq!(remotes.path_instances(), vec![ordinary]);
-    assert_eq!(remotes.flight_owner_instances(), vec![ordinary, candidate]);
-
-    let candidate_frame = data_frame(stream_id, 0, 4096);
-    let next_frame = data_frame(stream_id, 4096, 4096);
-    let mut controller = RequestMultipathController::new(stream_id);
-    controller
-        .request
-        .flights
-        .record_original_frame_instance(candidate, &candidate_frame);
-
-    assert!(
-        controller
-            .prepare_relay_path_decision(
-                &context,
-                &mut remotes,
-                &next_frame,
-                TrafficClass::Throughput,
-                RelaySendCause::StreamData,
-            )
-            .is_ok(),
-        "a live validation owner must not serialize later Product placement",
-    );
-    assert!(
-        controller
-            .request_recovery_original_paths(&remotes)
-            .is_empty(),
-        "validation flight remains owned until its lifecycle settles",
-    );
-
-    assert!(remotes.settle_validation_attachment(candidate));
-    assert!(matches!(
-        controller.prepare_relay_path_decision(
-            &context,
-            &mut remotes,
-            &next_frame,
-            TrafficClass::Throughput,
-            RelaySendCause::StreamData,
-        ),
-        Err(RuntimeError::SenderServiceBlocked)
-    ));
-    assert_eq!(
-        controller.request_recovery_original_paths(&remotes),
-        vec![candidate],
-        "settlement exposes unresolved candidate flight to normal recovery",
     );
 
     controller.release_all(&context);

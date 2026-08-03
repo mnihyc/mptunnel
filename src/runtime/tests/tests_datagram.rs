@@ -8,7 +8,7 @@ use crate::runtime::path::quic::metrics::UdpPathMetrics;
 
 #[test]
 fn mixed_bulk_striping_includes_unmeasured_endpoint_only_udp() {
-    let tcp_path = "tcp://127.0.0.1:10142"
+    let tcp_path = "tcp://127.0.0.1:10142?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("tcp path");
     let udp_path = "udp://127.0.0.1:10143"
@@ -226,7 +226,7 @@ fn mixed_datagram_underlay_uses_tcp_when_tcp_eta_is_better() {
     let slow_udp = "udp://127.0.0.1:10148?srtt-ms=90&rate-mbps=20"
         .parse::<PathSpec>()
         .expect("udp path");
-    let fast_tcp = "tcp://127.0.0.1:10149?srtt-ms=15&rate-mbps=100"
+    let fast_tcp = "tcp://127.0.0.1:10149?srtt-ms=15&rate-mbps=100&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("tcp path");
     let context = ClientPathContext::new(
@@ -248,7 +248,7 @@ fn mixed_datagram_underlay_uses_udp_when_udp_eta_is_better() {
     let fast_udp = "udp://127.0.0.1:10150?srtt-ms=15&rate-mbps=100"
         .parse::<PathSpec>()
         .expect("udp path");
-    let slow_tcp = "tcp://127.0.0.1:10151?srtt-ms=90&rate-mbps=20"
+    let slow_tcp = "tcp://127.0.0.1:10151?srtt-ms=90&rate-mbps=20&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("tcp path");
     let context = ClientPathContext::new(
@@ -269,7 +269,7 @@ fn realtime_underlay_scoring_uses_the_actual_datagram_size() {
     let low_latency_udp = "udp://127.0.0.1:10152?srtt-ms=20&rate-mbps=1"
         .parse::<PathSpec>()
         .expect("udp path");
-    let bulk_capacity_tcp = "tcp://127.0.0.1:10153?srtt-ms=80&rate-mbps=100"
+    let bulk_capacity_tcp = "tcp://127.0.0.1:10153?srtt-ms=80&rate-mbps=100&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("tcp path");
     let context = ClientPathContext::new(
@@ -507,7 +507,7 @@ fn tcp_datagram_open_budget_is_ttl_bounded_and_reserves_an_alternative() {
 
 #[test]
 fn fresh_tcp_datagram_carrier_keeps_initial_pto_floor_after_live_probe() {
-    let path = "tcp://127.0.0.1:10130?srtt-ms=20&jitter-ms=1&rate-mbps=100"
+    let path = "tcp://127.0.0.1:10130?srtt-ms=20&jitter-ms=1&rate-mbps=100&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("TCP path");
     let context =
@@ -699,10 +699,10 @@ fn udp_edge_association_queue_is_bounded_by_resource_bytes() {
 
 #[test]
 fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
-    let first_path = "tcp://127.0.0.1:10021?srtt-ms=10&rate-mbps=10"
+    let first_path = "tcp://127.0.0.1:10021?srtt-ms=10&rate-mbps=10&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10022?srtt-ms=10&rate-mbps=10"
+    let second_path = "tcp://127.0.0.1:10022?srtt-ms=10&rate-mbps=10&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
     let context = ClientPathContext::new(
@@ -736,10 +736,10 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
 
 #[test]
 fn active_interactive_tcp_flow_pushes_bulk_to_other_path() {
-    let low_latency_path = "tcp://127.0.0.1:10123?srtt-ms=20&rate-mbps=100"
+    let low_latency_path = "tcp://127.0.0.1:10123?srtt-ms=20&rate-mbps=100&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("low latency path");
-    let bulk_candidate_path = "tcp://127.0.0.1:10124?srtt-ms=180&rate-mbps=100"
+    let bulk_candidate_path = "tcp://127.0.0.1:10124?srtt-ms=180&rate-mbps=100&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("bulk candidate path");
     let context = ClientPathContext::new(
@@ -777,10 +777,10 @@ fn active_interactive_tcp_flow_pushes_bulk_to_other_path() {
 
 #[test]
 fn endpoint_only_tcp_startup_preserves_configured_order_on_equal_scores() {
-    let first_path = "tcp://127.0.0.1:10121"
+    let first_path = "tcp://127.0.0.1:10121?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10122"
+    let second_path = "tcp://127.0.0.1:10122?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
     let context = ClientPathContext::new(
@@ -801,10 +801,10 @@ fn endpoint_only_tcp_startup_preserves_configured_order_on_equal_scores() {
 
 #[test]
 fn endpoint_only_tcp_realtime_datagrams_preserve_configured_order() {
-    let first_path = "tcp://127.0.0.1:10135"
+    let first_path = "tcp://127.0.0.1:10135?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10136"
+    let second_path = "tcp://127.0.0.1:10136?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
     let context = ClientPathContext::new(
@@ -831,10 +831,10 @@ fn endpoint_only_tcp_realtime_datagrams_preserve_configured_order() {
 
 #[test]
 fn endpoint_only_tcp_startup_validates_order_before_noisy_probe_scores() {
-    let first_path = "tcp://127.0.0.1:10125"
+    let first_path = "tcp://127.0.0.1:10125?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10126"
+    let second_path = "tcp://127.0.0.1:10126?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
     let context = ClientPathContext::new(
@@ -861,13 +861,13 @@ fn endpoint_only_tcp_startup_validates_order_before_noisy_probe_scores() {
 
 #[test]
 fn endpoint_only_tcp_interactive_opens_spread_active_load_without_probe_noise() {
-    let low_latency_path = "tcp://127.0.0.1:10129"
+    let low_latency_path = "tcp://127.0.0.1:10129?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("low latency path");
-    let high_latency_path = "tcp://127.0.0.1:10130"
+    let high_latency_path = "tcp://127.0.0.1:10130?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("high latency path");
-    let poor_path = "tcp://127.0.0.1:10131"
+    let poor_path = "tcp://127.0.0.1:10131?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("poor path");
     let context = ClientPathContext::new(
@@ -888,13 +888,13 @@ fn endpoint_only_tcp_interactive_opens_spread_active_load_without_probe_noise() 
 
 #[test]
 fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_noise() {
-    let first_path = "tcp://127.0.0.1:10162"
+    let first_path = "tcp://127.0.0.1:10162?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10163"
+    let second_path = "tcp://127.0.0.1:10163?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
-    let probe_noisy_path = "tcp://127.0.0.1:10164"
+    let probe_noisy_path = "tcp://127.0.0.1:10164?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("probe noisy path");
     let context = ClientPathContext::new(
@@ -934,7 +934,7 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
 fn endpoint_only_mixed_reservation_prefers_proven_low_rtt_over_unproven_idle_path() {
     let context = ClientPathContext::new(
         vec![
-            "tcp://127.0.0.1:10173"
+            "tcp://127.0.0.1:10173?tcp-carriers=1-1"
                 .parse::<PathSpec>()
                 .expect("TCP path"),
             "udp://127.0.0.1:10174"
@@ -968,10 +968,10 @@ fn endpoint_only_mixed_reservation_prefers_proven_low_rtt_over_unproven_idle_pat
 
 #[test]
 fn endpoint_only_tcp_bulk_load_spreads_replacement_without_realtime_work() {
-    let first_path = "tcp://127.0.0.1:10166"
+    let first_path = "tcp://127.0.0.1:10166?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10167"
+    let second_path = "tcp://127.0.0.1:10167?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
     let context = ClientPathContext::new(
@@ -998,10 +998,10 @@ fn endpoint_only_tcp_bulk_load_spreads_replacement_without_realtime_work() {
 
 #[test]
 fn endpoint_only_tcp_bulk_load_keeps_new_interactive_streams_latency_first_with_realtime_work() {
-    let first_path = "tcp://127.0.0.1:10168"
+    let first_path = "tcp://127.0.0.1:10168?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10169"
+    let second_path = "tcp://127.0.0.1:10169?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
     let udp_path = "udp://127.0.0.1:10170"
@@ -1032,10 +1032,10 @@ fn endpoint_only_tcp_bulk_load_keeps_new_interactive_streams_latency_first_with_
 
 #[test]
 fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_latency_first() {
-    let first_path = "tcp://127.0.0.1:10171"
+    let first_path = "tcp://127.0.0.1:10171?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "tcp://127.0.0.1:10172"
+    let second_path = "tcp://127.0.0.1:10172?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("second path");
     let context = ClientPathContext::new(
@@ -1063,10 +1063,10 @@ fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_late
 
 #[test]
 fn hinted_tcp_startup_uses_configured_metrics_before_order() {
-    let high_latency_path = "tcp://127.0.0.1:10127?srtt-ms=200&rate-mbps=100"
+    let high_latency_path = "tcp://127.0.0.1:10127?srtt-ms=200&rate-mbps=100&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("high latency path");
-    let low_latency_path = "tcp://127.0.0.1:10128?srtt-ms=10&rate-mbps=100"
+    let low_latency_path = "tcp://127.0.0.1:10128?srtt-ms=10&rate-mbps=100&tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("low latency path");
     let context = ClientPathContext::new(

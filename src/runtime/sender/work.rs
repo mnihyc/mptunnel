@@ -2,26 +2,13 @@
 
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
 use crate::model::path::{CarrierPathKey, RelayPathInstance, RelayPathKey};
-use crate::model::tcp_carrier::TcpCarrierStableGenerations;
 use crate::model::timing::reliable_data_retransmission_interval;
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, StreamId};
+use crate::protocol::Frame;
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommandSender, ReliablePathFrameReservation};
 use crate::scheduler::{PathSnapshot, TrafficClass};
-use std::num::NonZeroU64;
 use std::time::Instant;
-
-/// Exact logical Product workload in one sender direction.
-///
-/// The session owner allocates the generation when the logical stream enters
-/// that sender's workload set. Every admission fence and ACK receipt uses this
-/// same identity; no second synthetic stream generation exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::runtime) struct ProductWorkloadIdentity {
-    pub(in crate::runtime) stream_id: StreamId,
-    pub(in crate::runtime) lifecycle_generation: NonZeroU64,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum CarrierEmitMode {
@@ -214,7 +201,6 @@ impl RelaySendCause {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RelaySendOutcome {
-    pub(in crate::runtime) tcp_carrier_stable: Option<TcpCarrierStableGenerations>,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) path_key: RelayPathKey,
 }

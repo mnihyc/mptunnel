@@ -1014,13 +1014,7 @@ fn sort_datagram_underlay_candidates(
                     left.eta_ms.total_cmp(&right.eta_ms)
                 }
             })
-            .then_with(|| {
-                context
-                    .relay_path_config_ordinal(left.key)
-                    .cmp(&context.relay_path_config_ordinal(right.key))
-            })
-            .then_with(|| left.key.index.cmp(&right.key.index))
-            .then_with(|| left.key.underlay.cmp(&right.key.underlay))
+            .then_with(|| context.relay_path_key_order(left.key, right.key))
     });
 }
 

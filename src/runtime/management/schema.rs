@@ -235,8 +235,6 @@ pub(super) struct ManagementPathStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tcp_carrier_ordinal: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) tcp_carriers_min: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tcp_carriers_max: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) path_id: Option<String>,

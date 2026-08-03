@@ -13,7 +13,7 @@ use crate::runtime::ingress_runtime::{
     probe_udp_client_path, spawn_http_connect_client_ingress, spawn_socks5_client_ingress,
     spawn_tcp_forward_client_ingress, spawn_udp_forward_client_ingress,
 };
-use crate::runtime::path::tcp::group::ClientTcpMinimumRetry;
+use crate::runtime::path::tcp::group::ClientTcpMemberRetry;
 use crate::runtime::path::{ClientPathContext, ClientPathRuntimeOptions};
 use crate::runtime::product_policy::ClientIngressRouter;
 use crate::runtime::readiness::RuntimeReadinessBarrier;
@@ -144,11 +144,11 @@ pub(in crate::runtime) async fn run_path_probe_service(
     let groups = context.tcp_carrier_groups.clone();
     let mut changes = groups.subscribe();
     let now = tokio::time::Instant::now();
-    let mut retry = vec![ClientTcpMinimumRetry::new(now); context.tcp_sessions.len()];
+    let mut retry = vec![ClientTcpMemberRetry::new(now); context.tcp_sessions.len()];
     let mut measurements = tokio::task::JoinSet::new();
 
     // Preserve immediate UDP measurement while the same service establishes
-    // configured-minimum TCP carriers.
+    // the bounded TCP carrier target.
     {
         let context = context.clone();
         measurements.spawn(async move {

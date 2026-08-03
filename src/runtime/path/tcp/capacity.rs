@@ -435,10 +435,7 @@ impl ClientPathState {
         }
         let mut health = self.health().lock().expect("client path health lock");
         let record = health.tcp_record_mut(path_index)?;
-        let before = record.eligibility_fingerprint();
         record.maintain(now);
-        let eligibility_changed = before != record.eligibility_fingerprint();
-        self.publish_eligibility_change_if(&mut health, eligibility_changed);
         let record = health.tcp_record_mut(path_index)?;
         // Distinct TCP sockets have independent ordering. The path capsule owns
         // exact identity while the session budget bounds their cumulative cost.

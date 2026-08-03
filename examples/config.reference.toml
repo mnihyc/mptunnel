@@ -306,9 +306,8 @@ paths = [
 # listener.
 #
 # Ranged QUIC paths periodically move the same authenticated connection to
-# another port in the set. Ranged TCP paths use the same interval to make a
-# configured-minimum carrier eligible for quiescent make-before-break
-# replacement. The default is five minutes; override it with
+# another port in the set. Ranged TCP paths use the same interval for ordered,
+# Product-quiescent carrier replacement. The default is five minutes; override it with
 # `port-hop-interval-ms=<u32>` (minimum 5000). TCP never migrates native state
 # or closes an active carrier to meet an interval.
 #
@@ -319,7 +318,7 @@ paths = [
 #   jitter-ms=<u32>
 #   rate-bps|rate-kbps|rate-mbps=<u64>, or rate=unknown|unlimited
 #   datagram-payload-limit=512..65000
-#   tcp-carriers=MIN-MAX (tcp:// only; default 1-3)
+#   tcp-carriers=MIN-MAX (tcp:// only; default 1-3; MIN is obsolete/ignored)
 #   port-hop-interval-ms=5000..4294967295 (ranged tcp:// or udp://)
 #   backup, expensive, bulk-allowed, probe-only, no-udp
 # Boolean flags may omit a value or use canonical true/false. Server bind

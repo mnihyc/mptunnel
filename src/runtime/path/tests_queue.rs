@@ -1,15 +1,14 @@
 use super::{
     ReliablePathCommand, recv_reliable_path_command, recv_reliable_path_command_during_drain,
     reliable_path_command_channels, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_bytes, reliable_path_effective_frame_lane,
-    reliable_path_frame_uses_priority_queue, try_recv_reliable_path_command,
+    reliable_path_effective_frame_lane, reliable_path_frame_uses_priority_queue,
+    try_recv_reliable_path_command,
 };
 use crate::protocol::{
     DatagramFlowId, Frame, PathId, PathUsage, ResetReason, StreamDemandHint, StreamId, TargetAddr,
 };
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
-use std::num::NonZeroU64;
 
 fn stream_data_frame(stream_id: u64, bytes: usize) -> Frame {
     Frame::StreamData {
@@ -49,203 +48,16 @@ fn ordered_writer_flow_load_tracks_lane_changes_and_lifetime() {
     assert_eq!(commands.active_flow_counts(), (0, 0));
 }
 
-#[test]
-fn tcp_carrier_validation_data_is_typed_bounded_and_exactly_accounted() {
-    const VALIDATION_ID: NonZeroU64 = NonZeroU64::new(17).expect("nonzero validation id");
-    let (commands, mut receivers) = reliable_path_command_channels(1);
-    let frame = stream_data_frame(7, 4096);
-    let expected_pending = crate::protocol::frame::reliable_path_frame_pacing_bytes(&frame);
-    let expected_writer = crate::protocol::codec::encoded_frame_capacity_hint(&frame).max(1);
-
-    let reservation = commands
-        .try_reserve_tcp_carrier_validation_data(
-            VALIDATION_ID,
-            frame.clone(),
-            TrafficClass::Throughput,
-        )
-        .expect("reserve one validation assignment");
-    assert_eq!(
-        commands.pending_bytes(),
-        0,
-        "reservation is not publication"
-    );
-    assert!(matches!(
-        commands.try_reserve_tcp_carrier_validation_data(
-            VALIDATION_ID,
-            stream_data_frame(8, 1),
-            TrafficClass::Throughput,
-        ),
-        Err(crate::runtime::RuntimeError::SenderServiceBlocked)
-    ));
-
-    reservation.commit();
-    assert_eq!(commands.pending_bytes(), expected_pending as u64);
-    let command =
-        try_recv_reliable_path_command(&mut receivers).expect("published validation assignment");
-    assert!(matches!(
-        &command,
-        ReliablePathCommand::SendTcpCarrierValidationData {
-            validation_id: VALIDATION_ID,
-            frame: received,
-        } if received == &frame
-    ));
-    assert_eq!(
-        reliable_path_command_pending_bytes(&command),
-        expected_pending
-    );
-    assert_eq!(
-        reliable_path_command_writer_run_bytes(&command),
-        expected_writer
-    );
-    assert_eq!(commands.writer_pending_bytes(), expected_pending as u64);
-
-    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
-    assert_eq!(commands.pending_bytes(), 0);
-    assert_eq!(commands.writer_pending_bytes(), 0);
-}
-
-#[test]
-fn tcp_carrier_validation_data_rejects_invalid_frame_and_lane() {
-    let (commands, mut receivers) = reliable_path_command_channels(1);
-    assert!(matches!(
-        commands.try_reserve_tcp_carrier_validation_data(
-            NonZeroU64::new(1).expect("nonzero validation id"),
-            Frame::Ping { nonce: 1 },
-            TrafficClass::Throughput,
-        ),
-        Err(crate::runtime::RuntimeError::Protocol(_))
-    ));
-    assert!(matches!(
-        commands.try_reserve_tcp_carrier_validation_data(
-            NonZeroU64::new(1).expect("nonzero validation id"),
-            stream_data_frame(1, 1),
-            TrafficClass::Latency,
-        ),
-        Err(crate::runtime::RuntimeError::Protocol(_))
-    ));
-    assert_eq!(commands.pending_bytes(), 0);
-
-    let reservation = commands
-        .try_reserve_tcp_carrier_validation_data(
-            NonZeroU64::new(1).expect("nonzero validation id"),
-            stream_data_frame(1, 1),
-            TrafficClass::Throughput,
-        )
-        .expect("invalid attempts consume no bounded capacity");
-    drop(reservation);
-    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
-    assert_eq!(commands.pending_bytes(), 0);
-}
-
-#[tokio::test]
-async fn tcp_carrier_validation_writer_boundary_is_bounded_zero_byte_fifo_work() {
-    let validation_id = NonZeroU64::new(19).expect("nonzero validation id");
-    let (commands, mut receivers) = reliable_path_command_channels(2);
-    let frame = stream_data_frame(12, 4096);
-    let frame_bytes =
-        reliable_path_command_pending_bytes(&ReliablePathCommand::SendFrame(frame.clone()));
-    commands
-        .try_reserve_tcp_carrier_validation_data(
-            validation_id,
-            frame.clone(),
-            TrafficClass::Throughput,
-        )
-        .expect("reserve preceding validation data")
-        .commit();
-
-    let mut boundary = Box::pin(commands.tcp_carrier_validation_writer_boundary(validation_id));
-    tokio::select! {
-        biased;
-        result = boundary.as_mut() => panic!("writer completed an unconsumed boundary: {result:?}"),
-        _ = std::future::ready(()) => {}
-    }
-
-    let preceding = recv_reliable_path_command(&mut receivers)
-        .await
-        .expect("preceding validation data");
-    assert!(matches!(
-        &preceding,
-        ReliablePathCommand::SendTcpCarrierValidationData {
-            validation_id: received_validation_id,
-            frame: received_frame,
-        } if *received_validation_id == validation_id && received_frame == &frame
-    ));
-    let marker = recv_reliable_path_command(&mut receivers)
-        .await
-        .expect("writer boundary follows preceding Product data");
-    assert_eq!(reliable_path_command_pending_bytes(&marker), 0);
-    assert_eq!(reliable_path_command_writer_run_bytes(&marker), 1);
-    let completion = match marker {
-        ReliablePathCommand::TcpCarrierValidationWriterBoundary {
-            validation_id: received_validation_id,
-            completion,
-        } => {
-            assert_eq!(received_validation_id, validation_id);
-            completion
-        }
-        _ => panic!("expected typed validation writer boundary"),
-    };
-    assert_eq!(commands.pending_bytes(), frame_bytes as u64);
-    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&preceding));
-    receivers.release_pending_command_bytes(0);
-    assert_eq!(commands.pending_bytes(), 0);
-    assert_eq!(commands.writer_pending_bytes(), 0);
-    tokio::select! {
-        biased;
-        result = boundary.as_mut() => panic!("boundary completed before its writer: {result:?}"),
-        _ = std::future::ready(()) => {}
-    }
-
-    let completed_at = std::time::Instant::now();
-    completion
-        .send(completed_at)
-        .expect("boundary requester remains live");
-    assert_eq!(
-        boundary.await.expect("completed writer boundary"),
-        completed_at
-    );
-}
-
-#[tokio::test]
-async fn tcp_carrier_validation_writer_boundary_fails_when_writer_closes() {
-    let validation_id = NonZeroU64::new(23).expect("nonzero validation id");
-    let (commands, receivers) = reliable_path_command_channels(1);
-    let mut boundary = Box::pin(commands.tcp_carrier_validation_writer_boundary(validation_id));
-    tokio::select! {
-        biased;
-        result = boundary.as_mut() => panic!("writer completed an unconsumed boundary: {result:?}"),
-        _ = std::future::ready(()) => {}
-    }
-
-    drop(receivers);
-    assert!(matches!(
-        boundary.await,
-        Err(crate::runtime::RuntimeError::ReliablePathSessionClosed)
-    ));
-}
-
 #[tokio::test]
 async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
     let (commands, mut receivers) = reliable_path_command_channels(1);
     let reservation = commands
-        .try_reserve_tcp_carrier_validation_data(
-            NonZeroU64::new(7).expect("nonzero validation id"),
-            stream_data_frame(1, 1024),
-            TrafficClass::Throughput,
-        )
-        .expect("pre-drain validation-data reservation");
+        .try_reserve_admitted_frame(stream_data_frame(1, 1024), TrafficClass::Throughput)
+        .expect("pre-drain data reservation");
 
     commands.begin_path_drain();
     assert!(matches!(
         commands.try_reserve_admitted_frame(stream_data_frame(2, 1024), TrafficClass::Throughput),
-        Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
-    ));
-    assert!(matches!(
-        commands.try_reserve_tcp_carrier_validation_data(
-            NonZeroU64::new(8).expect("nonzero validation id"),
-            stream_data_frame(2, 1024),
-            TrafficClass::Throughput,
-        ),
         Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
     ));
     commands
@@ -286,13 +98,10 @@ async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
     let command = draining.await.expect("pre-drain reservation is preserved");
     assert!(matches!(
         &command,
-        ReliablePathCommand::SendTcpCarrierValidationData {
-            validation_id,
-            frame: Frame::StreamData {
-                stream_id: StreamId(1),
-                ..
-            },
-        } if *validation_id == NonZeroU64::new(7).expect("nonzero validation id")
+        ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: StreamId(1),
+            ..
+        })
     ));
     receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
     assert!(
@@ -461,12 +270,11 @@ async fn control_close_discards_stale_stream_data_and_releases_queue_bytes() {
     let (commands, mut receivers) = reliable_path_command_channels(4);
 
     commands
-        .try_reserve_tcp_carrier_validation_data(
-            NonZeroU64::new(9).expect("nonzero validation id"),
+        .try_reserve_admitted_frame(
             stream_data_frame(closed_stream.0, 64 * 1024),
             TrafficClass::Throughput,
         )
-        .expect("reserve validation data that becomes stale")
+        .expect("reserve data that becomes stale")
         .commit();
     commands
         .try_enqueue_stream_ordered_frame(

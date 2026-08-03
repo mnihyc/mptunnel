@@ -123,11 +123,6 @@ struct ClientTcpPathSessionOwnership {
 #[derive(Default)]
 struct ClientTcpPathSessionStart {
     connection: Option<ClientTcpPathConnection>,
-    retained_stream: Option<(
-        StreamId,
-        tokio::sync::mpsc::Sender<Result<Frame, RuntimeError>>,
-    )>,
-    terminal_cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 pub(in crate::runtime::path::tcp) async fn run_client_tcp_path_session(
@@ -172,57 +167,6 @@ pub(in crate::runtime::path::tcp) async fn run_client_tcp_path_session_with_conn
         },
         ClientTcpPathSessionStart {
             connection: Some(connection),
-            ..ClientTcpPathSessionStart::default()
-        },
-    )
-    .await;
-}
-
-pub(in crate::runtime::path::tcp) struct ClientTcpRetainedSessionStart {
-    pub(in crate::runtime::path::tcp) runtime: ClientTcpPathSessionRuntime,
-    pub(in crate::runtime::path::tcp) commands: ReliablePathCommandReceivers,
-    pub(in crate::runtime::path::tcp) published_carrier_instance: Arc<AtomicU64>,
-    pub(in crate::runtime::path::tcp) published_remote_port: Arc<AtomicU32>,
-    pub(in crate::runtime::path::tcp) actor_terminal: Arc<AtomicBool>,
-    pub(in crate::runtime::path::tcp) reservation: ClientTcpCarrierReservation,
-    pub(in crate::runtime::path::tcp) connection: ClientTcpPathConnection,
-    pub(in crate::runtime::path::tcp) stream_id: StreamId,
-    pub(in crate::runtime::path::tcp) stream_frames:
-        tokio::sync::mpsc::Sender<Result<Frame, RuntimeError>>,
-    pub(in crate::runtime::path::tcp) terminal_cleanup: Box<dyn FnOnce() + Send>,
-}
-
-/// Continues one acknowledged validation-purpose carrier as an ordinary
-/// request-direction owner without replaying its already-established target
-/// binding.
-pub(in crate::runtime::path::tcp) async fn run_client_tcp_path_session_with_retained_stream(
-    start: ClientTcpRetainedSessionStart,
-) {
-    let ClientTcpRetainedSessionStart {
-        runtime,
-        commands,
-        published_carrier_instance,
-        published_remote_port,
-        actor_terminal,
-        reservation,
-        connection,
-        stream_id,
-        stream_frames,
-        terminal_cleanup,
-    } = start;
-    run_client_tcp_path_session_inner(
-        runtime,
-        commands,
-        ClientTcpPathSessionOwnership {
-            published_carrier_instance,
-            published_remote_port,
-            actor_terminal,
-            reservation,
-        },
-        ClientTcpPathSessionStart {
-            connection: Some(connection),
-            retained_stream: Some((stream_id, stream_frames)),
-            terminal_cleanup: Some(terminal_cleanup),
         },
     )
     .await;
@@ -242,11 +186,8 @@ async fn run_client_tcp_path_session_inner(
     } = ownership;
     let ClientTcpPathSessionStart {
         connection: initial_connection,
-        retained_stream,
-        terminal_cleanup,
     } = start;
-    let mut actor_terminal =
-        ClientTcpPathActorTerminal::new(actor_terminal, reservation, terminal_cleanup);
+    let mut actor_terminal = ClientTcpPathActorTerminal::new(actor_terminal, reservation);
     let mut carrier_readiness = ClientTcpCarrierReadiness::new(
         published_carrier_instance,
         published_remote_port,
@@ -255,13 +196,9 @@ async fn run_client_tcp_path_session_inner(
     if let Some(connection) = initial_connection.as_ref() {
         carrier_readiness.adopt_published(connection.path_instance_id);
     }
-    let mut streams = HashMap::new();
-    if let Some((stream_id, frames)) = retained_stream {
-        streams.insert(stream_id, ClientTcpPathStreamState::retained(frames));
-    }
     let mut state = ClientTcpPathSessionState {
         connection: initial_connection,
-        streams,
+        streams: HashMap::new(),
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
         datagrams: ClientTcpDatagramState::new(
             runtime.mux_limits.max_streams,
@@ -689,20 +626,14 @@ async fn run_client_tcp_path_session_inner(
 struct ClientTcpPathActorTerminal {
     terminal: Arc<AtomicBool>,
     reservation: Option<ClientTcpCarrierReservation>,
-    cleanup: Option<Box<dyn FnOnce() + Send>>,
     finished: bool,
 }
 
 impl ClientTcpPathActorTerminal {
-    fn new(
-        terminal: Arc<AtomicBool>,
-        reservation: ClientTcpCarrierReservation,
-        cleanup: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Self {
+    fn new(terminal: Arc<AtomicBool>, reservation: ClientTcpCarrierReservation) -> Self {
         Self {
             terminal,
             reservation: Some(reservation),
-            cleanup,
             finished: false,
         }
     }
@@ -713,12 +644,8 @@ impl ClientTcpPathActorTerminal {
         }
         self.terminal.store(true, Ordering::Release);
         self.finished = true;
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup();
-        }
         // Reconciliation wakes from the reservation's release only after the
-        // slot is terminal, all elastic publication is removed, and group
-        // capacity is actually available.
+        // slot is terminal and group capacity is actually available.
         drop(self.reservation.take());
     }
 }
@@ -1000,8 +927,6 @@ fn reject_client_tcp_command_for_path_drain(command: ReliablePathCommand) {
         }
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)
-        | ReliablePathCommand::SendTcpCarrierValidationData { .. }
-        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. }
         | ReliablePathCommand::ResetAndCloseStream { .. }
         | ReliablePathCommand::CloseStream(_) => {}
     }
@@ -1249,8 +1174,6 @@ async fn handle_disconnected_client_tcp_command(
         ReliablePathCommand::SendTcpCapacityProbe(_) => {}
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)
-        | ReliablePathCommand::SendTcpCarrierValidationData { .. }
-        | ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. }
         | ReliablePathCommand::ResetAndCloseStream { .. }
         | ReliablePathCommand::CloseStream(_) => {}
     }
@@ -1304,7 +1227,6 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
         ClientTcpCarrierConnect {
             path: runtime.path(),
             path_id,
-            purpose: runtime.purpose,
             carrier_identity: runtime.carrier_identity,
             session_id: runtime.session_id,
             security: runtime.security(),
@@ -1326,7 +1248,6 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
         result = &mut connect => result?,
     };
     debug_assert_eq!(carrier.path_id, path_id);
-    debug_assert_eq!(carrier.purpose, runtime.purpose);
     let path_instance_id = next_carrier_path_instance_id();
     startup_snapshot.peer_usage = Some(carrier.peer_usage);
     let peer_status = runtime.peer_status.register(runtime.session_id);

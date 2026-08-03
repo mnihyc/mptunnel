@@ -6,19 +6,14 @@
 
 use super::super::queue::ReliableRelaySenderQueue;
 use super::super::work::{ClientReinjectionOutputIdentity, RelaySendCause};
+use super::RequestDataAckGapObservation;
 use super::scheduling::{
     BulkRelayFrameRequest, BulkRelayPathChoice, ObservedBulkPathCandidate,
-    ObservedOrdinaryPathChoice, RequestOrdinarySaturationCheck,
-    RequestOrdinarySaturationObservation, RequestRelayPathObservation,
-    RequestRelaySchedulingObservation, RequestSchedulingState, choose_bulk_relay_path_avoiding,
-    choose_observed_ordinary_data_path, request_ordinary_saturation_observation,
+    ObservedOrdinaryPathChoice, RequestRelayPathObservation, RequestRelaySchedulingObservation,
+    RequestSchedulingState, choose_bulk_relay_path_avoiding, choose_observed_ordinary_data_path,
 };
 use super::tcp_capacity::{
     RequestTcpCapacityController, RequestTcpCapacityEvent, RequestTcpCapacityRetirement,
-};
-use super::{
-    RequestDataAckGapObservation, RequestProductAckOriginalRelease,
-    RequestProductAckOriginalResolution,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -30,73 +25,19 @@ use crate::model::request_evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidenceUpdate, RequestPerFlowRateModel,
     request_path_rate_coverage_floor_bytes,
 };
-use crate::model::tcp_carrier::TcpCarrierStableGenerations;
 use crate::model::timing::reliable_relay_tail_reinjection_delay;
-use crate::model::work::{RangeRecoveryState, flight_interval_bytes};
+use crate::model::work::RangeRecoveryState;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::stream::request::{
-    RequestAckClockOperation, RequestOriginalPathRelease, RequestPathRelease, RequestStreamState,
+    RequestAckClockOperation, RequestPathRelease, RequestStreamState,
 };
 use crate::runtime::stream::{ReliableRelayRemotePath, ReliableRelayRemoteSet};
 use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-
-fn request_product_ack_original_releases(
-    releases: &[RequestOriginalPathRelease],
-) -> smallvec::SmallVec<[RequestProductAckOriginalRelease; 4]> {
-    let mut normalized = smallvec::SmallVec::<[RequestProductAckOriginalRelease; 4]>::new();
-    for release in releases {
-        let resolution = if release.path_proving {
-            RequestProductAckOriginalResolution::Unambiguous
-        } else {
-            RequestProductAckOriginalResolution::Ambiguous
-        };
-        let mut range = release.range;
-        let mut index = 0;
-        while index < normalized.len() {
-            let current = normalized[index];
-            if current.instance == release.instance
-                && current.sent_at == release.sent_at
-                && current.resolution == resolution
-                && current.range.start <= range.end
-                && range.start <= current.range.end
-            {
-                range.start = range.start.min(current.range.start);
-                range.end = range.end.max(current.range.end);
-                normalized.remove(index);
-            } else {
-                index += 1;
-            }
-        }
-        normalized.push(RequestProductAckOriginalRelease {
-            range,
-            bytes: flight_interval_bytes(range.start, range.end),
-            instance: release.instance,
-            sent_at: release.sent_at,
-            resolution,
-        });
-    }
-    normalized.sort_unstable_by_key(|release| {
-        (
-            release.range.start,
-            release.range.end,
-            release.instance.key.underlay,
-            release.instance.key.index,
-            release.instance.path_instance_id.as_u64(),
-            release.instance.attachment_id,
-            release.sent_at,
-            match release.resolution {
-                RequestProductAckOriginalResolution::Unambiguous => 0_u8,
-                RequestProductAckOriginalResolution::Ambiguous => 1_u8,
-            },
-        )
-    });
-    normalized
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn observe_request_relay_scheduling(
@@ -148,6 +89,7 @@ pub(super) fn observe_request_relay_scheduling(
                     .has_fresh_native_carrier_rate_evidence,
                 fresh_proof: evidence.fresh_proof,
                 config_ordinal: evidence.config_ordinal,
+                member_ordinal: evidence.member_ordinal,
             }
         })
         .collect();
@@ -162,10 +104,10 @@ pub(super) fn observe_request_relay_scheduling(
             .map(|candidate| ObservedBulkPathCandidate {
                 candidate,
                 config_ordinal: context.relay_path_config_ordinal(candidate.key),
+                member_ordinal: context.relay_path_member_ordinal(candidate.key),
             })
             .collect(),
         latency_pressure: path_evidence.latency_pressure,
-        tcp_carrier_policy_epochs: path_evidence.tcp_carrier_policy_epochs,
     }
 }
 
@@ -206,22 +148,9 @@ fn observed_request_load_expectation(
 #[derive(Debug)]
 pub(super) struct RequestMultipathPlan {
     target: RequestMultipathTarget,
-    tcp_carrier_stable: Option<TcpCarrierStableGenerations>,
     product_mutation: RequestProductSendMutation,
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
     request_proof_expectation: Option<RelayPathProofEpoch>,
-}
-
-#[derive(Debug)]
-pub(super) enum RequestMultipathPlanError {
-    Runtime(RuntimeError),
-    OrdinarySaturation(Box<RequestOrdinarySaturationObservation>),
-}
-
-impl From<RuntimeError> for RequestMultipathPlanError {
-    fn from(error: RuntimeError) -> Self {
-        Self::Runtime(error)
-    }
 }
 
 /// Preparation may enqueue control evidence but never publishes unique data.
@@ -266,7 +195,6 @@ impl RequestMultipathPlan {
     fn new(target: RequestMultipathTarget, product_mutation: RequestProductSendMutation) -> Self {
         Self {
             target,
-            tcp_carrier_stable: None,
             product_mutation,
             request_load_expectation: None,
             request_proof_expectation: None,
@@ -275,15 +203,6 @@ impl RequestMultipathPlan {
 
     pub(super) fn target(&self) -> (u64, RelayPathInstance) {
         (self.target.membership_generation, self.target.instance)
-    }
-
-    pub(super) fn tcp_carrier_stable(&self) -> Option<TcpCarrierStableGenerations> {
-        self.tcp_carrier_stable
-    }
-
-    fn with_tcp_carrier_stable(mut self, stable: Option<TcpCarrierStableGenerations>) -> Self {
-        self.tcp_carrier_stable = stable;
-        self
     }
 
     pub(super) fn load_expectation(&self) -> Option<(RelayPathKey, u32, u32)> {
@@ -332,7 +251,7 @@ impl RequestMultipathController {
             .unique_original_flight_for_frame(preview);
         let original_path = original_flight
             .map(|(instance, _)| instance)
-            .filter(|instance| remotes.contains_flight_owner_instance(*instance));
+            .filter(|instance| remotes.contains_path_instance(*instance));
         let original_underlay = self
             .request
             .flights
@@ -341,7 +260,7 @@ impl RequestMultipathController {
         // its RTT or congestion evidence to an older attachment's flight.
         let original_path_timing =
             original_path.and_then(|instance| context.reliable_path_snapshot(instance.key));
-        let live_instances = remotes.flight_owner_instances();
+        let live_instances = remotes.path_instances();
         let avoid_instances = self
             .request
             .flights
@@ -396,7 +315,7 @@ impl RequestMultipathController {
             RelaySendCause::TailReinjection => {
                 let owner_keys = self.request.flights.tail_reinjection_owner_keys(
                     frame,
-                    &remotes.flight_owner_instances(),
+                    &remotes.path_instances(),
                     Duration::ZERO,
                     Duration::ZERO,
                 );
@@ -409,17 +328,11 @@ impl RequestMultipathController {
             cause if cause.is_ack_gap_reinjection() => self
                 .request
                 .flights
-                .original_transmission_instances_for_frame(
-                    frame,
-                    &remotes.flight_owner_instances(),
-                ),
+                .original_transmission_instances_for_frame(frame, &remotes.path_instances()),
             RelaySendCause::StalePathReinjection(_) => self
                 .request
                 .flights
-                .original_transmission_instances_for_frame(
-                    frame,
-                    &remotes.flight_owner_instances(),
-                ),
+                .original_transmission_instances_for_frame(frame, &remotes.path_instances()),
             cause if cause.is_reinjection() => self.request.flights.sent_instances_for_frame(frame),
             _ => Vec::new(),
         }
@@ -465,10 +378,6 @@ impl RequestMultipathController {
         self.request
             .flights
             .latest_unacked_ranges_for_path_instance(instance)
-    }
-
-    pub(super) fn original_data_in_flight_bytes(&self, instance: RelayPathInstance) -> u64 {
-        self.request.flights.original_data_in_flight_bytes(instance)
     }
 
     pub(super) fn unacked_original_paths_before(
@@ -705,10 +614,7 @@ impl RequestMultipathController {
             && self
                 .request
                 .flights
-                .has_missing_original_transmission_before_offset(
-                    offset,
-                    &remotes.flight_owner_instances(),
-                )
+                .has_missing_original_transmission_before_offset(offset, &remotes.path_instances())
         {
             return Err(RuntimeError::SenderServiceBlocked);
         }
@@ -723,27 +629,6 @@ impl RequestMultipathController {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn ordinary_saturation_after_block(
-        &self,
-        observation: &RequestRelaySchedulingObservation,
-        frame: &Frame,
-        lane: TrafficClass,
-        cause: RelaySendCause,
-        avoid_instances: &[RelayPathInstance],
-    ) -> Option<Box<RequestOrdinarySaturationObservation>> {
-        request_ordinary_saturation_observation(RequestOrdinarySaturationCheck {
-            observation,
-            lane,
-            frame,
-            cause,
-            avoid_instances,
-            path_flights: &self.request.flights,
-            stale_paths: &self.request.stale_paths,
-        })
-        .map(Box::new)
-    }
-
     pub(super) fn plan_relay_path_send(
         &mut self,
         context: &ClientPathContext,
@@ -752,7 +637,7 @@ impl RequestMultipathController {
         lane: TrafficClass,
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
-    ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
+    ) -> Result<RequestMultipathPlan, RuntimeError> {
         let prepared = self.prepare_relay_path_decision(context, remotes, frame, lane, cause)?;
         if let Some(payload_bytes) = prepared.unique_data_payload_bytes {
             let observe_bulk_admission =
@@ -788,9 +673,6 @@ impl RequestMultipathController {
                             instance,
                         },
                         RequestProductSendMutation::Data,
-                    )
-                    .with_tcp_carrier_stable(
-                        relay_observation.tcp_carrier_stable_generations_for_instance(instance),
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
@@ -828,8 +710,6 @@ impl RequestMultipathController {
                             membership_generation: relay_observation.membership_generation,
                             instance: candidate,
                         },
-                        tcp_carrier_stable: relay_observation
-                            .tcp_carrier_stable_generations_for_instance(candidate),
                         product_mutation: RequestProductSendMutation::OriginalData {
                             candidate,
                             target_bytes,
@@ -868,8 +748,6 @@ impl RequestMultipathController {
                             membership_generation: relay_observation.membership_generation,
                             instance: reference,
                         },
-                        tcp_carrier_stable: relay_observation
-                            .tcp_carrier_stable_generations_for_instance(reference),
                         product_mutation: RequestProductSendMutation::MeasurementFence {
                             reference,
                             candidate,
@@ -884,18 +762,7 @@ impl RequestMultipathController {
                         request_proof_expectation: None,
                     });
                 }
-                BulkRelayPathChoice::Blocked => {
-                    if let Some(observation) = self.ordinary_saturation_after_block(
-                        &relay_observation,
-                        frame,
-                        lane,
-                        cause,
-                        avoid_instances,
-                    ) {
-                        return Err(RequestMultipathPlanError::OrdinarySaturation(observation));
-                    }
-                    return Err(RuntimeError::SenderServiceBlocked.into());
-                }
+                BulkRelayPathChoice::Blocked => return Err(RuntimeError::SenderServiceBlocked),
                 BulkRelayPathChoice::NotApplicable => {
                     let instance = match choose_observed_ordinary_data_path(
                         &relay_observation,
@@ -906,21 +773,10 @@ impl RequestMultipathController {
                     ) {
                         ObservedOrdinaryPathChoice::Selected(instance) => instance,
                         ObservedOrdinaryPathChoice::Blocked => {
-                            if let Some(observation) = self.ordinary_saturation_after_block(
-                                &relay_observation,
-                                frame,
-                                lane,
-                                cause,
-                                avoid_instances,
-                            ) {
-                                return Err(RequestMultipathPlanError::OrdinarySaturation(
-                                    observation,
-                                ));
-                            }
-                            return Err(RuntimeError::SenderServiceBlocked.into());
+                            return Err(RuntimeError::SenderServiceBlocked);
                         }
                         ObservedOrdinaryPathChoice::NoLivePath => {
-                            return Err(RuntimeError::ReliablePathSessionClosed.into());
+                            return Err(RuntimeError::ReliablePathSessionClosed);
                         }
                     };
                     let mut selection = RequestMultipathPlan::new(
@@ -929,9 +785,6 @@ impl RequestMultipathController {
                             instance,
                         },
                         RequestProductSendMutation::Data,
-                    )
-                    .with_tcp_carrier_stable(
-                        relay_observation.tcp_carrier_stable_generations_for_instance(instance),
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
@@ -1449,29 +1302,8 @@ impl RequestMultipathController {
         _remotes: &ReliableRelayRemoteSet,
         ranges: &[OffsetRange],
         acked_at: Instant,
-        capture_original_releases: bool,
-    ) -> (
-        smallvec::SmallVec<[RelayPathInstance; 4]>,
-        Option<smallvec::SmallVec<[RequestProductAckOriginalRelease; 4]>>,
-    ) {
-        // Receipt collection is a dormant ACK-transaction branch. The regular
-        // path instantiates the release ledger without original-range capture,
-        // allocation, synchronization, or per-release receipt work.
-        let (released, original_releases) = if capture_original_releases {
-            let (released, originals) = self
-                .request
-                .flights
-                .release_normalized_acked_ranges_with_originals(ranges);
-            (
-                released,
-                Some(request_product_ack_original_releases(&originals)),
-            )
-        } else {
-            (
-                self.request.flights.release_normalized_acked_ranges(ranges),
-                None,
-            )
-        };
+    ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
+        let released = self.request.flights.release_normalized_acked_ranges(ranges);
         let delivered_data = self.apply_released_data_at(context, released, acked_at);
         let data_ack_progress_paths = delivered_data
             .iter()
@@ -1480,7 +1312,7 @@ impl RequestMultipathController {
         for instance in &data_ack_progress_paths {
             self.request.stale_paths.remove(instance);
         }
-        (data_ack_progress_paths, original_releases)
+        data_ack_progress_paths
     }
 
     fn apply_released_data_at(
@@ -1697,7 +1529,7 @@ impl RequestMultipathController {
     ) -> Vec<RelayPathInstance> {
         let mut instances = self.stale_original_paths(remotes);
         for instance in self.request.flights.original_transmission_instances() {
-            if !remotes.contains_flight_owner_instance(instance) && !instances.contains(&instance) {
+            if !remotes.contains_path_instance(instance) && !instances.contains(&instance) {
                 instances.push(instance);
             }
         }
@@ -1719,17 +1551,6 @@ impl RequestMultipathController {
         self.request
             .flights
             .record_original_frame_instance(instance, frame);
-    }
-
-    #[cfg(test)]
-    pub(super) fn record_reinjection_frame_for_test(
-        &mut self,
-        instance: RelayPathInstance,
-        frame: &Frame,
-    ) {
-        self.request
-            .flights
-            .record_reinjection_frame_instance(instance, frame);
     }
 
     /// Periodic Data-ACK repair is useful only when the chosen ordered carrier

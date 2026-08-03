@@ -257,10 +257,14 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
     assert_eq!(disabled["path"], "primary");
     {
         let health = context.health().lock().expect("disabled health");
-        assert_eq!(health.tcp.len(), 2);
+        assert_eq!(health.tcp.len(), 3);
         assert!(health.tcp.iter().all(|record| record.manual_disabled));
-        assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
-        assert_eq!(health.tcp[1].state, SchedulerPathState::Failed);
+        assert!(
+            health
+                .tcp
+                .iter()
+                .all(|record| record.state == SchedulerPathState::Failed)
+        );
     }
     target
         .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"enabled"}"#)
@@ -268,8 +272,12 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
 
     let health = context.health().lock().expect("health");
     assert!(health.tcp.iter().all(|record| !record.manual_disabled));
-    assert_eq!(health.tcp[0].state, SchedulerPathState::Suspect);
-    assert_eq!(health.tcp[1].state, SchedulerPathState::Suspect);
+    assert!(
+        health
+            .tcp
+            .iter()
+            .all(|record| record.state == SchedulerPathState::Suspect)
+    );
 }
 
 #[test]
@@ -281,7 +289,9 @@ fn node_path_control_can_select_client_by_outbound_name() {
         vec![ClientPathConfig {
             name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443".parse().expect("path"),
+            spec: "tcp://127.0.0.1:443?tcp-carriers=1-1"
+                .parse()
+                .expect("path"),
             security,
         }],
         ResourceLimits::default(),
@@ -346,7 +356,9 @@ fn client_status_exposes_named_inventory_without_credentials() {
         vec![ClientPathConfig {
             name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443".parse().expect("path"),
+            spec: "tcp://127.0.0.1:443?tcp-carriers=1-1"
+                .parse()
+                .expect("path"),
             security,
         }],
         ResourceLimits::default(),
@@ -399,8 +411,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert_eq!(status.paths.len(), 1);
     assert_eq!(status.paths[0].path, "path-1");
     assert_eq!(status.paths[0].tcp_carrier_ordinal, Some(1));
-    assert_eq!(status.paths[0].tcp_carriers_min, Some(1));
-    assert_eq!(status.paths[0].tcp_carriers_max, Some(3));
+    assert_eq!(status.paths[0].tcp_carriers_max, Some(1));
     assert_eq!(status.outbounds[0].name, "daily-direct");
     assert_eq!(status.outbounds[0].protocol, "direct");
     assert_eq!(status.outbounds[0].networks, ["tcp", "udp"]);
@@ -415,7 +426,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
 }
 
 #[test]
-fn status_projects_retained_elastic_tcp_carriers() {
+fn status_projects_the_bounded_tcp_carrier_pool() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
@@ -433,11 +444,6 @@ fn status_projects_retained_elastic_tcp_carriers() {
         Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
-    {
-        let mut health = context.health().lock().expect("health");
-        let record = health.new_tcp_elastic_record();
-        assert!(health.insert_tcp_elastic_record(1, record));
-    }
     let target = ManagementTarget {
         clients: vec![context],
         servers: Vec::new(),
@@ -454,12 +460,12 @@ fn status_projects_retained_elastic_tcp_carriers() {
     target.refresh_sample_snapshot();
     let status = target.snapshot();
     assert_eq!(status.summary.configured_path_count, 1);
-    assert_eq!(status.summary.path_count, 2);
-    assert_eq!(status.paths.len(), 2);
+    assert_eq!(status.summary.path_count, 3);
+    assert_eq!(status.paths.len(), 3);
     assert_eq!(status.paths[1].path, "primary");
     assert_eq!(status.paths[1].tcp_carrier_ordinal, Some(2));
-    assert_eq!(status.paths[1].tcp_carriers_min, Some(1));
     assert_eq!(status.paths[1].tcp_carriers_max, Some(3));
+    assert_eq!(status.paths[2].tcp_carrier_ordinal, Some(3));
 }
 
 #[test]
@@ -471,7 +477,9 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
         vec![ClientPathConfig {
             name: "primary".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443".parse().expect("path"),
+            spec: "tcp://127.0.0.1:443?tcp-carriers=1-1"
+                .parse()
+                .expect("path"),
             security,
         }],
         ResourceLimits::default(),

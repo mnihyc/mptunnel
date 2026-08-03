@@ -6,7 +6,6 @@
 use super::super::io::encrypted_framed_peer_closed;
 use super::datagram::{ServerTcpDatagramEffect, ServerTcpDatagramState};
 use super::evidence::ServerTcpEvidenceState;
-use super::service::{ServerTcpCarrierDemand, ServerTcpCarrierDemandSubscription};
 use super::stream::ServerTcpStreamState;
 use super::writer::ServerTcpWriter;
 #[cfg(feature = "lab-diagnostics")]
@@ -53,7 +52,6 @@ enum ServerTcpPathEvent {
     Command(ReliablePathCommand),
     PeerStatusRequest(u64),
     SenderObservationDue,
-    CarrierDemand(ServerTcpCarrierDemand),
 }
 
 enum ServerTcpPathDrainEvent {
@@ -74,7 +72,6 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathAdmission {
     pub(in crate::runtime::path::tcp) commands_rx: ReliablePathCommandReceivers,
     pub(in crate::runtime::path::tcp) evidence: ServerTcpEvidenceState,
     pub(in crate::runtime::path::tcp) peer_status: PeerStatusCarrier,
-    pub(in crate::runtime::path::tcp) carrier_demands: ServerTcpCarrierDemandSubscription,
 }
 
 pub(in crate::runtime::path::tcp) struct ServerTcpPathSession {
@@ -91,7 +88,6 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathSession {
     deferred_input: Option<Frame>,
     writer: ServerTcpWriter,
     peer_status: PeerStatusCarrier,
-    carrier_demands: ServerTcpCarrierDemandSubscription,
     path_registration: ServerCarrierPathRegistration,
     context: ServerPathContext,
 }
@@ -111,7 +107,6 @@ impl ServerTcpPathSession {
             deferred_input: None,
             writer: admission.writer,
             peer_status: admission.peer_status,
-            carrier_demands: admission.carrier_demands,
             path_registration: admission.path_registration,
             context: admission.context,
         }
@@ -129,14 +124,6 @@ impl ServerTcpPathSession {
     }
 
     async fn run_active(mut self) -> Result<(), RuntimeError> {
-        if let Some(demand) = self.carrier_demands.current()
-            && matches!(
-                self.write_reply(demand.into_frame()).await?,
-                ServerTcpFrameDisposition::Stop
-            )
-        {
-            return Ok(());
-        }
         loop {
             let event = if let Some(frame) = self.deferred_input.take() {
                 Some(ServerTcpPathEvent::Frame(frame))
@@ -145,7 +132,6 @@ impl ServerTcpPathSession {
                     &mut self.path_frames,
                     &mut self.commands_rx,
                     &mut self.peer_status,
-                    Some(&mut self.carrier_demands),
                     self.evidence.next_sender_observation_at(),
                 )
                 .await?
@@ -192,14 +178,6 @@ impl ServerTcpPathSession {
                     }
                 }
                 ServerTcpPathEvent::SenderObservationDue => {}
-                ServerTcpPathEvent::CarrierDemand(demand) => {
-                    if matches!(
-                        self.write_reply(demand.into_frame()).await?,
-                        ServerTcpFrameDisposition::Stop
-                    ) {
-                        return Ok(());
-                    }
-                }
             }
         }
     }
@@ -227,7 +205,6 @@ impl ServerTcpPathSession {
                         &mut self.path_frames,
                         &mut self.commands_rx,
                         &mut self.peer_status,
-                        None,
                         self.evidence.next_sender_observation_at(),
                     ) => event?,
                 }
@@ -260,9 +237,6 @@ impl ServerTcpPathSession {
                     }
                 }
                 ServerTcpPathEvent::SenderObservationDue => {}
-                ServerTcpPathEvent::CarrierDemand(_) => {
-                    unreachable!("draining TCP carrier does not receive new demand")
-                }
             }
         }
 
@@ -624,7 +598,6 @@ impl ServerTcpPathSession {
         let mut sent_items = 0usize;
         let mut wrote_frame = false;
         let mut writer_pending_bytes = 0usize;
-        let mut writer_boundary = None;
 
         loop {
             let Some(command) = next_command.take().or_else(|| {
@@ -681,20 +654,6 @@ impl ServerTcpPathSession {
                     return Err(RuntimeError::Protocol(
                         "server TCP path received request capacity command",
                     ));
-                }
-                ReliablePathCommand::SendTcpCarrierValidationData { .. } => {
-                    self.commands_rx
-                        .release_pending_command_bytes(pending_bytes);
-                    return Err(RuntimeError::Protocol(
-                        "ordinary server TCP path received carrier validation data",
-                    ));
-                }
-                ReliablePathCommand::TcpCarrierValidationWriterBoundary {
-                    validation_id: _,
-                    completion,
-                } => {
-                    writer_boundary = Some(completion);
-                    break;
                 }
                 ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
                     // A TCP session is shared, so retire only this attachment
@@ -796,12 +755,8 @@ impl ServerTcpPathSession {
                 sent_items >= item_budget,
             ),
         );
-        if (wrote_frame || writer_boundary.is_some()) && !self.writer.flush().await? {
+        if wrote_frame && !self.writer.flush().await? {
             return Ok(ServerTcpSessionDisposition::Stop);
-        }
-        if let Some(completion) = writer_boundary {
-            self.commands_rx.release_pending_command_bytes(0);
-            let _ = completion.send(std::time::Instant::now());
         }
         Ok(ServerTcpSessionDisposition::Continue)
     }
@@ -950,7 +905,6 @@ async fn recv_server_tcp_path_event(
     path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     commands_rx: &mut ReliablePathCommandReceivers,
     peer_status: &mut PeerStatusCarrier,
-    mut carrier_demands: Option<&mut ServerTcpCarrierDemandSubscription>,
     sender_observation_at: Option<std::time::Instant>,
 ) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {
     let sender_observation_timer = async move {
@@ -969,16 +923,6 @@ async fn recv_server_tcp_path_event(
             request_id = peer_status.recv_request() => {
                 if let Some(request_id) = request_id {
                     return Ok(Some(ServerTcpPathEvent::PeerStatusRequest(request_id)));
-                }
-            }
-            demand = async {
-                match carrier_demands.as_mut() {
-                    Some(demands) => demands.changed().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(demand) = demand {
-                    return Ok(Some(ServerTcpPathEvent::CarrierDemand(demand)));
                 }
             }
             frame = path_frames.recv() => {

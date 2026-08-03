@@ -15,7 +15,6 @@ use super::tcp::client::{
     ClientTcpPathSessionHandle, ClientTcpPathSessionRuntime, tcp_session_command_queue,
 };
 use super::tcp::group::{ClientTcpCarrierGroup, ClientTcpCarrierGroups};
-use super::tcp::retained::ClientTcpRetainedCarrierRegistry;
 use crate::config::ClientPathConfig;
 #[cfg(test)]
 use crate::config::ClientSecurityConfig;
@@ -48,9 +47,6 @@ use std::time::{Duration, Instant};
 /// Process-owned dependencies shared by every carrier in one client path group.
 pub(in crate::runtime) struct ClientPathRuntimeOptions {
     pub(in crate::runtime) session_retention_timeout: Duration,
-    /// Existing carrier-establishment ceiling shared by minimum reconciliation
-    /// and elastic validation; validation introduces no independent timer.
-    pub(in crate::runtime) path_probe_timeout: Duration,
     pub(in crate::runtime) path_group_ordinal: usize,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(in crate::runtime) allow_peer_diagnostics: bool,
@@ -64,8 +60,7 @@ pub struct ClientPathContext {
     pub(in crate::runtime) outbound: Option<OutboundId>,
     // Carrier ownership: path specs, per-path security, and live sessions belong
     // to the MPP session's carrier path registry, not to individual streams.
-    /// Configured-minimum TCP carriers visible to ordinary Core scheduling.
-    /// Elastic candidates stay outside this inventory until validation commits.
+    /// Every configured TCP carrier-pool member visible to ordinary scheduling.
     pub(in crate::runtime) tcp_paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) udp_paths: Arc<Vec<PathSpec>>,
     /// Stable Product names aligned with each underlay-local path vector.
@@ -75,7 +70,6 @@ pub struct ClientPathContext {
     pub(in crate::runtime) tcp_config_indices: Arc<Vec<usize>>,
     pub(in crate::runtime) tcp_member_ordinals: Arc<Vec<u16>>,
     pub(in crate::runtime) tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
-    pub(in crate::runtime) tcp_retained_carriers: Arc<ClientTcpRetainedCarrierRegistry>,
     pub(in crate::runtime) udp_path_ordinals: Arc<Vec<usize>>,
     #[cfg(test)]
     pub(in crate::runtime) tcp_security: Arc<Vec<ClientSecurityConfig>>,
@@ -91,7 +85,6 @@ pub struct ClientPathContext {
     pub(in crate::runtime) mux_limits: MuxLimits,
     /// RFC 8684 break-before-make lifetime for established logical streams.
     pub(in crate::runtime) session_retention_timeout: std::time::Duration,
-    pub(in crate::runtime) path_probe_timeout: std::time::Duration,
     // All reliable streams share one work-conserving unique-byte memory owner.
     // Per-stream peer windows and per-carrier congestion authority stay separate.
     pub(in crate::runtime) session_send_buffer: SessionSendBuffer,
@@ -170,7 +163,6 @@ impl ClientPathContext {
             outbound,
             ClientPathRuntimeOptions {
                 session_retention_timeout: crate::config::DEFAULT_SESSION_RETENTION_TIMEOUT,
-                path_probe_timeout: crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
                 path_group_ordinal,
                 carrier_network,
                 allow_peer_diagnostics: false,
@@ -198,7 +190,6 @@ impl ClientPathContext {
     ) -> Result<Self, RuntimeError> {
         let ClientPathRuntimeOptions {
             session_retention_timeout,
-            path_probe_timeout,
             path_group_ordinal,
             carrier_network,
             allow_peer_diagnostics,
@@ -255,9 +246,10 @@ impl ClientPathContext {
             return Err(RuntimeError::PathIdOverflow);
         }
 
-        // Preserve every configured endpoint's historical primary index, then
-        // append only its configured-minimum siblings. Unopened elastic
-        // capacity is not an ordinary path, health record, or session actor.
+        // Preserve every configured endpoint's primary index, then append its
+        // remaining bounded pool members. Every healthy member is an ordinary
+        // bidirectional carrier; the configured scheduler decides whether it
+        // receives Product work.
         let configured_tcp_path_names = tcp_path_names.clone();
         let configured_tcp_path_ordinals = tcp_path_ordinals.clone();
         let mut tcp_paths = tcp_config_paths.clone();
@@ -276,7 +268,7 @@ impl ClientPathContext {
             })
             .collect::<Vec<_>>();
         for group in &mut tcp_carrier_groups {
-            for member_ordinal in 1..group.range.min() {
+            for member_ordinal in 1..group.range.max() {
                 let path_index = tcp_paths.len();
                 tcp_paths.push(tcp_config_paths[group.config_index].clone());
                 tcp_path_names.push(configured_tcp_path_names[group.config_index].clone());
@@ -286,16 +278,6 @@ impl ClientPathContext {
                 group.members.push(path_index);
             }
         }
-        let mut next_elastic_path_index = tcp_paths.len();
-        for group in &mut tcp_carrier_groups {
-            for _ in group.range.min()..group.range.max() {
-                group.elastic_slots.push(next_elastic_path_index);
-                next_elastic_path_index = next_elastic_path_index
-                    .checked_add(1)
-                    .ok_or(RuntimeError::PathIdOverflow)?;
-            }
-        }
-
         // Context and carrier actors share one immutable configuration backing;
         // reconnecting a session must not deep-copy endpoint or secret material.
         let tcp_config_paths = Arc::new(tcp_config_paths);
@@ -313,21 +295,10 @@ impl ClientPathContext {
         let udp_security = Arc::new(udp_security);
         let udp_tls = Arc::new(udp_tls);
         let path_proof_limit = resources.max_streams.saturating_mul(2).max(1);
-        let state = ClientPathState::new_with_tcp_path_slot_count(
-            ClientPathHealth::new(
-                vec![
-                    ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
-                    tcp_paths.len()
-                ],
-                vec![
-                    ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
-                    udp_paths.len()
-                ],
-            ),
-            next_elastic_path_index,
-        );
-        let tcp_retained_carriers =
-            ClientTcpRetainedCarrierRegistry::new(state.tcp_carrier_service().clone());
+        let state = ClientPathState::new(ClientPathHealth::new(
+            vec![ClientPathHealthRecord::with_path_proof_limit(path_proof_limit); tcp_paths.len()],
+            vec![ClientPathHealthRecord::with_path_proof_limit(path_proof_limit); udp_paths.len()],
+        ));
         let codec_limits = resources.into();
         let mux_limits = resources.into();
         let session_send_buffer = SessionSendBuffer::from_limits(mux_limits);
@@ -337,17 +308,10 @@ impl ClientPathContext {
         let peer_status_snapshot = PeerStatusSnapshotSource::new({
             let tcp_paths = tcp_paths.clone();
             let udp_paths = udp_paths.clone();
-            let tcp_carrier_groups = tcp_carrier_groups.clone();
             let state = state.clone();
             let authenticated_carriers = authenticated_carriers.clone();
             move || {
-                client_peer_status_snapshot(
-                    &tcp_paths,
-                    &udp_paths,
-                    &tcp_carrier_groups,
-                    &state,
-                    &authenticated_carriers,
-                )
+                client_peer_status_snapshot(&tcp_paths, &udp_paths, &state, &authenticated_carriers)
             }
         });
         let tcp_sessions = (0..tcp_paths.len())
@@ -362,7 +326,6 @@ impl ClientPathContext {
                     path_index,
                     path_id: None,
                     remote_port: None,
-                    purpose: crate::protocol::PathPurpose::Ordinary,
                     carrier_identity: CarrierPathIdentity {
                         group_ordinal: path_group_ordinal,
                         path_ordinal: tcp_path_ordinals[path_index],
@@ -385,7 +348,6 @@ impl ClientPathContext {
                     authenticated_carriers: authenticated_carriers.clone(),
                     endpoint_policy,
                     carrier_groups: tcp_carrier_groups.clone(),
-                    retained_carriers: tcp_retained_carriers.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -427,7 +389,6 @@ impl ClientPathContext {
             tcp_config_indices,
             tcp_member_ordinals,
             tcp_carrier_groups,
-            tcp_retained_carriers,
             udp_path_ordinals,
             #[cfg(test)]
             tcp_security,
@@ -442,7 +403,6 @@ impl ClientPathContext {
             authenticated_carriers,
             mux_limits,
             session_retention_timeout,
-            path_probe_timeout,
             session_send_buffer,
             #[cfg(test)]
             proxy_auth: ProxyAuthConfig::disabled(),
@@ -480,40 +440,19 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn tcp_config_index(&self, path_index: usize) -> Option<usize> {
-        self.tcp_config_indices
-            .get(path_index)
-            .copied()
-            .or_else(|| {
-                self.tcp_carrier_groups
-                    .elastic_path_owner(path_index)
-                    .map(|(config_index, _)| config_index)
-            })
+        self.tcp_config_indices.get(path_index).copied()
     }
 
     pub(in crate::runtime) fn tcp_member_ordinal(&self, path_index: usize) -> Option<u16> {
-        self.tcp_member_ordinals
-            .get(path_index)
-            .copied()
-            .or_else(|| {
-                self.tcp_carrier_groups
-                    .elastic_path_owner(path_index)
-                    .map(|(_, member_ordinal)| member_ordinal)
-            })
+        self.tcp_member_ordinals.get(path_index).copied()
     }
 
-    /// Resolves a configured-minimum member directly and an elastic slot
-    /// through immutable endpoint ownership. Callers still require active
-    /// health or an exact reservation before the slot has any authority.
+    /// Resolves one configured bounded-pool member.
     pub(in crate::runtime) fn tcp_path_spec(&self, path_index: usize) -> Option<&PathSpec> {
-        self.tcp_paths.get(path_index).or_else(|| {
-            self.tcp_carrier_groups
-                .elastic_path_owner(path_index)
-                .and_then(|(config_index, _)| self.tcp_paths.get(config_index))
-        })
+        self.tcp_paths.get(path_index)
     }
 
-    /// Resolves the configured endpoint name shared by every minimum or
-    /// elastic carrier member in that endpoint's group.
+    /// Resolves the configured endpoint name shared by every pool member.
     pub(in crate::runtime) fn tcp_path_name(&self, path_index: usize) -> Option<&str> {
         self.tcp_config_index(path_index)
             .and_then(|config_index| self.tcp_path_names.get(config_index))
@@ -521,11 +460,7 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn tcp_path_config_ordinal(&self, path_index: usize) -> Option<usize> {
-        self.tcp_path_ordinals.get(path_index).copied().or_else(|| {
-            self.tcp_carrier_groups
-                .elastic_path_owner(path_index)
-                .and_then(|(config_index, _)| self.tcp_path_ordinals.get(config_index).copied())
-        })
+        self.tcp_path_ordinals.get(path_index).copied()
     }
 
     pub(in crate::runtime) fn tcp_endpoint(
@@ -570,13 +505,27 @@ impl ClientPathContext {
         .unwrap_or(usize::MAX)
     }
 
+    /// Local pool tier used only after scheduling evidence compares equal.
+    /// QUIC and each TCP endpoint's first carrier occupy tier zero.
+    pub(in crate::runtime) fn relay_path_member_ordinal(&self, key: RelayPathKey) -> u16 {
+        match key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_member_ordinal(key.index),
+            UnderlayProtocol::Udp => self.udp_paths.get(key.index).map(|_| 0),
+        }
+        .unwrap_or(u16::MAX)
+    }
+
     pub(in crate::runtime) fn relay_path_key_order(
         &self,
         left: RelayPathKey,
         right: RelayPathKey,
     ) -> std::cmp::Ordering {
-        self.relay_path_config_ordinal(left)
-            .cmp(&self.relay_path_config_ordinal(right))
+        self.relay_path_member_ordinal(left)
+            .cmp(&self.relay_path_member_ordinal(right))
+            .then_with(|| {
+                self.relay_path_config_ordinal(left)
+                    .cmp(&self.relay_path_config_ordinal(right))
+            })
             .then_with(|| left.index.cmp(&right.index))
             .then_with(|| left.underlay.cmp(&right.underlay))
     }
@@ -585,7 +534,6 @@ impl ClientPathContext {
 fn client_peer_status_snapshot(
     tcp_paths: &[PathSpec],
     udp_paths: &[PathSpec],
-    tcp_carrier_groups: &ClientTcpCarrierGroups,
     state: &ClientPathState,
     authenticated_carriers: &AuthenticatedCarrierInventory,
 ) -> Option<Vec<PeerPathStatus>> {
@@ -609,11 +557,7 @@ fn client_peer_status_snapshot(
         if !record.has_live_authenticated_carrier() {
             continue;
         }
-        let path = tcp_paths.get(path_index).or_else(|| {
-            tcp_carrier_groups
-                .elastic_path_owner(path_index)
-                .and_then(|(config_index, _)| tcp_paths.get(config_index))
-        })?;
+        let path = tcp_paths.get(path_index)?;
         let observation = record.observation_at(now);
         let path_id = observation.wire_path_id?;
         if !tcp_path_ids.insert(path_id) {

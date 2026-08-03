@@ -2,8 +2,8 @@
 
 MPTUNNEL is an encrypted multipath proxy and tunnel for everyday Internet use.
 It combines independent TCP and QUIC paths into one logical connection, adds
-capacity when demand justifies it, and keeps established traffic alive when a
-carrier disappears.
+their available capacity according to live completion evidence, and keeps
+established traffic alive when a carrier disappears.
 
 It provides the daily-use surface expected from a modern proxy: SOCKS5, HTTP
 CONNECT, TCP/UDP port forwarding, TUN, routing, DNS policy, outbound selection,
@@ -39,8 +39,8 @@ carrier disappears.
 | MPTCP | — | — | — | — | ✓ | — | ✓ | ✓ |
 
 Live delivery—not a source IP—ranks eligible carriers. A TCP endpoint defaults
-to a demand-driven `1-3` carrier range; added sessions stay only when completed
-delivery proves useful service.
+to three ordinary carrier connections; keeping a carrier ready never forces
+traffic onto it.
 
 Reference behavior is taken from the
 [Hysteria client modes and TUN documentation](https://v2.hysteria.network/docs/advanced/Full-Client-Config/),
@@ -68,10 +68,9 @@ host. Product comparisons used two flows for 20 seconds.
 | **MPTUNNEL** | MPP/QUIC | **244.596** | **229.631** | 2/2 |
 
 MPP/QUIC delivered 2.64× Hysteria2's download goodput. MPP/TCP did not beat
-Xray on this lossy single path: direct and Xray gave each flow its own native
-TCP connection, while MPP/TCP initially shared one carrier. Its bounded range
-expands only when added delivery proves useful. Incomplete uploads are excluded
-from ratios.
+Xray on this lossy single-path sample. Multiple TCP carriers on one route do
+not create independent network capacity or remove native TCP head-of-line
+recovery. Incomplete uploads are excluded from ratios.
 
 ### Five 500 Mbps paths
 
@@ -160,7 +159,7 @@ SOCKS5 / HTTP CONNECT / TCP+UDP forward / TUN
                    independent links
 ```
 
-MPP version 5 uses independent sequence and receive-window state in each
+MPP version 6 uses independent sequence and receive-window state in each
 stream direction. Carrier state is fenced by its physical lifetime, so a
 reconnect never inherits stale congestion, flight, or delivery evidence.
 Configured backup/expensive flags are restrictions; live measurements and
@@ -302,7 +301,7 @@ and assets are never replaced; corrections use a new release.
 - [Operations](docs/OPERATIONS.md)
 - [Reference configuration](examples/config.reference.toml)
 - [Performance evidence](docs/PERFORMANCE.md)
-- [MPP version 5 specification](RFC.md)
+- [MPP version 6 specification](RFC.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Contributing](CONTRIBUTING.md)
 

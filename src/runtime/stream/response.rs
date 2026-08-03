@@ -15,18 +15,16 @@ mod snapshot;
 use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
+use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::TrafficClass;
 #[cfg(test)]
 pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
     ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
-    ResponsePathDetachOutcome, ResponseSenderPathObservation, ResponseSenderPathTarget,
-    ResponseStreamAttachOutcome, ResponseValidationOutputIdentity,
+    ResponsePathDetachOutcome, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
-pub(in crate::runtime) use data_commit::ResponseValidationDataReservation;
 use delivery::ResponseAckOrderingState;
 pub(super) use delivery::{
     CarrierPathFlight, product_flights_have_recent_reinjection_overlap,
@@ -37,90 +35,12 @@ pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
-/// Exact unpublished S2C validation output shared by the carrier actor and
-/// target response owner. Cloning this handle clones no authority: every
-/// operation exact-matches the binding's physical instance and incarnation.
-#[derive(Clone)]
-pub(in crate::runtime) struct ServerTcpValidationOutput {
-    binding: Arc<ResponseStreamBinding>,
-    identity: ResponseValidationOutputIdentity,
-}
-
-impl ServerTcpValidationOutput {
-    pub(in crate::runtime::stream) fn new(
-        binding: Arc<ResponseStreamBinding>,
-        identity: ResponseValidationOutputIdentity,
-    ) -> Self {
-        Self { binding, identity }
-    }
-
-    pub(in crate::runtime) fn identity(&self) -> ResponseValidationOutputIdentity {
-        self.identity
-    }
-
-    pub(in crate::runtime) fn is_current(&self) -> bool {
-        self.binding.validation_output_is_current(self.identity)
-    }
-
-    pub(in crate::runtime) fn peer_available(&self) -> bool {
-        self.binding.validation_output_peer_available(self.identity)
-    }
-
-    pub(in crate::runtime) fn sender_path_observation(&self) -> ResponseSenderPathObservation {
-        self.binding
-            .sender_path_observation(TrafficClass::Throughput, 1)
-    }
-
-    pub(in crate::runtime) fn try_reserve_data(
-        &self,
-        validation_id: NonZeroU64,
-        frame: &crate::protocol::Frame,
-    ) -> Result<ResponseValidationDataReservation, crate::runtime::RuntimeError> {
-        self.binding
-            .try_reserve_validation_data_frame(self.identity, validation_id, frame)
-    }
-
-    pub(in crate::runtime) fn original_flight_bytes(&self) -> u64 {
-        self.binding
-            .validation_candidate_original_flight_bytes(self.identity)
-    }
-
-    pub(in crate::runtime) fn settle(&self) -> bool {
-        self.binding.settle_validation_output(self.identity)
-    }
-
-    pub(in crate::runtime) fn promote(&self) -> Result<(), crate::runtime::RuntimeError> {
-        self.binding.promote_validation_output(self.identity)
-    }
-}
-
 // Reliable-path bindings own attachment instances, exact range flights,
 // evidence, and atomic commit. Sender services rank immutable snapshots.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum ResponseProductAckOriginalResolution {
-    Unambiguous,
-    Ambiguous,
-}
-
-/// One normalized newly released response OriginalData interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ResponseProductAckOriginalRelease {
-    pub(in crate::runtime) key: CarrierPathKey,
-    /// Present only while the exact response attachment lifetime remains
-    /// resolvable. A missing instance makes the release ambiguous.
-    pub(in crate::runtime) path_instance_id: Option<CarrierPathInstanceId>,
-    pub(in crate::runtime) output_incarnation: u64,
-    pub(in crate::runtime) range: OffsetRange,
-    pub(in crate::runtime) bytes: usize,
-    pub(in crate::runtime) sent_at: std::time::Instant,
-    pub(in crate::runtime) resolution: ResponseProductAckOriginalResolution,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestFeedbackIngress {
@@ -150,9 +70,6 @@ pub(in crate::runtime) struct ResponseStreamBinding {
     next_output_incarnation: AtomicU64,
     /// Changes only when the set of live response attachments changes.
     output_membership_generation: AtomicU64,
-    /// Changes only when stable, non-queue ordinary policy eligibility
-    /// changes. Dynamic recovery evidence and transport samples are excluded.
-    tcp_carrier_ordinary_eligibility_generation: AtomicU64,
     // Publishes coherent path evidence, exact flights, ACK ordering, and queues.
     response_model_generation: AtomicU64,
     // Close publishes before carrier commands so no later scheduler commit can
@@ -266,12 +183,10 @@ impl ResponseStreamBinding {
             session_registration,
             next_output_incarnation: AtomicU64::new(2),
             output_membership_generation: AtomicU64::new(1),
-            tcp_carrier_ordinary_eligibility_generation: AtomicU64::new(1),
             response_model_generation: AtomicU64::new(0),
             response_stream_open: AtomicBool::new(true),
             outputs: Mutex::new(ResponseStreamOutputs {
                 detaching: Vec::new(),
-                validation: None,
                 entries: vec![ResponseStreamOutputEntry {
                     key,
                     path_instance_id,
@@ -312,21 +227,6 @@ impl ResponseStreamBinding {
         })
     }
 
-    fn advance_tcp_carrier_ordinary_eligibility_generation(&self) {
-        let _ = self
-            .tcp_carrier_ordinary_eligibility_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.checked_add(1).unwrap_or(0))
-            });
-    }
-
-    fn tcp_carrier_ordinary_eligibility_generation(&self) -> Option<NonZeroU64> {
-        NonZeroU64::new(
-            self.tcp_carrier_ordinary_eligibility_generation
-                .load(Ordering::Acquire),
-        )
-    }
-
     pub(in crate::runtime::stream) fn session_send_buffer(&self) -> super::SessionSendBuffer {
         self.session_registration.send_buffer()
     }
@@ -337,7 +237,7 @@ impl ResponseStreamBinding {
 
     fn begin_close(&self) -> Vec<ReliablePathCommandSender> {
         {
-            let mut outputs = self
+            let outputs = self
                 .outputs
                 .lock()
                 .expect("server reliable stream binding lock");
@@ -345,20 +245,11 @@ impl ResponseStreamBinding {
             for entry in outputs.entries.iter().chain(&outputs.detaching) {
                 entry.load_registration.deactivate();
             }
-            let validation = outputs.validation.take();
-            if let Some(entry) = &validation {
-                self.invalidate_path_flight_evidence(entry.key, entry.incarnation);
-            }
-            let mut commands = outputs
+            outputs
                 .entries
                 .iter()
                 .map(|entry| entry.commands.clone())
-                .collect::<Vec<_>>();
-            if let Some(entry) = validation {
-                let entry = *entry;
-                commands.push(entry.commands);
-            }
-            commands
+                .collect::<Vec<_>>()
         }
     }
 

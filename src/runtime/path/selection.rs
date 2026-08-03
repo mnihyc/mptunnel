@@ -11,7 +11,6 @@ use crate::model::admission::{
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
-use crate::model::tcp_carrier::TcpCarrierPolicyEpochs;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
@@ -19,10 +18,10 @@ use crate::runtime::path::model::{
     bulk_candidate_has_bulk_rate_evidence, bulk_candidate_has_fresh_native_carrier_rate_evidence,
     bulk_path_candidate, configured_order_path_indices, configured_order_path_scores,
     endpoint_only_reliable_startup_should_preserve_configured_order, health_observations,
-    ordered_path_scores, ordered_path_scores_for_ttl, ordered_reliable_path_indices,
-    path_allows_automatic_bulk_use, path_can_be_auto_discovered, path_is_endpoint_only,
-    path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
-    reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
+    ordered_path_scores, ordered_path_scores_for_ttl, path_allows_automatic_bulk_use,
+    path_can_be_auto_discovered, path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot,
+    path_startup_snapshot, reliable_reservation_should_use_endpoint_only_startup_order,
+    reliable_stream_path_candidates, reliable_stream_startup_path_scores,
     udp_datagram_payload_limit_bytes, udp_observation_has_datagram_feedback,
     udp_path_has_realtime_model, udp_reliable_stream_loss_reinjection_penalty_ms,
 };
@@ -42,6 +41,7 @@ pub(in crate::runtime) struct ReliableRequestPathEvidence {
     pub(in crate::runtime) has_fresh_native_carrier_rate_evidence: bool,
     pub(in crate::runtime) fresh_proof: Option<RelayPathProofEpoch>,
     pub(in crate::runtime) config_ordinal: usize,
+    pub(in crate::runtime) member_ordinal: u16,
 }
 
 /// TCP-only priors stay typed so a QUIC observation cannot carry TCP state.
@@ -57,10 +57,34 @@ pub(in crate::runtime) struct ReliableRequestPathBatchObservation {
     pub(in crate::runtime) paths: SmallVec<[ReliableRequestPathEvidence; 4]>,
     pub(in crate::runtime) bulk_candidates: SmallVec<[BulkPathCandidate; 4]>,
     pub(in crate::runtime) latency_pressure: bool,
-    pub(in crate::runtime) tcp_carrier_policy_epochs: Option<TcpCarrierPolicyEpochs>,
 }
 
 impl ClientPathContext {
+    fn sort_reliable_path_candidates(
+        &self,
+        candidates: &mut [BulkPathCandidate],
+        evidence_free_startup: bool,
+    ) {
+        candidates.sort_by(|left, right| {
+            let common = scheduler::path_is_backup(left.snapshot)
+                .cmp(&scheduler::path_is_backup(right.snapshot));
+            if evidence_free_startup {
+                common
+                    .then_with(|| {
+                        left.snapshot
+                            .active_latency_sensitive_flows
+                            .cmp(&right.snapshot.active_latency_sensitive_flows)
+                    })
+                    .then_with(|| left.snapshot.active_flows.cmp(&right.snapshot.active_flows))
+                    .then_with(|| self.relay_path_key_order(left.key, right.key))
+            } else {
+                common
+                    .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
+                    .then_with(|| self.relay_path_key_order(left.key, right.key))
+            }
+        });
+    }
+
     pub(in crate::runtime) fn relay_path_allows_automatic_bulk_use(
         &self,
         key: RelayPathKey,
@@ -101,14 +125,56 @@ impl ClientPathContext {
             &observations,
             lane,
         ) {
-            return configured_order_path_indices(
-                &self.tcp_paths,
-                &observations,
-                lane,
-                payload_bytes,
-            );
+            let mut candidates =
+                configured_order_path_indices(&self.tcp_paths, &observations, lane, payload_bytes);
+            candidates.sort_by(|left, right| {
+                self.relay_path_key_order(
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index: *left,
+                    },
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index: *right,
+                    },
+                )
+            });
+            return candidates;
         }
-        ordered_reliable_path_indices(&self.tcp_paths, &observations, lane, payload_bytes)
+        let mut scores = reliable_stream_startup_path_scores(
+            &self.tcp_paths,
+            &observations,
+            lane,
+            payload_bytes,
+        );
+        scores.sort_by(|left, right| {
+            let left_snapshot = path_snapshot(
+                &self.tcp_paths[left.0],
+                left.0,
+                observations.get(left.0).copied().unwrap_or_default(),
+            );
+            let right_snapshot = path_snapshot(
+                &self.tcp_paths[right.0],
+                right.0,
+                observations.get(right.0).copied().unwrap_or_default(),
+            );
+            scheduler::path_is_backup(left_snapshot)
+                .cmp(&scheduler::path_is_backup(right_snapshot))
+                .then_with(|| left.1.total_cmp(&right.1))
+                .then_with(|| {
+                    self.relay_path_key_order(
+                        RelayPathKey {
+                            underlay: UnderlayProtocol::Tcp,
+                            index: left.0,
+                        },
+                        RelayPathKey {
+                            underlay: UnderlayProtocol::Tcp,
+                            index: right.0,
+                        },
+                    )
+                })
+        });
+        scores.into_iter().map(|(index, _)| index).collect()
     }
 
     pub(in crate::runtime) fn try_reserve_relay_path_load_if_unchanged(
@@ -129,13 +195,9 @@ impl ClientPathContext {
         {
             return None;
         }
-        let before = current.eligibility_fingerprint();
         if !current.reserve_load(lane, now) {
             return None;
         }
-        let eligibility_changed = before != current.eligibility_fingerprint();
-        self.state
-            .publish_eligibility_change_if(&mut health, eligibility_changed);
         drop(health);
         Some(RelayPathLoadLease::new(
             self.state.clone(),
@@ -166,34 +228,13 @@ impl ClientPathContext {
             payload_bytes,
         );
         candidates.retain(|candidate| !excluded.contains(&candidate.key));
-        if reliable_reservation_should_use_endpoint_only_startup_order(
+        let evidence_free_startup = reliable_reservation_should_use_endpoint_only_startup_order(
             &self.tcp_paths,
             &tcp_observations,
             &self.udp_paths,
             &udp_observations,
-            lane,
-        ) {
-            candidates.sort_by(|left, right| {
-                scheduler::path_is_backup(left.snapshot)
-                    .cmp(&scheduler::path_is_backup(right.snapshot))
-                    .then_with(|| {
-                        left.snapshot
-                            .active_latency_sensitive_flows
-                            .cmp(&right.snapshot.active_latency_sensitive_flows)
-                            .then_with(|| {
-                                left.snapshot.active_flows.cmp(&right.snapshot.active_flows)
-                            })
-                            .then_with(|| self.relay_path_key_order(left.key, right.key))
-                    })
-            });
-        } else {
-            candidates.sort_by(|left, right| {
-                scheduler::path_is_backup(left.snapshot)
-                    .cmp(&scheduler::path_is_backup(right.snapshot))
-                    .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                    .then_with(|| self.relay_path_key_order(left.key, right.key))
-            });
-        }
+        );
+        self.sort_reliable_path_candidates(&mut candidates, evidence_free_startup);
         #[cfg(feature = "lab-diagnostics")]
         for (rank, candidate) in candidates.iter().enumerate() {
             lab_diagnostic(
@@ -271,12 +312,7 @@ impl ClientPathContext {
             lane,
             payload_bytes,
         );
-        candidates.sort_by(|left, right| {
-            scheduler::path_is_backup(left.snapshot)
-                .cmp(&scheduler::path_is_backup(right.snapshot))
-                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                .then_with(|| self.relay_path_key_order(left.key, right.key))
-        });
+        self.sort_reliable_path_candidates(&mut candidates, false);
         candidates
             .into_iter()
             .map(|candidate| candidate.key)
@@ -548,21 +584,13 @@ impl ClientPathContext {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
         if include_bulk_admission {
-            let mut eligibility_changed = false;
             for record in health.tcp_records_mut() {
-                let before = record.eligibility_fingerprint();
                 record.maintain(now);
-                eligibility_changed |= before != record.eligibility_fingerprint();
             }
             for record in &mut health.udp {
-                let before = record.eligibility_fingerprint();
                 record.maintain(now);
-                eligibility_changed |= before != record.eligibility_fingerprint();
             }
-            self.state
-                .publish_eligibility_change_if(&mut health, eligibility_changed);
         }
-        let tcp_carrier_policy_epochs = health.tcp_carrier_policy_epochs();
         // Full configured-path vectors are needed only for multipath admission.
         // Ordinary and single-path sends sample attached records directly.
         let bulk_observations = include_bulk_admission.then(|| {
@@ -620,6 +648,7 @@ impl ClientPathContext {
                         has_fresh_native_carrier_rate_evidence: false,
                         fresh_proof: None,
                         config_ordinal: self.relay_path_config_ordinal(key),
+                        member_ordinal: self.relay_path_member_ordinal(key),
                     };
                 };
                 let fresh_proof = proof.filter(|proof| {
@@ -657,6 +686,7 @@ impl ClientPathContext {
                         }),
                     fresh_proof,
                     config_ordinal: self.relay_path_config_ordinal(key),
+                    member_ordinal: self.relay_path_member_ordinal(key),
                 }
             })
             .collect();
@@ -664,7 +694,6 @@ impl ClientPathContext {
             paths,
             bulk_candidates,
             latency_pressure,
-            tcp_carrier_policy_epochs,
         }
     }
 

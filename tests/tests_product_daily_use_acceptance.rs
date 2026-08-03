@@ -1039,10 +1039,10 @@ outbound = "direct-default"
     )
 }
 
-fn wait_for_mpp_outbound_carriers(
+fn wait_for_mpp_outbound_availability(
     process: &mut MptunnelProcess,
     management: SocketAddr,
-    expected: usize,
+    expected_available: bool,
     context: &str,
 ) {
     let deadline = Instant::now() + PROCESS_START_TIMEOUT;
@@ -1068,7 +1068,7 @@ fn wait_for_mpp_outbound_carriers(
                 })
                 .and_then(|session| session["carrier_count"].as_u64())
                 .and_then(|count| usize::try_from(count).ok());
-            if count == Some(expected) {
+            if count.is_some_and(|count| (count > 0) == expected_available) {
                 return;
             }
         }
@@ -1138,7 +1138,12 @@ fn packaged_mpp_outage_rejects_new_flows_and_client_server_restarts_recover() {
         OPERATOR_TOKEN,
         PROCESS_START_TIMEOUT,
     );
-    wait_for_mpp_outbound_carriers(&mut client, management, 1, "initial authenticated carrier");
+    wait_for_mpp_outbound_availability(
+        &mut client,
+        management,
+        true,
+        "initial authenticated carrier",
+    );
     socks5_round_trip(
         socks,
         SocksTarget::Domain("localhost", direct_target.port()),
@@ -1148,10 +1153,10 @@ fn packaged_mpp_outage_rejects_new_flows_and_client_server_restarts_recover() {
     .expect("initial MPP Product flow");
 
     server.stop();
-    wait_for_mpp_outbound_carriers(
+    wait_for_mpp_outbound_availability(
         &mut client,
         management,
-        0,
+        false,
         "authenticated carrier withdrawal after server stop",
     );
     let (_stream, unavailable) = socks5_connect(
@@ -1174,10 +1179,10 @@ fn packaged_mpp_outage_rejects_new_flows_and_client_server_restarts_recover() {
         PROCESS_START_TIMEOUT,
         "restarted MPP server listener",
     );
-    wait_for_mpp_outbound_carriers(
+    wait_for_mpp_outbound_availability(
         &mut client,
         management,
-        1,
+        true,
         "authenticated carrier after server restart",
     );
     socks5_round_trip(
@@ -1205,10 +1210,10 @@ fn packaged_mpp_outage_rejects_new_flows_and_client_server_restarts_recover() {
         OPERATOR_TOKEN,
         PROCESS_START_TIMEOUT,
     );
-    wait_for_mpp_outbound_carriers(
+    wait_for_mpp_outbound_availability(
         &mut client,
         management,
-        1,
+        true,
         "authenticated carrier after client restart",
     );
     socks5_round_trip(

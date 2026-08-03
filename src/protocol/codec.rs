@@ -1,14 +1,13 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
-    PathMetricDirection, PathMetrics, PathPurpose, PathUsage, PeerPathState, PeerPathStatus,
-    PeerStatusCode, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
-    TcpCarrierValidationResult, UnderlayProtocol,
+    PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
+    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 104;
@@ -130,8 +129,6 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
         Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
         Frame::PeerStatusResponse { paths, .. } => PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN
             .saturating_add(paths.len().saturating_mul(PEER_PATH_STATUS_ENCODED_LEN)),
-        Frame::TcpCarrierDemand { stream_id, .. } => 9 + usize::from(stream_id.is_some()) * 8,
-        Frame::TcpCarrierValidate { .. } => 25,
         Frame::OpenStream { .. } => 128,
         _ => 64,
     }
@@ -255,7 +252,6 @@ fn encode_payload(
             credential_id,
             path_id,
             underlay,
-            purpose,
             nonce,
             issued_at_unix_secs,
             auth_tag,
@@ -264,7 +260,6 @@ fn encode_payload(
             encode_credential_id(out, credential_id)?;
             put_u16(out, path_id.0);
             put_u8(out, underlay_to_u8(*underlay));
-            put_u8(out, path_purpose_to_u8(*purpose));
             encode_nonce(out, *nonce);
             put_u64(out, *issued_at_unix_secs);
             encode_auth_tag(out, *auth_tag);
@@ -471,54 +466,6 @@ fn encode_payload(
             }
             Ok(FrameKind::PeerStatusResponse)
         }
-        Frame::TcpCarrierDemand {
-            request_id,
-            stream_id,
-        } => {
-            validate_nonzero_id(*request_id)?;
-            put_u64(out, *request_id);
-            put_u8(out, u8::from(stream_id.is_some()));
-            if let Some(stream_id) = stream_id {
-                put_u64(out, stream_id.0);
-            }
-            Ok(FrameKind::TcpCarrierDemand)
-        }
-        Frame::TcpCarrierValidate {
-            validation_id,
-            request_id,
-            direction,
-            stream_id,
-        } => {
-            validate_nonzero_id(*validation_id)?;
-            validate_tcp_carrier_validation_request(*direction, *request_id)?;
-            put_u64(out, *validation_id);
-            put_u64(out, *request_id);
-            put_u8(out, path_metric_direction_to_u8(*direction));
-            put_u64(out, stream_id.0);
-            Ok(FrameKind::TcpCarrierValidate)
-        }
-        Frame::TcpCarrierResult {
-            validation_id,
-            direction,
-            result,
-        } => {
-            validate_nonzero_id(*validation_id)?;
-            put_u64(out, *validation_id);
-            put_u8(out, path_metric_direction_to_u8(*direction));
-            put_u8(out, tcp_carrier_result_to_u8(*result));
-            Ok(FrameKind::TcpCarrierResult)
-        }
-        Frame::TcpCarrierResultAck {
-            validation_id,
-            direction,
-            result,
-        } => {
-            validate_nonzero_id(*validation_id)?;
-            put_u64(out, *validation_id);
-            put_u8(out, path_metric_direction_to_u8(*direction));
-            put_u8(out, tcp_carrier_result_to_u8(*result));
-            Ok(FrameKind::TcpCarrierResultAck)
-        }
         Frame::Ping { nonce } => {
             put_u64(out, *nonce);
             Ok(FrameKind::Ping)
@@ -555,7 +502,6 @@ fn decode_payload(
             credential_id: decode_credential_id(reader)?,
             path_id: PathId(reader.get_u16()?),
             underlay: underlay_from_u8(reader.get_u8()?)?,
-            purpose: path_purpose_from_u8(reader.get_u8()?)?,
             nonce: decode_nonce(reader)?,
             issued_at_unix_secs: reader.get_u64()?,
             auth_tag: decode_auth_tag(reader)?,
@@ -720,49 +666,6 @@ fn decode_payload(
                 request_id,
                 code,
                 paths,
-            })
-        }
-        FrameKind::TcpCarrierDemand => {
-            let request_id = reader.get_u64()?;
-            validate_nonzero_id(request_id)?;
-            let stream_id = match decode_bool(reader.get_u8()?)? {
-                true => Some(StreamId(reader.get_u64()?)),
-                false => None,
-            };
-            Ok(Frame::TcpCarrierDemand {
-                request_id,
-                stream_id,
-            })
-        }
-        FrameKind::TcpCarrierValidate => {
-            let validation_id = reader.get_u64()?;
-            validate_nonzero_id(validation_id)?;
-            let request_id = reader.get_u64()?;
-            let direction = path_metric_direction_from_u8(reader.get_u8()?)?;
-            validate_tcp_carrier_validation_request(direction, request_id)?;
-            Ok(Frame::TcpCarrierValidate {
-                validation_id,
-                request_id,
-                direction,
-                stream_id: StreamId(reader.get_u64()?),
-            })
-        }
-        FrameKind::TcpCarrierResult => {
-            let validation_id = reader.get_u64()?;
-            validate_nonzero_id(validation_id)?;
-            Ok(Frame::TcpCarrierResult {
-                validation_id,
-                direction: path_metric_direction_from_u8(reader.get_u8()?)?,
-                result: tcp_carrier_result_from_u8(reader.get_u8()?)?,
-            })
-        }
-        FrameKind::TcpCarrierResultAck => {
-            let validation_id = reader.get_u64()?;
-            validate_nonzero_id(validation_id)?;
-            Ok(Frame::TcpCarrierResultAck {
-                validation_id,
-                direction: path_metric_direction_from_u8(reader.get_u8()?)?,
-                result: tcp_carrier_result_from_u8(reader.get_u8()?)?,
             })
         }
         FrameKind::Ping => Ok(Frame::Ping {
@@ -1057,24 +960,6 @@ fn decode_offset_ranges(
     Ok(ranges)
 }
 
-fn validate_nonzero_id(id: u64) -> Result<(), CodecError> {
-    if id == 0 {
-        return Err(CodecError::InvalidIdentifier);
-    }
-    Ok(())
-}
-
-fn validate_tcp_carrier_validation_request(
-    direction: PathMetricDirection,
-    request_id: u64,
-) -> Result<(), CodecError> {
-    match (direction, request_id) {
-        (PathMetricDirection::ClientToServer, 0)
-        | (PathMetricDirection::ServerToClient, 1..=u64::MAX) => Ok(()),
-        _ => Err(CodecError::InvalidCarrierValidationRequest),
-    }
-}
-
 fn validate_path_count(count: usize, limits: CodecLimits) -> Result<(), CodecError> {
     if count > limits.max_paths {
         return Err(CodecError::TooManyPaths {
@@ -1219,7 +1104,7 @@ enum FrameKind {
     SessionReady = 2,
     SessionClose = 3,
     PathJoin = 4,
-    // 5 and 6 are reserved; an abandoned challenge exchange never had a sender.
+    // 5 and 6 are reserved.
     OpenStream = 7,
     StreamData = 8,
     StreamAck = 9,
@@ -1232,15 +1117,15 @@ enum FrameKind {
     Ping = 16,
     Pong = 17,
     SessionAuth = 18,
-    // 19 is reserved for the unused PATH_JOIN_OK draft frame.
+    // 19 is reserved.
     PathStatus = 20,
     PathDrain = 21,
     PathClose = 22,
     DatagramFeedback = 23,
     PathMetrics = 24,
-    // 25 is reserved for a removed hint; 26 has never been allocated.
+    // 25 and 26 are reserved.
     StreamFin = 27,
-    // 28 and 29 are reserved for a removed product-PMTU draft.
+    // 28 and 29 are reserved.
     StreamDetach = 30,
     PathProofData = 31,
     PathProofAck = 32,
@@ -1249,10 +1134,7 @@ enum FrameKind {
     PathCapacityReceipt = 35,
     PeerStatusRequest = 36,
     PeerStatusResponse = 37,
-    TcpCarrierDemand = 38,
-    TcpCarrierValidate = 39,
-    TcpCarrierResult = 40,
-    TcpCarrierResultAck = 41,
+    // 38 through 41 are reserved.
 }
 
 impl FrameKind {
@@ -1287,10 +1169,6 @@ impl FrameKind {
             35 => Ok(Self::PathCapacityReceipt),
             36 => Ok(Self::PeerStatusRequest),
             37 => Ok(Self::PeerStatusResponse),
-            38 => Ok(Self::TcpCarrierDemand),
-            39 => Ok(Self::TcpCarrierValidate),
-            40 => Ok(Self::TcpCarrierResult),
-            41 => Ok(Self::TcpCarrierResultAck),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1311,21 +1189,6 @@ fn underlay_from_u8(value: u8) -> Result<UnderlayProtocol, CodecError> {
     }
 }
 
-fn path_purpose_to_u8(value: PathPurpose) -> u8 {
-    match value {
-        PathPurpose::Ordinary => 1,
-        PathPurpose::Validation => 2,
-    }
-}
-
-fn path_purpose_from_u8(value: u8) -> Result<PathPurpose, CodecError> {
-    match value {
-        1 => Ok(PathPurpose::Ordinary),
-        2 => Ok(PathPurpose::Validation),
-        _ => Err(CodecError::InvalidEnum),
-    }
-}
-
 fn path_metric_direction_to_u8(value: PathMetricDirection) -> u8 {
     match value {
         PathMetricDirection::ClientToServer => 1,
@@ -1337,23 +1200,6 @@ fn path_metric_direction_from_u8(value: u8) -> Result<PathMetricDirection, Codec
     match value {
         1 => Ok(PathMetricDirection::ClientToServer),
         2 => Ok(PathMetricDirection::ServerToClient),
-        _ => Err(CodecError::InvalidEnum),
-    }
-}
-
-fn tcp_carrier_result_to_u8(value: TcpCarrierValidationResult) -> u8 {
-    match value {
-        TcpCarrierValidationResult::Retain => 1,
-        TcpCarrierValidationResult::NoGain => 2,
-        TcpCarrierValidationResult::Withdrawn => 3,
-    }
-}
-
-fn tcp_carrier_result_from_u8(value: u8) -> Result<TcpCarrierValidationResult, CodecError> {
-    match value {
-        1 => Ok(TcpCarrierValidationResult::Retain),
-        2 => Ok(TcpCarrierValidationResult::NoGain),
-        3 => Ok(TcpCarrierValidationResult::Withdrawn),
         _ => Err(CodecError::InvalidEnum),
     }
 }
@@ -1480,10 +1326,8 @@ pub enum CodecError {
     InvalidUtf8,
     InvalidCredentialId,
     InvalidPeerStatus,
-    InvalidCarrierValidationRequest,
     InvalidEnum,
     InvalidRange,
-    InvalidIdentifier,
     InvalidPort,
     LengthOverflow,
 }
@@ -1514,15 +1358,8 @@ impl std::fmt::Display for CodecError {
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
             Self::InvalidCredentialId => write!(f, "invalid credential ID"),
             Self::InvalidPeerStatus => write!(f, "non-OK peer status contains path entries"),
-            Self::InvalidCarrierValidationRequest => {
-                write!(
-                    f,
-                    "TCP carrier validation direction and request ID disagree"
-                )
-            }
             Self::InvalidEnum => write!(f, "invalid enum value"),
             Self::InvalidRange => write!(f, "invalid offset range"),
-            Self::InvalidIdentifier => write!(f, "identifier must be nonzero"),
             Self::InvalidPort => write!(f, "port must be in 1..=65535"),
             Self::LengthOverflow => write!(f, "frame length overflow"),
         }

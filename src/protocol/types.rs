@@ -33,23 +33,10 @@ pub enum UnderlayProtocol {
     Udp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PathPurpose {
-    Ordinary,
-    Validation,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathMetricDirection {
     ClientToServer,
     ServerToClient,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcpCarrierValidationResult {
-    Retain,
-    NoGain,
-    Withdrawn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,7 +184,6 @@ pub enum Frame {
         credential_id: String,
         path_id: PathId,
         underlay: UnderlayProtocol,
-        purpose: PathPurpose,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
         auth_tag: AuthTag,
@@ -301,26 +287,6 @@ pub enum Frame {
         code: PeerStatusCode,
         paths: Vec<PeerPathStatus>,
     },
-    TcpCarrierDemand {
-        request_id: u64,
-        stream_id: Option<StreamId>,
-    },
-    TcpCarrierValidate {
-        validation_id: u64,
-        request_id: u64,
-        direction: PathMetricDirection,
-        stream_id: StreamId,
-    },
-    TcpCarrierResult {
-        validation_id: u64,
-        direction: PathMetricDirection,
-        result: TcpCarrierValidationResult,
-    },
-    TcpCarrierResultAck {
-        validation_id: u64,
-        direction: PathMetricDirection,
-        result: TcpCarrierValidationResult,
-    },
     Ping {
         nonce: u64,
     },
@@ -377,10 +343,6 @@ impl Frame {
             Self::PathMetrics { .. } => "PATH_METRICS",
             Self::PeerStatusRequest { .. } => "PEER_STATUS_REQUEST",
             Self::PeerStatusResponse { .. } => "PEER_STATUS_RESPONSE",
-            Self::TcpCarrierDemand { .. } => "TCP_CARRIER_DEMAND",
-            Self::TcpCarrierValidate { .. } => "TCP_CARRIER_VALIDATE",
-            Self::TcpCarrierResult { .. } => "TCP_CARRIER_RESULT",
-            Self::TcpCarrierResultAck { .. } => "TCP_CARRIER_RESULT_ACK",
             Self::Ping { .. } => "PING",
             Self::Pong { .. } => "PONG",
         }

@@ -5255,3 +5255,62 @@ entry is authoritative.
   browser-load, continuity, and local-ceiling matrix from this exact binary;
   replace every public measured output from those bundles, then run the final
   documentation and source gates.
+
+## 2026-08-04T03:07:52+08:00: MPP v6 bounded maximum carrier pool accepted
+
+- Name: ordinary-carrier maximum pool and clean wire cutover
+- Category: RFC conformance, lifecycle simplification, and performance
+- State: accepted implementation; final clean publication matrix pending
+- Superseding decision:
+  - the retained-tail recovery correction remains, but the prior elastic
+    candidate, validation, retain, and no-gain machinery is removed;
+  - a configured TCP range now has one effective sizing value: its maximum.
+    The first value remains accepted only as an explicitly obsolete grammar
+    position and changes no runtime behavior;
+  - every member from ordinal zero through `maximum - 1` is reconciled as an
+    ordinary bidirectional carrier. Readiness does not force Product placement;
+    the shared completion scheduler still chooses among currently admitted
+    native carriers; and
+  - exact native failure is immediate, while port rotation and configuration
+    retirement retain the existing ordered drain and replacement lifecycle.
+    No source address, interface identity, inferred bottleneck, throughput
+    threshold, percentage threshold, or new timer controls pool membership.
+- Proven behavior:
+  - under an independent `100 Mbit/s` per-TCP-flow policer, one carrier reached
+    `75.139/77.518 Mbps`, default `1-3` reached `224.123/215.666 Mbps`, exact
+    `3-3` reached `225.158/218.047 Mbps`, and three explicit `1-1` endpoints
+    reached `222.027/220.080 Mbps` for download/upload. This proves that the
+    default maximum pool is equivalent to three explicit endpoints for the
+    intended single-flow-QoS case;
+  - under a shared `200 Mbit/s` bottleneck, all four forms stayed in the same
+    broad capacity region (`151.656` through `171.505 Mbps` across directions),
+    so ready surplus carriers did not create a second network capacity or a
+    throughput collapse; and
+  - on the host-only multi-gigabit control, exact `1-1` reached `6.713 Gbps`
+    while default maximum three reached `5.407 Gbps`. Packet density increased
+    about `48-53%` per GiB and client CPU per Gbit/s increased `25.5%` with
+    three independent TLS/TCP flows. Two bounded batching variants left the
+    result effectively unchanged (`5.370/6.534` and `5.387/6.537 Gbps` for
+    maximum-three/maximum-one), so both variants were rejected and fully
+    removed. The remaining difference is a native multi-flow packet-processing
+    trade-off, not evidence for a Product congestion controller or hidden
+    elastic policy. Users seeking the highest single-route host ceiling can
+    configure `1-1`; the default retains independent-flow QoS resilience.
+- Additional corrections:
+  - equal-capacity endpoint startup now orders member ordinals across distinct
+    endpoints instead of allowing the first configured endpoint's siblings to
+    displace every other physical path;
+  - response scheduling gives qualified native delivery rate precedence over
+    a portable Product fallback, restoring mixed TCP/QUIC local download from
+    `3.383` to `4.495 Gbps` without altering congestion control; and
+  - the MPP v6 QUIC session-authentication transcript now uses the v6 domain
+    label, matching the clean-break wire version and preventing cross-version
+    authentication-domain reuse. The RFC and deterministic vector match.
+- Verification: formatting, warnings-denied all-target/all-feature Clippy,
+  `1450` library tests, `2` allocation regressions, `6` daily-use acceptance
+  tests, and `23` lab-runner contract tests pass. The restart/offline acceptance
+  gate now checks the actual availability contract rather than assuming one
+  carrier, and passes twice with the default maximum pool.
+- Next: commit this exact source as the clean performance candidate; run the
+  bounded current-version product, QoS, scale, asymmetry, continuity, browser,
+  and stress matrix; publish only valid final-candidate measurements.

@@ -314,7 +314,7 @@ impl RequestTcpCapacityController {
                 Some((path, candidate_snapshot, geometry, train_envelope_bytes))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(path, _, _, _)| context.relay_path_config_ordinal(path.key()));
+        candidates.sort_by(|left, right| context.relay_path_key_order(left.0.key(), right.0.key()));
         if candidates.is_empty() {
             return;
         }

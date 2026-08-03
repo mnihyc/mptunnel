@@ -314,18 +314,6 @@ async fn drain_server_udp_datagram_commands(
                     "server QUIC datagram writer received TCP capacity command",
                 ));
             }
-            ReliablePathCommand::SendTcpCarrierValidationData { .. } => {
-                commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "server QUIC datagram writer received TCP carrier validation data",
-                ));
-            }
-            ReliablePathCommand::TcpCarrierValidationWriterBoundary { .. } => {
-                commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "server QUIC datagram writer received reliable writer boundary",
-                ));
-            }
             ReliablePathCommand::ResetAndCloseStream { .. } => {
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(

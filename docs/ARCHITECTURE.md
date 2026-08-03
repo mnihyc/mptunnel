@@ -35,12 +35,12 @@ make their packet controllers identical:
 A native TCP ACK or QUIC packet ACK is path evidence. It never releases the MPP
 connection-level flight ledger; only a `STREAM_ACK` for the MPP range does.
 
-The startup probe for each configured path establishes and retains its first
-authenticated TCP or QUIC carrier for product use. Later reachability probes
-are isolated from that durable instance. TCP and QUIC keep their own handshake
-and liveness mechanics, while the path layer exposes one prepared-connection
-lifecycle and records only the authenticated exchange as RTT, not connection
-setup time.
+Each configured QUIC path owns its authenticated native connection. Each TCP
+endpoint owns a bounded carrier group reconciled toward its configured maximum;
+every authenticated ready member is an ordinary Product carrier. Diagnostic
+reachability probes are isolated from those durable instances. TCP and QUIC
+keep their own handshake and liveness mechanics, while the path layer records
+only authenticated exchange timing as path RTT, not connection setup time.
 
 Carrier bootstrap may select one concrete destination port from a configured
 inclusive set before resolution. Every address-family attempt for that
@@ -50,7 +50,7 @@ resolved carrier IP addresses rather than freezing one selected port before
 host routes are published. This local locator selection does not change MPP
 path or carrier-instance identity.
 
-## MPP v5 model
+## MPP v6 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
 or attaching a stream does not assign a persistent primary, validation, or
@@ -197,16 +197,14 @@ fence, not a duplicated ledger field. Replacing a carrier invalidates physical
 evidence, while detach and reattach invalidates that stream's ownership even if
 the carrier itself stayed live.
 
-One configured TCP endpoint owns a bounded carrier group. Its durable minimum
-members and occupied elastic reservations never exceed the configured range;
-the Product default is `1-3`. Each exact physical carrier has its own actor,
-encrypted reader/writer, `PathId`, instance identity, attachments, queues,
-flight, evidence, and `PATH_STATUS` sequence. The session group owner alone
-reconciles missing minimum members. Capacity above the minimum has no ordinary
-Product authority until the bounded directional validation in RFC Section 7.2
-ends with an acknowledged `RETAIN`. `TrafficClass` changes priority and demand
-only. Product close or detach removes only its flow or attachment and cannot
-create, retain, replace, or close a carrier.
+One configured TCP endpoint owns a bounded carrier group whose maximum is the
+healthy target; the Product default creates three members. Each exact physical
+carrier has its own actor, encrypted reader/writer, `PathId`, instance identity,
+attachments, queues, flight, evidence, and `PATH_STATUS` sequence. The session
+group owner reconciles every missing member. Every authenticated member has the
+same ordinary Product authority, while `TrafficClass` changes priority and
+demand only. Product close or detach removes only its flow or attachment and
+cannot create, retain, replace, or close a carrier.
 
 Datagram failover keeps timing ownership below the carrier-neutral association.
 TCP and QUIC each derive a modeled pre-feedback response timeout from their own

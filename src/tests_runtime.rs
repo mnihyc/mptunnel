@@ -1,8 +1,8 @@
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
 use crate::outbound::OutboundConfig;
+use crate::protocol::PathUsage;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
-use crate::protocol::{PathPurpose, PathUsage};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
@@ -221,7 +221,9 @@ fn tun_tcp_accept_tasks_share_the_configured_core_stream_ceiling() {
 
 async fn reserve_tcp_path() -> PathSpec {
     let port = reserve_process_unique_tcp_port().await;
-    format!("tcp://127.0.0.1:{port}").parse().expect("path")
+    format!("tcp://127.0.0.1:{port}?tcp-carriers=1-1")
+        .parse()
+        .expect("path")
 }
 
 async fn reserve_tcp_path_with_query(query: &str) -> PathSpec {
@@ -684,171 +686,6 @@ async fn quic_session_principal_rejection_precedes_readiness() {
         "different-principal carrier received readiness"
     );
     assert_eq!(peer_usage, None);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn quic_validation_purpose_is_rejected_before_replay_and_readiness() {
-    let path = reserve_udp_path().await;
-    let ServerIdentityRuntime {
-        paths,
-        reliable_relay: _,
-    } = server_runtime(OutboundConfig::Direct);
-    let server_context = paths.clone();
-    let endpoint = bind_server_udp_endpoint(&path, &paths)
-        .await
-        .expect("bind UDP endpoint");
-    let local_path = ServerLocalPath::new(0, path.clone());
-    let server = tokio::spawn(run_server_udp_listener(endpoint, local_path, paths));
-
-    let resources = ResourceLimits::default();
-    let codec_limits = CodecLimits::from(resources);
-    let mux_limits = crate::mux::MuxLimits::from(resources);
-    let client_security = security();
-    let client_tls = crate::transport::encrypted::test_client_tls_config();
-    let selector = crate::transport::quic::QuicCandidateSelector::derive(
-        client_security.credential.id().as_str(),
-        client_security.credential.secret().as_bytes(),
-    );
-    let client_endpoint = crate::transport::quic::Endpoint::bind_client(
-        "0.0.0.0:0".parse().expect("client bind address"),
-        &client_tls,
-        selector,
-        mux_limits,
-    )
-    .await
-    .expect("bind client endpoint");
-    let remote = path
-        .endpoint
-        .first_endpoint()
-        .authority()
-        .parse()
-        .expect("server address");
-    let session_id = SessionId(71);
-    let path_id = PathId(7);
-    let [session_hello, session_auth, ordinary_join] =
-        crate::runtime::path::authentication::ClientPathAuthenticationFrames::for_session(
-            &client_security,
-            path_id,
-            UnderlayProtocol::Udp,
-            session_id,
-        )
-        .expect("client authentication")
-        .into_array();
-    let Frame::PathJoin {
-        session_id: joined_session_id,
-        credential_id,
-        path_id: joined_path_id,
-        underlay,
-        nonce,
-        issued_at_unix_secs,
-        ..
-    } = ordinary_join.clone()
-    else {
-        unreachable!("client authentication emits PATH_JOIN");
-    };
-    let authenticator = crate::protocol::auth::SessionAuthenticator::new(
-        client_security.credential.secret().as_bytes(),
-    )
-    .expect("authenticator");
-    let validation_join = Frame::PathJoin {
-        session_id: joined_session_id,
-        credential_id: credential_id.clone(),
-        path_id: joined_path_id,
-        underlay,
-        purpose: PathPurpose::Validation,
-        nonce,
-        issued_at_unix_secs,
-        auth_tag: authenticator.path_join_tag(
-            joined_session_id,
-            &credential_id,
-            joined_path_id,
-            underlay,
-            PathPurpose::Validation,
-            nonce,
-            issued_at_unix_secs,
-        ),
-    };
-    let path_status = Frame::PathStatus {
-        path_id,
-        sequence: 0,
-        usage: PathUsage::Available,
-    };
-
-    let rejected_connection = client_endpoint
-        .connect(remote)
-        .await
-        .expect("connect validation carrier");
-    let (mut rejected_send, mut rejected_recv) = rejected_connection
-        .open_bi()
-        .await
-        .expect("open validation control stream");
-    crate::transport::quic::write_frames(
-        &mut rejected_send,
-        &[
-            session_hello.clone(),
-            session_auth.clone(),
-            validation_join,
-            path_status.clone(),
-        ],
-        codec_limits,
-    )
-    .await
-    .expect("write validation admission");
-    let rejection = tokio::time::timeout(
-        Duration::from_secs(2),
-        crate::transport::quic::read_frame(&mut rejected_recv, codec_limits),
-    )
-    .await
-    .expect("validation admission decision");
-    assert!(
-        rejection.is_err(),
-        "QUIC validation purpose received readiness"
-    );
-    let rejected_snapshot = server_context.reliable_streams.management_snapshot();
-    assert!(rejected_snapshot.paths.is_empty());
-    assert!(rejected_snapshot.sessions.is_empty());
-    rejected_connection.close();
-
-    let ordinary_connection = client_endpoint
-        .connect(remote)
-        .await
-        .expect("connect ordinary carrier");
-    let (mut ordinary_send, mut ordinary_recv) = ordinary_connection
-        .open_bi()
-        .await
-        .expect("open ordinary control stream");
-    crate::transport::quic::write_frames(
-        &mut ordinary_send,
-        &[
-            session_hello,
-            session_auth,
-            ordinary_join,
-            path_status.clone(),
-        ],
-        codec_limits,
-    )
-    .await
-    .expect("write ordinary admission");
-    assert_eq!(
-        crate::transport::quic::read_frame(&mut ordinary_recv, codec_limits)
-            .await
-            .expect("ordinary readiness"),
-        Frame::SessionReady
-    );
-    assert_eq!(
-        crate::transport::quic::read_frame(&mut ordinary_recv, codec_limits)
-            .await
-            .expect("ordinary path status"),
-        path_status
-    );
-    let accepted_snapshot = server_context.reliable_streams.management_snapshot();
-    assert_eq!(accepted_snapshot.paths.len(), 1);
-    assert_eq!(accepted_snapshot.paths[0].session_id, session_id);
-    assert_eq!(accepted_snapshot.paths[0].path_id, path_id);
-
-    ordinary_connection.close();
-    server.abort();
-    let _ = server.await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

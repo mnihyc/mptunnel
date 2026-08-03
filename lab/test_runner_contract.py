@@ -450,9 +450,9 @@ class RunnerContractTests(unittest.TestCase):
             "prepare_path_variation_initial_epoch() {", 1
         )[1].split("\n}", 1)[0]
 
-        self.assertEqual(endpoints.count("${tcp_endpoint_"), 5)
-        self.assertEqual(endpoints.count("--path 'tcp://"), 5)
+        self.assertEqual(endpoints.count("--path 'tcp://"), 10)
         self.assertEqual(endpoints.count("--path 'udp://"), 10)
+        self.assertEqual(endpoints.count("${scale_tcp_carrier_query}"), 10)
         for prefix in range(41, 46):
             self.assertIn(f'"tcp://172.31.{prefix}.20:${{server_port}}"', server)
         for prefix in range(51, 61):

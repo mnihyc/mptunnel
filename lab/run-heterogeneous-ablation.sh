@@ -3837,12 +3837,25 @@ udp_all="${udp_lowlat} ${udp_balanced} ${udp_mildloss} ${udp_fat} ${udp_poor}"
 tcp_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_mildloss} ${tcp_endpoint_fat} ${tcp_endpoint_poor}"
 udp_equal_all="${udp_endpoint_lowlat} ${udp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
 mixed_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
-tcp_scale_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_mildloss} ${tcp_endpoint_fat} ${tcp_endpoint_poor} \
---path 'tcp://172.31.41.20:${server_port}' \
---path 'tcp://172.31.42.20:${server_port}' \
---path 'tcp://172.31.43.20:${server_port}' \
---path 'tcp://172.31.44.20:${server_port}' \
---path 'tcp://172.31.45.20:${server_port}'"
+scale_tcp_carrier_max="${MPTUNNEL_LAB_SCALE_TCP_CARRIER_MAX:-}"
+scale_tcp_carrier_query=""
+if [[ -n "$scale_tcp_carrier_max" ]]; then
+  if [[ ! "$scale_tcp_carrier_max" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MPTUNNEL_LAB_SCALE_TCP_CARRIER_MAX must be a positive integer" >&2
+    exit 2
+  fi
+  scale_tcp_carrier_query="?tcp-carriers=1-${scale_tcp_carrier_max}"
+fi
+tcp_scale_all="--path 'tcp://172.31.10.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.15.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.16.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.20.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.30.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.41.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.42.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.43.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.44.20:${server_port}${scale_tcp_carrier_query}' \
+--path 'tcp://172.31.45.20:${server_port}${scale_tcp_carrier_query}'"
 udp_scale_all="--path 'udp://172.31.51.20:${server_port}' \
 --path 'udp://172.31.52.20:${server_port}' \
 --path 'udp://172.31.53.20:${server_port}' \

@@ -312,6 +312,45 @@ fn byte_threshold_classifies_bulk_even_when_average_rate_is_low() {
 }
 
 #[test]
+fn receive_demand_uses_carrier_timing_without_opposite_direction_capacity() {
+    let limits = MuxLimits::default();
+    let path = PathSnapshot::new(
+        crate::protocol::PathId(0),
+        crate::protocol::UnderlayProtocol::Tcp,
+        120.0,
+        1_000_000_000.0,
+    );
+    let receiver_threshold = reliable_flow_bulk_threshold_bytes(None, limits);
+    assert!(
+        reliable_flow_bulk_threshold_bytes(Some(path), limits) > receiver_threshold,
+        "the control path must expose capacity that could contaminate receiver demand"
+    );
+
+    let mut receiver = ReliableRelayFlowDemandTracker::new();
+    receiver.epoch_started_at = Some(Instant::now() - Duration::from_secs(60));
+    let receiver_decision = receiver.refresh(
+        ReliableRelayFlowSignals::new(receiver_threshold),
+        ReliableRelayFlowPathEvidence::timing_only(Some(path)),
+        limits,
+    );
+    assert_eq!(receiver_decision.lane, TrafficClass::Throughput);
+    assert_eq!(
+        receiver.last_rebalance_interval,
+        reliable_flow_rebalance_interval(Some(path)),
+        "removing opposite-direction capacity must not discard carrier timing"
+    );
+
+    let mut sender = ReliableRelayFlowDemandTracker::new();
+    sender.epoch_started_at = Some(Instant::now() - Duration::from_secs(60));
+    let sender_decision = sender.refresh(
+        ReliableRelayFlowSignals::new(receiver_threshold),
+        ReliableRelayFlowPathEvidence::measured(Some(path)),
+        limits,
+    );
+    assert_eq!(sender_decision.lane, TrafficClass::Latency);
+}
+
+#[test]
 fn latency_startup_credit_follows_the_directional_demand_episode() {
     let limits = MuxLimits::default();
     let path = PathSnapshot::new(

@@ -5,7 +5,8 @@
 
 use super::diagnostics::log_unexpected_stream_relay_frame;
 use super::flow::{
-    ReliableRelayFlowDecision, ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals,
+    ReliableRelayFlowDecision, ReliableRelayFlowDemandTracker, ReliableRelayFlowPathEvidence,
+    ReliableRelayFlowSignals,
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::io::normalized_stream_ack_first_gap;
@@ -1503,7 +1504,7 @@ fn refresh_server_response_flow_demand(
             queued_unique_original_bytes,
             send_stream.reinjection_bytes(),
         ),
-        classifier_path,
+        ReliableRelayFlowPathEvidence::measured(classifier_path),
         mux_limits,
     )
 }
@@ -1708,7 +1709,7 @@ where
         let request_demand_update = request_flow_demand.refresh(
             ReliableRelayFlowSignals::new(recv_stream.next_offset())
                 .with_product_work(0, recv_stream.reorder_bytes()),
-            request_classifier_path,
+            ReliableRelayFlowPathEvidence::timing_only(request_classifier_path),
             mux_limits,
         );
         let request_lane = request_demand_update.lane;

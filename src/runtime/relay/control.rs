@@ -4,7 +4,9 @@ use super::client::{
     update_request_path_staleness,
 };
 use super::diagnostics::log_unexpected_stream_relay_frame;
-use super::flow::{ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals};
+use super::flow::{
+    ReliableRelayFlowDemandTracker, ReliableRelayFlowPathEvidence, ReliableRelayFlowSignals,
+};
 use super::io::{
     ReadyStreamDataBatchBounds, ReadyStreamDataDirection, apply_and_write_ready_stream_data_batch,
     collect_ready_stream_data_batch, pending_stream_fin_ready, read_reliable_relay_payload,
@@ -20,10 +22,10 @@ use super::lifecycle::{
     reliable_relay_product_stall_preserves_attached_path_set,
     reliable_relay_product_stall_should_try_alternate_attach,
     reliable_relay_queued_send_blocked_for_retry, reliable_relay_receive_hole_reinjection_active,
-    reliable_relay_receive_hole_reinjection_deadline, reliable_relay_stall_progress_anchor,
-    reliable_relay_stall_watch_active, spawn_reliable_relay_additional_path_opens,
-    spawn_reliable_relay_disconnected_path_open, spawn_reliable_relay_recovery_path_open,
-    switch_reliable_relay_to_best_path,
+    reliable_relay_receive_hole_reinjection_deadline, reliable_relay_response_stall_watch_active,
+    reliable_relay_stall_progress_anchor, reliable_relay_stall_watch_active,
+    spawn_reliable_relay_additional_path_opens, spawn_reliable_relay_disconnected_path_open,
+    spawn_reliable_relay_recovery_path_open, switch_reliable_relay_to_best_path,
 };
 use super::open::ReliableRelayOpenSpec;
 use super::remote::{ReliableRelayAttachMode, ReliableRelayPathLanes};
@@ -233,9 +235,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let _session_product_flow = context.reserve_session_product_flow();
+    let initial_lane = remote.stream().lane;
     let initial_recv_max_offset = reliable_stream_initial_advertised_window_bytes(
         remote.stream().underlay,
-        remote.stream().lane,
+        initial_lane,
         context.mux_limits,
     );
     let mut remotes =
@@ -266,8 +269,8 @@ where
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut state = ClientRelayState::new();
     let mut sender = RequestSenderService::new_with_performance(stream_id, performance);
-    let mut response_flow_demand = ReliableRelayFlowDemandTracker::new();
-    let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
+    let mut response_flow_demand = ReliableRelayFlowDemandTracker::with_initial_lane(initial_lane);
+    let mut request_flow_demand = ReliableRelayFlowDemandTracker::with_initial_lane(initial_lane);
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let mut deferred_remote_frame = None::<ReliableRelayRemoteFrame>;
     let mut ready_remote_data = super::io::ReadyStreamDataBatch::new();
@@ -464,7 +467,7 @@ where
         let response_demand_update = response_flow_demand.refresh(
             ReliableRelayFlowSignals::new(recv_stream.next_offset())
                 .with_product_work(0, recv_stream.reorder_bytes()),
-            timing_path_snapshot,
+            ReliableRelayFlowPathEvidence::timing_only(timing_path_snapshot),
             context.mux_limits,
         );
         let response_lane = response_demand_update.lane;
@@ -474,7 +477,7 @@ where
         let request_demand_update = request_flow_demand.refresh(
             ReliableRelayFlowSignals::new(request_observed_bytes)
                 .with_product_work(sender_queue.data_bytes(), send_stream.reinjection_bytes()),
-            timing_path_snapshot,
+            ReliableRelayFlowPathEvidence::measured(timing_path_snapshot),
             context.mux_limits,
         );
         let request_lane = request_demand_update.lane;
@@ -768,6 +771,14 @@ where
             state.progress.interactive_response_pending,
             context.mux_limits,
         );
+        let response_stall_watch_active = state.endpoint.remote_open
+            && (state.progress.interactive_response_pending
+                || reliable_relay_response_stall_watch_active(
+                    &recv_stream,
+                    state.endpoint.remote_open,
+                    response_lane,
+                    context.mux_limits,
+                ));
         let stall_progress_anchor = reliable_relay_stall_progress_anchor(
             state.progress.last_stream_at,
             state.progress.last_delivery_at,
@@ -787,10 +798,15 @@ where
             state.progress.last_receive_hole_reinjection_at,
             response_path_snapshot,
         );
+        let stall_path_snapshot = if response_stall_watch_active {
+            response_path_snapshot
+        } else {
+            path_snapshot
+        };
         let stall_deadline = reliable_relay_product_stall_deadline(
             stall_progress_anchor,
             state.progress.last_product_stall_attempt_at,
-            response_path_snapshot,
+            stall_path_snapshot,
         );
         let recv_progress_deadline = tokio::time::Instant::from_std(
             state.progress.last_recv_progress_sent_at

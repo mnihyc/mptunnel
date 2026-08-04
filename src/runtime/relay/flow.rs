@@ -7,6 +7,36 @@ use crate::mux::MuxLimits;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::time::{Duration, Instant};
 
+/// Capacity belongs to the sender direction that measured it. Receivers may
+/// still use carrier timing without borrowing the opposite sender's rate.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ReliableRelayFlowPathEvidence {
+    capacity: Option<PathSnapshot>,
+    timing: Option<PathSnapshot>,
+}
+
+impl ReliableRelayFlowPathEvidence {
+    pub(in crate::runtime) const fn measured(path: Option<PathSnapshot>) -> Self {
+        Self {
+            capacity: path,
+            timing: path,
+        }
+    }
+
+    pub(in crate::runtime) const fn timing_only(path: Option<PathSnapshot>) -> Self {
+        Self {
+            capacity: None,
+            timing: path,
+        }
+    }
+}
+
+impl From<Option<PathSnapshot>> for ReliableRelayFlowPathEvidence {
+    fn from(path: Option<PathSnapshot>) -> Self {
+        Self::measured(path)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ReliableRelayFlowSignals {
     observed_offset: u64,
@@ -55,6 +85,7 @@ pub(in crate::runtime) struct ReliableRelayFlowDemandTracker {
 }
 
 impl ReliableRelayFlowDemandTracker {
+    #[cfg(test)]
     pub(in crate::runtime) fn new() -> Self {
         Self::with_initial_lane(TrafficClass::Latency)
     }
@@ -104,9 +135,10 @@ impl ReliableRelayFlowDemandTracker {
     pub(in crate::runtime) fn refresh(
         &mut self,
         signals: ReliableRelayFlowSignals,
-        path: Option<PathSnapshot>,
+        path: impl Into<ReliableRelayFlowPathEvidence>,
         mux_limits: MuxLimits,
     ) -> ReliableRelayFlowDecision {
+        let path = path.into();
         let now = Instant::now();
         #[cfg(feature = "lab-diagnostics")]
         let observed_bytes = signals.observed_bytes();
@@ -120,9 +152,9 @@ impl ReliableRelayFlowDemandTracker {
         }
         self.last_observed_offset = self.last_observed_offset.max(signals.observed_offset);
         let previous = self.current;
-        let rebalance_interval = reliable_flow_rebalance_interval(path);
+        let rebalance_interval = reliable_flow_rebalance_interval(path.timing);
         self.last_rebalance_interval = rebalance_interval;
-        let threshold = reliable_flow_bulk_threshold_bytes(path, mux_limits);
+        let threshold = reliable_flow_bulk_threshold_bytes(path.capacity, mux_limits);
         // Poll frequency is not demand. Fresh bytes establish the demand
         // epoch; queued product work shows current buffered demand while
         // transport or data-level credit catches up.
@@ -131,7 +163,7 @@ impl ReliableRelayFlowDemandTracker {
         let idle_gap = product_delta == 0
             && !has_active_product_work
             && now.duration_since(self.last_progress_at)
-                >= reliable_flow_interactive_idle_gap(path);
+                >= reliable_flow_interactive_idle_gap(path.timing);
         if idle_gap {
             self.epoch_started_at = None;
             self.epoch_bytes = 0;
@@ -150,11 +182,12 @@ impl ReliableRelayFlowDemandTracker {
                     .as_secs_f64()
                     .max(QUIC_TIMER_GRANULARITY.as_secs_f64())
         };
-        let rate_threshold = reliable_flow_bulk_rate_threshold_bps(path, mux_limits);
+        let rate_threshold = reliable_flow_bulk_rate_threshold_bps(path.capacity, mux_limits);
         let rate_proven_bulk = self.product_rate_bps >= rate_threshold;
         let rate_evidence_bytes =
-            reliable_flow_rate_bulk_evidence_bytes(path, mux_limits, threshold);
-        let path_open_threshold = reliable_relay_bulk_path_open_threshold_bytes(path, mux_limits);
+            reliable_flow_rate_bulk_evidence_bytes(path.capacity, mux_limits, threshold);
+        let path_open_threshold =
+            reliable_relay_bulk_path_open_threshold_bytes(path.capacity, mux_limits);
         let preopen_additional_paths = !idle_gap
             && self.current != TrafficClass::Throughput
             && self.epoch_bytes >= path_open_threshold;

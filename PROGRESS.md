@@ -5314,3 +5314,61 @@ entry is authoritative.
 - Next: commit this exact source as the clean performance candidate; run the
   bounded current-version product, QoS, scale, asymmetry, continuity, browser,
   and stress matrix; publish only valid final-candidate measurements.
+
+## 2026-08-04T08:20:48+08:00: native TCP flight and shared staging model accepted
+
+- Name: per-output native congestion authority with connection-wide source
+  staging
+- Category: RFC conformance and final performance acceptance
+- State: accepted and committed; public evidence refresh in progress
+- Root cause and minimal correction:
+  - a fresh exact TCP completion sample remains a demonstrated capacity lower
+    bound for ranking, but an older MPP service estimate can no longer enlarge
+    one output's positive native congestion window;
+  - exact MPP flight already committed to that output drains gradually and is
+    never revoked by a later smaller native window; and
+  - unassigned source staging is connection-wide work for several outputs. It
+    uses the existing stream/repair/reorder and configured resource envelopes,
+    including its configured path-flight ceiling, and is no longer charged to
+    one selected output's native window. Every later DSN assignment still
+    passes per-output admission and native writer backpressure.
+- Diagnosis and proof:
+  - using one TCP output window as the shared request-source budget reduced the
+    20-link multi-gigabit upload from `545.268` to `353.409 Mbps`;
+  - separating those authorities restored the targeted diagnostic to
+    `730.261 Mbps`, and clean commit `ee26898` delivered
+    `2,277.788/723.070 Mbps` download/upload;
+  - the exact-seed flapping control retained every persistent TCP exchange and
+    the final clean run delivered `159.741 Mbps`, `40/40` TCP exchanges,
+    `34/37` deadline-bounded HTTP requests, and `86/91` datagrams across the
+    deliberate blackholes;
+  - five shaped TCP paths reached `641.250 Mbps` in the matched 20-second run
+    and `805.194 Mbps` in its 30-second confirmation. All five interfaces
+    carried payload. The paired durations show that the shorter result is not
+    a capacity ceiling; throughput alone does not identify a causal owner; and
+  - the default mixed one-path result reached `284.982/305.017 Mbps`, while the
+    five-path default reached `677.370/748.829 Mbps`.
+- Cross-condition acceptance:
+  - independent 500-Mbps-per-flow TCP limits produced
+    `355.923/347.045 Mbps` for one carrier, `886.246/823.774 Mbps` for default
+    `1-3`, and `794.061/901.910 Mbps` for three explicit one-carrier endpoints;
+  - the same forms stayed between `151.999` and `167.363 Mbps` behind one
+    shared 200-Mbps bottleneck;
+  - asymmetric multipath reached `153.998/156.716 Mbps`, with `90.7/90.3%` of
+    download/upload bytes on the directionally faster link;
+  - mixed blackhole and latency changes retained `60/60` TCP exchanges and all
+    HTTP requests; TCP-only disruption cases delivered `200.169-288.669 Mbps`;
+    and
+  - browser gates passed `90/90` deadline-bounded requests and `686/686`
+    continuously replaced one-MiB requests with zero rejection or failure.
+- Rejected alternatives: a service-estimate-first per-path window and a
+  native-rate pacing cap each violated authority boundaries or disrupted reliable traffic;
+  both were fully removed. No Mbps threshold, utilization percentage, source
+  address, platform branch, native congestion controller, RFC timer, or lab
+  condition entered production behavior.
+- Reproducible clean evidence is under
+  `./.tmp/lab/results/v017-final-ee-product/`,
+  `./.tmp/lab/results/v017-final-ee-product-confirm/`,
+  `./.tmp/lab/results/v017-final-ee-scale/`,
+  `./.tmp/lab/results/v017-final-ee-continuity-load/`, and
+  `./.tmp/lab/results/v017-final-ee-topology/`.

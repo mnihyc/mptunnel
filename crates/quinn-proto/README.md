@@ -47,8 +47,8 @@ References:
 
 ## Updating the upstream baseline
 
-Treat an upstream refresh as a Performance/Core change, never dependency
-housekeeping. Use a clean worktree and one exact candidate version:
+Treat an upstream refresh as a performance-sensitive transport change, never
+dependency housekeeping. Use a clean worktree and one exact candidate version:
 
 1. Download `quinn-proto-<version>.crate` from `static.crates.io`, record and
    verify its registry SHA-256, and extract it under ignored

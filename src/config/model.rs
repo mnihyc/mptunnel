@@ -1250,10 +1250,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "max stream window bytes must be greater than zero")
             }
             Self::ReinjectionLimitTooSmall => {
-                write!(
-                    f,
-                    "max reinjection bytes must be at least max payload bytes"
-                )
+                write!(f, "max repair bytes must be at least max payload bytes")
             }
             Self::ReorderLimitTooSmall => {
                 write!(f, "max reorder bytes must be at least max payload bytes")
@@ -1291,7 +1288,7 @@ impl std::fmt::Display for ConfigError {
             Self::PathFlightLimitExceedsReinjectionLimit => {
                 write!(
                     f,
-                    "max path flight bytes must be no greater than max reinjection bytes"
+                    "max path flight bytes must be no greater than max repair bytes"
                 )
             }
             Self::TcpPathHeartbeatIntervalZero => {

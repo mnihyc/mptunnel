@@ -20,7 +20,7 @@ user ports. TUN mode needs host-approved network privileges.
 
 - **Linux**: TUN and route setup need `CAP_NET_ADMIN` or equivalent service
   capability. Ports below 1024 need `CAP_NET_BIND_SERVICE`.
-- **macOS**: proxy mode can run as an ordinary user. Product VPN packet flow
+- **macOS**: proxy mode can run as an ordinary user. VPN packet flow
   and route/DNS publication require a signed, entitled Network Extension host;
   a privileged process supervisor alone is insufficient.
 - **Windows**: keep the package's architecture-matched `wintun.dll` beside
@@ -105,7 +105,7 @@ Flow events require `info`, because they are information records.
 Lifecycle, control, saturation, and fault records are length-bounded,
 rate-limited per call site, and redact common authorization, token, password,
 and credential forms. `flow_events = true` additionally emits one sanitized
-open and close record for each observable Product flow, including its inbound,
+open and close record for each observable flow, including its inbound,
 destination, selected concrete outbound, duration, outcome, and byte/packet
 counts. It deliberately omits source addresses, principals, credentials,
 session/protocol IDs, carrier endpoints, and payload. Destinations remain
@@ -115,7 +115,7 @@ A live logging change applies to newly opened flows. A flow whose open record
 was emitted retains that sink and format through its close record, so enabling,
 disabling, or moving flow logs does not split lifecycle pairs.
 
-Logging performs no per-packet or per-byte output and never enters Core
+Logging performs no per-packet or per-byte output and never enters forwarding,
 scheduling, recovery, congestion, or carrier loops. File rotation is
 host-owned. Changing logging settings or restarting the process reopens the
 file; an unrelated runtime-generation replacement retains the already-open
@@ -161,12 +161,12 @@ Balancer strategies are `manual`, `ordered-failover`, `round-robin`, `random`,
 `enabled`, `draining`, or `disabled`; only enabled members receive new flows.
 Optional destination or principal stickiness is bounded by both TTL and entry
 capacity. Active probes require a literal IP TCP target and run under one
-process-wide concurrency bound. Least-latency uses only fresh Product-owned
-end-to-end observations, while least-load uses Product flow leases. Neither
+process-wide concurrency bound. Least-latency uses only fresh end-to-end
+observations, while least-load uses active-flow leases. Neither
 strategy reads MPP carrier/path metrics.
 
 Each selected local TCP or native UDP member receives its configured outbound
-connect timeout, and an MPP TCP member receives its Product open timeout. A
+connect timeout, and an MPP TCP member receives its MPP stream-open timeout. A
 blackholed member therefore cannot consume a successor's attempt budget, and
 unrelated outbounds do not lengthen or shorten the selected balancer. MPP UDP
 has no pre-commit network-open stage; its first send supplies the open outcome.
@@ -226,7 +226,8 @@ fixed server listener. `port-hop-interval-ms` is accepted on ranged TCP and
 QUIC paths, defaults to five minutes, and has a 5000 ms minimum. QUIC uses a
 fresh protected socket while retaining the authenticated native connection;
 native QUIC migration and validation remain authoritative. TCP waits for an
-exact Product-quiescent boundary and replaces only that member ordinal. With a
+exact active-work quiescent boundary and replaces only that member ordinal.
+With a
 spare physical reservation it may establish the successor before draining the
 predecessor; at the full envelope it retires the predecessor first. It never
 transfers native transport state or closes active work to meet the interval.
@@ -244,7 +245,7 @@ runtime or unavailable remote endpoint is a warning and exits zero, so offline
 preflight remains useful. Doctor never changes host routes, DNS, caches, or
 runtime configuration.
 
-Explain the exact immutable Product route table without opening a socket:
+Explain the exact immutable route table without opening a socket:
 
 ```bash
 mptunnel --config ./config.toml --principal-id local-user route explain \
@@ -292,7 +293,7 @@ management policy changes them. Rate, RTT, and jitter are startup measurement
 priors that live evidence may replace. Neither category is a persistent
 stream-placement role.
 
-A configured path `name` is its stable endpoint-local Product identity. The
+A configured path `name` is its stable endpoint-local path identity. The
 server preserves that name with its bound socket or QUIC endpoint; a
 peer-supplied `path_id` is opaque runtime identity and never indexes local
 configuration. Client and server path lists therefore do not need matching
@@ -338,10 +339,10 @@ All data and controls are authenticated under `/api/v2/`:
   local path inventory.
 - `GET /api/v2/paths` returns configured named paths and live carrier
   instances with their lifecycle state.
-- `GET /api/v2/traffic` returns monotonic Product totals, one-second rates,
+- `GET /api/v2/traffic` returns monotonic forwarded totals, one-second rates,
   and five minutes of one-second trend samples.
 - `GET /api/v2/sessions` returns authenticated MPP session ownership.
-- `GET /api/v2/flows` returns bounded active reliable/datagram Product-flow
+- `GET /api/v2/flows` returns bounded active reliable/datagram logical-flow
   detail, including the origin inbound, application target, selected outbound,
   and optional balancer.
 - `GET /api/v2/diagnostics` returns local diagnostic capability, peer session
@@ -429,10 +430,10 @@ Tokens must contain 16-256 visible ASCII characters. The server rejects
 duplicate authorization/content-type headers, transfer encoding, ambiguous
 content lengths, pipelining, and non-origin request targets.
 
-Forwarded totals come from one generation-owned Product observer and are
-monotonic logical Product counters. `to_peer` counts bytes
-or datagrams accepted from the local product source; `from_peer` counts bytes or
-datagrams delivered to the local product destination. They do not grow from
+Forwarded totals come from one generation-owned forwarding observer and are
+monotonic logical counters. `to_peer` counts bytes or datagrams accepted from
+the local source; `from_peer` counts bytes or datagrams delivered to the local
+destination. They do not grow from
 carrier retransmission, MPP reinjection, multipath copies, DNS connector work,
 or path probes. Native and MPP boundaries share the owner but never observe one
 flow twice. Path delivery rate, queue, and flight remain separate current
@@ -503,9 +504,27 @@ transmission modes and not desired memory occupancy.
 | `quic_path_keep_alive_interval_ms` | 10,000 ms |
 | `quic_path_idle_timeout_ms` | 30,000 ms |
 
+The four byte-window fields compose rather than replace one another. Estimate
+aggregate BDP as `sum(rate_bps × RTT_seconds) / 8`. Aggregate admitted work is
+bounded by the applicable `max_stream_window_bytes`, `max_repair_bytes`, and
+`max_reorder_bytes` envelopes plus the sum of independently applicable
+per-path `max_path_flight_bytes` envelopes. Each path must still cover its own
+BDP. Raise the relevant fields coherently on both endpoints only when
+diagnostics show that envelope, and keep
+`max_path_flight_bytes <= max_repair_bytes`. If
+`max_path_flight_bytes` is omitted from TOML, it inherits the effective repair
+limit. Larger windows increase worst-case retained memory; available RAM alone
+is not an automatic sizing signal.
+
+The 64 MiB defaults cover one raw BDP up to about 537 ms at 1 Gbps or 53.7 ms
+at 10 Gbps. They are configurable local bounds, not protocol constants. At
+10 Gbps and 100 ms RTT, a 64 MiB logical window has a rough 5.37 Gbps
+window/RTT ceiling and must be raised for line rate. Frame, payload, chunk, and
+sparse-range limits are separate safeguards and do not need to grow with BDP.
+
 Each proxy outbound has its own `connect_timeout_ms`; the default is 10,000 ms.
 
-`[admission]` is the independent Product envelope used before DNS, target
+`[admission]` is the independent new-flow envelope used before DNS, target
 connects, or other flow-opening I/O. Defaults are finite:
 
 | Field | Default |
@@ -523,11 +542,11 @@ SOCKS5, HTTP CONNECT, fixed forwarding, TUN, and authenticated MPP server
 opens share this one generation owner. Their listener/source/association
 limits still compose at their narrower boundary. Permits release exactly on
 close, error, cancellation, or generation retirement and never enter payload
-forwarding. These fields do not derive from `[resources]`; raising a Core stream
-or queue budget never raises Product admission.
+forwarding. These fields do not derive from `[resources]`; raising an MPP stream
+or queue budget never raises new-flow admission.
 
 An MPP client outbound that has previously authenticated a carrier rejects new
-Product flows while its exact authenticated-carrier count is zero. Existing
+new flows while its exact authenticated-carrier count is zero. Existing
 flows remain retained under `[session]`, and the normal TCP/QUIC maintenance
 services continue reconnection. A newly started configuration generation may
 perform its first bounded establishment attempt; no source-address heuristic or
@@ -594,8 +613,8 @@ forwarding within retained MPP state, not end-to-end exactly-once UDP delivery.
 Configured QUIC paths retain their authenticated native connection, while each
 TCP endpoint reconciles its bounded group toward the configured maximum.
 Diagnostic probes use isolated connections; idle TCP heartbeats and native
-QUIC keep-alives own liveness on Product carriers. Together they detect
-reachability without placing diagnostic work in a Product stream. Active
+QUIC keep-alives own carrier liveness. Together they detect reachability
+without placing diagnostic work in an MPP data stream. Active
 failover additionally uses exact MPP progress, path-instance lifetime, PTO,
 and queue/flight evidence. A reconnect creates a new physical path instance;
 old flights and evidence cannot be inherited from its numeric path ID. A
@@ -652,7 +671,7 @@ evidence, while durable unambiguous Data ACK progress may additionally establish
 a per-flow TCP MPP rate. While fresh, that exact rate may serve only as a
 demonstrated lower bound for native TCP carrier capacity. It is not multiplied
 across flows, does not lower a faster native observation, and remains divided
-among active Product flows.
+among active flows.
 
 The adapter is optional. Older systems, unsupported kernels, restricted hosts,
 and compatibility layers that reject the socket query use the portable fallback
@@ -727,7 +746,7 @@ passwords use the same
 file/environment reference shape as MPP credentials and the management token.
 Local proxy inbounds separately bound total connections, connections per
 source IP, connections per principal, and their authentication/header deadline
-under `[inbounds.admission]`; these limits never derive from Core capacity.
+under `[inbounds.admission]`; these limits never derive from MPP capacity.
 
 ## Installed files
 

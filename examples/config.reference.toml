@@ -12,7 +12,7 @@
 
 check_config = false
 
-# Process logging stays outside the forwarding Core. Relative file paths are
+# Process logging stays outside the forwarding data path. Relative file paths are
 # resolved beside this document; parent directories must already exist.
 [logging]
 level = "info"          # off, error, warn, or info
@@ -36,7 +36,7 @@ secret = { from = "file", path = "mpp-credential.key" }
 
 # Optional named users for local SOCKS5 and HTTP CONNECT authentication.
 # Login names and passwords are protocol credentials; `principal_id` is the
-# stable Product identity used by routing and admission. Passwords are never
+# stable principal identity used by routing and admission. Passwords are never
 # accepted inline.
 # [[local_users]]
 # name = "phone-login"
@@ -101,8 +101,8 @@ tcp_path_heartbeat_timeout_ms = 30000
 quic_path_keep_alive_interval_ms = 10000
 quic_path_idle_timeout_ms = 30000
 
-# Product admission is a separate open/control-time owner. These limits do not
-# derive from, resize, or feed Core MPP path/session/stream/queue budgets.
+# New-flow admission is a separate open/control-time owner. These limits do not
+# derive from, resize, or feed MPP path/session/stream/queue budgets.
 # Established permits do no per-byte or per-packet accounting.
 [admission]
 max_live_flows = 4096
@@ -210,7 +210,7 @@ listen = ["127.0.0.1:1080"]
 # local_users = ["phone-login"]
 
 [inbounds.admission]
-# Product connection-open limits; these do not derive from MPP Core limits.
+# Connection-open limits; these do not derive from MPP resource limits.
 max_connections = 1024
 max_connections_per_source = 256
 max_connections_per_principal = 512
@@ -306,8 +306,9 @@ paths = [
 # listener.
 #
 # Ranged QUIC paths periodically move the same authenticated connection to
-# another port in the set. Ranged TCP paths use the same interval for ordered,
-# Product-quiescent carrier replacement. The default is five minutes; override it with
+# another port in the set. Ranged TCP paths use the same interval for ordered
+# replacement at an exact active-work quiescent boundary. The default is five
+# minutes; override it with
 # `port-hop-interval-ms=<u32>` (minimum 5000). TCP never migrates native state
 # or closes an active carrier to meet an interval.
 #
@@ -555,8 +556,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 #
 # An MPP balancer chooses one independent MPP outbound once per new flow. It
 # never merges carrier paths from separate sessions. Selection uses only
-# Product-owned probe/open/flow outcomes; it cannot inspect MPP PathScheduler
-# state or carrier metrics.
+# end-to-end probe/open/flow outcomes; it cannot inspect per-carrier MPP
+# scheduler state or carrier metrics.
 # [[routing.balancers]]
 # name = "edge-balancer"
 # strategy = "least-latency"
@@ -567,7 +568,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 #   { outbound = "edge-mpp", weight = 3, mode = "enabled" },
 #   { outbound = "edge-mpp-secondary", weight = 1, mode = "enabled" },
 # ]
-# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_ms = 1000, maximum_backoff_ms = 60000 }
+# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_ms = 1000,
+#            maximum_backoff_ms = 60000 }
 # stickiness = { key = "destination", ttl_ms = 60000, capacity = 4096 }
 # probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }
 #

@@ -201,13 +201,14 @@ evidence, while detach and reattach invalidates that stream's ownership even if
 the carrier itself stayed live.
 
 One configured TCP endpoint owns a bounded carrier group whose maximum is the
-healthy target; the Product default creates three members. Each exact physical
+healthy target; the configuration default creates three members. Each physical
 carrier has its own actor, encrypted reader/writer, `PathId`, instance identity,
 attachments, queues, flight, evidence, and `PATH_STATUS` sequence. The session
-group owner reconciles every missing member. Every authenticated member has the
-same ordinary Product authority, while `TrafficClass` changes priority and
-demand only. Product close or detach removes only its flow or attachment and
-cannot create, retain, replace, or close a carrier.
+group owner reconciles every missing member. A lone endpoint exposes all of its
+members as regular capacity. With several endpoints, each primary is regular
+and its correlated siblings are ready backups; live directional evidence ranks
+members inside that eligible tier. Flow close or detach removes only its flow
+or attachment and cannot create, retain, replace, or close a carrier.
 
 Datagram failover keeps timing ownership below the carrier-neutral association.
 TCP and QUIC each derive a modeled pre-feedback response timeout from their own

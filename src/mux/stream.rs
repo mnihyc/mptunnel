@@ -25,10 +25,10 @@ impl ReliableSendStream {
     /// Runtime relays use `initial_max_offset=0` and then apply the peer's
     /// `STREAM_MAX_DATA`/open credit before sending. Keeping the public test
     /// constructor above at the configured window avoids rewriting older unit
-    /// tests, but production paths must not manufacture a 64 MiB credit before
-    /// the receiver advertises it. That uncredited window was the root cause of
-    /// QUIC reliable-stream burst delivery: mptunnel could queue tens of MiB
-    /// above QUIC before the application receiver had created matching credit.
+    /// tests, but production paths must not manufacture the configured credit
+    /// before the receiver advertises it. An uncredited window could otherwise
+    /// queue data above QUIC before the application receiver creates matching
+    /// credit.
     pub fn new_with_initial_max_offset(
         stream_id: StreamId,
         limits: MuxLimits,

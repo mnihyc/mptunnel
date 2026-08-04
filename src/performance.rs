@@ -246,10 +246,9 @@ impl std::fmt::Display for ResourceLimitError {
             Self::StreamWindowLimitZero => {
                 write!(f, "max stream window bytes must be greater than zero")
             }
-            Self::ReinjectionLimitTooSmall => write!(
-                f,
-                "max reinjection bytes must be at least max payload bytes"
-            ),
+            Self::ReinjectionLimitTooSmall => {
+                write!(f, "max repair bytes must be at least max payload bytes")
+            }
             Self::ReorderLimitTooSmall => {
                 write!(f, "max reorder bytes must be at least max payload bytes")
             }
@@ -281,7 +280,7 @@ impl std::fmt::Display for ResourceLimitError {
             }
             Self::PathFlightLimitExceedsReinjectionLimit => write!(
                 f,
-                "max path flight bytes must be no greater than max reinjection bytes"
+                "max path flight bytes must be no greater than max repair bytes"
             ),
             Self::TcpPathHeartbeatIntervalZero => {
                 write!(f, "TCP path heartbeat interval must be greater than zero")

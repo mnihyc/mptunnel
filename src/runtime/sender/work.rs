@@ -139,6 +139,19 @@ impl RelaySendCause {
         matches!(self, Self::AckGapReinjection) || self.is_persistent_ack_gap_reinjection()
     }
 
+    /// Recovery that already owns a bounded retry may use carrier queue
+    /// capacity without requiring unrelated shared-carrier work to drain.
+    pub(in crate::runtime::sender) fn permits_busy_carrier_recovery(self) -> bool {
+        self.is_persistent_ack_gap_reinjection()
+            || matches!(
+                self,
+                Self::TailReinjection
+                    | Self::PathFailureReinjection
+                    | Self::StalePathReinjection(_)
+                    | Self::StaleResponsePathReinjection(_)
+            )
+    }
+
     pub(in crate::runtime::sender) fn persistent_client_target(self) -> Option<RelayPathInstance> {
         match self {
             Self::PersistentClientAckGapReinjection(batch) => Some(batch.target.instance),

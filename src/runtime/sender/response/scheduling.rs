@@ -452,6 +452,13 @@ pub(super) fn select_response_frame_path(
                 .or_else(|| select(allow_backup, avoid_existing, true, false))
                 .or_else(|| select(allow_backup, avoid_existing, false, false));
         }
+        if matches!(reinjection_cause, Some(RelaySendCause::TailReinjection)) {
+            // The bounded live-tail probe prefers a drained carrier. Shared
+            // carrier work may delay it, but cannot veto recovery when every
+            // distinct healthy output is busy with unrelated streams.
+            return select(allow_backup, avoid_existing, false, true)
+                .or_else(|| select(allow_backup, avoid_existing, false, false));
+        }
         select(
             allow_backup,
             avoid_existing,
@@ -485,8 +492,8 @@ pub(super) fn select_response_frame_path(
         })
 }
 
-/// A repeated Data Sequence range helps only where it can get ahead of the
-/// blocked copy. Confirmed path failure has a separate busy-carrier fallback.
+/// Idle preference for ordinary speculative repair. Authoritative recovery
+/// causes may separately fall back to a busy carrier with bounded queue space.
 fn ordered_carrier_reinjection_ready(target: &ResponseSenderPathTarget) -> bool {
     let observation = &target.observation;
     if observation.writer_pending_bytes != 0 {

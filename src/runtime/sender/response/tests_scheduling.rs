@@ -643,6 +643,30 @@ fn ack_gap_reinjection_uses_distinct_repair_headroom_when_fresh_data_is_full() {
         selected.observation.key, backup.observation.key,
         "strict tail reinjection may use Backup only because same-path duplication is forbidden",
     );
+
+    backup.observation.writer_pending_bytes = 1;
+    assert!(
+        select_response_frame_path(
+            &[available.clone(), backup.clone()],
+            TrafficClass::Throughput,
+            &frame,
+            CarrierEmitMode::StreamOrdered,
+            &[(available.observation.key, available.observation.incarnation)],
+            Some(RelaySendCause::AckGapReinjection),
+        )
+        .is_none(),
+        "ordinary speculative repair still waits for shared carrier drain",
+    );
+    let selected = select_response_frame_path(
+        &[available.clone(), backup.clone()],
+        TrafficClass::Throughput,
+        &frame,
+        CarrierEmitMode::StreamOrdered,
+        &[(available.observation.key, available.observation.incarnation)],
+        Some(RelaySendCause::TailReinjection),
+    )
+    .expect("bounded tail recovery survives unrelated shared-carrier work");
+    assert_eq!(selected.observation.key, backup.observation.key);
 }
 
 #[test]

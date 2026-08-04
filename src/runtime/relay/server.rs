@@ -901,8 +901,9 @@ fn prefix_live_reinjection_frames_with_carrier_credit(
 ) -> (Vec<Frame>, Option<u64>) {
     let mut accepted = Vec::with_capacity(reinjection_frames.len());
     for frame in reinjection_frames {
-        // Match Linux MPTCP recovery: select an eligible idle carrier before
-        // publishing reinjection work, rather than blocking new data behind it.
+        // Select an eligible alternate before publishing reinjection work.
+        // Live-tail recovery prefers a drained carrier but retains bounded
+        // liveness when every alternate carries unrelated shared work.
         if response_sender
             .reinjection_path_snapshot_for_frame(path_stream, &frame, cause)
             .is_none()

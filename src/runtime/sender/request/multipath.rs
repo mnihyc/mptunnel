@@ -1566,9 +1566,10 @@ impl RequestMultipathController {
             .record_original_frame_instance(instance, frame);
     }
 
-    /// Periodic Data-ACK repair is useful only when the chosen ordered carrier
-    /// can get ahead of the blocked copy. TCP uses native socket state when it
-    /// exists; QUIC and portable TCP use exact same-stream product ownership.
+    /// Drained-carrier preference for ordinary periodic repair. Recovery that
+    /// already owns a bounded retry may separately use a busy-carrier fallback.
+    /// TCP uses native socket state when it exists; QUIC and portable TCP use
+    /// exact same-stream product ownership.
     pub(super) fn ordered_reinjection_carrier_ready(
         &self,
         context: &ClientPathContext,
@@ -1619,10 +1620,7 @@ impl RequestMultipathController {
         let required_persistent_target = cause.persistent_client_target();
         let invalid_persistent_target =
             matches!(cause, RelaySendCause::PersistentServerAckGapReinjection(_));
-        let failure_recovery = matches!(
-            cause,
-            RelaySendCause::PathFailureReinjection | RelaySendCause::StalePathReinjection(_)
-        );
+        let live_tail_recovery = cause == RelaySendCause::TailReinjection;
         let requires_distinct_output =
             cause == RelaySendCause::TailReinjection || ack_gap_reinjection;
         let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
@@ -1634,9 +1632,9 @@ impl RequestMultipathController {
                     || context
                         .relay_path_has_bulk_model_evidence(path.key().underlay, path.key().index))
         };
-        let busy_reinjection_allowed = failure_recovery || requires_measured_reinjection_target;
+        let busy_reinjection_allowed = cause.permits_busy_carrier_recovery() && !live_tail_recovery;
         let carrier_reinjection_ready = |path: &ReliableRelayRemotePath, require_idle: bool| {
-            (!require_idle && busy_reinjection_allowed)
+            (!require_idle && (busy_reinjection_allowed || live_tail_recovery))
                 || self.ordered_reinjection_carrier_ready(context, path, frame, cause)
         };
         let can_enqueue = |path: &ReliableRelayRemotePath| {
@@ -1681,7 +1679,13 @@ impl RequestMultipathController {
                     .or_else(|| choose(true, false, require_idle))
             }
         };
-        let selected = choose_ranked(!busy_reinjection_allowed);
+        let selected = choose_ranked(!busy_reinjection_allowed).or_else(|| {
+            // A live tail has already passed the authoritative ACK-prefix,
+            // age, repeat, distinct-output, and bounded-queue gates. Prefer a
+            // drained carrier, but unrelated work on every shared carrier
+            // must not turn that bounded liveness probe into starvation.
+            live_tail_recovery.then(|| choose_ranked(false)).flatten()
+        });
         if let Some(position) = selected {
             return Ok(position);
         }
@@ -1714,7 +1718,11 @@ impl RequestMultipathController {
                     .or_else(|| choose_capacity(true, false, require_idle))
             }
         };
-        let capacity_fallback = choose_capacity_fallback(!busy_reinjection_allowed);
+        let capacity_fallback = choose_capacity_fallback(!busy_reinjection_allowed).or_else(|| {
+            live_tail_recovery
+                .then(|| choose_capacity_fallback(false))
+                .flatten()
+        });
         if let Some(position) = capacity_fallback {
             return Ok(position);
         }

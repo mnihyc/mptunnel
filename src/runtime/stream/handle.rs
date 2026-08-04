@@ -750,8 +750,9 @@ impl ReliablePathStreamHandle {
         self.output.can_enqueue_reinjection_frame_now(frame)
     }
 
-    /// Carrier work already removed from this stream's command queues but not
-    /// yet handed off by the ordered writer. Priority repair cannot overtake it.
+    /// Shared-carrier work already removed from the command queues but not yet
+    /// handed off by the ordered writer. It is an idle preference, not
+    /// direction-local stream state.
     pub(in crate::runtime) fn ordered_writer_pending_bytes(&self) -> Option<u64> {
         match &self.output {
             ReliablePathStreamOutput::Fixed(fixed) => Some(fixed.commands().writer_pending_bytes()),

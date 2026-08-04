@@ -9,7 +9,8 @@ use crate::model::work::{
 use crate::protocol::{PathId, SessionId};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
-    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
+    reliable_path_command_pending_bytes, try_recv_reliable_path_command,
+    try_recv_reliable_path_priority_command,
 };
 use crate::runtime::sender::response::ServerResponseSenderService;
 use crate::runtime::stream::response::ResponseStreamBinding;
@@ -304,25 +305,22 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
             TrafficClass::Throughput,
         )
         .expect("fill the modeled reinjection output after sizing");
+    let unrelated = recv_reliable_path_command(&mut udp_receivers)
+        .await
+        .expect("ordered writer accepts unrelated carrier work");
     let bound_cause =
         RelaySendCause::persistent_client_ack_gap_reinjection(reinjection_target, reinjection_path);
     sender
         .send_reinjection_frame(&context, &mut remotes, blocked.clone(), bound_cause)
         .await
-        .expect("bound repair uses headroom independent of fresh data");
+        .expect("bound repair uses headroom independent of shared writer work");
+    udp_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&unrelated));
     assert!(matches!(
         try_recv_reliable_path_command(&mut udp_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             ref payload,
             ..
         })) if payload.len() == 4096
-    ));
-    assert!(matches!(
-        try_recv_reliable_path_command(&mut udp_receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
-            ref payload,
-            ..
-        })) if payload.as_ref() == b"busy"
     ));
     assert!(
         try_recv_reliable_path_command(&mut proof_only_receivers).is_none(),
@@ -374,6 +372,7 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
     consume_client_path_proof_for_test(&mut tcp_receivers);
     let tcp = remotes.paths[0].instance();
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
+    let udp_commands_for_writer = udp_commands.clone();
     assert_eq!(
         remotes.attach(opened_test_relay_stream_with_underlay(
             stream_id,
@@ -410,6 +409,19 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
     let recovery_interval =
         reliable_relay_tail_reinjection_delay(context.reliable_path_snapshot(tcp.key));
     tokio::time::sleep(recovery_interval + Duration::from_millis(10)).await;
+    udp_commands_for_writer
+        .try_enqueue_stream_ordered_frame(
+            Frame::StreamData {
+                stream_id: StreamId(999),
+                offset: 0,
+                payload: Bytes::from_static(b"unrelated carrier work"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("queue unrelated work on the shared carrier");
+    let unrelated = recv_reliable_path_command(&mut udp_receivers)
+        .await
+        .expect("ordered writer accepts unrelated carrier work");
     let mut sender_queue = ReliableRelaySenderQueue::default();
     assert!(sender.enqueue_tail_reinjection(
         &mut sender_queue,
@@ -436,6 +448,7 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
             .expect("live tail dispatch"),
         ClientQueuedDispatch::Reinjection { payload_bytes: 64 }
     ));
+    udp_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&unrelated));
     assert!(matches!(
         try_recv_reliable_path_command(&mut udp_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {

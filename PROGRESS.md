@@ -5515,3 +5515,44 @@ entry is authoritative.
   `v017-final-a173c55-browser/`, and `v017-final-a173c55-local-1-1/` under that
   result root. Diagnostic-only evidence is under
   `v017-diagnostic-a173c55-tcp-qos-download/`.
+
+## 2026-08-04T14:41:01+08:00: shared-carrier tail-recovery starvation corrected
+
+- Name: bounded live-tail recovery under concurrent carrier load
+- Category: post-v0.1.7 reliability correction
+- State: targeted implementation and causal verification passed; clean
+  non-instrumented non-regression matrix pending
+- Frozen baseline: release commit
+  `40de8b4f5ec43c15c3e65de456b1791bde8af548` remains tagged `v0.1.7` and
+  unchanged.
+- Reproduced defect: during the low-latency-path blackhole case, client stream
+  `0` retained request range `704..768` for the rest of the 30-second run while
+  the server remained fully acknowledged at offset `704`. Six to seven
+  alternatives were attached and bulk delivery continued at `271.394 Mbps`.
+- Root cause: live-tail dispatch treated carrier-wide ordered-writer backlog
+  and native TCP flight as if they were direction-local stream state. Unrelated
+  saturated bulk traffic could therefore keep every healthy alternate
+  permanently ineligible for one already-authorized 64-byte recovery copy.
+- Correction:
+  - ordinary speculative Data-ACK repair still requires a drained carrier;
+  - an RFC-bounded live-tail recovery still prefers a drained distinct output,
+    but may use bounded reinjection queue space on a busy healthy output when
+    all distinct alternatives carry unrelated work;
+  - request apply now honors the same busy-carrier authority already granted
+    to persistent, failed-path, and stale-path recovery; and
+  - the response direction uses the same live-tail fallback. No timing,
+    threshold, congestion controller, normal placement, or platform behavior
+    changed.
+- Evidence:
+  - all `115` sender tests passed, including full request dispatch with
+    writer-dequeued unrelated carrier work and the symmetric response selector;
+  - the affected mixed low-latency blackhole diagnostic completed `34/34`
+    persistent TCP exchanges with no failure or disconnect, matching
+    `2,176/2,176` request/response bytes; and
+  - each retained 64-byte tail was visibly dispatched on a distinct output and
+    cumulatively acknowledged. Deliberately blackholed UDP/short HTTP probes
+    keep the case-level status `loss`; they do not represent a retained TCP
+    exchange failure.
+- Reproducible evidence:
+  `./.tmp/lab/results/post-v017-inst-lowlat-blackhole-diag/` and
+  `./.tmp/lab/results/post-v017-tail-recovery-lowlat-diag/`.

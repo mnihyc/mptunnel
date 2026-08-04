@@ -655,12 +655,8 @@ impl RequestSenderService {
                 );
                 return Err(RuntimeError::SenderServiceBlocked);
             }
-            let failure_recovery = matches!(
-                cause,
-                RelaySendCause::PathFailureReinjection | RelaySendCause::StalePathReinjection(_)
-            );
             if cause.is_reinjection()
-                && !failure_recovery
+                && !cause.permits_busy_carrier_recovery()
                 && !self.multipath.ordered_reinjection_carrier_ready(
                     context,
                     &remotes.paths[position],

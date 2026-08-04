@@ -8,7 +8,9 @@ use super::queue::TcpCapacityProbeLease;
 use super::tcp::capacity::RequestTcpCapacityProbeLease;
 use super::tcp::client::ClientTcpDatagramInbound;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
-use crate::protocol::{DatagramFlowId, Frame, PathId, ResetReason, StreamId, TargetAddr};
+use crate::protocol::{
+    DatagramFlowId, Frame, PathId, ResetReason, StreamDemandHint, StreamId, TargetAddr,
+};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::sync::{
@@ -215,6 +217,7 @@ pub(in crate::runtime) enum ReliablePathCommand {
         observed_carrier_instance: u64,
         target: TargetAddr,
         lane: TrafficClass,
+        initial_demand: StreamDemandHint,
         advertised_recv_max_offset: u64,
         open_deadlines: ClientTcpOpenDeadlines,
         session_commands: ReliablePathCommandSender,

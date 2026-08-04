@@ -414,6 +414,9 @@ impl ResponseStreamBinding {
         commands: ReliablePathCommandSender,
         lane: TrafficClass,
     ) -> ResponseStreamAttachOutcome {
+        // Tests use this argument to establish explicit local sender state.
+        // Production attachment admission never accepts a peer-provided lane.
+        self.set_lane(lane);
         let key = CarrierPathKey { underlay, path_id };
         let path_instance_id = self
             .outputs
@@ -425,22 +428,18 @@ impl ResponseStreamBinding {
             .map_or_else(next_server_carrier_path_instance_id, |entry| {
                 entry.path_instance_id
             });
-        self.attach_output(
-            ResponseOutputAttachment {
-                key,
-                path_instance_id,
-                local_policy: PathPolicy::default(),
-                commands,
-                state: ResponseOutputAttachmentState::default(),
-            },
-            lane,
-        )
+        self.attach_output(ResponseOutputAttachment {
+            key,
+            path_instance_id,
+            local_policy: PathPolicy::default(),
+            commands,
+            state: ResponseOutputAttachmentState::default(),
+        })
     }
 
     pub(in crate::runtime::stream) fn attach_output(
         &self,
         attachment: ResponseOutputAttachment,
-        lane: TrafficClass,
     ) -> ResponseStreamAttachOutcome {
         let ResponseOutputAttachment {
             key,
@@ -451,7 +450,10 @@ impl ResponseStreamBinding {
         } = attachment;
         #[cfg(feature = "lab-diagnostics")]
         let CarrierPathKey { underlay, path_id } = key;
-        let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
+        // A new carrier inherits the sender-local live response lane. The
+        // peer's immutable OPEN_STREAM hint cannot mutate this direction.
+        let current_lane = self.lane.lock().expect("server reliable stream lane lock");
+        let lane = *current_lane;
         let mut outputs = self
             .outputs
             .lock()
@@ -493,21 +495,14 @@ impl ResponseStreamBinding {
                     ),
                 );
                 if same_channel {
-                    let lane_changed = *current_lane != lane;
-                    *current_lane = lane;
                     let evidence_changed = apply_attachment_state(entry, attachment_state);
-                    if lane_changed {
-                        for output in outputs.entries.iter().chain(&outputs.detaching) {
-                            output.load_registration.set_lane(lane);
-                        }
-                    }
-                    if lane_changed || evidence_changed {
+                    if evidence_changed {
                         self.response_model_generation
                             .fetch_add(1, Ordering::AcqRel);
                     }
                     drop(outputs);
                     drop(current_lane);
-                    if lane_changed || evidence_changed {
+                    if evidence_changed {
                         self.notify_update();
                     }
                     return ResponseStreamAttachOutcome::Attached;
@@ -601,7 +596,6 @@ impl ResponseStreamBinding {
         if let Some(incarnation) = replaced_incarnation {
             self.invalidate_path_flight_evidence(key, incarnation);
         }
-        *current_lane = lane;
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
         self.output_membership_generation

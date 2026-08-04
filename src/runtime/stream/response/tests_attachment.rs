@@ -81,16 +81,13 @@ fn exact_carrier_cannot_reattach_while_ordered_detach_is_pending() {
     );
     let (commands, _replacement_receivers) = reliable_path_command_channels(8);
     assert_eq!(
-        binding.attach_output(
-            ResponseOutputAttachment {
-                key,
-                path_instance_id: entry.path_instance_id,
-                local_policy: PathPolicy::default(),
-                commands,
-                state: ResponseOutputAttachmentState::default(),
-            },
-            TrafficClass::Throughput,
-        ),
+        binding.attach_output(ResponseOutputAttachment {
+            key,
+            path_instance_id: entry.path_instance_id,
+            local_policy: PathPolicy::default(),
+            commands,
+            state: ResponseOutputAttachmentState::default(),
+        },),
         ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput,
         "pending ordered lifecycle state must stay one-per-carrier incarnation"
     );

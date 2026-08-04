@@ -8,7 +8,7 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-use crate::protocol::{Frame, StreamId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{Frame, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenAttemptId, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
@@ -19,7 +19,7 @@ use crate::runtime::path::tcp::client::state::{
     ClientTcpPathConnection, ClientTcpPathSessionRuntime,
 };
 use crate::runtime::recent_ids::RecentIdCache;
-use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
+use crate::scheduler::TrafficClass;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "lab-diagnostics")]
@@ -98,6 +98,7 @@ pub(in crate::runtime::path::tcp) struct ClientTcpOpenStreamRequest {
     pub(in crate::runtime::path::tcp) attempt_id: ClientTcpOpenAttemptId,
     pub(in crate::runtime::path::tcp) target: TargetAddr,
     pub(in crate::runtime::path::tcp) lane: TrafficClass,
+    pub(in crate::runtime::path::tcp) initial_demand: StreamDemandHint,
     pub(in crate::runtime::path::tcp) advertised_recv_max_offset: u64,
     pub(in crate::runtime::path::tcp) open_deadline: tokio::time::Instant,
     pub(in crate::runtime::path::tcp) session_commands: ReliablePathCommandSender,
@@ -174,6 +175,7 @@ pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
         attempt_id,
         target,
         lane,
+        initial_demand,
         advertised_recv_max_offset,
         open_deadline,
         session_commands,
@@ -220,7 +222,7 @@ pub(in crate::runtime::path::tcp) async fn open_client_tcp_stream_on_connection(
             .write_frame(&Frame::OpenStream {
                 stream_id,
                 target,
-                demand: stream_demand_hint_for_traffic_class(lane),
+                demand: initial_demand,
             })
             .await?;
         // Initial opens publish the logical receive owner's starting credit.

@@ -2,7 +2,7 @@ use super::*;
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS};
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, PathMetricDirection, PathUsage};
+use crate::protocol::{OffsetRange, PathMetricDirection, PathUsage, StreamDemandHint};
 use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
@@ -310,7 +310,7 @@ async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
             session_id,
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: registration.clone(),
                 commands,
@@ -320,7 +320,7 @@ async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
     let mut stream = accepted.take_stream();
@@ -416,7 +416,7 @@ async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
                 session_id,
                 stream_id,
                 target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-                lane: TrafficClass::Throughput,
+                initial_demand: StreamDemandHint::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: replacement.clone(),
                     commands: replacement_commands,
@@ -425,7 +425,7 @@ async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
                 mux_limits: MuxLimits::default(),
             })
             .expect("attach replacement carrier"),
-        ServerReliableStreamOpen::Existing
+        ServerReliableStreamOpen::Existing(_)
     ));
     let replacement_key = CarrierPathKey {
         underlay: replacement.underlay(),
@@ -527,7 +527,7 @@ async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
             session_id,
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            lane: TrafficClass::Latency,
+            initial_demand: StreamDemandHint::Latency,
             attachment: ServerStreamPathAttachment {
                 path_registration: registration,
                 commands,
@@ -537,7 +537,7 @@ async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
 
@@ -624,7 +624,7 @@ fn accepted_stream_does_not_extend_carrier_registration_lifetime() {
             session_id,
             stream_id: StreamId(7),
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            lane: TrafficClass::Latency,
+            initial_demand: StreamDemandHint::Latency,
             attachment: ServerStreamPathAttachment {
                 path_registration: registration.clone(),
                 commands,
@@ -634,7 +634,7 @@ fn accepted_stream_does_not_extend_carrier_registration_lifetime() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
 
@@ -711,7 +711,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: registration.clone(),
                 commands,
@@ -721,7 +721,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
     let stream = accepted.stream();
@@ -776,7 +776,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
                 session_id,
                 stream_id,
                 target: target.clone(),
-                lane: TrafficClass::Throughput,
+                initial_demand: StreamDemandHint::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: registration.clone(),
                     commands: replacement_commands,
@@ -785,7 +785,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
                 mux_limits: MuxLimits::default(),
             },)
             .expect("replace closed response output"),
-        ServerReliableStreamOpen::Existing
+        ServerReliableStreamOpen::Existing(_)
     ));
     assert_eq!(
         binding.response_model_generation(),
@@ -847,7 +847,7 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: first_registration.clone(),
                 commands: first_commands,
@@ -857,7 +857,7 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
     let ReliablePathStreamOutput::Switchable(binding) = &accepted.stream().output else {
@@ -889,7 +889,7 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
                 session_id,
                 stream_id,
                 target,
-                lane: TrafficClass::Throughput,
+                initial_demand: StreamDemandHint::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: replacement_registration.clone(),
                     commands: replacement_commands,
@@ -898,7 +898,7 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
                 mux_limits: MuxLimits::default(),
             })
             .expect("attach replacement response path"),
-        ServerReliableStreamOpen::Existing
+        ServerReliableStreamOpen::Existing(_)
     ));
     let replacement = binding
         .sender_path_targets(TrafficClass::Throughput, 1)
@@ -1026,7 +1026,7 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
             session_id,
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: registration.clone(),
                 commands,
@@ -1036,7 +1036,7 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
     let mut stream = accepted.take_stream();
@@ -1080,6 +1080,108 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
     ));
 }
 
+#[test]
+fn attachment_identity_is_immutable_and_cannot_overwrite_live_response_lane() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(16));
+    let port = registry.path_port();
+    let session_id = SessionId(704);
+    let stream_id = StreamId(12);
+    let limits = MuxLimits::default();
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let first_registration = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        Default::default(),
+    );
+    let (first_commands, _first_receivers) = reliable_path_command_channels(8);
+    let accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            initial_demand: StreamDemandHint::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first_registration,
+                commands: first_commands,
+                max_frame_payload_bytes: limits.max_payload_bytes,
+            },
+            mux_limits: limits,
+        })
+        .expect("open response stream")
+    {
+        ServerReliableStreamOpen::New(accepted, TrafficClass::Latency) => accepted,
+        _ => panic!("expected new latency response stream"),
+    };
+    let ReliablePathStreamOutput::Switchable(binding) = &accepted.stream().output else {
+        panic!("expected switchable response binding");
+    };
+    let binding = binding.clone();
+
+    binding.set_lane(TrafficClass::Throughput);
+    let second_registration = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(1),
+        Default::default(),
+    );
+    let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: target.clone(),
+                initial_demand: StreamDemandHint::Latency,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: second_registration,
+                    commands: second_commands,
+                    max_frame_payload_bytes: limits.max_payload_bytes,
+                },
+                mux_limits: limits,
+            })
+            .expect("attach matching response output"),
+        ServerReliableStreamOpen::Existing(TrafficClass::Throughput)
+    ));
+    assert_eq!(binding.lane(), TrafficClass::Throughput);
+
+    let accepted_generation = binding.output_membership_generation();
+    let mismatched_registration = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(2),
+        Default::default(),
+    );
+    let (mismatched_commands, _mismatched_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target,
+                initial_demand: StreamDemandHint::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: mismatched_registration,
+                    commands: mismatched_commands,
+                    max_frame_payload_bytes: limits.max_payload_bytes,
+                },
+                mux_limits: limits,
+            })
+            .expect("reject mismatched immutable demand"),
+        ServerReliableStreamOpen::Rejected
+    ));
+    assert_eq!(
+        binding.output_membership_generation(),
+        accepted_generation,
+        "a rejected attachment must not change membership"
+    );
+    assert_eq!(
+        binding.lane(),
+        TrafficClass::Throughput,
+        "a later wire hint must not overwrite sender-local response demand"
+    );
+}
+
 #[tokio::test]
 async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_snapshot() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(4));
@@ -1106,7 +1208,7 @@ async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_s
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: tcp.clone(),
                 commands: tcp_commands,
@@ -1116,7 +1218,7 @@ async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_s
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
     let mut stream = accepted.take_stream();
@@ -1127,7 +1229,7 @@ async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_s
                 session_id,
                 stream_id,
                 target,
-                lane: TrafficClass::Throughput,
+                initial_demand: StreamDemandHint::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: udp.clone(),
                     commands: udp_commands,
@@ -1136,7 +1238,7 @@ async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_s
                 mux_limits,
             })
             .expect("attach QUIC response output"),
-        ServerReliableStreamOpen::Existing
+        ServerReliableStreamOpen::Existing(_)
     ));
     assert_eq!(
         stream.request_feedback_underlay(),
@@ -1284,7 +1386,7 @@ async fn queued_ack_precedes_following_path_detach_at_stream_actor() {
             session_id,
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: registration.clone(),
                 commands,
@@ -1294,7 +1396,7 @@ async fn queued_ack_precedes_following_path_detach_at_stream_actor() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
     let mut stream = accepted.take_stream();
@@ -1371,7 +1473,7 @@ async fn late_frame_after_relay_exit_does_not_close_shared_carrier() {
             session_id,
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            lane: TrafficClass::Latency,
+            initial_demand: StreamDemandHint::Latency,
             attachment: ServerStreamPathAttachment {
                 path_registration: registration.clone(),
                 commands,
@@ -1381,7 +1483,7 @@ async fn late_frame_after_relay_exit_does_not_close_shared_carrier() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new response stream"),
     };
 

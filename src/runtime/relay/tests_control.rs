@@ -166,9 +166,7 @@ async fn closed_output_relay(
             relay_side,
             &relay_context,
             MppPerformanceConfig::default(),
-            ReliableRelayOpenSpec {
-                target: TargetAddr::Ip(unused_addr),
-            },
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(unused_addr), TrafficClass::Latency),
             opened,
         )
         .await
@@ -231,9 +229,7 @@ async fn blocked_feedback_relay(
             relay_side,
             &relay_context,
             MppPerformanceConfig::default(),
-            ReliableRelayOpenSpec {
-                target: TargetAddr::Ip(unused_addr),
-            },
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(unused_addr), TrafficClass::Latency),
             opened,
         )
         .await

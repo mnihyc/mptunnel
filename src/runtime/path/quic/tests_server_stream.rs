@@ -13,7 +13,7 @@ use crate::mux::MuxLimits;
 use crate::outbound::OutboundConfig;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, PathId, ResetReason, SessionId, StreamId, TargetAddr, UnderlayProtocol,
+    Frame, PathId, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
@@ -118,7 +118,7 @@ impl ServerUdpTerminalWriterFixture {
                 session_id,
                 stream_id,
                 target: target.clone(),
-                lane: TrafficClass::Throughput,
+                initial_demand: StreamDemandHint::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: path_registration.clone(),
                     commands: commands_tx.clone(),
@@ -131,7 +131,10 @@ impl ServerUdpTerminalWriterFixture {
             })
             .await
             .expect("open server QUIC response stream");
-        assert_eq!(outcome, ServerStreamOpenOutcome::New);
+        assert_eq!(
+            outcome,
+            ServerStreamOpenOutcome::New(TrafficClass::Throughput)
+        );
         let accepted = accepted_rx
             .recv()
             .await
@@ -275,7 +278,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
             session_id,
             stream_id,
             target,
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -288,7 +291,10 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
         })
         .await
         .expect("open UDP response stream");
-    assert_eq!(outcome, ServerStreamOpenOutcome::New);
+    assert_eq!(
+        outcome,
+        ServerStreamOpenOutcome::New(TrafficClass::Throughput)
+    );
     let mut accepted = accepted_rx
         .recv()
         .await
@@ -717,7 +723,7 @@ async fn server_quic_duplicate_refusal_preserves_live_attachment() {
             path_registration: fixture._path_registration.clone(),
             stream_id,
             target: fixture.target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
         },
     )
     .await
@@ -779,7 +785,7 @@ async fn server_quic_attachment_refusal_is_stream_local_during_ordered_detach() 
             path_registration: fixture._path_registration.clone(),
             stream_id,
             target: fixture.target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
         },
     )
     .await

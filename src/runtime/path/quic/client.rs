@@ -19,8 +19,8 @@ use crate::model::path::{CarrierPathInstanceId, RelayPathKey, next_carrier_path_
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, PathId, PathMetricDirection, PathUsage, SessionId, StreamId, TargetAddr,
-    UnderlayProtocol,
+    Frame, PathId, PathMetricDirection, PathUsage, SessionId, StreamDemandHint, StreamId,
+    TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
@@ -29,7 +29,7 @@ use crate::runtime::path::model::path_startup_snapshot;
 use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
-use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
+use crate::scheduler::TrafficClass;
 use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::quic::{QuicCandidateSelector, QuicCarrierError};
 use crate::transport::{
@@ -99,6 +99,7 @@ impl ClientUdpPathSessionHandle {
         stream_id: StreamId,
         target: TargetAddr,
         lane: TrafficClass,
+        initial_demand: StreamDemandHint,
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
@@ -109,6 +110,7 @@ impl ClientUdpPathSessionHandle {
                 stream_id,
                 target.clone(),
                 lane,
+                initial_demand,
                 advertised_recv_max_offset,
                 self.runtime.clone(),
             )
@@ -123,6 +125,7 @@ impl ClientUdpPathSessionHandle {
                         stream_id,
                         target,
                         lane,
+                        initial_demand,
                         advertised_recv_max_offset,
                         self.runtime.clone(),
                     )
@@ -743,6 +746,7 @@ async fn open_client_udp_stream_on_connection(
     stream_id: StreamId,
     target: TargetAddr,
     lane: TrafficClass,
+    initial_demand: StreamDemandHint,
     advertised_recv_max_offset: u64,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
@@ -751,7 +755,7 @@ async fn open_client_udp_stream_on_connection(
     let open = Frame::OpenStream {
         stream_id,
         target,
-        demand: stream_demand_hint_for_traffic_class(lane),
+        demand: initial_demand,
     };
     udp_path_write_frame(&mut send, &open, runtime.codec_limits).await?;
     // Initial opens publish the logical receive owner's starting credit.

@@ -25,7 +25,7 @@ pub(in crate::runtime) use self::state::ClientTcpPathSessionRuntime;
 use self::stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
 use crate::model::path::CarrierPathInstanceId;
 use crate::performance::ResourceLimits;
-use crate::protocol::{PathId, StreamId, TargetAddr};
+use crate::protocol::{PathId, StreamDemandHint, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenDeadlines, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
@@ -128,6 +128,7 @@ impl ClientTcpPathSessionHandle {
         stream_id: StreamId,
         target: TargetAddr,
         lane: TrafficClass,
+        initial_demand: StreamDemandHint,
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
@@ -153,6 +154,7 @@ impl ClientTcpPathSessionHandle {
                     observed_carrier_instance,
                     target: target.clone(),
                     lane,
+                    initial_demand,
                     advertised_recv_max_offset,
                     open_deadlines,
                     session_commands: commands.clone(),

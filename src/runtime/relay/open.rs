@@ -14,17 +14,29 @@ use crate::model::path::RelayPathKey;
 use crate::model::timing::{
     path_open_pto, path_open_serialized_exchanges, path_open_timeout, transport_pto_from_snapshot,
 };
-use crate::protocol::{Frame, PathMetrics, StreamId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{
+    Frame, PathMetrics, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{OpenedRemoteStream, ReliablePathStream};
-use crate::scheduler::TrafficClass;
+use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliableRelayOpenSpec {
     pub(in crate::runtime) target: TargetAddr,
+    pub(in crate::runtime) initial_demand: StreamDemandHint,
+}
+
+impl ReliableRelayOpenSpec {
+    pub(in crate::runtime) fn new(target: TargetAddr, initial_lane: TrafficClass) -> Self {
+        Self {
+            target,
+            initial_demand: stream_demand_hint_for_traffic_class(initial_lane),
+        }
+    }
 }
 
 /// A selected initial carrier whose scheduler load remains owned across I/O.
@@ -72,6 +84,7 @@ async fn open_reliable_initial_attempt(
     lane: TrafficClass,
     has_unattempted_alternative: bool,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
+    let spec = ReliableRelayOpenSpec::new(target, lane);
     let ReliableInitialOpenAttempt {
         key,
         stream_id,
@@ -86,7 +99,7 @@ async fn open_reliable_initial_attempt(
             match open_remote_stream_on_preselected_tcp_path(
                 context,
                 stream_id,
-                target,
+                &spec,
                 lane,
                 key.index,
                 open_deadlines,
@@ -125,7 +138,7 @@ async fn open_reliable_initial_attempt(
                 open_remote_stream_on_preselected_udp_path(
                     context,
                     stream_id,
-                    target,
+                    &spec,
                     lane,
                     key.index,
                     open_deadline,
@@ -201,7 +214,7 @@ pub(in crate::runtime) async fn open_remote_stream(
 pub(in crate::runtime) async fn open_remote_stream_on_path(
     context: &ClientPathContext,
     stream_id: StreamId,
-    target: TargetAddr,
+    spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     path_index: usize,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
@@ -221,7 +234,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
     let open_result = open_remote_stream_on_preselected_tcp_path(
         context,
         stream_id,
-        target,
+        spec,
         lane,
         path_index,
         open_deadlines,
@@ -302,7 +315,7 @@ pub(in crate::runtime) fn reliable_initial_open_timeout(
 pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
-    target: TargetAddr,
+    spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     path_index: usize,
     open_deadlines: ClientTcpOpenDeadlines,
@@ -327,8 +340,9 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
         .open_stream_with_deadlines(
             stream_id,
-            target,
+            spec.target.clone(),
             lane,
+            spec.initial_demand,
             open_deadlines,
             advertised_recv_max_offset,
         )
@@ -366,7 +380,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
 pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
-    target: TargetAddr,
+    spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     path_index: usize,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
@@ -387,7 +401,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
         open_remote_stream_on_preselected_udp_path(
             context,
             stream_id,
-            target,
+            spec,
             lane,
             path_index,
             open_deadline,
@@ -406,16 +420,16 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
 pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
     context: &ClientPathContext,
     stream_id: StreamId,
-    target: TargetAddr,
+    spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     key: RelayPathKey,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     match key.underlay {
         UnderlayProtocol::Tcp => {
-            open_remote_stream_on_path(context, stream_id, target, lane, key.index).await
+            open_remote_stream_on_path(context, stream_id, spec, lane, key.index).await
         }
         UnderlayProtocol::Udp => {
-            open_remote_stream_on_udp_path(context, stream_id, target, lane, key.index).await
+            open_remote_stream_on_udp_path(context, stream_id, spec, lane, key.index).await
         }
     }
 }
@@ -436,7 +450,7 @@ where
 pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
-    target: TargetAddr,
+    spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     path_index: usize,
     open_deadline: tokio::time::Instant,
@@ -461,8 +475,9 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
         .open_stream(
             stream_id,
-            target,
+            spec.target.clone(),
             lane,
+            spec.initial_demand,
             open_deadline,
             advertised_recv_max_offset,
         )

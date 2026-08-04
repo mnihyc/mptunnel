@@ -1,8 +1,8 @@
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
 use crate::outbound::OutboundConfig;
-use crate::protocol::PathUsage;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
+use crate::protocol::{PathUsage, StreamDemandHint};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
@@ -1854,7 +1854,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: old_path_registration.clone(),
                 commands: old_commands,
@@ -1864,7 +1864,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
         })
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected a new response stream"),
     };
     let stream = accepted.stream();
@@ -1896,7 +1896,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
                 session_id,
                 stream_id,
                 target: target.clone(),
-                lane: TrafficClass::Throughput,
+                initial_demand: StreamDemandHint::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: new_path_registration.clone(),
                     commands: new_commands,
@@ -1905,7 +1905,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
                 mux_limits: MuxLimits::default(),
             },)
             .expect("replace closed response output"),
-        ServerReliableStreamOpen::Existing
+        ServerReliableStreamOpen::Existing(_)
     ));
     registry.record_local_path_metrics(
         old_path_identity,
@@ -3171,7 +3171,7 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
             session_id: SessionId(1),
             stream_id: StreamId(7),
             target: target.clone(),
-            lane: TrafficClass::Latency,
+            initial_demand: StreamDemandHint::Latency,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -3181,8 +3181,8 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
         })
         .expect("open stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
-        ServerReliableStreamOpen::Existing => panic!("expected new stream"),
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
+        ServerReliableStreamOpen::Existing(_) => panic!("expected new stream"),
         ServerReliableStreamOpen::DuplicateLiveIgnored => {
             panic!("new active stream must not be treated as duplicate")
         }
@@ -3217,7 +3217,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands: first_commands,
@@ -3227,7 +3227,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
         })
         .expect("open stream");
     let _accepted = match opened {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected new stream"),
     };
 
@@ -3237,7 +3237,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands: duplicate_commands,
@@ -3285,7 +3285,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
             session_id: SessionId(1),
             stream_id: StreamId(8),
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -3295,8 +3295,8 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         })
         .expect("open stream")
     {
-        ServerReliableStreamOpen::New(accepted) => accepted,
-        ServerReliableStreamOpen::Existing => panic!("expected new stream"),
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
+        ServerReliableStreamOpen::Existing(_) => panic!("expected new stream"),
         ServerReliableStreamOpen::DuplicateLiveIgnored => {
             panic!("new active stream must not be treated as duplicate")
         }
@@ -3364,7 +3364,7 @@ fn server_reliable_registry_opens_an_unknown_stream_on_any_live_path() {
             session_id: SessionId(1),
             stream_id: StreamId(99),
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -3374,7 +3374,7 @@ fn server_reliable_registry_opens_an_unknown_stream_on_any_live_path() {
         })
         .expect("neutral stream open should be handled");
     let _accepted = match opened {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("unknown neutral stream must open on its first live path"),
     };
     assert_eq!(registry.management_snapshot().active_streams, 1);
@@ -3396,7 +3396,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands,
@@ -3406,7 +3406,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
         })
         .expect("active open should be handled");
     let _accepted = match opened {
-        ServerReliableStreamOpen::New(accepted) => accepted,
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
         _ => panic!("expected active stream open"),
     };
     registry.close(session_id, stream_id);
@@ -3419,7 +3419,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: TrafficClass::Throughput,
+            initial_demand: StreamDemandHint::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: replacement_path_registration.clone(),
                 commands,

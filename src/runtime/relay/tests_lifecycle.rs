@@ -268,9 +268,10 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
     );
     assert_eq!(remotes.accepted_path_count(), 2);
     let mut send_stream = ReliableSendStream::new(StreamId(2), context.mux_limits);
-    let spec = ReliableRelayOpenSpec {
-        target: TargetAddr::Ip("127.0.0.1:9".parse().expect("test target")),
-    };
+    let spec = ReliableRelayOpenSpec::new(
+        TargetAddr::Ip("127.0.0.1:9".parse().expect("test target")),
+        TrafficClass::Latency,
+    );
     let mut pending = HashMap::new();
     let (result_tx, _result_rx) = mpsc::channel(1);
 

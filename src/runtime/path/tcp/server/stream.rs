@@ -18,7 +18,6 @@ use crate::runtime::path::{
     ServerCarrierPathRegistration, ServerStreamFrameRoute, ServerStreamOpenOutcome,
     ServerStreamOpenRequest, ServerStreamPathAttachment,
 };
-use crate::scheduler::traffic_class_from_stream_demand_hint;
 use std::collections::HashSet;
 
 pub(in crate::runtime::path::tcp) struct ServerTcpStreamState {
@@ -50,14 +49,13 @@ impl ServerTcpStreamState {
         context
             .reliable_streams
             .validate_target(path_registration, &target)?;
-        let lane = traffic_class_from_stream_demand_hint(demand);
         let response = match context
             .reliable_streams
             .open_or_attach(ServerStreamOpenRequest {
                 session_id,
                 stream_id,
                 target,
-                lane,
+                initial_demand: demand,
                 attachment: ServerStreamPathAttachment {
                     path_registration: path_registration.clone(),
                     commands: commands.clone(),
@@ -67,11 +65,11 @@ impl ServerTcpStreamState {
             })
             .await?
         {
-            ServerStreamOpenOutcome::New => {
+            ServerStreamOpenOutcome::New(_) => {
                 self.attached.insert(stream_id);
                 None
             }
-            ServerStreamOpenOutcome::Existing => {
+            ServerStreamOpenOutcome::Existing(_) => {
                 self.attached.insert(stream_id);
                 Some(Frame::StreamMaxData {
                     stream_id,

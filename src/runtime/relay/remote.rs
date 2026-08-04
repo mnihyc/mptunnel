@@ -71,14 +71,8 @@ async fn attach_relay_path_candidates(
         if remotes.contains_path_key(key) {
             continue;
         }
-        match open_remote_stream_for_relay_path(
-            context,
-            stream_id,
-            request.spec.target.clone(),
-            request.lane,
-            key,
-        )
-        .await
+        match open_remote_stream_for_relay_path(context, stream_id, request.spec, request.lane, key)
+            .await
         {
             Ok(opened) => {
                 let attach_control_result = send_request_attach_control_frames(

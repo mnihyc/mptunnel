@@ -139,7 +139,7 @@ impl DnsTcpConnector for MppOutboundDnsTcpConnector {
                         relay_side,
                         &context,
                         performance,
-                        ReliableRelayOpenSpec { target },
+                        ReliableRelayOpenSpec::new(target, TrafficClass::Latency),
                         remote,
                     )
                     .await;
@@ -943,7 +943,7 @@ impl RuntimeOutboundRegistry {
                         context: context.clone(),
                         performance: *performance,
                         remote,
-                        spec: ReliableRelayOpenSpec { target },
+                        spec: ReliableRelayOpenSpec::new(target, traffic_class),
                         _gateway_lease: None,
                         _product_flow: OpenedProductFlow::new(scope.clone(), None, Network::Tcp),
                     })

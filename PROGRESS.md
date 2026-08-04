@@ -5556,3 +5556,43 @@ entry is authoritative.
 - Reproducible evidence:
   `./.tmp/lab/results/post-v017-inst-lowlat-blackhole-diag/` and
   `./.tmp/lab/results/post-v017-tail-recovery-lowlat-diag/`.
+
+## 2026-08-04T15:07:29+08:00: tail recovery accepted; open identity corrected
+
+- Name: exact clean tail-recovery confirmation and immutable stream admission
+- Category: post-v0.1.7 reliability and RFC conformance
+- State: tail recovery accepted; immutable-open implementation and focused
+  verification passed; affected performance matrix pending
+- Clean tail-recovery evidence at commit `20908c9`:
+  - saturated mixed fat service delivered `263.715 Mbps`, completed `60/60`
+    persistent interactive exchanges and `87/87` short requests, and retained
+    no TCP failure; this is `4.6%` above the frozen `252.070 Mbps` control;
+  - the exact low-latency blackhole case delivered `280.092 Mbps` and retained
+    all `28/28` persistent exchanges without disconnect; and
+  - the remaining short HTTP and UDP loss occurred only inside the deliberate
+    blackhole and is not retained reliable-stream loss.
+- RFC discrepancy corrected: a later carrier used to serialize the mutable
+  sender-local lane as a fresh `OPEN_STREAM` admission hint. The registry then
+  validated only the target and allowed that hint to overwrite the peer's
+  live response lane. RFC section 8.1 instead makes the first target and demand
+  immutable attachment identity and keeps each live objective direction-local.
+- Structural correction:
+  - the logical open specification now owns the initial demand, separately
+    from the live lane used to select and account a carrier;
+  - TCP and QUIC serialize that immutable value on every attachment;
+  - the server validates both target and initial demand and rejects only a
+    mismatching pending attachment; and
+  - a newly accepted output inherits the current server response lane. Only
+    the server-local demand tracker can mutate that lane.
+- No wire encoding, protocol version, threshold, timer, congestion control,
+  path ranking, or platform branch changed.
+- Verification: warnings-denied all-target/all-feature Clippy passed; all `17`
+  registry tests, all `8` QUIC reliable-stream lifecycle tests, and all `38`
+  TCP carrier tests passed. The
+  new invariant test proves that a matching later attachment preserves a
+  locally promoted response lane and that a mismatched demand changes neither
+  membership nor lane. The existing response-only `2 MiB` automatic bulk
+  attachment integration test also passed, proving that a latency-opened
+  stream can still expand after live promotion under strict identity checks.
+- Reproducible clean tail evidence:
+  `./.tmp/lab/results/post-v017-tail-recovery-clean/`.

@@ -7,7 +7,7 @@ use super::io::{
 };
 use super::server_writer::drain_server_udp_reliable_commands;
 use crate::model::capacity::RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET;
-use crate::protocol::{Frame, PathId, SessionId, StreamId, TargetAddr};
+use crate::protocol::{Frame, PathId, SessionId, StreamDemandHint, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommandReceivers, ReliablePathCommandSender, recv_reliable_path_command,
@@ -20,7 +20,6 @@ use crate::runtime::path::{
     ServerCarrierPathRegistration, ServerStreamOpenOutcome, ServerStreamOpenRequest,
     ServerStreamPathAttachment, ServerStreamPort,
 };
-use crate::scheduler::{TrafficClass, traffic_class_from_stream_demand_hint};
 
 pub(super) struct ServerUdpReliableStreamContext {
     pub(super) session_id: SessionId,
@@ -28,7 +27,7 @@ pub(super) struct ServerUdpReliableStreamContext {
     pub(super) path_registration: ServerCarrierPathRegistration,
     pub(super) stream_id: StreamId,
     pub(super) target: TargetAddr,
-    pub(super) lane: TrafficClass,
+    pub(super) initial_demand: StreamDemandHint,
 }
 
 struct ServerUdpReliableOutputDetachGuard {
@@ -84,7 +83,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
         path_registration,
         stream_id,
         target,
-        lane,
+        initial_demand,
     } = stream_context;
     context
         .reliable_streams
@@ -101,7 +100,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
             session_id,
             stream_id,
             target: target.clone(),
-            lane,
+            initial_demand,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands: commands_tx.clone(),
@@ -114,8 +113,14 @@ pub(super) async fn handle_server_udp_reliable_stream(
         })
         .await?
     {
-        ServerStreamOpenOutcome::New => false,
-        ServerStreamOpenOutcome::Existing => true,
+        ServerStreamOpenOutcome::New(response_lane) => {
+            send.set_traffic_class(response_lane)?;
+            false
+        }
+        ServerStreamOpenOutcome::Existing(response_lane) => {
+            send.set_traffic_class(response_lane)?;
+            true
+        }
         ServerStreamOpenOutcome::DuplicateLiveIgnored => {
             udp_path_write_frame(
                 &mut send,
@@ -395,15 +400,13 @@ async fn run_server_udp_reliable_stream_loop(
                         ..
                     })) if open_stream_id == stream_id && open_target == target =>
                     {
-                        let updated_lane = traffic_class_from_stream_demand_hint(open_demand);
-                        send.set_traffic_class(updated_lane)?;
                         match context
                             .reliable_streams
                             .attach_existing(ServerStreamOpenRequest {
                                 session_id,
                                 stream_id,
                                 target: target.clone(),
-                                lane: updated_lane,
+                                initial_demand: open_demand,
                                 attachment: ServerStreamPathAttachment {
                                     path_registration: path_registration.clone(),
                                     commands: commands_tx.clone(),
@@ -416,7 +419,8 @@ async fn run_server_udp_reliable_stream_loop(
                             })
                             .await?
                         {
-                            ServerStreamOpenOutcome::Existing => {
+                            ServerStreamOpenOutcome::Existing(response_lane) => {
+                                send.set_traffic_class(response_lane)?;
                                 write_udp_stream_accept(
                                     &mut send,
                                     &context,
@@ -426,7 +430,7 @@ async fn run_server_udp_reliable_stream_loop(
                                 )
                                 .await?;
                             }
-                            ServerStreamOpenOutcome::New => {
+                            ServerStreamOpenOutcome::New(_) => {
                                 return Err(RuntimeError::Protocol(
                                     "QUIC UDP path reannouncement opened duplicate stream",
                                 ));

@@ -17,7 +17,7 @@ use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerLocalPathProperties};
 use crate::runtime::peer_status::PeerStatusCarrier;
-use crate::scheduler::{TrafficClass, traffic_class_from_stream_demand_hint};
+use crate::scheduler::TrafficClass;
 use crate::transport::PathSpec;
 use crate::transport::quic::QuicCarrierError;
 use tokio::sync::OwnedSemaphorePermit;
@@ -401,8 +401,6 @@ async fn handle_server_udp_bidi_stream(
             demand,
             ..
         } => {
-            let lane = traffic_class_from_stream_demand_hint(demand);
-            send.set_traffic_class(lane)?;
             handle_server_udp_reliable_stream(
                 send,
                 recv,
@@ -413,7 +411,7 @@ async fn handle_server_udp_bidi_stream(
                     path_registration,
                     stream_id,
                     target,
-                    lane,
+                    initial_demand: demand,
                 },
             )
             .await

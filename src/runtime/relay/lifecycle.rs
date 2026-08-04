@@ -494,12 +494,12 @@ fn spawn_reliable_relay_path_opens(
             _ => continue,
         }
         let context = context.clone();
-        let target = spec.target.clone();
+        let spec = spec.clone();
         let result_tx = result_tx.clone();
         let generation = next_relay_additional_path_open_generation();
         let handle = tokio::spawn(async move {
             let result =
-                open_remote_stream_for_relay_path(&context, stream_id, target, lane, key).await;
+                open_remote_stream_for_relay_path(&context, stream_id, &spec, lane, key).await;
             let message = RelayAdditionalPathOpenResult {
                 key,
                 generation,

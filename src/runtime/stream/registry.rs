@@ -20,7 +20,7 @@ use crate::product::PrincipalPermit;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
     Frame, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, ResetReason, SessionId,
-    StreamId, TargetAddr, UnderlayProtocol,
+    StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::RuntimeError;
 #[cfg(test)]
@@ -37,7 +37,7 @@ use crate::runtime::path::{
     ServerStreamPort, ServerStreamPortBackend,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
-use crate::scheduler::TrafficClass;
+use crate::scheduler::{TrafficClass, traffic_class_from_stream_demand_hint};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -80,6 +80,7 @@ impl std::fmt::Debug for ServerReliableStreamRegistry {
 
 struct ServerReliableStreamEntry {
     target: TargetAddr,
+    initial_demand: StreamDemandHint,
     events: mpsc::Sender<ServerReliableStreamEvent>,
     binding: Arc<ResponseStreamBinding>,
 }
@@ -293,8 +294,8 @@ fn queue_ordered_path_detach(
 }
 
 pub(in crate::runtime) enum ServerReliableStreamOpen {
-    New(Box<AcceptedServerReliableStream>),
-    Existing,
+    New(Box<AcceptedServerReliableStream>, TrafficClass),
+    Existing(TrafficClass),
     DuplicateLiveIgnored,
     Rejected,
 }
@@ -1146,10 +1147,11 @@ impl ServerReliableStreamRegistry {
             session_id,
             stream_id,
             target,
-            lane,
+            initial_demand,
             attachment,
             mux_limits,
         } = request;
+        let initial_lane = traffic_class_from_stream_demand_hint(initial_demand);
         let crate::runtime::path::ServerStreamPathAttachment {
             path_registration,
             commands,
@@ -1178,25 +1180,29 @@ impl ServerReliableStreamRegistry {
         let initial_path_proof =
             self.initial_path_proof(session_id, underlay, path_id, path_instance_id);
         if let Some(entry) = streams.get_mut(&(session_id, stream_id)) {
-            if entry.target != target {
-                return Err(RuntimeError::Protocol(
-                    "reliable stream migration target does not match original stream",
-                ));
+            if entry.target != target || entry.initial_demand != initial_demand {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "server_stream_open",
+                    format_args!(
+                        "session_id={} stream_id={} path_underlay={:?} path_id={} initial_demand={:?} result=rejected_open_identity_mismatch",
+                        session_id.0, stream_id.0, underlay, path_id.0, initial_demand,
+                    ),
+                );
+                return Ok(ServerReliableStreamOpen::Rejected);
             }
-            let attach_outcome = entry.binding.attach_output(
-                ResponseOutputAttachment {
-                    key: CarrierPathKey { underlay, path_id },
-                    path_instance_id,
-                    local_policy,
-                    commands,
-                    state: ResponseOutputAttachmentState {
-                        metrics: initial_metrics,
-                        peer_usage: initial_usage.map(|usage| (usage.sequence, usage.usage)),
-                        path_proof: initial_path_proof,
-                    },
+            let attach_outcome = entry.binding.attach_output(ResponseOutputAttachment {
+                key: CarrierPathKey { underlay, path_id },
+                path_instance_id,
+                local_policy,
+                commands,
+                state: ResponseOutputAttachmentState {
+                    metrics: initial_metrics,
+                    peer_usage: initial_usage.map(|usage| (usage.sequence, usage.usage)),
+                    path_proof: initial_path_proof,
                 },
-                lane,
-            );
+            });
+            let response_lane = entry.binding.lane();
             if matches!(
                 attach_outcome,
                 ResponseStreamAttachOutcome::RejectedClosedStream
@@ -1205,8 +1211,8 @@ impl ServerReliableStreamRegistry {
                 lab_diagnostic(
                     "server_stream_open",
                     format_args!(
-                        "session_id={} stream_id={} path_underlay={:?} path_id={} lane={:?} result=rejected_closing_stream",
-                        session_id.0, stream_id.0, underlay, path_id.0, lane,
+                        "session_id={} stream_id={} path_underlay={:?} path_id={} response_lane={:?} result=rejected_closing_stream",
+                        session_id.0, stream_id.0, underlay, path_id.0, response_lane,
                     ),
                 );
                 return Ok(ServerReliableStreamOpen::Rejected);
@@ -1228,8 +1234,8 @@ impl ServerReliableStreamRegistry {
                 lab_diagnostic(
                     "server_stream_open",
                     format_args!(
-                        "session_id={} stream_id={} path_underlay={:?} path_id={} lane={:?} result={}",
-                        session_id.0, stream_id.0, underlay, path_id.0, lane, result,
+                        "session_id={} stream_id={} path_underlay={:?} path_id={} response_lane={:?} result={}",
+                        session_id.0, stream_id.0, underlay, path_id.0, response_lane, result,
                     ),
                 );
                 return Ok(ServerReliableStreamOpen::DuplicateLiveIgnored);
@@ -1242,11 +1248,11 @@ impl ServerReliableStreamRegistry {
             lab_diagnostic(
                 "server_stream_open",
                 format_args!(
-                    "session_id={} stream_id={} path_underlay={:?} path_id={} lane={:?} result=existing",
-                    session_id.0, stream_id.0, underlay, path_id.0, lane,
+                    "session_id={} stream_id={} path_underlay={:?} path_id={} response_lane={:?} result=existing",
+                    session_id.0, stream_id.0, underlay, path_id.0, response_lane,
                 ),
             );
-            return Ok(ServerReliableStreamOpen::Existing);
+            return Ok(ServerReliableStreamOpen::Existing(response_lane));
         }
 
         if self
@@ -1259,8 +1265,8 @@ impl ServerReliableStreamRegistry {
             lab_diagnostic(
                 "server_stream_open",
                 format_args!(
-                    "session_id={} stream_id={} path_underlay={:?} path_id={} lane={:?} result=rejected_closed_stream",
-                    session_id.0, stream_id.0, underlay, path_id.0, lane,
+                    "session_id={} stream_id={} path_underlay={:?} path_id={} initial_demand={:?} result=rejected_closed_stream",
+                    session_id.0, stream_id.0, underlay, path_id.0, initial_demand,
                 ),
             );
             return Ok(ServerReliableStreamOpen::Rejected);
@@ -1283,7 +1289,7 @@ impl ServerReliableStreamRegistry {
             underlay,
             path_id,
             commands,
-            lane,
+            initial_lane,
             mux_limits,
             self.session_tracker.clone(),
             path_instance_id,
@@ -1316,6 +1322,7 @@ impl ServerReliableStreamRegistry {
             (session_id, stream_id),
             ServerReliableStreamEntry {
                 target: target.clone(),
+                initial_demand,
                 events: events_tx,
                 binding: binding.clone(),
             },
@@ -1324,8 +1331,8 @@ impl ServerReliableStreamRegistry {
         lab_diagnostic(
             "server_stream_open",
             format_args!(
-                "session_id={} stream_id={} path_underlay={:?} path_id={} lane={:?} result=new",
-                session_id.0, stream_id.0, underlay, path_id.0, lane,
+                "session_id={} stream_id={} path_underlay={:?} path_id={} initial_demand={:?} response_lane={:?} result=new",
+                session_id.0, stream_id.0, underlay, path_id.0, initial_demand, initial_lane,
             ),
         );
         let stream = ReliablePathStream {
@@ -1335,14 +1342,14 @@ impl ServerReliableStreamRegistry {
             // flight; until that event is consumed the server send side must
             // remain blocked at offset zero.
             max_offset: 0,
-            lane,
+            lane: initial_lane,
             underlay,
             max_frame_payload_bytes,
             output: ReliablePathStreamOutput::Switchable(binding),
             frames: ReliablePathStreamInput::server(events_rx),
         };
-        Ok(ServerReliableStreamOpen::New(Box::new(
-            self.accepted_stream(
+        Ok(ServerReliableStreamOpen::New(
+            Box::new(self.accepted_stream(
                 session_id,
                 path_registration.principal_permit().clone(),
                 target,
@@ -1353,8 +1360,9 @@ impl ServerReliableStreamRegistry {
                     mux_limits,
                 },
                 session_send_buffer,
-            ),
-        )))
+            )),
+            initial_lane,
+        ))
     }
 
     pub(in crate::runtime) fn record_path_metrics(
@@ -1884,7 +1892,7 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         let registry = self.registry.clone();
         Box::pin(async move {
             match registry.open_or_attach(request)? {
-                ServerReliableStreamOpen::New(accepted) => {
+                ServerReliableStreamOpen::New(accepted, response_lane) => {
                     let accepted = *accepted;
                     match new_stream_policy {
                         ServerNewStreamPolicy::Submit => {
@@ -1897,9 +1905,11 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
                         }
                         ServerNewStreamPolicy::Reject => accepted.close().await,
                     }
-                    Ok(ServerStreamOpenOutcome::New)
+                    Ok(ServerStreamOpenOutcome::New(response_lane))
                 }
-                ServerReliableStreamOpen::Existing => Ok(ServerStreamOpenOutcome::Existing),
+                ServerReliableStreamOpen::Existing(response_lane) => {
+                    Ok(ServerStreamOpenOutcome::Existing(response_lane))
+                }
                 ServerReliableStreamOpen::DuplicateLiveIgnored => {
                     Ok(ServerStreamOpenOutcome::DuplicateLiveIgnored)
                 }

@@ -10,7 +10,7 @@ use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{
     Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId,
-    StreamId, TargetAddr, UnderlayProtocol,
+    StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
@@ -417,15 +417,15 @@ pub(in crate::runtime) struct ServerStreamOpenRequest {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) target: TargetAddr,
-    pub(in crate::runtime) lane: TrafficClass,
+    pub(in crate::runtime) initial_demand: StreamDemandHint,
     pub(in crate::runtime) attachment: ServerStreamPathAttachment,
     pub(in crate::runtime) mux_limits: MuxLimits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum ServerStreamOpenOutcome {
-    New,
-    Existing,
+    New(TrafficClass),
+    Existing(TrafficClass),
     DuplicateLiveIgnored,
     Rejected,
 }

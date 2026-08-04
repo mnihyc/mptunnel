@@ -134,5 +134,5 @@ impl Display for BandwidthEstimation {
 }
 
 #[cfg(test)]
-#[path = "bw_estimation_test.rs"]
+#[path = "tests_bw_estimation.rs"]
 mod tests;

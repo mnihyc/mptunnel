@@ -22,12 +22,12 @@ to classify outliers.
 | Direct | TCP | 207.720 | 201.212 |
 | Xray 26.3.27 | VMess/TCP | 218.716 | ≥151.299 |
 | Hysteria2 2.10.0 | QUIC | 87.525 | ≥105.615 |
-| MPTUNNEL | MPP/TCP | 225.564 | 253.758 |
-| MPTUNNEL | MPP/QUIC | 252.859 | 209.684 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 284.982 | 305.017 |
+| MPTUNNEL | MPP/TCP | 257.226 | 262.397 |
+| MPTUNNEL | MPP/QUIC | 220.280 | 173.353 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 297.387 | 287.721 |
 
-The default delivered 1.37× direct TCP download and 1.52× upload goodput.
-MPP/QUIC delivered 2.89× Hysteria2's download. The Xray and Hysteria2
+The default delivered 1.43× direct TCP download and upload goodput.
+MPP/QUIC delivered 2.52× Hysteria2's download. The Xray and Hysteria2
 uploads are receiver-confirmed lower bounds and are excluded from ratios.
 
 Multiple TCP carriers on one route can overcome a per-flow limiter, but they
@@ -41,11 +41,11 @@ recovery. The default also has QUIC available when it is the better carrier.
 | System | Transport | Shaped links | Download (Mbps) | Upload (Mbps) |
 | --- | --- | ---: | ---: | ---: |
 | Linux MPTCP | TCP | 5 | 357.424 | 382.493 |
-| MPTUNNEL | MPP/TCP | 5 | 641.250 | 526.701 |
-| MPTUNNEL | MPP/QUIC | 5 | 602.712 | 748.958 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 677.370 | 748.829 |
+| MPTUNNEL | MPP/TCP | 5 | 841.572 | 562.796 |
+| MPTUNNEL | MPP/QUIC | 5 | 623.590 | 730.726 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 639.898 | 804.675 |
 
-The default delivered 1.90× MPTCP download and 1.96× upload goodput. The
+The default delivered 1.79× MPTCP download and 2.10× upload goodput. The
 MPTCP topology used one initial path plus four aligned address pairs and
 established additional subflows. Every MPTUNNEL row completed with exact
 receiver accounting.
@@ -63,15 +63,15 @@ work; readiness never creates a fixed traffic share.
 
 | Direction | `1-1` | Default `1-3` | 3 × `1-1` |
 | --- | ---: | ---: | ---: |
-| Download (Mbps) | 355.923 | 886.246 | 794.061 |
-| Upload (Mbps) | 347.045 | 823.774 | 901.910 |
+| Download (Mbps) | 345.465 | 901.519 | 744.216 |
+| Upload (Mbps) | 338.671 | 873.097 | 890.466 |
 
 ### Shared 200 Mbps bottleneck
 
 | Direction | `1-1` | Default `1-3` | 3 × `1-1` |
 | --- | ---: | ---: | ---: |
-| Download (Mbps) | 153.965 | 165.220 | 164.624 |
-| Upload (Mbps) | 157.547 | 151.999 | 167.363 |
+| Download (Mbps) | 158.931 | 164.476 | 167.164 |
+| Upload (Mbps) | 157.099 | 172.327 | 150.939 |
 
 The three-carrier forms aggregate independent per-flow capacity and stay near
 the same aggregate ceiling when all connections share one bottleneck. No rate
@@ -84,9 +84,9 @@ five deterministic epochs.
 
 | Rate/link (Mbps) | Transport | Download (Mbps) | Upload (Mbps) |
 | ---: | --- | ---: | ---: |
-| 30–100 | MPP/TCP+QUIC (default) | 356.397 | 247.699 |
-| 300–1,000 | MPP/TCP+QUIC (default) | 1,403.046 | 592.790 |
-| 3,000–10,000 | MPP/TCP+QUIC (default) | 2,277.788 | 723.070 |
+| 30–100 | MPP/TCP+QUIC (default) | 350.135 | 245.383 |
+| 300–1,000 | MPP/TCP+QUIC (default) | 1,346.848 | 726.616 |
+| 3,000–10,000 | MPP/TCP+QUIC (default) | 2,000.420 | 597.670 |
 
 Configured topology establishes regular and backup eligibility. Fresh
 directional delivery evidence ranks members inside the eligible tier. Neither
@@ -99,8 +99,8 @@ traffic direction.
 
 | Direction | Single fast link (Mbps) | Multipath (Mbps) | Fast-link share |
 | --- | ---: | ---: | ---: |
-| Download | 143.262 | 153.998 | 90.7% |
-| Upload | 148.979 | 156.716 | 90.3% |
+| Download | 141.161 | 144.587 | 90.1% |
+| Upload | 141.258 | 141.300 | 90.9% |
 
 The interface accounting shows that upload and download independently selected
 their faster member without using a source-address heuristic.
@@ -109,19 +109,20 @@ their faster member without using a source-address heuristic.
 
 | Condition | Transport | Download (Mbps) | Upload (Mbps) | Receiver gap DL/UL (ms) |
 | --- | --- | ---: | ---: | ---: |
-| Port hop | MPP/QUIC | 2,759.843 | 2,754.965 | 8 / — |
-| Blackhole | MPP/TCP+QUIC (default) | 223.127 | — | 371 / — |
-| Latency change | MPP/TCP+QUIC (default) | 132.196 | — | 547 / — |
-| Repeated link changes | MPP/TCP+QUIC (default) | 159.741 | — | 2,609 / — |
-| Blackhole | MPP/TCP | 288.669 | 276.831 | 744 / 899 |
-| Latency change | MPP/TCP | 287.350 | 200.169 | 723 / 2,583 |
+| Port hop | MPP/QUIC | 2,818.042 | 2,798.515 | 11 / 24 |
+| Blackhole | MPP/TCP+QUIC (default) | 204.833 | — | 366 / — |
+| Latency change | MPP/TCP+QUIC (default) | 167.651 | — | 3,310 / — |
+| Repeated link changes | MPP/TCP+QUIC (default) | 186.452 | — | 1,501 / — |
+| Blackhole | MPP/TCP | 272.124 | 274.925 | 1,136 / 369 |
+| Latency change | MPP/TCP | 253.904 | 221.276 | 315 / 1,625 |
 
 | Default mixed condition | TCP echo | HTTP | Datagrams |
 | --- | ---: | ---: | ---: |
-| Blackhole | 60/60 | 93/93 | 231/234 |
-| Latency change | 60/60 | 102/102 | 303/304 |
-| Repeated link changes | 40/40 | 34/37 | 86/91 |
+| Blackhole | 60/60 | 108/108 | 240/243 |
+| Latency change | 60/60 | 94/94 | 257/259 |
+| Repeated link changes | 48/48 | 90/92 | 280/282 |
 
+The latency-change row includes a 900 ms one-way, 10% loss epoch.
 Persistent TCP echo streams stayed attached in every mixed disruption run.
 The repeated-change HTTP misses began within deliberate blackholes and reached
 their application deadlines before service returned. Datagram counts expose
@@ -142,7 +143,7 @@ existing connections remain until their normal timeout or recovery.
 | Concurrency | Object (KiB) | Duration (s) | Requests | Rejected | Failed | Deadline (ms) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10 | 32 | 30 | 90/90 | 0 | 0 | 3,000 |
-| 20 | 1,024 | 60 | 686/686 | 0 | 0 | — |
+| 20 | 1,024 | 60 | 739/739 | 0 | 0 | — |
 
 The first run opened ten requests every three seconds. Every batch completed
 inside its deadline. The second kept twenty one-MiB transfers active and
@@ -158,10 +159,10 @@ container and host path, not a public Internet link.
 | Direct | TCP | 1 | 21.393 | 22.113 |
 | Xray 26.3.27 | VMess/TCP | 1 | 8.044 | ≥6.952 |
 | Hysteria2 2.10.0 | QUIC | 1 | 2.714 | ≥2.816 |
-| MPTUNNEL | MPP/TCP (`1-1`) | 1 | 6.580 | 6.715 |
-| MPTUNNEL | MPP/TCP (default) | 3 | 5.550 | 6.393 |
-| MPTUNNEL | MPP/QUIC | 1 | 2.825 | 2.721 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 4 | 5.026 | 6.173 |
+| MPTUNNEL | MPP/TCP (`1-1`) | 1 | 6.362 | 6.581 |
+| MPTUNNEL | MPP/TCP (default) | 3 | 5.584 | 6.328 |
+| MPTUNNEL | MPP/QUIC | 1 | 2.867 | 2.796 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 4 | 4.921 | 5.190 |
 
 MPP performs encryption, framing, sequencing, scheduling, Data ACKs, flow
 control, and bounded recovery. Extra unshaped carriers add processing and

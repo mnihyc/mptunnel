@@ -5372,3 +5372,146 @@ entry is authoritative.
   `./.tmp/lab/results/v017-final-ee-scale/`,
   `./.tmp/lab/results/v017-final-ee-continuity-load/`, and
   `./.tmp/lab/results/v017-final-ee-topology/`.
+
+## 2026-08-04T09:26:16+08:00: preliminary v0.1.7 evidence (superseded)
+
+- Name: exact-candidate product and scale confirmation
+- Category: release performance acceptance
+- State: superseded by the later exact `a173c55` release-candidate matrix;
+  retained only as predecessor comparison evidence
+- Exact source: clean commit `ac227f274de08bfad1b8abb2064c15b57492b0a9`,
+  with valid host snapshots and receiver accounting.
+- Product evidence:
+  - one lossy 500-Mbps link delivered `218.718/194.412 Mbps` over MPP/TCP
+    and `277.469/282.256 Mbps` with the default TCP+QUIC configuration;
+  - five shaped links delivered `736.711/534.609 Mbps` over MPP/TCP and
+    `626.407/752.164 Mbps` with the default configuration;
+  - local default TCP delivered `5.386/6.386 Gbps`, while local default mixed
+    delivered `5.023/4.755 Gbps`; and
+  - the full-load browser case completed `808/808` continuously replenished
+    one-MiB requests in 60 seconds with 20 live connections, zero rejection,
+    and zero failure.
+- Scale evidence:
+  - the 20-link access and gigabit profiles delivered
+    `376.287/321.846 Mbps` and `1,482.293/609.487 Mbps`;
+  - multi-gigabit download repeated at `2,014.173` and `2,022.533 Mbps`;
+  - multi-gigabit upload produced one low-epoch `542.044 Mbps` sample and a
+    clean `752.993 Mbps` confirmation. Its one-second trace shows the lower
+    interval coinciding with deliberate six-second condition epochs and later
+    recovery, not steady-link oscillation; and
+  - the older `2,882.347 Mbps` download used the rejected per-flow service
+    authority and is not a valid regression baseline.
+- Causality controls:
+  - the same-host detached-ancestor control at `4951ec7` delivered
+    `4.608 Gbps` local mixed upload, below current v0.1.7's `4.755 Gbps`;
+    therefore the earlier `6.173 Gbps` row was environmental variation rather
+    than a shared-staging regression;
+  - matched single-TCP upload samples were `161.703`, `194.412`, and
+    `202.487 Mbps` under 360-ms RTT and 1% random loss. The median is published;
+    and
+  - the earlier five-TCP `641.250 Mbps` sample was superseded by the matched
+    `736.711 Mbps` confirmation; a 30-second control had already reached
+    `805.194 Mbps` with payload on all five interfaces.
+- Accepted trade: the mixed latency-change throughput is measured during the
+  injected disruption. Its maximum receiver gap improved from `1,995` to
+  `547 ms`, with `60/60` TCP and `102/102` HTTP completion; it is not a
+  healthy-link capacity regression.
+- Reproducible final evidence is under
+  `./.tmp/lab/results/v017-final-ac-product-valid/`,
+  `./.tmp/lab/results/v017-final-ac-scale-valid/`,
+  `./.tmp/lab/results/v017-final-ac-confirm-valid/`,
+  `./.tmp/lab/results/v017-final-ac-tcp-upload-valid/`, and
+  `./.tmp/lab/results/v017-final-ac-browser-valid/`.
+
+## 2026-08-04T13:18:46+08:00: exact v0.1.7 performance matrix accepted
+
+- Name: final exact-candidate publication evidence
+- Category: release performance acceptance
+- State: accepted; source gates passed; release transaction pending
+- Exact runtime source: clean commit `a173c55c5e4a1c7ffdfa9761294e20305e23ed17`
+  and optimized binary SHA-256
+  `4dc313a85594745ba9d4fa6b7d843f0bb31721f4be10566872b8a5854137df43`.
+  Every published MPTUNNEL row has a valid host snapshot and exact receiver
+  accounting. Rebuilding after the later path-only test renames reproduced the
+  same release binary SHA-256 exactly.
+- Matched product results:
+  - one lossy 500-Mbps route delivered `257.226/262.397 Mbps` over MPP/TCP,
+    `220.280/173.353 Mbps` over MPP/QUIC, and `297.387/287.721 Mbps` with the
+    default TCP+QUIC configuration;
+  - five shaped routes delivered `841.572/562.796 Mbps` over MPP/TCP,
+    `623.590/730.726 Mbps` over MPP/QUIC, and `639.898/804.675 Mbps` by default;
+  - the default therefore reached `1.43x` direct TCP in both directions on one
+    route and `1.79x/2.10x` Linux MPTCP across five routes; and
+  - no baseline upload lower bound was used in a ratio.
+- Carrier and topology results:
+  - under independent 500-Mbps-per-flow service, `1-1`, default `1-3`, and
+    three explicit `1-1` endpoints delivered `345.465/338.671`,
+    `901.519/873.097`, and `744.216/890.466 Mbps`;
+  - the same forms remained at the one shared 200-Mbps ceiling, delivering
+    `158.931/157.099`, `164.476/172.327`, and `167.164/150.939 Mbps`;
+  - a diagnostic control delivered `910.926/912.851 Mbps` for default and
+    explicit three-carrier forms and showed all three exact carriers carrying
+    comparable byte shares. The lower ordinary explicit download is therefore
+    native high-BDP TCP growth variation, not suppressed MPP capacity; and
+  - asymmetric 200/20 and 20/200-Mbps links delivered
+    `144.587/141.300 Mbps`, with `90.1/90.9%` of bytes on the directionally
+    faster link. No source-address heuristic participates.
+- Scale and load results:
+  - twenty varying TCP/QUIC links delivered `350.135/245.383 Mbps` in the
+    30-100-Mbps band, `1,346.848/726.616 Mbps` in the 300-1,000-Mbps band, and
+    `2,000.420/597.670 Mbps` in the 3-10-Gbps band;
+  - one gigabit download ended exactly at measurement teardown and was
+    retained as diagnostic evidence only; its clean confirmation delivered
+    `1,346.848 Mbps`;
+  - browser batches completed `90/90` inside three seconds, while the
+    60-second full-load run completed `739/739` one-MiB requests with twenty
+    continuously live connections and zero rejection or failure; and
+  - clean local capacity was `6.362/6.581 Gbps` for MPP/TCP `1-1`,
+    `5.584/6.328 Gbps` for default MPP/TCP, `2.867/2.796 Gbps` for MPP/QUIC,
+    and `4.921/5.190 Gbps` for the default mixed configuration.
+- Continuity results:
+  - QUIC port hopping delivered `2.818/2.799 Gbps`, with `11/24 ms` maximum
+    receiver gaps and no recovery gap;
+  - mixed blackhole, latency-change, and repeated-change runs retained every
+    persistent TCP exchange (`60/60`, `60/60`, and `48/48`) and delivered
+    `108/108`, `94/94`, and `90/92` deadline-bounded HTTP requests;
+  - the mixed maximum download gaps were `366 ms`, `3,310 ms`, and `1,501 ms`.
+    The latency result lies within the historical `0.55-4.10 s` range for the
+    deliberately injected 900-ms one-way, 10% loss epoch, while every TCP and
+    HTTP exchange completed; and
+  - TCP-only blackhole and latency-change cases delivered
+    `272.124/274.925` and `253.904/221.276 Mbps`, respectively.
+- Below-best classification:
+  - lossy high-RTT QUIC repeated across `162.762`, `173.353`, and
+    `185.607 Mbps` upload samples. Exact diagnostics showed a live path
+    snapshot, nonzero admission, and no window starvation. Static QUIC
+    authority is unchanged; local, port-hop, five-path, and default mixed QUIC
+    remain healthy, so a transport-specific patch is rejected;
+  - scale results span five deliberate six-second condition epochs and are not
+    steady-link best-of runs. Static one-link and five-link results improved,
+    so lower epoch averages do not identify a shared model failure;
+  - the local `1-1` result is within three percent of its historical best; and
+  - the full-load request count varies with host service time, while the actual
+    acceptance contract remains zero rejection, zero failure, and twenty live
+    connections for sixty seconds.
+- Decision: no parameter, timer, congestion controller, platform branch, or
+  scheduling rule changed after `a173c55`; every remaining lower historical
+  number was classified without evidence of a production model regression.
+- Public evidence now uses the exact accepted values in `README.md` and
+  `docs/PERFORMANCE.md`; release-specific predecessor analysis was removed
+  from public documentation.
+- Final source verification: formatting, warnings-denied all-target/all-feature
+  Clippy, `1,457` Core tests, `2` allocation checks, `6` daily-use acceptance
+  tests, `282` standalone Quinn tests, `3` Quinn doctests, `5` deterministic
+  benchmark tests, `210` lab contract tests, and `9` packaging contract tests
+  passed. The registry declares `29` cells and `66` metrics; every shell and
+  release-version contract check passed.
+- Reproducible evidence:
+  `./.tmp/v017-release-candidate/.tmp/lab/results/v017-final-a173c55-product/`,
+  `v017-final-a173c55-scale/`, `v017-final-a173c55-quic/`,
+  `v017-final-a173c55-tcp-qos/`,
+  `v017-final-a173c55-tcp-qos-explicit-dl-confirm/`,
+  `v017-final-a173c55-asymmetry/`, `v017-final-a173c55-continuity/`,
+  `v017-final-a173c55-browser/`, and `v017-final-a173c55-local-1-1/` under that
+  result root. Diagnostic-only evidence is under
+  `v017-diagnostic-a173c55-tcp-qos-download/`.

@@ -5,11 +5,11 @@ fn peer_bulk_hint_seeds_but_does_not_pin_reliable_flow_demand() {
     let limits = MuxLimits::default();
     let mut tracker = ReliableRelayFlowDemandTracker::with_initial_lane(TrafficClass::Throughput);
 
-    let initial = tracker.refresh(ReliableRelayFlowSignals::new(0, 0), None, limits);
+    let initial = tracker.refresh(ReliableRelayFlowSignals::new(0), None, limits);
     assert_eq!(initial.lane, TrafficClass::Throughput);
 
     tracker.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(None);
-    let idle = tracker.refresh(ReliableRelayFlowSignals::new(0, 0), None, limits);
+    let idle = tracker.refresh(ReliableRelayFlowSignals::new(0), None, limits);
     assert_eq!(
         idle.lane,
         TrafficClass::Latency,
@@ -25,11 +25,11 @@ fn historical_bulk_volume_does_not_override_live_idleness() {
     );
     let mut tracker = ReliableRelayFlowDemandTracker::new();
 
-    let active = tracker.refresh(ReliableRelayFlowSignals::new(bulk_bytes, 0), None, limits);
+    let active = tracker.refresh(ReliableRelayFlowSignals::new(bulk_bytes), None, limits);
     assert_eq!(active.lane, TrafficClass::Throughput);
 
     tracker.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(None);
-    let idle = tracker.refresh(ReliableRelayFlowSignals::new(bulk_bytes, 0), None, limits);
+    let idle = tracker.refresh(ReliableRelayFlowSignals::new(bulk_bytes), None, limits);
     assert_eq!(
         idle.lane,
         TrafficClass::Latency,
@@ -37,7 +37,7 @@ fn historical_bulk_volume_does_not_override_live_idleness() {
     );
 
     let resumed = tracker.refresh(
-        ReliableRelayFlowSignals::new(bulk_bytes.saturating_add(1), 0),
+        ReliableRelayFlowSignals::new(bulk_bytes.saturating_add(1)),
         None,
         limits,
     );
@@ -48,7 +48,7 @@ fn historical_bulk_volume_does_not_override_live_idleness() {
     );
 
     let reproven = tracker.refresh(
-        ReliableRelayFlowSignals::new(bulk_bytes.saturating_mul(2), 0),
+        ReliableRelayFlowSignals::new(bulk_bytes.saturating_mul(2)),
         None,
         limits,
     );
@@ -63,14 +63,14 @@ fn pending_product_work_preserves_but_cannot_alone_create_bulk_demand() {
     );
     let mut bulk = ReliableRelayFlowDemandTracker::new();
     assert_eq!(
-        bulk.refresh(ReliableRelayFlowSignals::new(bulk_bytes, 0), None, limits,)
+        bulk.refresh(ReliableRelayFlowSignals::new(bulk_bytes), None, limits,)
             .lane,
         TrafficClass::Throughput
     );
 
     bulk.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(None);
     let backpressured = bulk.refresh(
-        ReliableRelayFlowSignals::new(bulk_bytes, 0)
+        ReliableRelayFlowSignals::new(bulk_bytes)
             .with_product_work(0, reliable_relay_buffer_len(limits)),
         None,
         limits,
@@ -81,13 +81,13 @@ fn pending_product_work_preserves_but_cannot_alone_create_bulk_demand() {
         "queued or unacknowledged product bytes are active work, not application idleness"
     );
 
-    let drained = bulk.refresh(ReliableRelayFlowSignals::new(bulk_bytes, 0), None, limits);
+    let drained = bulk.refresh(ReliableRelayFlowSignals::new(bulk_bytes), None, limits);
     assert_eq!(drained.lane, TrafficClass::Latency);
 
     let mut latency = ReliableRelayFlowDemandTracker::new();
     latency.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(None);
     let recovery_only = latency.refresh(
-        ReliableRelayFlowSignals::new(0, 0).with_product_work(0, reliable_relay_buffer_len(limits)),
+        ReliableRelayFlowSignals::new(0).with_product_work(0, reliable_relay_buffer_len(limits)),
         None,
         limits,
     );
@@ -99,25 +99,39 @@ fn pending_product_work_preserves_but_cannot_alone_create_bulk_demand() {
 }
 
 #[test]
-fn direction_switch_contributes_fresh_flow_evidence() {
+fn each_direction_requires_its_own_flow_evidence() {
     let limits = MuxLimits::default();
     let floor = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
-    let first_direction = floor / 2;
-    let second_direction = floor.saturating_sub(first_direction);
-    let mut tracker = ReliableRelayFlowDemandTracker::new();
+    let half = floor / 2;
+    let mut request = ReliableRelayFlowDemandTracker::new();
+    let mut response = ReliableRelayFlowDemandTracker::new();
 
-    let first = tracker.refresh(
-        ReliableRelayFlowSignals::new(first_direction, 0),
-        None,
-        limits,
+    assert_eq!(
+        request
+            .refresh(ReliableRelayFlowSignals::new(half), None, limits)
+            .lane,
+        TrafficClass::Latency
     );
-    assert_eq!(first.lane, TrafficClass::Latency);
-    let switched = tracker.refresh(
-        ReliableRelayFlowSignals::new(first_direction, second_direction),
-        None,
-        limits,
+    assert_eq!(
+        response
+            .refresh(ReliableRelayFlowSignals::new(half), None, limits)
+            .lane,
+        TrafficClass::Latency,
+        "request progress cannot contribute response evidence"
     );
-    assert_eq!(switched.lane, TrafficClass::Throughput);
+    assert_eq!(
+        request
+            .refresh(ReliableRelayFlowSignals::new(floor), None, limits)
+            .lane,
+        TrafficClass::Throughput
+    );
+    assert_eq!(
+        response
+            .refresh(ReliableRelayFlowSignals::new(half), None, limits)
+            .lane,
+        TrafficClass::Latency,
+        "request promotion cannot overwrite the response objective"
+    );
 }
 
 #[test]
@@ -125,7 +139,7 @@ fn flow_demand_rebalances_repeatedly_during_sustained_bulk() {
     let mut tracker = ReliableRelayFlowDemandTracker::new();
     let limits = MuxLimits::default();
     let first = tracker.refresh(
-        ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 4, 0),
+        ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 4),
         None,
         limits,
     );
@@ -135,7 +149,7 @@ fn flow_demand_rebalances_repeatedly_during_sustained_bulk() {
     tracker.mark_rebalance_attempted();
 
     let immediate = tracker.refresh(
-        ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 5, 0),
+        ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 5),
         None,
         limits,
     );
@@ -144,7 +158,7 @@ fn flow_demand_rebalances_repeatedly_during_sustained_bulk() {
 
     tracker.next_rebalance_at = Instant::now() - Duration::from_millis(1);
     let recurring = tracker.refresh(
-        ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 6, 0),
+        ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 6),
         None,
         limits,
     );
@@ -159,7 +173,7 @@ fn rate_evidence_does_not_classify_bulk_before_sustained_demand_floor() {
     let floor = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
     let below_floor = floor.saturating_sub(1).max(1);
 
-    let decision = tracker.refresh(ReliableRelayFlowSignals::new(below_floor, 0), None, limits);
+    let decision = tracker.refresh(ReliableRelayFlowSignals::new(below_floor), None, limits);
 
     assert_eq!(decision.lane, TrafficClass::Latency);
     assert!(!decision.promoted_to_throughput);
@@ -177,7 +191,7 @@ fn initial_window_response_stays_latency_and_does_not_preopen_additional_paths()
     assert!(threshold > PATH_OPEN_SCORE_BYTES as u64);
 
     let decision = tracker.refresh(
-        ReliableRelayFlowSignals::new(PATH_OPEN_SCORE_BYTES as u64, 0),
+        ReliableRelayFlowSignals::new(PATH_OPEN_SCORE_BYTES as u64),
         None,
         limits,
     );
@@ -191,7 +205,7 @@ fn initial_window_response_stays_latency_and_does_not_preopen_additional_paths()
 
     let mut queued = ReliableRelayFlowDemandTracker::new();
     let queued_decision = queued.refresh(
-        ReliableRelayFlowSignals::new(PATH_OPEN_SCORE_BYTES as u64, 0)
+        ReliableRelayFlowSignals::new(PATH_OPEN_SCORE_BYTES as u64)
             .with_product_work(reliable_relay_buffer_len(limits), 0),
         None,
         limits,
@@ -216,11 +230,7 @@ fn additional_path_preparation_uses_an_amortized_bulk_floor() {
         "additional-path preparation starts after several startup windows without waiting for full bulk classification"
     );
 
-    let decision = tracker.refresh(
-        ReliableRelayFlowSignals::new(path_open_floor, 0),
-        None,
-        limits,
-    );
+    let decision = tracker.refresh(ReliableRelayFlowSignals::new(path_open_floor), None, limits);
 
     assert_eq!(decision.lane, TrafficClass::Latency);
     assert!(!decision.promoted_to_throughput);
@@ -228,7 +238,7 @@ fn additional_path_preparation_uses_an_amortized_bulk_floor() {
 
     let mut outstanding = ReliableRelayFlowDemandTracker::new();
     let outstanding_decision = outstanding.refresh(
-        ReliableRelayFlowSignals::new(path_open_floor, 0)
+        ReliableRelayFlowSignals::new(path_open_floor)
             .with_product_work(0, reliable_relay_buffer_len(limits)),
         None,
         limits,
@@ -241,7 +251,7 @@ fn additional_path_preparation_uses_an_amortized_bulk_floor() {
 
     let mut residual = ReliableRelayFlowDemandTracker::new();
     let residual_decision = residual.refresh(
-        ReliableRelayFlowSignals::new(path_open_floor, 0).with_product_work(1, 0),
+        ReliableRelayFlowSignals::new(path_open_floor).with_product_work(1, 0),
         None,
         limits,
     );
@@ -254,7 +264,7 @@ fn additional_path_preparation_uses_an_amortized_bulk_floor() {
     let queued_window = PATH_OPEN_SCORE_BYTES.min(reliable_relay_buffer_len(limits));
     let mut below_window = ReliableRelayFlowDemandTracker::new();
     let below_window_decision = below_window.refresh(
-        ReliableRelayFlowSignals::new(path_open_floor, 0)
+        ReliableRelayFlowSignals::new(path_open_floor)
             .with_product_work(queued_window.saturating_sub(1), 0),
         None,
         limits,
@@ -266,7 +276,7 @@ fn additional_path_preparation_uses_an_amortized_bulk_floor() {
         ReliableRelayFlowDemandTracker::new(),
     ] {
         let queued_decision = queued.refresh(
-            ReliableRelayFlowSignals::new(path_open_floor, 0).with_product_work(queued_window, 0),
+            ReliableRelayFlowSignals::new(path_open_floor).with_product_work(queued_window, 0),
             None,
             limits,
         );
@@ -281,7 +291,7 @@ fn sustained_rate_evidence_classifies_the_flow_as_bulk() {
     let limits = MuxLimits::default();
     let floor = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
 
-    let decision = tracker.refresh(ReliableRelayFlowSignals::new(floor, 0), None, limits);
+    let decision = tracker.refresh(ReliableRelayFlowSignals::new(floor), None, limits);
 
     assert_eq!(decision.lane, TrafficClass::Throughput);
     assert!(decision.promoted_to_throughput);
@@ -295,7 +305,7 @@ fn byte_threshold_classifies_bulk_even_when_average_rate_is_low() {
     let threshold = reliable_flow_bulk_threshold_bytes(None, limits);
     tracker.epoch_started_at = Some(Instant::now() - Duration::from_secs(60));
 
-    let decision = tracker.refresh(ReliableRelayFlowSignals::new(threshold, 0), None, limits);
+    let decision = tracker.refresh(ReliableRelayFlowSignals::new(threshold), None, limits);
 
     assert_eq!(decision.lane, TrafficClass::Throughput);
     assert!(decision.promoted_to_throughput);
@@ -320,7 +330,7 @@ fn latency_startup_credit_follows_the_directional_demand_episode() {
     let mut tracker = ReliableRelayFlowDemandTracker::new();
     let historical_offset = threshold;
     let initial_bulk = tracker.refresh(
-        ReliableRelayFlowSignals::new(historical_offset, 0),
+        ReliableRelayFlowSignals::new(historical_offset),
         Some(path),
         limits,
     );
@@ -336,7 +346,7 @@ fn latency_startup_credit_follows_the_directional_demand_episode() {
 
     tracker.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(Some(path));
     let idle = tracker.refresh(
-        ReliableRelayFlowSignals::new(historical_offset, 0),
+        ReliableRelayFlowSignals::new(historical_offset),
         Some(path),
         limits,
     );
@@ -352,7 +362,7 @@ fn latency_startup_credit_follows_the_directional_demand_episode() {
     tracker.epoch_started_at = Some(Instant::now() - Duration::from_secs(60));
     let almost_bulk_offset = historical_offset.saturating_add(threshold.saturating_sub(1));
     let almost_bulk = tracker.refresh(
-        ReliableRelayFlowSignals::new(almost_bulk_offset, 0),
+        ReliableRelayFlowSignals::new(almost_bulk_offset),
         Some(path),
         limits,
     );
@@ -364,7 +374,7 @@ fn latency_startup_credit_follows_the_directional_demand_episode() {
     );
 
     let reproven = tracker.refresh(
-        ReliableRelayFlowSignals::new(almost_bulk_offset.saturating_add(1), 0),
+        ReliableRelayFlowSignals::new(almost_bulk_offset.saturating_add(1)),
         Some(path),
         limits,
     );

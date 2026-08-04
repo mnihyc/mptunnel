@@ -26,7 +26,7 @@ use super::lifecycle::{
     switch_reliable_relay_to_best_path,
 };
 use super::open::ReliableRelayOpenSpec;
-use super::remote::ReliableRelayAttachMode;
+use super::remote::{ReliableRelayAttachMode, ReliableRelayPathLanes};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
 use crate::model::capacity::{
@@ -211,6 +211,17 @@ where
     }
 }
 
+fn reliable_relay_topology_lane(
+    request_lane: TrafficClass,
+    response_lane: TrafficClass,
+) -> TrafficClass {
+    if request_lane.is_bulk() || response_lane.is_bulk() {
+        TrafficClass::Throughput
+    } else {
+        TrafficClass::Latency
+    }
+}
+
 pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
     local: S,
     context: &ClientPathContext,
@@ -255,7 +266,7 @@ where
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut state = ClientRelayState::new();
     let mut sender = RequestSenderService::new_with_performance(stream_id, performance);
-    let mut flow_demand = ReliableRelayFlowDemandTracker::new();
+    let mut response_flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let mut deferred_remote_frame = None::<ReliableRelayRemoteFrame>;
@@ -303,14 +314,16 @@ where
             }
             let retention_deadline =
                 disconnected.retention_deadline(context.session_retention_timeout);
-            let relay_lane = flow_demand.current_lane();
+            let request_lane = request_flow_demand.current_lane();
+            let response_lane = response_flow_demand.current_lane();
+            let topology_lane = reliable_relay_topology_lane(request_lane, response_lane);
             if state.recovery.pending_additional_path_opens.is_empty()
                 && now_async >= disconnected.retry_at
             {
                 let spawned = spawn_reliable_relay_disconnected_path_open(
                     context,
                     &spec,
-                    relay_lane,
+                    ReliableRelayPathLanes::new(topology_lane, request_lane),
                     &remotes,
                     &send_stream,
                     &mut disconnected.attempted_paths,
@@ -358,6 +371,7 @@ where
                         &mut remotes,
                         &mut send_stream,
                         !state.endpoint.local_open,
+                        request_lane,
                         additional_path_open,
                         state.recovery.pending_additional_path_opens.len(),
                         &mut state.progress.last_stream_at,
@@ -369,16 +383,16 @@ where
                         send_stream.update_max_offset(remotes.max_offset());
                         let path_snapshot = remotes.lowest_eta_path_snapshot(
                             context,
-                            relay_lane,
+                            response_lane,
                             PATH_OPEN_SCORE_BYTES,
                         );
                         let recv_progress_send = if pending_stream_fin_ready(
                             &recv_stream,
                             state.endpoint.pending_remote_fin_offset,
                         ) {
-                            RelayRecvProgressSend::final_ack(path_snapshot, relay_lane)
+                            RelayRecvProgressSend::final_ack(path_snapshot, response_lane)
                         } else {
-                            RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                            RelayRecvProgressSend::new(path_snapshot, response_lane, true)
                         };
                         let progress_ready = match sender
                             .send_recv_progress(
@@ -434,6 +448,7 @@ where
                 &mut remotes,
                 &mut send_stream,
                 !state.endpoint.local_open,
+                request_flow_demand.current_lane(),
                 &mut state.recovery.pending_additional_path_opens,
                 &mut additional_path_open_rx,
                 &mut state.progress.last_stream_at,
@@ -446,35 +461,28 @@ where
         }
         let timing_path_snapshot =
             remotes.lowest_eta_path_snapshot(context, TrafficClass::Latency, PATH_OPEN_SCORE_BYTES);
-        let demand_update = flow_demand.refresh(
-            ReliableRelayFlowSignals::new(
-                send_stream
-                    .next_offset()
-                    .saturating_add(sender_queue.data_bytes() as u64),
-                recv_stream.next_offset(),
-            )
-            .with_product_work(
-                sender_queue.data_bytes(),
-                send_stream
-                    .reinjection_bytes()
-                    .saturating_add(recv_stream.reorder_bytes()),
-            ),
+        let response_demand_update = response_flow_demand.refresh(
+            ReliableRelayFlowSignals::new(recv_stream.next_offset())
+                .with_product_work(0, recv_stream.reorder_bytes()),
             timing_path_snapshot,
             context.mux_limits,
         );
-        let relay_lane = demand_update.lane;
+        let response_lane = response_demand_update.lane;
         let request_observed_bytes = send_stream
             .next_offset()
             .saturating_add(sender_queue.data_bytes() as u64);
         let request_demand_update = request_flow_demand.refresh(
-            ReliableRelayFlowSignals::new(request_observed_bytes, 0)
+            ReliableRelayFlowSignals::new(request_observed_bytes)
                 .with_product_work(sender_queue.data_bytes(), send_stream.reinjection_bytes()),
             timing_path_snapshot,
             context.mux_limits,
         );
         let request_lane = request_demand_update.lane;
+        let topology_lane = reliable_relay_topology_lane(request_lane, response_lane);
         let path_snapshot =
-            remotes.lowest_eta_path_snapshot(context, relay_lane, PATH_OPEN_SCORE_BYTES);
+            remotes.lowest_eta_path_snapshot(context, request_lane, PATH_OPEN_SCORE_BYTES);
+        let response_path_snapshot =
+            remotes.lowest_eta_path_snapshot(context, response_lane, PATH_OPEN_SCORE_BYTES);
         let request_membership_generation = remotes.membership_generation();
         let request_membership_changed =
             request_membership_generation != observed_request_membership_generation;
@@ -518,7 +526,7 @@ where
             lab_diagnostic(
                 "client_request_lane_changed",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} observed_bytes={} product_rate_mbps={:.3} byte_proven={} rate_proven={} buffered_data={} relay_lane={:?}",
+                    "stream_id={} previous={:?} lane={:?} observed_bytes={} product_rate_mbps={:.3} byte_proven={} rate_proven={} buffered_data={} request_lane={:?}",
                     stream_id.0,
                     request_demand_update.previous_lane,
                     request_lane,
@@ -527,7 +535,7 @@ where
                     request_demand_update.byte_proven_bulk,
                     request_demand_update.rate_proven_sustained_bulk,
                     request_demand_update.buffered_bulk,
-                    relay_lane,
+                    request_lane,
                 ),
             );
         }
@@ -556,50 +564,66 @@ where
             (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
             (None, None) => None,
         };
-        if reliable_relay_lane_changed(demand_update.previous_lane, relay_lane) {
+        if reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane) {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
-                "client_stream_lane_changed",
+                "client_request_lane_applied",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={} reorder_bytes={} byte_proven={} rate_proven={} buffered_data={}",
+                    "stream_id={} previous={:?} lane={:?} sent_offset={} reinjection_bytes={} byte_proven={} rate_proven={} buffered_data={}",
                     stream_id.0,
-                    demand_update.previous_lane,
-                    relay_lane,
+                    request_demand_update.previous_lane,
+                    request_lane,
                     send_stream.next_offset(),
-                    recv_stream.next_offset(),
                     send_stream.reinjection_bytes(),
-                    recv_stream.reorder_bytes(),
-                    demand_update.byte_proven_bulk,
-                    demand_update.rate_proven_sustained_bulk,
-                    demand_update.buffered_bulk,
+                    request_demand_update.byte_proven_bulk,
+                    request_demand_update.rate_proven_sustained_bulk,
+                    request_demand_update.buffered_bulk,
                 ),
             );
             for key in remotes.load_owned_path_keys() {
                 context.change_relay_path_lane_load(
                     key.underlay,
                     key.index,
-                    demand_update.previous_lane,
-                    relay_lane,
+                    request_demand_update.previous_lane,
+                    request_lane,
                 );
             }
-            remotes.set_lane(relay_lane);
+            remotes.set_lane(request_lane);
         }
-        if demand_update.preopen_additional_paths && !relay_lane.is_bulk() {
+        #[cfg(feature = "lab-diagnostics")]
+        if reliable_relay_lane_changed(response_demand_update.previous_lane, response_lane) {
+            lab_diagnostic(
+                "client_response_lane_changed",
+                format_args!(
+                    "stream_id={} previous={:?} lane={:?} received_offset={} reorder_bytes={} byte_proven={} rate_proven={}",
+                    stream_id.0,
+                    response_demand_update.previous_lane,
+                    response_lane,
+                    recv_stream.next_offset(),
+                    recv_stream.reorder_bytes(),
+                    response_demand_update.byte_proven_bulk,
+                    response_demand_update.rate_proven_sustained_bulk,
+                ),
+            );
+        }
+        let topology_preopen = request_demand_update.preopen_additional_paths
+            || response_demand_update.preopen_additional_paths;
+        if topology_preopen && !topology_lane.is_bulk() {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "client_stream_additional_path_open_due",
                 format_args!(
-                    "stream_id={} observed_bytes={} product_rate_mbps={:.3} attached_paths={}",
+                    "stream_id={} request_observed_bytes={} response_observed_bytes={} attached_paths={}",
                     stream_id.0,
-                    demand_update.observed_bytes,
-                    demand_update.product_rate_bps / 1_000_000.0,
+                    request_demand_update.observed_bytes,
+                    response_demand_update.observed_bytes,
                     remotes.path_keys().len(),
                 ),
             );
             if spawn_reliable_relay_additional_path_opens(
                 context,
                 &spec,
-                TrafficClass::Throughput,
+                ReliableRelayPathLanes::new(TrafficClass::Throughput, request_lane),
                 &remotes,
                 &send_stream,
                 &mut state.recovery.pending_additional_path_opens,
@@ -608,27 +632,44 @@ where
                 state.progress.last_stream_at = Instant::now();
             }
         }
-        if flow_demand.should_rebalance(demand_update) {
+        let request_rebalance_due = request_flow_demand.should_rebalance(request_demand_update);
+        let response_rebalance_due = response_flow_demand.should_rebalance(response_demand_update);
+        if request_rebalance_due || response_rebalance_due {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "client_stream_rebalance_due",
                 format_args!(
                     "stream_id={} lane={:?} promoted={} observed_bytes={} product_rate_mbps={:.3} interval_ms={:.3} attached_paths={}",
                     stream_id.0,
-                    relay_lane,
-                    demand_update.promoted_to_throughput,
-                    demand_update.observed_bytes,
-                    demand_update.product_rate_bps / 1_000_000.0,
-                    demand_update.rebalance_interval.as_secs_f64() * 1000.0,
+                    topology_lane,
+                    request_demand_update.promoted_to_throughput
+                        || response_demand_update.promoted_to_throughput,
+                    request_demand_update
+                        .observed_bytes
+                        .max(response_demand_update.observed_bytes),
+                    request_demand_update
+                        .product_rate_bps
+                        .max(response_demand_update.product_rate_bps)
+                        / 1_000_000.0,
+                    request_demand_update
+                        .rebalance_interval
+                        .max(response_demand_update.rebalance_interval)
+                        .as_secs_f64()
+                        * 1000.0,
                     remotes.path_keys().len(),
                 ),
             );
-            flow_demand.mark_rebalance_attempted();
-            if relay_lane.is_bulk() {
+            if request_rebalance_due {
+                request_flow_demand.mark_rebalance_attempted();
+            }
+            if response_rebalance_due {
+                response_flow_demand.mark_rebalance_attempted();
+            }
+            if topology_lane.is_bulk() {
                 if spawn_reliable_relay_additional_path_opens(
                     context,
                     &spec,
-                    relay_lane,
+                    ReliableRelayPathLanes::new(topology_lane, request_lane),
                     &remotes,
                     &send_stream,
                     &mut state.recovery.pending_additional_path_opens,
@@ -639,7 +680,7 @@ where
             } else if let Err(err) = switch_reliable_relay_to_best_path(
                 context,
                 &spec,
-                relay_lane,
+                ReliableRelayPathLanes::new(topology_lane, request_lane),
                 &mut remotes,
                 &send_stream,
                 !state.endpoint.local_open,
@@ -668,7 +709,7 @@ where
                     let instance = remote.instance();
                     (instance, sender.request_path_is_stale(instance))
                 }),
-            relay_lane,
+            request_lane,
             PATH_OPEN_SCORE_BYTES,
         );
         let source_path_snapshot = source_admission.selected_path;
@@ -676,12 +717,12 @@ where
         let adaptive_inflight = source_admission.window_bytes;
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
             source_path_snapshot,
-            relay_lane,
+            request_lane,
             context.mux_limits,
             remotes.max_frame_payload_bytes(context.mux_limits),
         );
         let request_outstanding_limit = reliable_relay_request_outstanding_limit_bytes(
-            relay_lane,
+            request_lane,
             adaptive_chunk,
             context.mux_limits,
         );
@@ -695,19 +736,19 @@ where
         let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
             reliable_relay_sender_dispatch_budget(
                 context.mux_limits,
-                relay_lane,
+                request_lane,
                 adaptive_chunk,
                 adaptive_inflight,
                 sender_queue_limit,
             );
         #[cfg(feature = "lab-diagnostics")]
-        if last_reported_budget != Some((relay_lane, adaptive_chunk, adaptive_inflight)) {
+        if last_reported_budget != Some((request_lane, adaptive_chunk, adaptive_inflight)) {
             lab_diagnostic(
                 "client_relay_budget",
                 format_args!(
                     "stream_id={} lane={:?} chunk_bytes={} inflight_bytes={} request_outstanding_limit_bytes={} session_send_buffer_used_bytes={} session_send_buffer_limit_bytes={} attached_paths={} path_snapshot={}",
                     stream_id.0,
-                    relay_lane,
+                    request_lane,
                     adaptive_chunk,
                     adaptive_inflight,
                     request_outstanding_limit,
@@ -717,13 +758,13 @@ where
                     source_path_snapshot.is_some(),
                 ),
             );
-            last_reported_budget = Some((relay_lane, adaptive_chunk, adaptive_inflight));
+            last_reported_budget = Some((request_lane, adaptive_chunk, adaptive_inflight));
         }
         let stall_watch_active = reliable_relay_stall_watch_active(
             &send_stream,
             &recv_stream,
             state.endpoint.remote_open,
-            relay_lane,
+            response_lane,
             state.progress.interactive_response_pending,
             context.mux_limits,
         );
@@ -733,7 +774,7 @@ where
             state.progress.last_response_stall_reinjection_at,
             &recv_stream,
             state.endpoint.remote_open,
-            relay_lane,
+            response_lane,
             state.progress.interactive_response_pending,
             context.mux_limits,
         );
@@ -744,22 +785,22 @@ where
         let receive_hole_reinjection_deadline = reliable_relay_receive_hole_reinjection_deadline(
             state.progress.last_delivery_at,
             state.progress.last_receive_hole_reinjection_at,
-            path_snapshot,
+            response_path_snapshot,
         );
         let stall_deadline = reliable_relay_product_stall_deadline(
             stall_progress_anchor,
             state.progress.last_product_stall_attempt_at,
-            path_snapshot,
+            response_path_snapshot,
         );
         let recv_progress_deadline = tokio::time::Instant::from_std(
             state.progress.last_recv_progress_sent_at
-                + reliable_stream_recv_progress_interval(path_snapshot),
+                + reliable_stream_recv_progress_interval(response_path_snapshot),
         );
         let recv_progress_resend_active = remotes.path_keys().len() > 1
             && reliable_relay_recv_progress_resend_active(
                 &recv_stream,
                 state.endpoint.remote_open,
-                path_snapshot.map(|snapshot| snapshot.underlay),
+                response_path_snapshot.map(|snapshot| snapshot.underlay),
             );
         let recv_progress_ack_update_pending =
             state.endpoint.remote_open && state.progress.recv_progress.ack_update_pending();
@@ -800,7 +841,7 @@ where
             &remotes,
             &send_stream,
             path_snapshot,
-            relay_lane,
+            request_lane,
             stream_id,
         );
         #[cfg(feature = "lab-diagnostics")]
@@ -943,7 +984,7 @@ where
                         format_args!(
                             "stream_id={} lane={:?} reinjection_bytes={} send_credit_bytes={} inflight_limit={} request_outstanding_limit={} request_outstanding_headroom={} sent_offset={} received_offset={}",
                             stream_id.0,
-                            relay_lane,
+                            request_lane,
                             blocked_state.0,
                             blocked_state.1,
                             blocked_state.2,
@@ -975,12 +1016,16 @@ where
                         context,
                         &mut recv_stream,
                         &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::final_ack(path_snapshot, relay_lane),
+                        RelayRecvProgressSend::final_ack(response_path_snapshot, response_lane),
                     )
                     .await
                 {
                     Ok(sent) => {
-                        record_final_recv_progress_enqueue(&mut state, sent, path_snapshot);
+                        record_final_recv_progress_enqueue(
+                            &mut state,
+                            sent,
+                            response_path_snapshot,
+                        );
                         sent
                     }
                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -1004,7 +1049,7 @@ where
                 let recovery_path_open_spawned = spawn_reliable_relay_recovery_path_open(
                     context,
                     &spec,
-                    relay_lane,
+                    ReliableRelayPathLanes::new(response_lane, request_lane),
                     &remotes,
                     &send_stream,
                     &state.recovery.excluded_paths,
@@ -1019,7 +1064,11 @@ where
                         context,
                         &mut recv_stream,
                         &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                        RelayRecvProgressSend::new(
+                            response_path_snapshot,
+                            response_lane,
+                            true,
+                        ),
                     )
                     .await
                 {
@@ -1035,7 +1084,7 @@ where
                     format_args!(
                         "stream_id={} lane={:?} reorder_bytes={} attempts={} recovery_path_open_spawned={} action=ack_progress_existing_paths",
                         stream_id.0,
-                        relay_lane,
+                        response_lane,
                         recv_stream.reorder_bytes(),
                         state.progress.receive_hole_reinjection_attempts,
                         recovery_path_open_spawned,
@@ -1067,13 +1116,13 @@ where
                     state.progress.last_send_ack.complete(),
                     reinjection_horizon,
                     state.progress.last_send_ack_frontier,
-                    relay_lane,
+                    request_lane,
                 );
                 let recovery_open_spawned = persistent_product_stall
                     && spawn_reliable_relay_recovery_path_open(
                         context,
                         &spec,
-                        relay_lane,
+                        ReliableRelayPathLanes::new(topology_lane, request_lane),
                         &remotes,
                         &send_stream,
                         &state.recovery.excluded_paths,
@@ -1092,7 +1141,11 @@ where
                         context,
                         &mut recv_stream,
                         &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                        RelayRecvProgressSend::new(
+                            response_path_snapshot,
+                            response_lane,
+                            true,
+                        ),
                     )
                     .await
                     {
@@ -1108,7 +1161,7 @@ where
                         format_args!(
                             "stream_id={} active_underlay={:?} attached_paths={} pending_opens={} recovery_open_spawned={} reinjection_bytes={} recv_reorder_bytes={} sent_offset={} cause=product_stall_only",
                             stream_id.0,
-                            path_snapshot.map(|snapshot| snapshot.underlay),
+                            response_path_snapshot.map(|snapshot| snapshot.underlay),
                             remotes.path_keys().len(),
                             state.recovery.pending_additional_path_opens.len(),
                             recovery_open_spawned,
@@ -1127,7 +1180,7 @@ where
                     let recovery_open_spawned = spawn_reliable_relay_recovery_path_open(
                         context,
                         &spec,
-                        relay_lane,
+                        ReliableRelayPathLanes::new(topology_lane, request_lane),
                         &remotes,
                         &send_stream,
                         &state.recovery.excluded_paths,
@@ -1145,7 +1198,7 @@ where
                         format_args!(
                             "stream_id={} active_underlay={:?} attached_paths={} pending_opens={} reinjection_bytes={} sent_offset={} cause=product_stall_only",
                             stream_id.0,
-                            path_snapshot.map(|snapshot| snapshot.underlay),
+                            response_path_snapshot.map(|snapshot| snapshot.underlay),
                             remotes.path_keys().len(),
                             state.recovery.pending_additional_path_opens.len(),
                             send_stream.reinjection_bytes(),
@@ -1164,7 +1217,7 @@ where
                     context,
                     &mut recv_stream,
                     &mut state.progress.recv_progress,
-                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                    RelayRecvProgressSend::new(response_path_snapshot, response_lane, true),
                 )
                 .await
                 {
@@ -1177,7 +1230,7 @@ where
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
-                            relay_lane,
+                            ReliableRelayPathLanes::new(response_lane, request_lane),
                             &mut remotes,
                             &send_stream,
                             !state.endpoint.local_open,
@@ -1196,8 +1249,8 @@ where
                                         &mut recv_stream,
                                         &mut state.progress.recv_progress,
                                         RelayRecvProgressSend::new(
-                                            path_snapshot,
-                                            relay_lane,
+                                            response_path_snapshot,
+                                            response_lane,
                                             true,
                                         ),
                                     )
@@ -1221,7 +1274,7 @@ where
                     format_args!(
                         "stream_id={} active_underlay={:?} attached_paths={} reinjection_bytes={} recv_reorder_bytes={} sent_offset={} cause=product_stall_only",
                         stream_id.0,
-                        path_snapshot.map(|snapshot| snapshot.underlay),
+                        response_path_snapshot.map(|snapshot| snapshot.underlay),
                         remotes.path_keys().len(),
                         send_stream.reinjection_bytes(),
                         recv_stream.reorder_bytes(),
@@ -1234,9 +1287,9 @@ where
             _ = tokio::time::sleep_until(recv_progress_deadline), if recv_progress_resend_active
                 || recv_progress_ack_update_pending => {
                 let recv_progress_send = if recv_progress_resend_active {
-                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                    RelayRecvProgressSend::new(response_path_snapshot, response_lane, true)
                 } else {
-                    RelayRecvProgressSend::ack_only(path_snapshot, relay_lane)
+                    RelayRecvProgressSend::ack_only(response_path_snapshot, response_lane)
                 };
                 match sender.send_recv_progress(
                     &mut remotes,
@@ -1260,7 +1313,7 @@ where
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
-                            relay_lane,
+                            ReliableRelayPathLanes::new(response_lane, request_lane),
                             &mut remotes,
                             &send_stream,
                             !state.endpoint.local_open,
@@ -1304,7 +1357,7 @@ where
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
-                            relay_lane,
+                            ReliableRelayPathLanes::new(request_lane, request_lane),
                             &mut remotes,
                             &send_stream,
                             true,
@@ -1366,7 +1419,7 @@ where
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
-                            relay_lane,
+                            ReliableRelayPathLanes::new(request_lane, request_lane),
                             &mut remotes,
                             &send_stream,
                             true,
@@ -1448,7 +1501,7 @@ where
                             match attach_reliable_relay_paths_with_recovery_exclusions(
                                 context,
                                 &spec,
-                                relay_lane,
+                                ReliableRelayPathLanes::new(request_lane, request_lane),
                                 &mut remotes,
                                 &send_stream,
                                 !state.endpoint.local_open,
@@ -1489,7 +1542,7 @@ where
                         format_args!(
                             "stream_id={} lane={:?} dispatches={} payload_bytes={} byte_budget={} item_budget={} queue_bytes_after={} blocked_by_carrier={}",
                             stream_id.0,
-                            relay_lane,
+                            request_lane,
                             dispatched_items,
                             dispatched_payload_bytes,
                             sender_dispatch_byte_budget,
@@ -1556,6 +1609,7 @@ where
                     &mut remotes,
                     &mut send_stream,
                     !state.endpoint.local_open,
+                    request_lane,
                     additional_path_open,
                     state.recovery.pending_additional_path_opens.len(),
                     &mut state.progress.last_stream_at,
@@ -1574,7 +1628,7 @@ where
                         state.progress.last_send_ack.complete(),
                         Some(send_stream.next_offset()),
                         state.progress.last_send_ack_frontier,
-                        relay_lane,
+                        request_lane,
                     ) {
                         state.progress.sender_retry_at = None;
                     }
@@ -1583,7 +1637,11 @@ where
                         context,
                         &mut recv_stream,
                         &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                        RelayRecvProgressSend::new(
+                            response_path_snapshot,
+                            response_lane,
+                            true,
+                        ),
                     )
                     .await
                     {
@@ -1628,7 +1686,7 @@ where
                 if read == 0 {
                     state.record_local_eof();
                 } else {
-                    state.record_local_payload(relay_lane);
+                    state.record_local_payload(request_lane);
                     let payload = payload.expect("positive read returns payload");
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
@@ -1636,7 +1694,7 @@ where
                         format_args!(
                             "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={} opportunistic=false",
                             stream_id.0,
-                            relay_lane,
+                            request_lane,
                             read,
                             sender_queue.bytes().saturating_add(read),
                             sender_queue_limit,
@@ -1684,7 +1742,7 @@ where
                             state.record_local_eof();
                             break;
                         }
-                        state.record_local_payload(relay_lane);
+                        state.record_local_payload(request_lane);
                         let payload = payload.expect("positive read returns payload");
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
@@ -1692,7 +1750,7 @@ where
                             format_args!(
                                 "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={} opportunistic=true",
                                 stream_id.0,
-                                relay_lane,
+                                request_lane,
                                 read,
                                 sender_queue.bytes().saturating_add(read),
                                 sender_queue_limit,
@@ -1726,7 +1784,7 @@ where
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
-                            relay_lane,
+                            ReliableRelayPathLanes::new(topology_lane, request_lane),
                             &mut remotes,
                             &send_stream,
                             !state.endpoint.local_open,
@@ -1911,7 +1969,11 @@ where
                             context,
                             &mut recv_stream,
                             &mut state.progress.recv_progress,
-                            RelayRecvProgressSend::new(path_snapshot, relay_lane, false),
+                            RelayRecvProgressSend::new(
+                                response_path_snapshot,
+                                response_lane,
+                                false,
+                            ),
                         )
                         .await
                         {
@@ -1923,7 +1985,7 @@ where
                                 match attach_reliable_relay_paths_with_recovery_exclusions(
                                     context,
                                     &spec,
-                                    relay_lane,
+                                    ReliableRelayPathLanes::new(response_lane, request_lane),
                                     &mut remotes,
                                     &send_stream,
                                     !state.endpoint.local_open,
@@ -1949,7 +2011,10 @@ where
                                 context,
                                 &mut recv_stream,
                                 &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::final_ack(path_snapshot, relay_lane),
+                                RelayRecvProgressSend::final_ack(
+                                    response_path_snapshot,
+                                    response_lane,
+                                ),
                             )
                             .await
                             {
@@ -1957,7 +2022,7 @@ where
                                     record_final_recv_progress_enqueue(
                                         &mut state,
                                         sent,
-                                        path_snapshot,
+                                        response_path_snapshot,
                                     );
                                     sent
                                 }
@@ -1990,7 +2055,7 @@ where
                                 remotes: &remotes,
                                 send_stream: &mut send_stream,
                                 path_snapshot,
-                                relay_lane,
+                                relay_lane: request_lane,
                             },
                             stream_id,
                             complete,
@@ -2025,7 +2090,7 @@ where
                                     match attach_reliable_relay_paths_with_recovery_exclusions(
                                         context,
                                         &spec,
-                                        relay_lane,
+                                        ReliableRelayPathLanes::new(request_lane, request_lane),
                                         &mut remotes,
                                         &send_stream,
                                         true,
@@ -2094,7 +2159,10 @@ where
                                 context,
                                 &mut recv_stream,
                                 &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::final_ack(path_snapshot, relay_lane),
+                                RelayRecvProgressSend::final_ack(
+                                    response_path_snapshot,
+                                    response_lane,
+                                ),
                             )
                             .await
                             {
@@ -2102,7 +2170,7 @@ where
                                     record_final_recv_progress_enqueue(
                                         &mut state,
                                         sent,
-                                        path_snapshot,
+                                        response_path_snapshot,
                                     );
                                     sent
                                 }
@@ -2139,7 +2207,11 @@ where
                                 context,
                                 &mut recv_stream,
                                 &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                                RelayRecvProgressSend::new(
+                                    response_path_snapshot,
+                                    response_lane,
+                                    true,
+                                ),
                             )
                         .await
                         {
@@ -2167,6 +2239,7 @@ where
         &mut remotes,
         &mut send_stream,
         !state.endpoint.local_open,
+        request_flow_demand.current_lane(),
         &mut state.recovery.pending_additional_path_opens,
         &mut additional_path_open_rx,
         &mut state.progress.last_stream_at,

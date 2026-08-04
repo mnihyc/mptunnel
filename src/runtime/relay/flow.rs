@@ -9,17 +9,15 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ReliableRelayFlowSignals {
-    sent_offset: u64,
-    received_offset: u64,
+    observed_offset: u64,
     queued_unsent_bytes: usize,
     pending_delivery_bytes: usize,
 }
 
 impl ReliableRelayFlowSignals {
-    pub(in crate::runtime) fn new(sent_offset: u64, received_offset: u64) -> Self {
+    pub(in crate::runtime) fn new(observed_offset: u64) -> Self {
         Self {
-            sent_offset,
-            received_offset,
+            observed_offset,
             queued_unsent_bytes: 0,
             pending_delivery_bytes: 0,
         }
@@ -40,7 +38,7 @@ impl ReliableRelayFlowSignals {
 
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) fn observed_bytes(self) -> u64 {
-        self.sent_offset.max(self.received_offset)
+        self.observed_offset
     }
 }
 
@@ -52,8 +50,7 @@ pub(in crate::runtime) struct ReliableRelayFlowDemandTracker {
     last_progress_at: Instant,
     next_rebalance_at: Instant,
     last_rebalance_interval: Duration,
-    last_sent_offset: u64,
-    last_received_offset: u64,
+    last_observed_offset: u64,
     product_rate_bps: f64,
 }
 
@@ -77,8 +74,7 @@ impl ReliableRelayFlowDemandTracker {
             last_progress_at: now,
             next_rebalance_at: now,
             last_rebalance_interval: reliable_flow_rebalance_interval(None),
-            last_sent_offset: 0,
-            last_received_offset: 0,
+            last_observed_offset: 0,
             product_rate_bps: 0.0,
         }
     }
@@ -114,18 +110,15 @@ impl ReliableRelayFlowDemandTracker {
         let now = Instant::now();
         #[cfg(feature = "lab-diagnostics")]
         let observed_bytes = signals.observed_bytes();
-        let sent_delta = signals.sent_offset.saturating_sub(self.last_sent_offset);
-        let received_delta = signals
-            .received_offset
-            .saturating_sub(self.last_received_offset);
-        let product_delta = sent_delta.max(received_delta);
+        let product_delta = signals
+            .observed_offset
+            .saturating_sub(self.last_observed_offset);
         if product_delta > 0 {
             self.last_progress_at = now;
             self.epoch_started_at.get_or_insert(now);
             self.epoch_bytes = self.epoch_bytes.saturating_add(product_delta);
         }
-        self.last_sent_offset = self.last_sent_offset.max(signals.sent_offset);
-        self.last_received_offset = self.last_received_offset.max(signals.received_offset);
+        self.last_observed_offset = self.last_observed_offset.max(signals.observed_offset);
         let previous = self.current;
         let rebalance_interval = reliable_flow_rebalance_interval(path);
         self.last_rebalance_interval = rebalance_interval;

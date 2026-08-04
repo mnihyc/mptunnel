@@ -4,7 +4,9 @@
 //! carrier-neutral lifetime from target connection through ordered close.
 
 use super::diagnostics::log_unexpected_stream_relay_frame;
-use super::flow::{ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals};
+use super::flow::{
+    ReliableRelayFlowDecision, ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals,
+};
 #[cfg(feature = "lab-diagnostics")]
 use super::io::normalized_stream_ack_first_gap;
 use super::io::{
@@ -1491,19 +1493,19 @@ fn refresh_server_response_flow_demand(
     send_stream: &ReliableSendStream,
     classifier_path: Option<PathSnapshot>,
     mux_limits: MuxLimits,
-) {
+) -> ReliableRelayFlowDecision {
     let queued_unique_original_bytes = response_sender.data_bytes();
     let response_observed_bytes = send_stream
         .next_offset()
         .saturating_add(queued_unique_original_bytes as u64);
     response_flow_demand.refresh(
-        ReliableRelayFlowSignals::new(response_observed_bytes, 0).with_product_work(
+        ReliableRelayFlowSignals::new(response_observed_bytes).with_product_work(
             queued_unique_original_bytes,
             send_stream.reinjection_bytes(),
         ),
         classifier_path,
         mux_limits,
-    );
+    )
 }
 
 // Reliable server response relay
@@ -1618,7 +1620,7 @@ where
     let mut last_send_ack_frontier = 0_u64;
     let mut last_send_ack = AuthoritativeStreamAckSnapshot::default();
     let mut tail_reinjection_timer = ReliableRelayTailReinjectionTimer::default();
-    let mut flow_demand =
+    let mut request_flow_demand =
         ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
     let mut response_flow_demand =
         ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
@@ -1693,67 +1695,76 @@ where
         {
             break Ok(stats);
         }
-        let previous_lane = path_stream.current_lane();
+        let previous_response_lane = path_stream.current_lane();
         response_sender.publish_queue_bytes(path_stream);
-        let classifier_payload_hint = relay_lane_startup_chunk_bytes(previous_lane, mux_limits)
-            .min(path_stream.max_frame_payload_bytes);
-        let (classifier_path, classifier_inflight_limit) = path_stream
-            .send_path_snapshot_and_source_window(previous_lane, classifier_payload_hint);
-        let demand_update = flow_demand.refresh(
-            ReliableRelayFlowSignals::new(
-                send_stream
-                    .next_offset()
-                    .saturating_add(response_sender.data_bytes() as u64),
-                recv_stream.next_offset(),
-            )
-            .with_product_work(
-                response_sender.data_bytes(),
-                send_stream
-                    .reinjection_bytes()
-                    .saturating_add(recv_stream.reorder_bytes()),
-            ),
-            classifier_path,
+        let classifier_payload_hint =
+            relay_lane_startup_chunk_bytes(previous_response_lane, mux_limits)
+                .min(path_stream.max_frame_payload_bytes);
+        let (response_classifier_path, classifier_inflight_limit) = path_stream
+            .send_path_snapshot_and_source_window(previous_response_lane, classifier_payload_hint);
+        let previous_request_lane = request_flow_demand.current_lane();
+        let request_classifier_path =
+            path_stream.request_feedback_path_snapshot(previous_request_lane);
+        let request_demand_update = request_flow_demand.refresh(
+            ReliableRelayFlowSignals::new(recv_stream.next_offset())
+                .with_product_work(0, recv_stream.reorder_bytes()),
+            request_classifier_path,
             mux_limits,
         );
-        let relay_lane = demand_update.lane;
-        refresh_server_response_flow_demand(
+        let request_lane = request_demand_update.lane;
+        let response_demand_update = refresh_server_response_flow_demand(
             &mut response_flow_demand,
             &response_sender,
             &send_stream,
-            classifier_path,
+            response_classifier_path,
             mux_limits,
         );
-        if relay_lane != previous_lane {
-            path_stream.set_lane(relay_lane);
+        let response_lane = response_demand_update.lane;
+        if response_lane != previous_response_lane {
+            path_stream.set_lane(response_lane);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
-                "server_stream_lane_changed",
+                "server_response_lane_changed",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={} reorder_bytes={} byte_proven={} rate_proven={} buffered_data={}",
+                    "stream_id={} previous={:?} lane={:?} sent_offset={} reinjection_bytes={} byte_proven={} rate_proven={} buffered_data={}",
                     stream_id.0,
-                    previous_lane,
-                    relay_lane,
+                    previous_response_lane,
+                    response_lane,
                     send_stream.next_offset(),
-                    recv_stream.next_offset(),
                     send_stream.reinjection_bytes(),
-                    recv_stream.reorder_bytes(),
-                    demand_update.byte_proven_bulk,
-                    demand_update.rate_proven_sustained_bulk,
-                    demand_update.buffered_bulk,
+                    response_demand_update.byte_proven_bulk,
+                    response_demand_update.rate_proven_sustained_bulk,
+                    response_demand_update.buffered_bulk,
                 ),
             );
         }
-        let payload_hint = relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
+        #[cfg(feature = "lab-diagnostics")]
+        if request_lane != previous_request_lane {
+            lab_diagnostic(
+                "server_request_lane_changed",
+                format_args!(
+                    "stream_id={} previous={:?} lane={:?} received_offset={} reorder_bytes={} byte_proven={} rate_proven={}",
+                    stream_id.0,
+                    previous_request_lane,
+                    request_lane,
+                    recv_stream.next_offset(),
+                    recv_stream.reorder_bytes(),
+                    request_demand_update.byte_proven_bulk,
+                    request_demand_update.rate_proven_sustained_bulk,
+                ),
+            );
+        }
+        let payload_hint = relay_lane_startup_chunk_bytes(response_lane, mux_limits)
             .min(path_stream.max_frame_payload_bytes);
-        let (send_path_snapshot, inflight_limit) = if relay_lane == previous_lane {
-            (classifier_path, classifier_inflight_limit)
+        let (send_path_snapshot, inflight_limit) = if response_lane == previous_response_lane {
+            (response_classifier_path, classifier_inflight_limit)
         } else {
-            path_stream.send_path_snapshot_and_source_window(relay_lane, payload_hint)
+            path_stream.send_path_snapshot_and_source_window(response_lane, payload_hint)
         };
         let tail_reinjection_path_snapshot = path_stream.tail_reinjection_snapshot(
             last_send_ack_frontier,
-            relay_lane,
-            relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
+            response_lane,
+            relay_lane_startup_chunk_bytes(response_lane, mux_limits)
                 .min(path_stream.max_frame_payload_bytes),
         );
         let response_path_staleness_due = response_path_staleness
@@ -1767,7 +1778,7 @@ where
                 path_stream,
                 &response_path_staleness_candidates,
                 &response_data_ack_progress_outputs,
-                relay_lane,
+                response_lane,
             ) {
                 response_recovery_dirty = true;
             }
@@ -1872,7 +1883,7 @@ where
             last_send_ack_frontier,
             tail_reinjection_path_snapshot,
             send_path_snapshot,
-            relay_lane,
+            response_lane,
             mux_limits,
             stream_id,
         );
@@ -1893,7 +1904,8 @@ where
             path_stream.data_ack_recovery_candidate(last_send_ack_frontier);
         let data_ack_recovery_candidate =
             data_ack_recovery_candidate.map(ReliableRelayTailRecoveryCandidate::Tracked);
-        let request_feedback_path_snapshot = path_stream.request_feedback_path_snapshot(relay_lane);
+        let request_feedback_path_snapshot =
+            path_stream.request_feedback_path_snapshot(request_lane);
         let request_feedback_underlay = request_feedback_path_snapshot
             .map(|snapshot| snapshot.underlay)
             .or_else(|| path_stream.request_feedback_underlay())
@@ -1936,7 +1948,7 @@ where
             })
         });
         let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-            relay_lane,
+            response_lane,
             &send_stream,
             last_send_ack_frontier,
         );
@@ -1962,18 +1974,18 @@ where
         let tail_reinjection_active = tail_timer_active || ack_gap_reinjection_deadline.is_some();
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
             send_path_snapshot,
-            relay_lane,
+            response_lane,
             mux_limits,
             path_stream.max_frame_payload_bytes,
         );
         let sender_queue_limit = reliable_relay_sender_queue_limit(mux_limits, inflight_limit);
         let latency_startup_credit = response_flow_demand.latency_startup_credit_remaining_bytes(
-            relay_lane,
-            classifier_path,
+            response_lane,
+            response_classifier_path,
             mux_limits,
         );
         let source_staging_headroom = reliable_relay_source_staging_headroom(
-            relay_lane,
+            response_lane,
             data_ack_outstanding_bytes,
             response_sender.data_bytes(),
             reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
@@ -1992,16 +2004,16 @@ where
         let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
             reliable_relay_sender_dispatch_budget(
                 mux_limits,
-                relay_lane,
+                response_lane,
                 adaptive_chunk,
                 inflight_limit,
                 sender_queue_limit,
             );
-        close.lane = relay_lane;
+        close.lane = response_lane;
         last_sender_dispatch_byte_budget = sender_dispatch_byte_budget;
         last_sender_dispatch_item_budget = sender_dispatch_item_budget;
         #[cfg(feature = "lab-diagnostics")]
-        if last_reported_budget != Some((relay_lane, adaptive_chunk, inflight_limit)) {
+        if last_reported_budget != Some((response_lane, adaptive_chunk, inflight_limit)) {
             let snapshot = send_path_snapshot;
             lab_diagnostic(
                 "server_relay_budget",
@@ -2009,7 +2021,7 @@ where
                     "stream_id={} underlay={:?} lane={:?} chunk_bytes={} inflight_bytes={} max_frame_payload_bytes={} snapshot={} rate_mbps={:.3} pacing_mbps={:.3} product_progress_mbps={:.3} queue_bytes={} data_level_queue_bytes={} carrier_flight_bytes={} product_flight_bytes={} confidence_ppm={}",
                     stream_id.0,
                     path_stream.underlay,
-                    relay_lane,
+                    response_lane,
                     adaptive_chunk,
                     inflight_limit,
                     path_stream.max_frame_payload_bytes,
@@ -2028,7 +2040,7 @@ where
                         .round() as u32),
                 ),
             );
-            last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
+            last_reported_budget = Some((response_lane, adaptive_chunk, inflight_limit));
         }
         let now = tokio::time::Instant::now();
         if response_sender_retry_at.is_some_and(|deadline| deadline <= now) {
@@ -2038,7 +2050,7 @@ where
             .front_has_carrier_credit_with_data_ack_outstanding(
                 path_stream,
                 &send_stream,
-                relay_lane,
+                response_lane,
                 mux_limits,
                 data_ack_outstanding_bytes,
             );
@@ -2125,7 +2137,7 @@ where
                 last_send_ack.complete(),
                 last_send_ack.horizon(),
                 tail_reinjection_path_snapshot,
-                relay_lane,
+                response_lane,
                 mux_limits,
                 performance,
                 path_stream.max_frame_payload_bytes,
@@ -2135,7 +2147,7 @@ where
                 tail_reinjection_timer.record_scan();
             }
             let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-                relay_lane,
+                response_lane,
                 &send_stream,
                 last_send_ack_frontier,
             );
@@ -2144,7 +2156,7 @@ where
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
-                relay_lane,
+                response_lane,
                 mux_limits,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
@@ -2277,7 +2289,7 @@ where
                         &mut request_sparse_ack_progress,
                         &mut request_ack_publication,
                         request_feedback_path_snapshot,
-                        relay_lane,
+                        request_lane,
                         mux_limits,
                         false,
                         true,
@@ -2295,7 +2307,7 @@ where
                             &mut request_sparse_ack_progress,
                             &mut request_ack_publication,
                             request_feedback_path_snapshot,
-                            relay_lane,
+                            request_lane,
                             mux_limits,
                             true,
                             false,
@@ -2379,7 +2391,7 @@ where
                         last_send_ack_frontier,
                         tail_reinjection_path_snapshot,
                         send_path_snapshot,
-                        relay_lane,
+                        response_lane,
                         mux_limits,
                         stream_id,
                     );
@@ -2557,7 +2569,7 @@ where
                             &mut request_sparse_ack_progress,
                             &mut request_ack_publication,
                             request_feedback_path_snapshot,
-                            relay_lane,
+                            request_lane,
                             mux_limits,
                             true,
                             false,
@@ -2590,7 +2602,7 @@ where
                         &mut request_sparse_ack_progress,
                         &mut request_ack_publication,
                         request_feedback_path_snapshot,
-                        relay_lane,
+                        request_lane,
                         mux_limits,
                         true,
                         true,
@@ -2607,7 +2619,7 @@ where
             }
             if response_sender.queued_send_ready() {
                 let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-                    relay_lane,
+                    response_lane,
                     &send_stream,
                     last_send_ack_frontier,
                 );
@@ -2616,7 +2628,7 @@ where
                 path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
-                    relay_lane,
+                    response_lane,
                 mux_limits,
                 sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
@@ -2679,7 +2691,7 @@ where
                 let reinjection_limit = reliable_critical_tail_reinjection_limit_bytes(
                     adaptive_reliable_relay_reinjection_bytes(
                         tail_reinjection_path_snapshot,
-                        relay_lane,
+                        response_lane,
                         mux_limits,
                     ),
                     send_stream.reinjection_bytes(),
@@ -2745,7 +2757,7 @@ where
                     format_args!(
                         "stream_id={} lane={:?} ack_frontier={} sent_offset={} reinjection_bytes={} reinjection_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_reinjection_limit={} reinjection_limit={} extra_traffic_hint_percent={} reinjection_kind=fin_tail",
                         stream_id.0,
-                        relay_lane,
+                        response_lane,
                         last_send_ack_frontier,
                         send_stream.next_offset(),
                         send_stream.reinjection_bytes(),
@@ -2763,7 +2775,7 @@ where
             }
             if response_sender.queued_send_ready() {
                 let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-                    relay_lane,
+                    response_lane,
                     &send_stream,
                     last_send_ack_frontier,
                 );
@@ -2772,7 +2784,7 @@ where
                 path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
-                    relay_lane,
+                    response_lane,
                 mux_limits,
                 sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
@@ -2840,7 +2852,7 @@ where
                 &mut request_sparse_ack_progress,
                 &mut request_ack_publication,
                 request_feedback_path_snapshot,
-                relay_lane,
+                request_lane,
                 mux_limits,
                 true,
                 resend_progress,
@@ -2851,7 +2863,7 @@ where
             }
             if response_sender.queued_send_ready() {
                 let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-                    relay_lane,
+                    response_lane,
                     &send_stream,
                     last_send_ack_frontier,
                 );
@@ -2860,7 +2872,7 @@ where
                 path_stream,
                     data_ack_outstanding_bytes,
                     &mut send_stream,
-                    relay_lane,
+                    response_lane,
                 mux_limits,
                 sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
@@ -2884,7 +2896,7 @@ where
             close.sent = true;
             pending_local_fin = false;
             let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-                relay_lane,
+                response_lane,
                 &send_stream,
                 last_send_ack_frontier,
             );
@@ -2893,7 +2905,7 @@ where
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
-                relay_lane,
+                response_lane,
                 mux_limits,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
@@ -2908,7 +2920,7 @@ where
         }
         _ = std::future::ready(()), if queued_send_ready => {
             let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-                relay_lane,
+                response_lane,
                 &send_stream,
                 last_send_ack_frontier,
             );
@@ -2917,7 +2929,7 @@ where
                 path_stream,
                 data_ack_outstanding_bytes,
                 &mut send_stream,
-                relay_lane,
+                response_lane,
                 mux_limits,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
@@ -2955,9 +2967,9 @@ where
             } else {
                 let payload = payload.expect("positive read returns payload");
                 #[cfg(feature = "lab-diagnostics")]
-                let enqueue_id = response_sender.enqueue_data_for_lane(payload, relay_lane);
+                let enqueue_id = response_sender.enqueue_data_for_lane(payload, response_lane);
                 #[cfg(not(feature = "lab-diagnostics"))]
-                response_sender.enqueue_data_for_lane(payload, relay_lane);
+                response_sender.enqueue_data_for_lane(payload, response_lane);
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "server_sender_enqueue",
@@ -2966,7 +2978,7 @@ where
                         session_id.0,
                         stream_id.0,
                         enqueue_id,
-                        relay_lane,
+                        response_lane,
                         read,
                         response_sender.bytes(),
                         sender_queue_limit,
@@ -2986,7 +2998,7 @@ where
                     && response_sender.data_bytes() < sender_dispatch_byte_budget
                 {
                     let source_staging_headroom = reliable_relay_source_staging_headroom(
-                            relay_lane,
+                            response_lane,
                             data_ack_outstanding_bytes,
                             response_sender.data_bytes(),
                             reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
@@ -3027,9 +3039,10 @@ where
                     }
                     let payload = payload.expect("positive read returns payload");
                     #[cfg(feature = "lab-diagnostics")]
-                    let enqueue_id = response_sender.enqueue_data_for_lane(payload, relay_lane);
+                    let enqueue_id =
+                        response_sender.enqueue_data_for_lane(payload, response_lane);
                     #[cfg(not(feature = "lab-diagnostics"))]
-                    response_sender.enqueue_data_for_lane(payload, relay_lane);
+                    response_sender.enqueue_data_for_lane(payload, response_lane);
                     opportunistic_reads = opportunistic_reads.saturating_add(1);
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
@@ -3039,7 +3052,7 @@ where
                             session_id.0,
                             stream_id.0,
                             enqueue_id,
-                            relay_lane,
+                            response_lane,
                             read,
                             response_sender.bytes(),
                             sender_queue_limit,
@@ -3052,12 +3065,12 @@ where
                     &mut response_flow_demand,
                     &response_sender,
                     &send_stream,
-                    classifier_path,
+                    response_classifier_path,
                     mux_limits,
                 );
                 if response_sender.queued_send_ready() {
                     let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
-                        relay_lane,
+                        response_lane,
                         &send_stream,
                         last_send_ack_frontier,
                     );
@@ -3066,7 +3079,7 @@ where
                 path_stream,
                         data_ack_outstanding_bytes,
                         &mut send_stream,
-                        relay_lane,
+                        response_lane,
                 mux_limits,
                 sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,

@@ -2302,7 +2302,7 @@ fn reliable_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
     let small_flow_bytes =
         (relay_lane_startup_chunk_bytes(TrafficClass::Throughput, mux_limits) as u64 / 2).max(1);
     let before = state.refresh(
-        ReliableRelayFlowSignals::new(small_flow_bytes, 0),
+        ReliableRelayFlowSignals::new(small_flow_bytes),
         Some(path),
         mux_limits,
     );
@@ -2310,7 +2310,7 @@ fn reliable_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
     assert!(!before.promoted_to_throughput);
 
     let after = state.refresh(
-        ReliableRelayFlowSignals::new(threshold, 0),
+        ReliableRelayFlowSignals::new(threshold),
         Some(path),
         mux_limits,
     );
@@ -2318,7 +2318,7 @@ fn reliable_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
     assert!(after.promoted_to_throughput);
 
     let steady = state.refresh(
-        ReliableRelayFlowSignals::new(threshold.saturating_mul(2), 0),
+        ReliableRelayFlowSignals::new(threshold.saturating_mul(2)),
         Some(path),
         mux_limits,
     );

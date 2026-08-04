@@ -8,7 +8,7 @@ use super::open::{
     ReliableRelayOpenSpec, open_remote_stream_for_relay_path, relay_path_open_error_is_retryable,
 };
 use super::remote::{
-    ReliableRelayAttachMode, attach_reliable_relay_paths,
+    ReliableRelayAttachMode, ReliableRelayPathLanes, attach_reliable_relay_paths,
     attach_reliable_relay_paths_with_claims_and_recovery_exclusions,
     reliable_relay_additional_path_open_payload_bytes, reliable_relay_attach_payload_bytes,
     reliable_relay_reinjection_path_candidates,
@@ -71,7 +71,7 @@ pub(in crate::runtime) async fn recover_reliable_relay_after_path_failure(
 pub(super) async fn switch_reliable_relay_to_best_path(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
@@ -85,7 +85,7 @@ pub(super) async fn switch_reliable_relay_to_best_path(
     let attached = attach_reliable_relay_paths(
         context,
         spec,
-        lane,
+        lanes,
         remotes,
         send_stream,
         resend_fin,
@@ -154,6 +154,7 @@ pub(super) async fn handle_additional_path_open_result(
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
     resend_fin: bool,
+    output_lane: TrafficClass,
     additional_path_open: RelayAdditionalPathOpenResult,
     pending_count: usize,
     last_stream_progress_at: &mut Instant,
@@ -193,6 +194,10 @@ pub(super) async fn handle_additional_path_open_result(
             }
             match remotes.attach_candidate(opened) {
                 ReliableRelayAttachOutcome::Attached => {
+                    // Demand may change while the open future is pending.
+                    // Attachment commits to the stream owner's current output
+                    // lane, never the stale lane captured by that future.
+                    remotes.set_lane(output_lane);
                     send_stream.update_max_offset(remotes.max_offset());
                     *last_stream_progress_at = Instant::now();
                     #[cfg(feature = "lab-diagnostics")]
@@ -272,6 +277,7 @@ pub(super) async fn drain_completed_additional_path_opens(
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
     resend_fin: bool,
+    output_lane: TrafficClass,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     additional_path_open_rx: &mut mpsc::Receiver<RelayAdditionalPathOpenResult>,
     last_stream_progress_at: &mut Instant,
@@ -295,6 +301,7 @@ pub(super) async fn drain_completed_additional_path_opens(
             remotes,
             send_stream,
             resend_fin,
+            output_lane,
             additional_path_open,
             pending.len(),
             last_stream_progress_at,
@@ -362,13 +369,13 @@ pub(super) fn take_matching_additional_path_open(
 pub(super) fn spawn_reliable_relay_additional_path_opens(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    lanes: ReliableRelayPathLanes,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
 ) -> bool {
-    if !lane.is_bulk() {
+    if !lanes.selection.is_bulk() {
         return false;
     }
     if !pending.is_empty() {
@@ -377,8 +384,12 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
     let stream_id = remotes.stream_id();
     let payload_bytes =
         reliable_relay_additional_path_open_payload_bytes(send_stream, context.mux_limits);
-    let candidates =
-        reliable_relay_additional_path_open_candidates(context, remotes, lane, payload_bytes);
+    let candidates = reliable_relay_additional_path_open_candidates(
+        context,
+        remotes,
+        lanes.selection,
+        payload_bytes,
+    );
     let candidates = reliable_relay_available_path_open_candidates(candidates, pending);
     if candidates.is_empty() {
         return false;
@@ -386,7 +397,7 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
     spawn_reliable_relay_path_opens(
         context,
         spec,
-        lane,
+        lanes.output,
         ReliableRelayAttachMode::BulkStriping,
         stream_id,
         candidates,
@@ -399,7 +410,7 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
 pub(super) fn spawn_reliable_relay_recovery_path_open(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    lanes: ReliableRelayPathLanes,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     recovery_excluded_paths: &HashSet<RelayPathKey>,
@@ -409,9 +420,14 @@ pub(super) fn spawn_reliable_relay_recovery_path_open(
     if !reliable_relay_should_open_recovery_path(remotes) || !pending.is_empty() {
         return false;
     }
-    let payload_bytes = reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits);
-    let candidates =
-        reliable_relay_reinjection_path_candidates(context, remotes, lane, payload_bytes);
+    let payload_bytes =
+        reliable_relay_attach_payload_bytes(send_stream, lanes.selection, context.mux_limits);
+    let candidates = reliable_relay_reinjection_path_candidates(
+        context,
+        remotes,
+        lanes.selection,
+        payload_bytes,
+    );
     let candidates =
         reliable_relay_recovery_path_open_candidates(candidates, recovery_excluded_paths, pending);
     if candidates.is_empty() {
@@ -420,7 +436,7 @@ pub(super) fn spawn_reliable_relay_recovery_path_open(
     spawn_reliable_relay_path_opens(
         context,
         spec,
-        lane,
+        lanes.output,
         ReliableRelayAttachMode::Recovery,
         remotes.stream_id(),
         candidates,
@@ -433,7 +449,7 @@ pub(super) fn spawn_reliable_relay_recovery_path_open(
 pub(super) fn spawn_reliable_relay_disconnected_path_open(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    lanes: ReliableRelayPathLanes,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     attempted_paths: &mut HashSet<RelayPathKey>,
@@ -443,9 +459,14 @@ pub(super) fn spawn_reliable_relay_disconnected_path_open(
     if !remotes.is_empty() || !pending.is_empty() {
         return false;
     }
-    let payload_bytes = reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits);
-    let candidates =
-        reliable_relay_reinjection_path_candidates(context, remotes, lane, payload_bytes);
+    let payload_bytes =
+        reliable_relay_attach_payload_bytes(send_stream, lanes.selection, context.mux_limits);
+    let candidates = reliable_relay_reinjection_path_candidates(
+        context,
+        remotes,
+        lanes.selection,
+        payload_bytes,
+    );
     let Some(key) = candidates
         .iter()
         .copied()
@@ -462,7 +483,7 @@ pub(super) fn spawn_reliable_relay_disconnected_path_open(
     spawn_reliable_relay_path_opens(
         context,
         spec,
-        lane,
+        lanes.output,
         ReliableRelayAttachMode::Recovery,
         remotes.stream_id(),
         vec![key],
@@ -634,7 +655,7 @@ fn reliable_relay_recovery_path_open_candidates(
 pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
@@ -651,7 +672,7 @@ pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
     attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
         context,
         spec,
-        lane,
+        lanes,
         remotes,
         send_stream,
         resend_fin,

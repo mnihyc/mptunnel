@@ -31,6 +31,25 @@ pub(in crate::runtime) enum ReliableRelayAttachMode {
     Recovery,
 }
 
+/// Separates client-owned topology ranking from the sender-local request lane
+/// installed on a newly opened output attachment.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReliableRelayPathLanes {
+    pub(super) selection: TrafficClass,
+    pub(super) output: TrafficClass,
+}
+
+impl ReliableRelayPathLanes {
+    pub(super) const fn new(selection: TrafficClass, output: TrafficClass) -> Self {
+        Self { selection, output }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn same(lane: TrafficClass) -> Self {
+        Self::new(lane, lane)
+    }
+}
+
 fn send_request_attach_control_frames(
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
@@ -47,7 +66,7 @@ fn send_request_attach_control_frames(
 
 struct RelayPathAttachRequest<'a> {
     spec: &'a ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    output_lane: TrafficClass,
     send_stream: &'a ReliableSendStream,
     resend_fin: bool,
     candidates: Vec<RelayPathKey>,
@@ -71,8 +90,14 @@ async fn attach_relay_path_candidates(
         if remotes.contains_path_key(key) {
             continue;
         }
-        match open_remote_stream_for_relay_path(context, stream_id, request.spec, request.lane, key)
-            .await
+        match open_remote_stream_for_relay_path(
+            context,
+            stream_id,
+            request.spec,
+            request.output_lane,
+            key,
+        )
+        .await
         {
             Ok(opened) => {
                 let attach_control_result = send_request_attach_control_frames(
@@ -123,10 +148,10 @@ async fn attach_relay_path_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::runtime) async fn attach_reliable_relay_paths(
+pub(super) async fn attach_reliable_relay_paths(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
@@ -137,7 +162,7 @@ pub(in crate::runtime) async fn attach_reliable_relay_paths(
     attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
         context,
         spec,
-        lane,
+        lanes,
         remotes,
         send_stream,
         resend_fin,
@@ -152,7 +177,7 @@ pub(in crate::runtime) async fn attach_reliable_relay_paths(
 pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
-    lane: TrafficClass,
+    lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
@@ -162,7 +187,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
 ) -> Result<usize, RuntimeError> {
     let payload_bytes = match mode {
         ReliableRelayAttachMode::Any | ReliableRelayAttachMode::Recovery => {
-            reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits)
+            reliable_relay_attach_payload_bytes(send_stream, lanes.selection, context.mux_limits)
         }
         ReliableRelayAttachMode::BulkStriping => {
             reliable_relay_bulk_striping_payload_bytes(send_stream, context.mux_limits)
@@ -174,7 +199,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
             remotes,
             RelayPathAttachRequest {
                 spec,
-                lane,
+                output_lane: lanes.output,
                 send_stream,
                 resend_fin,
                 candidates: reliable_relay_exclude_inflight_open_claims(
@@ -193,14 +218,19 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
         }
     }
     let prefer_reinjection_alternative = matches!(mode, ReliableRelayAttachMode::Recovery)
-        || reliable_relay_should_open_reinjection_alternative(lane, send_stream, resend_fin, mode);
+        || reliable_relay_should_open_reinjection_alternative(
+            lanes.selection,
+            send_stream,
+            resend_fin,
+            mode,
+        );
     if prefer_reinjection_alternative {
         let result = attach_relay_path_candidates(
             context,
             remotes,
             RelayPathAttachRequest {
                 spec,
-                lane,
+                output_lane: lanes.output,
                 send_stream,
                 resend_fin,
                 candidates: reliable_relay_exclude_inflight_open_claims(
@@ -208,7 +238,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
                         reliable_relay_reinjection_path_candidates(
                             context,
                             remotes,
-                            lane,
+                            lanes.selection,
                             payload_bytes,
                         ),
                         recovery_excluded_paths,
@@ -231,7 +261,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
         remotes,
         RelayPathAttachRequest {
             spec,
-            lane,
+            output_lane: lanes.output,
             send_stream,
             resend_fin,
             candidates: reliable_relay_exclude_inflight_open_claims(
@@ -239,7 +269,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
                     reliable_relay_additional_path_candidates(
                         context,
                         remotes,
-                        lane,
+                        lanes.selection,
                         payload_bytes,
                     ),
                     recovery_excluded_paths,

@@ -278,7 +278,7 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
     assert!(spawn_reliable_relay_recovery_path_open(
         &context,
         &spec,
-        TrafficClass::Latency,
+        ReliableRelayPathLanes::same(TrafficClass::Latency),
         &remotes,
         &send_stream,
         &HashSet::new(),
@@ -304,6 +304,7 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
             &mut remotes,
             &mut send_stream,
             false,
+            TrafficClass::Throughput,
             RelayAdditionalPathOpenResult {
                 key: third,
                 generation: next_relay_additional_path_open_generation(),
@@ -326,6 +327,13 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
         Some(ReliableRelayAttachMode::Recovery)
     ));
     assert_eq!(remotes.accepted_path_count(), 3);
+    assert!(
+        remotes
+            .paths
+            .iter()
+            .all(|path| path.stream.lane == TrafficClass::Throughput),
+        "a completed open inherits current request demand, not its captured lane"
+    );
 }
 
 #[test]
@@ -459,6 +467,7 @@ async fn additional_attachment_timeout_preserves_live_carrier_health_and_work_ac
             &mut remotes,
             &mut send_stream,
             false,
+            TrafficClass::Throughput,
             RelayAdditionalPathOpenResult {
                 key: candidate,
                 generation: next_relay_additional_path_open_generation(),

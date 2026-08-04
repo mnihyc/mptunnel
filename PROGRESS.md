@@ -5596,3 +5596,71 @@ entry is authoritative.
   stream can still expand after live promotion under strict identity checks.
 - Reproducible clean tail evidence:
   `./.tmp/lab/results/post-v017-tail-recovery-clean/`.
+
+## 2026-08-04T16:20:07+08:00: directional reliable-flow corrections accepted
+
+- Name: immutable admission and direction-owned reliable-flow evidence
+- Category: post-v0.1.7 RFC conformance and performance acceptance
+- State: accepted; exact affected matrix, continuity case, and full Rust suite
+  passed
+- Frozen baseline: release commit
+  `40de8b4f5ec43c15c3e65de456b1791bde8af548` remains tagged `v0.1.7` and
+  unchanged. These corrections are subsequent commits; current-branch public
+  evidence reports them without rewriting the tagged tree or release assets.
+- Immutable admission confirmation at commit `1260f74`:
+  - asymmetric download/upload delivered `134.684/144.496 Mbps`; the clean
+    download repeat delivered `150.719 Mbps`;
+  - default single mixed-path download/upload delivered
+    `372.587/389.789 Mbps`; and
+  - paired mixed-path download/upload delivered `666.838/801.770 Mbps`.
+- Direction-local model correction at commits `8c17872` and `bd2a297`:
+  - request and response demand now have independent observed offsets and
+    lanes on both peers;
+  - the immutable opening demand seeds both directional trackers but cannot be
+    overwritten by a later attachment;
+  - capacity evidence belongs only to the local sender direction. The receiver
+    retains carrier RTT/PTO timing without borrowing the opposite sender's
+    rate or BDP; and
+  - response stalls use response-path timing while request-only reinjection
+    uses request-path timing.
+- Scope: no protocol encoding, configuration, threshold, timer constant,
+  congestion controller, path ranking rule, native transport behavior, or
+  platform branch changed. Native carrier recovery remains authoritative.
+- Exact clean affected matrix at commit `bd2a297`, optimized binary SHA-256
+  `5bdcadfa08bd1425b51e4c5a6789837ffc793eff905ccc3fbe1edf13084c8628`:
+  - asymmetric download/upload: `147.748/149.680 Mbps`;
+  - default single mixed-path download/upload: `370.207/398.793 Mbps`; and
+  - paired mixed-path download/upload: `662.573/794.876 Mbps`.
+- `README.md` and `docs/PERFORMANCE.md` use those exact current-branch values,
+  their derived `1.78/1.98×` direct and `1.85/2.08×` MPTCP ratios, and the
+  measured `90.1/89.4%` asymmetric fast-link shares.
+- Comparison and decision:
+  - versus frozen v0.1.7, five rows improved by `2.19-38.60%`; paired upload
+    was `1.22%` lower;
+  - versus the strongest recent clean row for each case, every lower result was
+    within `1.97%`, while asymmetric and single-path upload improved; and
+  - the first otherwise-successful matrix was rejected as exact evidence
+    because build load produced `0.526` load per affinity CPU against the
+    versioned `0.500` host limit. The no-rebuild rerun used the identical
+    binary and passed every source and host gate.
+- Disruption confirmation:
+  - the exact low-latency-path blackhole repeat delivered `266.094 Mbps`,
+    about `5.0%` below the prior `280.092 Mbps` sample in this deliberately
+    bursty workload;
+  - all `37/37` persistent exchanges remained connected, with zero failure,
+    and the maximum success gap improved from `2.859 s` to `1.458 s`; and
+  - a preceding sample delivered `234.178 Mbps` while retaining `50/50`
+    persistent exchanges and a `1.565 s` maximum success gap. The exact steady
+    matrix and repeat exclude a shared throughput regression; no additional
+    algorithm change is justified.
+- Verification: formatting, all-target/all-feature compilation, warnings-denied
+  all-target/all-feature Clippy, all `153` focused relay tests, the response-only
+  automatic bulk attachment integration test, `1,459` core tests, `2`
+  allocation checks, and `6` daily-use acceptance tests passed.
+- Reproducible evidence:
+  `./.tmp/lab/results/post-v017-immutable-open-six/`,
+  `./.tmp/lab/results/post-v017-immutable-open-asym-dl-repeat/`,
+  `./.tmp/lab/results/post-v017-direction-evidence-six-clean/`,
+  `./.tmp/lab/results/post-v017-direction-evidence-blackhole-lowlat-clean/`,
+  and
+  `./.tmp/lab/results/post-v017-direction-evidence-blackhole-lowlat-repeat/`.

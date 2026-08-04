@@ -24,9 +24,9 @@ to classify outliers.
 | Hysteria2 2.10.0 | QUIC | 87.525 | ≥105.615 |
 | MPTUNNEL | MPP/TCP | 257.226 | 262.397 |
 | MPTUNNEL | MPP/QUIC | 220.280 | 173.353 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 297.387 | 287.721 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 370.207 | 398.793 |
 
-The default delivered 1.43× direct TCP download and upload goodput.
+The default delivered 1.78× direct TCP download and 1.98× upload goodput.
 MPP/QUIC delivered 2.52× Hysteria2's download. The Xray and Hysteria2
 uploads are receiver-confirmed lower bounds and are excluded from ratios.
 
@@ -43,9 +43,9 @@ recovery. The default also has QUIC available when it is the better carrier.
 | Linux MPTCP | TCP | 5 | 357.424 | 382.493 |
 | MPTUNNEL | MPP/TCP | 5 | 841.572 | 562.796 |
 | MPTUNNEL | MPP/QUIC | 5 | 623.590 | 730.726 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 639.898 | 804.675 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 662.573 | 794.876 |
 
-The default delivered 1.79× MPTCP download and 2.10× upload goodput. The
+The default delivered 1.85× MPTCP download and 2.08× upload goodput. The
 MPTCP topology used one initial path plus four aligned address pairs and
 established additional subflows. Every MPTUNNEL row completed with exact
 receiver accounting.
@@ -99,8 +99,8 @@ traffic direction.
 
 | Direction | Single fast link (Mbps) | Multipath (Mbps) | Fast-link share |
 | --- | ---: | ---: | ---: |
-| Download | 141.161 | 144.587 | 90.1% |
-| Upload | 141.258 | 141.300 | 90.9% |
+| Download | 141.161 | 147.748 | 90.1% |
+| Upload | 141.258 | 149.680 | 89.4% |
 
 The interface accounting shows that upload and download independently selected
 their faster member without using a source-address heuristic.

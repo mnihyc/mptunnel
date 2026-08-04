@@ -774,6 +774,12 @@ impl ClientPathContext {
     }
 
     /// Projects exact attached carrier instances under one path-health lock.
+    ///
+    /// A newly authenticated instance can become available before its first
+    /// health publication. That is an unmeasured output, not an absent one:
+    /// use only the configured startup prior until exact-instance evidence is
+    /// published. Evidence from a replacement occupying the same path key is
+    /// never inherited by the older attachment.
     pub(in crate::runtime) fn reliable_stream_source_admission(
         &self,
         instances: impl IntoIterator<Item = (RelayPathInstance, bool)>,
@@ -789,8 +795,11 @@ impl ClientPathContext {
                     UnderlayProtocol::Udp => self.udp_paths.get(instance.key.index),
                 }?;
                 let observation = health
-                    .path_record(instance.key)?
-                    .observation_for_instance_at(instance.path_instance_id, now)?;
+                    .path_record(instance.key)
+                    .and_then(|record| {
+                        record.observation_for_instance_at(instance.path_instance_id, now)
+                    })
+                    .unwrap_or_default();
                 Some(ReliableOriginalDataOutput {
                     snapshot: path_snapshot(path, instance.key.index, observation),
                     stale,
@@ -1134,3 +1143,7 @@ impl ClientPathContext {
                 .any(|record| record.observation_at(now).active_latency_sensitive_flows > 0)
     }
 }
+
+#[cfg(test)]
+#[path = "tests_selection.rs"]
+mod tests;

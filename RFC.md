@@ -1458,6 +1458,14 @@ output is eligible. Staging grants no output ownership or carrier reservation;
 every assignment still passes the per-output admission and native writer checks
 above.
 
+An authenticated, admission-active attachment can precede its first
+exact-instance measurement. It remains an unproven output and uses only the
+configured startup prior and startup-flight bounds until that measurement is
+published. Absence of measurement is not absence of an output; source
+admission becomes zero only when no admission-active attachment remains.
+Evidence from another carrier incarnation with the same path key MUST NOT be
+substituted for the unmeasured attachment.
+
 TCP pool establishment is owned by Section 7.2 and is independent of
 instantaneous Product demand. A ready pool member enters the regular or backup
 placement set defined by Sections 7.2 and 7.3. It receives no fixed share and

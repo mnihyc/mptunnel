@@ -6,8 +6,9 @@ use super::response::{
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
-    data_level_service_window_bytes, product_delivery_samples_override_startup_prior,
-    reliable_path_startup_sample_limit_bytes,
+    ReliableOriginalDataOutput, data_level_service_window_bytes,
+    product_delivery_samples_override_startup_prior, reliable_path_startup_sample_limit_bytes,
+    reliable_stream_source_admission,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::work::{CarrierWorkKind, RangeRecoveryState, ReliableWorkClass};
@@ -350,6 +351,15 @@ impl ReliablePathStream {
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
         self.output.send_path_snapshot(lane, payload_bytes)
+    }
+
+    pub(in crate::runtime) fn send_path_snapshot_and_source_window(
+        &self,
+        lane: TrafficClass,
+        payload_bytes: usize,
+    ) -> (Option<PathSnapshot>, usize) {
+        self.output
+            .send_path_snapshot_and_source_window(lane, payload_bytes)
     }
 
     pub(in crate::runtime) fn tail_reinjection_snapshot(
@@ -766,6 +776,10 @@ impl ReliablePathStreamHandle {
         self.output.is_terminally_closed()
     }
 
+    pub(in crate::runtime) fn product_admission_active(&self) -> bool {
+        self.output.product_admission_active()
+    }
+
     pub(in crate::runtime) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -996,6 +1010,13 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    fn product_admission_active(&self) -> bool {
+        match self {
+            Self::Fixed(fixed) => fixed.commands().product_admission_active(),
+            Self::Switchable(binding) => binding.has_product_output(),
+        }
+    }
+
     /// Fixed request outputs die with their carrier command port. Switchable
     /// response outputs remain live while the binding can select another port.
     fn is_terminally_closed(&self) -> bool {
@@ -1175,6 +1196,34 @@ impl ReliablePathStreamOutput {
                 Some(fixed.send_path_snapshot())
             }
             Self::Switchable(binding) => binding.send_path_snapshot(lane, payload_bytes),
+        }
+    }
+
+    pub(in crate::runtime) fn send_path_snapshot_and_source_window(
+        &self,
+        lane: TrafficClass,
+        payload_bytes: usize,
+    ) -> (Option<PathSnapshot>, usize) {
+        match self {
+            Self::Fixed(fixed) => {
+                let snapshot = fixed.send_path_snapshot();
+                let outputs = fixed.commands().product_admission_active().then_some(
+                    ReliableOriginalDataOutput {
+                        snapshot,
+                        stale: false,
+                    },
+                );
+                let admission = reliable_stream_source_admission(
+                    outputs,
+                    lane,
+                    payload_bytes,
+                    fixed.mux_limits,
+                );
+                (admission.selected_path, admission.window_bytes)
+            }
+            Self::Switchable(binding) => {
+                binding.send_path_snapshot_and_source_window(lane, payload_bytes)
+            }
         }
     }
 

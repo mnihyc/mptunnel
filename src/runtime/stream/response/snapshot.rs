@@ -14,7 +14,9 @@ use super::evidence::{
     server_path_metrics_has_bulk_rate_evidence,
 };
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, adaptive_reliable_relay_inflight_bytes,
+    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, ReliableOriginalDataOutput,
+    ReliableStreamSourceAdmission, adaptive_reliable_relay_inflight_bytes,
+    reliable_stream_source_admission, reliable_stream_source_path,
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
@@ -23,13 +25,26 @@ use crate::mux::MuxLimits;
 use crate::protocol::{SessionId, UnderlayProtocol};
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
-use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass, path_is_backup, score_path};
+use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 impl ResponseStreamBinding {
+    pub(in crate::runtime) fn send_path_snapshot_and_source_window(
+        &self,
+        lane: TrafficClass,
+        payload_bytes: usize,
+    ) -> (Option<PathSnapshot>, usize) {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let admission = outputs.source_admission(lane, payload_bytes, self.mux_limits);
+        (admission.selected_path, admission.window_bytes)
+    }
+
     pub(in crate::runtime) fn send_path_snapshot(
         &self,
         lane: TrafficClass,
@@ -133,6 +148,7 @@ impl ResponseStreamBinding {
                             self.mux_limits,
                         ),
                     },
+                    product_admission_active: entry.commands.product_admission_active(),
                     command_queue: entry.commands.queue_snapshot(),
                 }
             })
@@ -192,44 +208,54 @@ impl ResponseStreamOutputs {
             })
     }
 
+    fn source_admission(
+        &self,
+        lane: TrafficClass,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+    ) -> ReliableStreamSourceAdmission {
+        reliable_stream_source_admission(
+            self.entries
+                .iter()
+                .filter(|entry| entry.commands.product_admission_active())
+                .map(|entry| ReliableOriginalDataOutput {
+                    snapshot: server_bulk_output_snapshot(
+                        entry,
+                        self.data_level_queue_bytes,
+                        lane,
+                        mux_limits,
+                    ),
+                    stale: entry.stale_for_original_data,
+                }),
+            lane,
+            payload_bytes,
+            mux_limits,
+        )
+    }
+
     fn best_live_path_snapshot(
         &self,
         lane: TrafficClass,
         payload_bytes: usize,
         mux_limits: MuxLimits,
     ) -> Option<PathSnapshot> {
-        let has_nonstale_output = self
-            .entries
-            .iter()
-            .any(|entry| !entry.commands.is_closed() && !entry.stale_for_original_data);
-        let choose = |allow_backup: bool, allow_stale: bool| {
+        reliable_stream_source_path(
             self.entries
                 .iter()
-                .filter(|entry| !entry.commands.is_closed())
-                .filter(|entry| allow_stale || !entry.stale_for_original_data)
-                .filter_map(|entry| {
-                    let snapshot = server_bulk_output_snapshot(
+                .filter(|entry| entry.commands.product_admission_active())
+                .map(|entry| ReliableOriginalDataOutput {
+                    snapshot: server_bulk_output_snapshot(
                         entry,
                         self.data_level_queue_bytes,
                         lane,
                         mux_limits,
-                    );
-                    (allow_backup || !path_is_backup(snapshot))
-                        .then(|| score_path(snapshot, lane, payload_bytes))
-                        .flatten()
-                        .map(|score| (score.eta_ms, snapshot))
-                })
-                .min_by(|left, right| left.0.total_cmp(&right.0))
-                .map(|(_, snapshot)| snapshot)
-        };
-        choose(false, false)
-            .or_else(|| choose(true, false))
-            .or_else(|| {
-                (!has_nonstale_output)
-                    .then(|| choose(false, true))
-                    .flatten()
-            })
-            .or_else(|| (!has_nonstale_output).then(|| choose(true, true)).flatten())
+                    ),
+                    stale: entry.stale_for_original_data,
+                }),
+            lane,
+            payload_bytes,
+            mux_limits,
+        )
     }
 }
 

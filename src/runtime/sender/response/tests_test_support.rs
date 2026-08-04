@@ -40,6 +40,7 @@ pub(in crate::runtime::sender) fn response_target(
             has_path_proof_evidence: true,
             has_bulk_rate_evidence: true,
         },
+        product_admission_active: true,
         command_queue: commands.queue_snapshot(),
     }
 }

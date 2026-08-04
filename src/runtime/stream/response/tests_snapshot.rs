@@ -564,7 +564,7 @@ fn confidence_and_durable_progress_use_explicit_sample_thresholds() {
 }
 
 #[test]
-fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
+fn closed_and_draining_outputs_are_excluded_from_new_product_selection() {
     let closed_key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(7),
@@ -573,18 +573,27 @@ fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(8),
     };
+    let draining_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(11),
+    };
     let (closed_commands, closed_receivers) = reliable_path_command_channels(8);
     let (live_commands, _live_receivers) = reliable_path_command_channels(8);
+    let (draining_commands, _draining_receivers) = reliable_path_command_channels(8);
     let mut closed = output_entry(closed_key, closed_commands);
     closed.product_progress_rate_bps = Some(1_000_000_000.0);
     closed.srtt_ms = Some(1.0);
     let mut live = output_entry(live_key, live_commands);
     live.product_progress_rate_bps = Some(10_000_000.0);
     live.srtt_ms = Some(100.0);
+    let mut draining = output_entry(draining_key, draining_commands.clone());
+    draining.product_progress_rate_bps = Some(2_000_000_000.0);
+    draining.srtt_ms = Some(1.0);
+    draining_commands.begin_path_drain();
     drop(closed_receivers);
     let outputs = ResponseStreamOutputs {
         detaching: Vec::new(),
-        entries: vec![closed, live],
+        entries: vec![closed, draining, live],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
     };
@@ -602,4 +611,13 @@ fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
         )
         .expect("remaining live path");
     assert_eq!(best.id, live_key.path_id);
+    let source = outputs.source_admission(
+        TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
+        MuxLimits::default(),
+    );
+    assert_eq!(
+        source.selected_path.map(|path| path.id),
+        Some(live_key.path_id)
+    );
 }

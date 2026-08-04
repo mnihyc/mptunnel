@@ -65,19 +65,32 @@ pub(super) fn observe_request_relay_scheduling(
         payload_bytes,
         include_bulk_admission,
     );
+    let has_nonstale_product_output =
+        remote_paths
+            .iter()
+            .zip(path_evidence.paths.iter())
+            .any(|(path, evidence)| {
+                path.stream.product_admission_active()
+                    && !stale_paths.contains(&path.instance())
+                    && evidence.shared_snapshot.is_some_and(|snapshot| {
+                        scheduler::score_path(snapshot, lane, payload_bytes).is_some()
+                    })
+            });
     let paths = remote_paths
         .iter()
         .zip(path_evidence.paths)
         .map(|(path, evidence)| {
             let instance = path.instance();
             debug_assert_eq!(instance.key, evidence.key);
+            let original_data_eligible =
+                !stale_paths.contains(&instance) || !has_nonstale_product_output;
             RequestRelayPathObservation {
                 instance,
-                can_enqueue_frame: !stale_paths.contains(&instance)
+                can_enqueue_frame: original_data_eligible
                     && frame
                         .map(|frame| path.stream.can_enqueue_frame_now(frame, lane))
                         .unwrap_or(true),
-                can_enqueue_stream_lane: !stale_paths.contains(&instance)
+                can_enqueue_stream_lane: original_data_eligible
                     && frame
                         .map(|frame| path.stream.can_enqueue_frame_now(frame, path.stream.lane))
                         .unwrap_or(true),

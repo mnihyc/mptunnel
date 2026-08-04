@@ -56,6 +56,7 @@ async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
         .expect("pre-drain data reservation");
 
     commands.begin_path_drain();
+    assert!(!commands.product_admission_active());
     assert!(matches!(
         commands.try_reserve_admitted_frame(stream_data_frame(2, 1024), TrafficClass::Throughput),
         Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)

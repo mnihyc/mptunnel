@@ -154,16 +154,14 @@ impl ResponseStreamOutputs {
     /// remains. Staleness is relative placement state, not a permanent health
     /// verdict on a carrier that becomes the sole survivor.
     pub(super) fn reconcile_stale_output_eligibility(&mut self) -> bool {
-        if self
-            .entries
-            .iter()
-            .any(|entry| !entry.commands.is_closed() && !entry.stale_for_original_data)
-        {
+        if self.entries.iter().any(|entry| {
+            entry.commands.product_admission_active() && !entry.stale_for_original_data
+        }) {
             return false;
         }
         let mut changed = false;
         for entry in &mut self.entries {
-            if !entry.commands.is_closed() && entry.stale_for_original_data {
+            if entry.commands.product_admission_active() && entry.stale_for_original_data {
                 entry.stale_for_original_data = false;
                 changed = true;
             }
@@ -284,6 +282,15 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .any(|entry| !entry.commands.is_closed())
+    }
+
+    pub(in crate::runtime::stream) fn has_product_output(&self) -> bool {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .any(|entry| entry.commands.product_admission_active())
     }
 
     fn allocate_output_incarnation(&self) -> u64 {
@@ -984,6 +991,7 @@ impl ResponseStreamBinding {
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) observation: ResponsePathObservation,
+    pub(in crate::runtime) product_admission_active: bool,
     pub(in crate::runtime) command_queue: ReliablePathCommandQueueSnapshot,
 }
 

@@ -24,10 +24,10 @@ use crate::lab_diagnostics::{
 use crate::model::admission::reliable_relay_source_staging_headroom;
 use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit,
-    adaptive_reliable_relay_reinjection_bytes, adaptive_reliable_stream_source_window_bytes,
-    relay_lane_startup_chunk_bytes, reliable_bulk_carrier_feed_quantum_bytes,
-    reliable_relay_buffer_len, reliable_relay_sender_dispatch_budget,
-    reliable_stream_advertised_window_bytes, reliable_stream_initial_advertised_window_bytes,
+    adaptive_reliable_relay_reinjection_bytes, relay_lane_startup_chunk_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
+    reliable_relay_sender_dispatch_budget, reliable_stream_advertised_window_bytes,
+    reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::{
     reliable_data_ack_gap_reinjection_deadline, reliable_data_ack_recovery_deadline,
@@ -1693,10 +1693,11 @@ where
             break Ok(stats);
         }
         let previous_lane = path_stream.current_lane();
+        response_sender.publish_queue_bytes(path_stream);
         let classifier_payload_hint = relay_lane_startup_chunk_bytes(previous_lane, mux_limits)
             .min(path_stream.max_frame_payload_bytes);
-        let classifier_path =
-            path_stream.send_path_snapshot(previous_lane, classifier_payload_hint);
+        let (classifier_path, classifier_inflight_limit) = path_stream
+            .send_path_snapshot_and_source_window(previous_lane, classifier_payload_hint);
         let demand_update = flow_demand.refresh(
             ReliableRelayFlowSignals::new(
                 send_stream
@@ -1741,10 +1742,13 @@ where
                 ),
             );
         }
-        response_sender.publish_queue_bytes(path_stream);
         let payload_hint = relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
             .min(path_stream.max_frame_payload_bytes);
-        let send_path_snapshot = path_stream.send_path_snapshot(relay_lane, payload_hint);
+        let (send_path_snapshot, inflight_limit) = if relay_lane == previous_lane {
+            (classifier_path, classifier_inflight_limit)
+        } else {
+            path_stream.send_path_snapshot_and_source_window(relay_lane, payload_hint)
+        };
         let tail_reinjection_path_snapshot = path_stream.tail_reinjection_snapshot(
             last_send_ack_frontier,
             relay_lane,
@@ -1961,11 +1965,6 @@ where
             mux_limits,
             path_stream.max_frame_payload_bytes,
         );
-        let inflight_limit = adaptive_reliable_stream_source_window_bytes(
-            send_path_snapshot,
-            relay_lane,
-            mux_limits,
-        );
         let sender_queue_limit = reliable_relay_sender_queue_limit(mux_limits, inflight_limit);
         let latency_startup_credit = response_flow_demand.latency_startup_credit_remaining_bytes(
             relay_lane,
@@ -2077,7 +2076,7 @@ where
         };
         // A target socket can stay established while every MPP carrier is down.
         // Stop reading so ordinary socket backpressure bounds retained response data.
-        let can_read_local = has_live_output && can_read_by_flow && read_budget > 0;
+        let can_read_local = send_path_snapshot.is_some() && can_read_by_flow && read_budget > 0;
         let can_send_pending_fin = pending_local_fin && response_sender.is_empty() && !close.sent;
 
         // Carrier input and target responses can both remain continuously

@@ -1132,6 +1132,10 @@ impl ReliablePathCommandSender {
             && self.data.is_closed()
     }
 
+    pub(in crate::runtime) fn product_admission_active(&self) -> bool {
+        self.metrics.lifecycle.is_active() && !self.data.is_closed()
+    }
+
     pub(in crate::runtime) fn same_channel(&self, other: &Self) -> bool {
         self.retirement.same_channel(&other.retirement)
             && self.control.same_channel(&other.control)

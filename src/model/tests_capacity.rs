@@ -1,14 +1,14 @@
 use super::{
     MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT,
-    RELIABLE_PIPE_WINDOW_BDPS, TcpCapacityProofCandidate, adaptive_reliable_relay_chunk_bytes,
-    adaptive_reliable_relay_chunk_bytes_with_frame_limit, adaptive_reliable_relay_inflight_bytes,
-    adaptive_reliable_stream_source_window_bytes, min_reliable_pipe_bytes,
+    RELIABLE_PIPE_WINDOW_BDPS, ReliableOriginalDataOutput, TcpCapacityProofCandidate,
+    adaptive_reliable_relay_chunk_bytes, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
+    adaptive_reliable_relay_inflight_bytes, min_reliable_pipe_bytes,
     reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
     reliable_relay_scheduler_quantum_cap, reliable_relay_sender_dispatch_budget,
     reliable_startup_bdp_bytes, reliable_startup_send_quantum_bytes,
     reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
     reliable_stream_initial_advertised_window_bytes, reliable_stream_max_data_update_bytes,
-    valid_tcp_capacity_proof_candidate_at,
+    reliable_stream_source_admission, valid_tcp_capacity_proof_candidate_at,
 };
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
@@ -284,7 +284,7 @@ fn tcp_product_service_window_cannot_enlarge_native_congestion_credit() {
 }
 
 #[test]
-fn shared_source_staging_is_not_owned_by_one_tcp_congestion_window() {
+fn shared_source_staging_sums_exact_live_output_windows() {
     let mux_limits = MuxLimits::default();
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 800.0, 4_000_000_000.0);
     path.product_progress_rate_bps = Some(4_000_000_000.0);
@@ -293,14 +293,87 @@ fn shared_source_staging_is_not_owned_by_one_tcp_congestion_window() {
 
     let path_limit =
         adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
-    let source_window = adaptive_reliable_stream_source_window_bytes(
-        Some(path),
+    let output = ReliableOriginalDataOutput {
+        snapshot: path,
+        stale: false,
+    };
+    let one_output = reliable_stream_source_admission(
+        [output],
         TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
+        mux_limits,
+    );
+    let two_outputs = reliable_stream_source_admission(
+        [output, output],
+        TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
         mux_limits,
     );
 
-    assert!(source_window > path_limit);
-    assert!(source_window <= mux_limits.max_path_flight_bytes);
+    assert_eq!(one_output.window_bytes, path_limit);
+    assert_eq!(
+        one_output.selected_path.map(|selected| selected.id),
+        Some(path.id)
+    );
+    assert_eq!(
+        two_outputs.window_bytes,
+        path_limit
+            .saturating_mul(2)
+            .min(mux_limits.max_path_flight_bytes)
+    );
+    assert_eq!(
+        reliable_stream_source_admission(
+            [],
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            mux_limits,
+        )
+        .window_bytes,
+        0
+    );
+}
+
+#[test]
+fn source_admission_uses_one_schedulable_precedence_set() {
+    let mux_limits = MuxLimits::default();
+    let mut regular = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 40.0, 100_000_000.0);
+    regular.carrier_inflight_limit_bytes = 256 * 1024;
+    let mut backup = regular;
+    backup.id = PathId(1);
+    backup.policy.backup = true;
+    let mut draining = regular;
+    draining.id = PathId(2);
+    draining.state = crate::scheduler::PathState::Draining;
+
+    let admission = reliable_stream_source_admission(
+        [
+            ReliableOriginalDataOutput {
+                snapshot: regular,
+                stale: true,
+            },
+            ReliableOriginalDataOutput {
+                snapshot: backup,
+                stale: false,
+            },
+            ReliableOriginalDataOutput {
+                snapshot: draining,
+                stale: false,
+            },
+        ],
+        TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
+        mux_limits,
+    );
+
+    assert_eq!(
+        admission.selected_path.map(|selected| selected.id),
+        Some(backup.id),
+        "a schedulable non-stale backup precedes stale regular and draining outputs"
+    );
+    assert_eq!(
+        admission.window_bytes,
+        adaptive_reliable_relay_inflight_bytes(Some(backup), TrafficClass::Throughput, mux_limits)
+    );
 }
 
 #[test]

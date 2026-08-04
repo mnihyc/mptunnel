@@ -9,7 +9,10 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
     BulkPathCandidate, bulk_scheduling_horizon_bytes, bulk_striping_admitted_candidates,
 };
-use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, ReliableOriginalDataOutput, ReliableStreamSourceAdmission,
+    relay_lane_startup_chunk_bytes, reliable_stream_source_admission,
+};
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
@@ -768,6 +771,35 @@ impl ClientPathContext {
             .path_record(instance.key)?
             .observation_for_instance_at(instance.path_instance_id, Instant::now())?;
         Some(path_snapshot(path, instance.key.index, observation))
+    }
+
+    /// Projects exact attached carrier instances under one path-health lock.
+    pub(in crate::runtime) fn reliable_stream_source_admission(
+        &self,
+        instances: impl IntoIterator<Item = (RelayPathInstance, bool)>,
+        lane: TrafficClass,
+        payload_bytes: usize,
+    ) -> ReliableStreamSourceAdmission {
+        let now = Instant::now();
+        let health = self.state.health().lock().expect("client path health lock");
+        reliable_stream_source_admission(
+            instances.into_iter().filter_map(|(instance, stale)| {
+                let path = match instance.key.underlay {
+                    UnderlayProtocol::Tcp => self.tcp_path_spec(instance.key.index),
+                    UnderlayProtocol::Udp => self.udp_paths.get(instance.key.index),
+                }?;
+                let observation = health
+                    .path_record(instance.key)?
+                    .observation_for_instance_at(instance.path_instance_id, now)?;
+                Some(ReliableOriginalDataOutput {
+                    snapshot: path_snapshot(path, instance.key.index, observation),
+                    stale,
+                })
+            }),
+            lane,
+            payload_bytes,
+            self.mux_limits,
+        )
     }
 
     pub(in crate::runtime) fn tcp_native_drain_observed(&self, index: usize) -> bool {

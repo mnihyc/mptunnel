@@ -31,8 +31,7 @@ use super::remote::ReliableRelayAttachMode;
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes,
-    adaptive_reliable_relay_chunk_bytes_with_frame_limit,
-    adaptive_reliable_stream_source_window_bytes, reliable_relay_buffer_len,
+    adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_relay_buffer_len,
     reliable_relay_sender_dispatch_budget, reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::sender_service_retry_delay;
@@ -277,6 +276,20 @@ where
     let result = loop {
         if client_relay_finished(&state, &send_stream, &recv_stream, &sender_queue, &remotes) {
             break Ok(state.delivery.total);
+        }
+        if deferred_remote_frame.is_none()
+            && let Some(instance) = remotes
+                .paths
+                .iter()
+                .find(|path| path.stream.output_is_terminally_closed())
+                .map(|path| path.instance())
+        {
+            // Terminal command ownership is an authoritative carrier-loss
+            // event even when its independent input queue is still retained.
+            deferred_remote_frame = Some(ReliableRelayRemoteFrame {
+                instance,
+                frame: Err(RuntimeError::ReliablePathSessionClosed),
+            });
         }
         if remotes.is_empty() {
             let now = Instant::now();
@@ -646,16 +659,26 @@ where
             }
             send_stream.update_max_offset(remotes.max_offset());
         }
+        let source_admission = context.reliable_stream_source_admission(
+            remotes
+                .paths
+                .iter()
+                .filter(|remote| remote.stream.product_admission_active())
+                .map(|remote| {
+                    let instance = remote.instance();
+                    (instance, sender.request_path_is_stale(instance))
+                }),
+            relay_lane,
+            PATH_OPEN_SCORE_BYTES,
+        );
+        let source_path_snapshot = source_admission.selected_path;
+        let has_source_output = source_path_snapshot.is_some();
+        let adaptive_inflight = source_admission.window_bytes;
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
-            path_snapshot,
+            source_path_snapshot,
             relay_lane,
             context.mux_limits,
             remotes.max_frame_payload_bytes(context.mux_limits),
-        );
-        let adaptive_inflight = adaptive_reliable_stream_source_window_bytes(
-            path_snapshot,
-            relay_lane,
-            context.mux_limits,
         );
         let request_outstanding_limit = reliable_relay_request_outstanding_limit_bytes(
             relay_lane,
@@ -691,7 +714,7 @@ where
                     context.session_send_buffer.used_bytes(),
                     context.session_send_buffer.limit_bytes(),
                     remotes.accepted_path_count(),
-                    path_snapshot.is_some(),
+                    source_path_snapshot.is_some(),
                 ),
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, adaptive_inflight));
@@ -872,13 +895,14 @@ where
             Vec::new()
         };
         let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
-        let can_read_by_flow = reliable_relay_can_read_product_source(
-            state.endpoint.local_open,
-            queued_send_blocked,
-            &send_stream,
-            &sender_queue,
-            sender_queue_limit,
-        );
+        let can_read_by_flow = has_source_output
+            && reliable_relay_can_read_product_source(
+                state.endpoint.local_open,
+                queued_send_blocked,
+                &send_stream,
+                &sender_queue,
+                sender_queue_limit,
+            );
         let request_outstanding_headroom = reliable_relay_request_outstanding_headroom_bytes(
             &send_stream,
             &sender_queue,

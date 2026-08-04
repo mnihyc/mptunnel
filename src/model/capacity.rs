@@ -5,7 +5,7 @@
 
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
-use crate::scheduler::{PathSnapshot, TrafficClass};
+use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::time::{Duration, Instant};
 
 pub(crate) const TRANSPORT_MSS_BYTES: usize = 1460;
@@ -332,29 +332,131 @@ pub(crate) fn adaptive_reliable_relay_inflight_bytes(
     modeled.max(native_feed).min(cap)
 }
 
-/// Bounds connection-wide Product bytes staged before path assignment.
-///
-/// This window may cover work for several independently admitted outputs, so
-/// one selected output's native congestion window cannot own it. Staging
-/// grants no DSN range or carrier reservation: each eventual output remains
-/// bounded by [`adaptive_reliable_relay_inflight_bytes`] and native writer
-/// backpressure at commit.
-pub(crate) fn adaptive_reliable_stream_source_window_bytes(
-    path: Option<PathSnapshot>,
-    lane: TrafficClass,
-    mux_limits: MuxLimits,
-) -> usize {
-    let path_limit = adaptive_reliable_relay_inflight_bytes(path, lane, mux_limits);
-    if !lane.is_bulk() {
-        return path_limit;
+/// One exact output considered for new OriginalData placement.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReliableOriginalDataOutput {
+    pub(crate) snapshot: PathSnapshot,
+    pub(crate) stale: bool,
+}
+
+/// One coherent source-admission view over the exact current outputs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReliableStreamSourceAdmission {
+    pub(crate) selected_path: Option<PathSnapshot>,
+    pub(crate) window_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReliableSourceCandidateSet {
+    selected: Option<(f64, PathSnapshot)>,
+    aggregate_window_bytes: usize,
+}
+
+impl ReliableSourceCandidateSet {
+    fn admit(&mut self, snapshot: PathSnapshot, eta_ms: f64, window_bytes: usize) {
+        self.aggregate_window_bytes = self.aggregate_window_bytes.saturating_add(window_bytes);
+        if self
+            .selected
+            .is_none_or(|(selected_eta_ms, _)| eta_ms < selected_eta_ms)
+        {
+            self.selected = Some((eta_ms, snapshot));
+        }
     }
-    let Some(path) = path else {
-        return path_limit;
+}
+
+/// Projects connection-wide Product source admission before path assignment.
+///
+/// Selection and the bulk window consume the same exact, schedulable outputs.
+/// Non-stale regular outputs take precedence, then non-stale backup outputs;
+/// stale outputs are fallback-only. Bulk work sums the chosen set's native
+/// admission windows under the shared resource cap. Latency-sensitive work
+/// uses only the chosen output's window. Staging grants no DSN range or carrier
+/// reservation: every eventual output remains bounded by
+/// [`adaptive_reliable_relay_inflight_bytes`] and native writer backpressure at
+/// commit.
+pub(crate) fn reliable_stream_source_admission<I>(
+    outputs: I,
+    lane: TrafficClass,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> ReliableStreamSourceAdmission
+where
+    I: IntoIterator<Item = ReliableOriginalDataOutput>,
+{
+    reliable_stream_source_projection(outputs, lane, payload_bytes, mux_limits, true)
+}
+
+/// Selects from the same OriginalData eligibility model without calculating a
+/// source window for callers that only need path timing.
+pub(crate) fn reliable_stream_source_path<I>(
+    outputs: I,
+    lane: TrafficClass,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> Option<PathSnapshot>
+where
+    I: IntoIterator<Item = ReliableOriginalDataOutput>,
+{
+    reliable_stream_source_projection(outputs, lane, payload_bytes, mux_limits, false).selected_path
+}
+
+fn reliable_stream_source_projection<I>(
+    outputs: I,
+    lane: TrafficClass,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    calculate_window: bool,
+) -> ReliableStreamSourceAdmission
+where
+    I: IntoIterator<Item = ReliableOriginalDataOutput>,
+{
+    let mut regular = [ReliableSourceCandidateSet::default(); 2];
+    let mut backup = [ReliableSourceCandidateSet::default(); 2];
+    for output in outputs {
+        let Some(score) = score_path(output.snapshot, lane, payload_bytes) else {
+            continue;
+        };
+        let stale_index = usize::from(output.stale);
+        let candidates = if path_is_backup(output.snapshot) {
+            &mut backup[stale_index]
+        } else {
+            &mut regular[stale_index]
+        };
+        let window_bytes = if calculate_window {
+            adaptive_reliable_relay_inflight_bytes(Some(output.snapshot), lane, mux_limits)
+        } else {
+            0
+        };
+        candidates.admit(output.snapshot, score.eta_ms, window_bytes);
+    }
+
+    let candidates = regular[0]
+        .selected
+        .map(|_| regular[0])
+        .or_else(|| backup[0].selected.map(|_| backup[0]))
+        .or_else(|| regular[1].selected.map(|_| regular[1]))
+        .or_else(|| backup[1].selected.map(|_| backup[1]));
+    let Some(candidates) = candidates else {
+        return ReliableStreamSourceAdmission {
+            selected_path: None,
+            window_bytes: 0,
+        };
     };
-    let cap = mux_limits.max_path_flight_bytes.max(1);
-    let modeled =
-        (data_level_service_window_bytes(path, lane, mux_limits).ceil() as usize).clamp(1, cap);
-    modeled.max(path_limit).min(cap)
+    let selected_path = candidates.selected.map(|(_, snapshot)| snapshot);
+    let window_bytes = if !calculate_window {
+        0
+    } else if lane.is_bulk() {
+        candidates
+            .aggregate_window_bytes
+            .min(mux_limits.max_path_flight_bytes.max(1))
+            .max(1)
+    } else {
+        adaptive_reliable_relay_inflight_bytes(selected_path, lane, mux_limits)
+    };
+    ReliableStreamSourceAdmission {
+        selected_path,
+        window_bytes,
+    }
 }
 
 pub(crate) fn reliable_relay_sender_dispatch_budget(

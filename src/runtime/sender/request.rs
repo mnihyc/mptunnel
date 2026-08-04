@@ -325,6 +325,10 @@ impl RequestSenderService {
         self.multipath.mark_path_stale(instance)
     }
 
+    pub(in crate::runtime) fn request_path_is_stale(&self, instance: RelayPathInstance) -> bool {
+        self.multipath.path_is_stale(instance)
+    }
+
     pub(in crate::runtime) fn unacked_original_paths_before(
         &self,
         remotes: &ReliableRelayRemoteSet,

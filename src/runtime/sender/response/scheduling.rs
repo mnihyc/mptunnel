@@ -62,13 +62,27 @@ pub(super) fn select_response_data_path_with_payload(
 ) -> Option<ResponseDataPathSelection> {
     let nonstale_live_paths = targets
         .iter()
-        .filter(|target| !target.observation.stale_for_original_data)
+        .filter(|target| {
+            target.product_admission_active && !target.observation.stale_for_original_data
+        })
+        .filter(|target| {
+            scheduler::score_path(response_completion_snapshot(target), lane, payload_bytes)
+                .is_some()
+        })
         .count();
     let has_nonstale_live_path = nonstale_live_paths > 0;
     let single_live_path = if has_nonstale_live_path {
         nonstale_live_paths == 1
     } else {
-        targets.len() == 1
+        targets
+            .iter()
+            .filter(|target| target.product_admission_active)
+            .filter(|target| {
+                scheduler::score_path(response_completion_snapshot(target), lane, payload_bytes)
+                    .is_some()
+            })
+            .count()
+            == 1
     };
     let connection_window = u64::try_from(mux_limits.max_reorder_bytes)
         .unwrap_or(u64::MAX)
@@ -83,6 +97,7 @@ pub(super) fn select_response_data_path_with_payload(
         let candidates = targets
             .iter()
             .filter(|target| allow_stale || !target.observation.stale_for_original_data)
+            .filter(|target| target.product_admission_active)
             .filter(|target| target.can_enqueue_stream_data(lane))
             // Registration follows the carrier's TCP/QUIC establishment and
             // authenticated PATH_JOIN/SESSION_READY exchange. That is the

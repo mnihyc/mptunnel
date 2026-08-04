@@ -581,6 +581,9 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_limit(
     mux_limits: MuxLimits,
     inflight_limit: usize,
 ) -> usize {
+    if inflight_limit == 0 {
+        return 0;
+    }
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
     inflight_limit
         .max(reliable_relay_buffer_len(mux_limits))

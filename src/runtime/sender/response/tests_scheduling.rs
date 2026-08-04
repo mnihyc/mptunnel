@@ -81,6 +81,20 @@ fn stale_response_output_is_excluded_until_it_is_the_only_live_output() {
         Some(alternate.observation.key),
         "a live non-stale output owns all new OriginalData placement"
     );
+    let mut draining = alternate.clone();
+    draining.product_admission_active = false;
+    assert_eq!(
+        select(&[stale.clone(), draining], &[], 0),
+        Some(stale.observation.key),
+        "a Product-inactive drain cannot suppress the stale active fallback"
+    );
+    let mut probe_only = alternate.clone();
+    probe_only.observation.snapshot.policy.probe_only = true;
+    assert_eq!(
+        select(&[stale.clone(), probe_only], &[], 0),
+        Some(stale.observation.key),
+        "an unschedulable non-stale output cannot suppress the stale active fallback"
+    );
     block_data_queue(&mut alternate);
     assert_eq!(
         select(&[stale.clone(), alternate], &[], 0),

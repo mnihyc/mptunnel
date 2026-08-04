@@ -740,6 +740,42 @@ async fn stale_path_is_not_selected_for_new_request_data() {
         )
         .expect("connection FIN remains schedulable on the progressing path");
     assert_eq!(fin_plan.target().1, udp);
+
+    udp_commands.begin_path_drain();
+    let fallback_observation = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&frame),
+        TrafficClass::Latency,
+        4096,
+        false,
+        &controller.request.stale_paths,
+    );
+    assert!(
+        fallback_observation
+            .path_by_instance(tcp)
+            .expect("stale active fallback")
+            .can_enqueue_stream_lane
+    );
+    assert!(
+        !fallback_observation
+            .path_by_instance(udp)
+            .expect("draining alternate")
+            .can_enqueue_stream_lane
+    );
+    let fallback = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &frame,
+            TrafficClass::Latency,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("a Product-inactive drain restores the stale active fallback");
+    assert_eq!(fallback.target().1, tcp);
 }
 
 #[tokio::test]

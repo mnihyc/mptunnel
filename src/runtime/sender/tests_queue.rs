@@ -21,6 +21,11 @@ fn sender_queue_read_budget_respects_stream_flow_control_credit() {
     };
     let mut send_stream = ReliableSendStream::new(StreamId(7), limits);
     let sender_queue = ReliableRelaySenderQueue::default();
+    assert_eq!(
+        reliable_relay_sender_queue_limit(limits, 0),
+        0,
+        "no admissible output grants no source staging"
+    );
     send_stream
         .send_data(Bytes::from_static(b"data"))
         .expect("initial window payload");

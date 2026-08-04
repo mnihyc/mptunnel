@@ -1447,9 +1447,16 @@ receive-credit, reorder, queue, or configured flight bounds.
 Connection-wide source staging precedes DSN assignment and may contain bounded
 work for several independently admitted outputs. It is therefore governed by
 the shared stream, repair, reorder, and configured resource envelopes, not by
-one selected output's native congestion window. Staging grants no output
-ownership or carrier reservation; every assignment still passes the per-output
-admission and native writer checks above.
+one selected output's native congestion window. For bulk work its active
+allowance is the bounded sum of the current per-output admission windows for
+the exact live outputs eligible for original data; with one output it is
+exactly that output's window. Latency-sensitive work retains the selected
+output's bounded window. Selection and allowance use one coherent view:
+withdrawn or unschedulable outputs contribute nothing, non-stale outputs
+precede stale recovery fallbacks, and a backup contributes only when no regular
+output is eligible. Staging grants no output ownership or carrier reservation;
+every assignment still passes the per-output admission and native writer checks
+above.
 
 TCP pool establishment is owned by Section 7.2 and is independent of
 instantaneous Product demand. A ready pool member enters the regular or backup

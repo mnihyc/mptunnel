@@ -83,11 +83,9 @@ loss.
 | System | Links | Download (Mbps) | Upload (Mbps) |
 | --- | ---: | ---: | ---: |
 | **MPTUNNEL (default)** | 1 | 370.207 | 398.793 |
-| Linux MPTCP | 5 | 357.424 | 382.493 |
 | **MPTUNNEL (default)** | 5 | **662.573** | **794.876** |
 
-Five links raise MPTUNNEL goodput by 1.79× download and 1.99× upload. On the
-same five-link topology, that is 1.85× and 2.08× Linux MPTCP respectively.
+Five links raise MPTUNNEL goodput by 1.79× download and 1.99× upload.
 
 ### Path choice
 
@@ -98,6 +96,20 @@ reverse. MPTUNNEL ranks each direction independently.
 | --- | ---: | ---: | ---: | ---: |
 | Download | 200 | 20 | 90.1% | 147.748 |
 | Upload | 20 | 200 | 89.4% | 149.680 |
+
+Under simultaneous bulk and interactive load, the low-latency path was
+80 Mbps at approximately 40 ms RTT and the high-throughput path was 500 Mbps
+at approximately 360 ms RTT. Both had zero loss.
+
+| Low-latency transport | High-throughput transport | Bulk (Mbps) | Interactive p50 (ms) | Interactive checks |
+| --- | --- | ---: | ---: | ---: |
+| TCP | QUIC | 289.061 | 117.161 | 60/60 |
+| QUIC | TCP | 288.886 | 48.296 | 57/57 |
+
+Bulk exceeded the low-latency path's ceiling by 3.61× while interactive median
+latency stayed below the high-throughput path's RTT in both orientations. The
+same outcome with transport roles reversed rules out a fixed TCP/QUIC
+preference.
 
 ### Failover and recovery
 

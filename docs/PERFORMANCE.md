@@ -33,6 +33,11 @@ MPTUNNEL is 4.8% below the fastest baseline on the clean 40 ms path. Under
 A health-probe deadline applies only to that probe; complete carrier setup uses
 the adaptive path-open budget derived from observed path timing.
 
+The 40 ms/0% and 360 ms/10% rows use clean source `9c2265b`; the other two use
+clean source `32f7568`. The only Core change between them assigns full carrier
+setup to the adaptive path-open deadline instead of the health-probe deadline;
+established-path congestion control and scheduling are unchanged.
+
 ## Link aggregation
 
 180 ms one-way delay, 20 ms jitter, 0% loss per path.
@@ -40,16 +45,12 @@ the adaptive path-open budget derived from observed path timing.
 | System | Transport | Shaped links | Download (Mbps) | Upload (Mbps) |
 | --- | --- | ---: | ---: | ---: |
 | MPTUNNEL | MPP/TCP+QUIC (default) | 1 | 370.207 | 398.793 |
-| Linux MPTCP | TCP | 5 | 357.424 | 382.493 |
 | MPTUNNEL | MPP/TCP | 5 | 841.572 | 562.796 |
 | MPTUNNEL | MPP/QUIC | 5 | 623.590 | 730.726 |
 | MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 662.573 | 794.876 |
 
 Five links raised default MPTUNNEL goodput by 1.79× download and 1.99× upload.
-The five-link default delivered 1.85× MPTCP download and 2.08× upload goodput.
-The MPTCP topology used one initial path plus four aligned address pairs and
-established additional subflows. Every MPTUNNEL row completed with exact
-receiver accounting.
+Every MPTUNNEL row completed with exact receiver accounting.
 
 ## Per-flow TCP limits
 
@@ -105,6 +106,26 @@ traffic direction.
 
 The interface accounting shows that upload and download independently selected
 their faster member without using a source-address heuristic.
+
+## Latency and throughput together
+
+The low-latency path was shaped to 80 Mbps, 20 ms one-way delay, and 2 ms
+jitter. The high-throughput path was 500 Mbps, 180 ms one-way delay, and 20 ms
+jitter. Both used zero loss. Each orientation ran bulk HTTP, short HTTP,
+persistent TCP echo, and UDP traffic together for 30 seconds.
+
+| Low-latency transport | High-throughput transport | Bulk (Mbps) | Interactive p50/p95 (ms) | Short HTTP p50/p95 (ms) | Echo / HTTP / UDP |
+| --- | --- | ---: | ---: | ---: | ---: |
+| TCP | QUIC | 289.061 | 117 / 361 | 218 / 654 | 60/60 / 67/67 / 176/176 |
+| QUIC | TCP | 288.886 | 48 / 439 | 105 / 112 | 57/57 / 130/130 / 399/399 |
+
+Bulk exceeded the low-latency path's 80 Mbps ceiling by 3.61× in both
+orientations, so the high-throughput path was contributing under load. Median
+interactive latency stayed below the high-throughput path's approximately
+360 ms RTT. Reversing TCP and QUIC roles preserved both outcomes, ruling out a
+fixed transport-family preference. Tail latency includes concurrent bulk
+service and ordered-delivery effects, so it does not claim that every
+interactive sample remained on one carrier.
 
 ## Disruption recovery
 

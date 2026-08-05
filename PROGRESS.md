@@ -5937,3 +5937,35 @@ entry is authoritative.
   `./.tmp/lab/results/readme-baseline-lowlat-highloss/`,
   `./.tmp/lab/results/readme-fixed-lowlat-lowloss/`, and
   `./.tmp/lab/results/readme-fixed-highlat-highloss/`.
+
+## 2026-08-05T15:36:02+08:00: latency-versus-throughput selection proof accepted
+
+- Name: transport-neutral simultaneous bulk and interactive path selection
+- Category: scheduler evidence and public performance presentation
+- State: completed; no scheduler, threshold, or RFC change was required
+- Controlled topology:
+  - low-latency path: `80 Mbps`, `20 ms` one-way delay, `2 ms` jitter;
+  - high-throughput path: `500 Mbps`, `180 ms` one-way delay, `20 ms` jitter;
+  - zero loss on both paths so this experiment isolates selection rather than
+    packet-loss recovery; and
+  - 30 seconds of simultaneous bulk HTTP, short HTTP, persistent TCP echo, and
+    UDP traffic, with TCP and QUIC roles reversed in the second case.
+- Results:
+  - TCP low-latency plus QUIC high-throughput delivered `289.061 Mbps` bulk,
+    `117.161 ms` interactive median, and passed `60/60` echo, `67/67` HTTP,
+    and `176/176` UDP checks; and
+  - QUIC low-latency plus TCP high-throughput delivered `288.886 Mbps` bulk,
+    `48.296 ms` interactive median, and passed `57/57` echo, `130/130` HTTP,
+    and `399/399` UDP checks.
+- Interpretation: bulk exceeded the low-latency path ceiling by `3.61×` in
+  both orientations while median interactive latency remained below the
+  high-throughput path's approximately `360 ms` RTT. Reversing the transport
+  roles preserved the result, ruling out a fixed TCP/QUIC family preference.
+- An earlier 1% loss run was not reused as this selection proof: shaped loss
+  caused one short-request timeout in one orientation and two expected
+  unreliable-datagram losses in the other. The zero-loss rerun isolates the
+  intended variable instead of weakening acceptance or tuning the product.
+- Both accepted rows used a clean source tree at `671e9e8`, the same optimized
+  binary, valid host snapshots, and no unrelated containers.
+- Reproducible evidence:
+  `./.tmp/lab/results/readme-path-selection-zero-loss/`.

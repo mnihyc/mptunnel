@@ -132,7 +132,7 @@ interactive sample remained on one carrier.
 | Condition | Transport | Download (Mbps) | Upload (Mbps) | Receiver gap DL/UL (ms) |
 | --- | --- | ---: | ---: | ---: |
 | Port hop | MPP/QUIC | 2,818.042 | 2,798.515 | 11 / 24 |
-| Blackhole | MPP/TCP+QUIC (default) | 204.833 | — | 366 / — |
+| Blackhole | MPP/TCP+QUIC (default) | 243.210 | — | 576 / — |
 | Latency change | MPP/TCP+QUIC (default) | 167.651 | — | 3,310 / — |
 | Repeated link changes | MPP/TCP+QUIC (default) | 186.452 | — | 1,501 / — |
 | Blackhole | MPP/TCP | 272.124 | 274.925 | 1,136 / 369 |
@@ -140,12 +140,15 @@ interactive sample remained on one carrier.
 
 | Default mixed condition | TCP echo | HTTP | Datagrams |
 | --- | ---: | ---: | ---: |
-| Blackhole | 60/60 | 108/108 | 240/243 |
+| Blackhole | 60/60 | 81/81 | 199/200 |
 | Latency change | 60/60 | 94/94 | 257/259 |
 | Repeated link changes | 48/48 | 90/92 | 280/282 |
 
 The latency-change row includes a 900 ms one-way, 10% loss epoch.
 Persistent TCP echo streams stayed attached in every mixed disruption run.
+The current blackhole row is clean-source evidence from `ea842dd`; every
+reliable check completed, while one unreliable datagram traversing the
+blackholed path was not delivered.
 The repeated-change HTTP misses began within deliberate blackholes and reached
 their application deadlines before service returned. Datagram counts expose
 expected loss during those same unavailable intervals.

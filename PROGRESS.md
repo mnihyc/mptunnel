@@ -5969,3 +5969,23 @@ entry is authoritative.
   binary, valid host snapshots, and no unrelated containers.
 - Reproducible evidence:
   `./.tmp/lab/results/readme-path-selection-zero-loss/`.
+
+## 2026-08-05T15:42:13+08:00: current blackhole recovery proof retained
+
+- Name: active-path blackhole recovery on the default TCP+QUIC topology
+- Category: disruption recovery evidence and README verification
+- State: completed on clean source `ea842dd`; no product change was required
+- A two-second active-path blackhole was injected during 30 seconds of mixed
+  bulk HTTP, short HTTP, persistent TCP echo, and UDP traffic.
+- Reliable outcomes: `243.210 Mbps` bulk goodput, `60/60` persistent TCP
+  exchanges, `81/81` HTTP requests, and a `576 ms` maximum bulk delivery gap.
+  Existing reliable flows remained attached and completed.
+- Unreliable outcome: `199/200` UDP datagrams arrived. The one datagram lost
+  while its path was blackholed is reported as such; the mixed row is not
+  relabeled as globally loss-free.
+- The host snapshot is valid, the source tree was clean, no unrelated
+  containers were running, and the shared-transport-key profile was active.
+- The prior README values were replaced rather than reused because their raw
+  artifact had already been cleaned.
+- Reproducible evidence:
+  `./.tmp/lab/results/readme-blackhole-current/`.

@@ -115,7 +115,7 @@ preference.
 
 | Event | Existing-flow checks | Outcome |
 | --- | ---: | ---: |
-| Active path blackholed | TCP 60/60; HTTP 108/108 | Continued; 366 ms max gap |
+| Active path blackholed | TCP 60/60; HTTP 81/81 | Continued; 576 ms max gap |
 
 Existing flows stay attached to their MPP sequence space while a surviving or
 replacement carrier resumes delivery. New inbound connections are rejected

@@ -14,44 +14,44 @@ directional run, not a best-of selection. Repetitions were used only to classify
 outliers. The one-path and local TCP `1-1` MPTUNNEL rows use the default
 shared-transport-key profile.
 
-## One 500 Mbps path
+## Matched proxy conditions
 
-180 ms one-way delay, 20 ms jitter, 1% loss.
+Each path was shaped to 500 Mbps with zero jitter. Every cell used two parallel
+downloads for 20 seconds. Delay was applied once in each direction, so 20 ms
+and 180 ms one-way shaping correspond to approximately 40 ms and 360 ms RTT.
+MPTUNNEL used its default TCP+QUIC configuration.
 
-| System | Transport | Download (Mbps) | Upload (Mbps) |
-| --- | --- | ---: | ---: |
-| Direct | TCP | 207.720 | 201.212 |
-| Xray 26.3.27 | VMess/TCP | 218.716 | ≥151.299 |
-| Hysteria2 2.10.0 | QUIC | 87.525 | ≥105.615 |
-| MPTUNNEL | MPP/TCP | 230.396 | 220.212 |
-| MPTUNNEL | MPP/QUIC | 238.954 | 237.677 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 347.100 | 375.497 |
+| RTT (ms) | Loss | Xray 26.3.27 VMess/TCP | Hysteria2 2.10.0 | MPTUNNEL TCP+QUIC |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 0% | 461.341 | 461.425 | 439.091 |
+| 40 | 10% | 406.613 | 421.454 | 405.129 |
+| 360 | 0% | 355.414 | 251.473 | 346.164 |
+| 360 | 10% | 25.000 | 71.960 | 225.025 |
 
-The default delivered 1.67× direct TCP download and 1.87× upload goodput.
-MPP/QUIC delivered 2.73× Hysteria2's download. The Xray and Hysteria2
-uploads are receiver-confirmed lower bounds and are excluded from ratios.
+MPTUNNEL is 4.8% below the fastest baseline on the clean 40 ms path. Under
+360 ms RTT and 10% loss it delivers 3.13× Hysteria2 and 9.00× Xray/VMess.
+A health-probe deadline applies only to that probe; complete carrier setup uses
+the adaptive path-open budget derived from observed path timing.
 
-Multiple TCP carriers on one route can overcome a per-flow limiter, but they
-do not create independent link capacity or remove native TCP head-of-line
-recovery. The default also has QUIC available when it is the better carrier.
-
-## Five 500 Mbps paths
+## Link aggregation
 
 180 ms one-way delay, 20 ms jitter, 0% loss per path.
 
 | System | Transport | Shaped links | Download (Mbps) | Upload (Mbps) |
 | --- | --- | ---: | ---: | ---: |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 1 | 370.207 | 398.793 |
 | Linux MPTCP | TCP | 5 | 357.424 | 382.493 |
 | MPTUNNEL | MPP/TCP | 5 | 841.572 | 562.796 |
 | MPTUNNEL | MPP/QUIC | 5 | 623.590 | 730.726 |
 | MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 662.573 | 794.876 |
 
-The default delivered 1.85× MPTCP download and 2.08× upload goodput. The
-MPTCP topology used one initial path plus four aligned address pairs and
+Five links raised default MPTUNNEL goodput by 1.79× download and 1.99× upload.
+The five-link default delivered 1.85× MPTCP download and 2.08× upload goodput.
+The MPTCP topology used one initial path plus four aligned address pairs and
 established additional subflows. Every MPTUNNEL row completed with exact
 receiver accounting.
 
-## TCP carrier pool
+## Per-flow TCP limits
 
 A lone TCP endpoint maintains the configured maximum as regular members; the
 default maximum is three. When several endpoints are configured, each endpoint
@@ -78,7 +78,7 @@ The three-carrier forms aggregate independent per-flow capacity and stay near
 the same aggregate ceiling when all connections share one bottleneck. No rate
 or percentage from these runs is a production threshold.
 
-## Twenty varying links
+## Changing link conditions at scale
 
 Ten TCP and ten QUIC links changed bandwidth, latency, jitter, and loss across
 five deterministic epochs.
@@ -106,7 +106,7 @@ traffic direction.
 The interface accounting shows that upload and download independently selected
 their faster member without using a source-address heuristic.
 
-## Continuity
+## Disruption recovery
 
 | Condition | Transport | Download (Mbps) | Upload (Mbps) | Receiver gap DL/UL (ms) |
 | --- | --- | ---: | ---: | ---: |

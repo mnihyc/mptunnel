@@ -1,9 +1,9 @@
 # MPTUNNEL
 
 MPTUNNEL is an encrypted multipath proxy and tunnel for everyday Internet use.
-It combines independent TCP and QUIC paths into one logical connection, adds
-their available capacity according to live completion evidence, and keeps
-established traffic alive when a carrier disappears.
+It lets one application connection use several independent TCP and QUIC paths,
+chooses paths from live latency and delivery evidence, and keeps the connection
+alive when a path disappears.
 
 It provides the daily-use surface expected from a modern proxy: SOCKS5, HTTP
 CONNECT, TCP/UDP port forwarding, TUN, routing, DNS policy, outbound selection,
@@ -14,7 +14,6 @@ diagnostics.
 
 - [Why MPTUNNEL?](#why-mptunnel)
 - [Performance](#performance)
-- [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Configuration and operation](#configuration-and-operation)
 - [Platform support](#platform-support)
@@ -24,160 +23,97 @@ diagnostics.
 
 ## Why MPTUNNEL?
 
-Most proxies place a logical connection on one transport. MPTUNNEL maintains
-one Multipath Proxy Protocol (MPP) sequence across independent TCP and QUIC
-carriers. Native transports keep their congestion control and loss recovery;
-MPP adds live path selection, exact Data ACKs, and bounded reinjection across
-them. One flow can therefore aggregate links and remain attached when a
-carrier disappears.
+Xray/V2Ray routes or balances separate connections across outbounds. Hysteria2
+carries proxy streams within one QUIC session and supports transparent UDP
+port hopping. MPTUNNEL addresses the gap between them: one application flow
+can use several independent TCP and QUIC carriers at the same time.
 
-| System | Proxy | TUN | Route | DNS | TCP | QUIC | Multipath | Failover |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **MPTUNNEL** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Hysteria2 | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — |
-| Xray/V2Ray | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
-| MPTCP | — | — | — | — | ✓ | — | ✓ | ✓ |
+| Within one logical flow | Xray/V2Ray | Hysteria2 | **MPTUNNEL** |
+| --- | ---: | ---: | ---: |
+| Multiple independent paths | — | — | ✓ |
+| TCP + QUIC together | — | — | ✓ |
+| Upload/download path ranking | — | — | ✓ |
+| Independent-carrier failover | — | — | ✓ |
 
-A lone TCP endpoint maintains up to three regular carriers by default. With
-several endpoints, each endpoint contributes a regular primary while its
-correlated siblings remain ready backups. Live directional delivery ranks
-carriers inside the eligible tier; source addresses never establish capacity.
+Beyond its daily-use proxy, forwarding, TUN, routing, and DNS surface,
+MPTUNNEL's advantage is inside the flow: it can add independent link capacity,
+rank paths from live latency and delivery evidence, choose differently for
+upload and download, and move undelivered ranges to a surviving carrier.
+
+```text
+SOCKS5 / HTTP CONNECT / port forward / TUN
+                       |
+             routing, DNS, outbounds
+                       |
+                one MPP flow
+                       |
+        live ranking + Data ACK + reinjection
+              /             |             \
+        TCP path A      QUIC path B     TCP path C
+```
 
 ![Live MPTUNNEL Overview with real connections, paths, sessions, and transfer speed](docs/assets/dashboard.png)
 
 ## Performance
 
-All rates are receiver-delivered goodput from the same Linux/Docker host.
-Matched proxy comparisons used two flows for 20 seconds. Movement around five
-percent can be ordinary run-to-run variance. The one-path and local TCP `1-1`
-MPTUNNEL rows use the default shared-transport-key profile.
+Rates below are receiver-delivered goodput from isolated Linux containers.
+Matched product cells use a 500 Mbps path, two downloads, a 20-second window,
+zero jitter, Xray-core 26.3.27 with VMess/TCP, Hysteria2 2.10.0, and the default
+MPTUNNEL TCP+QUIC configuration.
 
-### One 500 Mbps path
+### Across Internet conditions
 
-180 ms one-way delay, 20 ms jitter, 1% loss.
+| RTT (ms) | Loss | Xray/VMess (Mbps) | Hysteria2 (Mbps) | **MPTUNNEL (Mbps)** |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 0% | 461.341 | **461.425** | 439.091 |
+| 40 | 10% | 406.613 | **421.454** | 405.129 |
+| 360 | 0% | **355.414** | 251.473 | 346.164 |
+| 360 | 10% | 25.000 | 71.960 | **225.025** |
 
-| System | Transport | Download (Mbps) | Upload (Mbps) |
-| --- | --- | ---: | ---: |
-| Direct | TCP | 207.720 | 201.212 |
-| Xray 26.3.27 | VMess/TCP | 218.716 | ≥151.299 |
-| Hysteria2 2.10.0 | QUIC | 87.525 | ≥105.615 |
-| **MPTUNNEL** | MPP/TCP | 230.396 | 220.212 |
-| **MPTUNNEL** | MPP/QUIC | 238.954 | 237.677 |
-| **MPTUNNEL** | **MPP/TCP+QUIC (default)** | **347.100** | **375.497** |
+On a clean 40 ms route, MPTUNNEL is 4.8% below the fastest single-transport
+baseline. At 360 ms RTT and 10% loss, it delivers 3.13× Hysteria2 and 9.00×
+Xray/VMess goodput. The default can combine independent TCP and QUIC delivery
+inside each logical flow.
 
-The default delivered 1.67× direct TCP download and 1.87× upload goodput;
-MPP/QUIC delivered 2.73× Hysteria2's download. Incomplete baseline uploads
-are shown only as receiver-confirmed lower bounds.
+### Aggregation
 
-### Five 500 Mbps paths
+Each shaped link is 500 Mbps with 180 ms one-way delay, 20 ms jitter, and no
+loss.
 
-180 ms one-way delay, 20 ms jitter, 0% loss per path.
-
-| System | Transport | Shaped links | Download (Mbps) | Upload (Mbps) |
-| --- | --- | ---: | ---: | ---: |
-| Linux MPTCP | TCP | 5 | 357.424 | 382.493 |
-| **MPTUNNEL** | MPP/TCP | 5 | **841.572** | 562.796 |
-| **MPTUNNEL** | MPP/QUIC | 5 | 623.590 | 730.726 |
-| **MPTUNNEL** | **MPP/TCP+QUIC (default)** | 5 | 662.573 | **794.876** |
-
-The default delivered 1.85× MPTCP download and 2.08× upload goodput.
-
-### TCP carrier pool
-
-| Network condition | Direction | `1-1` | Default `1-3` | 3 × `1-1` |
-| --- | --- | ---: | ---: | ---: |
-| 500 Mbps per flow | Download | 345.465 | **901.519** | 744.216 |
-| 500 Mbps per flow | Upload | 338.671 | 873.097 | **890.466** |
-| Shared 200 Mbps | Download | 158.931 | 164.476 | 167.164 |
-| Shared 200 Mbps | Upload | 157.099 | 172.327 | 150.939 |
-
-The default pool aggregates independent per-flow capacity and remains at the
-same aggregate ceiling when its carriers share one bottleneck.
-
-### 20 links
-
-Ten TCP and ten QUIC links with varied bandwidth, latency, jitter, and loss.
-
-| Rate/link (Mbps) | Transport | Download (Mbps) | Upload (Mbps) |
-| ---: | --- | ---: | ---: |
-| 30–100 | MPP/TCP+QUIC (default) | 350.135 | 245.383 |
-| 300–1,000 | MPP/TCP+QUIC (default) | 1,346.848 | 726.616 |
-| 3,000–10,000 | MPP/TCP+QUIC (default) | 2,000.420 | 597.670 |
-
-| Direction | Single fast link (Mbps) | Multipath (Mbps) | Fast-link share |
+| System | Links | Download (Mbps) | Upload (Mbps) |
 | --- | ---: | ---: | ---: |
-| Download | 141.161 | 147.748 | 90.1% |
-| Upload | 141.258 | 149.680 | 89.4% |
+| **MPTUNNEL (default)** | 1 | 370.207 | 398.793 |
+| Linux MPTCP | 5 | 357.424 | 382.493 |
+| **MPTUNNEL (default)** | 5 | **662.573** | **794.876** |
 
-### Continuity
+Five links raise MPTUNNEL goodput by 1.79× download and 1.99× upload. On the
+same five-link topology, that is 1.85× and 2.08× Linux MPTCP respectively.
 
-| Condition | Transport | Download (Mbps) | Upload (Mbps) | TCP echo | HTTP | Datagrams | Max DL gap (ms) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Port hop | MPP/QUIC | 2,818.042 | 2,798.515 | — | — | — | 11 |
-| Blackhole | MPP/TCP+QUIC (default) | 204.833 | — | 60/60 | 108/108 | 240/243 | 366 |
-| Latency change | MPP/TCP+QUIC (default) | 167.651 | — | 60/60 | 94/94 | 257/259 | 3,310 |
-| Repeated link changes | MPP/TCP+QUIC (default) | 186.452 | — | 48/48 | 90/92 | 280/282 | 1,501 |
+### Path choice
 
-The latency-change row includes a 900 ms one-way, 10% loss epoch.
-A five-second total carrier outage passed 1/1. Client/server restart recovery
-passed 2/2. Repeated-change misses began inside deliberate blackholes and met
-their application deadlines before service returned; persistent TCP completed.
+Link A provides 200 Mbps download and 20 Mbps upload. Link B provides the
+reverse. MPTUNNEL ranks each direction independently.
 
-| Concurrency | Object (KiB) | Duration (s) | Requests | Rejected | Failed | Deadline (ms) |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 | 32 | 30 | 90/90 | 0 | 0 | 3,000 |
-| 20 | 1,024 | 60 | 739/739 | 0 | 0 | — |
+| Direction | Link A (Mbps) | Link B (Mbps) | Faster-path share | Goodput (Mbps) |
+| --- | ---: | ---: | ---: | ---: |
+| Download | 200 | 20 | 90.1% | 147.748 |
+| Upload | 20 | 200 | 89.4% | 149.680 |
 
-Every batched request met its three-second deadline. The 60-second run kept 20
-requests active and replaced each completed request immediately.
+### Failover and recovery
 
-### Local host ceiling
+| Event | Existing-flow checks | Outcome |
+| --- | ---: | ---: |
+| Active path blackholed | TCP 60/60; HTTP 108/108 | Continued; 366 ms max gap |
 
-No rate, delay, jitter, or loss was configured.
+Existing flows stay attached to their MPP sequence space while a surviving or
+replacement carrier resumes delivery. New inbound connections are rejected
+while every outbound path is unavailable. Total-outage and peer-restart
+recovery results remain in the detailed evidence guide.
 
-| System | Transport | Carriers | Download (Gbps) | Upload (Gbps) |
-| --- | --- | ---: | ---: | ---: |
-| Direct | TCP | 1 | 21.393 | 22.113 |
-| Xray 26.3.27 | VMess/TCP | 1 | 8.044 | ≥6.952 |
-| Hysteria2 2.10.0 | QUIC | 1 | 2.714 | ≥2.816 |
-| **MPTUNNEL** | MPP/TCP (`1-1`) | 1 | 7.185 | 6.443 |
-| **MPTUNNEL** | MPP/TCP (default) | 3 | 5.584 | 6.328 |
-| **MPTUNNEL** | MPP/QUIC | 1 | 2.867 | 2.796 |
-| **MPTUNNEL** | **MPP/TCP+QUIC (default)** | 4 | 4.921 | 5.190 |
-
-These rows measure local processing capacity, not a public Internet link.
-Extra unshaped carriers add work without adding network capacity; independently
-shaped links provide the aggregation opportunity shown above.
-
-The proxy tables are matched comparisons. Scale, continuity, and load results
-show capability and are not direct product rankings.
-
-Production contains no fixed Mbps target or fixed percentage threshold.
-
-See [Performance evidence](docs/PERFORMANCE.md) for the full results and
-limits.
-
-## How it works
-
-```text
-SOCKS5 / HTTP CONNECT / TCP+UDP forward / TUN
-                         |
-             routing, DNS, ACL, balancer
-                         |
-          MPP stream or datagram sequence space
-                         |
-       selection, Data ACK, flow control, reinjection
-                         |
-       TCP protected carriers   QUIC/HTTP/3 carriers
-                  \              /
-                   independent links
-```
-
-MPP version 6 uses independent sequence and receive-window state in each
-stream direction. Carrier state is fenced by its physical lifetime, so a
-reconnect never inherits stale congestion, flight, or delivery evidence.
-Configured backup/expensive flags are restrictions; live measurements and
-current demand rank eligible paths.
+Movement around five percent can be ordinary run-to-run variance, not a pass
+threshold. See [Performance evidence](docs/PERFORMANCE.md) for the detailed
+topologies, upload accounting, load tests, resource limits, and reproducible
+methodology.
 
 ## Quick start
 
@@ -326,7 +262,7 @@ and assets are never replaced; corrections use a new release.
 - [Operations](docs/OPERATIONS.md)
 - [Reference configuration](examples/config.reference.toml)
 - [Performance evidence](docs/PERFORMANCE.md)
-- [MPP version 6 specification](RFC.md)
+- [Protocol specification](RFC.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Contributing](CONTRIBUTING.md)
 

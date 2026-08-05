@@ -5888,3 +5888,52 @@ entry is authoritative.
 - Reproducible post-refresh evidence:
   `./.tmp/lab/results/dependency-upgrade-protected/` and
   `./.tmp/lab/results/dependency-upgrade-repeat/`.
+
+## 2026-08-05T15:28:33+08:00: buyer-facing baseline matrix and carrier timing ownership
+
+- Name: matched Internet-condition comparison and long-loss carrier startup
+- Category: runtime lifecycle, performance evidence, and public presentation
+- State: runtime correction committed as `9c2265b`; README and detailed evidence
+  presentation remain intentionally uncommitted until the final selection
+  proof and documentation audit finish
+- Proven root cause and correction:
+  - the background TCP carrier owner reused `path_probe_timeout` as the
+    deadline for the complete TCP, transport-protection, MPP join, and
+    readiness transaction;
+  - at approximately 360 ms RTT and 10% loss, the two-second probe deadline
+    terminated valid cold TCP setup before the existing RFC path-open timing
+    model allowed its loss-tolerant transaction to complete;
+  - a diagnostic configuration-only run raised that deadline to ten seconds:
+    TCP recovered from `0.162 Mbps` with failed requests to `144.871 Mbps`, and
+    default TCP+QUIC completed at `227.797 Mbps`; and
+  - the correction preserves the configured timeout for health probes while
+    complete TCP carrier setup now uses the existing adaptive
+    `path_open_timeout` model, exactly as demand-driven stream attachment does.
+- Clean, receiver-delivered 500 Mbps comparison, two downloads for 20 seconds,
+  zero jitter, pinned Xray/VMess and Hysteria2 baselines:
+  - approximately 40 ms RTT, 0% loss: `461.341 / 461.425 / 439.091 Mbps`;
+  - approximately 40 ms RTT, 10% loss: `406.613 / 421.454 / 405.129 Mbps`;
+  - approximately 360 ms RTT, 0% loss: `355.414 / 251.473 / 346.164 Mbps`; and
+  - approximately 360 ms RTT, 10% loss: `25.000 / 71.960 / 225.025 Mbps`.
+  Values are ordered Xray/VMess, Hysteria2, and default MPTUNNEL TCP+QUIC.
+- The severe-condition MPTUNNEL cell completed with zero failed requests and
+  improved from the pre-correction failed `1.085 Mbps` run without changing
+  congestion control, scheduling thresholds, RFC parameters, or lab shaping.
+- Verification: all `1,463` release-profile library tests passed, including
+  all seven timing-model tests and the TCP carrier reconciliation integration
+  coverage. Both corrected clean-source cells have valid host snapshots.
+- A focused latency-versus-throughput selection run was rejected from evidence
+  because 27 unrelated containers started after the host snapshot boundary;
+  its host validity correctly failed and none of its values are published.
+- README presentation now concentrates on baseline behavior, aggregation,
+  directional path choice, and recovery. TCP pool mechanics, scale inventory,
+  browser stress, and local processing ceilings remain only in the detailed
+  evidence guide.
+- The immutable release workflow completed successfully for every packaged
+  platform and its publish-verification job; no additional release operation
+  was performed.
+- Reproducible evidence:
+  `./.tmp/lab/results/readme-baseline-highlat-lowloss/`,
+  `./.tmp/lab/results/readme-baseline-lowlat-highloss/`,
+  `./.tmp/lab/results/readme-fixed-lowlat-lowloss/`, and
+  `./.tmp/lab/results/readme-fixed-highlat-highloss/`.

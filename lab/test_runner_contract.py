@@ -387,6 +387,25 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn("client MPTCP endpoint configuration failed:", SCRIPT)
         self.assertIn("target MPTCP endpoint configuration failed:", SCRIPT)
 
+    def test_asymmetric_product_baselines_use_the_directionally_fast_link(self):
+        self.assertIn('[[ "$netem_mode" == "asymmetric" ]]', SCRIPT)
+        self.assertIn(
+            '"baseline_vmess_tcp_single_asymmetric_download_reference"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"baseline_hysteria2_udp_single_asymmetric_download_reference"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"baseline_vmess_tcp_single_asymmetric_upload_reference"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"baseline_hysteria2_udp_single_asymmetric_upload_reference"',
+            SCRIPT,
+        )
+
     def test_mixed_single_equal_fat_controls_use_one_tcp_and_one_udp_endpoint(self):
         self.assertIn(
             'run_reliable_ideal_download_case "mptunnel_reliable_mixed_single_equal_fat" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"',
@@ -412,6 +431,28 @@ class RunnerContractTests(unittest.TestCase):
         )
         self.assertIn(
             'run_reliable_ideal_upload_case "mptunnel_reliable_mixed_paired_multipath_equal_fat_upload" "fat" "$tcp_equal_all $udp_equal_all"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"mptunnel_reliable_mixed_two_links_equal_fat"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"$tcp_endpoint_lowlat $udp_endpoint_lowlat $tcp_endpoint_fat $udp_endpoint_fat"',
+            SCRIPT,
+        )
+
+    def test_path_choice_controls_pair_both_transports_on_each_link(self):
+        self.assertIn(
+            '"mptunnel_mixed_single_cross_continent_high_bandwidth"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"mptunnel_mixed_two_links_lowlat_fat"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"$tcp_lowlat $udp_lowlat $tcp_fat $udp_fat"',
             SCRIPT,
         )
 

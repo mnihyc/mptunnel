@@ -2466,6 +2466,16 @@ prepare_baseline_case() {
   start_target_services
 }
 
+prepare_baseline_profile() {
+  local netem_mode="$1"
+  if [[ "$netem_mode" == "asymmetric" ]]; then
+    prepare_baseline_case unconstrained
+    apply_asymmetric_netem
+  else
+    prepare_baseline_case "$netem_mode"
+  fi
+}
+
 run_baseline_download_probe_case() {
   local case_name="$1"
   local protocol="$2"
@@ -2572,7 +2582,7 @@ run_vmess_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
   local netem_mode="${3:-apply}"
-  prepare_baseline_case "$netem_mode"
+  prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
     append_skipped_result "$case_name" "vmess" "xray baseline binary unavailable"
     return 0
@@ -2602,7 +2612,7 @@ run_vmess_baseline_upload_case() {
   local case_name="$1"
   local server_ip="$2"
   local netem_mode="${3:-apply}"
-  prepare_baseline_case "$netem_mode"
+  prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
     append_skipped_result "$case_name" "vmess-upload" "xray baseline binary unavailable"
     return 0
@@ -2632,7 +2642,7 @@ run_hysteria2_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
   local netem_mode="${3:-apply}"
-  prepare_baseline_case "$netem_mode"
+  prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
     append_skipped_result "$case_name" "hysteria2" "hysteria2 baseline binary unavailable"
     return 0
@@ -2665,7 +2675,7 @@ run_hysteria2_baseline_upload_case() {
   local case_name="$1"
   local server_ip="$2"
   local netem_mode="${3:-apply}"
-  prepare_baseline_case "$netem_mode"
+  prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
     append_skipped_result "$case_name" "hysteria2-upload" "hysteria2 baseline binary unavailable"
     return 0
@@ -4005,6 +4015,31 @@ if should_run_case "baseline_hysteria2_udp_single_unconstrained_upload"; then
   run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_unconstrained_upload" "172.31.10.20" unconstrained
 fi
 
+if should_run_case "baseline_vmess_tcp_single_asymmetric_download_reference"; then
+  run_vmess_baseline_case \
+    "baseline_vmess_tcp_single_asymmetric_download_reference" \
+    "172.31.10.20" \
+    asymmetric
+fi
+if should_run_case "baseline_hysteria2_udp_single_asymmetric_download_reference"; then
+  run_hysteria2_baseline_case \
+    "baseline_hysteria2_udp_single_asymmetric_download_reference" \
+    "172.31.10.20" \
+    asymmetric
+fi
+if should_run_case "baseline_vmess_tcp_single_asymmetric_upload_reference"; then
+  run_vmess_baseline_upload_case \
+    "baseline_vmess_tcp_single_asymmetric_upload_reference" \
+    "172.31.15.20" \
+    asymmetric
+fi
+if should_run_case "baseline_hysteria2_udp_single_asymmetric_upload_reference"; then
+  run_hysteria2_baseline_upload_case \
+    "baseline_hysteria2_udp_single_asymmetric_upload_reference" \
+    "172.31.15.20" \
+    asymmetric
+fi
+
 if should_run_case "baseline_mptcp_tcp_multipath_all"; then
   run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_all"
 fi
@@ -4141,6 +4176,12 @@ fi
 if should_run_case "mptunnel_reliable_mixed_single_equal_fat"; then
   run_reliable_ideal_download_case "mptunnel_reliable_mixed_single_equal_fat" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"
 fi
+if should_run_case "mptunnel_reliable_mixed_two_links_equal_fat"; then
+  run_reliable_ideal_download_case \
+    "mptunnel_reliable_mixed_two_links_equal_fat" \
+    "fat" \
+    "$tcp_endpoint_lowlat $udp_endpoint_lowlat $tcp_endpoint_fat $udp_endpoint_fat"
+fi
 
 if should_run_case "mptunnel_reliable_mixed_multipath_all"; then
   start_client "reliable_mixed_multipath_all" "$tcp_all $udp_all"
@@ -4266,6 +4307,12 @@ fi
 if should_run_case "mptunnel_reliable_mixed_single_equal_fat_upload"; then
   run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_equal_fat_upload" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"
 fi
+if should_run_case "mptunnel_reliable_mixed_two_links_equal_fat_upload"; then
+  run_reliable_ideal_upload_case \
+    "mptunnel_reliable_mixed_two_links_equal_fat_upload" \
+    "fat" \
+    "$tcp_endpoint_lowlat $udp_endpoint_lowlat $tcp_endpoint_fat $udp_endpoint_fat"
+fi
 if should_run_case "mptunnel_reliable_mixed_family_contention_equal_fat_upload"; then
   # UDP-first ordering makes one QUIC Service compete with one TCP Service;
   # the second TCP endpoint exists only to expose cross-family admission bugs.
@@ -4375,6 +4422,16 @@ if should_run_case "mptunnel_mixed_single_low_latency"; then
 fi
 if should_run_case "mptunnel_mixed_single_balanced"; then
   run_mixed_case "mptunnel_mixed_single_balanced" "$tcp_balanced $udp_balanced"
+fi
+if should_run_case "mptunnel_mixed_single_cross_continent_high_bandwidth"; then
+  run_mixed_case \
+    "mptunnel_mixed_single_cross_continent_high_bandwidth" \
+    "$tcp_fat $udp_fat"
+fi
+if should_run_case "mptunnel_mixed_two_links_lowlat_fat"; then
+  run_mixed_case \
+    "mptunnel_mixed_two_links_lowlat_fat" \
+    "$tcp_lowlat $udp_lowlat $tcp_fat $udp_fat"
 fi
 if should_run_case "mptunnel_mixed_single_unconstrained"; then
   run_mixed_ideal_case "mptunnel_mixed_single_unconstrained" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"

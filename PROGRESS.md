@@ -10,6 +10,34 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-05T23:24:22+08:00: v0.2.1 release candidate validated
+
+- Name: immutable v0.2.1 source release
+- Category: Release identity, quality gate, and repository hygiene
+- State: accepted for the tag-triggered GitHub release workflow
+- Scope:
+  - raised the package identity and both local-package lock entries from
+    `0.2.0` to `0.2.1`;
+  - preserved the established seven-platform archive and tag-specific
+    `version.json` contract without changing packaging or CI; and
+  - replaced six Option-returning `let ... else { return None }` expressions
+    with the behavior-identical `?` form required by Rust 1.96 Clippy. No
+    recovery decision, threshold, timing, or data flow changed.
+- Verification:
+  - strict all-target/all-feature Clippy and formatting pass;
+  - `1,471` library tests, two allocation tests, six packaged daily-use tests,
+    all doctests, `283` patched-QUIC tests, and three patched-QUIC doctests
+    pass;
+  - all `213` lab contract tests, five deterministic benchmark tests, and nine
+    release archive contract tests pass; and
+  - shell syntax, performance registry, whitespace, self-test, and immutable
+    version gates pass. The candidate is newer than `v0.2.0` and exactly
+    matches `v0.2.1`.
+- Environment note: the first deterministic benchmark link stopped with a
+  host `SIGBUS` because the filesystem had only `46 MiB` free. Cleaning only
+  the three ignored project build caches recovered `15 GiB`; the same locked
+  benchmark gate then passed from a clean build.
+
 ## 2026-08-05T23:06:00+08:00: public aggregation uploads refreshed on corrected recovery
 
 - Name: current one-, two-, and five-link request-direction evidence

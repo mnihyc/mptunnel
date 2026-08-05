@@ -396,37 +396,24 @@ impl RequestMultipathController {
         frame: &Frame,
         lane: TrafficClass,
     ) -> Option<ClientReinjectionOutputIdentity> {
-        let Some((original_instance, _)) = self
+        let (original_instance, _) = self
             .request
             .flights
             .unique_original_flight_for_frame(frame)
-            .filter(|(instance, _)| remotes.contains_path_instance(*instance))
-        else {
-            return None;
-        };
+            .filter(|(instance, _)| remotes.contains_path_instance(*instance))?;
         if !context.relay_path_instance_has_bulk_model_evidence(original_instance) {
             return None;
         }
-        let Some(original) = context.reliable_path_snapshot_for_instance(original_instance) else {
-            return None;
-        };
+        let original = context.reliable_path_snapshot_for_instance(original_instance)?;
         let model = self.data_ack_gap_reinjection_model(context, remotes, frame, lane);
-        let Some((target, _)) = model.reinjection_target else {
-            return None;
-        };
+        let (target, _) = model.reinjection_target?;
         if !context.relay_path_instance_has_bulk_model_evidence(target.instance) {
             return None;
         }
-        let Some(alternate) = context.reliable_path_snapshot_for_instance(target.instance) else {
-            return None;
-        };
+        let alternate = context.reliable_path_snapshot_for_instance(target.instance)?;
         let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
-        let Some(original_score) = scheduler::score_path(original, lane, payload_bytes) else {
-            return None;
-        };
-        let Some(alternate_score) = scheduler::score_path(alternate, lane, payload_bytes) else {
-            return None;
-        };
+        let original_score = scheduler::score_path(original, lane, payload_bytes)?;
+        let alternate_score = scheduler::score_path(alternate, lane, payload_bytes)?;
         if alternate_score.eta_ms >= original_score.eta_ms {
             return None;
         }

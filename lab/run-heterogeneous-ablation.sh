@@ -332,6 +332,7 @@ saturate_fat_bandwidth="${MPTUNNEL_LAB_SATURATE_FAT_BANDWIDTH:-450M}"
 saturate_poor_bandwidth="${MPTUNNEL_LAB_SATURATE_POOR_BANDWIDTH:-45M}"
 flap_min_seconds="${MPTUNNEL_LAB_FLAP_MIN_SECONDS:-1}"
 flap_max_seconds="${MPTUNNEL_LAB_FLAP_MAX_SECONDS:-4}"
+flap_initial_stable_seconds="${MPTUNNEL_LAB_FLAP_INITIAL_STABLE_SECONDS:-10}"
 flap_modes="${MPTUNNEL_LAB_FLAP_MODES:-apply,spike-lowlat,spike-balanced,spike-fat,spike-poor,blackhole-lowlat,blackhole-balanced,blackhole-fat,blackhole-poor}"
 flap_seed="${MPTUNNEL_LAB_FLAP_SEED:-}"
 flap_seed_source=""
@@ -1974,6 +1975,7 @@ flapping_result_metadata() {
     --modes "$flap_modes" \
     --min-seconds "$flap_min_seconds" \
     --max-seconds "$flap_max_seconds" \
+    --initial-stable-seconds "$flap_initial_stable_seconds" \
     --trace "$flapper_trace_file" \
     "${anchor_args[@]}"
 }
@@ -2122,8 +2124,12 @@ start_random_flapping() {
   local probe_finished_file="$2"
   local min_seconds="$flap_min_seconds"
   local max_seconds="$flap_max_seconds"
-  if ! [[ "$min_seconds" =~ ^[0-9]+$ && "$max_seconds" =~ ^[0-9]+$ ]]; then
-    echo "MPTUNNEL_LAB_FLAP_MIN_SECONDS and MPTUNNEL_LAB_FLAP_MAX_SECONDS must be non-negative integers" >&2
+  local initial_stable_seconds="$flap_initial_stable_seconds"
+  if ! [[ "$min_seconds" =~ ^[0-9]+$ \
+    && "$max_seconds" =~ ^[0-9]+$ \
+    && "$initial_stable_seconds" =~ ^[0-9]+$ ]]; then
+    echo "MPTUNNEL_LAB_FLAP_MIN_SECONDS, MPTUNNEL_LAB_FLAP_MAX_SECONDS, and" \
+      "MPTUNNEL_LAB_FLAP_INITIAL_STABLE_SECONDS must be non-negative integers" >&2
     return 2
   fi
   if (( min_seconds < 1 )); then
@@ -2176,6 +2182,11 @@ start_random_flapping() {
     flapper_probe_started_unix_seconds="${probe_anchor[0]}"
     flapper_started_monotonic_ms="${probe_anchor[1]}"
     flapper_started_unix_ms="${probe_anchor[2]}"
+    initial_hold_deadline_ms="$(($(monotonic_milliseconds) + initial_stable_seconds * 1000))"
+    while [[ ! -f "$flapper_stop_file" && ! -f "$flapper_probe_finished_file" ]] \
+      && (( $(monotonic_milliseconds) < initial_hold_deadline_ms )); do
+      sleep 0.05
+    done
     event_index=0
     planned_offset_seconds=0
     while [[ ! -f "$flapper_stop_file" && ! -f "$flapper_probe_finished_file" ]]; do

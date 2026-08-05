@@ -196,6 +196,7 @@ def build_metadata(
     min_seconds: int,
     max_seconds: int,
     trace_path: Path,
+    initial_stable_seconds: int = 0,
     probe_started_unix_seconds: str | None = None,
     schedule_origin_unix_ms: str | None = None,
     schedule_origin_monotonic_ms: str | None = None,
@@ -205,6 +206,8 @@ def build_metadata(
 ) -> dict[str, object]:
     modes = normalize_modes(raw_modes)
     min_seconds, max_seconds = normalize_bounds(min_seconds, max_seconds)
+    if initial_stable_seconds < 0:
+        raise ValueError("initial stable interval must be non-negative")
     applied, trace_parse_complete, trace_error = read_trace(trace_path)
     expected = list(
         generate_schedule(seed, modes, min_seconds, max_seconds, max(1, len(applied)))
@@ -229,6 +232,7 @@ def build_metadata(
         "configured_modes": modes,
         "min_hold_seconds": min_seconds,
         "max_hold_seconds": max_seconds,
+        "initial_stable_seconds": initial_stable_seconds,
     }
     schedule_profile_sha256 = hashlib.sha256(
         json.dumps(profile, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -255,6 +259,7 @@ def build_metadata(
         "configured_modes": modes,
         "min_hold_seconds": min_seconds,
         "max_hold_seconds": max_seconds,
+        "initial_stable_seconds": initial_stable_seconds,
         "applied_event_count": len(applied),
         "applied_schedule_sha256": schedule_digest(applied),
         "applied_trace_sha256": trace_digest(applied),
@@ -279,6 +284,9 @@ def build_metadata(
         metadata["schedule_origin_monotonic_ms"] = schedule_origin_monotonic_ms
     if applied:
         metadata["first_event_start_offset_ms"] = applied[0]["event_start_offset_ms"]
+    metadata["initial_stable_timing_valid"] = bool(applied) and int(
+        applied[0]["event_start_offset_ms"]
+    ) >= initial_stable_seconds * 1000 - 100
     if stop_requested_offset_ms is not None:
         metadata["stop_requested_offset_ms"] = stop_requested_offset_ms
     if worker_exit_code is not None:
@@ -290,6 +298,7 @@ def build_metadata(
         and bool(applied)
         and applied_matches_plan
         and dwell_timing_valid
+        and metadata["initial_stable_timing_valid"]
         and metadata["command_failure_count"] == 0
         and worker_exit_code == 0
         and restore_exit_code == 0
@@ -334,6 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     metadata.add_argument("--modes", required=True)
     metadata.add_argument("--min-seconds", required=True, type=int)
     metadata.add_argument("--max-seconds", required=True, type=int)
+    metadata.add_argument("--initial-stable-seconds", type=int, default=0)
     metadata.add_argument("--trace", required=True, type=Path)
     metadata.add_argument("--probe-started-unix-seconds")
     metadata.add_argument("--schedule-origin-unix-ms")
@@ -378,6 +388,7 @@ def main() -> int:
             min_seconds=args.min_seconds,
             max_seconds=args.max_seconds,
             trace_path=args.trace,
+            initial_stable_seconds=args.initial_stable_seconds,
             probe_started_unix_seconds=args.probe_started_unix_seconds,
             schedule_origin_unix_ms=args.schedule_origin_unix_ms,
             schedule_origin_monotonic_ms=args.schedule_origin_monotonic_ms,

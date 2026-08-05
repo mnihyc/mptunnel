@@ -341,6 +341,12 @@ class RunnerContractTests(unittest.TestCase):
             "\n}\n\nshould_run_case()", 1
         )[0]
 
+        self.assertIn(
+            'flap_initial_stable_seconds="${MPTUNNEL_LAB_FLAP_INITIAL_STABLE_SECONDS:-10}"',
+            SCRIPT,
+        )
+        self.assertIn("initial_hold_deadline_ms", flapper)
+        self.assertIn("initial_stable_seconds * 1000", flapper)
         self.assertIn("exec_netem client apply", flapper)
         self.assertIn('exec_netem client "$mode"', flapper)
         self.assertIn("exec_netem server apply", flapper)

@@ -53,12 +53,12 @@ class FlappingScheduleTests(unittest.TestCase):
         applied = [
             {
                 **event,
-                "event_start_offset_ms": index * 1_100,
-                "client_apply_start_offset_ms": index * 1_100 + 1,
-                "client_apply_end_offset_ms": index * 1_100 + 6,
+                "event_start_offset_ms": 10_000 + index * 1_100,
+                "client_apply_start_offset_ms": 10_001 + index * 1_100,
+                "client_apply_end_offset_ms": 10_006 + index * 1_100,
                 "client_command_exit_code": 0,
-                "server_apply_start_offset_ms": index * 1_100 + 7,
-                "server_apply_end_offset_ms": index * 1_100 + 12,
+                "server_apply_start_offset_ms": 10_007 + index * 1_100,
+                "server_apply_end_offset_ms": 10_012 + index * 1_100,
                 "server_command_exit_code": 0,
             }
             for index, event in enumerate(schedule[:3])
@@ -78,10 +78,11 @@ class FlappingScheduleTests(unittest.TestCase):
                 min_seconds=1,
                 max_seconds=1,
                 trace_path=trace_path,
+                initial_stable_seconds=10,
                 probe_started_unix_seconds="1783630000.125000000",
                 schedule_origin_unix_ms="1783630000125",
                 schedule_origin_monotonic_ms="123456789",
-                stop_requested_offset_ms=3_250,
+                stop_requested_offset_ms=13_250,
                 worker_exit_code=0,
                 restore_exit_code=0,
             )
@@ -91,9 +92,11 @@ class FlappingScheduleTests(unittest.TestCase):
         self.assertNotIn("events", metadata)
         self.assertTrue(metadata["applied_schedule_matches_plan"])
         self.assertEqual(metadata["command_failure_count"], 0)
-        self.assertEqual(metadata["stop_requested_offset_ms"], 3_250)
+        self.assertEqual(metadata["stop_requested_offset_ms"], 13_250)
         self.assertEqual(metadata["schedule_origin_monotonic_ms"], "123456789")
-        self.assertEqual(metadata["first_event_start_offset_ms"], 0)
+        self.assertEqual(metadata["initial_stable_seconds"], 10)
+        self.assertEqual(metadata["first_event_start_offset_ms"], 10_000)
+        self.assertTrue(metadata["initial_stable_timing_valid"])
         self.assertTrue(metadata["completed_dwell_timing_valid"])
         self.assertTrue(metadata["trace_complete"])
         self.assertEqual(

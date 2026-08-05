@@ -6047,3 +6047,48 @@ entry is authoritative.
   `./.tmp/lab/results/readme-final-core/`,
   `./.tmp/lab/results/readme-final-path-choice-valid/`, and
   `./.tmp/lab/results/readme-final-asymmetric-fixed-baseline/`.
+
+## 2026-08-05T19:19:59+08:00: performance evidence lifecycle audit and static rerun
+
+- Name: fair asymmetric startup, current static controls, and stable-before-change evidence
+- Category: performance methodology and publication integrity
+- State: asymmetric and static cohorts completed; the corrected dynamic cohort remains pending
+- Proven methodology correction:
+  - commit `a5d0cac` applies asymmetric shaping before baseline processes and MPTUNNEL carriers start;
+  - the clean rerun delivered `181.902/≥17.638 Mbps` for fixed-link Xray,
+    `188.888/≥18.762 Mbps` for fixed-link Hysteria2, and
+    `198.504/196.630 Mbps` for MPTUNNEL using both asymmetric links;
+  - matching single-fast-link MPTUNNEL controls delivered
+    `183.436/180.222 Mbps`, while the two-link run placed `90.7%` of bytes on
+    the directionally faster link in each direction; and
+  - the prior MPTUNNEL `153.009/151.513 Mbps` rows are rejected because their
+    carriers predated asymmetric shaping.
+- Current clean static evidence:
+  - independent 500-Mbps per-flow limits delivered
+    `346.354/338.889 Mbps` with one carrier, `904.757/931.537 Mbps` with the
+    default `1-3`, and `902.027/901.967 Mbps` with three explicit `1-1`
+    endpoints;
+  - behind one shared 200-Mbps bottleneck the same forms remained within
+    `153.374-171.062 Mbps`, so extra carriers did not create capacity where
+    the path had none;
+  - the 60-second admission window completed `734/734` one-MiB requests with
+    twenty live requests, zero rejection, and zero failure; and
+  - the periodic browser case completed all `90/90` requests, but one cold
+    first batch took `5.031 s`; the remaining eight batches met the `3 s`
+    deadline. This row is rejected as deadline-pass evidence pending the
+    focused path-selection rerun.
+- Remaining dynamic evidence boundary:
+  - the randomized condition schedule previously changed a link immediately
+    at workload start, so it could not prove recovery after a stable interval;
+  - the persistent lab now defaults to a configurable ten-second initial
+    stable interval, records it in schedule identity and metadata, and rejects
+    traces whose first condition change violates that interval;
+  - port-hopping throughput will be accepted only with retained
+    `carrier_port_migrated` events; and
+  - scale and disruption rows will distinguish maximum inter-delivery gaps
+    from recovery time and will not infer active-path use without evidence.
+- Verification: Bash syntax, all `36` focused flapping/runner contract tests,
+  and diff whitespace checks pass.
+- Reproducible evidence:
+  `./.tmp/lab/results/readme-asymmetric-fair-clean/` and
+  `./.tmp/lab/results/public-current-static/`.

@@ -450,8 +450,15 @@ impl RequestSenderService {
                 .await
             }
             ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
-                self.dispatch_client_reinjection_work(context, remotes, sender_queue, frame, cause)
-                    .await
+                self.dispatch_client_reinjection_work(
+                    context,
+                    request_lane,
+                    remotes,
+                    sender_queue,
+                    frame,
+                    cause,
+                )
+                .await
             }
         }
     }
@@ -505,15 +512,20 @@ impl RequestSenderService {
     async fn dispatch_client_reinjection_work(
         &mut self,
         context: &ClientPathContext,
+        request_lane: TrafficClass,
         remotes: &mut ReliableRelayRemoteSet,
         sender_queue: &mut ReliableRelaySenderQueue,
         frame: Frame,
         cause: RelaySendCause,
     ) -> Result<ClientQueuedDispatch, RuntimeError> {
-        match self
-            .send_reinjection_frame(context, remotes, frame, cause)
-            .await
-        {
+        let dispatch = if matches!(cause, RelaySendCause::CompletionTailReinjection(_)) {
+            self.send_frame(context, remotes, frame, cause, Some(request_lane))
+                .await
+        } else {
+            self.send_reinjection_frame(context, remotes, frame, cause)
+                .await
+        };
+        match dispatch {
             Ok(outcome) => {
                 let (_, committed) = sender_queue
                     .commit_front()
@@ -546,8 +558,10 @@ impl RequestSenderService {
                 Ok(ClientQueuedDispatch::PersistentReinjectionCancelled)
             }
             Err(err)
-                if cause == RelaySendCause::TailReinjection
-                    && reliable_path_error_is_migratable(&err) =>
+                if matches!(
+                    cause,
+                    RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
+                ) && reliable_path_error_is_migratable(&err) =>
             {
                 let (_, _) = sender_queue
                     .commit_front()
@@ -886,17 +900,75 @@ impl RequestSenderService {
         last_send_ack_frontier: u64,
         lane: TrafficClass,
     ) -> bool {
+        self.enqueue_tail_reinjection_inner(
+            sender_queue,
+            context,
+            remotes,
+            send_stream,
+            last_send_ack_ranges,
+            last_send_ack_complete,
+            reinjection_horizon,
+            last_send_ack_frontier,
+            lane,
+            false,
+        )
+    }
+
+    /// Races only a finite retained tail whose measured alternate is expected
+    /// to complete earlier than its still-live original owner. The existing
+    /// recovery interval, exact-range repeat suppression, and repair envelope
+    /// remain the authority for when and how much can be copied.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn enqueue_completion_tail_reinjection(
+        &mut self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        last_send_ack_ranges: &[OffsetRange],
+        last_send_ack_complete: bool,
+        last_send_ack_frontier: u64,
+        lane: TrafficClass,
+    ) -> bool {
+        self.enqueue_tail_reinjection_inner(
+            sender_queue,
+            context,
+            remotes,
+            send_stream,
+            last_send_ack_ranges,
+            last_send_ack_complete,
+            Some(send_stream.next_offset()),
+            last_send_ack_frontier,
+            lane,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_tail_reinjection_inner(
+        &mut self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        last_send_ack_ranges: &[OffsetRange],
+        last_send_ack_complete: bool,
+        reinjection_horizon: Option<u64>,
+        last_send_ack_frontier: u64,
+        lane: TrafficClass,
+        require_earlier_completion: bool,
+    ) -> bool {
         let Some(reinjection_horizon) = reinjection_horizon else {
             return false;
         };
         if !last_send_ack_complete
-            || last_send_ack_frontier == 0
+            || (!require_earlier_completion && last_send_ack_frontier == 0)
             || last_send_ack_frontier >= reinjection_horizon
             || send_stream.reinjection_bytes() == 0
-            || !matches!(
+            || !(matches!(
                 last_send_ack_ranges,
                 [range] if range.start == 0 && range.end == last_send_ack_frontier
-            )
+            ) || (last_send_ack_frontier == 0 && last_send_ack_ranges.is_empty()))
         {
             return false;
         }
@@ -966,12 +1038,24 @@ impl RequestSenderService {
             if sender_queue.has_queued_reinjection_overlap(&frame) {
                 continue;
             }
+            let completion_target = if require_earlier_completion {
+                let Some(target) = self
+                    .multipath
+                    .tail_reinjection_earlier_completion_target(context, remotes, &frame, lane)
+                else {
+                    break;
+                };
+                Some(target)
+            } else {
+                None
+            };
             let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-            self.enqueue_critical_reinjection_frame(
-                sender_queue,
-                frame,
-                RelaySendCause::TailReinjection,
-            );
+            let cause = if let Some(target) = completion_target {
+                RelaySendCause::CompletionTailReinjection(target)
+            } else {
+                RelaySendCause::TailReinjection
+            };
+            self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);
             queued = true;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(

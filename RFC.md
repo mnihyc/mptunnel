@@ -1690,6 +1690,24 @@ A contiguous live tail without an authoritative gap may send one bounded probe
 after one MPP recovery interval. Another repair requires another full interval
 without MPP Data ACK progress.
 
+For the finite-drain rule below, MPP Data ACK progress means newly
+acknowledged unique Product bytes. Receipt or republication of an unchanged or
+subsumed Data ACK remains stream activity but does not rewrite an
+OriginalData range's assignment age.
+
+Once the sending application fixes a final offset, a remaining exact
+OriginalData range also has an immutable finite-drain age from its original
+assignment. After one owning-path MPP recovery interval, the sender MAY race
+one bounded quantum of that range on a distinct output when both outputs have
+qualified current completion evidence and the ordinary completion scheduler
+estimates that the alternate will finish earlier outside its existing adaptive
+jitter and queue hysteresis. Partial Data ACK progress shrinks the retained
+range but does not rewrite any remaining original flight's assignment time.
+This finite-tail rule does not mark the original attachment stale, withdraw it
+from ordinary placement, or replace native recovery. Exact range identity,
+repeat-delay suppression, shared credit, queue, flight, repair, reorder, and
+extra-traffic bounds continue to apply.
+
 When another non-stale attachment is available, original placement in either
 direction stops selecting a non-progressing attachment after four TCP MPP
 recovery intervals or three QUIC MPP recovery intervals. Every exact

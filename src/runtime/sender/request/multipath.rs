@@ -325,7 +325,7 @@ impl RequestMultipathController {
         remotes: &ReliableRelayRemoteSet,
     ) -> Vec<RelayPathInstance> {
         match cause {
-            RelaySendCause::TailReinjection => {
+            RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_) => {
                 let owner_keys = self.request.flights.tail_reinjection_owner_keys(
                     frame,
                     &remotes.path_instances(),
@@ -381,6 +381,62 @@ impl RequestMultipathController {
             first_reinjection_after,
             repeat_reinjection_after,
         )
+    }
+
+    /// Returns a distinct measured output only when the exact live original
+    /// owner and the measured output both have current completion evidence,
+    /// and the original owner no longer falls within the scheduler's adaptive
+    /// lead hysteresis. This races a finite retained tail without withdrawing the
+    /// live carrier or changing ordinary OriginalData placement.
+    pub(super) fn tail_reinjection_earlier_completion_target(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+    ) -> Option<ClientReinjectionOutputIdentity> {
+        let Some((original_instance, _)) = self
+            .request
+            .flights
+            .unique_original_flight_for_frame(frame)
+            .filter(|(instance, _)| remotes.contains_path_instance(*instance))
+        else {
+            return None;
+        };
+        if !context.relay_path_instance_has_bulk_model_evidence(original_instance) {
+            return None;
+        }
+        let Some(original) = context.reliable_path_snapshot_for_instance(original_instance) else {
+            return None;
+        };
+        let model = self.data_ack_gap_reinjection_model(context, remotes, frame, lane);
+        let Some((target, _)) = model.reinjection_target else {
+            return None;
+        };
+        if !context.relay_path_instance_has_bulk_model_evidence(target.instance) {
+            return None;
+        }
+        let Some(alternate) = context.reliable_path_snapshot_for_instance(target.instance) else {
+            return None;
+        };
+        let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
+        let Some(original_score) = scheduler::score_path(original, lane, payload_bytes) else {
+            return None;
+        };
+        let Some(alternate_score) = scheduler::score_path(alternate, lane, payload_bytes) else {
+            return None;
+        };
+        if alternate_score.eta_ms >= original_score.eta_ms {
+            return None;
+        }
+        (!scheduler::path_within_adaptive_lead_hysteresis(
+            original_score.eta_ms,
+            original,
+            alternate_score.eta_ms,
+            alternate,
+            payload_bytes,
+        ))
+        .then_some(target)
     }
 
     #[cfg(test)]
@@ -652,6 +708,12 @@ impl RequestMultipathController {
         avoid_instances: &[RelayPathInstance],
     ) -> Result<RequestMultipathPlan, RuntimeError> {
         let prepared = self.prepare_relay_path_decision(context, remotes, frame, lane, cause)?;
+        if let Some(target) = cause.completion_tail_target()
+            && self.tail_reinjection_earlier_completion_target(context, remotes, frame, lane)
+                != Some(target)
+        {
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        }
         if let Some(payload_bytes) = prepared.unique_data_payload_bytes {
             let observe_bulk_admission =
                 lane.is_bulk() && remotes.paths.len() > 1 && avoid_instances.is_empty();
@@ -1583,7 +1645,11 @@ impl RequestMultipathController {
         if path.stream.ordered_writer_pending_bytes() != Some(0) {
             return false;
         }
-        if (cause.is_ack_gap_reinjection() || cause == RelaySendCause::TailReinjection)
+        if (cause.is_ack_gap_reinjection()
+            || matches!(
+                cause,
+                RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
+            ))
             && self.request.flights.has_recent_reinjection_on_instance(
                 frame,
                 path.instance(),
@@ -1616,18 +1682,25 @@ impl RequestMultipathController {
         avoid_instances: &[RelayPathInstance],
     ) -> Result<usize, RuntimeError> {
         let ack_gap_reinjection = cause.is_ack_gap_reinjection();
+        let completion_tail_target = cause.completion_tail_target();
         let requires_measured_reinjection_target = cause.is_persistent_ack_gap_reinjection();
-        let required_persistent_target = cause.persistent_client_target();
+        let required_client_target = cause
+            .persistent_client_target()
+            .or_else(|| completion_tail_target.map(|target| target.instance));
         let invalid_persistent_target =
             matches!(cause, RelaySendCause::PersistentServerAckGapReinjection(_));
-        let live_tail_recovery = cause == RelaySendCause::TailReinjection;
-        let requires_distinct_output =
-            cause == RelaySendCause::TailReinjection || ack_gap_reinjection;
+        let live_tail_recovery = matches!(
+            cause,
+            RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
+        );
+        let requires_distinct_output = live_tail_recovery || ack_gap_reinjection;
         let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
         let ordinary_path_allowed = |path: &ReliableRelayRemotePath| {
             !self.request.stale_paths.contains(&path.instance())
                 && !invalid_persistent_target
-                && required_persistent_target.is_none_or(|required| path.instance() == required)
+                && required_client_target.is_none_or(|required| path.instance() == required)
+                && (completion_tail_target.is_none()
+                    || context.relay_path_instance_has_bulk_model_evidence(path.instance()))
                 && (!requires_measured_reinjection_target
                     || context
                         .relay_path_has_bulk_model_evidence(path.key().underlay, path.key().index))
@@ -1650,8 +1723,11 @@ impl RequestMultipathController {
                 .filter(|(_, path)| carrier_reinjection_ready(path, require_idle))
                 .filter(|(_, path)| can_enqueue(path))
                 .filter_map(|(position, path)| {
-                    let key = path.key();
-                    let snapshot = context.reliable_path_snapshot(key)?;
+                    let snapshot = if completion_tail_target.is_some() {
+                        context.reliable_path_snapshot_for_instance(path.instance())?
+                    } else {
+                        context.reliable_path_snapshot(path.key())?
+                    };
                     if !allow_backup && scheduler::path_is_backup(snapshot) {
                         return None;
                     }

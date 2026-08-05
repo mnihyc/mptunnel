@@ -803,6 +803,34 @@ where
         } else {
             path_snapshot
         };
+        // After source staging drains, `next_offset` is the assigned final
+        // offset; racing sooner would put duplicate work ahead of unique data.
+        if !state.endpoint.local_open
+            && sender_queue.data_bytes() == 0
+            && sender.enqueue_completion_tail_reinjection(
+                &mut sender_queue,
+                context,
+                &remotes,
+                &send_stream,
+                state.progress.last_send_ack.ranges(),
+                state.progress.last_send_ack.complete(),
+                state.progress.last_send_ack_frontier,
+                request_lane,
+            )
+        {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "request_completion_tail_reinjection",
+                format_args!(
+                    "stream_id={} ack_frontier={} sent_offset={} reinjection_bytes={} attached_paths={}",
+                    stream_id.0,
+                    state.progress.last_send_ack_frontier,
+                    send_stream.next_offset(),
+                    send_stream.reinjection_bytes(),
+                    remotes.path_keys().len(),
+                ),
+            );
+        }
         let stall_deadline = reliable_relay_product_stall_deadline(
             stall_progress_anchor,
             state.progress.last_product_stall_attempt_at,

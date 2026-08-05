@@ -440,7 +440,11 @@ fn discard_unusable_tail_reinjection_queue(
         let ReliableRelayQueuedWorkKind::Reinjection { frame, cause } = &work.kind else {
             return true;
         };
-        let keep = *cause != RelaySendCause::TailReinjection || usable(frame);
+        let tail_reinjection = matches!(
+            cause,
+            RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
+        );
+        let keep = !tail_reinjection || usable(frame);
         if !keep {
             released = released.saturating_add(work.payload_bytes);
         }

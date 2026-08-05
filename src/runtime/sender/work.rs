@@ -89,6 +89,7 @@ pub(in crate::runtime) enum RelaySendCause {
     PersistentClientAckGapReinjection(PersistentClientAckGapBatch),
     PersistentServerAckGapReinjection(PersistentServerAckGapBatch),
     TailReinjection,
+    CompletionTailReinjection(ClientReinjectionOutputIdentity),
     PathFailureReinjection,
     StalePathReinjection(RelayPathInstance),
     StaleResponsePathReinjection(ServerReinjectionOutputIdentity),
@@ -105,6 +106,7 @@ impl RelaySendCause {
             | Self::PersistentClientAckGapReinjection(_)
             | Self::PersistentServerAckGapReinjection(_) => "persistent_ack_gap_reinjection",
             Self::TailReinjection => "tail_reinjection",
+            Self::CompletionTailReinjection(_) => "completion_tail_reinjection",
             Self::PathFailureReinjection => "path_failure_reinjection",
             Self::StalePathReinjection(_) | Self::StaleResponsePathReinjection(_) => {
                 "stale_path_reinjection"
@@ -120,6 +122,7 @@ impl RelaySendCause {
                 | Self::PersistentClientAckGapReinjection(_)
                 | Self::PersistentServerAckGapReinjection(_)
                 | Self::TailReinjection
+                | Self::CompletionTailReinjection(_)
                 | Self::PathFailureReinjection
                 | Self::StalePathReinjection(_)
                 | Self::StaleResponsePathReinjection(_)
@@ -146,6 +149,7 @@ impl RelaySendCause {
             || matches!(
                 self,
                 Self::TailReinjection
+                    | Self::CompletionTailReinjection(_)
                     | Self::PathFailureReinjection
                     | Self::StalePathReinjection(_)
                     | Self::StaleResponsePathReinjection(_)
@@ -155,6 +159,15 @@ impl RelaySendCause {
     pub(in crate::runtime::sender) fn persistent_client_target(self) -> Option<RelayPathInstance> {
         match self {
             Self::PersistentClientAckGapReinjection(batch) => Some(batch.target.instance),
+            _ => None,
+        }
+    }
+
+    pub(in crate::runtime::sender) fn completion_tail_target(
+        self,
+    ) -> Option<ClientReinjectionOutputIdentity> {
+        match self {
+            Self::CompletionTailReinjection(target) => Some(target),
             _ => None,
         }
     }

@@ -1053,6 +1053,45 @@ impl ClientPathContext {
         }
     }
 
+    pub(in crate::runtime) fn relay_path_instance_has_bulk_model_evidence(
+        &self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        let path = match instance.key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_path_spec(instance.key.index),
+            UnderlayProtocol::Udp => self.udp_paths.get(instance.key.index),
+        };
+        let Some(path) = path else {
+            return false;
+        };
+        let observation = self
+            .state
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .path_record(instance.key)
+            .and_then(|record| {
+                record.observation_for_instance_at(instance.path_instance_id, Instant::now())
+            });
+        observation
+            .map(|observation| bulk_candidate_has_bulk_rate_evidence(path, observation))
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn install_relay_path_instance_for_test(
+        &self,
+        instance: RelayPathInstance,
+    ) {
+        self.state.install_peer_path_usage(
+            instance.key.underlay,
+            instance.key.index,
+            instance.path_instance_id,
+            0,
+            crate::protocol::PathUsage::Available,
+        );
+    }
+
     pub(in crate::runtime) fn relay_path_has_fresh_proof(
         &self,
         underlay: UnderlayProtocol,

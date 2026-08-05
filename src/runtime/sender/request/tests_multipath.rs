@@ -3,6 +3,7 @@ use super::super::test_support::{
     opened_test_relay_stream_with_underlay, seed_client_bulk_evidence_for_test,
 };
 use super::*;
+use crate::model::capacity::{PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS};
 use crate::model::request_evidence::RequestPerFlowRateModel;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::runtime::path::commands::{
@@ -100,6 +101,123 @@ async fn bounded_ack_gap_uses_an_active_unmeasured_alternate() {
         ),
         Err(RuntimeError::ReliablePathSessionClosed)
     ));
+}
+
+#[tokio::test]
+async fn retained_tail_uses_only_a_measured_earlier_completion() {
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10253?srtt-ms=20",
+        "udp://127.0.0.1:10254?srtt-ms=20",
+        "udp://127.0.0.1:10255?srtt-ms=20",
+    ]);
+    let stream_id = StreamId(18);
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
+    let tcp = remotes.paths[0].instance();
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        udp_commands,
+    ));
+    let udp = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("UDP attachment")
+        .instance();
+    let (unmeasured_commands, mut unmeasured_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        1,
+        unmeasured_commands,
+    ));
+    let unmeasured = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp && path.key().index == 1)
+        .expect("unmeasured UDP attachment")
+        .instance();
+    consume_client_path_proof_for_test(&mut tcp_receivers);
+    consume_client_path_proof_for_test(&mut udp_receivers);
+    consume_client_path_proof_for_test(&mut unmeasured_receivers);
+
+    context.install_relay_path_instance_for_test(tcp);
+    context.install_relay_path_instance_for_test(udp);
+    context.install_relay_path_instance_for_test(unmeasured);
+
+    let slow_owner_sample = PathRateSample::new(4 * 1024 * 1024, Duration::from_secs(10))
+        .expect("single-digit-Mbps measured owner");
+    let fast_alternate_sample = PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20))
+        .expect("fast measured alternate");
+    for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
+        context.mark_relay_path_rate_sample(tcp, slow_owner_sample);
+        context.mark_relay_path_rate_sample(udp, fast_alternate_sample);
+    }
+    assert!(context.relay_path_instance_has_bulk_model_evidence(tcp));
+    assert!(context.relay_path_instance_has_bulk_model_evidence(udp));
+    assert!(!context.relay_path_instance_has_bulk_model_evidence(unmeasured));
+
+    let frame = data_frame(stream_id, 0, 64 * 1024);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(tcp, &frame);
+    context.record_relay_path_send(tcp, reliable_stream_frame_accounted_bytes(&frame));
+
+    let original = context
+        .reliable_path_snapshot_for_instance(tcp)
+        .expect("exact original snapshot");
+    let alternate = context
+        .reliable_path_snapshot_for_instance(udp)
+        .expect("exact alternate snapshot");
+    let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
+    let original_score = scheduler::score_path(original, TrafficClass::Throughput, payload_bytes)
+        .expect("original completion score");
+    let alternate_score = scheduler::score_path(alternate, TrafficClass::Throughput, payload_bytes)
+        .expect("alternate completion score");
+    assert!(
+        alternate_score.eta_ms < original_score.eta_ms,
+        "alternate ETA {} ms must beat original ETA {} ms (rates {}/{})",
+        alternate_score.eta_ms,
+        original_score.eta_ms,
+        alternate.delivery_rate_bps,
+        original.delivery_rate_bps,
+    );
+    assert!(!scheduler::path_within_adaptive_lead_hysteresis(
+        original_score.eta_ms,
+        original,
+        alternate_score.eta_ms,
+        alternate,
+        payload_bytes,
+    ));
+
+    let target = controller
+        .tail_reinjection_earlier_completion_target(
+            &context,
+            &remotes,
+            &frame,
+            TrafficClass::Throughput,
+        )
+        .expect("the measured alternate completes earlier");
+    assert_eq!(target, ClientReinjectionOutputIdentity { instance: udp });
+    let selected = controller
+        .choose_lowest_eta_relay_path(
+            &context,
+            &remotes,
+            &frame,
+            TrafficClass::Throughput,
+            RelaySendCause::CompletionTailReinjection(target),
+            &[tcp],
+        )
+        .expect("the completion copy remains bound to its proven output");
+    assert_eq!(
+        remotes.paths[selected].instance(),
+        udp,
+        "an unmeasured attachment cannot replace the proven completion output"
+    );
+    assert!(!controller.path_is_stale(tcp));
 }
 
 #[tokio::test]

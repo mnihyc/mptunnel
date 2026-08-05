@@ -9,7 +9,7 @@ and macOS keep VPN policy in their application host.
 | Linux | Process | Two-phase | Native |
 | Android | Host | Published | Adapter |
 | Windows | Process | Two-phase | Wintun |
-| macOS | Host | Published | Adapter |
+| macOS | Host | Two-phase | Adapter |
 
 Run `mptunnel platform` for the exact current-host report. Unsupported managed
 operation fails explicitly; it never starts a partially configured tunnel.

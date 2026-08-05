@@ -335,11 +335,32 @@ fn routes_equal(left: &Route, right: &Route) -> bool {
         && left.prefix() == right.prefix()
         && normalized_gateway(left.gateway()) == normalized_gateway(right.gateway())
         && left.if_index() == right.if_index()
+        && route_scopes_equal(left, right)
         && route_metrics_equal(left, right)
 }
 
 fn normalized_gateway(gateway: Option<IpAddr>) -> Option<IpAddr> {
     gateway.filter(|gateway| !gateway.is_unspecified())
+}
+
+#[cfg(target_os = "windows")]
+fn route_scopes_equal(_left: &Route, _right: &Route) -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn route_scopes_equal(left: &Route, right: &Route) -> bool {
+    left.if_scope() == right.if_scope()
+}
+
+#[cfg(target_os = "windows")]
+fn route_is_global(_route: &Route) -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn route_is_global(route: &Route) -> bool {
+    !route.if_scope()
 }
 
 #[cfg(target_os = "windows")]
@@ -375,6 +396,9 @@ pub fn snapshot_process_vpn_environment()
     #[cfg(target_os = "windows")]
     let mut interface_metrics = BTreeMap::<(AddressFamily, u32), u32>::new();
     for route in routes {
+        if !route_is_global(&route) {
+            continue;
+        }
         let Some(interface_index) = route.if_index().filter(|index| *index != 0) else {
             continue;
         };
@@ -616,6 +640,6 @@ impl std::error::Error for SystemProcessMutationError {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 #[path = "tests_desktop_routes.rs"]
 mod tests;

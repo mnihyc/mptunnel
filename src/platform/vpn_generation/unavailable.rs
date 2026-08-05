@@ -1,8 +1,8 @@
 //! Truthful process-host behavior until a target adapter is supplied.
 //!
-//! Android is host-owned and enters through the public provider API. Windows
-//! and macOS have first-class lifecycle contracts but do not silently claim
-//! route/DNS mutation before their native adapters are installed.
+//! Android and macOS enter managed VPN operation through application-owned host
+//! adapters. Neither target silently claims route/DNS mutation when that host
+//! integration is unavailable.
 
 use super::super::{PacketDeviceProvider, VpnCapability, VpnPlatform, VpnPlatformCapabilities};
 use super::VpnGenerationError;

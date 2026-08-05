@@ -163,6 +163,13 @@ pub(super) async fn spawn_socks5_client_ingress(
     }
     let admission = LocalIngressAdmission::new(admission);
     for listener in bound {
+        let local_address = listener.local_addr()?;
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "inbound",
+            "listening",
+            format_args!("{inbound}: SOCKS5 listening on {local_address}"),
+        );
         let router = router.clone();
         let inbound = inbound.clone();
         let proxy_auth = proxy_auth.clone();
@@ -258,6 +265,13 @@ pub(super) async fn spawn_http_connect_client_ingress(
     }
     let admission = LocalIngressAdmission::new(admission);
     for listener in bound {
+        let local_address = listener.local_addr()?;
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "inbound",
+            "listening",
+            format_args!("{inbound}: HTTP CONNECT listening on {local_address}"),
+        );
         let router = router.clone();
         let inbound = inbound.clone();
         let proxy_auth = proxy_auth.clone();
@@ -349,6 +363,13 @@ pub(super) async fn spawn_tcp_forward_client_ingress(
     let target = Arc::new(target.into_target());
     let connection_slots = Arc::new(Semaphore::new(max_connections));
     for listener in bound {
+        let local_address = listener.local_addr()?;
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "inbound",
+            "listening",
+            format_args!("{inbound}: TCP forwarding listening on {local_address}"),
+        );
         services.spawn(run_tcp_forward_client_listener(
             listener,
             target.clone(),
@@ -475,6 +496,13 @@ pub(super) async fn spawn_udp_forward_client_ingress(
     let target = Arc::new(target.into_target());
     let association_slots = Arc::new(Semaphore::new(max_associations));
     for socket in bound {
+        let local_address = socket.local_addr()?;
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "inbound",
+            "listening",
+            format_args!("{inbound}: UDP forwarding listening on {local_address}"),
+        );
         services.spawn(run_udp_forward_client_socket(
             socket,
             target.clone(),

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 
 const DEFAULT_WINDOW_MS: u64 = 10_000;
 const DEFAULT_BURST: u32 = 4;
@@ -393,6 +394,40 @@ pub(crate) fn emit(
     let Some(suppressed) = limiter.admit(timestamp_unix_ms) else {
         return;
     };
+    emit_record(
+        level,
+        component,
+        event,
+        timestamp_unix_ms,
+        suppressed,
+        arguments,
+    );
+}
+
+/// Emits a bounded control-plane lifecycle record without fault-rate limiting.
+///
+/// Callers use this only for finite state transitions and configured inventory,
+/// never from traffic, carrier retry, probe, or sampling loops.
+pub(crate) fn emit_lifecycle(
+    level: LogLevel,
+    component: &'static str,
+    event: &'static str,
+    arguments: fmt::Arguments<'_>,
+) {
+    if !enabled(level) {
+        return;
+    }
+    emit_record(level, component, event, unix_millis(), 0, arguments);
+}
+
+fn emit_record(
+    level: LogLevel,
+    component: &'static str,
+    event: &'static str,
+    timestamp_unix_ms: u64,
+    suppressed: u64,
+    arguments: fmt::Arguments<'_>,
+) {
     let mut bounded = BoundedMessage::new(MESSAGE_LIMIT);
     let _ = bounded.write_fmt(arguments);
     let message = bound_message(redact_message(&bounded.finish()), MESSAGE_LIMIT);
@@ -440,20 +475,50 @@ fn write_record(output: &mut Vec<u8>, format: LogFormat, record: &LogRecord<'_>)
             output.push(b'\n');
         }
         LogFormat::Text => {
-            let message = serde_json::to_string(record.message)
-                .unwrap_or_else(|_| "\"log-error\"".to_owned());
-            let _ = writeln!(
+            write_text_header(
                 output,
-                "timestamp_unix_ms={} level={} component={} event={} message={} suppressed={}",
                 record.timestamp_unix_ms,
                 record.level,
                 record.component,
                 record.event,
-                message,
-                record.suppressed,
             );
+            let _ = write!(output, "{}", record.message);
+            write_suppressed(output, record.suppressed);
+            output.push(b'\n');
         }
     }
+}
+
+fn write_text_header(
+    output: &mut Vec<u8>,
+    timestamp_unix_ms: u64,
+    level: &str,
+    component: &str,
+    event: &str,
+) {
+    let timestamp = readable_timestamp(timestamp_unix_ms);
+    let _ = write!(
+        output,
+        "{timestamp} {:<5} {component}.{event}: ",
+        text_level(level)
+    );
+}
+
+fn text_level(level: &str) -> &str {
+    match level {
+        "error" => "ERROR",
+        "warn" => "WARN",
+        "info" => "INFO",
+        _ => "UNKNOWN",
+    }
+}
+
+fn write_suppressed(output: &mut Vec<u8>, suppressed: u64) {
+    if suppressed == 0 {
+        return;
+    }
+    let noun = if suppressed == 1 { "event" } else { "events" };
+    let _ = write!(output, " ({suppressed} similar {noun} suppressed)");
 }
 
 #[derive(Serialize)]
@@ -543,20 +608,17 @@ pub(crate) fn emit_flow_open(
                 .balancer
                 .map(quote_text_field)
                 .unwrap_or_else(|| "null".to_string());
-            let _ = writeln!(
-                line,
-                "timestamp_unix_ms={} level={} component={} event={} flow_id={} origin={} network={} inbound={} target={} outbound={} balancer={}",
+            write_text_header(
+                &mut line,
                 record.timestamp_unix_ms,
                 record.level,
                 record.component,
                 record.event,
-                record.flow_id,
-                record.origin,
-                record.network,
-                inbound,
-                target,
-                outbound,
-                balancer,
+            );
+            let _ = writeln!(
+                line,
+                "id={} origin={} network={} inbound={} destination={} outbound={} balancer={}",
+                record.flow_id, record.origin, record.network, inbound, target, outbound, balancer,
             );
         }
     }
@@ -606,13 +668,16 @@ pub(crate) fn emit_flow_close(
             line.push(b'\n');
         }
         LogFormat::Text => {
-            let _ = writeln!(
-                line,
-                "timestamp_unix_ms={} level={} component={} event={} flow_id={} network={} outcome={} duration_ms={} to_peer_bytes={} to_peer_packets={} from_peer_bytes={} from_peer_packets={}",
+            write_text_header(
+                &mut line,
                 record.timestamp_unix_ms,
                 record.level,
                 record.component,
                 record.event,
+            );
+            let _ = writeln!(
+                line,
+                "id={} network={} outcome={} duration_ms={} to_peer_bytes={} to_peer_packets={} from_peer_bytes={} from_peer_packets={}",
                 record.flow_id,
                 record.network,
                 record.outcome,
@@ -637,6 +702,23 @@ fn unix_millis() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+fn readable_timestamp(timestamp_unix_ms: u64) -> String {
+    let nanoseconds = i128::from(timestamp_unix_ms).saturating_mul(1_000_000);
+    let Ok(timestamp) = OffsetDateTime::from_unix_timestamp_nanos(nanoseconds) else {
+        return format!("unix:{timestamp_unix_ms}");
+    };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        timestamp.year(),
+        u8::from(timestamp.month()),
+        timestamp.day(),
+        timestamp.hour(),
+        timestamp.minute(),
+        timestamp.second(),
+        timestamp.millisecond(),
+    )
 }
 
 struct BoundedMessage {
@@ -683,21 +765,37 @@ impl fmt::Write for BoundedMessage {
 }
 
 fn redact_message(message: &str) -> String {
-    let mut redacted = message.replace(['\r', '\n'], " ");
-    for marker in [
-        "bearer ",
-        "authorization:",
-        "authorization=",
-        "token=",
-        "token:",
-        "secret=",
-        "secret:",
-        "password=",
-        "password:",
-        "credential_secret=",
-        "credential-secret=",
+    let mut redacted = message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    for key in [
+        "authorization",
+        "proxy-authorization",
+        "proxy_authorization",
+        "cookie",
+        "set-cookie",
+        "token",
+        "management_token",
+        "api_key",
+        "api-key",
+        "access_token",
+        "refresh_token",
+        "secret",
+        "password",
+        "credential_secret",
+        "credential-secret",
+        "transport_shared_secret",
+        "private_key",
+        "private-key",
     ] {
-        redacted = redact_after_marker(&redacted, marker);
+        redacted = redact_key_value(&redacted, key);
     }
     redacted
 }
@@ -716,33 +814,114 @@ fn bound_message(mut message: String, limit: usize) -> String {
     message
 }
 
-fn redact_after_marker(value: &str, marker: &str) -> String {
+fn redact_key_value(value: &str, key: &str) -> String {
     let lower = value.to_ascii_lowercase();
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
-    while let Some(relative_start) = lower[cursor..].find(marker) {
-        let marker_start = cursor + relative_start;
-        let mut secret_start = marker_start + marker.len();
-        while value.as_bytes().get(secret_start) == Some(&b' ') {
+    while let Some(relative_start) = lower[cursor..].find(key) {
+        let key_start = cursor + relative_start;
+        let key_end = key_start + key.len();
+        if key_start > 0 && is_sensitive_key_character(value.as_bytes()[key_start - 1]) {
+            output.push_str(&value[cursor..key_end]);
+            cursor = key_end;
+            continue;
+        }
+
+        let bytes = value.as_bytes();
+        let mut separator = key_end;
+        if matches!(bytes.get(separator), Some(b'"' | b'\'')) {
+            separator += 1;
+        }
+        while bytes.get(separator).is_some_and(u8::is_ascii_whitespace) {
+            separator += 1;
+        }
+        if !matches!(bytes.get(separator), Some(b':' | b'=')) {
+            output.push_str(&value[cursor..key_end]);
+            cursor = key_end;
+            continue;
+        }
+
+        let mut secret_start = separator + 1;
+        while bytes.get(secret_start).is_some_and(u8::is_ascii_whitespace) {
             secret_start += 1;
         }
         output.push_str(&value[cursor..secret_start]);
-        if secret_start >= value.len() {
+        let Some(first) = bytes.get(secret_start).copied() else {
             cursor = secret_start;
             break;
-        }
-        let secret_end = value[secret_start..]
-            .char_indices()
-            .find_map(|(offset, character)| {
-                (character.is_whitespace() || matches!(character, ',' | ';' | ']' | '}' | '&'))
-                    .then_some(secret_start + offset)
-            })
-            .unwrap_or(value.len());
+        };
+        let secret_end = if matches!(first, b'"' | b'\'') {
+            output.push(char::from(first));
+            secret_start += 1;
+            quoted_secret_end(bytes, secret_start, first)
+        } else if matches!(
+            key,
+            "authorization" | "proxy-authorization" | "proxy_authorization"
+        ) {
+            authorization_secret_end(value, secret_start)
+        } else if matches!(key, "cookie" | "set-cookie") {
+            value.len()
+        } else {
+            unquoted_secret_end(value, secret_start)
+        };
         output.push_str("<redacted>");
         cursor = secret_end;
     }
     output.push_str(&value[cursor..]);
     output
+}
+
+fn is_sensitive_key_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn quoted_secret_end(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut escaped = false;
+    for (offset, byte) in bytes[start..].iter().copied().enumerate() {
+        if byte == quote && !escaped {
+            return start + offset;
+        }
+        escaped = byte == b'\\' && !escaped;
+        if byte != b'\\' {
+            escaped = false;
+        }
+    }
+    bytes.len()
+}
+
+fn authorization_secret_end(value: &str, start: usize) -> usize {
+    let remaining = &value[start..];
+    for scheme in ["basic", "bearer"] {
+        if remaining
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            && remaining
+                .as_bytes()
+                .get(scheme.len())
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            let mut credential_start = start + scheme.len();
+            while value
+                .as_bytes()
+                .get(credential_start)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                credential_start += 1;
+            }
+            return unquoted_secret_end(value, credential_start);
+        }
+    }
+    unquoted_secret_end(value, start)
+}
+
+fn unquoted_secret_end(value: &str, start: usize) -> usize {
+    value[start..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            (character.is_whitespace() || matches!(character, ',' | ';' | ']' | '}' | '&'))
+                .then_some(start + offset)
+        })
+        .unwrap_or(value.len())
 }
 
 macro_rules! process_event {

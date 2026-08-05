@@ -1,7 +1,7 @@
 use crate::cli::{Cli, CliConfigError, Command};
 use crate::config::{
-    AppConfig, CanonicalConfigStore, ConfigFileError, ConfigStoreError, DEFAULT_CONFIG_PATH,
-    canonical_config_owned_paths,
+    AppConfig, CanonicalConfigStore, CommandConfig, ConfigFileError, ConfigStoreError,
+    DEFAULT_CONFIG_PATH, OutboundLeafConfig, canonical_config_owned_paths,
 };
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -46,7 +46,13 @@ pub fn run_from_env() -> Result<(), AppError> {
 }
 
 pub fn report_fatal_error(error: &AppError) {
-    crate::observability::process_event!(Error, "process", "fatal", "{error}");
+    crate::observability::process_event!(
+        Error,
+        "process",
+        "fatal",
+        "MPTUNNEL {} failed: {error}",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 pub fn run(cli: Cli) -> Result<(), AppError> {
@@ -98,16 +104,15 @@ pub fn run_config_file(mut invocation: ConfigFileInvocation) -> Result<(), AppEr
     }
 
     crate::observability::configure_for_store(&config.logging, config_control.store())?;
-    crate::observability::process_event!(
-        Info,
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
         "process",
         "starting",
-        "mptunnel {} starting with {} ({})",
-        env!("CARGO_PKG_VERSION"),
-        config_control.store().path().display(),
-        config_control.store().revision()
+        format_args!("MPTUNNEL {} starting", env!("CARGO_PKG_VERSION")),
     );
+    log_file_configuration(&config, config_control.store());
     let runtime = build_runtime()?;
+    let update_check = crate::update::spawn(&runtime);
     if config.service.service_mode {
         crate::observability::process_event!(
             Info,
@@ -117,10 +122,19 @@ pub fn run_config_file(mut invocation: ConfigFileInvocation) -> Result<(), AppEr
         );
     }
     let shutdown = ProcessShutdown::new();
-    runtime.block_on(run_process_until_shutdown(
+    let result = runtime.block_on(run_process_until_shutdown(
         run_config_file_generations(config, config_control, invocation, shutdown.clone()),
         shutdown,
-    ))?;
+    ));
+    update_check.abort();
+    let _ = runtime.block_on(update_check);
+    result?;
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
+        "process",
+        "stopped",
+        format_args!("MPTUNNEL stopped cleanly"),
+    );
     Ok(())
 }
 
@@ -131,14 +145,15 @@ fn run_config(config: AppConfig) -> Result<(), AppError> {
     }
 
     crate::observability::configure(&config.logging)?;
-    crate::observability::process_event!(
-        Info,
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
         "process",
         "starting",
-        "mptunnel {} starting",
-        env!("CARGO_PKG_VERSION")
+        format_args!("MPTUNNEL {} starting", env!("CARGO_PKG_VERSION")),
     );
+    log_command_line_configuration(&config);
     let runtime = build_runtime()?;
+    let update_check = crate::update::spawn(&runtime);
     if config.service.service_mode {
         crate::observability::process_event!(
             Info,
@@ -152,8 +167,180 @@ fn run_config(config: AppConfig) -> Result<(), AppError> {
         run_standalone_generations(config, shutdown.clone()),
         shutdown,
     ));
+    update_check.abort();
+    let _ = runtime.block_on(update_check);
     result?;
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
+        "process",
+        "stopped",
+        format_args!("MPTUNNEL stopped cleanly"),
+    );
     Ok(())
+}
+
+fn log_file_configuration(config: &AppConfig, store: &CanonicalConfigStore) {
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
+        "configuration",
+        "loaded",
+        format_args!(
+            "Loaded {} (revision {})",
+            store.path().display(),
+            store.revision()
+        ),
+    );
+    log_configuration_inventory(config);
+}
+
+fn log_command_line_configuration(config: &AppConfig) {
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
+        "configuration",
+        "loaded",
+        format_args!("Loaded command-line configuration"),
+    );
+    log_configuration_inventory(config);
+}
+
+fn log_configuration_inventory(config: &AppConfig) {
+    let CommandConfig::Node(node) = &config.command;
+    let route_count = node
+        .product_policy
+        .as_ref()
+        .map_or(0, |policy| policy.routes.len());
+    let inbound_count = node.local_ingresses.len() + node.servers.len();
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
+        "configuration",
+        "summary",
+        format_args!(
+            "Configured {inbound_count} {}, {} {}, {} {}, {route_count} {}, and {} {}",
+            plural_noun(inbound_count, "inbound", "inbounds"),
+            node.outbounds.len(),
+            plural_noun(node.outbounds.len(), "outbound", "outbounds"),
+            node.gateway_balancers.len(),
+            plural_noun(node.gateway_balancers.len(), "balancer", "balancers"),
+            plural_noun(route_count, "route", "routes"),
+            node.dns_policy.spec.plans.len(),
+            plural_noun(node.dns_policy.spec.plans.len(), "DNS plan", "DNS plans"),
+        ),
+    );
+
+    for outbound in &node.outbounds {
+        match outbound {
+            OutboundLeafConfig::Mpp { id, config } => {
+                crate::observability::emit_lifecycle(
+                    crate::config::LogLevel::Info,
+                    "outbound",
+                    "configured",
+                    format_args!(
+                        "{}: MPP over {} configured {}, TCP and UDP targets",
+                        id.as_str(),
+                        config.paths.len(),
+                        plural_noun(config.paths.len(), "path", "paths"),
+                    ),
+                );
+                for path in &config.paths {
+                    log_mpp_path("outbound", id.as_str(), &path.name, &path.spec);
+                }
+            }
+            OutboundLeafConfig::Local { id, config, .. } => {
+                log_native_outbound(id.as_str(), config);
+            }
+        }
+    }
+}
+
+fn log_mpp_path(owner_kind: &str, owner: &str, name: &str, path: &crate::transport::PathSpec) {
+    let transport = match path.underlay {
+        crate::protocol::UnderlayProtocol::Tcp => "TCP",
+        crate::protocol::UnderlayProtocol::Udp => "QUIC",
+    };
+    if let Some(carriers) = path.tcp_carrier_range() {
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "path",
+            "configured",
+            format_args!(
+                "{owner_kind} {owner}, path {name}: {transport} to {}, {} {}",
+                path.endpoint.authority(),
+                carriers.max(),
+                plural_noun(usize::from(carriers.max()), "carrier", "carriers"),
+            ),
+        );
+    } else {
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "path",
+            "configured",
+            format_args!(
+                "{owner_kind} {owner}, path {name}: {transport} to {}",
+                path.endpoint.authority(),
+            ),
+        );
+    }
+}
+
+fn log_native_outbound(name: &str, outbound: &crate::outbound::OutboundConfig) {
+    let (kind, detail, authentication) = match outbound {
+        crate::outbound::OutboundConfig::Direct => ("direct", None, None),
+        crate::outbound::OutboundConfig::BindSourceIp(address) => {
+            ("direct", Some(address.to_string()), None)
+        }
+        crate::outbound::OutboundConfig::Socks5(proxy) => (
+            "SOCKS5 proxy",
+            Some(proxy.endpoint().authority()),
+            Some(proxy.credentials().is_some()),
+        ),
+        crate::outbound::OutboundConfig::HttpConnect(proxy) => (
+            "HTTP CONNECT proxy",
+            Some(proxy.endpoint().authority()),
+            Some(proxy.credentials().is_some()),
+        ),
+        crate::outbound::OutboundConfig::HttpsConnect(proxy) => (
+            "HTTPS CONNECT proxy",
+            Some(proxy.proxy().endpoint().authority()),
+            Some(proxy.proxy().credentials().is_some()),
+        ),
+    };
+    let networks = if outbound.supports_udp_targets() {
+        "TCP and UDP targets"
+    } else {
+        "TCP targets"
+    };
+    match (detail, authentication) {
+        (Some(detail), Some(authentication)) => crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "outbound",
+            "configured",
+            format_args!(
+                "{name}: {kind} via {detail}, {networks}; authentication {}",
+                if authentication {
+                    "configured"
+                } else {
+                    "disabled"
+                },
+            ),
+        ),
+        (Some(detail), None) => crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "outbound",
+            "configured",
+            format_args!("{name}: {kind} using source {detail}, {networks}"),
+        ),
+        (None, None) => crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "outbound",
+            "configured",
+            format_args!("{name}: {kind}, {networks}"),
+        ),
+        (None, Some(_)) => unreachable!("proxy outbounds always have an endpoint"),
+    }
+}
+
+fn plural_noun<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime, AppError> {
@@ -428,8 +615,16 @@ where
     tokio::select! {
         joined = &mut operation => map_process_join(joined),
         signal = signal => {
-            shutdown.request();
             let signal_error = signal.err();
+            if signal_error.is_none() {
+                crate::observability::emit_lifecycle(
+                    crate::config::LogLevel::Info,
+                    "process",
+                    "shutdown_requested",
+                    format_args!("Shutdown signal received; draining runtime services"),
+                );
+            }
+            shutdown.request();
             let joined = match tokio::time::timeout(teardown_timeout, &mut operation).await {
                 Ok(joined) => joined,
                 Err(_) if shutdown.must_preserve_published_vpn_runtime() => {
@@ -590,17 +785,31 @@ async fn drive_runtime_generation(
     shutdown: ProcessShutdown,
 ) -> crate::runtime::RuntimeGenerationOutcome {
     tokio::pin!(runtime);
+    let mut readiness_pending = true;
     if shutdown.is_requested() {
         generation.mark_stopping();
         generation.request_shutdown();
         return runtime.await;
     }
-    tokio::select! {
-        outcome = &mut runtime => outcome,
-        () = shutdown.wait() => {
-            generation.mark_stopping();
-            generation.request_shutdown();
-            runtime.await
+    loop {
+        tokio::select! {
+            outcome = &mut runtime => return outcome,
+            () = shutdown.wait() => {
+                generation.mark_stopping();
+                generation.request_shutdown();
+                return runtime.await;
+            }
+            ready = generation.wait_until_ready(), if readiness_pending => {
+                readiness_pending = false;
+                if ready.is_ok() && generation.is_ready() && !shutdown.is_requested() {
+                    crate::observability::emit_lifecycle(
+                        crate::config::LogLevel::Info,
+                        "process",
+                        "generation_ready",
+                        format_args!("Runtime generation is ready"),
+                    );
+                }
+            }
         }
     }
 }
@@ -688,6 +897,16 @@ async fn run_config_file_generations(
                     return Ok(());
                 }
                 config = config_control.store().current_config();
+                crate::observability::emit_lifecycle(
+                    crate::config::LogLevel::Info,
+                    "configuration",
+                    "reload_requested",
+                    format_args!(
+                        "Preparing configuration generation {} from {}",
+                        config_control.store().revision(),
+                        config_control.store().path().display(),
+                    ),
+                );
                 config_control = config_control.next_generation();
                 restarts = 0;
                 backoff = config.service.restart_backoff;
@@ -771,6 +990,7 @@ async fn run_config_file_generations(
                         config_control.runtime_revision(),
                         config_control.store().path().display()
                     );
+                    log_configuration_inventory(&config);
                 }
             }
         }
@@ -996,8 +1216,8 @@ where
                         match activate_ready_generation(control) {
                             Ok(activation) => {
                                 activated = true;
-                                if let Some(activation) = activation {
-                                    if activation.changed {
+                                match activation {
+                                    Some(activation) if activation.changed => {
                                         crate::observability::process_event!(
                                             Info,
                                             "configuration",
@@ -1006,13 +1226,24 @@ where
                                             activation.revision,
                                             control.store().path().display()
                                         );
-                                    } else {
+                                        log_configuration_inventory(&activation.config);
+                                    }
+                                    Some(activation) => {
                                         crate::observability::process_event!(
                                             Info,
                                             "vpn",
                                             "generation_ready",
                                             "runtime generation {} and managed VPN are ready",
                                             activation.revision
+                                        );
+                                    }
+                                    None => {
+                                        crate::observability::process_event!(
+                                            Info,
+                                            "vpn",
+                                            "generation_ready",
+                                            "runtime generation {} and managed VPN are ready",
+                                            control.runtime_revision()
                                         );
                                     }
                                 }
@@ -1164,8 +1395,8 @@ async fn drive_canonical_generation(
                     match activate_ready_generation(&config_control) {
                         Ok(activation) => {
                             activated = true;
-                            if let Some(activation) = activation {
-                                if activation.changed {
+                            match activation {
+                                Some(activation) if activation.changed => {
                                     crate::observability::process_event!(
                                         Info,
                                         "configuration",
@@ -1174,13 +1405,24 @@ async fn drive_canonical_generation(
                                         activation.revision,
                                         config_control.store().path().display()
                                     );
-                                } else {
+                                    log_configuration_inventory(&activation.config);
+                                }
+                                Some(activation) => {
                                     crate::observability::process_event!(
                                         Info,
                                         "process",
                                         "generation_ready",
                                         "runtime generation {} is ready",
                                         activation.revision
+                                    );
+                                }
+                                None => {
+                                    crate::observability::process_event!(
+                                        Info,
+                                        "process",
+                                        "generation_ready",
+                                        "runtime generation {} is ready",
+                                        config_control.runtime_revision()
                                     );
                                 }
                             }

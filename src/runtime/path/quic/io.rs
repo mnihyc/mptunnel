@@ -126,7 +126,6 @@ impl UdpPathEndpoint {
         self.endpoint.accept().await.map(UdpPathConnection::new)
     }
 
-    #[cfg(test)]
     pub(in crate::runtime) fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.endpoint.local_addr()
     }

@@ -129,6 +129,15 @@ impl ManagementTarget {
             if logging_changed && let Some(prepared) = prepared_logging {
                 crate::observability::install(prepared);
             }
+            crate::observability::emit_lifecycle(
+                crate::config::LogLevel::Info,
+                "configuration",
+                "live_update_activated",
+                format_args!(
+                    "Activated configuration generation {} without restarting runtime services",
+                    committed.revision
+                ),
+            );
         }
         let pending_revision = store.pending_revision();
         let pending_activation = pending_revision == Some(committed.revision);

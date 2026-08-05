@@ -6499,3 +6499,58 @@ entry is authoritative.
     not a new publishable throughput baseline; and
   - reproducible artifacts are retained under
     `./.tmp/lab/results/cold-start-current-regression/`.
+
+## 2026-08-06T03:04:00+08:00: operator logging contract matured
+
+- Name: readable process lifecycle and safe configuration inventory
+- Category: Product observability
+- State: implemented and verified for the `v0.2.2` release
+- Accepted contract:
+  - a normal runtime's first record identifies the package version; an early
+    fatal record also carries that version;
+  - default text is one-line UTC RFC 3339 with fixed milliseconds, uppercase
+    severity, a stable `component.event`, and a natural message;
+  - startup reports the configuration source and revision, bounded topology
+    counts, named outbounds and MPP paths, actual bound inbound/management
+    listeners, generation readiness, reload activation, shutdown request, and
+    clean stop;
+  - one process-scoped, five-second background HTTPS check reports the newest
+    immutable GitHub release and its canonical release URL without delaying
+    runtime readiness or forwarding;
+  - JSON remains newline-delimited with the existing typed envelope, and
+    destination-bearing flow records remain explicitly opt-in; and
+  - readiness is described factually as host-facing runtime readiness, not as
+    proof that every remote outbound carrier is online. Live carrier health
+    remains available through path diagnostics.
+- Safety and performance boundary:
+  - new lifecycle records occur only at finite control-plane transitions;
+    packet, scheduler, congestion-control, retry, probe, and sampling loops are
+    unchanged;
+  - text and JSON share one bounded emission path; recurring fault records keep
+    their existing per-call-site rate limits; and
+  - redaction now accepts whitespace and quoted TOML/JSON/header forms for
+    authorization, cookies, tokens, passwords, credential secrets, transport
+    secrets, and private keys. Authentication scheme words are no longer
+    redacted outside authorization values, and terminal controls cannot create
+    extra log lines; and
+  - raw TOML deserialization errors are discarded at the configuration parse
+    boundary. Display, debug, source chains, startup failures, and live reloads
+    retain only safe line/column context and optional unknown-field identity.
+- Evidence:
+  - the exact release candidate passes `cargo test --locked --all-features`:
+    `1,475` library tests, `2` allocation tests, `6` packaged daily-use tests,
+    and documentation tests;
+  - standalone patched Quinn passes `283` tests and `3` documentation tests;
+    the lab registry is valid at `29` cells and `66` metrics, all `213` lab
+    contract tests pass, and all `5` deterministic benchmark/replay tests pass;
+  - all `9` release-archive contract tests, shell syntax checks, and the stable
+    version-gate self-test pass. Both root and benchmark lockfiles resolve the
+    `0.2.2` package graph under `--locked`;
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+    formatting, and `git diff --check` pass;
+  - a live startup run became ready before the update result, reported the
+    newest immutable GitHub release, and shut down cleanly. The request
+    completed in approximately `295 ms` on that run; and
+  - malformed inline, multiline, and ordinary-field TOML canaries are absent
+    from display, debug, source-chain, and packaged fatal diagnostics while
+    safe line/column and unknown-field context remain available.

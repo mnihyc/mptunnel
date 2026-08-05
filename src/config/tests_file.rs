@@ -190,6 +190,34 @@ fn logging_schema_is_typed_strict_and_config_relative() {
     }
 }
 
+#[test]
+fn toml_diagnostics_discard_document_values_at_the_parse_boundary() {
+    for (canary, document) in [
+        (
+            "inline-toml-canary",
+            "[management]\ntoken = \"inline-toml-canary\"",
+        ),
+        (
+            "multiline-toml-canary",
+            "[management]\ntoken = \"\"\"multiline-toml-canary\"\"\"",
+        ),
+        (
+            "ordinary-field-canary",
+            "[resources]\nmax_streams = \"ordinary-field-canary\"",
+        ),
+    ] {
+        let error = super::load_config_toml_str_at(document, Path::new("."))
+            .expect_err("invalid TOML field type");
+        let rendered = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(rendered.contains("configuration document is invalid"));
+        assert!(rendered.contains("line") && rendered.contains("column"));
+        assert!(!rendered.contains(canary), "display leaked {canary}");
+        assert!(!debug.contains(canary), "debug leaked {canary}");
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
 fn ingress_configs(ingresses: &[LocalIngressConfig]) -> Vec<IngressConfig> {
     ingresses
         .iter()
@@ -2307,12 +2335,14 @@ action = "reset"
 "#,
     )
     .expect_err("generic reset action must not be accepted");
+    let diagnostic = unsupported_reset.to_string();
     assert!(
-        unsupported_reset
-            .to_string()
-            .contains("unknown variant `reset`"),
+        diagnostic.contains("configuration document is invalid")
+            && diagnostic.contains("line")
+            && diagnostic.contains("column"),
         "unexpected reset-action error: {unsupported_reset}"
     );
+    assert!(!diagnostic.contains("reset"));
 }
 
 #[test]

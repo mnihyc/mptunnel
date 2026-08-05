@@ -315,6 +315,32 @@ pub(super) async fn bind_paths(
             }
         }
     }
+    for path in &bound {
+        let (local_path, local_address, transport) = match path {
+            BoundServerPath::Tcp {
+                listener,
+                local_path,
+            } => (local_path, listener.local_addr()?, "TCP"),
+            BoundServerPath::Udp {
+                endpoint,
+                local_path,
+            } => (local_path, endpoint.local_addr()?, "QUIC"),
+        };
+        let path_name = context
+            .configured_path_names
+            .get(local_path.config_ordinal())
+            .map(String::as_str)
+            .unwrap_or("unnamed");
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "inbound",
+            "listening",
+            format_args!(
+                "{}: MPP path {path_name} listening on {local_address} over {transport}",
+                context.name
+            ),
+        );
+    }
     Ok(bound)
 }
 

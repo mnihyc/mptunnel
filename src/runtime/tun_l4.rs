@@ -79,6 +79,17 @@ pub(super) async fn run_tun_l4_client(
         // their bounded queues are already constructed.
         managed.signal_ready();
     }
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
+        "inbound",
+        "ready",
+        format_args!(
+            "{inbound}: TUN packet stack ready on {}",
+            tun.interface_name
+                .as_deref()
+                .unwrap_or("host-selected interface")
+        ),
+    );
     readiness.ready();
 
     tokio::try_join!(

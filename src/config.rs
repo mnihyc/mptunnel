@@ -20,7 +20,9 @@ pub use crate::product::{
     CredentialRecord, PrincipalPermit, ProductAdmissionConfig, ProductAdmissionConfigError,
     SecurityPolicyError, SharedSecret,
 };
-pub use file::{ConfigFileError, DEFAULT_CONFIG_PATH, load_config_toml, load_config_toml_str};
+pub use file::{
+    ConfigFileError, DEFAULT_CONFIG_PATH, TomlConfigError, load_config_toml, load_config_toml_str,
+};
 pub(crate) use file::{load_certificates, load_private_key};
 pub use model::{
     AppConfig, ClientPathConfig, ClientSecurityConfig, CommandConfig, ConfigError,

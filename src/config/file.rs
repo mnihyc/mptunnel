@@ -71,8 +71,73 @@ pub(super) fn load_config_toml_str_at(
     contents: &str,
     material_base: &Path,
 ) -> Result<AppConfig, ConfigFileError> {
-    let file = toml::from_str::<FileConfig>(contents).map_err(ConfigFileError::Toml)?;
+    let file = toml::from_str::<FileConfig>(contents)
+        .map_err(|error| ConfigFileError::Toml(TomlConfigError::new(contents, &error)))?;
     file.into_config(material_base)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TomlConfigError {
+    line: Option<usize>,
+    column: Option<usize>,
+    unknown_field: Option<String>,
+}
+
+impl TomlConfigError {
+    fn new(contents: &str, error: &toml::de::Error) -> Self {
+        let (line, column) = error
+            .span()
+            .map(|span| toml_line_column(contents, span.start))
+            .map_or((None, None), |(line, column)| (Some(line), Some(column)));
+        Self {
+            line,
+            column,
+            unknown_field: toml_unknown_field(error.message()),
+        }
+    }
+}
+
+impl std::fmt::Display for TomlConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.unknown_field, self.line, self.column) {
+            (Some(field), Some(line), Some(column)) => write!(
+                formatter,
+                "configuration document contains unknown field {field:?} at line {line}, column {column}"
+            ),
+            (Some(field), _, _) => {
+                write!(
+                    formatter,
+                    "configuration document contains unknown field {field:?}"
+                )
+            }
+            (None, Some(line), Some(column)) => write!(
+                formatter,
+                "configuration document is invalid at line {line}, column {column}"
+            ),
+            (None, _, _) => formatter.write_str("configuration document is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for TomlConfigError {}
+
+fn toml_line_column(contents: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(contents.len());
+    let prefix = contents.get(..offset).unwrap_or(contents);
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .map_or(1, |tail| tail.chars().count() + 1);
+    (line, column)
+}
+
+fn toml_unknown_field(message: &str) -> Option<String> {
+    let field = message.strip_prefix("unknown field `")?.split_once('`')?.0;
+    if field.is_empty() || field.len() > 128 || field.chars().any(char::is_control) {
+        return None;
+    }
+    Some(field.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3092,7 +3157,7 @@ impl From<DnsSecurityFileValue> for DnsSecurityPolicy {
 #[derive(Debug)]
 pub enum ConfigFileError {
     Io(std::io::Error),
-    Toml(toml::de::Error),
+    Toml(TomlConfigError),
     Config(ConfigError),
     Security(SecurityPolicyError),
     Credential(String),
@@ -3283,7 +3348,7 @@ impl std::error::Error for ConfigFileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::Toml(err) => Some(err),
+            Self::Toml(_) => None,
             Self::Config(err) => Some(err),
             Self::Security(err) => Some(err),
             Self::Credential(_) | Self::LocalUser(_) => None,

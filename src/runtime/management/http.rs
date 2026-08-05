@@ -67,6 +67,20 @@ pub(super) async fn spawn_listeners(
         ));
     }
     for listener in bound {
+        let local_address = listener.local_addr()?;
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "management",
+            "listening",
+            format_args!(
+                "HTTP diagnostics listening on {local_address}; dashboard {}",
+                if settings.dashboard {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+        );
         services.spawn(run_listener(
             listener,
             target.clone(),

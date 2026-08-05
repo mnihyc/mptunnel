@@ -183,6 +183,14 @@ fn assert_check_config_ok(path: &Path) {
     );
 }
 
+fn parse_json_log(contents: &str) -> Vec<serde_json::Value> {
+    contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("valid newline-delimited JSON log record"))
+        .collect()
+}
+
 #[test]
 fn packaged_no_args_restart_loads_the_edited_default_config() {
     let _network = network_test_guard();
@@ -269,6 +277,28 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     assert!(
         error.contains("legacy_unsafe_api") && error.contains("unknown field"),
         "strict TOML failure did not identify the unknown field:\n{error}"
+    );
+    let toml_canary = "packaged-toml-value-canary";
+    let invalid_value = original.replacen(
+        "token = { from = \"file\", path = \"operator-token.key\" }",
+        &format!("token = \"{toml_canary}\""),
+        1,
+    );
+    let invalid_value_path = directory.write("invalid-value.toml", &invalid_value);
+    let output = check_config(&invalid_value_path);
+    assert!(!output.status.success(), "invalid TOML value was accepted");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("configuration document is invalid"));
+    assert!(error.contains("line") && error.contains("column"));
+    assert!(error.contains(env!("CARGO_PKG_VERSION")));
+    assert!(
+        !error.contains(toml_canary),
+        "fatal log leaked TOML value: {error}"
+    );
+    assert_eq!(
+        error.lines().count(),
+        1,
+        "fatal error must be one log record"
     );
     assert!(
         !applied_log_path.exists(),
@@ -1371,19 +1401,49 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     client.assert_running("completed routing acceptance");
     server.assert_running("completed routing acceptance");
 
+    let startup_records =
+        parse_json_log(&fs::read_to_string(&flow_log_path).expect("read initial process log"));
+    assert!(
+        startup_records.iter().any(|record| {
+            record["component"] == "process"
+                && record["event"] == "starting"
+                && record["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(env!("CARGO_PKG_VERSION")))
+        }),
+        "startup log must identify the running package version: {startup_records:#?}"
+    );
+    let client_config_path = client_path.to_string_lossy();
+    let socks_listener = socks.to_string();
+    for (component, event, detail) in [
+        ("configuration", "loaded", client_config_path.as_ref()),
+        ("outbound", "configured", "edge-mpp"),
+        ("inbound", "listening", socks_listener.as_str()),
+        ("process", "generation_ready", "runtime generation"),
+    ] {
+        assert!(
+            startup_records.iter().any(|record| {
+                record["component"] == component
+                    && record["event"] == event
+                    && record["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(detail))
+            }),
+            "missing essential {component}.{event} lifecycle record: {startup_records:#?}"
+        );
+    }
+
     let deadline = Instant::now() + PROCESS_START_TIMEOUT;
     let (old_flow_records, new_flow_records, flow_records) = loop {
         client.assert_running("Product flow logging");
         let old_contents = fs::read_to_string(&flow_log_path).unwrap_or_default();
         let new_contents = fs::read_to_string(&next_flow_log_path).unwrap_or_default();
-        let old_records = old_contents
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        let old_records = parse_json_log(&old_contents)
+            .into_iter()
             .filter(|record| record["component"] == "flow")
             .collect::<Vec<_>>();
-        let new_records = new_contents
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        let new_records = parse_json_log(&new_contents)
+            .into_iter()
             .filter(|record| record["component"] == "flow")
             .collect::<Vec<_>>();
         let records = old_records

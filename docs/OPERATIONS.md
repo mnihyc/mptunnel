@@ -93,6 +93,33 @@ validation never create the file. Startup fails clearly if a requested file
 cannot be opened, and API apply rejects an unusable sink before it can replace
 or interrupt the active runtime.
 
+Default text records use UTC RFC 3339 time, an uppercase level, and one stable
+`component.event` name:
+
+```text
+2026-08-06T02:14:03.482Z INFO  process.starting: MPTUNNEL <version> starting
+2026-08-06T02:14:03.483Z INFO  configuration.loaded: Loaded ./config.toml (revision <revision>)
+2026-08-06T02:14:03.491Z INFO  inbound.listening: local-socks: SOCKS5 listening on 127.0.0.1:1080
+2026-08-06T02:14:03.496Z INFO  process.generation_ready: runtime generation <revision> is ready
+```
+
+Startup records identify the configuration generation and safely summarize
+configured inbounds, outbounds, MPP paths, balancers, DNS, and management
+listeners. Lifecycle records never include credentials, tokens, or keys, and
+sensitive forms in fault messages are redacted. Listener records are emitted
+only after binding succeeds; generation readiness means the configured local
+listeners and host-facing services have started. Outbound carrier health is
+independent and remains visible through path diagnostics.
+
+Startup also launches one process-scoped update check against GitHub's public
+latest-release API. It uses a direct, server-authenticated HTTPS connection to
+`api.github.com`, sends no credentials or machine identity, and therefore
+reveals only the request's public source address and timing to GitHub. The
+five-second bounded task never gates listeners, readiness, forwarding, or
+shutdown. It reports `update.available` with the canonical GitHub release URL,
+`update.current` with the newest checked tag, or `update.check_failed` at
+information level when the network or metadata is unavailable.
+
 Simple CLI profiles expose the same common settings through `--log-level`,
 `--log-format`, `--log-file`, `--log-no-console`, and `--log-flow-events`.
 The matching environment variables are `MPTUNNEL_LOG_LEVEL`,
@@ -100,11 +127,16 @@ The matching environment variables are `MPTUNNEL_LOG_LEVEL`,
 `MPTUNNEL_LOG_FLOW_EVENTS`.
 
 When logging is enabled, at least the console or file sink must be enabled.
-Flow events require `info`, because they are information records.
+Flow events require `info`, because they are information records. `error` means
+the process or a configured sink cannot continue; `warn` means the service is
+still running but degraded, retrying, saturated, or recovering; `info` covers
+configuration and service lifecycle transitions.
 
-Lifecycle, control, saturation, and fault records are length-bounded,
-rate-limited per call site, and redact common authorization, token, password,
-and credential forms. `flow_events = true` additionally emits one sanitized
+All records are length-bounded and remove terminal control characters. Repeated
+saturation and fault records are rate-limited per call site and report the
+suppressed count on the next record. Authorization, cookies, tokens, passwords,
+credential secrets, and private-key forms are redacted as a final defense.
+`flow_events = true` additionally emits one sanitized
 open and close record for each observable flow, including its inbound,
 destination, selected concrete outbound, duration, outcome, and byte/packet
 counts. It deliberately omits source addresses, principals, credentials,

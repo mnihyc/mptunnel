@@ -230,9 +230,13 @@ SOCKS5/HTTP/MPP outbounds can receive a domain unchanged; DNS resolution is
 performed only when routing or the selected outbound requires an IP. Ranged
 carrier endpoints use syntax such as `udp://server.example:20000-40000`.
 
-Logging supports `off`, `error`, `warn`, and `info`, text or JSON, console,
-append-only file, or both. Optional flow events record sanitized connection
-open/close summaries without credentials or payload.
+Logging starts with the running version, configuration source, safe inbound and
+outbound inventory, bound listeners, runtime readiness, and shutdown. The
+default UTC text format is readable at a terminal; newline-delimited JSON,
+append-only files, and sanitized opt-in flow summaries are also supported.
+One bounded background HTTPS check reports the newest published GitHub release
+without delaying startup or forwarding; an available update includes its
+release-page URL.
 
 The opt-in loopback management endpoint provides live health, paths, sessions,
 connections, traffic, DNS, balancers, configuration state, and bounded

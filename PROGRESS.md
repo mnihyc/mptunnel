@@ -10,6 +10,93 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-06T02:16:00+08:00: public browser and blackhole evidence reconciled
+
+- Name: clean current README continuity evidence
+- Category: Public performance provenance and recovery presentation
+- State: accepted on clean source `fc9042e`; documentation-only reconciliation
+- Audit findings corrected:
+  - the published cold-browser values came from the exact code later committed
+    as `fc9042e`, but their retained run was necessarily source-dirty and not
+    public-comparable;
+  - the earlier mixed-blackhole values no longer had their referenced raw
+    artifact; and
+  - process-restart acceptance proves renewed post-restart connectivity, not
+    survival of an existing application flow. Same-flow retention remains the
+    separately proven total-carrier-outage behavior.
+- One bounded clean-source invocation ran only the periodic browser,
+  continuous browser, and mixed blackhole cases with the ordinary
+  non-diagnostic binary:
+  - periodic load completed `90/90` requests with zero failure and zero
+    deadline miss; the slowest ten-request batch was `681.436 ms`;
+  - 60-second continuous load started, accepted, and completed `755/755`
+    one-MiB requests, rejected none, left none incomplete, and maintained the
+    requested peak concurrency of 20; and
+  - the two-second path blackhole retained `278.488 Mbps` bulk service with a
+    `636.401 ms` maximum receiver gap, completed `60/60` persistent TCP and
+    `72/72` HTTP checks, and delivered `228/229` datagrams. The one datagram
+    crossing the unavailable path remains an explicit expected loss.
+- Evidence integrity: every row has `host_valid=true`,
+  `performance_comparable=true`, clean tracked source, exact commit
+  `fc9042e6001fca7ee8e865da53c4930dc47c1128`, and binary SHA-256
+  `b5599301596f6cc8469787516184155d31a40a33c5f9d7529983a1c6a9035521`.
+- Presentation corrections:
+  - README transport scope now says default TCP+QUIC applies unless a transport
+    is named explicitly; and
+  - README and detailed evidence distinguish same-flow carrier recovery from
+    new successful flows after server and client process restarts.
+- No Core, Product, transport, timing, threshold, configuration, platform, or
+  lab behavior changed.
+- Evidence: `./.tmp/lab/results/readme-current-clean-evidence/`.
+
+## 2026-08-06T01:54:00+08:00: ordinary multi-endpoint TCP siblings rejected
+
+- Name: topology-derived TCP sibling usage experiment
+- Category: Core aggregation model and performance acceptance
+- State: rejected and fully removed; no runtime, RFC, public-documentation, or
+  test behavior from the candidate is retained
+- Bounded hypothesis and change:
+  - tested whether every member of every explicitly regular TCP endpoint could
+    remain ordinary capacity, instead of keeping correlated siblings as ready
+    backups when several TCP endpoints are configured; and
+  - changed only carrier usage assignment and its direct model tests and
+    documentation. No score, threshold, timing, congestion controller,
+    protocol frame, or platform implementation changed.
+- Source verification: formatting, strict all-target/all-feature Clippy, all
+  `1,471` library tests, two allocation tests, six daily-use tests, and
+  doctests passed before performance acceptance. This established functional
+  consistency, not performance acceptance.
+- Performance rejection under the existing public five-link profile
+  (`500 Mbps` per link, `20 ms` one-way delay, `10 ms` jitter, `0.5%` loss,
+  two flows, 20 seconds):
+  - the candidate delivered `1,066.886 Mbps` upload and an immediate focused
+    repeat delivered `1,048.797 Mbps`;
+  - the accepted model had previously delivered `1,383.641 Mbps`; after exact
+    restoration, a clean-source, valid-host confirmation delivered
+    `1,315.502 Mbps` (`1,380.180 Mbps` interval average); and
+  - the restored non-diagnostic binary SHA-256 is
+    `b5599301596f6cc8469787516184155d31a40a33c5f9d7529983a1c6a9035521`,
+    exactly the accepted `fc9042e` build identity.
+- Causal evidence: the diagnostic candidate attached all 15 TCP carriers to
+  the bulk flows, put Product work on every one, and observed up to 14 TCP
+  carriers with simultaneous Product work. The resulting request-direction
+  fragmentation repeatedly reduced five-link upload even though five-link
+  download and two-link upload could improve. Making every sibling ordinary
+  is therefore not direction-neutral and is not a clean aggregation fix.
+- Evidence validity: candidate rows are diagnostic experiments and are marked
+  non-public-comparable because the tracked candidate was intentionally
+  uncommitted; their source capture was stable, and the failure repeated. The
+  restored confirmation has a clean tracked tree, valid host snapshot, exact
+  receiver accounting, and `performance_comparable=true`.
+- Decision: retain the established multi-endpoint primary/ready-backup model.
+  Do not compensate with a new carrier cap, promotion threshold, or scheduler
+  state machine without an independently coherent RFC model and matched proof.
+- Evidence:
+  - `./.tmp/lab/results/sibling-regular-public/`
+  - `./.tmp/lab/results/sibling-regular-five-upload-repeat/`
+  - `./.tmp/lab/results/sibling-regular-five-upload-diagnostic/`
+  - `./.tmp/lab/results/sibling-regular-rejected-baseline-confirm/`
+
 ## 2026-08-05T23:24:22+08:00: v0.2.1 release candidate validated
 
 - Name: immutable v0.2.1 source release

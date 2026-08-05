@@ -58,7 +58,8 @@ SOCKS5 / HTTP CONNECT / port forward / TUN
 
 Results below are receiver-delivered goodput from controlled Linux tests,
 rounded to the nearest Mbps. Xray-core 26.3.27 uses VMess/TCP; Hysteria2 2.10.0
-uses Brutal at the shaped link rate; MPTUNNEL uses its default TCP+QUIC paths.
+uses Brutal at the shaped link rate; MPTUNNEL uses its default TCP+QUIC paths
+unless a transport is named explicitly.
 
 ### One link
 
@@ -125,9 +126,9 @@ check cells are completed/attempted.
 | Load | Object | Window | Completed | Rejected | Failed |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 10 every 3 s | 32 KiB | 30 s | 90/90 | 0 | 0 |
-| 20 continuous | 1 MiB | 60 s | 732/732 | 0 | 0 |
+| 20 continuous | 1 MiB | 60 s | 755/755 | 0 | 0 |
 
-The slowest ten-request batch completed in 1.288 seconds against its
+The slowest ten-request batch completed in 0.681 seconds against its
 three-second bound. The continuous run held twenty requests in flight and
 immediately replaced each completion.
 
@@ -138,14 +139,15 @@ application checks; pause is the longest receiver-side download gap.
 
 | Event | TCP checks | HTTP checks | UDP checks | DL pause |
 | --- | ---: | ---: | ---: | ---: |
-| 2 s path blackhole | 60/60 | 81/81 | 199/200 | 576 ms |
+| 2 s path blackhole | 60/60 | 72/72 | 228/229 | 636 ms |
 | Latency/loss change | 60/60 | 93/94 | 241/243 | 1,489 ms |
 | Repeated changes | 47/47 | 81/83 | 217/219 | 869 ms |
 
-Additional controls observed recovery after a five-second total carrier outage
-(1/1 existing flow) and after peer process restarts (2/2 existing flows). New
-inbound connections are rejected while every outbound path is unavailable;
-existing flows remain attached for recovery.
+Additional controls observed same-flow recovery after a five-second total
+carrier outage (1/1) and renewed connectivity after server and client process
+restarts (2/2 checks). New inbound connections are rejected while every
+outbound path is unavailable; established flows remain attached during carrier
+recovery.
 
 See [Performance evidence](docs/PERFORMANCE.md) for exact setup, upload
 accounting, stress tests, recovery evidence, and limitations.

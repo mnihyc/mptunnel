@@ -144,7 +144,7 @@ counters alone.
 | Condition | Transport | Download (Mbps) | Upload (Mbps) | Receiver gap DL/UL (ms) |
 | --- | --- | ---: | ---: | ---: |
 | Port hop | MPP/QUIC | 2,818.042 | 2,798.515 | 11 / 24 |
-| Blackhole | MPP/TCP+QUIC (default) | 243.210 | — | 576 / — |
+| Blackhole | MPP/TCP+QUIC (default) | 278.488 | — | 636 / — |
 | Latency change | MPP/TCP+QUIC (default) | 235.408 | — | 1,489 / — |
 | Repeated link changes | MPP/TCP+QUIC (default) | 248.291 | — | 869 / — |
 | Blackhole | MPP/TCP | 272.124 | 274.925 | 1,136 / 369 |
@@ -152,7 +152,7 @@ counters alone.
 
 | Default mixed condition | TCP echo | HTTP | Datagrams |
 | --- | ---: | ---: | ---: |
-| Blackhole | 60/60 | 81/81 | 199/200 |
+| Blackhole | 60/60 | 72/72 | 228/229 |
 | Latency change | 60/60 | 93/94 | 241/243 |
 | Repeated link changes | 47/47 | 81/83 | 217/219 |
 
@@ -165,10 +165,10 @@ The repeated-change HTTP misses began within deliberate blackholes and reached
 their application deadlines before service returned. Datagram counts expose
 expected loss during those same unavailable intervals.
 
-| Event | Duration (s) | Existing flows | New flows |
-| --- | ---: | ---: | ---: |
-| Total carrier outage | 5 | 1/1 | Rejected offline |
-| Client/server restart | — | 2/2 | — |
+| Event | Duration (s) | Continuity result |
+| --- | ---: | --- |
+| Total carrier outage | 5 | Existing flow recovered 1/1 |
+| Server/client restart | — | Post-restart flows 2/2 |
 
 QUIC uses native migration where available. TCP establishes a fresh carrier;
 MPP retains exact logical ranges and resumes on the replacement. New inbound
@@ -180,10 +180,10 @@ existing connections remain until their normal timeout or recovery.
 | Concurrency | Object (KiB) | Duration (s) | Requests | Rejected | Failed | Deadline (ms) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10 | 32 | 30 | 90/90 | 0 | 0 | 3,000 |
-| 20 | 1,024 | 60 | 732/732 | 0 | 0 | — |
+| 20 | 1,024 | 60 | 755/755 | 0 | 0 | — |
 
 The first run opened ten requests every three seconds. All 90 requests
-completed inside the three-second deadline; the slowest batch took 1.288
+completed inside the three-second deadline; the slowest batch took 0.681
 seconds. The second kept twenty one-MiB transfers active and replaced each
 completed request immediately.
 

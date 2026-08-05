@@ -71,15 +71,15 @@ work; readiness never creates a fixed traffic share.
 
 | Direction | `1-1` | Default `1-3` | 3 × `1-1` |
 | --- | ---: | ---: | ---: |
-| Download (Mbps) | 345.465 | 901.519 | 744.216 |
-| Upload (Mbps) | 338.671 | 873.097 | 890.466 |
+| Download (Mbps) | 346.354 | 904.757 | 902.027 |
+| Upload (Mbps) | 338.889 | 931.537 | 901.967 |
 
 ### Shared 200 Mbps bottleneck
 
 | Direction | `1-1` | Default `1-3` | 3 × `1-1` |
 | --- | ---: | ---: | ---: |
-| Download (Mbps) | 158.931 | 164.476 | 167.164 |
-| Upload (Mbps) | 157.099 | 172.327 | 150.939 |
+| Download (Mbps) | 157.495 | 164.943 | 171.062 |
+| Upload (Mbps) | 157.938 | 153.374 | 165.704 |
 
 The three-carrier forms aggregate independent per-flow capacity and stay near
 the same aggregate ceiling when all connections share one bottleneck. No rate
@@ -92,9 +92,9 @@ five deterministic epochs.
 
 | Rate/link (Mbps) | Transport | Download (Mbps) | Upload (Mbps) |
 | ---: | --- | ---: | ---: |
-| 30–100 | MPP/TCP+QUIC (default) | 350.135 | 245.383 |
-| 300–1,000 | MPP/TCP+QUIC (default) | 1,346.848 | 726.616 |
-| 3,000–10,000 | MPP/TCP+QUIC (default) | 2,000.420 | 597.670 |
+| 30–100 | MPP/TCP+QUIC (default) | 346.911 | 295.621 |
+| 300–1,000 | MPP/TCP+QUIC (default) | 1,476.501 | 517.327 |
+| 3,000–10,000 | MPP/TCP+QUIC (default) | 2,055.416 | 559.959 |
 
 Configured topology establishes regular and backup eligibility. Fresh
 directional delivery evidence ranks members inside the eligible tier. Neither
@@ -109,13 +109,13 @@ measurements. MPTUNNEL received both links in one configuration.
 
 | System | Configured links | Download (Mbps) | Upload (Mbps) |
 | --- | --- | ---: | ---: |
-| Xray 26.3.27 VMess/TCP | A | 181.696 | ≥17.708 |
-| Hysteria2 2.10.0 Brutal | A | 188.812 | ≥18.808 |
-| MPTUNNEL MPP/TCP | A + B | 153.009 | 151.513 |
+| Xray 26.3.27 VMess/TCP | A | 181.902 | ≥17.638 |
+| Hysteria2 2.10.0 Brutal | A | 188.888 | ≥18.762 |
+| MPTUNNEL MPP/TCP | A + B | 198.504 | 196.630 |
 
-MPTUNNEL sent 91.2% of download traffic over Link A and 89.6% of upload
+MPTUNNEL sent 90.7% of download traffic over Link A and 90.7% of upload
 traffic over Link B. Independent single-fast-link MPTUNNEL controls delivered
-141.280 Mbps download on Link A and 148.792 Mbps upload on Link B; adding both
+183.436 Mbps download on Link A and 180.222 Mbps upload on Link B; adding both
 links did not reduce either direction. Interface accounting, not source
 address or configured bandwidth, supplies the path-share evidence.
 
@@ -145,16 +145,16 @@ counters alone.
 | --- | --- | ---: | ---: | ---: |
 | Port hop | MPP/QUIC | 2,818.042 | 2,798.515 | 11 / 24 |
 | Blackhole | MPP/TCP+QUIC (default) | 243.210 | — | 576 / — |
-| Latency change | MPP/TCP+QUIC (default) | 167.651 | — | 3,310 / — |
-| Repeated link changes | MPP/TCP+QUIC (default) | 186.452 | — | 1,501 / — |
+| Latency change | MPP/TCP+QUIC (default) | 235.408 | — | 1,489 / — |
+| Repeated link changes | MPP/TCP+QUIC (default) | 248.291 | — | 869 / — |
 | Blackhole | MPP/TCP | 272.124 | 274.925 | 1,136 / 369 |
 | Latency change | MPP/TCP | 253.904 | 221.276 | 315 / 1,625 |
 
 | Default mixed condition | TCP echo | HTTP | Datagrams |
 | --- | ---: | ---: | ---: |
 | Blackhole | 60/60 | 81/81 | 199/200 |
-| Latency change | 60/60 | 94/94 | 257/259 |
-| Repeated link changes | 48/48 | 90/92 | 280/282 |
+| Latency change | 60/60 | 93/94 | 241/243 |
+| Repeated link changes | 47/47 | 81/83 | 217/219 |
 
 The latency-change row includes a 900 ms one-way, 10% loss epoch.
 Persistent TCP echo streams stayed attached in every mixed disruption run.
@@ -180,11 +180,12 @@ existing connections remain until their normal timeout or recovery.
 | Concurrency | Object (KiB) | Duration (s) | Requests | Rejected | Failed | Deadline (ms) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10 | 32 | 30 | 90/90 | 0 | 0 | 3,000 |
-| 20 | 1,024 | 60 | 739/739 | 0 | 0 | — |
+| 20 | 1,024 | 60 | 734/734 | 0 | 0 | — |
 
-The first run opened ten requests every three seconds. Every batch completed
-inside its deadline. The second kept twenty one-MiB transfers active and
-replaced each completed request immediately.
+The first run opened ten requests every three seconds. All 90 requests
+completed, but the cold first batch took 5.031 seconds; the remaining eight
+batches completed inside the three-second deadline. The second kept twenty
+one-MiB transfers active and replaced each completed request immediately.
 
 ## Local processing capacity
 

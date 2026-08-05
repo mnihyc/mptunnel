@@ -6092,3 +6092,75 @@ entry is authoritative.
 - Reproducible evidence:
   `./.tmp/lab/results/readme-asymmetric-fair-clean/` and
   `./.tmp/lab/results/public-current-static/`.
+
+## 2026-08-05T21:09:28+08:00: finite request drain accepted
+
+- Name: measured completion of an assigned final request tail
+- Category: RFC lifecycle correctness and upload performance
+- State: accepted at commit `5633a34`; public evidence reconciled; no release,
+  tag, or push performed
+- Proven root cause:
+  - two clean multi-gigabit upload runs left one of two request streams
+    incomplete for approximately 165 seconds even though alternate carriers
+    remained healthy;
+  - the remaining OriginalData range continued making slow Product progress,
+    so the inactivity-based live-tail trigger was continually refreshed and
+    never raced finite completion on a recently faster output; and
+  - diagnostic accounting found a `34,144,736`-byte accepted-versus-confirmed
+    request deficit and repeated unchanged cumulative Data ACKs. This was a
+    finite request-drain lifecycle gap, not evidence against native congestion
+    control or ordinary path placement.
+- Minimal correction and preserved provenance:
+  - application EOF becomes a completion decision only after queued unique
+    payload drains, when `next_offset` is the assigned final offset;
+  - the existing exact flight age, one MPP recovery interval, bounded repair
+    quantum, repeat suppression, shared credit, queue, flight, reorder, and
+    extra-traffic envelopes remain unchanged;
+  - a copy is admitted only when the exact live owner and exact alternate both
+    have qualified current completion evidence, the alternate has the lower
+    estimated completion time outside the existing adaptive jitter and queue
+    hysteresis, and that exact target still has capacity at dispatch;
+  - the decision does not mark the owner stale, withdraw a carrier, alter
+    ordinary placement, change ACK activity, or replace native recovery; and
+  - this preserves the retained-feedback purpose of `5e1ace6`, retained-tail
+    horizon of `9ab3cbc`, busy-carrier liveness of `20908c9`, exact-instance
+    fencing of `622960c`, and scheduler hysteresis of `9c5a125`.
+- Rejected expansion:
+  - no new expiry clock was added. Dispatch re-runs the exact measured target
+    selection, including current enqueue capacity; an invalid target follows
+    the existing migratable-tail discard path. A second recovery clock would
+    duplicate established timing without evidence.
+- Performance proof from the identical optimized binary at `5633a34`:
+  - the exact twice-failing 20-link multi-gigabit upload completed `2/2`
+    streams with zero failures, exact `3,401,383,936`-byte receiver accounting,
+    `559.959 Mbps` goodput, a `48.153 s` probe time, and a `1.453 s` maximum
+    per-stream receive gap; and
+  - the affected five-equal-fat-TCP upload control completed `2/2` streams
+    with zero failures at `685.070 Mbps`, exact `2,691,694,592`-byte receiver
+    accounting, and no recovery gap. It remains above the accepted
+    `562.796 Mbps` public control, so no upload downgrade is observed.
+- Previously pending dynamic evidence is accepted without another run:
+  - clean commit `c321dd7` held every path stable for ten seconds before the
+    first deterministic condition change and retained a complete schedule
+    trace with a valid host snapshot;
+  - corrected repeated changes delivered `248.291 Mbps`, retained `47/47`
+    TCP checks, completed `81/83` deadline-bounded HTTP checks and `217/219`
+    datagrams, and limited the receiver gap to `869 ms`; and
+  - the latency/loss change delivered `235.408 Mbps`, retained `60/60` TCP
+    checks, completed `93/94` HTTP checks and `241/243` datagrams, and limited
+    the receiver gap to `1.489 s`.
+- Verification:
+  - the durable exact-owner/measured-alternate scheduler regression passes;
+  - all `54` focused request-sender and `153` focused relay tests passed before
+    the final queue-boundary guard, after which all targets/all features
+    compiled and the focused regression passed again;
+  - the optimized release build completed; formatting and diff whitespace
+    checks pass; and
+  - `README.md` and `docs/PERFORMANCE.md` now use the accepted fair-start
+    asymmetric, stable-before-change scale/disruption, current static, and
+    finite-tail candidate evidence instead of rejected predecessor values.
+- Reproducible evidence:
+  `./.tmp/lab/results/public-current-scale-multi-tail-fix/` and
+  `./.tmp/lab/results/public-current-tail-fix-fat-upload/`, with the accepted
+  stable-before-change cohort under
+  `./.tmp/lab/results/public-current-dynamic/`.

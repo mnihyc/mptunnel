@@ -101,9 +101,9 @@ multipath capability, not equal path provisioning.
 | --- | --- | ---: | ---: |
 | Xray/VMess | A | 182 Mbps | ≥18 Mbps |
 | Hysteria2/Brutal | A | 189 Mbps | ≥19 Mbps |
-| MPTUNNEL (TCP) | A + B | 153 Mbps | 152 Mbps |
+| MPTUNNEL (TCP) | A + B | 199 Mbps | 197 Mbps |
 
-MPTUNNEL carried 91.2% of download traffic on Link A and 89.6% of upload
+MPTUNNEL carried 90.7% of download traffic on Link A and 90.7% of upload
 traffic on Link B without changing endpoints between directions.
 
 The next control combines an 80 Mbps ordinary link with the 500 Mbps adverse
@@ -128,8 +128,8 @@ application checks; pause is the longest receiver-side download gap.
 | Event | TCP checks | HTTP checks | UDP checks | DL pause |
 | --- | ---: | ---: | ---: | ---: |
 | 2 s path blackhole | 60/60 | 81/81 | 199/200 | 576 ms |
-| Latency/loss change | 60/60 | 94/94 | 257/259 | 3,310 ms |
-| Repeated changes | 48/48 | 90/92 | 280/282 | 1,501 ms |
+| Latency/loss change | 60/60 | 93/94 | 241/243 | 1,489 ms |
+| Repeated changes | 47/47 | 81/83 | 217/219 | 869 ms |
 
 Additional controls observed recovery after a five-second total carrier outage
 (1/1 existing flow) and after peer process restarts (2/2 existing flows). New

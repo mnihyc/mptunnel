@@ -23,7 +23,6 @@ fn spawn_tcp_pool_reconciliation(context: &ClientPathContext) -> tokio::task::Jo
             .tcp_carrier_groups
             .reconcile(
                 &context,
-                crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
                 crate::config::DEFAULT_PATH_PROBE_INTERVAL,
                 &mut retry,
             )

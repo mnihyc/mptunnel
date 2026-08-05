@@ -139,7 +139,7 @@ pub(super) fn spawn_path_probe_service(
 pub(in crate::runtime) async fn run_path_probe_service(
     context: ClientPathContext,
     interval: Duration,
-    timeout: Duration,
+    probe_timeout: Duration,
 ) -> Result<(), RuntimeError> {
     let groups = context.tcp_carrier_groups.clone();
     let mut changes = groups.subscribe();
@@ -152,7 +152,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
     {
         let context = context.clone();
         measurements.spawn(async move {
-            probe_selected_paths(&context, timeout, TcpProbeSelection::None).await;
+            probe_selected_paths(&context, probe_timeout, TcpProbeSelection::None).await;
         });
     }
 
@@ -160,9 +160,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
 
-    groups
-        .reconcile(&context, timeout, interval, &mut retry)
-        .await;
+    groups.reconcile(&context, interval, &mut retry).await;
 
     loop {
         let maintenance_at = groups.next_maintenance_at(&context, &retry);
@@ -177,23 +175,23 @@ pub(in crate::runtime) async fn run_path_probe_service(
             changed = changes.changed() => {
                 changed.expect("TCP carrier group sender lives with path context");
                 groups
-                    .reconcile(&context, timeout, interval, &mut retry)
+                    .reconcile(&context, interval, &mut retry)
                     .await;
             }
             _ = &mut maintenance_timer => {
                 groups
-                    .reconcile(&context, timeout, interval, &mut retry)
+                    .reconcile(&context, interval, &mut retry)
                     .await;
             }
             _ = ticker.tick() => {
                 if measurements.is_empty() {
                     let context = context.clone();
                     measurements.spawn(async move {
-                        probe_selected_paths(&context, timeout, TcpProbeSelection::None).await;
+                        probe_selected_paths(&context, probe_timeout, TcpProbeSelection::None).await;
                     });
                 }
                 groups
-                    .reconcile(&context, timeout, interval, &mut retry)
+                    .reconcile(&context, interval, &mut retry)
                     .await;
             }
             measurement = measurements.join_next(), if !measurements.is_empty() => {

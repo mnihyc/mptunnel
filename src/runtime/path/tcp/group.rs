@@ -4,8 +4,9 @@
 //! endpoint establishment policy. Exact carrier actors retain ownership of
 //! sockets, wire ordering, Product attachments, and terminal failure.
 
-use crate::model::path::CarrierPathInstanceId;
-use crate::protocol::PathId;
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
+use crate::model::timing::path_open_timeout;
+use crate::protocol::{PathId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::path_record_failure_cooldown;
@@ -303,7 +304,6 @@ impl ClientTcpCarrierGroups {
     pub(in crate::runtime) async fn reconcile(
         &self,
         context: &ClientPathContext,
-        connect_timeout: Duration,
         retry_interval: Duration,
         retry: &mut [ClientTcpMemberRetry],
     ) {
@@ -367,6 +367,7 @@ impl ClientTcpCarrierGroups {
                 retry.not_before = now + retry_interval;
                 let session = session.clone();
                 let replacement_port = retry.replacement_port.take();
+                let connect_timeout = tcp_carrier_establishment_timeout(context, path_index);
                 establishment_attempts.spawn(async move {
                     let deadline = tokio::time::Instant::now() + connect_timeout;
                     session
@@ -488,6 +489,7 @@ impl ClientTcpCarrierGroups {
                 };
                 if self.occupied(group.config_index).unwrap_or_default() < group.range.max() {
                     let session = session.clone();
+                    let connect_timeout = tcp_carrier_establishment_timeout(context, path_index);
                     replacement_attempts.spawn(async move {
                         let deadline = tokio::time::Instant::now() + connect_timeout;
                         (
@@ -556,6 +558,18 @@ impl ClientTcpCarrierGroups {
             }
         }
     }
+}
+
+/// Prices a complete cold TCP carrier transaction from the same RFC timing
+/// model used by demand-driven stream attachment. A health-probe deadline owns
+/// only that probe and must never shorten TCP, transport protection, path join,
+/// or readiness establishment.
+fn tcp_carrier_establishment_timeout(context: &ClientPathContext, path_index: usize) -> Duration {
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: path_index,
+    };
+    path_open_timeout(context.reliable_path_snapshot(key), false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4054,16 +4054,16 @@ fi
 if should_run_case "baseline_vmess_tcp_single_asymmetric_upload_reference"; then
   run_vmess_baseline_upload_case \
     "baseline_vmess_tcp_single_asymmetric_upload_reference" \
-    "172.31.15.20" \
+    "172.31.10.20" \
     asymmetric
 fi
 if should_run_case "baseline_hysteria2_udp_single_asymmetric_upload_reference"; then
   run_hysteria2_baseline_upload_case \
     "baseline_hysteria2_udp_single_asymmetric_upload_reference" \
-    "172.31.15.20" \
+    "172.31.10.20" \
     asymmetric \
-    "200 mbps" \
-    "20 mbps"
+    "20 mbps" \
+    "200 mbps"
 fi
 
 if should_run_case "baseline_mptcp_tcp_multipath_all"; then

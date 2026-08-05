@@ -387,7 +387,7 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn("client MPTCP endpoint configuration failed:", SCRIPT)
         self.assertIn("target MPTCP endpoint configuration failed:", SCRIPT)
 
-    def test_asymmetric_product_baselines_use_the_directionally_fast_link(self):
+    def test_asymmetric_product_baselines_keep_one_fixed_link(self):
         self.assertIn('[[ "$netem_mode" == "asymmetric" ]]', SCRIPT)
         self.assertIn(
             '"baseline_vmess_tcp_single_asymmetric_download_reference"',
@@ -405,6 +405,16 @@ class RunnerContractTests(unittest.TestCase):
             '"baseline_hysteria2_udp_single_asymmetric_upload_reference"',
             SCRIPT,
         )
+        vmess_upload = SCRIPT.split(
+            'if should_run_case "baseline_vmess_tcp_single_asymmetric_upload_reference";',
+            1,
+        )[1].split("fi", 1)[0]
+        hysteria_upload = SCRIPT.split(
+            'if should_run_case "baseline_hysteria2_udp_single_asymmetric_upload_reference";',
+            1,
+        )[1].split("fi", 1)[0]
+        self.assertIn('"172.31.10.20"', vmess_upload)
+        self.assertIn('"172.31.10.20"', hysteria_upload)
         self.assertIn('"20 mbps"', SCRIPT)
         self.assertIn('"200 mbps"', SCRIPT)
 

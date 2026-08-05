@@ -6359,3 +6359,56 @@ entry is authoritative.
   `./.tmp/lab/results/direction-root-cause-diagnostic-download/`. The normal
   optimized executable was restored afterward with SHA-256
   `98bfdaa1e533d63c1e678d9b88930f5fe1cc011fcc2e95378725fa25b9ab701b`.
+
+## 2026-08-06T00:36:57+08:00: cold browser placement corrected
+
+- Name: authenticated cold-latency path selection
+- Category: Core path selection and short-connection acceptance
+- State: accepted locally; no commit, tag, release, or push performed
+- Root cause:
+  - evidence-free startup deliberately withheld readiness timing from generic
+    path completion and capacity evidence until `PATH_PROOF`;
+  - concurrent latency-sensitive flows then used active-flow fan-out and could
+    be assigned to an establishing or materially slower TCP carrier; and
+  - the rejected run completed `89/90` requests, timed out one request, and
+    took `4.764 s` for the first batch. The previously published run exposed
+    the same defect at `5.031 s`.
+- Accepted correction:
+  - only evidence-free latency-sensitive ordering now prefers a carrier whose
+    exact instance has completed the authenticated readiness exchange;
+  - authenticated candidates use their existing scheduler ETA and exact
+    readiness timing for latency ranking; and
+  - `PATH_PROOF`, capacity qualification, throughput ordering, admission,
+    congestion control, recovery timing, and transport behavior are unchanged.
+- Durable tests:
+  - the existing cold TCP reservation test now proves two concurrent latency
+    reservations remain on the authenticated 20 ms carrier instead of an
+    authenticated 80 ms carrier or an unauthenticated 1 ms generic probe;
+  - the bounded-pool rotation test now asserts its actual invariant—exactly
+    one carrier owns the attachment—without assuming configured index zero
+    wins authenticated RTT ranking; and
+  - all `1,471` library tests, `2` allocation tests, and `6` daily-use product
+    tests pass with all features. Formatting and all-target/all-feature Clippy
+    with warnings denied also pass; and
+  - `README.md` and `docs/PERFORMANCE.md` publish the accepted `90/90`
+    periodic and `732/732` continuous short-connection results.
+- Performance evidence from one unchanged optimized binary:
+  - periodic browser load completed `90/90` requests with zero failures and
+    zero deadline misses; the slowest batch was `1.288 s` and the slowest
+    request was `1.285 s` against the `3 s` bound;
+  - 60-second full load accepted and completed `732/732` one-MiB requests with
+    zero rejection or incomplete requests while holding 20 live requests;
+  - mixed equal-fat download and upload completed at `621.980 Mbps` and
+    `703.988 Mbps`, versus the latest accepted matched control at
+    `622.660/590.934 Mbps`; throughput selection cannot enter the changed
+    latency-sensitive branch and no throughput downgrade was observed; and
+  - blackhole recovery retained bulk service at `176.875 Mbps`, completed all
+    reliable checks and HTTP checks, and limited the bulk recovery gap to
+    `404 ms`. Two deliberately unreliable datagrams were lost.
+- Evidence boundary:
+  - host validity rejected the performance cohort only because the tested
+    source patch was necessarily uncommitted; no host-condition rule failed;
+  - these runs prove functional acceptance and unchanged code-path behavior,
+    not a new publishable throughput baseline; and
+  - reproducible artifacts are retained under
+    `./.tmp/lab/results/cold-start-current-regression/`.

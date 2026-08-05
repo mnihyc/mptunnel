@@ -180,12 +180,12 @@ existing connections remain until their normal timeout or recovery.
 | Concurrency | Object (KiB) | Duration (s) | Requests | Rejected | Failed | Deadline (ms) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10 | 32 | 30 | 90/90 | 0 | 0 | 3,000 |
-| 20 | 1,024 | 60 | 734/734 | 0 | 0 | — |
+| 20 | 1,024 | 60 | 732/732 | 0 | 0 | — |
 
 The first run opened ten requests every three seconds. All 90 requests
-completed, but the cold first batch took 5.031 seconds; the remaining eight
-batches completed inside the three-second deadline. The second kept twenty
-one-MiB transfers active and replaced each completed request immediately.
+completed inside the three-second deadline; the slowest batch took 1.288
+seconds. The second kept twenty one-MiB transfers active and replaced each
+completed request immediately.
 
 ## Local processing capacity
 

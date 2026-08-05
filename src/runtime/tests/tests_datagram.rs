@@ -887,7 +887,7 @@ fn endpoint_only_tcp_interactive_opens_spread_active_load_without_probe_noise() 
 }
 
 #[test]
-fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_noise() {
+fn endpoint_only_tcp_open_reservations_prefer_authenticated_readiness_timing() {
     let first_path = "tcp://127.0.0.1:10162?tcp-carriers=1-1"
         .parse::<PathSpec>()
         .expect("first path");
@@ -904,6 +904,20 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
     )
     .expect("context");
 
+    {
+        let mut health = context.health().lock().expect("health lock");
+        for (index, readiness_rtt) in [(0, 20), (1, 80)] {
+            health.tcp[index].install_tcp_peer_usage(
+                PathId(index as u16),
+                next_carrier_path_instance_id(),
+                0,
+                PathUsage::Available,
+            );
+            health.tcp[index].mark_success(Duration::from_millis(readiness_rtt));
+        }
+    }
+    // A generic probe is not authenticated carrier readiness and must not
+    // displace either exact carrier despite its lower sample.
     context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
 
     let first = context
@@ -916,7 +930,7 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
     assert_eq!(first.key().underlay, UnderlayProtocol::Tcp);
     assert_eq!(first.key().index, 0);
     assert_eq!(second.key().underlay, UnderlayProtocol::Tcp);
-    assert_eq!(second.key().index, 1);
+    assert_eq!(second.key().index, 0);
 
     context.mark_tcp_path_reserved_open_success(first.key().index, Duration::from_millis(20));
     context.mark_tcp_path_reserved_open_success(second.key().index, Duration::from_millis(80));

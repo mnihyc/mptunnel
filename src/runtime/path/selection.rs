@@ -66,12 +66,48 @@ impl ClientPathContext {
     fn sort_reliable_path_candidates(
         &self,
         candidates: &mut [BulkPathCandidate],
+        lane: TrafficClass,
+        payload_bytes: usize,
         evidence_free_startup: bool,
     ) {
+        if evidence_free_startup && lane.is_latency_sensitive() {
+            for candidate in candidates
+                .iter_mut()
+                .filter(|candidate| candidate.snapshot.peer_usage.is_some())
+            {
+                if let Some(score) = scheduler::score_path(candidate.snapshot, lane, payload_bytes)
+                {
+                    // Authenticated readiness qualifies exact-instance timing
+                    // for latency ranking, but never promotes capacity.
+                    candidate.eta_ms = score.eta_ms;
+                }
+            }
+        }
         candidates.sort_by(|left, right| {
             let common = scheduler::path_is_backup(left.snapshot)
                 .cmp(&scheduler::path_is_backup(right.snapshot));
-            if evidence_free_startup {
+            if evidence_free_startup && lane.is_latency_sensitive() {
+                let left_authenticated = left.snapshot.peer_usage.is_some();
+                let right_authenticated = right.snapshot.peer_usage.is_some();
+                common
+                    // A latency-sensitive application flow is not a carrier probe:
+                    // prefer authenticated service over an establishing path.
+                    .then_with(|| right_authenticated.cmp(&left_authenticated))
+                    .then_with(|| {
+                        if left_authenticated && right_authenticated {
+                            left.eta_ms.total_cmp(&right.eta_ms)
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    })
+                    .then_with(|| {
+                        left.snapshot
+                            .active_latency_sensitive_flows
+                            .cmp(&right.snapshot.active_latency_sensitive_flows)
+                    })
+                    .then_with(|| left.snapshot.active_flows.cmp(&right.snapshot.active_flows))
+                    .then_with(|| self.relay_path_key_order(left.key, right.key))
+            } else if evidence_free_startup {
                 common
                     .then_with(|| {
                         left.snapshot
@@ -237,7 +273,12 @@ impl ClientPathContext {
             &self.udp_paths,
             &udp_observations,
         );
-        self.sort_reliable_path_candidates(&mut candidates, evidence_free_startup);
+        self.sort_reliable_path_candidates(
+            &mut candidates,
+            lane,
+            payload_bytes,
+            evidence_free_startup,
+        );
         #[cfg(feature = "lab-diagnostics")]
         for (rank, candidate) in candidates.iter().enumerate() {
             lab_diagnostic(
@@ -315,7 +356,7 @@ impl ClientPathContext {
             lane,
             payload_bytes,
         );
-        self.sort_reliable_path_candidates(&mut candidates, false);
+        self.sort_reliable_path_candidates(&mut candidates, lane, payload_bytes, false);
         candidates
             .into_iter()
             .map(|candidate| candidate.key)

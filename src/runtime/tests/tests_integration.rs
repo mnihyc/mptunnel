@@ -1179,8 +1179,11 @@ async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescen
 
     {
         let health = context.health().lock().expect("bounded-pool health");
-        assert_eq!(health.tcp[0].active_flows, 1);
-        assert!(health.tcp[1..].iter().all(|path| path.active_flows == 0));
+        assert_eq!(
+            health.tcp.iter().map(|path| path.active_flows).sum::<u32>(),
+            1,
+            "one carrier must own the live Product attachment"
+        );
     }
 
     // The hop interval makes replacement eligible; it never permits an active

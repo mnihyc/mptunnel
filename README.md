@@ -120,6 +120,17 @@ The two-link run measured 160 Mbps versus 61 and 99 Mbps separately, while
 every TCP, HTTP, and UDP check completed. Latency cells are p50/p95;
 check cells are completed/attempted.
 
+### Short connections
+
+| Load | Object | Window | Completed | Rejected | Failed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10 every 3 s | 32 KiB | 30 s | 90/90 | 0 | 0 |
+| 20 continuous | 1 MiB | 60 s | 732/732 | 0 | 0 |
+
+The slowest ten-request batch completed in 1.288 seconds against its
+three-second bound. The continuous run held twenty requests in flight and
+immediately replaced each completion.
+
 ### Stay online
 
 Each row is one controlled disruption run. Counts are completed/attempted

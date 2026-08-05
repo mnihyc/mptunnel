@@ -41,12 +41,12 @@ profile above.
 | --- | --- | ---: | ---: | ---: |
 | Xray | VMess/TCP | 1 | 441.353 | ≥337.788 |
 | Hysteria2 | Brutal | 1 | 463.502 | ≥459.287 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 1 | 414.200 | 436.133 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 2 | 771.888 | 602.173 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 1 | 414.200 | 425.335 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 2 | 771.888 | 621.237 |
 | Linux MPTCP | TCP | 5 | 884.667 | 2.572 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 1,365.876 | 1,496.079 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 1,365.876 | 1,383.641 |
 
-Default MPTUNNEL scales 1.86×/1.38× from one to two links and 3.30×/3.43×
+Default MPTUNNEL scales 1.86×/1.46× from one to two links and 3.30×/3.25×
 from one to five links for download/upload. Every MPTUNNEL result completed
 with exact receiver accounting. The Xray and Hysteria2 upload sessions did not
 close inside the completion window, so their receiver-delivered values are

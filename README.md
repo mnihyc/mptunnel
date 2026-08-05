@@ -80,13 +80,13 @@ loss profile above.
 
 | System | Links | Download | Upload |
 | --- | ---: | ---: | ---: |
-| MPTUNNEL | 1 | 414 Mbps | 436 Mbps |
-| MPTUNNEL | 2 | 772 Mbps | 602 Mbps |
+| MPTUNNEL | 1 | 414 Mbps | 425 Mbps |
+| MPTUNNEL | 2 | 772 Mbps | 621 Mbps |
 | Linux MPTCP | 5 | 885 Mbps | — |
-| MPTUNNEL | 5 | 1,366 Mbps | 1,496 Mbps |
+| MPTUNNEL | 5 | 1,366 Mbps | 1,384 Mbps |
 
-Two links provide 1.86× download and 1.38× upload goodput; five provide 3.30×
-and 3.43×. Xray/VMess and Hysteria2 remain the one-link product controls above;
+Two links provide 1.86× download and 1.46× upload goodput; five provide 3.30×
+and 3.25×. Xray/VMess and Hysteria2 remain the one-link product controls above;
 they do not aggregate one application flow across independent links. Linux
 MPTCP is a kernel transport control, not an encrypted proxy.
 

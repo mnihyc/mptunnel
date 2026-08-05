@@ -10,6 +10,30 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-05T23:06:00+08:00: public aggregation uploads refreshed on corrected recovery
+
+- Name: current one-, two-, and five-link request-direction evidence
+- Category: Public performance evidence and documentation consistency
+- State: completed on clean source `d87dc75`; README and detailed performance
+  evidence now use the same current receiver-delivered values
+- Results under the existing public `500 Mbps`, `20 ms` one-way delay,
+  `10 ms` jitter, `0.5%` loss, two-flow, 20-second profile:
+  - one physical link: `425.335 Mbps` upload;
+  - two physical links: `621.237 Mbps` upload; and
+  - five physical links: `1,383.641 Mbps` upload.
+- The five-link repeat delivered `1,379.945` and `1,383.641 Mbps`, a `0.27%`
+  difference. The older isolated `1,496.079 Mbps` value was therefore replaced
+  rather than selected as a historical peak.
+- Existing download and competitor rows were not rerun or changed because the
+  correction is request-direction recovery and their payload paths are
+  unaffected. Updated upload scaling is `1.46×` for two links and `3.25×` for
+  five links relative to the current one-link upload.
+- All three published runs completed with exact receiver accounting, valid
+  host snapshots, clean tracked source, no command failure, and the default
+  shared-transport-key TCP+QUIC profile.
+- Evidence: `./.tmp/lab/results/readme-request-recovery-current/` and
+  `./.tmp/lab/results/readme-request-recovery-five-repeat/`.
+
 ## 2026-08-05T22:56:00+08:00: request Data-ACK recovery regains direction-neutral flight age
 
 - Name: exact original-flight epoch for authoritative request-gap recovery

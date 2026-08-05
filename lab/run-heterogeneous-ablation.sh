@@ -253,6 +253,7 @@ if [[ ! "$client_start_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
 fi
 isolate_cases="${ISOLATE_CASES:-1}"
 isolate_containers="${ISOLATE_CONTAINERS_PER_CASE:-1}"
+shared_transport_secret="${MPTUNNEL_LAB_SHARED_TRANSPORT_SECRET:-0}"
 if [[ -n "${MPTUNNEL_LAB_SECRET:-}" ]]; then
   secret="$MPTUNNEL_LAB_SECRET"
 else
@@ -276,19 +277,25 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -addext "extendedKeyUsage=serverAuth" \
   -keyout "$lab_identity_dir/tls-private-key.pem" \
   -out "$lab_identity_dir/tls-certificate.pem" >/dev/null 2>&1
+if flag_enabled "$shared_transport_secret"; then
+  openssl rand -out "$lab_identity_dir/transport-secret.raw" 32
+fi
 server_credential_path="$lab_identity_container_dir/credential.key"
 server_management_token_path="$lab_identity_container_dir/management.token"
 server_tls_certificate_path="$lab_identity_container_dir/tls-certificate.pem"
 server_tls_private_key_path="$lab_identity_container_dir/tls-private-key.pem"
+server_transport_secret_path="$lab_identity_container_dir/transport-secret.raw"
 if [[ "$client_runtime" == "wine" ]]; then
   client_identity_dir="Z:\\workspace\\.tmp\\lab\\identity-$$"
   client_credential_path="${client_identity_dir}\\credential.key"
   client_management_token_path="${client_identity_dir}\\management.token"
   client_tls_certificate_path="${client_identity_dir}\\tls-certificate.pem"
+  client_transport_secret_path="${client_identity_dir}\\transport-secret.raw"
 else
   client_credential_path="$server_credential_path"
   client_management_token_path="$server_management_token_path"
   client_tls_certificate_path="$server_tls_certificate_path"
+  client_transport_secret_path="$server_transport_secret_path"
 fi
 baseline_uuid="${BASELINE_UUID:-$(SECRET="$secret" python3 -c 'import os, uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, os.environ["SECRET"]))')}"
 saturate_protocol="${MPTUNNEL_LAB_SATURATE_PROTOCOL:-udp}"
@@ -488,6 +495,7 @@ refresh_result_reproducibility() {
     MPTUNNEL_BUILD_FEATURES="$mptunnel_build_features" \
     MPTUNNEL_PROTOCOL_VERSION="$mptunnel_protocol_version" \
     MPTUNNEL_CARRIER_PRESENTATION="$mptunnel_carrier_presentation" \
+    MPTUNNEL_SHARED_TRANSPORT_SECRET="$shared_transport_secret" \
     MPTUNNEL_CLIENT_RUNTIME="$client_runtime" \
     MPTUNNEL_CLIENT_RUNTIME_VERSION="$runtime_version" \
     MPTUNNEL_CLIENT_TARGET="$client_target" \
@@ -519,6 +527,11 @@ identity = {
     "mptunnel_carrier_presentation": os.environ[
         "MPTUNNEL_CARRIER_PRESENTATION"
     ],
+    "mptunnel_transport_profile": (
+        "shared-secret"
+        if os.environ["MPTUNNEL_SHARED_TRANSPORT_SECRET"].lower() in {"1", "true", "yes"}
+        else "standard"
+    ),
     "mptunnel_client_runtime": os.environ["MPTUNNEL_CLIENT_RUNTIME"],
     "mptunnel_client_runtime_version": os.environ["MPTUNNEL_CLIENT_RUNTIME_VERSION"],
     "mptunnel_client_target": os.environ["MPTUNNEL_CLIENT_TARGET"],
@@ -789,13 +802,21 @@ management_config_toml() {
     "$management_snapshot_port" "$token_path_json"
 }
 
+shared_transport_secret_toml() {
+  local path="$1"
+  if flag_enabled "$shared_transport_secret"; then
+    printf 'transport_secret_file = %s\n' "$(toml_string "$path")"
+  fi
+}
+
 server_config_toml() {
   local log_level_json credential_path_json certificate_path_json private_key_path_json
-  local paths resources management
+  local paths resources management transport_security
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$server_credential_path")"
   certificate_path_json="$(toml_string "$server_tls_certificate_path")"
   private_key_path_json="$(toml_string "$server_tls_private_key_path")"
+  transport_security="$(shared_transport_secret_toml "$server_transport_secret_path")"
   paths="$(toml_named_paths_from_args \
     "tcp://172.31.10.20:${server_port}" \
     "tcp://172.31.15.20:${server_port}" \
@@ -849,6 +870,7 @@ outbound = "lab-direct"
 credential_ids = ["lab"]
 tls_certificate_chain_file = ${certificate_path_json}
 tls_private_key_file = ${private_key_path_json}
+${transport_security}
 
 [inbounds.destination_acl]
 generation = 1
@@ -868,10 +890,11 @@ EOF
 socks_client_config_toml() {
   local path_args="$1"
   local log_level_json credential_path_json certificate_path_json
-  local listen paths resources probe management
+  local listen paths resources probe management transport_security
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$client_credential_path")"
   certificate_path_json="$(toml_string "$client_tls_certificate_path")"
+  transport_security="$(shared_transport_secret_toml "$client_transport_secret_path")"
   listen="$(toml_array_from_args "127.0.0.1:${proxy_port}")"
   paths="$(path_args_to_named_path_array "$path_args")"
   resources="$(resource_config_toml)"
@@ -909,6 +932,7 @@ ${probe}
 credential_id = "lab"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = ${certificate_path_json}
+${transport_security}
 
 [routing]
 
@@ -930,10 +954,11 @@ EOF
 tun_client_config_toml() {
   local path_args="$1"
   local log_level_json credential_path_json certificate_path_json
-  local paths resources probe management
+  local paths resources probe management transport_security
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$client_credential_path")"
   certificate_path_json="$(toml_string "$client_tls_certificate_path")"
+  transport_security="$(shared_transport_secret_toml "$client_transport_secret_path")"
   paths="$(path_args_to_named_path_array "$path_args")"
   resources="$(resource_config_toml)"
   probe="$(probe_config_toml)"
@@ -972,6 +997,7 @@ ${probe}
 credential_id = "lab"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = ${certificate_path_json}
+${transport_security}
 
 [routing]
 

@@ -145,9 +145,10 @@ rather than to a global path role.
 
 Each MPP outbound selects one credential with `credential_id`; each MPP
 inbound accepts one or more credentials with `credential_ids`. Separate MPP
-outbounds may select separate credentials. The outbound's `tls_server_name`
-is the authenticated TLS identity for all of its TCP and QUIC carriers, while
-the pinned certificate identifies the exact accepted server leaf.
+outbounds may select separate credentials. `tls_server_name` defaults to
+`mptunnel.example` and identifies the pinned QUIC and legacy-TCP certificate.
+An optional `transport_secret_file` is one raw 32-byte endpoint-wide secret
+shared by the two peers; it is not an MPP client credential.
 
 `tcp-forward` and `udp-forward` local inbounds require explicit non-zero
 listeners and one canonical `target`. TCP overload is closed immediately at
@@ -390,18 +391,20 @@ change. A changed logging sink is prepared inside the serialized apply
 transaction after the document is staged; preparation failure rolls the
 document back before the active runtime is changed or a reload is requested.
 Every routing, DNS, transport, resource, timeout, client-credential, TLS, or
-other change activates through a clean runtime-generation replacement. A
-changed logging sink included with such a replacement is preflighted on apply
-and opened definitively at activation; unchanged logging retains its existing
-descriptor. Management listener or authentication changes are rejected by the
-API and require a local file edit and restart.
+shared-transport-secret change activates through a clean runtime-generation
+replacement. A changed logging sink included with such a replacement is
+preflighted on apply and opened definitively at activation; unchanged logging
+retains its existing descriptor. Management listener or authentication
+changes are rejected by the API and require a local file edit and restart.
 
 An identical TOML document is idempotent even if a referenced file was replaced.
-For an online certificate, key, CA, pin, proxy-password, or signed-rule-set
-rotation, write the material under a new versioned path and apply the document
-that names it. A normal process restart re-reads material at unchanged paths.
-Credential principal or secret rotation uses a new credential ID so overlap
-and retirement remain explicit.
+For an online certificate, key, CA, pin, transport-secret, proxy-password, or
+signed-rule-set rotation, write the material under a new versioned path and
+apply the document that names it. A shared transport secret changes as a
+coordinated generation cutover; it is not tried alongside an old key. A normal
+process restart re-reads material at unchanged paths. Credential principal or
+secret rotation uses a new credential ID so overlap and retirement remain
+explicit.
 
 Persistence is activation-safe. A newly persisted document remains pending
 while the prior active document is the durable last-good configuration. The
@@ -702,30 +705,37 @@ address when source-address selection matters.
 
 ## Encryption
 
-All MPP paths use TLS 1.3. TCP deliberately negotiates no ALPN, then uses one
-bounded exporter-bound binary admission prelude followed directly by raw MPP
-frames in TLS application data. Rejected unauthenticated TCP input is closed
-without application response bytes. TCP never changes into HTTP.
+Without `transport_secret_file`, TCP uses TLS 1.3 with no ALPN, followed by one
+bounded exporter-bound binary admission prelude and raw MPP frames. With the
+file configured, TCP instead uses `Noise_NNpsk0_25519_AESGCM_SHA256`; the Noise
+PSK, length masks, admission binding, and record keys are domain-separated from
+the endpoint secret. Public and wrong-secret probes receive no handshake
+response. Freshness and a bounded process-local replay cache admit a valid
+first flight before the server responds. TCP never changes into HTTP.
 
-QUIC negotiates standard `h3`. Each encrypted request carries a
-credential-derived selector; the same gate requires HTTPS, authority equal to
-the negotiated TLS SNI, and exactly `/` without a query before request DATA
-reaches the MPP parser. Normal `SESSION_AUTH`, `PATH_JOIN`, replay, and
-freshness validation still follow. Reliable records use H3 DATA and UDP
-payloads use RFC 9297 datagrams. Ordinary, nonmatching, and rejected requests
-receive the same marker-free 404, and a successful response is withheld until
-full MPP authentication. Both carriers authenticate the same explicitly
-configured server certificate. The MPP application credential is independent
-and never derives the TLS identity or verifier. QUIC path groups require a DNS
-TLS identity because IP identities do not produce SNI; carrier endpoints may
-still be literal IP addresses. MPP carrier 0-RTT is disabled.
+QUIC negotiates `h3`. The optional endpoint secret derives private Initial
+keys, so a public or wrong-key Initial receives no response and cannot elicit
+the certificate flight. QUIC version and packet shape remain visible. Each
+encrypted request carries a credential-derived selector; the same gate
+requires HTTPS, authority equal to the negotiated TLS SNI, and exactly `/`
+without a query before request DATA reaches the MPP parser. Normal
+`SESSION_AUTH`, `PATH_JOIN`, replay, and freshness validation still follow.
+Reliable records use H3 DATA and UDP payloads use RFC 9297 datagrams. Ordinary,
+nonmatching, and rejected requests receive the same marker-free 404, and a
+successful response is withheld until full MPP authentication. QUIC and
+legacy-profile TCP authenticate the explicitly configured server certificate;
+shared-secret TCP authenticates possession of the endpoint group secret and
+does not transmit the certificate. The MPP application credential is
+independent and never derives the TLS identity, verifier, or endpoint transport
+secret. QUIC path groups require a DNS TLS identity because IP identities do
+not produce SNI; carrier endpoints may still be literal IP addresses. MPP
+carrier 0-RTT is disabled.
 
 The selector removes an unauthenticated MPP-parser oracle; it does not make the
 endpoint indistinguishable. Source-aware clients and observers can still
-fingerprint certificate/SNI, TLS/QUIC/H3 behavior and parameters, packet
-shape, timing, and the public response profile. MPTUNNEL is not a cover
-service. See the RFC's
-[TCP presentation](../RFC.md#61-tcp-over-tls-13) and
+fingerprint QUIC packet shape and version, Noise ephemeral keys, timing, and
+response behavior. MPTUNNEL is not a cover service. See the RFC's
+[TCP presentation](../RFC.md#61-tcp-carrier-protection) and
 [HTTP/3 presentation](../RFC.md#62-quic-over-http3) for the exact
 admission, request, DATA-record, and native-datagram contracts.
 

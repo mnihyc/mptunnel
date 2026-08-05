@@ -15,6 +15,8 @@ const TEST_CREDENTIAL_FED_FILE: &str = "mptunnel-test-credential-fed.key";
 const TEST_REFERENCE_CREDENTIAL_FILE: &str = "mpp-credential.key";
 const TEST_MANAGEMENT_TOKEN_FILE: &str = "management-token.key";
 const TEST_PROXY_PASSWORD_FILE: &str = "proxy-password.key";
+const TEST_TRANSPORT_SECRET_FILE: &str = "mptunnel-transport-secret.key";
+const TEST_SHORT_TRANSPORT_SECRET_FILE: &str = "mptunnel-short-transport-secret.key";
 const TEST_CREDENTIAL_CATALOG: &str = r#"
 [[credentials]]
 credential_id = "test-default"
@@ -83,6 +85,11 @@ impl TestTlsDirectory {
             ),
             (TEST_MANAGEMENT_TOKEN_FILE, b"operator-token-123".as_slice()),
             (TEST_PROXY_PASSWORD_FILE, b"proxy-password".as_slice()),
+            (
+                TEST_TRANSPORT_SECRET_FILE,
+                b"transport-secret-32-bytes-value!",
+            ),
+            (TEST_SHORT_TRANSPORT_SECRET_FILE, b"too-short"),
         ] {
             std::fs::write(path.join(file), secret).expect("write config-test credential");
         }
@@ -198,6 +205,130 @@ fn mpp_outbounds(node: &NodeConfig) -> Vec<&MppOutboundConfig> {
             OutboundLeafConfig::Local { .. } => None,
         })
         .collect()
+}
+
+fn mpp_outbound_security_document(extra_security: &str) -> String {
+    format!(
+        r#"
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{{ name = "path-1", endpoint = "udp://127.0.0.1:443" }}]
+
+[outbounds.security]
+credential_id = "test-default"
+tls_pinned_certificate_file = "{TEST_CERTIFICATE_FILE}"
+{extra_security}
+
+[routing]
+[[routing.rules]]
+name = "default"
+action = "outbound"
+outbound = "edge"
+"#,
+    )
+}
+
+fn mpp_inbound_security_document(extra_security: &str) -> String {
+    format!(
+        r#"
+[[inbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }}]
+outbound = "direct"
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain_file = "{TEST_CERTIFICATE_FILE}"
+tls_private_key_file = "{TEST_PRIVATE_KEY_FILE}"
+{extra_security}
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+"#,
+    )
+}
+
+#[test]
+fn shared_transport_secret_is_optional_distinct_and_strict() {
+    let default_name =
+        load_config_toml_str(&mpp_outbound_security_document("")).expect("default MPP TLS name");
+    let explicit_name = load_config_toml_str(&mpp_outbound_security_document(
+        r#"tls_server_name = "mptunnel.example""#,
+    ))
+    .expect("explicit default MPP TLS name");
+    let CommandConfig::Node(default_name) = default_name.command;
+    let CommandConfig::Node(explicit_name) = explicit_name.command;
+    assert_eq!(
+        mpp_outbounds(&default_name)[0].paths[0]
+            .tls
+            .quic_server_name_text()
+            .as_deref(),
+        Some(DEFAULT_MPP_TLS_SERVER_NAME)
+    );
+    assert_eq!(
+        mpp_outbounds(&explicit_name)[0].paths[0]
+            .tls
+            .quic_server_name_text(),
+        mpp_outbounds(&default_name)[0].paths[0]
+            .tls
+            .quic_server_name_text(),
+        "omitted MPP TLS name must compile to the documented default"
+    );
+
+    let protected = load_config_toml_str(&mpp_outbound_security_document(&format!(
+        "transport_secret_file = {TEST_TRANSPORT_SECRET_FILE:?}"
+    )))
+    .expect("client shared transport secret");
+    let CommandConfig::Node(protected) = protected.command;
+    assert!(
+        !mpp_outbounds(&default_name)[0].paths[0]
+            .tls
+            .shared_transport_secret_configured()
+    );
+    assert!(
+        mpp_outbounds(&protected)[0].paths[0]
+            .tls
+            .shared_transport_secret_configured()
+    );
+    assert!(
+        !format!("{:?}", mpp_outbounds(&protected)[0].paths[0].tls)
+            .contains("transport-secret-32-bytes-value")
+    );
+
+    let server = load_config_toml_str(&mpp_inbound_security_document(&format!(
+        "transport_secret_file = {TEST_TRANSPORT_SECRET_FILE:?}"
+    )))
+    .expect("server shared transport secret");
+    let CommandConfig::Node(server) = server.command;
+    assert_eq!(server.servers.len(), 1);
+    assert!(server.servers[0].tls.shared_transport_secret_configured());
+
+    for file in [
+        TEST_SHORT_TRANSPORT_SECRET_FILE,
+        "missing-transport-secret.key",
+    ] {
+        let error = load_config_toml_str(&mpp_outbound_security_document(&format!(
+            "transport_secret_file = {file:?}"
+        )))
+        .expect_err("invalid shared transport secret");
+        assert!(error.to_string().contains("shared transport secret"));
+    }
+
+    for removed in ["tcp_server_public_key_file", "tcp_server_private_key_file"] {
+        assert!(matches!(
+            load_config_toml_str(&mpp_outbound_security_document(&format!(
+                "{removed} = \"obsolete.key\""
+            ))),
+            Err(ConfigFileError::Toml(_))
+        ));
+    }
 }
 
 fn local_outbound<'a>(node: &'a NodeConfig, id: &str) -> &'a OutboundConfig {

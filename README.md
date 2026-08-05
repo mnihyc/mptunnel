@@ -167,7 +167,7 @@ SOCKS5 / HTTP CONNECT / TCP+UDP forward / TUN
                          |
        selection, Data ACK, flow control, reinjection
                          |
-         TCP/TLS carriers       QUIC/HTTP/3 carriers
+       TCP protected carriers   QUIC/HTTP/3 carriers
                   \              /
                    independent links
 ```
@@ -188,8 +188,8 @@ and a separate TLS identity:
 umask 077
 openssl rand -hex 32 > mpp-credential.key
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -subj "/CN=server.example.com" \
-  -addext "subjectAltName=DNS:server.example.com" \
+  -subj "/CN=mptunnel.example" \
+  -addext "subjectAltName=DNS:mptunnel.example" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth" \
@@ -213,13 +213,25 @@ Start the client:
 ```bash
 mptunnel --credential-secret-file ./mpp-credential.key \
   client \
-  --tls-server-name server.example.com \
   --tls-pinned-certificate ./server-cert.pem \
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
   --path tcp://server.example.com:7443 \
   --path udp://server.example.com:7443
 ```
+
+Transport protection can additionally hide the TCP TLS handshake and prevent
+public QUIC Initial packets from eliciting a certificate flight. Generate a
+separate raw endpoint secret and pass the same file to both commands:
+
+```bash
+openssl rand -out mpp-transport.key 32
+# add: --transport-secret-file ./mpp-transport.key
+```
+
+This endpoint-wide file is not an MPP client credential. Omitting it retains
+the standard TLS 1.3 TCP and public QUIC profile. The certificate name defaults
+to `mptunnel.example`; `--tls-server-name` remains available as an override.
 
 For persistent operation, copy `examples/client.toml` or
 `examples/server.toml` to `config.toml`, replace the placeholders, and validate
@@ -279,15 +291,17 @@ can remain correct. Run `mptunnel platform` for the current host report.
 
 ## Security
 
-All carriers use TLS 1.3 with an independently configured server identity. TCP
-negotiates no fixed ALPN, sends an exporter-bound binary admission prelude, and
-then carries MPP records; it does not become HTTP. QUIC uses standard HTTP/3
-framing and RFC 9297 datagrams with an encrypted credential-derived admission
-selector before MPP parsing. Carrier 0-RTT is disabled.
+The default profile uses TLS 1.3 TCP with no ALPN and QUIC with HTTP/3; carrier
+0-RTT is disabled. When the optional shared transport secret is configured,
+TCP uses a PSK-gated Noise session and QUIC derives private Initial keys before
+its inner TLS/HTTP/3 handshake. Public and wrong-secret probes receive no TCP
+handshake response and cannot elicit or decrypt a QUIC certificate flight. MPP
+client credentials stay separate and still authorize individual peers after
+carrier protection.
 
 This removes simple plaintext protocol markers, but it is not an
 indistinguishability or cover-service claim. A source-aware active observer may
-still fingerprint certificate, TLS/QUIC/HTTP/3 parameters, packet shape, timing,
+still fingerprint QUIC packet shape and version, Noise ephemeral keys, timing,
 or response behavior. MPP is a new custom protocol without an independent
 security audit. Use high-entropy credentials, protect key/token files, keep the
 management listener on loopback, and read [SECURITY.md](SECURITY.md).

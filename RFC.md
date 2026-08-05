@@ -34,12 +34,12 @@ rules specified here.
 ## 2. Scope and Non-Goals
 
 MPP carries application byte streams and datagrams over one or more
-authenticated transport connections. A carrier uses one of:
-
-- TCP protected by TLS 1.3, with reliability, congestion control,
-  retransmission, and packetization owned by the TCP stack; or
-- QUIC over UDP, with packetization, congestion control, loss recovery,
-  address validation, and path MTU discovery owned by QUIC.
+authenticated transport connections. A carrier uses TCP or QUIC over UDP.
+TCP reliability, congestion control, retransmission, and packetization remain
+owned by the TCP stack. QUIC retains packetization, congestion control, loss
+recovery, address validation, migration, and path MTU discovery. Section 6
+defines the default carrier protection and the optional shared-transport-secret
+profile; neither profile changes that native transport ownership.
 
 MPP owns the data level above those transports:
 
@@ -261,14 +261,26 @@ authorizes state transfer or aggressive retirement.
 
 Every carrier MUST complete transport protection before MPP data admission:
 
-- TCP MUST complete TLS 1.3 with no early data and no negotiated ALPN.
+- A TCP carrier without a shared transport secret MUST complete TLS 1.3 with
+  no early data and no negotiated ALPN.
+- A TCP carrier with a shared transport secret MUST complete the Noise profile
+  in Section 6.1 before sending the MPP admission prelude.
 - QUIC MUST complete its TLS handshake, negotiate exactly `h3`, and disable
-  0-RTT for MPP carrier requests.
+  0-RTT for MPP carrier requests. A QUIC carrier with a shared transport secret
+  MUST first authenticate its Initial packets as specified in Section 6.2.
 
-Both carrier families MUST authenticate the configured TLS server identity.
-The certificate, private key, and client trust policy are independent from the
-MPP application credential. An MPP credential MUST NOT derive or replace a
-TLS certificate, private key, or certificate verifier.
+QUIC and default-profile TCP MUST authenticate the configured TLS server
+identity. Shared-secret TCP mutually authenticates possession of the endpoint
+transport secret; because this is a group PSK, any holder can impersonate
+either transport endpoint. The certificate, private key, client trust policy,
+and shared transport secret are independent from every MPP application
+credential. An MPP credential MUST NOT derive or replace any of them, and a
+shared transport secret MUST NOT be used as an MPP client credential.
+
+The shared-secret profile is selected only by matching out-of-band endpoint
+configuration. It has no wire negotiation, downgrade signal, or fallback. A
+configured endpoint MUST use that profile exclusively; authentication failure
+MUST NOT retry the default profile on the same or a new carrier attempt.
 
 ### 5.2 MPP application authentication
 
@@ -310,7 +322,7 @@ The TCP prelude transcript is:
 "mptunnel tcp session auth v1" ||
 carrier_role:u8 = 1 ||
 direction:u8 = 1 ||
-tls_exporter:32B ||
+transport_binding:32B ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 nonce:16B ||
@@ -341,7 +353,7 @@ The receiver MUST:
 - avoid disclosing which unauthenticated check failed.
 
 TCP additionally validates the fixed prelude fields, canonical zero padding,
-and exporter-bound tag. Credential lookup and policy evaluation occur at
+and transport-bound tag. Credential lookup and policy evaluation occur at
 authentication time; per-frame and per-byte processing MUST use the immutable
 permit established by that decision.
 
@@ -390,11 +402,90 @@ newer state that reused the same wire labels.
 
 ## 6. Carrier Profiles
 
-### 6.1 TCP over TLS 1.3
+### 6.1 TCP carrier protection
 
-TCP uses TLS 1.3, negotiates no ALPN, and accepts no early data. After the
-handshake, the initiator sends exactly one 131-byte admission prelude before
-any MPP frame:
+The default TCP profile uses TLS 1.3, negotiates no ALPN, and accepts no early
+data. Both endpoints export exactly 32 bytes from the completed connection
+using `EXPORTER-mptunnel-tcp-admission-v1` with no exporter context. An early
+exporter MUST NOT be used. This value is the `transport_binding` in Section
+5.2.
+
+The optional shared-secret TCP profile uses
+`Noise_NNpsk0_25519_AESGCM_SHA256` with the prologue
+`mptunnel tcp carrier v1`. The endpoint-wide input MUST be exactly 32 random
+bytes. Define:
+
+```text
+K(label, context) = HMAC-SHA256(transport_secret, label || context)
+```
+
+The Noise PSK is `K("mptunnel tcp noise psk v1", empty)`. The initiator
+handshake payload is:
+
+```text
+0       transport-profile version   u8; 1
+1..9    issued_at_unix_secs          u64
+9..25   nonce                        16 random bytes
+25..N   padding                      8 through 63 random bytes
+```
+
+The responder handshake payload contains only 8 through 63 random padding
+bytes. Padding length is selected uniformly. MPP identities, credentials, and
+frames MUST NOT appear in either Noise handshake payload.
+
+Each Noise handshake message is carried as its 32-byte ephemeral key, followed
+by a masked 16-bit network-order remaining length, followed by the remainder
+of that Noise message. For direction label `L`, the length mask is the first
+16 bits of:
+
+```text
+HMAC-SHA256(K(L, empty), L || ephemeral_key)
+```
+
+`L` is `mptunnel noise client handshake length v1` for the initiator flight
+and `mptunnel noise server handshake length v1` for the responder flight. The
+complete initiator Noise message length MUST be 81 through 136 bytes; the
+complete responder Noise message length MUST be 56 through 111 bytes.
+
+The responder MUST authenticate the complete initiator Noise message, validate
+its version and issue time against the configured authentication freshness
+window, and atomically admit its nonce to a bounded endpoint-local replay
+cache before writing any bytes. A malformed, stale, future, duplicate, or
+capacity-exceeding first flight is rejected without a response. Replay state
+is shared by every carrier created from that endpoint configuration and lives
+for that runtime configuration generation. A clean generation replacement,
+process restart, or independent process creates a new replay boundary unless
+the host supplies shared durable replay state. Reusing one transport secret
+across independent MPP inbounds therefore also creates independent replay
+boundaries and is NOT RECOMMENDED.
+
+Let `h` be the completed Noise handshake hash. The Noise profile's
+`transport_binding` is:
+
+```text
+K("mptunnel noise admission binding v1", h)
+```
+
+Noise application data is a sequence of records. Each record carries a masked
+16-bit ciphertext length followed by AES-GCM ciphertext and tag. Directional
+length keys are `K("mptunnel noise client record length v1", h)` and
+`K("mptunnel noise server record length v1", h)`. For record nonce `n`, the
+mask is the first 16 bits of:
+
+```text
+HMAC-SHA256(direction_length_key,
+            "mptunnel noise record header v1" || n:u64)
+```
+
+Plaintext is split into records of at most 65519 bytes. Empty records are
+invalid; ciphertext length is 17 through 65535 bytes. Nonces begin at zero and
+increase without reset. Before processing each nonzero nonce divisible by
+`2^20`, the sender rekeys its outgoing Noise cipher and the receiver rekeys its
+corresponding incoming cipher. An incomplete write or read makes that
+direction terminal.
+
+After either carrier-protection handshake, the initiator sends exactly one
+131-byte admission prelude before any MPP frame:
 
 ```text
 0        carrier_role              u8; client = 1
@@ -410,18 +501,15 @@ any MPP frame:
 The first `credential_id_length` bytes of `credential_id_slot` contain the
 canonical credential ID. Every remaining byte in the slot MUST be zero.
 
-Both endpoints export exactly 32 bytes from the completed TLS connection using
-the label `EXPORTER-mptunnel-tcp-admission-v1` and no exporter context. Those
-bytes are `tls_exporter` in Section 5.2. An early exporter MUST NOT be used.
-
 The prelude is carrier-admission data, not an MPP frame, and does not begin
 with `MPTF`. It is followed immediately by `PATH_JOIN` and sequence-zero
-`PATH_STATUS`. TLS record boundaries and write batching do not change this
+`PATH_STATUS`. Carrier record boundaries and write batching do not change this
 ordering.
 
 The listener reads one complete prelude before interpreting its fields. An
-incomplete or rejected prelude, TLS failure, admission timeout, or read failure
-MUST close without application response bytes or an MPP-specific close reason.
+incomplete or rejected prelude, carrier-protection failure, admission timeout,
+or read failure MUST close without application response bytes or an
+MPP-specific close reason.
 After successful authentication, ordinary MPP protocol errors follow
 Section 13.
 
@@ -465,6 +553,30 @@ evidence.
 `PATH_CAPACITY_RECEIPT` are valid only on TCP carriers.
 
 ### 6.2 QUIC over HTTP/3
+
+Without a shared transport secret, QUIC Initial keys follow RFC 9001. With a
+shared transport secret, define:
+
+```text
+private_initial_secret =
+  HMAC-SHA256(transport_secret,
+              "mptunnel quic private initial key v1")
+private_initial_input =
+  "mptunnel quic private initial v1" ||
+  private_initial_secret || destination_connection_id
+```
+
+The RFC 9001 version-specific Initial key schedule MUST use
+`private_initial_input` in place of the public destination-connection-ID input.
+This changes only Initial packet protection. QUIC version, long-header shape,
+connection IDs, minimum datagram size, the later TLS handshake, and every
+subsequent QUIC key space remain transport-owned and otherwise unchanged.
+
+Before authenticating a private Initial, a server MUST NOT emit Version
+Negotiation, Initial close, Retry, stateless reset, TLS certificate flight, or
+other response bytes. A public RFC 9001 or wrong-secret Initial is silently
+dropped. After successful private Initial authentication, ordinary QUIC
+validation and error behavior apply.
 
 QUIC MUST negotiate the standard `h3` ALPN. Each MPP control, stream, or flow
 channel uses an ordinary full-duplex HTTP/3 request stream whose encrypted
@@ -530,7 +642,7 @@ A nonmatching request, rejected selector, or failed MPP authentication receives
 the same marker-free `404 Not Found` response as an unknown resource. It MUST
 NOT receive an MPP-specific status, response field, body, or close reason.
 Failures before an HTTP/3 request exists use ordinary TLS, QUIC, or HTTP/3
-behavior.
+behavior after private-Initial authentication when that profile is configured.
 
 MPP frames carried in HTTP/3 DATA are each prefixed by their encoded length as
 an unsigned 32-bit network-order integer. HTTP/3 DATA boundaries are
@@ -1350,15 +1462,22 @@ authority merely because they were observed through a QUIC carrier.
 
 ### 14.1 Authentication and replay
 
-Transport encryption and server authentication precede MPP admission.
+Transport encryption and transport authentication precede MPP admission.
 Versioned HMAC contexts separate QUIC session authentication, TCP
-exporter-bound admission, and common path join. Nonces and freshness windows
-limit replay.
+transport-bound admission, common path join, Noise PSK/framing, and private
+QUIC Initial derivation. Nonces and freshness windows limit MPP admission
+replay.
+
+The shared transport secret MUST be generated as 256 bits of cryptographic
+randomness, stored as raw bytes, and protected as endpoint key material. It is
+not a password and MUST NOT be reused as an MPP credential. Noise handshake
+ephemerals provide forward secrecy for completed TCP transport keys, but the
+group PSK does not identify an individual client.
 
 The receiver MUST bound unauthenticated parsing, concurrent admission work,
-credential scans, replay state, and total admission duration. It MUST compare
-authentication material without data-dependent early exit that discloses the
-matching credential.
+transport and MPP replay state, credential scans, and total admission duration.
+It MUST compare authentication material without data-dependent early exit that
+discloses the matching credential.
 
 Target authorization is enforced under the authenticated principal at the
 receiving endpoint. A peer-supplied target, metric, usage, or `PathId` does not
@@ -1389,14 +1508,23 @@ payloads or targets are protocol violations.
 
 The QUIC candidate selector prevents a party without an active credential from
 reaching the MPP frame parser or eliciting an MPP-specific response. The TCP
-prelude and all MPP frames are encrypted.
+prelude and all MPP frames are encrypted. In the optional shared-secret
+profile, a public or wrong-secret probe cannot elicit TCP response bytes or a
+QUIC certificate flight. A replayed TCP first flight is rejected before a
+response while it remains in the endpoint replay cache.
 
-These properties do not provide indistinguishability. Passive observers can
-still observe IP and port locators, TLS and QUIC fingerprints, SNI and
-certificate identity, the standard `h3` ALPN, QUIC transport parameters,
-HTTP/3 settings, packet sizes, and timing. An active observer can probe public
-TLS, QUIC, and HTTP/3 behavior; a party holding an application credential can
-authenticate and identify the service.
+These properties do not provide indistinguishability. In the default profile,
+passive observers can still observe TLS and QUIC fingerprints, SNI and
+certificate identity, the `h3` ALPN, QUIC transport parameters, HTTP/3
+settings, packet sizes, and timing. The optional profile removes the public
+TCP ClientHello and prevents public QUIC Initial decryption, but Noise X25519
+ephemerals and QUIC version, header shape, connection IDs, size, and timing
+remain visible. Replay state is generation-local, so a captured, still-fresh
+Noise first flight can elicit a padded Noise response after a clean generation
+replacement or restart, or against an independent server process; it cannot
+disclose a certificate or admit MPP state. A party holding the endpoint
+transport secret can identify the transport service, and a party also holding
+an authorized MPP credential can authenticate as that credential.
 
 Implementations MUST NOT advertise MPP as a cover protocol or claim that its
 carrier presentation defeats a source-aware classifier. Fixed private
@@ -1710,6 +1838,12 @@ RFC 9000 and RFC 9002 govern each QUIC carrier's connection identity, network
 paths, address validation, migration, congestion control, loss recovery, RTT,
 ECN, and PMTU behavior. MPP does not redefine those mechanisms.
 
+The default profile uses the public RFC 9001 Initial key schedule. The optional
+shared-secret profile deliberately substitutes the private Initial input in
+Section 6.2 and is therefore not Initial-key interoperable with an endpoint
+that lacks the secret. After Initial authentication it retains the same QUIC
+connection and native transport ownership.
+
 MPP uses multiple independent QUIC connections as carriers. It does not claim
 Multipath QUIC conformance.
 
@@ -1741,6 +1875,7 @@ bounded MPP work.
 - [RFC 9114: HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html)
 - [RFC 9221: An Unreliable Datagram Extension to QUIC](https://www.rfc-editor.org/rfc/rfc9221.html)
 - [RFC 9297: HTTP Datagrams and the Capsule Protocol](https://www.rfc-editor.org/rfc/rfc9297.html)
+- [The Noise Protocol Framework, Revision 34](https://noiseprotocol.org/noise.html)
 
 ### 18.2 Informative
 

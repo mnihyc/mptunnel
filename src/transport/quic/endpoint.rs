@@ -392,7 +392,10 @@ fn server_config(
     tls: &TcpServerTlsConfig,
     mux_limits: MuxLimits,
 ) -> Result<ServerConfig, QuicCarrierError> {
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls.rustls_config())?;
+    let mut crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls.rustls_config())?;
+    if let Some(secret) = tls.quic_initial_secret() {
+        crypto.initial_packet_secret(secret);
+    }
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport = Arc::new(quic_transport_config(mux_limits)?);
     Ok(config)
@@ -402,9 +405,11 @@ fn client_config(
     tls: &TcpClientTlsConfig,
     mux_limits: MuxLimits,
 ) -> Result<ClientConfig, QuicCarrierError> {
-    let mut config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls.rustls_config())?,
-    ));
+    let mut crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls.rustls_config())?;
+    if let Some(secret) = tls.quic_initial_secret() {
+        crypto.initial_packet_secret(secret);
+    }
+    let mut config = ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(quic_transport_config(mux_limits)?));
     Ok(config)
 }

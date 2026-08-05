@@ -14,11 +14,11 @@ fn security() -> (ClientSecurityConfig, ServerSecurityConfig) {
 #[test]
 fn fixed_tcp_prelude_authenticates_session_and_then_distinct_path_join() {
     let (client, server) = security();
-    let exporter = [7; 32];
+    let transport_binding = [7; 32];
     let session_id = SessionId(41);
     let path_id = PathId(9);
     let (prelude, path_join) =
-        ClientTcpPathAuthentication::for_session(&client, path_id, session_id, &exporter)
+        ClientTcpPathAuthentication::for_session(&client, path_id, session_id, &transport_binding)
             .expect("client TCP admission")
             .into_parts();
 
@@ -41,7 +41,7 @@ fn fixed_tcp_prelude_authenticates_session_and_then_distinct_path_join() {
         &server,
         ProductCredentialAdmission::from_security(&server),
         &prelude,
-        &exporter,
+        &transport_binding,
     )
     .expect("server admission")
     .expect("valid TLS-bound prelude");
@@ -56,11 +56,15 @@ fn fixed_tcp_prelude_authenticates_session_and_then_distinct_path_join() {
 #[test]
 fn tcp_prelude_rejects_cross_connection_replay_and_malformed_fixed_fields() {
     let (client, server) = security();
-    let exporter = [11; 32];
-    let (prelude, _) =
-        ClientTcpPathAuthentication::for_session(&client, PathId(2), SessionId(8), &exporter)
-            .expect("client TCP admission")
-            .into_parts();
+    let transport_binding = [11; 32];
+    let (prelude, _) = ClientTcpPathAuthentication::for_session(
+        &client,
+        PathId(2),
+        SessionId(8),
+        &transport_binding,
+    )
+    .expect("client TCP admission")
+    .into_parts();
 
     assert!(
         authenticate_prelude(
@@ -71,7 +75,7 @@ fn tcp_prelude_rejects_cross_connection_replay_and_malformed_fixed_fields() {
         )
         .expect("cross-connection decision")
         .is_none(),
-        "a valid credential prelude cannot be replayed under another TLS exporter"
+        "a valid credential prelude cannot be replayed under another transport binding"
     );
 
     for offset in [ROLE_OFFSET, DIRECTION_OFFSET, TAG_OFFSET] {
@@ -82,7 +86,7 @@ fn tcp_prelude_rejects_cross_connection_replay_and_malformed_fixed_fields() {
                 &server,
                 ProductCredentialAdmission::from_security(&server),
                 &malformed,
-                &exporter,
+                &transport_binding,
             )
             .expect("malformed decision")
             .is_none()
@@ -97,7 +101,7 @@ fn tcp_prelude_rejects_cross_connection_replay_and_malformed_fixed_fields() {
             &server,
             ProductCredentialAdmission::from_security(&server),
             &noncanonical_padding,
-            &exporter,
+            &transport_binding,
         )
         .expect("padding decision")
         .is_none()

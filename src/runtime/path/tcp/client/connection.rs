@@ -154,10 +154,14 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         .await?;
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
         let mut framed = EncryptedFramedStream::connect(tcp_stream, tls, codec_limits).await?;
-        let tls_exporter = framed.tcp_admission_exporter()?;
-        let (admission_prelude, path_join) =
-            ClientTcpPathAuthentication::for_session(security, path_id, session_id, &tls_exporter)?
-                .into_parts();
+        let transport_binding = framed.tcp_admission_binding()?;
+        let (admission_prelude, path_join) = ClientTcpPathAuthentication::for_session(
+            security,
+            path_id,
+            session_id,
+            &transport_binding,
+        )?
+        .into_parts();
 
         let readiness_started_at = Instant::now();
         framed

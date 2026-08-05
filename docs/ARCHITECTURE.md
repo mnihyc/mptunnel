@@ -247,6 +247,11 @@ below that offset remains valid.
 stream. Native TCP EOF terminates its physical carrier.
 
 Each logical QUIC carrier stream is a full-duplex HTTP/3 `POST /` request.
+The optional endpoint-wide transport secret changes only QUIC Initial key
+derivation; TLS and HTTP/3 remain inside the authenticated QUIC connection.
+The same file selects PSK-gated Noise instead of TLS for TCP carriers. Without
+that file, the established TLS/QUIC profile is unchanged. MPP client
+credentials remain a separate Product admission layer in either profile.
 The gate requires HTTPS, authority equal to the negotiated TLS SNI, exactly
 `/` without a query, and the canonical encrypted selector supplied by Product
 credential authority before request DATA enters the bounded accepted queue or

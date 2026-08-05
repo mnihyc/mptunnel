@@ -172,8 +172,12 @@ impl Endpoint {
                 dst_cid,
                 version,
             }) => {
-                if self.server_config.is_none() {
+                let Some(server_config) = &self.server_config else {
                     debug!("dropping packet with unsupported version");
+                    return None;
+                };
+                if server_config.crypto.private_initial_keys() {
+                    debug!("dropping unauthenticated version probe");
                     return None;
                 }
                 trace!("sending version negotiation");
@@ -254,6 +258,13 @@ impl Endpoint {
             None
         } else if dst_cid.is_empty() {
             trace!("dropping unrecognized short packet without ID");
+            None
+        } else if self
+            .server_config
+            .as_ref()
+            .is_some_and(|config| config.crypto.private_initial_keys())
+        {
+            debug!("dropping unauthenticated short-header probe");
             None
         } else {
             // If we got this far, we're receiving a seemingly valid packet for an unknown
@@ -463,8 +474,13 @@ impl Endpoint {
                 return None;
             }
         };
+        let private_initial_keys = server_config.crypto.private_initial_keys();
 
         if let Err(reason) = self.early_validate_first_packet(header) {
+            if private_initial_keys {
+                debug!("dropping invalid unauthenticated private Initial");
+                return None;
+            }
             return Some(DatagramEvent::Response(self.initial_close(
                 header.version,
                 addresses,
@@ -475,7 +491,7 @@ impl Endpoint {
             )));
         }
 
-        let packet = match event.first_decode.finish(Some(&*crypto.header.remote)) {
+        let mut packet = match event.first_decode.finish(Some(&*crypto.header.remote)) {
             Ok(packet) => packet,
             Err(e) => {
                 trace!("unable to decode initial packet: {}", e);
@@ -490,6 +506,26 @@ impl Endpoint {
 
         let Header::Initial(header) = packet.header else {
             panic!("non-initial packet in handle_first_packet()");
+        };
+
+        // A private endpoint must authenticate the Initial payload before it
+        // validates tokens or exposes `Incoming` to application policy. Both
+        // can otherwise generate a response (INVALID_TOKEN, Retry, or refuse)
+        // from a packet that only happened to pass header protection.
+        let packet_authenticated = if private_initial_keys {
+            let packet_number = header.number.expand(0);
+            if crypto
+                .packet
+                .remote
+                .decrypt(packet_number, &packet.header_data, &mut packet.payload)
+                .is_err()
+            {
+                debug!(packet_number, "failed to authenticate private Initial packet");
+                return None;
+            }
+            true
+        } else {
+            false
         };
 
         let server_config = self.server_config.as_ref().unwrap().clone();
@@ -525,6 +561,7 @@ impl Endpoint {
             rest: event.remaining,
             crypto,
             token,
+            packet_authenticated,
             incoming_idx,
             improper_drop_warner: IncomingImproperDropWarner,
         }))
@@ -586,16 +623,17 @@ impl Endpoint {
             });
         }
 
-        if incoming
-            .crypto
-            .packet
-            .remote
-            .decrypt(
-                packet_number,
-                &incoming.packet.header_data,
-                &mut incoming.packet.payload,
-            )
-            .is_err()
+        if !incoming.packet_authenticated
+            && incoming
+                .crypto
+                .packet
+                .remote
+                .decrypt(
+                    packet_number,
+                    &incoming.packet.header_data,
+                    &mut incoming.packet.payload,
+                )
+                .is_err()
         {
             debug!(packet_number, "failed to authenticate initial packet");
             self.index.remove_initial(dst_cid);
@@ -1168,6 +1206,7 @@ pub struct Incoming {
     rest: Option<BytesMut>,
     crypto: Keys,
     token: IncomingToken,
+    packet_authenticated: bool,
     incoming_idx: usize,
     improper_drop_warner: IncomingImproperDropWarner,
 }

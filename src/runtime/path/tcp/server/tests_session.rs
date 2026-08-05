@@ -146,8 +146,8 @@ async fn server_tcp_test_session(
         EncryptedFramedStream::connect(client_socket, &client_tls, context.codec_limits),
         EncryptedFramedStream::accept(server_socket, server_tls, context.codec_limits),
     );
-    let mut client_framed = client_framed.expect("client TLS carrier");
-    let mut server_framed = server_framed.expect("server TLS carrier");
+    let mut client_framed = client_framed.expect("client protected carrier");
+    let mut server_framed = server_framed.expect("server protected carrier");
     client_framed
         .write_frame(&Frame::Ping { nonce: 1 })
         .await

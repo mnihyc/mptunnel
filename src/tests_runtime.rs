@@ -470,7 +470,7 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
         )
         .await
         .expect("initialize encrypted stream");
-        let exporter = framed.tcp_admission_exporter()?;
+        let transport_binding = framed.tcp_admission_binding()?;
         let encoded = framed.read_tcp_admission().await?;
         let authenticated = crate::runtime::path::tcp::admission::authenticate_prelude(
             &security,
@@ -478,7 +478,7 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
                 &security,
             ),
             &encoded,
-            &exporter,
+            &transport_binding,
         )?
         .ok_or(RuntimeError::Protocol("invalid TCP admission prelude"))?;
         let joined = authenticated

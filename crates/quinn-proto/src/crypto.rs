@@ -122,6 +122,14 @@ pub trait ClientConfig: Send + Sync {
 
 /// Server-side configuration for the crypto protocol
 pub trait ServerConfig: Send + Sync {
+    /// Whether Initial keys require an out-of-band endpoint secret.
+    ///
+    /// Endpoints using private Initial keys suppress responses that would
+    /// otherwise be generated before Initial authentication.
+    fn private_initial_keys(&self) -> bool {
+        false
+    }
+
     /// Create the initial set of keys given the client's initial destination ConnectionId
     fn initial_keys(
         &self,

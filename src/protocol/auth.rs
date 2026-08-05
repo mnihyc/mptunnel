@@ -29,7 +29,7 @@ pub struct TcpSessionAuthCheck<'a> {
     pub credential_id: &'a str,
     pub nonce: AuthNonce,
     pub issued_at_unix_secs: u64,
-    pub tls_exporter: &'a [u8; 32],
+    pub transport_binding: &'a [u8; 32],
     pub tag: AuthTag,
     pub now_unix_secs: u64,
     pub freshness_window_secs: u64,
@@ -60,8 +60,8 @@ impl std::fmt::Debug for SessionAuthenticator {
 }
 
 impl SessionAuthenticator {
-    pub fn new(exporter_secret: impl AsRef<[u8]>) -> Result<Self, AuthError> {
-        let secret = exporter_secret.as_ref();
+    pub fn new(secret: impl AsRef<[u8]>) -> Result<Self, AuthError> {
+        let secret = secret.as_ref();
         if secret.is_empty() {
             return Err(AuthError::EmptySecret);
         }
@@ -103,7 +103,7 @@ impl SessionAuthenticator {
         verify_tag(mac, check.tag)
     }
 
-    /// Authenticates the TCP session prelude and binds it to this exact TLS 1.3
+    /// Authenticates the TCP session prelude and binds it to this exact protected
     /// connection. Explicit role and direction bytes prevent reuse in a future
     /// reverse or server-originated admission exchange.
     pub fn tcp_session_auth_tag(
@@ -112,7 +112,7 @@ impl SessionAuthenticator {
         credential_id: &str,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
-        tls_exporter: &[u8; 32],
+        transport_binding: &[u8; 32],
     ) -> AuthTag {
         let mut mac = self.mac();
         update_tcp_session_auth_transcript(
@@ -121,7 +121,7 @@ impl SessionAuthenticator {
             credential_id,
             nonce,
             issued_at_unix_secs,
-            tls_exporter,
+            transport_binding,
         );
         finalize_tag(mac)
     }
@@ -141,7 +141,7 @@ impl SessionAuthenticator {
             check.credential_id,
             check.nonce,
             check.issued_at_unix_secs,
-            check.tls_exporter,
+            check.transport_binding,
         );
         verify_tag(mac, check.tag)
     }
@@ -219,11 +219,11 @@ fn update_tcp_session_auth_transcript(
     credential_id: &str,
     nonce: AuthNonce,
     issued_at_unix_secs: u64,
-    tls_exporter: &[u8; 32],
+    transport_binding: &[u8; 32],
 ) {
     mac.update(TCP_SESSION_AUTH_CONTEXT);
     mac.update(&[TCP_CARRIER_ROLE_CLIENT, TCP_DIRECTION_CLIENT_TO_SERVER]);
-    mac.update(tls_exporter);
+    mac.update(transport_binding);
     update_session_id(mac, session_id);
     update_credential_id(mac, credential_id);
     update_nonce(mac, nonce);

@@ -45,6 +45,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 smallvec = "1.15"
+snow = { version = "=0.10.0", default-features = false, features = ["ring-accelerated", "use-chacha20poly1305", "use-curve25519", "use-sha2"] }
 socket2 = "0.6"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

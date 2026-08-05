@@ -25,8 +25,8 @@ identity. Securely copy `mpp-credential.key` and the public
 umask 077
 openssl rand -hex 32 > mpp-credential.key
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -subj "/CN=server.example.com" \
-  -addext "subjectAltName=DNS:server.example.com" \
+  -subj "/CN=mptunnel.example" \
+  -addext "subjectAltName=DNS:mptunnel.example" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth" \
@@ -50,13 +50,24 @@ Start the client:
 ```text
 ./mptunnel --credential-secret-file ./mpp-credential.key \
   client \
-  --tls-server-name server.example.com \
   --tls-pinned-certificate ./server-cert.pem \
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
   --path tcp://server.example.com:7443 \
   --path udp://server.example.com:7443
 ```
+
+The certificate name defaults to `mptunnel.example`. Optional transport
+protection uses a separate raw 32-byte endpoint secret, passed to both commands
+as `--transport-secret-file`:
+
+```text
+openssl rand -out mpp-transport.key 32
+# add to the server command: --transport-secret-file ./mpp-transport.key
+# add to the client command: --transport-secret-file ./mpp-transport.key
+```
+
+Do not reuse an MPP client credential as this endpoint-wide secret.
 
 For a persistent setup, copy `examples/client.toml` or
 `examples/server.toml`, replace every placeholder, supply the referenced TLS
@@ -92,8 +103,8 @@ install -o mptunnel -g mptunnel -m 0600 ./config.toml /etc/mptunnel/config.toml
 ```
 
 Use the platform's equivalent account-management command when `useradd` is
-unavailable. Keep referenced credential and TLS private-key files readable
-only by that account.
+unavailable. Keep referenced credential, transport-secret, and TLS private-key
+files readable only by that account.
 
 The macOS archive intentionally contains no launchd definition. MPTUNNEL runs
 as a foreground command-line process; a persistent proxy deployment should use

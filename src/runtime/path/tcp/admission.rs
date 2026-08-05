@@ -1,4 +1,4 @@
-//! Fixed TCP carrier admission inside an authenticated TLS 1.3 connection.
+//! Fixed TCP carrier admission inside an authenticated protected connection.
 //!
 //! This module is Product admission glue, not a record layer. The prelude is
 //! sent exactly once before ordinary MPP frames and adds no steady-state
@@ -42,16 +42,16 @@ impl ClientTcpPathAuthentication {
     pub(in crate::runtime) fn for_new_session(
         security: &ClientSecurityConfig,
         path_id: PathId,
-        tls_exporter: &[u8; 32],
+        transport_binding: &[u8; 32],
     ) -> Result<Self, RuntimeError> {
-        Self::for_session(security, path_id, random_session_id()?, tls_exporter)
+        Self::for_session(security, path_id, random_session_id()?, transport_binding)
     }
 
     pub(in crate::runtime) fn for_session(
         security: &ClientSecurityConfig,
         path_id: PathId,
         session_id: SessionId,
-        tls_exporter: &[u8; 32],
+        transport_binding: &[u8; 32],
     ) -> Result<Self, RuntimeError> {
         let credential_id = security.credential.id().as_str();
         if credential_id.is_empty() || credential_id.len() > MAX_CREDENTIAL_ID_BYTES {
@@ -68,7 +68,7 @@ impl ClientTcpPathAuthentication {
             credential_id,
             session_nonce,
             issued_at_unix_secs,
-            tls_exporter,
+            transport_binding,
         );
         let path_tag = authenticator.path_join_tag(
             session_id,
@@ -107,7 +107,7 @@ pub(in crate::runtime) fn authenticate_prelude(
     security: &ServerSecurityConfig,
     credential_admission: Arc<dyn CredentialAdmissionPort>,
     encoded: &[u8; TCP_ADMISSION_PRELUDE_LEN],
-    tls_exporter: &[u8; 32],
+    transport_binding: &[u8; 32],
 ) -> Result<Option<AuthenticatedServerPathSession>, RuntimeError> {
     let Some(decoded) = decode_prelude(encoded) else {
         return Ok(None);
@@ -120,7 +120,7 @@ pub(in crate::runtime) fn authenticate_prelude(
         decoded.nonce,
         decoded.issued_at_unix_secs,
         decoded.auth_tag,
-        tls_exporter,
+        transport_binding,
     )
 }
 

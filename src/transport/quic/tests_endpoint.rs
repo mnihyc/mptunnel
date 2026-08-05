@@ -50,6 +50,60 @@ async fn spawn_udp_forwarder(
     (public_addr, task)
 }
 
+async fn spawn_observed_udp_forwarder(
+    upstream_addr: SocketAddr,
+) -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<usize>,
+    tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let public = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("observed UDP forwarder");
+    let public_addr = public.local_addr().expect("observed forwarder address");
+    let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("observed upstream socket");
+    upstream
+        .connect(upstream_addr)
+        .await
+        .expect("connect observed forwarder upstream");
+    let (requests, observed_requests) = tokio::sync::mpsc::unbounded_channel();
+    let (responses, observed_responses) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut client_addr = None;
+        let mut request = vec![0_u8; 65_535];
+        let mut response = vec![0_u8; 65_535];
+        loop {
+            tokio::select! {
+                received = public.recv_from(&mut request) => {
+                    let Ok((len, source)) = received else {
+                        return;
+                    };
+                    client_addr = Some(source);
+                    let _ = requests.send(len);
+                    if upstream.send(&request[..len]).await.is_err() {
+                        return;
+                    }
+                }
+                received = upstream.recv(&mut response) => {
+                    let Ok(len) = received else {
+                        return;
+                    };
+                    let _ = responses.send(response[..len].to_vec());
+                    if let Some(destination) = client_addr
+                        && public.send_to(&response[..len], destination).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    (public_addr, observed_requests, observed_responses, task)
+}
+
 async fn assert_quic_ping_round_trip(client: &Connection, server: &Connection, nonce: u64) {
     let limits = CodecLimits::default();
     let server = server.clone();
@@ -119,11 +173,9 @@ async fn quic_carrier_rejects_wrong_independent_tls_identity_before_product_fram
         ..
     } = rcgen::generate_simple_self_signed(vec!["mptunnel.test".to_string()])
         .expect("wrong test certificate");
-    let wrong_client_tls = crate::transport::encrypted::TcpClientTlsConfig::new(
-        "mptunnel.test",
+    let wrong_client_tls = crate::transport::encrypted::test_client_tls_config_for_pinned_leaf(
         wrong_certificate.der().clone(),
-    )
-    .expect("wrong client identity");
+    );
     let client = Endpoint::bind_client(
         "127.0.0.1:0".parse().expect("client addr"),
         &wrong_client_tls,
@@ -159,30 +211,195 @@ async fn quic_carrier_rejects_wrong_independent_tls_identity_before_product_fram
 }
 
 #[tokio::test]
-async fn quic_carrier_rejects_non_h3_alpn_during_tls_handshake() {
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["mptunnel.test".to_string()])
-            .expect("generate test identity");
-    let certificate = rustls::pki_types::CertificateDer::from(cert);
-    let private_key =
-        rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
-    let server_tls = crate::transport::encrypted::TcpServerTlsConfig::new(
-        vec![certificate.clone()],
-        private_key,
+async fn private_initial_rejects_wrong_secret_without_a_response_or_acceptance() {
+    let mux_limits = MuxLimits::default();
+    let transport_secret = [0x5a; 32];
+    let server_tls =
+        crate::transport::encrypted::test_server_tls_config_with_transport_secret(transport_secret);
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &server_tls,
+        super::super::test_candidate_verifier(),
+        mux_limits,
     )
-    .expect("server TLS");
-    let base_client_tls =
-        crate::transport::encrypted::TcpClientTlsConfig::new("mptunnel.test", certificate.clone())
-            .expect("client TLS");
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let server_task = tokio::spawn(async move {
+        timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("server accept timeout")
+            .expect("server accepts later valid client");
+    });
+
+    let wrong_tls =
+        crate::transport::encrypted::test_client_tls_config_with_transport_secret([0x3c; 32]);
+    let wrong_client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("wrong client addr"),
+        &wrong_tls,
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("wrong client endpoint");
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            wrong_client.connect(server_addr)
+        )
+        .await
+        .is_err(),
+        "wrong Initial secret must elicit no response"
+    );
+
+    let good_client_tls =
+        crate::transport::encrypted::test_client_tls_config_with_transport_secret(transport_secret);
+    let good_client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("good client addr"),
+        &good_client_tls,
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("good client endpoint");
+    timeout(Duration::from_secs(5), good_client.connect(server_addr))
+        .await
+        .expect("good connect timeout")
+        .expect("valid client connects after wrong-secret probe");
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn private_initial_sends_no_certificate_flight_to_a_public_quic_client() {
+    let mux_limits = MuxLimits::default();
+    let server_tls =
+        crate::transport::encrypted::test_server_tls_config_with_transport_secret([0x5a; 32]);
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &server_tls,
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let server_task = tokio::spawn(async move { server.accept().await });
+    let (forwarder_addr, mut client_requests, mut server_responses, forwarder_task) =
+        spawn_observed_udp_forwarder(server_addr).await;
+
+    let public_client_tls = crate::transport::encrypted::test_client_tls_config();
+    let public_client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &public_client_tls,
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("public client endpoint");
+    let client_task = tokio::spawn(async move { public_client.connect(forwarder_addr).await });
+
+    timeout(Duration::from_secs(1), client_requests.recv())
+        .await
+        .expect("public Initial timeout")
+        .expect("public Initial observed");
+
+    assert!(
+        timeout(Duration::from_millis(300), server_responses.recv())
+            .await
+            .is_err(),
+        "a public QUIC Initial must elicit no server bytes or certificate flight"
+    );
+
+    client_task.abort();
+    server_task.abort();
+    forwarder_task.abort();
+    let _ = client_task.await;
+    let _ = server_task.await;
+    let _ = forwarder_task.await;
+}
+
+#[tokio::test]
+async fn private_initial_suppresses_unauthenticated_endpoint_responses() {
+    let mux_limits = MuxLimits::default();
+    let transport_secret = [0x5a; 32];
+    let server_tls =
+        crate::transport::encrypted::test_server_tls_config_with_transport_secret(transport_secret);
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &server_tls,
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let server_task = tokio::spawn(async move {
+        timeout(Duration::from_secs(5), server.accept())
+            .await
+            .expect("server accept timeout")
+            .expect("server accepts later valid client");
+    });
+
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("probe socket");
+    let mut unsupported_initial = Vec::new();
+    unsupported_initial.push(0xc0);
+    unsupported_initial.extend_from_slice(&0x0a1a_2a3au32.to_be_bytes());
+    unsupported_initial.push(8);
+    unsupported_initial.extend_from_slice(&[0x11; 8]);
+    unsupported_initial.push(8);
+    unsupported_initial.extend_from_slice(&[0x22; 8]);
+    probe
+        .send_to(&unsupported_initial, server_addr)
+        .await
+        .expect("send unsupported-version Initial");
+    let mut response = [0u8; 1500];
+    assert!(
+        timeout(Duration::from_millis(200), probe.recv_from(&mut response))
+            .await
+            .is_err(),
+        "private endpoint must not send Version Negotiation before authentication"
+    );
+
+    let mut unknown_short_header = vec![0u8; 64];
+    unknown_short_header[0] = 0x40;
+    getrandom::getrandom(&mut unknown_short_header[1..]).expect("random short-header probe");
+    probe
+        .send_to(&unknown_short_header, server_addr)
+        .await
+        .expect("send unknown short-header packet");
+    assert!(
+        timeout(Duration::from_millis(200), probe.recv_from(&mut response))
+            .await
+            .is_err(),
+        "private endpoint must not send a stateless reset before authentication"
+    );
+
+    let good_client_tls =
+        crate::transport::encrypted::test_client_tls_config_with_transport_secret(transport_secret);
+    let good_client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("good client addr"),
+        &good_client_tls,
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("good client endpoint");
+    timeout(Duration::from_secs(5), good_client.connect(server_addr))
+        .await
+        .expect("good connect timeout")
+        .expect("valid client connects after unauthenticated probes");
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn quic_carrier_rejects_non_h3_alpn_during_tls_handshake() {
+    let server_tls = crate::transport::encrypted::test_server_tls_config();
+    let base_client_tls = crate::transport::encrypted::test_client_tls_config();
     let mut wrong_alpn = (*base_client_tls.rustls_config()).clone();
     wrong_alpn.alpn_protocols = vec![b"h2".to_vec()];
-    let wrong_client_tls = crate::transport::encrypted::TcpClientTlsConfig::from_config(
-        rustls::pki_types::ServerName::try_from("mptunnel.test")
-            .expect("server name")
-            .to_owned(),
-        certificate,
-        wrong_alpn,
-    );
+    let wrong_client_tls = base_client_tls.with_rustls_config_for_test(wrong_alpn);
     let mux_limits = MuxLimits::default();
     let server = Endpoint::bind_server(
         "127.0.0.1:0".parse().expect("server address"),
@@ -365,15 +582,18 @@ fn quic_transport_profile_follows_mux_resource_envelope() {
 }
 
 #[tokio::test]
-async fn source_informed_quic_probe_receives_public_not_found_before_parser_admission() {
+async fn transport_secret_holder_without_mpp_credential_receives_uniform_not_found() {
     use bytes::Buf;
     use h3::ConnectionState;
     use std::future::poll_fn;
 
     let mux_limits = MuxLimits::default();
+    let transport_secret = [0x5a; 32];
     let server = Endpoint::bind_server(
         "127.0.0.1:0".parse().expect("server addr"),
-        &crate::transport::encrypted::test_server_tls_config(),
+        &crate::transport::encrypted::test_server_tls_config_with_transport_secret(
+            transport_secret,
+        ),
         super::super::test_candidate_verifier(),
         mux_limits,
     )
@@ -396,7 +616,9 @@ async fn source_informed_quic_probe_receives_public_not_found_before_parser_admi
 
     let client = Endpoint::bind_client(
         "127.0.0.1:0".parse().expect("client addr"),
-        &crate::transport::encrypted::test_client_tls_config(),
+        &crate::transport::encrypted::test_client_tls_config_with_transport_secret(
+            transport_secret,
+        ),
         super::super::test_candidate_selector(),
         mux_limits,
     )
@@ -439,9 +661,10 @@ async fn source_informed_quic_probe_receives_public_not_found_before_parser_admi
         .expect("404 has a body");
     assert_eq!(body.copy_to_bytes(body.remaining()), b"Not Found\n"[..]);
 
-    // Knowing the source-level request shape and sending binary body bytes is
-    // insufficient: without the credential-derived selector the request takes
-    // the exact public response path and never enters the MPP stream queue.
+    // Even after possessing the endpoint transport secret and pinned identity,
+    // knowing the request shape and sending binary body bytes is insufficient:
+    // without an MPP credential the request takes the uniform decoy response
+    // path and never enters the MPP stream queue.
     let mut probe = requests
         .send_request(
             http::Request::post("https://mptunnel.test/")

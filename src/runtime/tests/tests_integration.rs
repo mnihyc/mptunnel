@@ -2982,7 +2982,7 @@ async fn spawn_scripted_tcp_datagram_path(
             SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
                 .expect("scripted server secret"),
         );
-        let exporter = framed.tcp_admission_exporter()?;
+        let transport_binding = framed.tcp_admission_binding()?;
         let encoded = framed.read_tcp_admission().await?;
         let authenticated = crate::runtime::path::tcp::admission::authenticate_prelude(
             &security,
@@ -2990,7 +2990,7 @@ async fn spawn_scripted_tcp_datagram_path(
                 &security,
             ),
             &encoded,
-            &exporter,
+            &transport_binding,
         )?
         .ok_or(RuntimeError::Protocol("invalid TCP admission prelude"))?;
         let joined = authenticated
@@ -3938,29 +3938,31 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
     target.await.expect("target join");
 }
 
-#[tokio::test]
-async fn tcp_server_rejects_wrong_secret_without_a_credential_or_protocol_oracle() {
+async fn assert_tcp_server_rejects_wrong_mpp_credential(transport_secret: Option<[u8; 32]>) {
     let path = reserve_tcp_path().await;
-    let listener = bind_listener(&path).await.expect("bind");
-    let server_path = path.clone();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let local_path = ServerLocalPath::new(0, server_path.clone());
-        let ServerIdentityRuntime {
-            paths,
-            reliable_relay: _reliable_relay,
-        } = new_identity_runtime(
-            vec![server_path],
-            OutboundConfig::Direct,
-            DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-            ServerSecurityConfig::for_test(
-                SharedSecret::new(b"fedcba9876543210fedcba9876543210".to_vec()).expect("secret"),
-            ),
-            MppPerformanceConfig::default(),
-            ResourceLimits::default(),
-        );
-        handle_server_path(stream, local_path, paths).await
-    });
+    let server_tls = match transport_secret {
+        Some(secret) => {
+            crate::transport::encrypted::test_server_tls_config_with_transport_secret(secret)
+        }
+        None => crate::transport::encrypted::test_server_tls_config(),
+    };
+    let server = tokio::spawn(run_server(
+        vec![path.clone()],
+        OutboundConfig::Direct,
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        test_server_destination_acl(),
+        ServerSecurityConfig::for_test(
+            SharedSecret::new(b"fedcba9876543210fedcba9876543210".to_vec())
+                .expect("server MPP credential"),
+        ),
+        server_tls,
+        MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+        SessionConfig::default(),
+        ManagementConfig::default(),
+        None,
+    ));
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let stream = tcp::connect_path(&path, TcpConnectOptions::default())
         .await
@@ -3968,21 +3970,23 @@ async fn tcp_server_rejects_wrong_secret_without_a_credential_or_protocol_oracle
     let client_security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
-    let mut client = EncryptedFramedStream::connect(
-        stream,
-        &crate::transport::encrypted::test_client_tls_config(),
-        CodecLimits::default(),
-    )
-    .await
-    .expect("initialize TLS stream");
-    let exporter = client
-        .tcp_admission_exporter()
-        .expect("client TLS exporter");
+    let client_tls = match transport_secret {
+        Some(secret) => {
+            crate::transport::encrypted::test_client_tls_config_with_transport_secret(secret)
+        }
+        None => crate::transport::encrypted::test_client_tls_config(),
+    };
+    let mut client = EncryptedFramedStream::connect(stream, &client_tls, CodecLimits::default())
+        .await
+        .expect("initialize protected stream");
+    let transport_binding = client
+        .tcp_admission_binding()
+        .expect("client transport binding");
     let (prelude, path_join) =
         crate::runtime::path::tcp::admission::ClientTcpPathAuthentication::for_new_session(
             &client_security,
             PathId(0),
-            &exporter,
+            &transport_binding,
         )
         .expect("TCP authentication")
         .into_parts();
@@ -3992,17 +3996,23 @@ async fn tcp_server_rejects_wrong_secret_without_a_credential_or_protocol_oracle
         .expect("write");
     client.flush().await.expect("flush");
 
-    let rejection = client.read_frame().await;
+    let rejection = tokio::time::timeout(Duration::from_secs(2), client.read_frame())
+        .await
+        .expect("wrong MPP credential rejection timeout");
     assert!(
         matches!(
             &rejection,
             Err(crate::transport::encrypted::EncryptedFramedTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::UnexpectedEof
         ),
-        "wrong-secret admission must close before any application frame: {rejection:?}"
+        "wrong MPP credential must close before any application frame: {rejection:?}"
     );
-    server
-        .await
-        .expect("join")
-        .expect("uniform public rejection");
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn tcp_server_keeps_transport_and_mpp_credentials_separate() {
+    assert_tcp_server_rejects_wrong_mpp_credential(None).await;
+    assert_tcp_server_rejects_wrong_mpp_credential(Some([0x5a; 32])).await;
 }

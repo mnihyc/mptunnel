@@ -5664,3 +5664,159 @@ entry is authoritative.
   `./.tmp/lab/results/post-v017-direction-evidence-blackhole-lowlat-clean/`,
   and
   `./.tmp/lab/results/post-v017-direction-evidence-blackhole-lowlat-repeat/`.
+
+## 2026-08-05T10:57:00+08:00: Noise TCP and private QUIC Initial preliminary verification
+
+- Name: carrier first-flight privacy and crypto-cost verification
+- Category: isolated transport-security prototype
+- State: performance hypotheses supported; current prototype rejected for RFC,
+  merge, or release adoption
+- Isolation: branch `verify/noise-protected-initial` starts at clean commit
+  `3a5ab0e`; `main`, tags, releases, and public documentation remain unchanged.
+- Frozen scope:
+  - TCP TLS was replaced by
+    `Noise_NKpsk0_25519_AESGCM_SHA256`, using a pinned X25519 server key, a
+    separate 32-byte endpoint secret, authenticated 8-63-byte random handshake
+    padding, masked handshake/record lengths, and bounded 65,535-byte records;
+  - TCP MPP admission binds to the completed Noise transcript;
+  - QUIC keeps standard TLS, H3, recovery, congestion control, packet sizes,
+    migration, and 1-RTT keys. Only Initial header/payload keys use an
+    endpoint-secret-derived input, and unauthenticated version/invalid-Initial
+    response oracles are suppressed; and
+  - arbitrary QUIC prefix/suffix padding was rejected because the standard
+    1,200-byte Initial, random connection IDs, and encrypted padding already
+    provide random bytes. A new outer shape would add a fingerprint.
+- TCP performance evidence:
+  - low-latency download/upload changed from `71.911/71.849 Mbps` to
+    `74.192/73.300 Mbps`; first body changed from `119` to `103 ms`;
+  - unconstrained download/upload changed from `6.593/6.087 Gbps` to
+    `7.187/7.011 Gbps`;
+  - the initially frozen fat-path sample was stronger than both later runs,
+    so it was not treated as a causal regression. An unmodified same-host
+    control produced `182.009/197.690 Mbps`; the adjacent Noise repeat produced
+    `204.755/203.268 Mbps`; and
+  - these dirty-tree samples are descriptive preliminary evidence, not the
+    seven-pair release acceptance ledger.
+- QUIC and mixed performance evidence:
+  - fat QUIC download/upload changed from `234.799/220.730 Mbps` to
+    `230.812/231.906 Mbps` (`-1.7%/+5.1%`);
+  - unconstrained QUIC changed from `2.456/2.599 Gbps` to
+    `2.788/2.572 Gbps` (`+13.5%/-1.0%`); and
+  - fat mixed TCP+QUIC changed from `352.790/358.629 Mbps` to
+    `344.707/361.264 Mbps` (`-2.3%/+0.7%`). No candidate row showed a
+    practical transport downgrade beyond ordinary run variation.
+- Wire and active-probe evidence:
+  - the captured TCP first flight was 93 high-entropy bytes and its first
+    response was 67 bytes; neither had a TLS record prefix. Plain HTTP, a
+    1,555-byte TLS ClientHello, and random TCP probes received zero server
+    bytes;
+  - replaying the captured TCP first flight elicited a fresh 94-byte server
+    response. Random padding changes lengths but does not supply freshness, so
+    this is a practical replay fingerprint oracle;
+  - unsupported-version, malformed public-Initial, and random short-header UDP
+    probes received zero bytes; and
+  - a valid protected QUIC first datagram exposed no plaintext `h3` or product
+    marker, but still visibly had the QUIC long-header/fixed bits, version `1`,
+    and the standard 1,200-byte Initial size. The change hides the ClientHello;
+    it cannot make QUIC cease to be classifiable or blockable as QUIC.
+- Rejection reasons:
+  - the Noise first flight needs bounded freshness/replay enforcement before a
+    server response;
+  - the long-lived Noise record layer needs a deterministic synchronized key
+    update before multi-gigabit production use;
+  - endpoint-secret rotation and the TCP-only configuration model are not yet
+    complete; and
+  - private QUIC Initial keys are useful against public Initial decryption but
+    do not satisfy a stronger non-QUIC-cover claim. The normative `RFC.md` is
+    therefore deliberately unchanged.
+- Verification: all `1,455` Core tests, all `283` Quinn tests, warnings-denied
+  all-target/all-feature Clippy, all-target compilation, formatting, and diff
+  whitespace checks passed. The audit corrected an ALPN test that had
+  accidentally stopped at the private-Initial boundary instead of exercising
+  TLS negotiation.
+- Reproducible evidence:
+  `./.tmp/lab/results/verify-noise-initial/` and
+  `./.tmp/covert-eval/`. The same-host unmodified control was copied to
+  `./.tmp/lab/results/verify-noise-initial/current-host-tls-control/` before
+  its temporary detached worktree was removed.
+
+## 2026-08-05T12:23:06+08:00: optional shared transport protection accepted
+
+- Name: one-secret TCP Noise and private QUIC Initial integration
+- Category: carrier security, protocol conformance, and performance acceptance
+- State: accepted for commit; no push, tag, or release is authorized
+- Configuration and security boundary:
+  - each MPP outbound or inbound has one optional `transport_secret_file`;
+    both endpoints read the same exact 32 raw bytes;
+  - this endpoint transport secret is a distinct type and configuration field
+    from every MPP client credential. Possessing it reaches only transport
+    authentication; normal MPP admission still requires an authorized client
+    credential;
+  - omission retains the prior TLS 1.3 TCP and public RFC 9001 QUIC behavior
+    with no negotiation or fallback; and
+  - `tls_server_name` now has the documented MPP-only default
+    `mptunnel.example`, while an explicit value remains available.
+- TCP model:
+  - configured TCP uses `Noise_NNpsk0_25519_AESGCM_SHA256`, random padded
+    first flights, secret-masked bounded lengths, transcript-bound MPP
+    admission, and bounded records;
+  - the server authenticates and decrypts the client flight, validates its
+    timestamp, and atomically admits its nonce to one generation-local bounded
+    replay cache before writing any byte;
+  - malformed, stale, replayed, and wrong-secret flights produce zero server
+    bytes and never invoke Rustls or transmit the certificate; and
+  - each direction rekeys deterministically before every nonzero record nonce
+    divisible by `2^20`. Partial protected reads or writes make only that
+    direction terminal instead of risking nonce reuse.
+- QUIC model:
+  - configured QUIC domain-separates a private Initial input from the endpoint
+    secret and DCID while retaining native QUIC packet size, connection,
+    recovery, congestion control, migration, TLS, H3, and later key spaces;
+  - the server authenticates/decrypts the Initial payload before token parsing,
+    exposing `Incoming`, Retry/refuse policy, TLS session creation, or any
+    response. Public and wrong-secret Initials cannot elicit a certificate
+    flight;
+  - secretless Initial derivation still passes the original DCID directly into
+    the stock RFC 9001 schedule, and stock endpoint response behavior remains
+    unchanged; and
+  - no outer packet-encryption shim was added. The private Initial keys already
+    protect the encryptable QUIC header and complete payload; hiding invariant
+    QUIC header fields would require a second protocol with extra framing,
+    nonce/replay ownership, MTU cost, and a new classifier surface.
+- Matched performance evidence used one optimized binary SHA-256
+  `8175ec115cd4b9793e5d55b18ee75aa32f9a76d17932e6687cd010ac382c0bcf`
+  and source snapshot
+  `d0035213466045b629e67d085053c35747c974ad84f425c96e505c50bb4370c4`
+  for both profiles:
+  - TCP fat download/upload changed from `198.945/232.407 Mbps` to
+    `230.396/220.212 Mbps` (`+15.8/-5.2%`);
+  - TCP unconstrained download/upload changed from `6.656/5.870 Gbps` to
+    `7.185/6.443 Gbps` (`+7.9/+9.8%`);
+  - QUIC fat download/upload changed from `240.306/215.937 Mbps` to
+    `238.954/237.677 Mbps` (`-0.6/+10.1%`); and
+  - mixed TCP+QUIC fat download/upload changed from `338.662/365.099 Mbps` to
+    `347.100/375.497 Mbps` (`+2.5/+2.8%`).
+- Every paired transfer completed with no failure. The sole `-5.2%` sample is
+  consistent with ordinary run variance and contradicts no structural limit:
+  the earlier adjacent fat-path control/protected TCP pair was
+  `182.009/197.690` versus `204.755/203.268 Mbps`. No algorithm or threshold
+  adjustment is justified. Host validity rejected both final matrices only
+  because the intentionally uncommitted source tree was dirty; the two runs
+  used the same source snapshot, binary, host rules, and lab shape.
+- Verification:
+  - formatting, warnings-denied all-target/all-feature Clippy, and whitespace
+    checks passed;
+  - all `1,470` library tests, `2` allocation checks, and `6` daily-use
+    acceptance tests passed;
+  - all `283` standalone Quinn tests and `3` Quinn documentation tests passed;
+  - performance-registry validation, `210` lab contract tests, `5`
+    deterministic benchmark tests, `9` packaging tests, every lab/packaging
+    shell syntax check, and the release-version-gate self-test passed; and
+  - final independent narrow audits found no blocking Noise, private-Initial,
+    configuration, or public-documentation inconsistency.
+- The benchmark workspace lockfile was updated only with the new locked Noise
+  dependency closure; an initially generated broad lockfile refresh was
+  rejected and fully reversed before the minimal locked update.
+- Reproducible final evidence:
+  `./.tmp/lab/results/transport-protection-final-legacy/` and
+  `./.tmp/lab/results/transport-protection-final-protected/`.

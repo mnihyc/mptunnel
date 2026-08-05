@@ -4,17 +4,17 @@ use crate::config::{
     DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT, DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
     DEFAULT_MAX_REINJECTION_CACHE_CHUNKS, DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
     DEFAULT_MAX_REORDER_BUFFER_CHUNKS, DEFAULT_MAX_RETAINED_RECEIVE_RANGES,
-    DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS,
-    DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
-    DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DEFAULT_STREAM_WINDOW_BYTES,
-    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig,
-    EgressRef, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig,
-    MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NodeConfig,
-    OutboundLeafConfig, ProductPolicyConfig, ResourceLimits, ServerDestinationAclConfig,
-    ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret, normalize_secret_bytes,
-    read_secret_environment, read_secret_file,
+    DEFAULT_MPP_TLS_SERVER_NAME, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_FLIGHT_BYTES,
+    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
+    DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS, DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS,
+    DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
+    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS,
+    DEFAULT_STREAM_WINDOW_BYTES, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig, EgressRef, LocalIngressConfig,
+    LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig, MppOutboundConfig,
+    MppPerformanceConfig, NamedPathConfig, NodeConfig, OutboundLeafConfig, ProductPolicyConfig,
+    ResourceLimits, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig, SessionConfig,
+    SharedSecret, normalize_secret_bytes, read_secret_environment, read_secret_file,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, ManagedVpnConfig, ManagedVpnPlatformConfig,
@@ -34,7 +34,7 @@ use crate::product::{
     DnsUpstreamSpec, DomainName, EgressAction, InboundId, OutboundId, PrincipalId, ProtocolTarget,
     RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId, TrafficIntent,
 };
-use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
+use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{Endpoint, PathSpec};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
@@ -972,6 +972,7 @@ pub struct ClientArgs {
     )]
     pub paths: Vec<PathSpec>,
 
+    /// Pinned MPP TLS identity (default: mptunnel.example).
     #[arg(long = "tls-server-name", env = "MPTUNNEL_TLS_SERVER_NAME")]
     pub tls_server_name: Option<String>,
 
@@ -981,6 +982,15 @@ pub struct ClientArgs {
         value_name = "PEM_FILE"
     )]
     pub tls_pinned_certificate: Option<PathBuf>,
+
+    /// Optional endpoint-wide 32-byte raw transport secret. This is not an
+    /// MPP client credential and must match the server value.
+    #[arg(
+        long = "transport-secret-file",
+        env = "MPTUNNEL_TRANSPORT_SECRET_FILE",
+        value_name = "FILE"
+    )]
+    pub transport_secret_file: Option<PathBuf>,
 
     #[arg(
         long,
@@ -1042,7 +1052,11 @@ impl ClientArgs {
                 && !tun_enabled
                 && !tcp_forward_requested
                 && !udp_forward_requested);
-        let tls = client_tls_from_cli(self.tls_server_name, self.tls_pinned_certificate)?;
+        let tls = client_tls_from_cli(
+            self.tls_server_name,
+            self.tls_pinned_certificate,
+            self.transport_secret_file,
+        )?;
         let proxy_auth = proxy_auth_config(
             self.proxy_username,
             self.proxy_password_file.as_deref(),
@@ -1337,6 +1351,15 @@ pub struct ServerArgs {
     )]
     pub tls_private_key: Option<PathBuf>,
 
+    /// Optional endpoint-wide 32-byte raw transport secret. This is not an
+    /// MPP client credential and must match the client value.
+    #[arg(
+        long = "transport-secret-file",
+        env = "MPTUNNEL_TRANSPORT_SECRET_FILE",
+        value_name = "FILE"
+    )]
+    pub transport_secret_file: Option<PathBuf>,
+
     #[arg(
         long = "outbound-protocol",
         env = "MPTUNNEL_OUTBOUND_PROTOCOL",
@@ -1423,7 +1446,13 @@ pub struct ServerArgs {
 
 impl ServerArgs {
     fn into_config(self, security: ServerSecurityConfig) -> Result<NodeConfig, CliConfigError> {
-        let tls = server_tls_from_cli(self.tls_certificate_chain, self.tls_private_key)?;
+        let tls = server_tls_from_cli(
+            self.tls_certificate_chain,
+            self.tls_private_key,
+            self.transport_secret_file,
+            security.auth_freshness_window,
+            security.max_pending_authentications,
+        )?;
         let credentials = match (
             self.upstream_proxy_username,
             self.upstream_proxy_password_file.as_deref(),
@@ -1696,15 +1725,13 @@ pub enum OutboundArg {
 fn client_tls_from_cli(
     server_name: Option<String>,
     pinned_certificate: Option<PathBuf>,
+    transport_secret_file: Option<PathBuf>,
 ) -> Result<TcpClientTlsConfig, CliConfigError> {
-    match (server_name, pinned_certificate) {
-        (None, _) => Err(CliConfigError::MppTls(
-            "MPP client paths require --tls-server-name".to_string(),
-        )),
-        (_, None) => Err(CliConfigError::MppTls(
+    let tls = match pinned_certificate {
+        None => Err(CliConfigError::MppTls(
             "MPP client paths require --tls-pinned-certificate".to_string(),
         )),
-        (Some(server_name), Some(path)) => {
+        Some(path) => {
             let certificates = crate::config::load_certificates(Path::new("."), &path)
                 .map_err(|error| CliConfigError::MppTls(error.to_string()))?;
             let [pinned_leaf] = certificates.as_slice() else {
@@ -1712,17 +1739,27 @@ fn client_tls_from_cli(
                     "--tls-pinned-certificate must contain exactly one certificate".to_string(),
                 ));
             };
-            TcpClientTlsConfig::new(server_name, pinned_leaf.clone())
-                .map_err(|error| CliConfigError::MppTls(error.to_string()))
+            TcpClientTlsConfig::new(
+                server_name.unwrap_or_else(|| DEFAULT_MPP_TLS_SERVER_NAME.to_string()),
+                pinned_leaf.clone(),
+            )
+            .map_err(|error| CliConfigError::MppTls(error.to_string()))
         }
-    }
+    }?;
+    Ok(match load_cli_transport_secret(transport_secret_file)? {
+        Some(secret) => tls.with_shared_transport_secret(secret),
+        None => tls,
+    })
 }
 
 fn server_tls_from_cli(
     certificate_chain: Option<PathBuf>,
     private_key: Option<PathBuf>,
+    transport_secret_file: Option<PathBuf>,
+    freshness_window: Duration,
+    max_pending_authentications: usize,
 ) -> Result<TcpServerTlsConfig, CliConfigError> {
-    match (certificate_chain, private_key) {
+    let tls = match (certificate_chain, private_key) {
         (None, _) => Err(CliConfigError::MppTls(
             "MPP server paths require --tls-certificate-chain".to_string(),
         )),
@@ -1737,7 +1774,35 @@ fn server_tls_from_cli(
             TcpServerTlsConfig::new(chain, key)
                 .map_err(|error| CliConfigError::MppTls(error.to_string()))
         }
-    }
+    }?;
+    Ok(match load_cli_transport_secret(transport_secret_file)? {
+        Some(secret) => {
+            tls.with_shared_transport_secret(secret, freshness_window, max_pending_authentications)
+        }
+        None => tls,
+    })
+}
+
+fn load_cli_transport_secret(
+    transport_secret_file: Option<PathBuf>,
+) -> Result<Option<SharedTransportSecret>, CliConfigError> {
+    let Some(path) = transport_secret_file else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path).map_err(|error| {
+        CliConfigError::MppTransportSecret(format!(
+            "failed to read shared transport secret {}: {error}",
+            path.display()
+        ))
+    })?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        CliConfigError::MppTransportSecret(format!(
+            "shared transport secret {} must contain exactly 32 raw bytes, found {}",
+            path.display(),
+            bytes.len()
+        ))
+    })?;
+    Ok(Some(SharedTransportSecret::new(bytes)))
 }
 
 #[derive(Debug)]
@@ -1766,6 +1831,7 @@ pub enum CliConfigError {
     ProxyUsernameRequired,
     ProxyPasswordRequired,
     MppTls(String),
+    MppTransportSecret(String),
     PortForward(String),
     ProductPolicy(String),
     Dns(String),
@@ -1872,6 +1938,7 @@ impl std::fmt::Display for CliConfigError {
                 )
             }
             Self::MppTls(message) => write!(f, "{message}"),
+            Self::MppTransportSecret(message) => write!(f, "{message}"),
             Self::PortForward(message) => write!(f, "invalid port-forward inbound: {message}"),
             Self::ProductPolicy(message) => write!(f, "{message}"),
             Self::Dns(message) => write!(f, "invalid DNS configuration: {message}"),

@@ -41,6 +41,7 @@ pub struct TlsSession {
     next_secrets: Option<Secrets>,
     inner: Connection,
     suite: Suite,
+    initial_secret: Option<[u8; 32]>,
 }
 
 impl TlsSession {
@@ -54,7 +55,13 @@ impl TlsSession {
 
 impl crypto::Session for TlsSession {
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
-        initial_keys(self.version, *dst_cid, side, &self.suite)
+        initial_keys(
+            self.version,
+            *dst_cid,
+            side,
+            &self.suite,
+            self.initial_secret.as_ref(),
+        )
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
@@ -291,6 +298,7 @@ pub struct HandshakeData {
 pub struct QuicClientConfig {
     pub(crate) inner: Arc<rustls::ClientConfig>,
     initial: Suite,
+    initial_secret: Option<[u8; 32]>,
 }
 
 impl QuicClientConfig {
@@ -309,6 +317,7 @@ impl QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
+            initial_secret: None,
         })
     }
 
@@ -323,6 +332,7 @@ impl QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
+            initial_secret: None,
         }
     }
 
@@ -334,9 +344,22 @@ impl QuicClientConfig {
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
-            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self {
+                inner,
+                initial,
+                initial_secret: None,
+            }),
             _ => Err(NoInitialCipherSuite { specific: true }),
         }
+    }
+
+    /// Use a private endpoint secret when deriving QUIC Initial packet keys.
+    ///
+    /// Peers must configure the same secret. This preserves packet sizes and
+    /// all later QUIC key spaces while preventing stock QUIC endpoints from
+    /// decrypting the Initial flight.
+    pub fn initial_packet_secret(&mut self, secret: [u8; 32]) {
+        self.initial_secret = Some(secret);
     }
 
     pub(crate) fn inner(verifier: Arc<dyn ServerCertVerifier>) -> rustls::ClientConfig {
@@ -377,6 +400,7 @@ impl crypto::ClientConfig for QuicClientConfig {
                 .unwrap(),
             ),
             suite: self.initial,
+            initial_secret: self.initial_secret,
         }))
     }
 }
@@ -397,6 +421,7 @@ impl TryFrom<Arc<rustls::ClientConfig>> for QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
+            initial_secret: None,
         })
     }
 }
@@ -440,6 +465,7 @@ impl std::error::Error for NoInitialCipherSuite {}
 pub struct QuicServerConfig {
     inner: Arc<rustls::ServerConfig>,
     initial: Suite,
+    initial_secret: Option<[u8; 32]>,
 }
 
 impl QuicServerConfig {
@@ -453,6 +479,7 @@ impl QuicServerConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
+            initial_secret: None,
         })
     }
 
@@ -464,9 +491,22 @@ impl QuicServerConfig {
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
-            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self {
+                inner,
+                initial,
+                initial_secret: None,
+            }),
             _ => Err(NoInitialCipherSuite { specific: true }),
         }
+    }
+
+    /// Use a private endpoint secret when deriving QUIC Initial packet keys.
+    ///
+    /// Peers must configure the same secret. This preserves packet sizes and
+    /// all later QUIC key spaces while preventing stock QUIC endpoints from
+    /// decrypting the Initial flight.
+    pub fn initial_packet_secret(&mut self, secret: [u8; 32]) {
+        self.initial_secret = Some(secret);
     }
 
     /// Initialize a sane QUIC-compatible TLS server configuration
@@ -505,6 +545,7 @@ impl TryFrom<Arc<rustls::ServerConfig>> for QuicServerConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
+            initial_secret: None,
         })
     }
 }
@@ -526,6 +567,7 @@ impl crypto::ServerConfig for QuicServerConfig {
                     .unwrap(),
             ),
             suite: self.initial,
+            initial_secret: self.initial_secret,
         })
     }
 
@@ -535,7 +577,17 @@ impl crypto::ServerConfig for QuicServerConfig {
         dst_cid: &ConnectionId,
     ) -> Result<Keys, UnsupportedVersion> {
         let version = interpret_version(version)?;
-        Ok(initial_keys(version, *dst_cid, Side::Server, &self.initial))
+        Ok(initial_keys(
+            version,
+            *dst_cid,
+            Side::Server,
+            &self.initial,
+            self.initial_secret.as_ref(),
+        ))
+    }
+
+    fn private_initial_keys(&self) -> bool {
+        self.initial_secret.is_some()
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
@@ -598,8 +650,20 @@ pub(crate) fn initial_keys(
     dst_cid: ConnectionId,
     side: Side,
     suite: &Suite,
+    initial_secret: Option<&[u8; 32]>,
 ) -> Keys {
-    let keys = suite.keys(&dst_cid, side.into(), version);
+    const PRIVATE_INITIAL_LABEL: &[u8] = b"mptunnel quic private initial v1";
+    let private_input = initial_secret.map(|secret| {
+        let mut input = Vec::with_capacity(
+            PRIVATE_INITIAL_LABEL.len() + secret.len() + dst_cid.len(),
+        );
+        input.extend_from_slice(PRIVATE_INITIAL_LABEL);
+        input.extend_from_slice(secret);
+        input.extend_from_slice(&dst_cid);
+        input
+    });
+    let key_input = private_input.as_deref().unwrap_or(&dst_cid);
+    let keys = suite.keys(key_input, side.into(), version);
     Keys {
         header: KeyPair {
             local: Box::new(keys.local.header),

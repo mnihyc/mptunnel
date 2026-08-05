@@ -31,6 +31,7 @@ pub const DEFAULT_RESTART_BACKOFF: Duration = Duration::from_millis(DEFAULT_REST
 pub const DEFAULT_RESTART_MAX_BACKOFF: Duration =
     Duration::from_millis(DEFAULT_RESTART_MAX_BACKOFF_MS);
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS: u64 = 300;
+pub const DEFAULT_MPP_TLS_SERVER_NAME: &str = "mptunnel.example";
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW: Duration =
     Duration::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS);
 pub const DEFAULT_AUTHENTICATION_TIMEOUT_MS: u64 = 10_000;
@@ -824,8 +825,9 @@ pub struct ClientPathConfig {
     pub spec: PathSpec,
     /// Security scoped to this path's MPP peer relationship.
     pub security: ClientSecurityConfig,
-    /// Independently pinned carrier TLS identity. TCP and QUIC consume the same
-    /// Product-configured identity; application credentials never derive it.
+    /// Independently pinned QUIC identity and legacy TCP TLS identity.
+    /// Optional shared transport protection never derives from an MPP client
+    /// credential.
     pub tls: TcpClientTlsConfig,
 }
 
@@ -849,7 +851,7 @@ pub struct MppInboundConfig {
     pub paths: Vec<NamedPathConfig>,
     /// Security scoped to peers that join this MPP inbound.
     pub security: ServerSecurityConfig,
-    /// TLS identity shared by every TCP and QUIC listener in this MPP inbound.
+    /// QUIC identity and legacy TCP TLS identity shared by this MPP inbound.
     pub tls: TcpServerTlsConfig,
     /// Immutable Product destination authorization for accepted TCP/UDP flows.
     pub destination_acl: ServerDestinationAclConfig,

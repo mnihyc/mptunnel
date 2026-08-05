@@ -225,9 +225,9 @@ pub(in crate::runtime) struct ServerPathAuthentication {
 }
 
 impl ServerPathAuthentication {
-    /// Authenticates the fixed TCP prelude after the TLS 1.3 handshake.
+    /// Authenticates the fixed TCP prelude after carrier protection completes.
     ///
-    /// Invalid IDs, unavailable credentials, stale timestamps, wrong exporters,
+    /// Invalid IDs, unavailable credentials, stale timestamps, wrong bindings,
     /// and wrong tags all take the same rejection path. A dummy HMAC keeps
     /// unknown credentials from becoming a cheap credential-existence oracle.
     #[allow(clippy::too_many_arguments)]
@@ -239,7 +239,7 @@ impl ServerPathAuthentication {
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
         auth_tag: AuthTag,
-        tls_exporter: &[u8; 32],
+        transport_binding: &[u8; 32],
     ) -> Result<Option<AuthenticatedServerPathSession>, RuntimeError> {
         let now_unix_secs = current_unix_secs()?;
         let parsed_id = CredentialId::parse(credential_id).ok();
@@ -257,7 +257,7 @@ impl ServerPathAuthentication {
             credential_id,
             nonce,
             issued_at_unix_secs,
-            tls_exporter,
+            transport_binding,
             tag: auth_tag,
             now_unix_secs,
             freshness_window_secs: security.auth_freshness_window.as_secs(),

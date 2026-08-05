@@ -2,14 +2,14 @@ use super::secret::{SecretMaterialError, SecretMaterialReference};
 use super::{
     AppConfig, ClientPathConfig, ClientSecurityConfig, CommandConfig, ConfigError,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_AUTHENTICATION_TIMEOUT_MS,
-    DEFAULT_MAX_PENDING_AUTHENTICATIONS, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
-    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS,
-    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig,
-    EgressRef, GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
-    ManagementConfig, MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NamedPathConfig,
-    NodeConfig, OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits,
-    SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
-    SessionConfig, SharedSecret,
+    DEFAULT_MAX_PENDING_AUTHENTICATIONS, DEFAULT_MPP_TLS_SERVER_NAME,
+    DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_PROBE_INTERVAL_MS,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
+    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, GatewayBalancerConfig,
+    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
+    MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NodeConfig, OutboundLeafConfig,
+    ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits, SecurityPolicyError,
+    ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -42,7 +42,7 @@ use crate::product::{
     RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage, RuleId, RuleSetId, RuleSetPublisher,
     RuleSetPublisherCatalog, RuleSetPublisherId, TrafficIntent, VerifiedRuleSet,
 };
-use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
+use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{EndpointParseError, PathSpecParseError};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -613,6 +613,7 @@ struct SecurityFileConfig {
     tls_pinned_certificate_file: Option<PathBuf>,
     tls_certificate_chain_file: Option<PathBuf>,
     tls_private_key_file: Option<PathBuf>,
+    transport_secret_file: Option<PathBuf>,
 }
 
 impl SecurityFileConfig {
@@ -712,18 +713,14 @@ impl SecurityFileConfig {
     fn client_tls(&self, material_base: &Path) -> Result<TcpClientTlsConfig, ConfigFileError> {
         if self.tls_certificate_chain_file.is_some() || self.tls_private_key_file.is_some() {
             return Err(ConfigFileError::MppTlsRoleMismatch(
-                "client MPP security cannot contain a server certificate chain or private key",
+                "client MPP security cannot contain server-private transport material",
             ));
         }
-        match (
-            self.tls_server_name.as_deref(),
-            self.tls_pinned_certificate_file.as_deref(),
-        ) {
-            (None, _) => Err(ConfigFileError::MppTlsFieldRequired("tls_server_name")),
-            (_, None) => Err(ConfigFileError::MppTlsFieldRequired(
+        let tls = match self.tls_pinned_certificate_file.as_deref() {
+            None => Err(ConfigFileError::MppTlsFieldRequired(
                 "tls_pinned_certificate_file",
             )),
-            (Some(server_name), Some(path)) => {
+            Some(path) => {
                 let certificates = load_certificates(material_base, path)?;
                 let [pinned_leaf] = certificates.as_slice() else {
                     return Err(ConfigFileError::MppTlsMaterial(
@@ -731,19 +728,33 @@ impl SecurityFileConfig {
                             .to_string(),
                     ));
                 };
-                TcpClientTlsConfig::new(server_name, pinned_leaf.clone())
-                    .map_err(|error| ConfigFileError::MppTlsMaterial(error.to_string()))
+                TcpClientTlsConfig::new(
+                    self.tls_server_name
+                        .as_deref()
+                        .unwrap_or(DEFAULT_MPP_TLS_SERVER_NAME),
+                    pinned_leaf.clone(),
+                )
+                .map_err(|error| ConfigFileError::MppTlsMaterial(error.to_string()))
             }
+        }?;
+        match self.transport_secret_file.as_deref() {
+            None => Ok(tls),
+            Some(path) => Ok(tls
+                .with_shared_transport_secret(load_shared_transport_secret(material_base, path)?)),
         }
     }
 
-    fn server_tls(&self, material_base: &Path) -> Result<TcpServerTlsConfig, ConfigFileError> {
+    fn server_tls(
+        &self,
+        material_base: &Path,
+        security: &ServerSecurityConfig,
+    ) -> Result<TcpServerTlsConfig, ConfigFileError> {
         if self.tls_server_name.is_some() || self.tls_pinned_certificate_file.is_some() {
             return Err(ConfigFileError::MppTlsRoleMismatch(
-                "server MPP security cannot contain a client server-name or certificate pin",
+                "server MPP security cannot contain client-side transport identity material",
             ));
         }
-        match (
+        let tls = match (
             self.tls_certificate_chain_file.as_deref(),
             self.tls_private_key_file.as_deref(),
         ) {
@@ -757,8 +768,37 @@ impl SecurityFileConfig {
                 TcpServerTlsConfig::new(certificate_chain, private_key)
                     .map_err(|error| ConfigFileError::MppTlsMaterial(error.to_string()))
             }
+        }?;
+        match self.transport_secret_file.as_deref() {
+            None => Ok(tls),
+            Some(path) => Ok(tls.with_shared_transport_secret(
+                load_shared_transport_secret(material_base, path)?,
+                security.auth_freshness_window,
+                security.max_pending_authentications,
+            )),
         }
     }
+}
+
+fn load_shared_transport_secret(
+    base: &Path,
+    configured: &Path,
+) -> Result<SharedTransportSecret, ConfigFileError> {
+    let path = material_path(base, configured);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        ConfigFileError::MppTransportSecret(format!(
+            "failed to read shared transport secret {}: {error}",
+            configured.display()
+        ))
+    })?;
+    let bytes = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        ConfigFileError::MppTransportSecret(format!(
+            "shared transport secret {} must contain exactly 32 raw bytes, found {}",
+            configured.display(),
+            bytes.len()
+        ))
+    })?;
+    Ok(SharedTransportSecret::new(bytes))
 }
 
 fn material_path(base: &Path, configured: &Path) -> PathBuf {
@@ -2444,6 +2484,8 @@ fn build_node_services(
                 if paths.is_empty() {
                     return Err(ConfigFileError::MppInboundRequiresPath);
                 }
+                let server_security = security.server_auth_config(credential_catalog)?;
+                let tls = security.server_tls(material_base, &server_security)?;
                 servers.push(MppInboundConfig {
                     name,
                     egress,
@@ -2455,8 +2497,8 @@ fn build_node_services(
                         })
                         .transpose()?,
                     paths,
-                    security: security.server_auth_config(credential_catalog)?,
-                    tls: security.server_tls(material_base)?,
+                    security: server_security,
+                    tls,
                     destination_acl: destination_acl.into_config()?,
                     performance: performance.into_config(),
                 });
@@ -3102,6 +3144,7 @@ pub enum ConfigFileError {
     MppTlsFieldRequired(&'static str),
     MppTlsRoleMismatch(&'static str),
     MppTlsMaterial(String),
+    MppTransportSecret(String),
 }
 
 impl From<ConfigError> for ConfigFileError {
@@ -3235,6 +3278,7 @@ impl std::fmt::Display for ConfigFileError {
             }
             Self::MppTlsRoleMismatch(message) => write!(f, "{message}"),
             Self::MppTlsMaterial(message) => write!(f, "{message}"),
+            Self::MppTransportSecret(message) => write!(f, "{message}"),
         }
     }
 }
@@ -3289,7 +3333,8 @@ impl std::error::Error for ConfigFileError {
             | Self::PortForward(_)
             | Self::MppTlsFieldRequired(_)
             | Self::MppTlsRoleMismatch(_)
-            | Self::MppTlsMaterial(_) => None,
+            | Self::MppTlsMaterial(_)
+            | Self::MppTransportSecret(_) => None,
         }
     }
 }

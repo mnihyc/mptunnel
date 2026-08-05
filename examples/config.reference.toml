@@ -334,12 +334,14 @@ extra_traffic_hint_percent = 5
 
 [outbounds.security]
 credential_id = "home-client"
-# TLS identity is independent from the MPP authentication credential and is
-# shared by the TCP and QUIC carriers in this path group. A path group with a
-# QUIC endpoint requires a DNS TLS identity because H3 authority is bound to
-# SNI; the carrier endpoint itself may still be a literal IP address.
-tls_server_name = "server.example.com"
+# The pinned QUIC and legacy-TCP certificate identity is independent from the
+# MPP credential. Its default is mptunnel.example; the carrier endpoint may be
+# a different DNS name or a literal IP address.
+# tls_server_name = "mptunnel.example"
 tls_pinned_certificate_file = "REPLACE_WITH_SERVER_CERT.pem"
+# Optional endpoint-wide transport protection. Both peers use the same raw
+# 32-byte file; it is separate from every MPP client credential.
+# transport_secret_file = "mpp-transport.key"
 auth_freshness_window_seconds = 300
 
 [routing]
@@ -442,6 +444,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # credential_id = "secondary-client"
 # tls_server_name = "secondary.example.com"
 # tls_pinned_certificate_file = "secondary-server-cert.pem"
+# transport_secret_file = "secondary-mpp-transport.key"
 # auth_freshness_window_seconds = 300
 
 # Optional server-side MPP inbound
@@ -467,6 +470,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # credential_ids = ["home-client"]
 # tls_certificate_chain_file = "server-cert.pem"
 # tls_private_key_file = "server-key.pem"
+# transport_secret_file = "mpp-transport.key"
 # auth_freshness_window_seconds = 300
 # authentication_timeout_ms = 5000
 # max_pending_authentications = 1024

@@ -7,6 +7,7 @@ struct TestTlsMaterial {
     certificate: std::path::PathBuf,
     private_key: std::path::PathBuf,
     credential: std::path::PathBuf,
+    transport_secret: std::path::PathBuf,
 }
 
 fn test_tls_material() -> &'static TestTlsMaterial {
@@ -21,15 +22,19 @@ fn test_tls_material() -> &'static TestTlsMaterial {
         let certificate = directory.join("certificate.pem");
         let private_key = directory.join("private-key.pem");
         let credential = directory.join("credential.key");
+        let transport_secret = directory.join("transport-secret.key");
         std::fs::write(&certificate, cert.pem()).expect("write CLI-test certificate");
         std::fs::write(&private_key, signing_key.serialize_pem())
             .expect("write CLI-test private key");
         std::fs::write(&credential, b"0123456789abcdef0123456789abcdef")
             .expect("write CLI-test credential");
+        std::fs::write(&transport_secret, b"transport-secret-32-bytes-value!")
+            .expect("write CLI-test transport secret");
         TestTlsMaterial {
             certificate,
             private_key,
             credential,
+            transport_secret,
         }
     })
 }
@@ -96,6 +101,38 @@ fn only_local_outbound(node: &NodeConfig) -> &OutboundConfig {
         panic!("expected one local outbound");
     };
     config
+}
+
+#[test]
+fn mpp_cli_defaults_identity_and_keeps_transport_secret_distinct() {
+    let material = test_tls_material();
+    let legacy = client_tls_from_cli(None, Some(material.certificate.clone()), None)
+        .expect("default MPP TLS identity");
+    let explicit = client_tls_from_cli(
+        Some(DEFAULT_MPP_TLS_SERVER_NAME.to_string()),
+        Some(material.certificate.clone()),
+        None,
+    )
+    .expect("explicit default MPP TLS identity");
+    assert_eq!(legacy, explicit);
+
+    let protected = client_tls_from_cli(
+        None,
+        Some(material.certificate.clone()),
+        Some(material.transport_secret.clone()),
+    )
+    .expect("client shared transport secret");
+    assert_ne!(legacy, protected);
+    assert!(!format!("{protected:?}").contains("transport-secret-32-bytes-value"));
+
+    server_tls_from_cli(
+        Some(material.certificate.clone()),
+        Some(material.private_key.clone()),
+        Some(material.transport_secret.clone()),
+        Duration::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS),
+        crate::config::DEFAULT_MAX_PENDING_AUTHENTICATIONS,
+    )
+    .expect("server shared transport secret");
 }
 
 #[test]

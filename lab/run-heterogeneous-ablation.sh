@@ -2000,7 +2000,9 @@ cleanup() {
 
 apply_netem() {
   local mode="$1"
-  if [[ "$mode" =~ ^scale-(access|gigabit|multi-gigabit)-epoch-0$ ]]; then
+  if [[ "$mode" == "asymmetric" ]]; then
+    apply_asymmetric_netem
+  elif [[ "$mode" =~ ^scale-(access|gigabit|multi-gigabit)-epoch-0$ ]]; then
     prepare_path_variation_initial_epoch "${BASH_REMATCH[1]}"
     exec_netem target clear >/dev/null
   else
@@ -2482,12 +2484,7 @@ prepare_baseline_case() {
 
 prepare_baseline_profile() {
   local netem_mode="$1"
-  if [[ "$netem_mode" == "asymmetric" ]]; then
-    prepare_baseline_case unconstrained
-    apply_asymmetric_netem
-  else
-    prepare_baseline_case "$netem_mode"
-  fi
+  prepare_baseline_case "$netem_mode"
 }
 
 run_baseline_download_probe_case() {
@@ -3459,8 +3456,7 @@ run_varying_links_upload_case() {
 run_asymmetric_download_case() {
   local case_name="$1"
   shift
-  start_client_with_netem "$case_name" unconstrained "$@"
-  apply_asymmetric_netem
+  start_client_with_netem "$case_name" asymmetric "$@"
   run_tcp_download_probe_case "$case_name"
   apply_netem apply
 }
@@ -3468,8 +3464,7 @@ run_asymmetric_download_case() {
 run_asymmetric_upload_case() {
   local case_name="$1"
   shift
-  start_client_with_netem "$case_name" unconstrained "$@"
-  apply_asymmetric_netem
+  start_client_with_netem "$case_name" asymmetric "$@"
   run_tcp_upload_probe_case "$case_name"
   apply_netem apply
 }

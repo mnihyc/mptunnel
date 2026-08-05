@@ -388,7 +388,28 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn("target MPTCP endpoint configuration failed:", SCRIPT)
 
     def test_asymmetric_product_baselines_keep_one_fixed_link(self):
-        self.assertIn('[[ "$netem_mode" == "asymmetric" ]]', SCRIPT)
+        apply_netem = SCRIPT.split("apply_netem() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        asymmetric_download = SCRIPT.split(
+            "run_asymmetric_download_case() {", 1
+        )[1].split("\n}", 1)[0]
+        asymmetric_upload = SCRIPT.split(
+            "run_asymmetric_upload_case() {", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn('[[ "$mode" == "asymmetric" ]]', apply_netem)
+        self.assertIn("apply_asymmetric_netem", apply_netem)
+        self.assertIn(
+            'start_client_with_netem "$case_name" asymmetric',
+            asymmetric_download,
+        )
+        self.assertIn(
+            'start_client_with_netem "$case_name" asymmetric',
+            asymmetric_upload,
+        )
+        self.assertNotIn("apply_asymmetric_netem", asymmetric_download)
+        self.assertNotIn("apply_asymmetric_netem", asymmetric_upload)
         self.assertIn(
             '"baseline_vmess_tcp_single_asymmetric_download_reference"',
             SCRIPT,

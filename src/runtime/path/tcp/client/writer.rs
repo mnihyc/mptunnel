@@ -469,6 +469,8 @@ async fn client_write_tcp_capacity_probe_interlocked(
     let mut deferred_frames = Vec::new();
     let mut defer_all = false;
     let mut routed_frames = 0usize;
+    #[cfg(feature = "lab-diagnostics")]
+    let mut first_barrier_reason = None;
     let mut deferred_error = None;
     let mut reader_open = true;
     let measurement = loop {
@@ -506,6 +508,13 @@ async fn client_write_tcp_capacity_probe_interlocked(
                             continue;
                         }
                         ClientTcpWriteFrameRoute::Barrier(frame) => {
+                            #[cfg(feature = "lab-diagnostics")]
+                            {
+                                first_barrier_reason = Some(client_tcp_write_barrier_reason(
+                                    &frame,
+                                    streams,
+                                ));
+                            }
                             defer_all = true;
                             deferred_frames.push(frame);
                         }
@@ -513,6 +522,17 @@ async fn client_write_tcp_capacity_probe_interlocked(
                 } else if deferred_frames.len() < deferred_limit {
                     deferred_frames.push(frame);
                 } else {
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "request_tcp_capacity_feedback_interlock",
+                        format_args!(
+                            "phase=overflow first_barrier_reason={} deferred_limit={} routed_frames={} overflow_frame_kind={}",
+                            first_barrier_reason.unwrap_or("unknown"),
+                            deferred_limit,
+                            routed_frames,
+                            frame.kind_name(),
+                        ),
+                    );
                     // Continue draining so the peer can read the in-progress
                     // probe, then fail the carrier and let reliable reinjection own
                     // any product frames that could not remain ordered here.
@@ -539,6 +559,28 @@ async fn client_write_tcp_capacity_probe_interlocked(
         );
     }
     Ok((measurement, deferred_frames))
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn client_tcp_write_barrier_reason(
+    frame: &Frame,
+    streams: &HashMap<StreamId, ClientTcpPathStreamState>,
+) -> &'static str {
+    let stream_id = match frame {
+        Frame::StreamMaxData { stream_id, .. }
+        | Frame::StreamReset { stream_id, .. }
+        | Frame::StreamData { stream_id, .. }
+        | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamFin { stream_id, .. }
+        | Frame::StreamDetach { stream_id } => Some(*stream_id),
+        _ => None,
+    };
+    match stream_id.and_then(|stream_id| streams.get(&stream_id)) {
+        Some(state) if state.pending_open.is_some() => "pending_stream_open",
+        Some(_) => "stream_delivery_backpressure",
+        None if stream_id.is_some() => "retired_stream",
+        None => "carrier_control",
+    }
 }
 
 enum ClientTcpWriteFrameRoute {

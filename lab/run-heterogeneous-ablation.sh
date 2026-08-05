@@ -16,6 +16,20 @@ flag_enabled() {
   esac
 }
 
+hysteria_bandwidth_from_netem_rate() {
+  local value="${1,,}"
+  if [[ "$value" =~ ^([0-9]+([.][0-9]+)?)([kmgt]?)bit$ ]]; then
+    printf '%s %sbps\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"
+    return
+  fi
+  if [[ "$value" =~ ^[0-9]+([.][0-9]+)?[[:space:]]*[kmgt]?bps$ ]]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  echo "cannot express netem rate as Hysteria2 bandwidth: $1" >&2
+  return 2
+}
+
 elapsed_seconds_between_ns() {
   local started_ns="$1"
   local stopped_ns="$2"
@@ -2642,6 +2656,8 @@ run_hysteria2_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
   local netem_mode="${3:-apply}"
+  local brutal_up="${4:-}"
+  local brutal_down="${5:-$brutal_up}"
   prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
     append_skipped_result "$case_name" "hysteria2" "hysteria2 baseline binary unavailable"
@@ -2651,7 +2667,7 @@ run_hysteria2_baseline_case() {
     append_skipped_result "$case_name" "hysteria2" "hysteria2 TLS certificate generation unavailable"
     return 0
   fi
-  exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}'"
+  exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}' '${brutal_up}' '${brutal_down}'"
   exec_in server "$baseline_tool_command run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
   exec_in client "$baseline_tool_command run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
   sleep 1
@@ -2675,6 +2691,8 @@ run_hysteria2_baseline_upload_case() {
   local case_name="$1"
   local server_ip="$2"
   local netem_mode="${3:-apply}"
+  local brutal_up="${4:-}"
+  local brutal_down="${5:-$brutal_up}"
   prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
     append_skipped_result "$case_name" "hysteria2-upload" "hysteria2 baseline binary unavailable"
@@ -2684,7 +2702,7 @@ run_hysteria2_baseline_upload_case() {
     append_skipped_result "$case_name" "hysteria2-upload" "hysteria2 TLS certificate generation unavailable"
     return 0
   fi
-  exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}'"
+  exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}' '${brutal_up}' '${brutal_down}'"
   exec_in server "$baseline_tool_command run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
   exec_in client "$baseline_tool_command run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
   sleep 1
@@ -3994,19 +4012,23 @@ if should_run_case "baseline_vmess_tcp_single_unconstrained_upload"; then
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_balanced"; then
-  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_balanced" "172.31.15.20"
+  hysteria_rate="$(hysteria_bandwidth_from_netem_rate "${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}")"
+  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_balanced" "172.31.15.20" apply "$hysteria_rate" "$hysteria_rate"
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth"; then
-  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth" "172.31.20.20"
+  hysteria_rate="$(hysteria_bandwidth_from_netem_rate "${MPTUNNEL_LAB_FAT_RATE:-500mbit}")"
+  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth" "172.31.20.20" apply "$hysteria_rate" "$hysteria_rate"
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_balanced_upload"; then
-  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_balanced_upload" "172.31.15.20"
+  hysteria_rate="$(hysteria_bandwidth_from_netem_rate "${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}")"
+  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_balanced_upload" "172.31.15.20" apply "$hysteria_rate" "$hysteria_rate"
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload"; then
-  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload" "172.31.20.20"
+  hysteria_rate="$(hysteria_bandwidth_from_netem_rate "${MPTUNNEL_LAB_FAT_RATE:-500mbit}")"
+  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload" "172.31.20.20" apply "$hysteria_rate" "$hysteria_rate"
 fi
 if should_run_case "baseline_hysteria2_udp_single_unconstrained"; then
   run_hysteria2_baseline_case "baseline_hysteria2_udp_single_unconstrained" "172.31.10.20" unconstrained
@@ -4025,7 +4047,9 @@ if should_run_case "baseline_hysteria2_udp_single_asymmetric_download_reference"
   run_hysteria2_baseline_case \
     "baseline_hysteria2_udp_single_asymmetric_download_reference" \
     "172.31.10.20" \
-    asymmetric
+    asymmetric \
+    "20 mbps" \
+    "200 mbps"
 fi
 if should_run_case "baseline_vmess_tcp_single_asymmetric_upload_reference"; then
   run_vmess_baseline_upload_case \
@@ -4037,7 +4061,9 @@ if should_run_case "baseline_hysteria2_udp_single_asymmetric_upload_reference"; 
   run_hysteria2_baseline_upload_case \
     "baseline_hysteria2_udp_single_asymmetric_upload_reference" \
     "172.31.15.20" \
-    asymmetric
+    asymmetric \
+    "200 mbps" \
+    "20 mbps"
 fi
 
 if should_run_case "baseline_mptcp_tcp_multipath_all"; then

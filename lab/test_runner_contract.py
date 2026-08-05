@@ -405,6 +405,15 @@ class RunnerContractTests(unittest.TestCase):
             '"baseline_hysteria2_udp_single_asymmetric_upload_reference"',
             SCRIPT,
         )
+        self.assertIn('"20 mbps"', SCRIPT)
+        self.assertIn('"200 mbps"', SCRIPT)
+
+    def test_hysteria2_product_baselines_enable_brutal_at_shaped_rate(self):
+        self.assertIn("hysteria_bandwidth_from_netem_rate", SCRIPT)
+        self.assertIn("${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}", SCRIPT)
+        self.assertIn("${MPTUNNEL_LAB_FAT_RATE:-500mbit}", SCRIPT)
+        self.assertIn("bandwidth:", BASELINE_TOOLS)
+        self.assertIn("disableLossCompensation: false", BASELINE_TOOLS)
 
     def test_mixed_single_equal_fat_controls_use_one_tcp_and_one_udp_endpoint(self):
         self.assertIn(

@@ -290,12 +290,27 @@ write_hysteria_client() {
   local server_port="$3"
   local listen="$4"
   local listen_port="$5"
+  local bandwidth_up="${6:-}"
+  local bandwidth_down="${7:-}"
+  if [[ -n "$bandwidth_up" && -z "$bandwidth_down" ]] || \
+     [[ -z "$bandwidth_up" && -n "$bandwidth_down" ]]; then
+    echo "Hysteria2 Brutal requires both upload and download bandwidth" >&2
+    return 2
+  fi
   cat > "$base_dir/hysteria-client.yaml" <<YAML
 server: "${server}:${server_port}"
 auth: "${password}"
 tls:
   sni: mptunnel.lab
   insecure: true
+$(if [[ -n "$bandwidth_up" ]]; then
+  cat <<BANDWIDTH
+bandwidth:
+  up: "${bandwidth_up}"
+  down: "${bandwidth_down}"
+  disableLossCompensation: false
+BANDWIDTH
+fi)
 socks5:
   listen: "${listen}:${listen_port}"
   disableUDP: false

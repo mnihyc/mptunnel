@@ -103,6 +103,7 @@ pub(in crate::runtime) struct RequestPathRecoveryOutcome {
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::runtime) struct RequestDataAckGapObservation {
     pub(in crate::runtime) has_live_original_path: bool,
+    pub(in crate::runtime) original_assignment_at: Option<Instant>,
     pub(in crate::runtime) original_underlay: Option<UnderlayProtocol>,
     pub(in crate::runtime) original_path_timing: Option<PathSnapshot>,
     pub(in crate::runtime) reinjection_target:

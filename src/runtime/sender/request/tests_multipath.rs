@@ -1054,6 +1054,11 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
         .request
         .flights
         .record_original_frame_instance(old_instance, &frame);
+    let original_assignment_at = controller
+        .request
+        .flights
+        .unique_original_sent_at_for_frame(&frame)
+        .expect("original request assignment epoch");
 
     drop(remotes.remove_path_instance(old_instance));
     let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
@@ -1061,12 +1066,20 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
     let replacement = remotes.paths[0].instance();
     assert_eq!(replacement.key, old_instance.key);
     assert_ne!(replacement, old_instance);
+    let observation = controller.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &frame,
+        TrafficClass::Throughput,
+    );
     assert!(
-        controller
-            .data_ack_gap_reinjection_model(&context, &remotes, &frame, TrafficClass::Throughput)
-            .original_path_timing
-            .is_none(),
+        observation.original_path_timing.is_none(),
         "a replacement attachment cannot lend path timing to the prior instance's Data ACK gap"
+    );
+    assert_eq!(
+        observation.original_assignment_at,
+        Some(original_assignment_at),
+        "Data ACK recovery retains the exact original assignment epoch across attachment replacement",
     );
 
     assert_eq!(

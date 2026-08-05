@@ -10,6 +10,73 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-08-05T22:56:00+08:00: request Data-ACK recovery regains direction-neutral flight age
+
+- Name: exact original-flight epoch for authoritative request-gap recovery
+- Category: Core recovery lifecycle and directional performance
+- State: accepted; supersedes the rejected 2026-08-02 timing candidate because
+  the action is now causal and its former disruption concern was retested with
+  a fixed schedule
+- Root cause and historical intent:
+  - the request flight ledger already retained exact attachment identity and
+    assignment time, and complete MPP Data ACK snapshots already supplied the
+    same bounded omission authority as response snapshots;
+  - request recovery discarded that assignment time and started a fresh full
+    recovery interval at observation, while response recovery used original
+    flight age and the established TCP `5/4 * SRTT` or QUIC `9/8 * SRTT`
+    Data-ACK threshold;
+  - sparse incomplete request ACKs remain intentional positive-only feedback:
+    they release exact delivered ranges, never establish an omission, and may
+    only fill gaps below a retained complete snapshot's horizon; and
+  - the earlier `32c6ea4` attempt was correctly reverted by `584dd11` because
+    its one gain had not exercised this action and its unmatched disruption
+    runs regressed. It is not treated as prior acceptance.
+- Bounded correction:
+  - request recovery now carries the existing ledger-owned assignment epoch
+    through its immutable gap observation and uses the same existing
+    transport-derived Data-ACK deadline as response recovery;
+  - exact unique ownership, a live original attachment, a measured distinct
+    alternate that beats full recovery, retained omission authority, queue and
+    flight overlap checks, native carrier backpressure, and all existing
+    repair/resource envelopes remain mandatory; and
+  - no frame, protocol version, threshold, scheduler score, congestion
+    controller, carrier policy, capacity limit, or platform path changed.
+- Causal direction evidence:
+  - on the identical deterministic 20-link schedule, normal optimized download
+    remained within variation at `1,235.010 Mbps` versus `1,216.058 Mbps`,
+    while upload increased from `534.255` to `1,221.342 Mbps`;
+  - upload delivered exactly `7,059,603,456` sink-confirmed bytes across two
+    completed streams with no failures, and its upload/download ratio improved
+    from `0.439` to `0.989`;
+  - request logical output increased in every schedule epoch and tracked sink
+    goodput, while download remained unchanged, proving a request sender
+    lifecycle correction rather than probe or accounting variance; and
+  - diagnostic-build goodput is excluded because hundreds of megabytes of
+    per-frame trace output interfered with both directions. Those traces were
+    used only to confirm that retained-authority evaluation and queue-overlap
+    rejection operated as designed.
+- Regression gates:
+  - matched equal-fat mixed paths completed at `622.660 Mbps` download and
+    `590.934 Mbps` upload;
+  - TCP-only equal-fat upload delivered `676.503 Mbps` versus the latest clean
+    `685.070 Mbps` reference, a `1.25%` difference inside ordinary variation;
+  - under one fixed flapping schedule, candidate bulk goodput was
+    `258.787 Mbps` and `250.705 Mbps` across two runs versus `205.935 Mbps`
+    control, with maximum bulk gaps `2.261 s` and `0.861 s` versus `4.507 s`;
+  - both candidate runs and control served `57/57` interactive requests and
+    lost exactly two UDP datagrams. One candidate run had one short-request
+    timeout; the repeat had zero, confirming variance rather than a persistent
+    regression; and
+  - all `1,471` library tests, two allocation tests, six packaged daily-use
+    tests, and doctests pass. Strict Clippy is blocked only by six existing
+    `question_mark` style findings in an unrelated request helper; the scoped
+    lint run, formatting, and whitespace gates pass.
+- Evidence: `./.tmp/lab/results/direction-gap-epoch-candidate-normal/`,
+  `./.tmp/lab/results/direction-gap-epoch-candidate-gates/`,
+  `./.tmp/lab/results/direction-gap-epoch-control-fixed-flap/`,
+  `./.tmp/lab/results/direction-gap-epoch-candidate-fixed-flap-repeat/`, and
+  `./.tmp/lab/results/direction-gap-epoch-candidate-tcp-gate/`.
+
 ## 2026-08-02T12:30:19+08:00: release identity and immutable asset contract corrected
 
 - Name: compact versioned release contract
@@ -6164,3 +6231,79 @@ entry is authoritative.
   `./.tmp/lab/results/public-current-tail-fix-fat-upload/`, with the accepted
   stable-before-change cohort under
   `./.tmp/lab/results/public-current-dynamic/`.
+
+## 2026-08-05T21:50:49+08:00: dynamic upload direction weakness isolated
+
+- Name: matched request/response throughput and Data-ACK authority diagnosis
+- Category: Core model audit; no implementation change
+- State: a reproducible directional model weakness is confirmed; a timing-only
+  change is explicitly not authorized by this diagnosis
+- Test-shape correction:
+  - each epoch contains the same `12,000 Mbps` aggregate rate inventory and the
+    same latency, jitter, and loss inventory in both directions;
+  - rate and quality are independently permuted with `direction` in the
+    deterministic hash, so this is aggregate-balanced but not path-for-path
+    symmetric; and
+  - the identical deterministic schedule is reused by the paired download and
+    upload runs, so their directional data flows remain directly comparable.
+- Matched optimized-binary evidence at `e17120d`:
+  - download delivered `1,216.058 Mbps`; upload delivered `534.255 Mbps` with
+    exact receiver accounting, while every `39-40` carrier remained live;
+  - the active sender's own average modeled path delivery was approximately
+    `2,280 Mbps` for download and `1,508 Mbps` for upload. Directional path
+    correlation therefore explains part of the result, but realized service
+    was still approximately `53%` versus `35%` of those respective models;
+  - upload repeatedly fell near zero while modeled delivery remained above
+    one gigabit and queue/flight state remained below its resource envelope;
+    and
+  - finite upload drain added only `1.478 s` in this pair. Independent direct
+    upload exceeded `20 Gbps`, while stationary ordinary, equal-fat,
+    independent-carrier, and local mixed controls remained directionally
+    balanced. Probe cost, sink cost, platform behavior, and generic upload
+    processing are therefore rejected as causes.
+- Matched Data-ACK traces:
+  - diagnostic download delivered `1,206.337 Mbps`. All `18,186` response ACK
+    observations were complete authoritative snapshots; `2,833` observations
+    authorized bounded persistent-gap service covering `53,745` frames;
+  - diagnostic upload delivered `663.181 Mbps`. Of `88,101` request ACK
+    observations, `65,510` were non-authoritative sparse deltas; only one ACK
+    observation directly authorized eight frames and seven retained-gap timers
+    authorized another `57` frames;
+  - response feedback released useful flight on every observed ACK, whereas
+    only `36,682` request ACK observations released new bytes. Sparse request
+    publication therefore generated over eight times as many ACK observations
+    per delivered byte in this topology while providing much weaker omission
+    authority; and
+  - the `64 MiB` stream-flight envelope was reached in `2.30%` of recorded
+    download budget transitions and `0.90%` of upload transitions. It is not
+    the sustained directional limiter.
+- Root-cause boundary:
+  - bulk TCP request feedback deliberately publishes positive sparse deltas
+    during reorder, while response feedback publishes cumulative snapshots;
+  - a sparse delta releases exact positive flight but cannot advance the
+    authoritative omission horizon. Request repair then waits one MPP recovery
+    interval from a later authoritative observation, whereas response repair
+    uses original-flight age and the Data-ACK time threshold;
+  - under many heterogeneous changing paths this composition withholds ordered
+    request recovery long enough to make source admission bursty. It is a Core
+    feedback/recovery model asymmetry, not a Linux or native-transport issue;
+    and
+  - the response trace's much larger repair activity is evidence of the
+    inconsistency, not authority to copy that activity blindly. A correction
+    must first define direction-neutral cumulative ACK-transaction authority,
+    then compare bounded recovery under identical timing and ownership rules.
+- Rejected shortcut and next proof boundary:
+  - do not restore `32c6ea4`: that timing-only candidate was previously
+    rejected because its intended ACK-gap action did not cause the observed
+    gain and it correlated with a severe mixed-disruption regression;
+  - preserve exact directional sender ownership, native congestion control,
+    resource envelopes, and reinjection budgets; and
+  - any future correction must causally reduce incomplete/duplicate request
+    feedback and close the dynamic direction gap, then preserve stationary,
+    aggregation, and disruption controls before acceptance.
+- Reproducible evidence:
+  `./.tmp/lab/results/direction-root-cause-current/`,
+  `./.tmp/lab/results/direction-root-cause-diagnostic/`, and
+  `./.tmp/lab/results/direction-root-cause-diagnostic-download/`. The normal
+  optimized executable was restored afterward with SHA-256
+  `98bfdaa1e533d63c1e678d9b88930f5fe1cc011fcc2e95378725fa25b9ab701b`.

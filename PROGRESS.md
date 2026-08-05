@@ -5989,3 +5989,61 @@ entry is authoritative.
   artifact had already been cleaned.
 - Reproducible evidence:
   `./.tmp/lab/results/readme-blackhole-current/`.
+
+## 2026-08-05T18:06:20+08:00: buyer performance evidence finalized
+
+- Name: ordinary/adverse comparison, same-flow aggregation, and path-use proof
+- Category: public performance evidence and benchmark controls
+- State: completed; no protocol, scheduler, congestion-control, or timing
+  change was required
+- Matched one-link download conditions, pinned Xray/VMess and
+  Hysteria2/Brutal baselines, default MPTUNNEL TCP+QUIC:
+  - `500 Mbps`, approximately `40 ms` RTT, `10 ms` per-direction jitter,
+    `0.5%` loss: `441.353 / 463.502 / 414.200 Mbps`; and
+  - `500 Mbps`, approximately `280 ms` RTT, `20 ms` per-direction jitter,
+    `10%` loss: `70.833 / 96.288 / 194.504 Mbps`.
+  Values are ordered Xray, Hysteria2, and MPTUNNEL.
+- Same-flow default MPTUNNEL scaling on repeated ordinary links:
+  - one link: `414.200 / 436.133 Mbps` download/upload;
+  - two links: `771.888 / 602.173 Mbps`; and
+  - five links: `1,365.876 / 1,496.079 Mbps`.
+  This is `1.86×/1.38×` at two links and `3.30×/3.43×` at five links.
+- Linux MPTCP with five links delivered `884.667 Mbps` download. Its exact,
+  receiver-complete upload run collapsed to `2.572 Mbps` under independently
+  jittered/lossy paths despite observed additional subflows. It is retained in
+  detailed evidence, excluded from ratios, and omitted from the buyer table
+  pending independent replication.
+- Asymmetric capability proof:
+  - Link A was `200/20 Mbps` download/upload and Link B was `20/200 Mbps`;
+  - fixed-Link-A Xray/Hysteria2 delivered `181.696/≥17.708 Mbps` and
+    `188.812/≥18.808 Mbps` download/upload respectively; and
+  - one MPTUNNEL MPP/TCP configuration using A+B delivered
+    `153.009/151.513 Mbps`, with `91.2%` of download bytes on A and `89.6%`
+    of upload bytes on B.
+  The baseline upload endpoint was corrected from a direction-changing oracle
+  to one fixed link in commit `a0cda09`.
+- Default TCP+QUIC simultaneous workload controls:
+  - ordinary `80 Mbps` link alone: `60.886 Mbps` bulk, `103/217 ms` TCP
+    p50/p95, all `60/60` TCP, `45/45` HTTP, and `102/102` UDP checks;
+  - adverse `500 Mbps` link alone: `98.512 Mbps` bulk, `452/1,868 ms` TCP
+    p50/p95, `35/35` TCP, `9/11` HTTP, and `14/18` UDP checks; and
+  - both links: `160.002 Mbps` bulk, `173/318 ms` TCP p50/p95, all `60/60`
+    TCP, `53/53` HTTP, and `205/205` UDP checks.
+- Evidence integrity:
+  - every row used in the public documents has a valid host snapshot, clean
+    source tree, no unrelated containers, and receiver-side accounting;
+  - the first direction-changing asymmetric baseline upload rows were excluded
+    after the comparison was corrected to one fixed baseline link;
+  - one path-choice attempt was rejected immediately because its snapshot saw
+    transient containers from the preceding isolated run; none of its values
+    were used; and
+  - baseline uploads that did not close within the completion window are
+    labeled as receiver-delivered lower bounds and excluded from ratios.
+- Public presentation now answers one-link competitiveness, one-to-two-to-five
+  link scaling, fixed-link versus multipath directional use, simultaneous
+  bulk/interactive behavior, and disruption recovery before linking to exact
+  detailed evidence.
+- Reproducible evidence:
+  `./.tmp/lab/results/readme-final-core/`,
+  `./.tmp/lab/results/readme-final-path-choice-valid/`, and
+  `./.tmp/lab/results/readme-final-asymmetric-fixed-baseline/`.

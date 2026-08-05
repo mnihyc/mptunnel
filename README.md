@@ -56,76 +56,88 @@ SOCKS5 / HTTP CONNECT / port forward / TUN
 
 ## Performance
 
-Rates below are receiver-delivered goodput from isolated Linux containers.
-Matched product cells use a 500 Mbps path, two downloads, a 20-second window,
-zero jitter, Xray-core 26.3.27 with VMess/TCP, Hysteria2 2.10.0, and the default
-MPTUNNEL TCP+QUIC configuration.
+Results below are receiver-delivered goodput from controlled Linux tests,
+rounded to the nearest Mbps. Xray-core 26.3.27 uses VMess/TCP; Hysteria2 2.10.0
+uses Brutal at the shaped link rate; MPTUNNEL uses its default TCP+QUIC paths.
 
-### Across Internet conditions
+### One link
 
-| RTT (ms) | Loss | Xray/VMess (Mbps) | Hysteria2 (Mbps) | **MPTUNNEL (Mbps)** |
-| ---: | ---: | ---: | ---: | ---: |
-| 40 | 0% | 461.341 | **461.425** | 439.091 |
-| 40 | 10% | 406.613 | **421.454** | 405.129 |
-| 360 | 0% | **355.414** | 251.473 | 346.164 |
-| 360 | 10% | 25.000 | 71.960 | **225.025** |
+Each product used the same 500 Mbps link, two parallel downloads, and a
+20-second load window.
 
-On a clean 40 ms route, MPTUNNEL is 4.8% below the fastest single-transport
-baseline. At 360 ms RTT and 10% loss, it delivers 3.13× Hysteria2 and 9.00×
-Xray/VMess goodput. The default can combine independent TCP and QUIC delivery
-inside each logical flow.
+| RTT | Jitter | Loss | Xray/VMess | Hysteria2 | MPTUNNEL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 ms | 10 ms | 0.5% | 441 Mbps | 464 Mbps | 414 Mbps |
+| 280 ms | 20 ms | 10% | 71 Mbps | 96 Mbps | 195 Mbps |
 
-### Aggregation
+MPTUNNEL was 10.6% below the fastest baseline on the ordinary link. On the
+adverse link it delivered 2.02× Hysteria2 and 2.75× Xray/VMess goodput.
 
-Each shaped link is 500 Mbps with 180 ms one-way delay, 20 ms jitter, and no
-loss.
+### Add links
 
-| System | Links | Download (Mbps) | Upload (Mbps) |
+Every physical link repeats the 500 Mbps, 40 ms RTT, 10 ms jitter, and 0.5%
+loss profile above.
+
+| System | Links | Download | Upload |
 | --- | ---: | ---: | ---: |
-| **MPTUNNEL (default)** | 1 | 370.207 | 398.793 |
-| **MPTUNNEL (default)** | 5 | **662.573** | **794.876** |
+| MPTUNNEL | 1 | 414 Mbps | 436 Mbps |
+| MPTUNNEL | 2 | 772 Mbps | 602 Mbps |
+| Linux MPTCP | 5 | 885 Mbps | — |
+| MPTUNNEL | 5 | 1,366 Mbps | 1,496 Mbps |
 
-Five links raise MPTUNNEL goodput by 1.79× download and 1.99× upload.
+Two links provide 1.86× download and 1.38× upload goodput; five provide 3.30×
+and 3.43×. Xray/VMess and Hysteria2 remain the one-link product controls above;
+they do not aggregate one application flow across independent links. Linux
+MPTCP is a kernel transport control, not an encrypted proxy.
 
-### Path choice
+### Use each link for what it does best
 
-Link A provides 200 Mbps download and 20 Mbps upload. Link B provides the
-reverse. MPTUNNEL ranks each direction independently.
+Link A is 200 Mbps down / 20 Mbps up; Link B is 20 Mbps down / 200 Mbps up.
+The single-path products remain on Link A in both directions. MPTUNNEL receives
+both links in one configuration; this compares fixed-link and same-flow
+multipath capability, not equal path provisioning.
 
-| Direction | Link A (Mbps) | Link B (Mbps) | Faster-path share | Goodput (Mbps) |
+| System | Links | Download | Upload |
+| --- | --- | ---: | ---: |
+| Xray/VMess | A | 182 Mbps | ≥18 Mbps |
+| Hysteria2/Brutal | A | 189 Mbps | ≥19 Mbps |
+| MPTUNNEL (TCP) | A + B | 153 Mbps | 152 Mbps |
+
+MPTUNNEL carried 91.2% of download traffic on Link A and 89.6% of upload
+traffic on Link B without changing endpoints between directions.
+
+The next control combines an 80 Mbps ordinary link with the 500 Mbps adverse
+link from the first table. MPTUNNEL uses default TCP+QUIC paths while bulk,
+short HTTP, persistent TCP, and datagrams run together for 30 seconds.
+
+| Links | Bulk | TCP latency | TCP checks | HTTP latency | HTTP checks | UDP checks |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ordinary | 61 Mbps | 103/217 ms | 60/60 | 444/1,026 ms | 45/45 | 102/102 |
+| Adverse | 99 Mbps | 452/1,868 ms | 35/35 | 1,835/2,686 ms | 9/11 | 14/18 |
+| Both | 160 Mbps | 173/318 ms | 60/60 | 376/838 ms | 53/53 | 205/205 |
+
+The two-link run measured 160 Mbps versus 61 and 99 Mbps separately, while
+every TCP, HTTP, and UDP check completed. Latency cells are p50/p95;
+check cells are completed/attempted.
+
+### Stay online
+
+Each row is one controlled disruption run. Counts are completed/attempted
+application checks; pause is the longest receiver-side download gap.
+
+| Event | TCP checks | HTTP checks | UDP checks | DL pause |
 | --- | ---: | ---: | ---: | ---: |
-| Download | 200 | 20 | 90.1% | 147.748 |
-| Upload | 20 | 200 | 89.4% | 149.680 |
+| 2 s path blackhole | 60/60 | 81/81 | 199/200 | 576 ms |
+| Latency/loss change | 60/60 | 94/94 | 257/259 | 3,310 ms |
+| Repeated changes | 48/48 | 90/92 | 280/282 | 1,501 ms |
 
-Under simultaneous bulk and interactive load, the low-latency path was
-80 Mbps at approximately 40 ms RTT and the high-throughput path was 500 Mbps
-at approximately 360 ms RTT. Both had zero loss.
+Additional controls observed recovery after a five-second total carrier outage
+(1/1 existing flow) and after peer process restarts (2/2 existing flows). New
+inbound connections are rejected while every outbound path is unavailable;
+existing flows remain attached for recovery.
 
-| Low-latency transport | High-throughput transport | Bulk (Mbps) | Interactive p50 (ms) | Interactive checks |
-| --- | --- | ---: | ---: | ---: |
-| TCP | QUIC | 289.061 | 117.161 | 60/60 |
-| QUIC | TCP | 288.886 | 48.296 | 57/57 |
-
-Bulk exceeded the low-latency path's ceiling by 3.61× while interactive median
-latency stayed below the high-throughput path's RTT in both orientations. The
-same outcome with transport roles reversed rules out a fixed TCP/QUIC
-preference.
-
-### Failover and recovery
-
-| Event | Existing-flow checks | Outcome |
-| --- | ---: | ---: |
-| Active path blackholed | TCP 60/60; HTTP 81/81 | Continued; 576 ms max gap |
-
-Existing flows stay attached to their MPP sequence space while a surviving or
-replacement carrier resumes delivery. New inbound connections are rejected
-while every outbound path is unavailable. Total-outage and peer-restart
-recovery results remain in the detailed evidence guide.
-
-Movement around five percent can be ordinary run-to-run variance, not a pass
-threshold. See [Performance evidence](docs/PERFORMANCE.md) for the detailed
-topologies, upload accounting, load tests, resource limits, and reproducible
-methodology.
+See [Performance evidence](docs/PERFORMANCE.md) for exact setup, upload
+accounting, stress tests, recovery evidence, and limitations.
 
 ## Quick start
 

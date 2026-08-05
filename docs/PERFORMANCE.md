@@ -8,49 +8,55 @@ workload, host capacity, and the native TCP or QUIC implementation.
 
 Measurements used isolated GNU/Linux containers on one host. Rates are bytes
 delivered to the receiver divided by full completion time; configured bandwidth
-is never reported as throughput. Matched proxy comparisons used the same
-objects, two flows, and a 20-second load window. Each cell reports one valid
+is never reported as throughput. The matched one-link and aggregation rows used
+the same objects, two flows, and a 20-second load window. The asymmetric and
+mixed-workload rows used 30-second windows. Each cell reports one valid
 directional run, not a best-of selection. Repetitions were used only to classify
-outliers. The one-path and local TCP `1-1` MPTUNNEL rows use the default
-shared-transport-key profile.
+outliers. Xray-core 26.3.27 used VMess/TCP. Hysteria2 2.10.0 used Brutal with
+client bandwidth equal to the shaped directional capacity. MPTUNNEL used the
+default shared-transport-key profile unless a transport is named explicitly.
 
 ## Matched proxy conditions
 
-Each path was shaped to 500 Mbps with zero jitter. Every cell used two parallel
-downloads for 20 seconds. Delay was applied once in each direction, so 20 ms
-and 180 ms one-way shaping correspond to approximately 40 ms and 360 ms RTT.
+Every path was shaped to 500 Mbps. Delay and jitter were applied once in each
+direction; the table reports the approximate RTT and the configured
+per-direction jitter. Every cell used two parallel downloads for 20 seconds.
 MPTUNNEL used its default TCP+QUIC configuration.
 
-| RTT (ms) | Loss | Xray 26.3.27 VMess/TCP | Hysteria2 2.10.0 | MPTUNNEL TCP+QUIC |
-| ---: | ---: | ---: | ---: | ---: |
-| 40 | 0% | 461.341 | 461.425 | 439.091 |
-| 40 | 10% | 406.613 | 421.454 | 405.129 |
-| 360 | 0% | 355.414 | 251.473 | 346.164 |
-| 360 | 10% | 25.000 | 71.960 | 225.025 |
+| RTT (ms) | Jitter (ms) | Loss | Xray 26.3.27 VMess/TCP | Hysteria2 2.10.0 Brutal | MPTUNNEL TCP+QUIC |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 | 10 | 0.5% | 441.353 | 463.502 | 414.200 |
+| 280 | 20 | 10% | 70.833 | 96.288 | 194.504 |
 
-MPTUNNEL is 4.8% below the fastest baseline on the clean 40 ms path. Under
-360 ms RTT and 10% loss it delivers 3.13× Hysteria2 and 9.00× Xray/VMess.
-A health-probe deadline applies only to that probe; complete carrier setup uses
-the adaptive path-open budget derived from observed path timing.
-
-The 40 ms/0% and 360 ms/10% rows use clean source `9c2265b`; the other two use
-clean source `32f7568`. The only Core change between them assigns full carrier
-setup to the adaptive path-open deadline instead of the health-probe deadline;
-established-path congestion control and scheduling are unchanged.
+MPTUNNEL is 10.6% below the fastest baseline on the ordinary path. Under
+280 ms RTT, 20 ms jitter, and 10% loss it delivers 2.02× Hysteria2 and 2.75×
+Xray/VMess. Every row has valid host, source, and receiver accounting.
 
 ## Link aggregation
 
-180 ms one-way delay, 20 ms jitter, 0% loss per path.
+Every physical link used the 500 Mbps, 40 ms RTT, 10 ms jitter, and 0.5% loss
+profile above.
 
 | System | Transport | Shaped links | Download (Mbps) | Upload (Mbps) |
 | --- | --- | ---: | ---: | ---: |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 1 | 370.207 | 398.793 |
-| MPTUNNEL | MPP/TCP | 5 | 841.572 | 562.796 |
-| MPTUNNEL | MPP/QUIC | 5 | 623.590 | 730.726 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 662.573 | 794.876 |
+| Xray | VMess/TCP | 1 | 441.353 | ≥337.788 |
+| Hysteria2 | Brutal | 1 | 463.502 | ≥459.287 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 1 | 414.200 | 436.133 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 2 | 771.888 | 602.173 |
+| Linux MPTCP | TCP | 5 | 884.667 | 2.572 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 5 | 1,365.876 | 1,496.079 |
 
-Five links raised default MPTUNNEL goodput by 1.79× download and 1.99× upload.
-Every MPTUNNEL row completed with exact receiver accounting.
+Default MPTUNNEL scales 1.86×/1.38× from one to two links and 3.30×/3.43×
+from one to five links for download/upload. Every MPTUNNEL result completed
+with exact receiver accounting. The Xray and Hysteria2 upload sessions did not
+close inside the completion window, so their receiver-delivered values are
+lower bounds and are excluded from ratios.
+
+The Linux kernel MPTCP control had additional subflows confirmed by runtime
+`ss -M` evidence. Its upload result completed with exact receiver accounting
+but collapsed under the independently jittered and lossy paths; it is reported
+rather than replaced and is not used for a product ratio. MPTCP is not an
+encrypted proxy.
 
 ## Per-flow TCP limits
 
@@ -96,36 +102,42 @@ source addresses nor fixed bandwidth thresholds participate in that decision.
 
 ## Asymmetric links
 
-The two links were 200/20 and 20/200 Mbps, so the faster member reversed with
-traffic direction.
+Link A was 200 Mbps download / 20 Mbps upload. Link B was 20 Mbps download /
+200 Mbps upload. A single Xray or Hysteria2 connection remained on Link A in
+both directions; it was not moved to the directionally faster endpoint between
+measurements. MPTUNNEL received both links in one configuration.
 
-| Direction | Single fast link (Mbps) | Multipath (Mbps) | Fast-link share |
-| --- | ---: | ---: | ---: |
-| Download | 141.161 | 147.748 | 90.1% |
-| Upload | 141.258 | 149.680 | 89.4% |
+| System | Configured links | Download (Mbps) | Upload (Mbps) |
+| --- | --- | ---: | ---: |
+| Xray 26.3.27 VMess/TCP | A | 181.696 | ≥17.708 |
+| Hysteria2 2.10.0 Brutal | A | 188.812 | ≥18.808 |
+| MPTUNNEL MPP/TCP | A + B | 153.009 | 151.513 |
 
-The interface accounting shows that upload and download independently selected
-their faster member without using a source-address heuristic.
+MPTUNNEL sent 91.2% of download traffic over Link A and 89.6% of upload
+traffic over Link B. Independent single-fast-link MPTUNNEL controls delivered
+141.280 Mbps download on Link A and 148.792 Mbps upload on Link B; adding both
+links did not reduce either direction. Interface accounting, not source
+address or configured bandwidth, supplies the path-share evidence.
 
 ## Latency and throughput together
 
-The low-latency path was shaped to 80 Mbps, 20 ms one-way delay, and 2 ms
-jitter. The high-throughput path was 500 Mbps, 180 ms one-way delay, and 20 ms
-jitter. Both used zero loss. Each orientation ran bulk HTTP, short HTTP,
-persistent TCP echo, and UDP traffic together for 30 seconds.
+The ordinary path was shaped to 80 Mbps, 40 ms RTT, 10 ms jitter, and 0.5%
+loss. The adverse high-capacity path was shaped to 500 Mbps, 280 ms RTT, 20 ms
+jitter, and 10% loss. Each control used default TCP+QUIC paths while bulk HTTP,
+short HTTP, persistent TCP echo, and UDP ran together for 30 seconds.
 
-| Low-latency transport | High-throughput transport | Bulk (Mbps) | Interactive p50/p95 (ms) | Short HTTP p50/p95 (ms) | Echo / HTTP / UDP |
-| --- | --- | ---: | ---: | ---: | ---: |
-| TCP | QUIC | 289.061 | 117 / 361 | 218 / 654 | 60/60 / 67/67 / 176/176 |
-| QUIC | TCP | 288.886 | 48 / 439 | 105 / 112 | 57/57 / 130/130 / 399/399 |
+| Available links | Bulk (Mbps) | TCP p50/p95 (ms) | TCP | HTTP p50/p95 (ms) | HTTP | UDP |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ordinary only | 60.886 | 103 / 217 | 60/60 | 444 / 1,026 | 45/45 | 102/102 |
+| Adverse only | 98.512 | 452 / 1,868 | 35/35 | 1,835 / 2,686 | 9/11 | 14/18 |
+| Both | 160.002 | 173 / 318 | 60/60 | 376 / 838 | 53/53 | 205/205 |
 
-Bulk exceeded the low-latency path's 80 Mbps ceiling by 3.61× in both
-orientations, so the high-throughput path was contributing under load. Median
-interactive latency stayed below the high-throughput path's approximately
-360 ms RTT. Reversing TCP and QUIC roles preserved both outcomes, ruling out a
-fixed transport-family preference. Tail latency includes concurrent bulk
-service and ordered-delivery effects, so it does not claim that every
-interactive sample remained on one carrier.
+The two single-link bulk controls sum to 159.398 Mbps; the two-link control
+delivered 160.002 Mbps. With both links available, every TCP, HTTP, and UDP
+check completed, interactive latency stayed far below the adverse-only
+control, and bulk retained the combined capacity. This is a direct control for
+latency-aware service and throughput aggregation, not an inference from path
+counters alone.
 
 ## Disruption recovery
 
@@ -146,9 +158,9 @@ interactive sample remained on one carrier.
 
 The latency-change row includes a 900 ms one-way, 10% loss epoch.
 Persistent TCP echo streams stayed attached in every mixed disruption run.
-The current blackhole row is clean-source evidence from `ea842dd`; every
-reliable check completed, while one unreliable datagram traversing the
-blackholed path was not delivered.
+The current blackhole row has clean source and host provenance; every reliable
+check completed, while one unreliable datagram traversing the blackholed path
+was not delivered.
 The repeated-change HTTP misses began within deliberate blackholes and reached
 their application deadlines before service returned. Datagram counts expose
 expected loss during those same unavailable intervals.

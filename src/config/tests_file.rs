@@ -1,8 +1,8 @@
 use super::*;
 use crate::config::CommandConfig;
 use crate::product::{
-    DomainName, EgressAction, FlowContext, InboundId, Network, PrincipalId, ProtocolTarget,
-    RouteInput, RouteMismatch, SourceEndpoint, TrafficIntent,
+    DomainName, EgressAction, FlowContext, InboundId, InitialDemand, Network, PrincipalId,
+    ProtocolTarget, RouteInput, RouteMismatch, SourceEndpoint,
 };
 
 const TEST_CERTIFICATE_FILE: &str = "mptunnel-test-certificate.pem";
@@ -1201,7 +1201,8 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
             .replace("server.example.com", "mptunnel.test")
             .replace("REPLACE_WITH_SERVER_CERT.pem", TEST_CERTIFICATE_FILE)
             .replace("server-cert.pem", TEST_CERTIFICATE_FILE)
-            .replace("server-key.pem", TEST_PRIVATE_KEY_FILE);
+            .replace("server-key.pem", TEST_PRIVATE_KEY_FILE)
+            .replace("mpp-transport.key", TEST_TRANSPORT_SECRET_FILE);
         load_config_toml_str(&contents).expect("shipped configuration")
     };
 
@@ -1212,18 +1213,29 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     assert!(reference.servers.is_empty());
     assert_eq!(reference.local_ingresses.len(), 2);
     assert_eq!(mpp_outbounds(&reference)[0].paths.len(), 2);
+    assert!(
+        mpp_outbounds(&reference)[0].paths[0]
+            .tls
+            .shared_transport_secret_configured()
+    );
 
     let client = load(include_str!("../../examples/client.toml"));
     let CommandConfig::Node(client) = client.command;
     assert!(client.servers.is_empty());
     assert_eq!(client.local_ingresses.len(), 1);
     assert_eq!(mpp_outbounds(&client)[0].paths.len(), 2);
+    assert!(
+        mpp_outbounds(&client)[0].paths[0]
+            .tls
+            .shared_transport_secret_configured()
+    );
 
     let server = load(include_str!("../../examples/server.toml"));
     let CommandConfig::Node(server) = server.command;
     assert!(server.local_ingresses.is_empty());
     assert_eq!(server.servers.len(), 1);
     assert_eq!(server.servers[0].paths.len(), 2);
+    assert!(server.servers[0].tls.shared_transport_secret_configured());
     assert!(mpp_outbounds(&server).is_empty());
 }
 
@@ -1929,14 +1941,14 @@ principal_ids = ["alice"]
 stages = ["pre-resolution"]
 action = "outbound"
 outbound = "edge-a"
-traffic_intent = "throughput"
+initial_demand = "throughput"
 explanation = "API traffic uses edge A"
 
 [[routing.rules]]
 name = "default"
 action = "balancer"
 balancer = "all-edges"
-traffic_intent = "interactive"
+initial_demand = "automatic"
 "#,
     )
     .expect("compiled routing config");
@@ -1958,8 +1970,8 @@ traffic_intent = "interactive"
     let decision = policy.routes().classify(RouteInput::pre_resolution(&flow));
     assert_eq!(decision.rule_id().as_str(), "interactive-api");
     assert_eq!(
-        decision.action().traffic_intent(),
-        TrafficIntent::Throughput
+        decision.action().initial_demand(),
+        InitialDemand::Throughput
     );
     assert!(matches!(
         decision.action().egress(),
@@ -2261,7 +2273,7 @@ tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 [[routing.rules]]
 name = "default-deny"
 action = "reject"
-traffic_intent = "background"
+initial_demand = "automatic"
 "#,
     )
     .expect("reject policy");
@@ -2280,10 +2292,7 @@ traffic_intent = "background"
     );
     let decision = policy.routes().classify(RouteInput::pre_resolution(&flow));
     assert_eq!(decision.action().egress(), &EgressAction::Reject);
-    assert_eq!(
-        decision.action().traffic_intent(),
-        TrafficIntent::Background
-    );
+    assert_eq!(decision.action().initial_demand(), InitialDemand::Automatic);
 
     let unsupported_reset = load_config_toml_str(
         r#"

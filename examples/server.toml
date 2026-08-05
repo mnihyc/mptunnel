@@ -3,8 +3,8 @@
 #
 # Linux/macOS: umask 077; openssl rand -hex 32 > mpp-credential.key
 # PowerShell:   (New-Guid).Guid | Set-Content -NoNewline mpp-credential.key
-# Optional transport protection uses a different raw 32-byte file shared by
-# the two endpoints: umask 077; openssl rand -out mpp-transport.key 32
+# Transport protection uses a different raw 32-byte file shared by the two
+# endpoints: umask 077; openssl rand -out mpp-transport.key 32
 
 [logging]
 level = "info"
@@ -52,7 +52,7 @@ credential_ids = ["home-client"]
 tls_certificate_chain_file = "server-cert.pem"
 tls_private_key_file = "server-key.pem"
 # This endpoint-wide secret is not an MPP client credential.
-# transport_secret_file = "mpp-transport.key"
+transport_secret_file = "mpp-transport.key"
 
 [[outbounds]]
 name = "direct-egress"

@@ -29,6 +29,7 @@ from performance_ledger import (
 )
 from result_enrichment import (
     MPTUNNEL_CARRIER_PRESENTATION,
+    MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE,
     MPTUNNEL_PROTOCOL_VERSION,
     RESULT_SCHEMA_VERSION,
     RUN_MANIFEST_SCHEMA_VERSION,
@@ -230,6 +231,12 @@ class PerformanceLedgerTests(unittest.TestCase):
         }
 
         self.assertEqual(subject_identity_from_result(row), subject("1"))
+
+        standard = subject("1")
+        standard["mptunnel_carrier_presentation"] = (
+            MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE["standard"]
+        )
+        self.assertEqual(subject_identity_from_result(standard), standard)
 
         row["source_tree_dirty"] = True
         self.assertTrue(subject_identity_from_result(row)["source_tree_dirty"])

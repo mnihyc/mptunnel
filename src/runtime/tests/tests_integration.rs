@@ -59,7 +59,7 @@ fn local_port_forward_runtime() -> (
             crate::product::RouteAction::new(
                 crate::product::EgressAction::Outbound(outbound.clone()),
                 None,
-                crate::product::TrafficIntent::Interactive,
+                crate::product::InitialDemand::Automatic,
             ),
         )],
         destination_acl: vec![crate::product::AclRuleSpec::new(

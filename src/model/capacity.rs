@@ -254,7 +254,7 @@ pub(crate) fn adaptive_reliable_relay_chunk_bytes(
             min_reliable_service_quantum_bytes(mux_limits).min(quantum)
         }
         TrafficClass::Latency => PATH_OPEN_SCORE_BYTES.min(quantum).max(floor),
-        TrafficClass::Throughput | TrafficClass::Background => quantum,
+        TrafficClass::Throughput => quantum,
     };
     let target = if lane.is_bulk() {
         // TCP and QUIC already own packet pacing and congestion below the
@@ -491,7 +491,7 @@ pub(crate) fn adaptive_reliable_relay_reinjection_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     let reinjection_lane = match lane {
-        TrafficClass::Throughput | TrafficClass::Background => TrafficClass::Latency,
+        TrafficClass::Throughput => TrafficClass::Latency,
         other => other,
     };
     adaptive_reliable_relay_chunk_bytes(path, reinjection_lane, mux_limits).max(1)
@@ -551,10 +551,10 @@ fn relay_lane_min_chunk_bytes(
     match lane {
         TrafficClass::Control | TrafficClass::RealtimeDatagram => min_quantum,
         TrafficClass::Latency => PATH_OPEN_SCORE_BYTES.min(cap).max(min_quantum),
-        TrafficClass::Throughput | TrafficClass::Background if path.is_none() => {
+        TrafficClass::Throughput if path.is_none() => {
             PATH_OPEN_SCORE_BYTES.min(cap).max(min_quantum)
         }
-        TrafficClass::Throughput | TrafficClass::Background => min_quantum,
+        TrafficClass::Throughput => min_quantum,
     }
 }
 
@@ -566,9 +566,7 @@ pub(crate) fn relay_lane_startup_chunk_bytes(lane: TrafficClass, mux_limits: Mux
             min_reliable_service_quantum_bytes(mux_limits)
         }
         TrafficClass::Latency => PATH_OPEN_SCORE_BYTES,
-        TrafficClass::Throughput | TrafficClass::Background => {
-            reliable_startup_send_quantum_bytes()
-        }
+        TrafficClass::Throughput => reliable_startup_send_quantum_bytes(),
     };
     target.clamp(floor.min(cap).max(1), cap)
 }
@@ -591,12 +589,10 @@ fn reliable_lane_min_inflight_bytes(lane: TrafficClass, mux_limits: MuxLimits) -
     match lane {
         TrafficClass::Control | TrafficClass::RealtimeDatagram => min_pipe,
         TrafficClass::Latency => initial_window,
-        TrafficClass::Throughput | TrafficClass::Background => {
-            reliable_relay_buffer_len(mux_limits)
-                .max(initial_window)
-                .min(cap)
-                .max(1)
-        }
+        TrafficClass::Throughput => reliable_relay_buffer_len(mux_limits)
+            .max(initial_window)
+            .min(cap)
+            .max(1),
     }
 }
 
@@ -636,7 +632,7 @@ fn data_level_service_window_bytes_for_model(
         TrafficClass::Control | TrafficClass::RealtimeDatagram | TrafficClass::Latency => {
             data_level_window.min(send_quantum.max(min_pipe))
         }
-        TrafficClass::Throughput | TrafficClass::Background => data_level_window,
+        TrafficClass::Throughput => data_level_window,
     }
 }
 

@@ -5,8 +5,8 @@ use crate::performance::MppPerformanceConfig;
 use crate::platform::{LinuxPolicyConfig, RouteMode};
 use crate::product::{
     CompiledDnsPolicy, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId,
-    DnsUpstreamSpec, EgressAction, FakeDnsSpec, Network, OutboundId, PortRange, RouteAction,
-    RouteMatchSpec, RouteRuleSpec, RuleId, TrafficIntent,
+    DnsUpstreamSpec, EgressAction, FakeDnsSpec, InitialDemand, Network, OutboundId, PortRange,
+    RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
 };
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
@@ -38,7 +38,7 @@ fn test_router_with_dns(dns: crate::dns::DnsGeneration) -> ClientIngressRouter {
             RouteAction::new(
                 EgressAction::Outbound(id.clone()),
                 None,
-                TrafficIntent::Interactive,
+                InitialDemand::Automatic,
             ),
         )],
         destination_acl: Vec::new(),
@@ -222,13 +222,13 @@ fn tun_udp_flow_routes_once_with_local_identity_and_effective_target() {
                 RouteAction::new(
                     EgressAction::Outbound(OutboundId::parse("dns-edge").expect("outbound")),
                     None,
-                    TrafficIntent::Realtime,
+                    InitialDemand::Automatic,
                 ),
             ),
             RouteRuleSpec::new(
                 RuleId::parse("default").expect("rule"),
                 RouteMatchSpec::default(),
-                RouteAction::new(EgressAction::Reject, None, TrafficIntent::Interactive),
+                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
             ),
         ],
         destination_acl: Vec::new(),

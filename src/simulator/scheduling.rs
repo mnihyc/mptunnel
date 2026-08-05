@@ -278,13 +278,12 @@ struct PathQueue {
     bytes: u64,
 }
 
-fn priority_order() -> [TrafficClass; 5] {
+fn priority_order() -> [TrafficClass; 4] {
     [
         TrafficClass::Control,
         TrafficClass::RealtimeDatagram,
         TrafficClass::Latency,
         TrafficClass::Throughput,
-        TrafficClass::Background,
     ]
 }
 

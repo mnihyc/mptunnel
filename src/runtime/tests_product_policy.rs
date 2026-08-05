@@ -4,8 +4,8 @@ use crate::ingress::ProxyAuthConfig;
 use crate::outbound::{OutboundConfig, ProxyConfig};
 use crate::performance::MppPerformanceConfig;
 use crate::product::{
-    BalancerId, DomainName, GatewayBalancerSpec, GatewayMemberSpec, GatewayStrategy, NetworkSet,
-    OutboundId, RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage, RuleId,
+    BalancerId, DomainName, GatewayBalancerSpec, GatewayMemberSpec, GatewayStrategy, InitialDemand,
+    NetworkSet, OutboundId, RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage, RuleId,
 };
 use crate::runtime::ingress_runtime::{
     handle_http_connect_client_stream_with_auth, handle_socks5_client_stream_with_auth,
@@ -69,7 +69,7 @@ fn rule(id: &str, matcher: RouteMatchSpec, egress: EgressAction) -> RouteRuleSpe
     RouteRuleSpec::new(
         RuleId::parse(id).expect("rule ID"),
         matcher,
-        RouteAction::new(egress, None, TrafficIntent::Interactive),
+        RouteAction::new(egress, None, InitialDemand::Automatic),
     )
 }
 
@@ -285,7 +285,7 @@ async fn post_dns_routing_authorizes_the_complete_answer_and_opens_only_a_litera
             RouteAction::new(
                 EgressAction::Outbound(routed_id.clone()),
                 None,
-                TrafficIntent::Throughput,
+                InitialDemand::Throughput,
             ),
         ),
         rule("default", RouteMatchSpec::default(), EgressAction::Reject),

@@ -28,14 +28,13 @@ destination_cidrs = ["192.0.2.0/24"]
 stages = ["post-resolution"]
 action = "outbound"
 outbound = "direct"
-traffic_intent = "throughput"
+initial_demand = "throughput"
 explanation = "resolved documentation network"
 
 [[routing.rules]]
 name = "default"
 action = "outbound"
 outbound = "direct"
-traffic_intent = "interactive"
 explanation = "ordinary default"
 "#;
 
@@ -325,7 +324,7 @@ fn route_explain_uses_the_canonical_pre_and_post_resolution_policy() {
     let post = String::from_utf8(post).expect("post explanation");
     assert!(post.contains("stage: post-resolution"));
     assert!(post.contains("rule: resolved-private"));
-    assert!(post.contains("traffic_intent: throughput"));
+    assert!(post.contains("initial_demand: throughput"));
     assert!(post.contains("action: outbound\n  outbound: direct"));
     assert!(post.contains("resolution:\n  rule: default\n  dns_plan: default (policy default)"));
 }

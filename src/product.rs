@@ -57,9 +57,9 @@ pub use identity::{
     SecurityPolicyError, SharedSecret,
 };
 pub use routing::{
-    BalancerId, CompiledRouteTable, DnsPlanId, EgressAction, OutboundId, PortRange, RouteAction,
-    RouteCompileError, RouteDecision, RouteExplanation, RouteInput, RouteMatchSpec, RouteMismatch,
-    RouteRuleSpec, RouteRuleTrace, RouteStage, RuleId, TrafficIntent,
+    BalancerId, CompiledRouteTable, DnsPlanId, EgressAction, InitialDemand, OutboundId, PortRange,
+    RouteAction, RouteCompileError, RouteDecision, RouteExplanation, RouteInput, RouteMatchSpec,
+    RouteMismatch, RouteRuleSpec, RouteRuleTrace, RouteStage, RuleId,
 };
 pub use rule_set::{
     CompiledRuleSetRegistry, MAX_ENTRIES_ACROSS_RULE_SET_REGISTRY, MAX_ENTRIES_PER_RULE_SET,

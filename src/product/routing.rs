@@ -197,11 +197,9 @@ impl RouteMatchSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TrafficIntent {
-    Interactive,
+pub enum InitialDemand {
+    Automatic,
     Throughput,
-    Realtime,
-    Background,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,24 +215,24 @@ pub enum EgressAction {
 pub struct RouteAction {
     egress: EgressAction,
     dns_plan: Option<DnsPlanId>,
-    traffic_intent: TrafficIntent,
+    initial_demand: InitialDemand,
 }
 
 impl RouteAction {
     pub const fn new(
         egress: EgressAction,
         dns_plan: Option<DnsPlanId>,
-        traffic_intent: TrafficIntent,
+        initial_demand: InitialDemand,
     ) -> Self {
         Self {
             egress,
             dns_plan,
-            traffic_intent,
+            initial_demand,
         }
     }
 
-    pub const fn direct(traffic_intent: TrafficIntent) -> Self {
-        Self::new(EgressAction::Direct, None, traffic_intent)
+    pub const fn direct(initial_demand: InitialDemand) -> Self {
+        Self::new(EgressAction::Direct, None, initial_demand)
     }
 
     pub const fn egress(&self) -> &EgressAction {
@@ -245,8 +243,8 @@ impl RouteAction {
         self.dns_plan.as_ref()
     }
 
-    pub const fn traffic_intent(&self) -> TrafficIntent {
-        self.traffic_intent
+    pub const fn initial_demand(&self) -> InitialDemand {
+        self.initial_demand
     }
 }
 

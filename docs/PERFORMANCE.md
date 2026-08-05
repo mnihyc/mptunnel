@@ -10,8 +10,9 @@ Measurements used isolated GNU/Linux containers on one host. Rates are bytes
 delivered to the receiver divided by full completion time; configured bandwidth
 is never reported as throughput. Matched proxy comparisons used the same
 objects, two flows, and a 20-second load window. Each cell reports one valid
-comparable directional run, not a best-of selection. Repetitions were used only
-to classify outliers.
+directional run, not a best-of selection. Repetitions were used only to classify
+outliers. The one-path and local TCP `1-1` MPTUNNEL rows use the default
+shared-transport-key profile.
 
 ## One 500 Mbps path
 
@@ -22,12 +23,12 @@ to classify outliers.
 | Direct | TCP | 207.720 | 201.212 |
 | Xray 26.3.27 | VMess/TCP | 218.716 | ≥151.299 |
 | Hysteria2 2.10.0 | QUIC | 87.525 | ≥105.615 |
-| MPTUNNEL | MPP/TCP | 257.226 | 262.397 |
-| MPTUNNEL | MPP/QUIC | 220.280 | 173.353 |
-| MPTUNNEL | MPP/TCP+QUIC (default) | 370.207 | 398.793 |
+| MPTUNNEL | MPP/TCP | 230.396 | 220.212 |
+| MPTUNNEL | MPP/QUIC | 238.954 | 237.677 |
+| MPTUNNEL | MPP/TCP+QUIC (default) | 347.100 | 375.497 |
 
-The default delivered 1.78× direct TCP download and 1.98× upload goodput.
-MPP/QUIC delivered 2.52× Hysteria2's download. The Xray and Hysteria2
+The default delivered 1.67× direct TCP download and 1.87× upload goodput.
+MPP/QUIC delivered 2.73× Hysteria2's download. The Xray and Hysteria2
 uploads are receiver-confirmed lower bounds and are excluded from ratios.
 
 Multiple TCP carriers on one route can overcome a per-flow limiter, but they
@@ -159,7 +160,7 @@ container and host path, not a public Internet link.
 | Direct | TCP | 1 | 21.393 | 22.113 |
 | Xray 26.3.27 | VMess/TCP | 1 | 8.044 | ≥6.952 |
 | Hysteria2 2.10.0 | QUIC | 1 | 2.714 | ≥2.816 |
-| MPTUNNEL | MPP/TCP (`1-1`) | 1 | 6.362 | 6.581 |
+| MPTUNNEL | MPP/TCP (`1-1`) | 1 | 7.185 | 6.443 |
 | MPTUNNEL | MPP/TCP (default) | 3 | 5.584 | 6.328 |
 | MPTUNNEL | MPP/QUIC | 1 | 2.867 | 2.796 |
 | MPTUNNEL | MPP/TCP+QUIC (default) | 4 | 4.921 | 5.190 |

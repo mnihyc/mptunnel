@@ -31,8 +31,8 @@ use crate::platform::RouteMode;
 use crate::product::{
     CredentialCatalog, CredentialId, CredentialRecord, DnsIpStrategy, DnsPlanId, DnsPlanLimits,
     DnsPlanSpec, DnsPolicySpec, DnsSecurityPolicy, DnsUpstreamEndpoint, DnsUpstreamId,
-    DnsUpstreamSpec, DomainName, EgressAction, InboundId, OutboundId, PrincipalId, ProtocolTarget,
-    RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId, TrafficIntent,
+    DnsUpstreamSpec, DomainName, EgressAction, InboundId, InitialDemand, OutboundId, PrincipalId,
+    ProtocolTarget, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{Endpoint, PathSpec};
@@ -1234,7 +1234,7 @@ impl ClientArgs {
                 RouteAction::new(
                     EgressAction::Outbound(id.clone()),
                     None,
-                    TrafficIntent::Interactive,
+                    InitialDemand::Automatic,
                 ),
             )],
             destination_acl: Vec::new(),

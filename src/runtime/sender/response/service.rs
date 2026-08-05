@@ -55,9 +55,6 @@ fn response_data_dispatch_lane(
         (Some(TrafficClass::Throughput), _) | (_, TrafficClass::Throughput) => {
             TrafficClass::Throughput
         }
-        (Some(TrafficClass::Background), _) | (_, TrafficClass::Background) => {
-            TrafficClass::Background
-        }
         (Some(queued_lane), _) => queued_lane,
         (None, current_lane) => current_lane,
     }

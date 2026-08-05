@@ -825,7 +825,7 @@ pub struct ClientPathConfig {
     pub spec: PathSpec,
     /// Security scoped to this path's MPP peer relationship.
     pub security: ClientSecurityConfig,
-    /// Independently pinned QUIC identity and legacy TCP TLS identity.
+    /// Independently pinned QUIC identity and TLS-fallback TCP identity.
     /// Optional shared transport protection never derives from an MPP client
     /// credential.
     pub tls: TcpClientTlsConfig,
@@ -851,7 +851,7 @@ pub struct MppInboundConfig {
     pub paths: Vec<NamedPathConfig>,
     /// Security scoped to peers that join this MPP inbound.
     pub security: ServerSecurityConfig,
-    /// QUIC identity and legacy TCP TLS identity shared by this MPP inbound.
+    /// QUIC identity and TLS-fallback TCP identity shared by this MPP inbound.
     pub tls: TcpServerTlsConfig,
     /// Immutable Product destination authorization for accepted TCP/UDP flows.
     pub destination_acl: ServerDestinationAclConfig,

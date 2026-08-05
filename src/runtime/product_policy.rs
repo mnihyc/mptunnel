@@ -4,8 +4,8 @@ use crate::outbound::{
     DestinationAuthorization, DestinationAuthorizationError, DestinationAuthorizer,
 };
 use crate::product::{
-    DestinationAcl, DnsPlanId, EgressAction, FlowContext, InboundId, Network, PrincipalId,
-    ProductPolicyGeneration, ProtocolTarget, RouteInput, SourceEndpoint, TrafficIntent,
+    DestinationAcl, DnsPlanId, EgressAction, FlowContext, InboundId, InitialDemand, Network,
+    PrincipalId, ProductPolicyGeneration, ProtocolTarget, RouteInput, SourceEndpoint,
 };
 use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
@@ -218,7 +218,7 @@ impl ClientOutboundPlan {
                     &self.authorizer.flow,
                     authorized_target.address(),
                 ));
-            let traffic_class = traffic_class(decision.action().traffic_intent(), network);
+            let traffic_class = traffic_class(decision.action().initial_demand(), network);
             let selection = match decision.action().egress() {
                 EgressAction::Outbound(_) | EgressAction::Balancer(_) => self
                     .registry
@@ -315,7 +315,7 @@ impl ClientIngressRouter {
             RouteAction::new(
                 EgressAction::Outbound(id.clone()),
                 None,
-                TrafficIntent::Interactive,
+                InitialDemand::Automatic,
             ),
         )];
         let acl = vec![AclRuleSpec::new(
@@ -445,7 +445,7 @@ impl ClientIngressRouter {
             ),
         };
         let dns_plan = decision.action().dns_plan().cloned();
-        let selected_traffic_class = traffic_class(decision.action().traffic_intent(), network);
+        let selected_traffic_class = traffic_class(decision.action().initial_demand(), network);
         let authorizer = ProductFlowDestinationAuthorizer {
             policy: self.policy.clone(),
             flow,
@@ -475,16 +475,11 @@ fn protocol_target(target: &TargetAddr) -> Result<ProtocolTarget, RuntimeError> 
     .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))
 }
 
-const fn traffic_class(intent: TrafficIntent, network: Network) -> TrafficClass {
-    match (intent, network) {
-        (TrafficIntent::Interactive | TrafficIntent::Realtime, Network::Tcp) => {
-            TrafficClass::Latency
-        }
-        (TrafficIntent::Interactive | TrafficIntent::Realtime, Network::Udp) => {
-            TrafficClass::RealtimeDatagram
-        }
-        (TrafficIntent::Throughput, _) => TrafficClass::Throughput,
-        (TrafficIntent::Background, _) => TrafficClass::Background,
+const fn traffic_class(initial_demand: InitialDemand, network: Network) -> TrafficClass {
+    match (initial_demand, network) {
+        (InitialDemand::Automatic, Network::Tcp) => TrafficClass::Latency,
+        (InitialDemand::Automatic, Network::Udp) => TrafficClass::RealtimeDatagram,
+        (InitialDemand::Throughput, _) => TrafficClass::Throughput,
     }
 }
 

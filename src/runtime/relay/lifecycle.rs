@@ -704,7 +704,7 @@ pub(in crate::runtime) fn reliable_relay_response_stall_watch_active(
 ) -> bool {
     remote_open
         && recv_stream.next_offset() > 0
-        && (matches!(lane, TrafficClass::Throughput | TrafficClass::Background)
+        && (lane == TrafficClass::Throughput
             || recv_stream.next_offset() >= reliable_relay_response_stall_watch_bytes(mux_limits))
 }
 

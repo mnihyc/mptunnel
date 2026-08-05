@@ -59,7 +59,7 @@ generation = {generation}
 [[routing.rules]]
 name = "default-reject"
 action = "reject"
-traffic_intent = "background"
+initial_demand = "automatic"
 "#
     )
 }

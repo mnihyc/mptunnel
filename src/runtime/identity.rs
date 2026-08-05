@@ -20,12 +20,12 @@ pub(super) fn random_session_id() -> Result<SessionId, RuntimeError> {
 
 pub(super) fn random_u64() -> Result<u64, RuntimeError> {
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).map_err(RuntimeError::Random)?;
+    getrandom::fill(&mut bytes).map_err(RuntimeError::Random)?;
     Ok(u64::from_be_bytes(bytes))
 }
 
 pub(super) fn random_nonce() -> Result<AuthNonce, RuntimeError> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(RuntimeError::Random)?;
+    getrandom::fill(&mut bytes).map_err(RuntimeError::Random)?;
     Ok(AuthNonce(bytes))
 }

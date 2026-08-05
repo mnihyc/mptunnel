@@ -14,10 +14,8 @@ fn replay_is_deterministic_across_observation_and_failure_events() {
 
     assert_eq!(first, second);
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(
-            &render_json(&first).expect("rendered replay")
-        )
-        .expect("rendered replay JSON"),
+        serde_json::from_str::<serde_json::Value>(&render_json(&first).expect("rendered replay"))
+            .expect("rendered replay JSON"),
         serde_json::from_str::<serde_json::Value>(expected).expect("expected replay JSON")
     );
     assert!(matches!(

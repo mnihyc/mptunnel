@@ -6,7 +6,6 @@ pub enum TrafficClass {
     Latency,
     Throughput,
     RealtimeDatagram,
-    Background,
 }
 
 impl TrafficClass {
@@ -19,7 +18,7 @@ impl TrafficClass {
     /// Bulk traffic classes may trade latency for sustained carrier feeding; the
     /// transport-specific schedulers consume this product classification.
     pub(crate) const fn is_bulk(self) -> bool {
-        matches!(self, Self::Throughput | Self::Background)
+        matches!(self, Self::Throughput)
     }
 }
 
@@ -29,7 +28,7 @@ pub(crate) fn stream_demand_hint_for_traffic_class(
 ) -> StreamDemandHint {
     match traffic_class {
         TrafficClass::Control | TrafficClass::Latency => StreamDemandHint::latency(),
-        TrafficClass::Throughput | TrafficClass::Background => StreamDemandHint::throughput(),
+        TrafficClass::Throughput => StreamDemandHint::throughput(),
         TrafficClass::RealtimeDatagram => StreamDemandHint::realtime(),
     }
 }

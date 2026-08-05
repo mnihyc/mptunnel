@@ -33,6 +33,7 @@ from typing import Any, Mapping, Sequence
 try:
     from result_enrichment import (
         MPTUNNEL_CARRIER_PRESENTATION,
+        MPTUNNEL_CARRIER_PRESENTATIONS,
         MPTUNNEL_PROTOCOL_VERSION,
         RESULT_SCHEMA_VERSION,
         RUN_MANIFEST_SCHEMA_VERSION,
@@ -41,6 +42,7 @@ try:
 except ModuleNotFoundError:
     from lab.result_enrichment import (
         MPTUNNEL_CARRIER_PRESENTATION,
+        MPTUNNEL_CARRIER_PRESENTATIONS,
         MPTUNNEL_PROTOCOL_VERSION,
         RESULT_SCHEMA_VERSION,
         RUN_MANIFEST_SCHEMA_VERSION,
@@ -359,10 +361,10 @@ def validate_subject_identity(value: Any) -> dict[str, Any]:
             f"subject mptunnel_protocol_version must be "
             f"{MPTUNNEL_PROTOCOL_VERSION}"
         )
-    if subject["mptunnel_carrier_presentation"] != MPTUNNEL_CARRIER_PRESENTATION:
+    if subject["mptunnel_carrier_presentation"] not in MPTUNNEL_CARRIER_PRESENTATIONS:
         raise LedgerError(
-            "subject mptunnel_carrier_presentation does not match the current "
-            "v4 TCP/QUIC wire presentation"
+            "subject mptunnel_carrier_presentation is not a supported v6 "
+            "TCP/QUIC wire presentation"
         )
     for field in (
         "mptunnel_client_runtime",

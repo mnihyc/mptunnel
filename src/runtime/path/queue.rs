@@ -23,11 +23,10 @@ use tokio::sync::{Notify, mpsc};
 // QUIC writers. Control keeps independent capacity; a typed carrier probe remains
 // one data-lane command so its token and frozen proof contract cannot split.
 
-const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [TrafficClass; 4] = [
+const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [TrafficClass; 3] = [
     TrafficClass::Control,
     TrafficClass::Latency,
     TrafficClass::RealtimeDatagram,
-    TrafficClass::Background,
 ];
 
 #[derive(Clone)]

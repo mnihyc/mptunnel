@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Security fixes are applied to the latest published `0.1.x` release and the
-default branch. Older builds are unsupported.
+Security fixes are applied to the latest published release and the default
+branch. Older builds are unsupported.
 
 ## Reporting a vulnerability
 

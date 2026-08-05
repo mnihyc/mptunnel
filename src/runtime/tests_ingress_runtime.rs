@@ -24,7 +24,7 @@ fn socks_udp_classifies_once_per_cached_target() {
     };
     use crate::product::{
         BalancerId, EgressAction, GatewayBalancerSpec, GatewayMemberSpec, GatewayStrategy,
-        NetworkSet, OutboundId, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId, TrafficIntent,
+        InitialDemand, NetworkSet, OutboundId, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
     };
     use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 
@@ -54,7 +54,7 @@ fn socks_udp_classifies_once_per_cached_target() {
             RouteAction::new(
                 EgressAction::Balancer(gateway_id.clone()),
                 None,
-                TrafficIntent::Realtime,
+                InitialDemand::Automatic,
             ),
         )],
         destination_acl: Vec::new(),

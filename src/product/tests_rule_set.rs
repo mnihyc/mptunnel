@@ -118,9 +118,9 @@ fn registry_rejects_duplicate_ids() {
 #[test]
 fn domain_only_destination_set_cannot_create_address_routing_demand() {
     use crate::product::{
-        CompiledRouteTable, EgressAction, FlowContext, InboundId, Network, OutboundId, PrincipalId,
-        ProtocolTarget, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId, SourceEndpoint,
-        TrafficIntent,
+        CompiledRouteTable, EgressAction, FlowContext, InboundId, InitialDemand, Network,
+        OutboundId, PrincipalId, ProtocolTarget, RouteAction, RouteMatchSpec, RouteRuleSpec,
+        RuleId, SourceEndpoint,
     };
 
     let (artifact, catalog) = signed_artifact(json!({
@@ -144,7 +144,7 @@ fn domain_only_destination_set_cannot_create_address_routing_demand() {
                     destination_rule_sets: vec![domain_only],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(EgressAction::Reject, None, TrafficIntent::Interactive),
+                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
             ),
             RouteRuleSpec::new(
                 RuleId::parse("stable-domain").expect("rule"),
@@ -155,13 +155,13 @@ fn domain_only_destination_set_cannot_create_address_routing_demand() {
                 RouteAction::new(
                     EgressAction::Outbound(OutboundId::parse("proxy").expect("outbound")),
                     None,
-                    TrafficIntent::Interactive,
+                    InitialDemand::Automatic,
                 ),
             ),
             RouteRuleSpec::new(
                 RuleId::parse("default").expect("rule"),
                 RouteMatchSpec::default(),
-                RouteAction::new(EgressAction::Reject, None, TrafficIntent::Interactive),
+                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
             ),
         ],
     )

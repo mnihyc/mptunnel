@@ -386,7 +386,7 @@ fn packaged_wintun_path() -> Result<PathBuf, WindowsVpnPrepareError> {
 
 fn random_generation_guid() -> Result<u128, WindowsVpnPrepareError> {
     let mut bytes = [0_u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(WindowsVpnPrepareError::Random)?;
+    getrandom::fill(&mut bytes).map_err(WindowsVpnPrepareError::Random)?;
     // RFC 4122 variant/version bits keep diagnostics conventional. Wintun
     // consumes the value as a stable 128-bit adapter identity.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

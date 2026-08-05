@@ -364,7 +364,7 @@ async fn private_initial_suppresses_unauthenticated_endpoint_responses() {
 
     let mut unknown_short_header = vec![0u8; 64];
     unknown_short_header[0] = 0x40;
-    getrandom::getrandom(&mut unknown_short_header[1..]).expect("random short-header probe");
+    getrandom::fill(&mut unknown_short_header[1..]).expect("random short-header probe");
     probe
         .send_to(&unknown_short_header, server_addr)
         .await

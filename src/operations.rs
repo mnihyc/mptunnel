@@ -11,7 +11,7 @@ use crate::config::{
     AppConfig, CommandConfig, ConfigFileError, DEFAULT_CONFIG_PATH, ManagementConfig, NodeConfig,
     OutboundLeafConfig, load_config_toml,
 };
-use crate::product::{EgressAction, FlowContext, RouteInput, SourceEndpoint, TrafficIntent};
+use crate::product::{EgressAction, FlowContext, InitialDemand, RouteInput, SourceEndpoint};
 use crate::protocol::UnderlayProtocol;
 use crate::transport::Endpoint;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -200,8 +200,8 @@ fn render_route_explanation(
     }
     writeln!(
         output,
-        "  traffic_intent: {}",
-        traffic_intent_name(action.traffic_intent())
+        "  initial_demand: {}",
+        initial_demand_name(action.initial_demand())
     )?;
     writeln!(output, "  explanation: {}", selected.explanation())?;
     writeln!(output, "rules:")?;
@@ -245,12 +245,10 @@ fn egress_action_name(action: &EgressAction) -> &'static str {
     }
 }
 
-const fn traffic_intent_name(intent: TrafficIntent) -> &'static str {
-    match intent {
-        TrafficIntent::Interactive => "interactive",
-        TrafficIntent::Throughput => "throughput",
-        TrafficIntent::Realtime => "realtime",
-        TrafficIntent::Background => "background",
+const fn initial_demand_name(demand: InitialDemand) -> &'static str {
+    match demand {
+        InitialDemand::Automatic => "automatic",
+        InitialDemand::Throughput => "throughput",
     }
 }
 

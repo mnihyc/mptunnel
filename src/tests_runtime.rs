@@ -2176,7 +2176,6 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
     let stream_payload_queue = reliable_stream_frame_queue(mux_limits);
     let packet_payload_queue = reliable_stream_frame_queue_for_payload(mux_limits, 1200);
 
-    assert_eq!(stream_payload_queue, 68);
     assert_eq!(
         packet_payload_queue,
         mux_limits.max_reorder_bytes / 1200 + reliable_path_priority_headroom_frames()

@@ -330,7 +330,7 @@ impl ClientPathContext {
     ) -> Vec<usize> {
         let observations = self.tcp_health_observations_for_lane(lane);
         let scores = ordered_path_scores(&self.tcp_paths, &observations, lane, payload_bytes);
-        if !matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
+        if lane != TrafficClass::Throughput {
             return scores.into_iter().map(|(index, _)| index).collect();
         }
         let current_eta = current_path_index.and_then(|current_path_index| {
@@ -388,7 +388,7 @@ impl ClientPathContext {
             .into_iter()
             .filter(|(index, _)| Some(*index) != current_path_index)
             .filter(|(index, _)| {
-                !matches!(lane, TrafficClass::Throughput | TrafficClass::Background)
+                lane != TrafficClass::Throughput
                     || !observations
                         .iter()
                         .enumerate()

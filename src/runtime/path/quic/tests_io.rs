@@ -21,9 +21,10 @@ fn quic_stream_priority_uses_only_default_and_latency_levels() {
     ] {
         assert_eq!(quic_stream_priority(lane), QUIC_LATENCY_STREAM_PRIORITY);
     }
-    for lane in [TrafficClass::Throughput, TrafficClass::Background] {
-        assert_eq!(quic_stream_priority(lane), QUIC_DEFAULT_STREAM_PRIORITY);
-    }
+    assert_eq!(
+        quic_stream_priority(TrafficClass::Throughput),
+        QUIC_DEFAULT_STREAM_PRIORITY
+    );
 }
 
 #[test]

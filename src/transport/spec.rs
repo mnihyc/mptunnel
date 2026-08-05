@@ -187,7 +187,7 @@ fn random_offset(width: u32) -> Result<u32, getrandom::Error> {
     let accepted = sample_space - sample_space % width;
     loop {
         let mut bytes = [0_u8; 2];
-        getrandom::getrandom(&mut bytes)?;
+        getrandom::fill(&mut bytes)?;
         let sample = u32::from(u16::from_ne_bytes(bytes));
         if sample < accepted {
             return Ok(sample % width);

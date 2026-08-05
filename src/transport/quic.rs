@@ -1,4 +1,4 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use quinn::ConnectionError;
 use sha2::Sha256;
 use std::fmt;

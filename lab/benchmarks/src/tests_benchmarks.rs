@@ -18,7 +18,12 @@ fn deterministic_developer_gates_pass() {
             .iter()
             .any(|gate| gate.name == "page_load_complete")
     );
-    assert!(report.gates.iter().any(|gate| gate.name == "stream_ram_budget"));
+    assert!(
+        report
+            .gates
+            .iter()
+            .any(|gate| gate.name == "stream_ram_budget")
+    );
 }
 
 #[test]

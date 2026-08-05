@@ -143,12 +143,20 @@ is reserved for an application or active-probe destination authority, while
 MPP security and named carrier paths belong to each MPP inbound/outbound
 rather than to a global path role.
 
+When `initial_demand` is omitted or set to `"automatic"`, reliable streams
+begin latency-oriented and datagrams begin realtime-oriented. Live reliable
+demand can move between latency and throughput scheduling without reopening the
+stream. Set `initial_demand = "throughput"` only for a route whose workload is
+known to be bulk from its first bytes. This is an admission hint, not a fixed
+path choice or a permanent traffic class.
+
 Each MPP outbound selects one credential with `credential_id`; each MPP
 inbound accepts one or more credentials with `credential_ids`. Separate MPP
 outbounds may select separate credentials. `tls_server_name` defaults to
-`mptunnel.example` and identifies the pinned QUIC and legacy-TCP certificate.
-An optional `transport_secret_file` is one raw 32-byte endpoint-wide secret
-shared by the two peers; it is not an MPP client credential.
+`mptunnel.example` and identifies the pinned QUIC and TLS-fallback TCP
+certificate. Shipped configurations set `transport_secret_file` to one raw
+32-byte endpoint-wide secret shared by the two peers; it is optional and is not
+an MPP client credential.
 
 `tcp-forward` and `udp-forward` local inbounds require explicit non-zero
 listeners and one canonical `target`. TCP overload is closed immediately at
@@ -261,7 +269,7 @@ evaluates post-resolution policy. Route explanation accepts only attributes
 that every live ingress supplies: destination, resolved IP, network, source,
 principal, and inbound. Output separately identifies the pre-resolution rule
 and DNS plan that owned resolution, then the selected stage rule, action,
-outbound or balancer, traffic intent, every rule's first mismatch, and the
+outbound or balancer, initial demand, every rule's first mismatch, and the
 ID/publisher/revision/expiry/hash of each consulted signed rule set.
 
 Runtime status and DNS operations use only the authenticated versioned API:
@@ -705,15 +713,17 @@ address when source-address selection matters.
 
 ## Encryption
 
-Without `transport_secret_file`, TCP uses TLS 1.3 with no ALPN, followed by one
-bounded exporter-bound binary admission prelude and raw MPP frames. With the
-file configured, TCP instead uses `Noise_NNpsk0_25519_AESGCM_SHA256`; the Noise
+With `transport_secret_file`, TCP uses
+`Noise_NNpsk0_25519_AESGCM_SHA256`; the Noise
 PSK, length masks, admission binding, and record keys are domain-separated from
 the endpoint secret. Public and wrong-secret probes receive no handshake
 response. Freshness and a bounded process-local replay cache admit a valid
 first flight before the server responds. TCP never changes into HTTP.
 
-QUIC negotiates `h3`. The optional endpoint secret derives private Initial
+Without the file, TCP uses TLS 1.3 with no ALPN, followed by one bounded
+exporter-bound binary admission prelude and raw MPP frames.
+
+QUIC negotiates `h3`. The configured endpoint secret derives private Initial
 keys, so a public or wrong-key Initial receives no response and cannot elicit
 the certificate flight. QUIC version and packet shape remain visible. Each
 encrypted request carries a credential-derived selector; the same gate
@@ -723,7 +733,7 @@ without a query before request DATA reaches the MPP parser. Normal
 Reliable records use H3 DATA and UDP payloads use RFC 9297 datagrams. Ordinary,
 nonmatching, and rejected requests receive the same marker-free 404, and a
 successful response is withheld until full MPP authentication. QUIC and
-legacy-profile TCP authenticate the explicitly configured server certificate;
+TLS-based TCP authenticate the explicitly configured server certificate;
 shared-secret TCP authenticates possession of the endpoint group secret and
 does not transmit the certificate. The MPP application credential is
 independent and never derives the TLS identity, verifier, or endpoint transport

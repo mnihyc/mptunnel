@@ -5820,3 +5820,71 @@ entry is authoritative.
 - Reproducible final evidence:
   `./.tmp/lab/results/transport-protection-final-legacy/` and
   `./.tmp/lab/results/transport-protection-final-protected/`.
+
+## 2026-08-05T13:12:17+08:00: shipped profile, routing demand, and dependency audit complete
+
+- Name: current transport profile documentation and stable dependency refresh
+- Category: product configuration, Core boundary, dependencies, and regression evidence
+- State: completed locally and intentionally uncommitted; no push, tag, or release
+  was performed
+- Configuration and documentation:
+  - shipped client, server, and reference configurations now use one separate
+    raw 32-byte `transport_secret_file`; the schema remains optional so an
+    explicitly secretless pair retains TLS 1.3 TCP and public QUIC Initials;
+  - the README, operations guide, packaging guide, and performance guide
+    describe the current shipped profile directly, without development-history
+    or feature-announcement wording;
+  - the laboratory now defaults to the shipped shared-secret profile and
+    records its exact TCP Noise plus private-Initial QUIC carrier presentation;
+    explicit `MPTUNNEL_LAB_SHARED_TRANSPORT_SECRET=0` still selects the standard
+    control profile; and
+  - the one-path and local `1-1` public figures are the accepted matched
+    protected-profile measurements already recorded above.
+- Routing/Core boundary:
+  - removed the public `traffic_intent` taxonomy. `interactive` and `realtime`
+    mapped to the same network-derived starts, while `background` collapsed to
+    throughput on the wire and had no coherent RFC scheduling objective;
+  - the replacement `initial_demand` has only `automatic` and `throughput`.
+    Automatic starts reliable streams latency-oriented and datagrams
+    realtime-oriented; live reliable demand remains adaptive. Throughput is an
+    explicit first-byte admission hint for a route known to be bulk, never a
+    fixed path choice or permanent class; and
+  - removed the unreachable endpoint-local Background lane rather than retain
+    duplicate Core branches. The RFC latency, throughput, and realtime demand
+    values and adaptive data flow are unchanged.
+- Dependencies:
+  - refreshed every direct application and laboratory dependency to the newest
+    stable Rust 1.96-compatible release and updated all three lockfiles;
+  - retained `quinn-proto` 0.11.16, the newest upstream release, with the local
+    BBR and private-Initial extensions documented in its mirror README; and
+  - dry-run resolution reports no remaining compatible direct update. Older
+    transitive `generic-array` and optional vendored `qlog` versions remain
+    upstream-constrained and were not forced into fork-only drift.
+- Post-refresh performance evidence, shared-secret profile, identical optimized
+  binary:
+  - initial matrix: TCP `209.660/201.245 Mbps`, QUIC
+    `247.512/226.521 Mbps`, default TCP+QUIC `350.038/373.540 Mbps`, and
+    local TCP `1-1` `7.620/6.201 Gbps` download/upload;
+  - the two shaped TCP directions were the only samples outside ordinary
+    adjacency to the accepted protected figures. A focused repeat produced
+    `233.586/224.167 Mbps`, slightly above the documented
+    `230.396/220.212 Mbps`, while a clean local download completed at
+    `6.873 Gbps`; and
+  - no dependency or encryption ceiling is supported by the evidence. The
+    shaped discrepancy was ordinary loss realization, so no algorithm,
+    threshold, or documentation cherry-pick was introduced. One initial local
+    duration run ended with a replacement request at the measurement boundary;
+    its clean repeat passed.
+- Verification:
+  - formatting, diff whitespace, stale-vocabulary checks, and warnings-denied
+    all-target/all-feature Clippy passed;
+  - all `1,470` library tests, `2` allocation checks, and `6` daily-use
+    acceptance tests passed after the dependency refresh;
+  - the recently completed standalone Quinn (`283` plus `3` documentation),
+    lab-contract (`210`), deterministic benchmark (`5`), and packaging (`9`)
+    suites remain the applicable unchanged evidence; and
+  - final narrow dependency, RFC/Quinn, and public-documentation audits found
+    no release blocker.
+- Reproducible post-refresh evidence:
+  `./.tmp/lab/results/dependency-upgrade-protected/` and
+  `./.tmp/lab/results/dependency-upgrade-repeat/`.

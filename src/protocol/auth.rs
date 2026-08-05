@@ -1,7 +1,7 @@
 //! Session and path-join authentication for the MPP wire protocol.
 
 use super::{AuthNonce, AuthTag, PathId, SessionId, UnderlayProtocol};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;

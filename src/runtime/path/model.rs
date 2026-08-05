@@ -153,7 +153,7 @@ pub(in crate::runtime) fn apply_bulk_latency_isolation(
     lane: TrafficClass,
     mux_limits: MuxLimits,
 ) {
-    if !matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
+    if lane != TrafficClass::Throughput {
         return;
     }
     if !observations
@@ -448,7 +448,7 @@ pub(in crate::runtime) fn reliable_stream_path_candidates(
             let observation = udp_observations.get(*index).copied().unwrap_or_default();
             let snapshot = path_snapshot(path, *index, observation);
             let eta_ms = *eta_ms
-                + if matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
+                + if lane == TrafficClass::Throughput {
                     udp_reliable_stream_loss_reinjection_penalty_ms(snapshot, payload_bytes)
                 } else {
                     0.0
@@ -492,7 +492,7 @@ pub(in crate::runtime) fn reliable_stream_path_candidates(
                 let observation = udp_observations.get(*index).copied().unwrap_or_default();
                 let snapshot = path_snapshot(path, *index, observation);
                 let eta_ms = *eta_ms
-                    + if matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
+                    + if lane == TrafficClass::Throughput {
                         udp_reliable_stream_loss_reinjection_penalty_ms(snapshot, payload_bytes)
                     } else {
                         0.0
@@ -811,8 +811,7 @@ fn path_can_be_auto_discovered_for_lane(
         && !path.metadata.policy.expensive
         && !path.metadata.policy.backup
         && !path.metadata.policy.probe_only
-        && (!matches!(lane, TrafficClass::Throughput | TrafficClass::Background)
-            || path.metadata.policy.bulk_allowed)
+        && (lane != TrafficClass::Throughput || path.metadata.policy.bulk_allowed)
 }
 
 fn path_can_be_recovery_candidate_for_lane(
@@ -824,8 +823,7 @@ fn path_can_be_recovery_candidate_for_lane(
         observation.state,
         SchedulerPathState::Failed | SchedulerPathState::Draining
     ) && !path.metadata.policy.probe_only
-        && (!matches!(lane, TrafficClass::Throughput | TrafficClass::Background)
-            || path.metadata.policy.bulk_allowed)
+        && (lane != TrafficClass::Throughput || path.metadata.policy.bulk_allowed)
 }
 
 pub(in crate::runtime) fn bulk_candidate_has_liveness_evidence(

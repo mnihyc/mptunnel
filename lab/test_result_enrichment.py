@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from result_enrichment import (
     MPTUNNEL_CARRIER_PRESENTATION,
+    MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE,
     MPTUNNEL_PROTOCOL_VERSION,
     RESULT_SCHEMA_VERSION,
     RUN_MANIFEST_SCHEMA_VERSION,
@@ -255,6 +256,17 @@ class ResultEnrichmentTests(unittest.TestCase):
             enrich_reproducibility({}, metadata)
 
     def test_reproducibility_rejects_a_stale_wire_identity(self):
+        for profile, presentation in MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE.items():
+            row = {}
+            enrich_reproducibility(
+                row,
+                reproducibility_metadata(
+                    mptunnel_transport_profile=profile,
+                    mptunnel_carrier_presentation=presentation,
+                ),
+            )
+            self.assertEqual(row["mptunnel_carrier_presentation"], presentation)
+
         stale_values = (
             {"mptunnel_protocol_version": 3},
             {"mptunnel_protocol_version": 4},
@@ -266,6 +278,15 @@ class ResultEnrichmentTests(unittest.TestCase):
                     enrich_reproducibility(
                         {}, reproducibility_metadata(**overrides)
                     )
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            enrich_reproducibility(
+                {},
+                reproducibility_metadata(
+                    mptunnel_transport_profile="standard",
+                    mptunnel_carrier_presentation=MPTUNNEL_CARRIER_PRESENTATION,
+                ),
+            )
 
     def test_run_manifest_records_inputs_without_secrets(self):
         baseline_lock = {

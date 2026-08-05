@@ -166,7 +166,7 @@ pub fn score_path(
     // work is not behind another flow's Data ACK; it follows only bytes still
     // queued above the carrier plus work owned by the native transport.
     let path_work = match lane {
-        TrafficClass::Throughput | TrafficClass::Background => carrier_work.max(data_level_work),
+        TrafficClass::Throughput => carrier_work.max(data_level_work),
         TrafficClass::Control | TrafficClass::RealtimeDatagram | TrafficClass::Latency => {
             path.data_level_queue_bytes.saturating_add(carrier_work)
         }
@@ -196,7 +196,7 @@ pub fn score_path(
 
 fn active_flow_penalty_ms(path: PathSnapshot, lane: TrafficClass) -> f64 {
     match lane {
-        TrafficClass::Throughput | TrafficClass::Background => {
+        TrafficClass::Throughput => {
             f64::from(path.active_latency_sensitive_flows) * path_pto_ms(path)
         }
         TrafficClass::Control | TrafficClass::RealtimeDatagram | TrafficClass::Latency => {
@@ -215,9 +215,7 @@ fn effective_path_rate_bps(path: PathSnapshot, lane: TrafficClass) -> f64 {
     }
     .max(1.0);
     match lane {
-        TrafficClass::Throughput | TrafficClass::Background
-            if matches!(path.rate_scope, PathRateScope::PathCapacity) =>
-        {
+        TrafficClass::Throughput if matches!(path.rate_scope, PathRateScope::PathCapacity) => {
             let active_bulk_flows = path
                 .active_flows
                 .saturating_sub(path.active_latency_sensitive_flows)
@@ -227,8 +225,7 @@ fn effective_path_rate_bps(path: PathSnapshot, lane: TrafficClass) -> f64 {
         TrafficClass::Control
         | TrafficClass::Latency
         | TrafficClass::RealtimeDatagram
-        | TrafficClass::Throughput
-        | TrafficClass::Background => rate,
+        | TrafficClass::Throughput => rate,
     }
 }
 

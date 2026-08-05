@@ -4,10 +4,10 @@ use ipnet::IpNet;
 use mptunnel::product::{
     AclEffect, AclRuleSpec, CompiledRouteTable, DestinationAcl, DomainName, EgressAction,
     FlowContext, GatewayBalancer, GatewayBalancerSpec, GatewayInstant, GatewayMemberSpec,
-    GatewayStickinessKey, GatewayStickinessPolicy, GatewayStrategy, InboundId, Network, NetworkSet,
-    OutboundId, PortRange, PrincipalId, ProtocolTarget, RULE_SET_SIGNATURE_CONTEXT, RouteAction,
-    RouteInput, RouteMatchSpec, RouteRuleSpec, RuleId, RuleSetPublisher, RuleSetPublisherCatalog,
-    RuleSetPublisherId, SourceEndpoint, TrafficIntent, VerifiedRuleSet,
+    GatewayStickinessKey, GatewayStickinessPolicy, GatewayStrategy, InboundId, InitialDemand,
+    Network, NetworkSet, OutboundId, PortRange, PrincipalId, ProtocolTarget,
+    RULE_SET_SIGNATURE_CONTEXT, RouteAction, RouteInput, RouteMatchSpec, RouteRuleSpec, RuleId,
+    RuleSetPublisher, RuleSetPublisherCatalog, RuleSetPublisherId, SourceEndpoint, VerifiedRuleSet,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::json;
@@ -166,13 +166,13 @@ fn warmed_route_and_acl_classification_allocate_nothing() {
                 RouteAction::new(
                     EgressAction::Outbound(OutboundId::parse("edge").expect("outbound")),
                     None,
-                    TrafficIntent::Interactive,
+                    InitialDemand::Automatic,
                 ),
             ),
             RouteRuleSpec::new(
                 route_id("default"),
                 RouteMatchSpec::default(),
-                RouteAction::direct(TrafficIntent::Interactive),
+                RouteAction::direct(InitialDemand::Automatic),
             ),
         ],
     )

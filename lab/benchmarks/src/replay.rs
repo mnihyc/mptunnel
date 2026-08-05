@@ -101,7 +101,6 @@ enum TraceLane {
     Realtime,
     Interactive,
     Throughput,
-    Background,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -369,7 +368,6 @@ impl TraceLane {
             Self::Realtime => TrafficClass::RealtimeDatagram,
             Self::Interactive => TrafficClass::Latency,
             Self::Throughput => TrafficClass::Throughput,
-            Self::Background => TrafficClass::Background,
         }
     }
 }

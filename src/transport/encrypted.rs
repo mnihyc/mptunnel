@@ -1,9 +1,9 @@
 //! Carrier cryptographic configuration and protected TCP framing.
 //!
-//! The default profile retains TLS 1.3 TCP and public QUIC Initial packets.
-//! An optional endpoint-wide shared transport secret selects a PSK-gated
-//! Noise TCP carrier and private QUIC Initial keys. MPP client credentials
-//! remain an independent admission layer in both profiles.
+//! The shipped profile uses an endpoint-wide shared transport secret for a
+//! PSK-gated Noise TCP carrier and private QUIC Initial keys. Omitting the
+//! optional secret selects TLS 1.3 TCP and public QUIC Initial packets. MPP
+//! client credentials remain an independent admission layer in both profiles.
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_perf_record;
@@ -13,7 +13,7 @@ use crate::protocol::codec::{
     encode_frame_into,
 };
 use bytes::BytesMut;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -31,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, Rea
 use tokio_rustls::TlsStream;
 
 /// QUIC presents as the standardized HTTP/3 application protocol. MPP
-/// admission is carried only in encrypted HTTP/3 request DATA; legacy TCP
+/// admission is carried only in encrypted HTTP/3 request DATA; TLS-based TCP
 /// deliberately negotiates no ALPN.
 pub const HTTP_3_ALPN: &[u8] = b"h3";
 
@@ -1056,7 +1056,7 @@ where
 
 // The TLS stream already carried this state inline before transport profiles
 // were selectable. Boxing only that variant would add a heap allocation to
-// every legacy TCP carrier solely to equalize enum variant sizes.
+// every TLS-based TCP carrier solely to equalize enum variant sizes.
 #[allow(clippy::large_enum_variant)]
 enum EncryptedFramedStreamInner<S> {
     Tls(TlsFramedStream<S>),
@@ -1298,8 +1298,8 @@ fn noise_parameters() -> Result<NoiseParams, EncryptedFramedTransportError> {
 }
 
 fn keyed_digest(secret: &[u8], label: &[u8], context: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts arbitrary-length keys");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret)
+        .expect("HMAC accepts arbitrary-length keys");
     mac.update(label);
     mac.update(context);
     mac.finalize().into_bytes().into()
@@ -1315,13 +1315,13 @@ fn random_handshake_padding() -> Result<Vec<u8>, EncryptedFramedTransportError> 
     let unbiased_limit = u8::MAX - (usize::from(u8::MAX) + 1).rem_euclid(span) as u8;
     let length = loop {
         let mut selector = [0u8; 1];
-        getrandom::getrandom(&mut selector).map_err(EncryptedFramedTransportError::Random)?;
+        getrandom::fill(&mut selector).map_err(EncryptedFramedTransportError::Random)?;
         if selector[0] <= unbiased_limit {
             break TCP_NOISE_MIN_PADDING + usize::from(selector[0]) % span;
         }
     };
     let mut padding = vec![0u8; length];
-    getrandom::getrandom(&mut padding).map_err(EncryptedFramedTransportError::Random)?;
+    getrandom::fill(&mut padding).map_err(EncryptedFramedTransportError::Random)?;
     Ok(padding)
 }
 
@@ -1424,7 +1424,7 @@ fn unix_time_seconds() -> Result<u64, EncryptedFramedTransportError> {
 
 fn noise_client_hello() -> Result<Vec<u8>, EncryptedFramedTransportError> {
     let mut nonce = [0u8; 16];
-    getrandom::getrandom(&mut nonce).map_err(EncryptedFramedTransportError::Random)?;
+    getrandom::fill(&mut nonce).map_err(EncryptedFramedTransportError::Random)?;
     let padding = random_handshake_padding()?;
     let mut payload = Vec::with_capacity(TCP_NOISE_CLIENT_HELLO_HEADER_LEN + padding.len());
     payload.push(TCP_NOISE_CLIENT_HELLO_VERSION);

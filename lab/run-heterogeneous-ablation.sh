@@ -204,15 +204,27 @@ else
   log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-4000}"
   log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-120}"
 fi
+shared_transport_secret="${MPTUNNEL_LAB_SHARED_TRANSPORT_SECRET:-1}"
+if flag_enabled "$shared_transport_secret"; then
+  mptunnel_transport_profile="shared-secret"
+else
+  mptunnel_transport_profile="standard"
+fi
 mptunnel_protocol_version="$(sed -nE 's/^const VERSION: u8 = ([0-9]+);$/\1/p' src/protocol/codec.rs)"
 IFS=$'\t' read -r mptunnel_expected_protocol_version mptunnel_carrier_presentation < <(
-  PYTHONPATH="$script_dir" python3 - <<'PY'
+  MPTUNNEL_TRANSPORT_PROFILE="$mptunnel_transport_profile" \
+    PYTHONPATH="$script_dir" python3 - <<'PY'
+import os
+
 from result_enrichment import (
-    MPTUNNEL_CARRIER_PRESENTATION,
     MPTUNNEL_PROTOCOL_VERSION,
+    mptunnel_carrier_presentation,
 )
 
-print(f"{MPTUNNEL_PROTOCOL_VERSION}\t{MPTUNNEL_CARRIER_PRESENTATION}")
+presentation = mptunnel_carrier_presentation(
+    os.environ["MPTUNNEL_TRANSPORT_PROFILE"]
+)
+print(f"{MPTUNNEL_PROTOCOL_VERSION}\t{presentation}")
 PY
 )
 if [[ "$mptunnel_protocol_version" != "$mptunnel_expected_protocol_version" ]]; then
@@ -253,7 +265,6 @@ if [[ ! "$client_start_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
 fi
 isolate_cases="${ISOLATE_CASES:-1}"
 isolate_containers="${ISOLATE_CONTAINERS_PER_CASE:-1}"
-shared_transport_secret="${MPTUNNEL_LAB_SHARED_TRANSPORT_SECRET:-0}"
 if [[ -n "${MPTUNNEL_LAB_SECRET:-}" ]]; then
   secret="$MPTUNNEL_LAB_SECRET"
 else
@@ -495,7 +506,7 @@ refresh_result_reproducibility() {
     MPTUNNEL_BUILD_FEATURES="$mptunnel_build_features" \
     MPTUNNEL_PROTOCOL_VERSION="$mptunnel_protocol_version" \
     MPTUNNEL_CARRIER_PRESENTATION="$mptunnel_carrier_presentation" \
-    MPTUNNEL_SHARED_TRANSPORT_SECRET="$shared_transport_secret" \
+    MPTUNNEL_TRANSPORT_PROFILE="$mptunnel_transport_profile" \
     MPTUNNEL_CLIENT_RUNTIME="$client_runtime" \
     MPTUNNEL_CLIENT_RUNTIME_VERSION="$runtime_version" \
     MPTUNNEL_CLIENT_TARGET="$client_target" \
@@ -527,11 +538,7 @@ identity = {
     "mptunnel_carrier_presentation": os.environ[
         "MPTUNNEL_CARRIER_PRESENTATION"
     ],
-    "mptunnel_transport_profile": (
-        "shared-secret"
-        if os.environ["MPTUNNEL_SHARED_TRANSPORT_SECRET"].lower() in {"1", "true", "yes"}
-        else "standard"
-    ),
+    "mptunnel_transport_profile": os.environ["MPTUNNEL_TRANSPORT_PROFILE"],
     "mptunnel_client_runtime": os.environ["MPTUNNEL_CLIENT_RUNTIME"],
     "mptunnel_client_runtime_version": os.environ["MPTUNNEL_CLIENT_RUNTIME_VERSION"],
     "mptunnel_client_target": os.environ["MPTUNNEL_CLIENT_TARGET"],

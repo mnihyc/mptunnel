@@ -49,7 +49,8 @@ carriers inside the eligible tier; source addresses never establish capacity.
 
 All rates are receiver-delivered goodput from the same Linux/Docker host.
 Matched proxy comparisons used two flows for 20 seconds. Movement around five
-percent can be ordinary run-to-run variance.
+percent can be ordinary run-to-run variance. The one-path and local TCP `1-1`
+MPTUNNEL rows use the default shared-transport-key profile.
 
 ### One 500 Mbps path
 
@@ -60,12 +61,12 @@ percent can be ordinary run-to-run variance.
 | Direct | TCP | 207.720 | 201.212 |
 | Xray 26.3.27 | VMess/TCP | 218.716 | ≥151.299 |
 | Hysteria2 2.10.0 | QUIC | 87.525 | ≥105.615 |
-| **MPTUNNEL** | MPP/TCP | 257.226 | 262.397 |
-| **MPTUNNEL** | MPP/QUIC | 220.280 | 173.353 |
-| **MPTUNNEL** | **MPP/TCP+QUIC (default)** | **370.207** | **398.793** |
+| **MPTUNNEL** | MPP/TCP | 230.396 | 220.212 |
+| **MPTUNNEL** | MPP/QUIC | 238.954 | 237.677 |
+| **MPTUNNEL** | **MPP/TCP+QUIC (default)** | **347.100** | **375.497** |
 
-The default delivered 1.78× direct TCP download and 1.98× upload goodput;
-MPP/QUIC delivered 2.52× Hysteria2's download. Incomplete baseline uploads
+The default delivered 1.67× direct TCP download and 1.87× upload goodput;
+MPP/QUIC delivered 2.73× Hysteria2's download. Incomplete baseline uploads
 are shown only as receiver-confirmed lower bounds.
 
 ### Five 500 Mbps paths
@@ -139,7 +140,7 @@ No rate, delay, jitter, or loss was configured.
 | Direct | TCP | 1 | 21.393 | 22.113 |
 | Xray 26.3.27 | VMess/TCP | 1 | 8.044 | ≥6.952 |
 | Hysteria2 2.10.0 | QUIC | 1 | 2.714 | ≥2.816 |
-| **MPTUNNEL** | MPP/TCP (`1-1`) | 1 | 6.362 | 6.581 |
+| **MPTUNNEL** | MPP/TCP (`1-1`) | 1 | 7.185 | 6.443 |
 | **MPTUNNEL** | MPP/TCP (default) | 3 | 5.584 | 6.328 |
 | **MPTUNNEL** | MPP/QUIC | 1 | 2.867 | 2.796 |
 | **MPTUNNEL** | **MPP/TCP+QUIC (default)** | 4 | 4.921 | 5.190 |
@@ -181,12 +182,13 @@ current demand rank eligible paths.
 ## Quick start
 
 Download the archive for your platform from
-[GitHub Releases](../../releases/latest). Generate one shared MPP credential
-and a separate TLS identity:
+[GitHub Releases](../../releases/latest). Generate one shared MPP credential,
+one shared transport key, and a separate TLS identity:
 
 ```bash
 umask 077
 openssl rand -hex 32 > mpp-credential.key
+openssl rand -out mpp-transport.key 32
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -subj "/CN=mptunnel.example" \
   -addext "subjectAltName=DNS:mptunnel.example" \
@@ -201,6 +203,7 @@ Start the server:
 ```bash
 mptunnel --credential-secret-file ./mpp-credential.key \
   server \
+  --transport-secret-file ./mpp-transport.key \
   --tls-certificate-chain ./server-cert.pem \
   --tls-private-key ./server-key.pem \
   --bind-path tcp://0.0.0.0:7443 \
@@ -213,6 +216,7 @@ Start the client:
 ```bash
 mptunnel --credential-secret-file ./mpp-credential.key \
   client \
+  --transport-secret-file ./mpp-transport.key \
   --tls-pinned-certificate ./server-cert.pem \
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
@@ -220,18 +224,12 @@ mptunnel --credential-secret-file ./mpp-credential.key \
   --path udp://server.example.com:7443
 ```
 
-Transport protection can additionally hide the TCP TLS handshake and prevent
-public QUIC Initial packets from eliciting a certificate flight. Generate a
-separate raw endpoint secret and pass the same file to both commands:
-
-```bash
-openssl rand -out mpp-transport.key 32
-# add: --transport-secret-file ./mpp-transport.key
-```
-
-This endpoint-wide file is not an MPP client credential. Omitting it retains
-the standard TLS 1.3 TCP and public QUIC profile. The certificate name defaults
-to `mptunnel.example`; `--tls-server-name` remains available as an override.
+The shared transport key replaces the TCP TLS handshake with PSK-gated Noise
+and prevents public QUIC Initial packets from eliciting a certificate flight.
+It is not an MPP client credential. Shipped configurations enable it; the field
+is optional so peers can instead use TLS 1.3 TCP and public QUIC Initials. The
+QUIC and TLS-fallback certificate name defaults to `mptunnel.example`;
+`--tls-server-name` remains available as an override.
 
 For persistent operation, copy `examples/client.toml` or
 `examples/server.toml` to `config.toml`, replace the placeholders, and validate
@@ -291,13 +289,13 @@ can remain correct. Run `mptunnel platform` for the current host report.
 
 ## Security
 
-The default profile uses TLS 1.3 TCP with no ALPN and QUIC with HTTP/3; carrier
-0-RTT is disabled. When the optional shared transport secret is configured,
-TCP uses a PSK-gated Noise session and QUIC derives private Initial keys before
-its inner TLS/HTTP/3 handshake. Public and wrong-secret probes receive no TCP
-handshake response and cannot elicit or decrypt a QUIC certificate flight. MPP
-client credentials stay separate and still authorize individual peers after
-carrier protection.
+The shipped profile uses PSK-gated Noise for TCP and private QUIC Initial keys
+before QUIC's inner TLS/HTTP/3 handshake; carrier 0-RTT is disabled. Public and
+wrong-secret probes receive no TCP handshake response and cannot elicit or
+decrypt a QUIC certificate flight. Omitting the optional transport secret uses
+TLS 1.3 TCP with no ALPN and public QUIC Initials instead. MPP client
+credentials stay separate and still authorize individual peers after carrier
+protection.
 
 This removes simple plaintext protocol markers, but it is not an
 indistinguishability or cover-service claim. A source-aware active observer may

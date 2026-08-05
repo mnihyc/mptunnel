@@ -14,8 +14,18 @@ from typing import Any, Mapping
 RESULT_SCHEMA_VERSION = 2
 RUN_MANIFEST_SCHEMA_VERSION = 3
 MPTUNNEL_PROTOCOL_VERSION = 6
-MPTUNNEL_CARRIER_PRESENTATION = (
-    "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297"
+MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE = {
+    "standard": "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297",
+    "shared-secret": (
+        "tcp-noise-nnpsk0-25519-aesgcm-sha256"
+        "+quic-private-initial-h3-post-data-rfc9297"
+    ),
+}
+MPTUNNEL_CARRIER_PRESENTATION = MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE[
+    "shared-secret"
+]
+MPTUNNEL_CARRIER_PRESENTATIONS = frozenset(
+    MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE.values()
 )
 
 _SAFE_RUN_OVERRIDE = re.compile(
@@ -39,6 +49,15 @@ _SAFE_RUN_OVERRIDE = re.compile(
 
 def _flag_enabled(value: Any) -> bool:
     return str(value).lower() in {"1", "true", "yes"}
+
+
+def mptunnel_carrier_presentation(profile: str) -> str:
+    """Return the exact wire presentation selected by one lab profile."""
+
+    try:
+        return MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE[profile]
+    except KeyError as exc:
+        raise ValueError(f"unsupported MPTUNNEL transport profile: {profile}") from exc
 
 
 def _require_sha256(value: Any, field: str) -> str:
@@ -214,6 +233,7 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
     build_profile = metadata.get("mptunnel_build_profile")
     protocol_version = metadata.get("mptunnel_protocol_version")
     carrier_presentation = metadata.get("mptunnel_carrier_presentation")
+    transport_profile = metadata.get("mptunnel_transport_profile")
     source_tree_dirty = metadata.get("source_tree_dirty")
     build_features = metadata.get("mptunnel_build_features")
     if metadata.get("result_schema_version") != RESULT_SCHEMA_VERSION:
@@ -249,11 +269,19 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
         raise ValueError(
             f"mptunnel_protocol_version must be {MPTUNNEL_PROTOCOL_VERSION}"
         )
-    if carrier_presentation != MPTUNNEL_CARRIER_PRESENTATION:
+    if carrier_presentation not in MPTUNNEL_CARRIER_PRESENTATIONS:
         raise ValueError(
-            "mptunnel_carrier_presentation does not match the current v6 "
-            "TCP/QUIC wire presentation"
+            "mptunnel_carrier_presentation is not a supported v6 TCP/QUIC "
+            "wire presentation"
         )
+    if transport_profile is not None:
+        if not isinstance(transport_profile, str):
+            raise ValueError("mptunnel_transport_profile must be a string")
+        if carrier_presentation != mptunnel_carrier_presentation(transport_profile):
+            raise ValueError(
+                "mptunnel_transport_profile does not match "
+                "mptunnel_carrier_presentation"
+            )
     if not isinstance(source_tree_dirty, bool):
         raise ValueError("source_tree_dirty must be a boolean")
     if not isinstance(build_features, list) or not all(

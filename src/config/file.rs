@@ -37,10 +37,10 @@ use crate::product::{
     DnsSecurityPolicy, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, DnsUpstreamStrategy,
     DomainName, EgressAction, FakeDnsSpec, GatewayBalancer, GatewayBalancerSpec,
     GatewayHealthPolicy, GatewayMemberMode, GatewayMemberSpec, GatewayProbePolicy,
-    GatewayStickinessKey, GatewayStickinessPolicy, GatewayStrategy, InboundId,
+    GatewayStickinessKey, GatewayStickinessPolicy, GatewayStrategy, InboundId, InitialDemand,
     MAX_RULE_SET_ENVELOPE_BYTES, Network, OutboundId, PortRange, PrincipalId, ProtocolTarget,
     RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage, RuleId, RuleSetId, RuleSetPublisher,
-    RuleSetPublisherCatalog, RuleSetPublisherId, TrafficIntent, VerifiedRuleSet,
+    RuleSetPublisherCatalog, RuleSetPublisherId, VerifiedRuleSet,
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{EndpointParseError, PathSpecParseError};
@@ -1435,7 +1435,7 @@ struct RoutingRuleFileConfig {
     balancer: Option<String>,
     dns_plan: Option<String>,
     #[serde(default)]
-    traffic_intent: RoutingTrafficIntentFileValue,
+    initial_demand: RoutingInitialDemandFileValue,
     explanation: Option<String>,
 }
 
@@ -1590,12 +1590,10 @@ enum RoutingActionFileValue {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum RoutingTrafficIntentFileValue {
+enum RoutingInitialDemandFileValue {
     #[default]
-    Interactive,
+    Automatic,
     Throughput,
-    Realtime,
-    Background,
 }
 
 #[derive(Debug, Clone)]
@@ -2165,16 +2163,14 @@ fn compile_product_route_rule(
             EgressAction::Drop
         }
     };
-    let traffic_intent = match rule.traffic_intent {
-        RoutingTrafficIntentFileValue::Interactive => TrafficIntent::Interactive,
-        RoutingTrafficIntentFileValue::Throughput => TrafficIntent::Throughput,
-        RoutingTrafficIntentFileValue::Realtime => TrafficIntent::Realtime,
-        RoutingTrafficIntentFileValue::Background => TrafficIntent::Background,
+    let initial_demand = match rule.initial_demand {
+        RoutingInitialDemandFileValue::Automatic => InitialDemand::Automatic,
+        RoutingInitialDemandFileValue::Throughput => InitialDemand::Throughput,
     };
     Ok(RouteRuleSpec {
         id,
         matcher,
-        action: RouteAction::new(egress, dns_plan, traffic_intent),
+        action: RouteAction::new(egress, dns_plan, initial_demand),
         explanation: rule.explanation,
     })
 }

@@ -2,8 +2,8 @@
 
 This core crate contains the crates.io source for `quinn-proto` 0.11.16,
 checksum `2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560`,
-plus MPTUNNEL's performance-critical congestion-control patch. The upstream
-MIT and Apache-2.0 licenses are included unchanged.
+plus MPTUNNEL's congestion-control and private-Initial extensions. The
+upstream MIT and Apache-2.0 licenses are included unchanged.
 
 The local patch keeps Quinn's public congestion-controller boundary while
 aligning its BBR implementation with the delivery-rate and pacing
@@ -27,13 +27,25 @@ model used by the reference algorithm. The semantic deviations from upstream
 - an absent minimum-RTT timestamp is not expired, and the timestamp starts with
   the first RTT sample instead of entering ProbeRTT on the first useful ACK.
 
-The added BBR, bandwidth-estimator, pacer, and path-lifecycle tests cover these
-changes. No unrelated upstream source file differs semantically from 0.11.16.
-The two upstream BBR test modules use the repository-wide `tests_[module].rs`
-naming; normalize those path-only renames before reviewing an upstream diff.
-The 0.11.16 refresh first applies upstream's rand 0.10 and dependency baseline,
-then ports the MPTUNNEL delta across the overlapping BBR and connection
-plumbing files.
+The private-Initial extension keeps QUIC packet framing and TLS unchanged while
+allowing both endpoints to supply the same 32-byte input to Initial key
+derivation. An endpoint using private Initial keys discards packets that do not
+authenticate under those keys before sending Version Negotiation, Retry,
+stateless reset, or a TLS certificate flight. The maintained surface is:
+
+- the opt-in crypto-session capability in `src/crypto.rs`;
+- rustls client/server configuration and Initial derivation in
+  `src/crypto/rustls.rs`;
+- pre-response endpoint admission in `src/endpoint.rs`; and
+- packet-shape and wrong-key coverage in `src/packet.rs`.
+
+The added BBR, bandwidth-estimator, pacer, path-lifecycle, endpoint-admission,
+and packet tests cover these changes. No unrelated upstream source file differs
+semantically from 0.11.16. Two BBR test modules use the repository-wide
+`tests_[module].rs` naming; normalize those path-only renames before reviewing
+an upstream diff. The 0.11.16 refresh first applied the upstream rand 0.10 and
+dependency baseline, then ported the MPTUNNEL delta across the overlapping BBR,
+connection, crypto, endpoint, and packet files.
 
 The exact full-source mirror is deliberate: the required delivery, ACK/loss,
 pacing, and network-path hooks cross private Quinn internals and cannot be
@@ -63,7 +75,9 @@ dependency housekeeping. Use a clean worktree and one exact candidate version:
    `src/connection/pacing.rs`, and the BBR delivery model in
    `src/congestion/bbr/`.
 4. Port the BBR, bandwidth-estimator, and pacer regression tests with the
-   behavior. A compiling controller without those tests is not an update.
+   behavior. Port the private-Initial crypto, pre-response admission, and
+   packet tests with their extension. Compiling without those tests is not an
+   update.
 5. Update this document's version/checksum, the package manifest inherited
    from upstream, the root exact `quinn-proto` requirement, and the root,
    benchmark, and standalone Quinn lockfiles in the same change.

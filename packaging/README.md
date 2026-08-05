@@ -17,13 +17,14 @@ Check the binary:
 On Windows, use `.\mptunnel.exe` instead. Keep `wintun.dll` beside the
 executable when using the Windows packet-device integration.
 
-For a quick proxy-only trial, generate one credential file and a server TLS
-identity. Securely copy `mpp-credential.key` and the public
-`server-cert.pem` to the client:
+For a quick proxy-only trial, generate one credential file, one transport key,
+and a server TLS identity. Securely copy `mpp-credential.key`,
+`mpp-transport.key`, and the public `server-cert.pem` to the client:
 
 ```text
 umask 077
 openssl rand -hex 32 > mpp-credential.key
+openssl rand -out mpp-transport.key 32
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -subj "/CN=mptunnel.example" \
   -addext "subjectAltName=DNS:mptunnel.example" \
@@ -38,6 +39,7 @@ Start the server:
 ```text
 ./mptunnel --credential-secret-file ./mpp-credential.key \
   server \
+  --transport-secret-file ./mpp-transport.key \
   --tls-certificate-chain ./server-cert.pem \
   --tls-private-key ./server-key.pem \
   --bind-path tcp://0.0.0.0:7443 \
@@ -50,6 +52,7 @@ Start the client:
 ```text
 ./mptunnel --credential-secret-file ./mpp-credential.key \
   client \
+  --transport-secret-file ./mpp-transport.key \
   --tls-pinned-certificate ./server-cert.pem \
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
@@ -57,17 +60,10 @@ Start the client:
   --path udp://server.example.com:7443
 ```
 
-The certificate name defaults to `mptunnel.example`. Optional transport
-protection uses a separate raw 32-byte endpoint secret, passed to both commands
-as `--transport-secret-file`:
-
-```text
-openssl rand -out mpp-transport.key 32
-# add to the server command: --transport-secret-file ./mpp-transport.key
-# add to the client command: --transport-secret-file ./mpp-transport.key
-```
-
-Do not reuse an MPP client credential as this endpoint-wide secret.
+The certificate name defaults to `mptunnel.example`. The commands use the
+separate raw 32-byte endpoint key. The flag is optional so both peers can
+instead use TLS TCP and public QUIC Initials. Do not reuse an MPP client
+credential as this endpoint-wide key.
 
 For a persistent setup, copy `examples/client.toml` or
 `examples/server.toml`, replace every placeholder, supply the referenced TLS

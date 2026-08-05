@@ -298,7 +298,7 @@ fn ablation_row(name: &str, path_profile: &str, paths: Vec<VirtualPath>) -> Abla
     let mut page_simulator = Simulator::new(paths.clone());
     page_simulator
         .schedule_transfer(TrafficClass::Throughput, 128 * MIB, MIB)
-        .expect("ablation paths schedule background bulk");
+        .expect("ablation paths schedule concurrent bulk");
     let page_interactive_p95_ms = page_simulator
         .route_interactive_burst(1024, 20, 5.0)
         .expect("ablation paths schedule interactive burst")
@@ -414,7 +414,7 @@ fn page_load_benchmark() -> PageLoadMetrics {
     let mut interactive_simulator = Simulator::new(browser_paths());
     interactive_simulator
         .schedule_transfer(TrafficClass::Throughput, 128 * MIB, MIB)
-        .expect("benchmark paths schedule background bulk");
+        .expect("benchmark paths schedule concurrent bulk");
     let interactive_p95_ms = interactive_simulator
         .route_interactive_burst(1024, 20, 5.0)
         .expect("benchmark paths schedule interactive burst")

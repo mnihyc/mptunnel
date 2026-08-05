@@ -67,6 +67,16 @@ class RunnerContractTests(unittest.TestCase):
 
         self.assertIn("MPTUNNEL_CARRIER_PRESENTATION", provenance)
         self.assertIn("mptunnel_carrier_presentation", provenance)
+        self.assertIn(
+            'MPTUNNEL_LAB_SHARED_TRANSPORT_SECRET:-1',
+            SCRIPT,
+        )
+        self.assertIn('mptunnel_transport_profile="shared-secret"', SCRIPT)
+        self.assertIn('mptunnel_transport_profile="standard"', SCRIPT)
+        self.assertIn(
+            'MPTUNNEL_TRANSPORT_PROFILE="$mptunnel_transport_profile"',
+            SCRIPT,
+        )
         self.assertIn("lab evidence supports only MPP wire protocol", SCRIPT)
         for name in (
             "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS",

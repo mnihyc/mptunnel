@@ -10,6 +10,11 @@ CONNECT, TCP/UDP port forwarding, TUN, routing, DNS policy, outbound selection,
 balancing, persistent configuration, live management, and connection
 diagnostics.
 
+TUN is available either as routed Product TUN-L4 or as a first-class TUN-L3
+packet tunnel with server-owned address pools and explicit per-principal
+allocations. TUN-L3 can use TCP and QUIC together and leaves host routes, DNS,
+firewall policy, forwarding, and NAT under operator control.
+
 ## Contents
 
 - [Why MPTUNNEL?](#why-mptunnel)
@@ -41,7 +46,7 @@ rank paths from live latency and delivery evidence, choose differently for
 upload and download, and move undelivered ranges to a surviving carrier.
 
 ```text
-SOCKS5 / HTTP CONNECT / port forward / TUN
+SOCKS5 / HTTP CONNECT / port forward / TUN-L4
                        |
              routing, DNS, outbounds
                        |

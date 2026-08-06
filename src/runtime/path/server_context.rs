@@ -18,6 +18,7 @@ use crate::runtime::path::{ServerDatagramPort, ServerStreamPort};
 use crate::runtime::peer_status::PeerStatusBroker;
 use crate::runtime::recent_ids::ExpiringReplayCache;
 use crate::runtime::telemetry::RuntimeTelemetry;
+use crate::runtime::tun_l3::{ServerIpTunnelDevice, ServerIpTunnelPort};
 use crate::transport::PathSpec;
 use crate::transport::encrypted::TcpServerTlsConfig;
 use std::collections::HashMap;
@@ -150,6 +151,8 @@ pub(in crate::runtime) struct ServerPathContext {
     pub(in crate::runtime) tls: TcpServerTlsConfig,
     pub(in crate::runtime) reliable_streams: ServerStreamPort,
     pub(in crate::runtime) datagrams: ServerDatagramPort,
+    pub(in crate::runtime) ip_tunnels: Option<ServerIpTunnelPort>,
+    pub(in crate::runtime) ip_tunnel_device: Arc<Mutex<Option<ServerIpTunnelDevice>>>,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     #[allow(
         dead_code,
@@ -162,6 +165,13 @@ pub(in crate::runtime) struct ServerPathContext {
 }
 
 impl ServerPathContext {
+    pub(in crate::runtime) fn take_ip_tunnel_device(&self) -> Option<ServerIpTunnelDevice> {
+        self.ip_tunnel_device
+            .lock()
+            .expect("server IP tunnel device lock")
+            .take()
+    }
+
     pub(in crate::runtime) fn validate_credential_authority_replacement(
         &self,
         authority: &CredentialAuthority,

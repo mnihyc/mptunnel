@@ -17,16 +17,18 @@ use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
-    ClientPathObservation, UdpPathCandidate, UdpPathRuntimeModel, apply_bulk_latency_isolation,
-    bulk_candidate_has_bulk_rate_evidence, bulk_candidate_has_fresh_native_carrier_rate_evidence,
-    bulk_path_candidate, configured_order_path_indices, configured_order_path_scores,
+    ClientPathObservation, PacketPathCandidate, PacketPathSelectionInput, UdpPathCandidate,
+    UdpPathRuntimeModel, apply_bulk_latency_isolation, bulk_candidate_has_bulk_rate_evidence,
+    bulk_candidate_has_fresh_native_carrier_rate_evidence, bulk_path_candidate,
+    configured_order_path_indices, configured_order_path_scores,
     endpoint_only_reliable_startup_should_preserve_configured_order, health_observations,
-    ordered_path_scores, ordered_path_scores_for_ttl, path_allows_automatic_bulk_use,
-    path_can_be_auto_discovered, path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot,
-    path_startup_snapshot, reliable_reservation_should_use_endpoint_only_startup_order,
-    reliable_stream_path_candidates, reliable_stream_startup_path_scores,
-    udp_datagram_payload_limit_bytes, udp_observation_has_datagram_feedback,
-    udp_path_has_realtime_model, udp_reliable_stream_loss_reinjection_penalty_ms,
+    ordered_path_scores, ordered_path_scores_for_ttl, packet_path_snapshot,
+    path_allows_automatic_bulk_use, path_can_be_auto_discovered, path_is_endpoint_only,
+    path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
+    reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
+    reliable_stream_startup_path_scores, udp_datagram_payload_limit_bytes,
+    udp_observation_has_datagram_feedback, udp_path_has_realtime_model,
+    udp_reliable_stream_loss_reinjection_penalty_ms,
 };
 use crate::runtime::path::state::RelayPathLoadLease;
 use crate::scheduler::{self, PathSnapshot, PathState as SchedulerPathState, TrafficClass};
@@ -63,6 +65,48 @@ pub(in crate::runtime) struct ReliableRequestPathBatchObservation {
 }
 
 impl ClientPathContext {
+    /// Observes packet-service-ready attachments under one coherent health
+    /// lock and ranks them without reserving Product load or mutating queues.
+    pub(in crate::runtime) fn ordered_packet_path_candidates(
+        &self,
+        inputs: &[PacketPathSelectionInput],
+        packet_bytes: usize,
+    ) -> Vec<PacketPathCandidate> {
+        let now = Instant::now();
+        let health = self.state.health().lock().expect("client path health lock");
+        let mut candidates = inputs
+            .iter()
+            .copied()
+            .filter_map(|input| {
+                let attachment = input.attachment;
+                let path = match attachment.key.underlay {
+                    UnderlayProtocol::Tcp => self.tcp_path_spec(attachment.key.index),
+                    UnderlayProtocol::Udp => self.udp_paths.get(attachment.key.index),
+                }?;
+                let observation = health
+                    .path_record(attachment.key)?
+                    .observation_for_instance_at(attachment.path_instance_id, now)?;
+                let mut snapshot = packet_path_snapshot(path, attachment.key.index, observation);
+                snapshot.active_flows = input.active_flows;
+                let eta_ms =
+                    scheduler::score_path(snapshot, TrafficClass::RealtimeDatagram, packet_bytes)?
+                        .eta_ms;
+                Some(PacketPathCandidate {
+                    attachment,
+                    snapshot,
+                    eta_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            scheduler::path_is_backup(left.snapshot)
+                .cmp(&scheduler::path_is_backup(right.snapshot))
+                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
+                .then_with(|| self.relay_path_key_order(left.attachment.key, right.attachment.key))
+        });
+        candidates
+    }
+
     fn sort_reliable_path_candidates(
         &self,
         candidates: &mut [BulkPathCandidate],

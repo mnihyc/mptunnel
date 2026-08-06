@@ -200,7 +200,15 @@ impl PacketDeviceProvider for SystemPacketDeviceProvider {
     target_os = "netbsd",
 ))]
 fn open_system_packet_device(config: &PacketDeviceConfig<'_>) -> io::Result<PacketDevice> {
-    let mut builder = tun_rs::DeviceBuilder::new().mtu(config.mtu);
+    let builder = tun_rs::DeviceBuilder::new();
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    let builder = builder.associate_route(false);
+    let mut builder = builder.mtu(config.mtu);
     if let Some(interface_name) = &config.interface_name {
         builder = builder.name((*interface_name).to_owned());
     }

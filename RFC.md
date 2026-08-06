@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 6
+# MPTunnel Multipath Proxy Protocol (MPP) Version 7
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 6: its wire format, carrier profiles,
+This document specifies MPP version 7: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 6 is identified by the frame header in Section 12. A peer MUST
+Wire version 7 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -33,7 +33,7 @@ rules specified here.
 
 ## 2. Scope and Non-Goals
 
-MPP carries application byte streams and datagrams over one or more
+MPP carries application byte streams, datagrams, and complete IP packets over one or more
 authenticated transport connections. A carrier uses TCP or QUIC over UDP.
 TCP reliability, congestion control, retransmission, and packetization remain
 owned by the TCP stack. QUIC retains packetization, congestion control, loss
@@ -43,7 +43,7 @@ profile; neither profile changes that native transport ownership.
 
 MPP owns the data level above those transports:
 
-- authenticated session, stream, flow, and MPP Path ID namespaces;
+- authenticated session, stream, datagram-flow, IP-tunnel, and MPP Path ID namespaces;
 - a separate absolute offset space for each direction of each reliable stream;
 - ordered delivery, deduplication, MPP Data ACK ranges, and shared receive
   credit;
@@ -51,6 +51,11 @@ MPP owns the data level above those transports:
 - selection among eligible carriers;
 - bounded cross-carrier reinjection and failover; and
 - application demand used as a mutable scheduling objective.
+
+The optional IP packet service is a distinct data plane. It forwards complete
+IPv4 and IPv6 packets without terminating their transport protocols. MPP does
+not acknowledge or retransmit those packets above a carrier and does not
+install routes, DNS policy, firewall rules, or NAT state for them.
 
 MPP does not:
 
@@ -156,13 +161,27 @@ third transport protocol.
   or inferred from locators. Member ordinal zero is the configured endpoint's
   primary member; greater ordinals are its correlated siblings.
 
+**IP tunnel**
+: One authenticated layer-3 packet service identified by an `IpTunnelId`.
+  One logical tunnel may have an attachment on multiple carrier instances.
+  Its assigned addresses and routed-prefix ownership come from server policy,
+  never from an outer locator or an address claimed by a packet.
+
+**IP tunnel attachment**
+: One IP tunnel's membership on one exact carrier instance. Failure or ordered
+  retirement of that carrier removes only that attachment.
+
+**Packet flow**
+: A direction-local stable classification derived from an inner IP packet for
+  carrier affinity. It is local scheduling state and is not a wire identity.
+
 ## 4. Architecture and Authority
 
 The ownership boundary is:
 
 ```text
 application
-    MPP reliable stream or datagram
+    MPP reliable stream | datagram | IP packet service
         per-direction offsets, Data ACK, shared credit, bounded reinjection
             regular-before-backup carrier selection
                 TCP controller | QUIC controller
@@ -171,7 +190,7 @@ application
 
 ### 4.1 MPP authority
 
-MPP owns stream and datagram identity, offset assignment, Data ACK processing,
+MPP owns stream, datagram, and IP-tunnel identity, offset assignment, Data ACK processing,
 shared receive credit, carrier selection, bounded reinjection, and exact
 data-level deduplication.
 
@@ -309,7 +328,7 @@ two frames before `PATH_JOIN`.
 The `SESSION_AUTH` transcript is:
 
 ```text
-"mptunnel session auth v6" ||
+"mptunnel session auth v7" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 nonce:16B ||
@@ -332,7 +351,7 @@ issued_at_unix_secs:u64
 The common `PATH_JOIN` transcript is:
 
 ```text
-"mptunnel path join v6" ||
+"mptunnel path join v7" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 path_id:u16 || underlay:u8 ||
@@ -699,6 +718,44 @@ buffered within the preceding bound.
 Closing a flow releases its live-flow charge. A flow ID already used on one
 request stream MUST NOT reopen on that request stream; later monotonically
 allocated IDs remain valid for its lifetime.
+
+### 6.4 Native IP Packets
+
+An admitted IP tunnel uses the same RFC 9297 request-stream association and
+negotiation requirements as Section 6.3. The payload following the Quarter
+Stream ID is:
+
+```text
+0       extension version       u8; 2
+1..9    tunnel_id               u64
+9..17   packet_id               u64
+17..19  fragment_index          u16; zero based
+19..21  fragment_count          u16; 1 through 64
+21..25  total_payload_length    u32; nonzero
+25..    fragment payload
+```
+
+Multibyte fields use network byte order. Version 2 is distinct from the
+version-1 application-datagram envelope; an implementation MUST NOT reinterpret
+either envelope as the other. The sender fragments against the current maximum
+QUIC datagram size and MUST reject a packet requiring more than 64 fragments.
+
+`OPEN_IP_TUNNEL` and `IP_TUNNEL_READY` MUST complete their reliable transitions
+before either direction sends `IP_PACKET` on that request association. Because
+a QUIC Datagram may overtake reliable DATA already submitted by its sender, a
+receiver MAY retain a complete or partial version-2 packet until the matching
+ready transition for no longer than:
+
+```text
+clamp(2 * current QUIC RTT, 25 ms, 250 ms)
+```
+
+That receiver-owned interval starts when the first fragment is received. It
+also bounds incomplete reassembly. Route, packet, byte, association, fragment,
+and reassembly counts remain bounded, and expiry releases every resource
+charge. A packet for a closed or different tunnel association is silently
+dropped. Native IP delivery adds no MPP acknowledgment, retransmission,
+ordering, or flow control.
 
 ## 7. Carrier Lifecycle and Directional Usage
 
@@ -1103,7 +1160,7 @@ or a bounded live-tail condition. It MUST remain within:
 Missing MPP progress alone does not authorize unbounded copies. Native
 transport recovery continues independently.
 
-## 9. Datagrams
+## 9. Datagrams and IP Packets
 
 ### 9.1 Flow and datagram identity
 
@@ -1147,6 +1204,79 @@ reattach the same session, flow, and target within the configured retention
 interval.
 
 The exact bounded retry profile is specified in Section 15.
+
+### 9.3 IP tunnel admission and ownership
+
+`OPEN_IP_TUNNEL(tunnel_id)` attaches one authenticated carrier to a logical IP
+tunnel. The server admits the request only when the carrier's authenticated
+principal has an explicit allocation in that MPP inbound's address plan. It
+replies with `IP_TUNNEL_READY(tunnel_id, mtu, addresses)` on that exact
+attachment or `IP_TUNNEL_CLOSE(tunnel_id, POLICY_REJECTED)`.
+
+An address plan contains server-owned IPv4 and/or IPv6 pools, the server's TUN
+address in each enabled pool, and explicit principal-to-address allocations.
+It MAY contain additional principal-owned prefixes for site routing. Pools and
+prefixes are server configuration, not negotiated wire state. The server MUST
+reject duplicate address ownership, cross-principal prefix overlap, an
+allocation outside its pool, and any peer prefix containing a server address.
+Credential rotation does not alter an allocation because ownership binds to
+the authenticated principal, not to a credential ID or outer source address.
+
+An MPP inbound admits at most one live logical IP tunnel for one principal.
+Opening a different session or tunnel identity for that principal atomically
+supersedes the previous attachment set. This is authenticated takeover for
+restart and roaming; an outer source locator is neither consulted nor retained.
+
+The ready address list contains at most one IPv4 and one IPv6 host address.
+The receiver MUST NOT infer, publish, or install a route, DNS server, firewall
+rule, or NAT rule from the ready frame. The MTU MUST be at least 576 and MUST
+be at least 1280 when IPv6 is assigned. A client opens its packet device only
+after this frame is accepted.
+
+Every client-to-server packet MUST have a source address owned by the
+authenticated principal. Every server-to-client packet MUST have a destination
+address owned by that principal. The server drops a packet that fails parsing,
+exceeds the negotiated MTU, or violates ownership. It MUST NOT use an outer
+locator as peer identity and MUST NOT learn ownership from packet contents.
+
+`IP_TUNNEL_CLOSE` removes only the tunnel attachment on the carrying carrier.
+The logical tunnel remains available while another authenticated attachment
+exists or can be established. Carrier loss has the same attachment effect
+without requiring a close frame. A non-normal open rejection is local to that
+exact carrier lifetime and MUST NOT be retried on the same carrier instance.
+Lifecycle close delivery MUST NOT be discarded or blocked indefinitely behind
+packet-payload queue pressure.
+
+### 9.4 IP packet delivery and carrier selection
+
+`IP_PACKET(tunnel_id, packet_id, payload)` carries exactly one complete IPv4 or
+IPv6 packet. `packet_id` is directional and monotonic within the logical
+tunnel. It provides a bounded stale-handoff and duplicate-suppression identity;
+it does not create MPP delivery acknowledgment, retransmission, ordering, or
+flow control. The inner TTL or Hop Limit is forwarded unchanged.
+
+On QUIC, `OPEN_IP_TUNNEL`, `IP_TUNNEL_READY`, and `IP_TUNNEL_CLOSE` use the
+reliable request stream while `IP_PACKET` uses request-stream-associated QUIC
+Datagrams and the bounded fragmentation envelope in Section 6.4. On TCP all
+four frames use the carrier's ordered framing. TCP reliability therefore
+applies to a TCP attachment; MPP MUST NOT add another retry or copy after the
+frame is accepted by that carrier.
+
+TCP and QUIC attachments are equally eligible after authentication,
+validation, readiness, usage, MTU, and queue admission. An implementation MUST
+NOT select a carrier family from protocol name alone. Each direction selects
+independently from current native rate, RTT, loss, congestion, queue, and
+configured regular/backup evidence.
+
+The packet scheduler SHOULD retain a healthy exact-carrier binding for one
+inner flow to avoid transport-damaging reordering. It MAY reselect immediately
+after exact carrier failure, retirement, MTU incompatibility, or terminal queue
+loss, and MAY reselect at a flowlet boundary derived from current transport
+timing. Queue fullness drops the current packet; it does not prove path failure
+or authorize a duplicate. Opposite directions have independent affinity, so
+asymmetric carriers may be selected independently. Selection MAY include
+direction-local packet-flow load, but that evidence MUST age with actual flow
+activity and MUST NOT be borrowed from Product flow accounting.
 
 ## 10. Core Scheduling Requirements
 
@@ -1330,7 +1460,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        6
+4      version        7
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -1376,14 +1506,21 @@ frames.
 | 35 | `PATH_CAPACITY_RECEIPT` | `path_id:u16, measurement_id:u64, received_payload_bytes:u64` |
 | 36 | `PEER_STATUS_REQUEST` | `request_id:u64` |
 | 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]` |
-Kinds 5, 6, 15, 19, 25, 26, 28, 29, and 38 through 41 are reserved and MUST
-NOT be sent.
+| 38 | `OPEN_IP_TUNNEL` | `tunnel_id:u64` |
+| 39 | `IP_TUNNEL_READY` | `tunnel_id:u64, mtu:u16, address_count:u8, addresses[address_count]` |
+| 40 | `IP_PACKET` | `tunnel_id:u64, packet_id:u64, length:u32, bytes` |
+| 41 | `IP_TUNNEL_CLOSE` | `tunnel_id:u64, reason:u8` |
+Kinds 5, 6, 15, 19, 25, 26, 28, and 29 are reserved and MUST NOT be sent.
 
 `SESSION_HELLO` and `SESSION_AUTH` are QUIC carrier-admission frames; TCP uses
 the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, and kinds 33 through 35
 are TCP-only. Receiving a carrier-incompatible frame is a
 protocol violation. `PATH_DRAIN` is client-to-server only; `PATH_CLOSE` is
 server-to-client only and requires a matching `PATH_DRAIN`.
+
+Kinds 38 through 41 are valid only when the endpoint has enabled the IP packet
+service. `OPEN_IP_TUNNEL` is client-to-server, `IP_TUNNEL_READY` is
+server-to-client, and `IP_PACKET` and `IP_TUNNEL_CLOSE` are bidirectional.
 
 ### 12.3 Common field encodings
 
@@ -1400,6 +1537,10 @@ A credential ID begins with a `u8` length from 1 through 64. Its first ASCII
 byte is a lowercase letter or digit. Remaining bytes are lowercase letters,
 digits, `.`, `_`, or `-`. Receivers reject rather than normalize noncanonical
 text.
+
+An assigned IP address begins with family `4` followed by four address bytes,
+or family `6` followed by sixteen address bytes. A ready frame contains at
+most one address of each family and at least one address.
 
 Demand values are latency `1`, throughput `2`, and realtime `3`. Underlay
 values are TCP `1` and UDP `2`. Directional wire fields use client-to-server
@@ -1531,7 +1672,7 @@ carrier presentation defeats a source-aware classifier. Fixed private
 cleartext protocol markers are avoided, but authenticated tunneling—not
 traffic impersonation—is the security objective.
 
-## 15. MPTunnel Core Profile 6
+## 15. MPTunnel Core Profile 7
 
 This section specifies the transport-neutral Core policy used with the wire
 semantics above. It defines Core conformance, not peer interoperability.
@@ -1826,6 +1967,13 @@ A conforming implementation preserves all of the following:
     original placement. Every exact instance already in that group reaches
     terminal state through ordered carrier retirement; re-enable creates fresh
     instances and never cancels a drain already begun.
+28. An IP packet's authenticated principal comes from carrier admission, never
+    from an outer locator or a claimed inner source address.
+29. IP packet delivery installs no MPP acknowledgment, retransmission, global
+    reorder buffer, congestion window, route, DNS, firewall, or NAT state.
+30. TCP and QUIC IP-tunnel attachments remain equally eligible; each direction
+    preserves inner-flow affinity until an exact failure or a transport-derived
+    flowlet boundary permits safe reselection.
 ## 17. Relationship to Existing Standards
 
 ### 17.1 MPTCP
@@ -1884,6 +2032,20 @@ apply that algorithm above independent TCP and QUIC carriers. This document's
 fairness requirement is limited to preserving native transport authority and
 bounded MPP work.
 
+### 17.5 Layer-3 address ownership
+
+WireGuard's cryptokey routing associates each authenticated peer with allowed
+inner addresses and prefixes, using them as a source-ownership check on receive
+and a peer lookup on send. Its tunnel interface remains separate from ordinary
+host route configuration. MPP's IP-tunnel service follows those ownership and
+interface boundaries, but binds them to an authenticated MPP principal and may
+carry packets over eligible TCP and QUIC attachments.
+
+OpenVPN 2.6 distinguishes server address pools, stable per-client address
+assignment, and client-owned internal prefixes from host routing and gateway
+redirection. MPP uses only explicit principal allocations inside configured
+pools; it neither leases addresses dynamically nor installs host routes.
+
 ## 18. References
 
 ### 18.1 Normative
@@ -1907,3 +2069,5 @@ bounded MPP work.
 - [RFC 8985: The RACK-TLP Loss Detection Algorithm for
   TCP](https://www.rfc-editor.org/rfc/rfc8985.html)
 - [RFC 9298: Proxying UDP in HTTP](https://www.rfc-editor.org/rfc/rfc9298.html)
+- [OpenVPN 2.6 Manual](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html)
+- [WireGuard: Cryptokey Routing](https://www.wireguard.com/#cryptokey-routing)

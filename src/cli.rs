@@ -1246,6 +1246,7 @@ impl ClientArgs {
             }],
             gateway_balancers: Vec::new(),
             local_ingresses: ingresses,
+            tun_l3_ingresses: Vec::new(),
             product_policy: Some(policy),
             dns_policy,
             servers: Vec::new(),
@@ -1553,6 +1554,7 @@ impl ServerArgs {
             performance: MppPerformanceConfig {
                 extra_traffic_hint_percent: self.extra_traffic_hint_percent,
             },
+            tun_l3: None,
         };
         Ok(NodeConfig {
             outbounds: vec![OutboundLeafConfig::Local {
@@ -1562,6 +1564,7 @@ impl ServerArgs {
             }],
             gateway_balancers: Vec::new(),
             local_ingresses: Vec::new(),
+            tun_l3_ingresses: Vec::new(),
             product_policy: None,
             dns_policy,
             servers: vec![server],

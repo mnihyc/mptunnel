@@ -185,6 +185,7 @@ impl ServerUdpTerminalWriterFixture {
             peer_status: PeerStatusBroker::new(false),
             peer_status_snapshot: PeerStatusSnapshotSource::new(|| Some(Vec::new())),
             authenticated_carriers: crate::runtime::path::AuthenticatedCarrierInventory::default(),
+            ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub::default(),
         };
         let client_carrier = CarrierSocket::system(CarrierSocketRequest {
             path: &client_path,

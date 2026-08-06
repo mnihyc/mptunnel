@@ -25,17 +25,102 @@ pub(in crate::runtime) use self::state::ClientTcpPathSessionRuntime;
 use self::stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
 use crate::model::path::CarrierPathInstanceId;
 use crate::performance::ResourceLimits;
-use crate::protocol::{PathId, StreamDemandHint, StreamId, TargetAddr};
+use crate::protocol::{
+    CloseReason, Frame, IpPacketId, IpTunnelId, PathId, StreamDemandHint, StreamId, TargetAddr,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenDeadlines, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
     ReliablePathCommandSender, reliable_path_command_channels, reliable_path_command_queue,
 };
 use crate::scheduler::TrafficClass;
+use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+pub(in crate::runtime) struct ClientTcpIpTunnelAttachment {
+    handle: ClientTcpPathSessionHandle,
+    commands: ReliablePathCommandSender,
+    tunnel_id: IpTunnelId,
+    path_instance_id: CarrierPathInstanceId,
+    opened: AtomicBool,
+}
+
+impl ClientTcpIpTunnelAttachment {
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.path_instance_id
+    }
+
+    pub(in crate::runtime) fn is_current(&self) -> bool {
+        self.handle.connection_instance_id() == Some(self.path_instance_id)
+    }
+
+    pub(in crate::runtime) async fn start(
+        &self,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<(), RuntimeError> {
+        if !self.is_current() {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        self.opened.store(true, Ordering::Release);
+        let queued = tokio::select! {
+            result = self.commands.send_control(ReliablePathCommand::SendFrame(
+                Frame::OpenIpTunnel { tunnel_id: self.tunnel_id },
+            )) => result,
+            _ = tokio::time::sleep_until(open_deadline) => {
+                self.opened.store(false, Ordering::Release);
+                return Err(RuntimeError::PathOpenTimedOut);
+            }
+        };
+        if queued.is_err() {
+            self.opened.store(false, Ordering::Release);
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        }
+        if !self.is_current() {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        Ok(())
+    }
+
+    pub(in crate::runtime) fn try_send(
+        &self,
+        packet_id: IpPacketId,
+        payload: Bytes,
+    ) -> Result<(), RuntimeError> {
+        if !self.is_current() {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        self.commands.try_enqueue_admitted_frame(
+            Frame::IpPacket {
+                tunnel_id: self.tunnel_id,
+                packet_id,
+                payload,
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+    }
+
+    pub(in crate::runtime) async fn wait_retired(&self) {
+        let mut changes = self.handle.runtime.carrier_groups.subscribe();
+        while self.is_current() && changes.changed().await.is_ok() {}
+    }
+}
+
+impl Drop for ClientTcpIpTunnelAttachment {
+    fn drop(&mut self) {
+        if self.opened.load(Ordering::Acquire) && self.is_current() {
+            let _ = self.commands.try_enqueue_admitted_frame(
+                Frame::IpTunnelClose {
+                    tunnel_id: self.tunnel_id,
+                    reason: CloseReason::Normal,
+                },
+                TrafficClass::Control,
+            );
+        }
+    }
+}
 
 pub(in crate::runtime) struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
@@ -281,6 +366,31 @@ impl ClientTcpPathSessionHandle {
         }
     }
 
+    pub(in crate::runtime) async fn prepare_ip_tunnel_attachment(
+        &self,
+        tunnel_id: IpTunnelId,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<ClientTcpIpTunnelAttachment, RuntimeError> {
+        let mut changes = self.runtime.carrier_groups.subscribe();
+        loop {
+            let (session, observed_instance) = self
+                .wait_for_ready_session_slot(&mut changes, open_deadline)
+                .await?;
+            let commands = session.commands.clone();
+            let path_instance_id = CarrierPathInstanceId::from_raw(observed_instance);
+            if self.connection_instance_id() != Some(path_instance_id) {
+                continue;
+            }
+            return Ok(ClientTcpIpTunnelAttachment {
+                handle: self.clone(),
+                commands,
+                tunnel_id,
+                path_instance_id,
+                opened: AtomicBool::new(false),
+            });
+        }
+    }
+
     /// Establishes the durable carrier without creating a product stream.
     #[cfg(test)]
     pub(in crate::runtime) async fn prepare_connection(
@@ -464,6 +574,14 @@ impl ClientTcpPathSessionHandle {
             0 => None,
             instance_id => Some(CarrierPathInstanceId::from_raw(instance_id)),
         }
+    }
+
+    pub(in crate::runtime) async fn wait_for_connection_instance_change(
+        &self,
+        previous: CarrierPathInstanceId,
+    ) {
+        let mut changes = self.runtime.carrier_groups.subscribe();
+        while self.connection_instance_id() == Some(previous) && changes.changed().await.is_ok() {}
     }
 
     #[cfg(test)]

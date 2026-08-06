@@ -74,6 +74,7 @@ fn tun_host_runtime_config(host: TunHostConfig) -> AppConfig {
                     ..TunL4Config::default()
                 }),
             }],
+            tun_l3_ingresses: Vec::new(),
             product_policy: None,
             dns_policy: DnsPolicyConfig::default(),
             servers: Vec::new(),

@@ -1,9 +1,9 @@
 use super::*;
 use crate::config::{CanonicalConfigStore, ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::runtime::config_control::RuntimeConfigControl;
-use crate::runtime::management::ProductRuntimeInventory;
 use crate::runtime::management::http::health_response;
 use crate::runtime::management::snapshot::ManagementState;
+use crate::runtime::management::{ProductRuntimeInventory, TunL3RuntimeInventory};
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::readiness::RuntimeReadinessBarrier;
 use crate::runtime::telemetry::RuntimeTelemetry;
@@ -179,6 +179,7 @@ fn target_from_document(
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: Some(control.clone()),

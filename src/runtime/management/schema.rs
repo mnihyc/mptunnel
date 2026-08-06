@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::gateway::ManagementBalancerStatus;
 
-pub(super) const SCHEMA: &str = "mptunnel.management.v5";
+pub(super) const SCHEMA: &str = "mptunnel.management.v6";
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementSnapshot {
@@ -25,6 +25,7 @@ pub(super) struct ManagementSnapshot {
     pub(super) uptime_ms: u64,
     pub(super) services: ManagementServices,
     pub(super) local_inbounds: Vec<ManagementIngressStatus>,
+    pub(super) tun_l3_services: Vec<ManagementTunL3Status>,
     pub(super) outbounds: Vec<ManagementOutboundStatus>,
     pub(super) summary: ManagementSummary,
     pub(super) admission: ManagementAdmission,
@@ -79,10 +80,24 @@ pub(super) struct ManagementServices {
     pub(super) mpp_outbounds: usize,
     pub(super) mpp_inbounds: usize,
     pub(super) local_inbounds: usize,
+    pub(super) tun_l3_services: usize,
     pub(super) local_outbounds: usize,
     pub(super) outbounds: usize,
     pub(super) balancers: usize,
     pub(super) configured_path_listeners: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ManagementTunL3Status {
+    pub(super) role: &'static str,
+    pub(super) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) interface_name: Option<String>,
+    pub(super) mpp_binding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mtu: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) allocation_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]

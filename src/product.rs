@@ -12,6 +12,7 @@ mod gateway;
 mod identity;
 mod routing;
 mod rule_set;
+mod tun_l3;
 
 pub use acl::{
     AclEffect, AclError, AclRuleSpec, AclVerdict, AuthorizedDomainTarget, AuthorizedResolution,
@@ -66,6 +67,9 @@ pub use rule_set::{
     MAX_RULE_SET_ENVELOPE_BYTES, MAX_RULE_SET_PAYLOAD_BYTES, MAX_RULE_SET_PUBLISHERS,
     MAX_RULE_SETS, RULE_SET_SCHEMA_VERSION, RULE_SET_SIGNATURE_CONTEXT, RuleSetError, RuleSetId,
     RuleSetPublisher, RuleSetPublisherCatalog, RuleSetPublisherId, VerifiedRuleSet,
+};
+pub use tun_l3::{
+    TunL3AddressPlan, TunL3AllocationSpec, TunL3PeerAllocation, TunL3PlanError, TunL3ServerSpec,
 };
 
 /// One immutable Product-policy generation shared by all new-flow inbounds.

@@ -7,9 +7,10 @@ use super::{
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
     DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, GatewayBalancerConfig,
     LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
-    MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NodeConfig, OutboundLeafConfig,
-    ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits, SecurityPolicyError,
-    ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret,
+    MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NamedTunL3Config, NodeConfig,
+    OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits,
+    SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
+    SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -20,7 +21,7 @@ use crate::ingress::{
     DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS, DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS, IngressConfig,
     LocalIngressAdmissionConfig, LocalIngressAdmissionConfigError, LocalProxyUser,
     MAX_LOCAL_PROXY_USERS, PortForwardTarget, ProxyAuthConfig, ProxyAuthConfigError,
-    TcpForwardConfig, UdpForwardConfig,
+    TcpForwardConfig, TunL3IngressConfig, UdpForwardConfig,
 };
 use crate::outbound::{
     HttpsProxyConfig, OutboundConfig, OutboundError, ProxyConfig, ProxyCredentials,
@@ -40,7 +41,8 @@ use crate::product::{
     GatewayStickinessKey, GatewayStickinessPolicy, GatewayStrategy, InboundId, InitialDemand,
     MAX_RULE_SET_ENVELOPE_BYTES, Network, OutboundId, PortRange, PrincipalId, ProtocolTarget,
     RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage, RuleId, RuleSetId, RuleSetPublisher,
-    RuleSetPublisherCatalog, RuleSetPublisherId, VerifiedRuleSet,
+    RuleSetPublisherCatalog, RuleSetPublisherId, TunL3AddressPlan, TunL3AllocationSpec,
+    TunL3ServerSpec, VerifiedRuleSet,
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{EndpointParseError, PathSpecParseError};
@@ -200,13 +202,14 @@ impl FileConfig {
             &local_inbound_names,
             &parsed_outbounds,
         )?;
-        let (outbounds, gateway_balancers, local_ingresses, servers) = build_node_services(
-            self.inbounds,
-            parsed_outbounds,
-            material_base,
-            &credential_catalog,
-            &local_user_catalog,
-        )?;
+        let (outbounds, gateway_balancers, local_ingresses, tun_l3_ingresses, servers) =
+            build_node_services(
+                self.inbounds,
+                parsed_outbounds,
+                material_base,
+                &credential_catalog,
+                &local_user_catalog,
+            )?;
         let config = AppConfig {
             logging: self.logging.into_config(material_base)?,
             check_config: self.check_config,
@@ -219,6 +222,7 @@ impl FileConfig {
                 outbounds,
                 gateway_balancers,
                 local_ingresses,
+                tun_l3_ingresses,
                 product_policy,
                 dns_policy,
                 servers,
@@ -1007,9 +1011,14 @@ enum InboundFileConfig {
         #[serde(default)]
         host: TunHostFileConfig,
     },
+    TunL3 {
+        name: String,
+        outbound: String,
+        interface_name: Option<String>,
+    },
     Mpp {
         name: String,
-        security: SecurityFileConfig,
+        security: Box<SecurityFileConfig>,
         #[serde(default)]
         performance: MppPerformanceFileConfig,
         #[serde(default)]
@@ -1019,7 +1028,91 @@ enum InboundFileConfig {
         outbound: Option<String>,
         balancer: Option<String>,
         dns_plan: Option<String>,
+        tun_l3: Option<TunL3ServerFileConfig>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TunL3ServerFileConfig {
+    interface_name: Option<String>,
+    ipv4_pool: Option<String>,
+    ipv4: Option<Ipv4Addr>,
+    ipv6_pool: Option<String>,
+    ipv6: Option<Ipv6Addr>,
+    mtu: Option<u16>,
+    #[serde(default)]
+    allocations: Vec<TunL3AllocationFileConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TunL3AllocationFileConfig {
+    principal_id: String,
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
+    #[serde(default)]
+    allowed_ips: Vec<String>,
+}
+
+impl TunL3ServerFileConfig {
+    fn into_plan(
+        self,
+        authority: &crate::product::CredentialAuthority,
+    ) -> Result<TunL3AddressPlan, ConfigFileError> {
+        let ipv4_pool = self
+            .ipv4_pool
+            .map(|value| {
+                value
+                    .parse::<ipnet::Ipv4Net>()
+                    .map_err(|error| ConfigFileError::TunL3(error.to_string()))
+            })
+            .transpose()?;
+        let ipv6_pool = self
+            .ipv6_pool
+            .map(|value| {
+                value
+                    .parse::<ipnet::Ipv6Net>()
+                    .map_err(|error| ConfigFileError::TunL3(error.to_string()))
+            })
+            .transpose()?;
+        let allocations = self
+            .allocations
+            .into_iter()
+            .map(|allocation| {
+                let principal_id = PrincipalId::parse(&allocation.principal_id)
+                    .map_err(|error| ConfigFileError::TunL3(error.to_string()))?;
+                let allowed_ips = allocation
+                    .allowed_ips
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .parse::<ipnet::IpNet>()
+                            .map_err(|error| ConfigFileError::TunL3(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(TunL3AllocationSpec {
+                    principal_id,
+                    ipv4: allocation.ipv4,
+                    ipv6: allocation.ipv6,
+                    allowed_ips,
+                })
+            })
+            .collect::<Result<Vec<_>, ConfigFileError>>()?;
+        TunL3AddressPlan::compile(
+            TunL3ServerSpec {
+                interface_name: self.interface_name,
+                ipv4_pool,
+                ipv4: self.ipv4,
+                ipv6_pool,
+                ipv6: self.ipv6,
+                mtu: self.mtu.unwrap_or(DEFAULT_TUN_MTU),
+                allocations,
+            },
+            authority,
+        )
+        .map_err(|error| ConfigFileError::TunL3(error.to_string()))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1971,7 +2064,7 @@ fn configured_local_inbound_names(
             | InboundFileConfig::TcpForward { name, .. }
             | InboundFileConfig::UdpForward { name, .. }
             | InboundFileConfig::Tun { name, .. } => name,
-            InboundFileConfig::Mpp { .. } => continue,
+            InboundFileConfig::TunL3 { .. } | InboundFileConfig::Mpp { .. } => continue,
         };
         let name = canonical_config_name(name)?;
         InboundId::parse(&name)
@@ -2386,6 +2479,7 @@ type BuiltNodeServices = (
     Vec<OutboundLeafConfig>,
     Vec<GatewayBalancerConfig>,
     Vec<LocalIngressConfig>,
+    Vec<NamedTunL3Config>,
     Vec<MppInboundConfig>,
 );
 
@@ -2398,6 +2492,7 @@ fn build_node_services(
 ) -> Result<BuiltNodeServices, ConfigFileError> {
     let mut inbound_names = HashSet::new();
     let mut local_ingresses = Vec::new();
+    let mut tun_l3_ingresses = Vec::new();
     let mut servers = Vec::new();
 
     for inbound in inbounds {
@@ -2528,6 +2623,24 @@ fn build_node_services(
                     ),
                 });
             }
+            InboundFileConfig::TunL3 {
+                name,
+                outbound,
+                interface_name,
+            } => {
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
+                let outbound = canonical_config_name(&outbound)?;
+                let outbound = OutboundId::parse(&outbound)
+                    .map_err(|error| ConfigFileError::TunL3(error.to_string()))?;
+                tun_l3_ingresses.push(NamedTunL3Config {
+                    name,
+                    config: TunL3IngressConfig {
+                        outbound,
+                        interface_name,
+                    },
+                });
+            }
             InboundFileConfig::Mpp {
                 name,
                 security,
@@ -2537,6 +2650,7 @@ fn build_node_services(
                 outbound,
                 balancer,
                 dns_plan,
+                tun_l3,
             } => {
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
@@ -2547,6 +2661,9 @@ fn build_node_services(
                 }
                 let server_security = security.server_auth_config(credential_catalog)?;
                 let tls = security.server_tls(material_base, &server_security)?;
+                let tun_l3 = tun_l3
+                    .map(|tun_l3| tun_l3.into_plan(&server_security.credential_authority))
+                    .transpose()?;
                 servers.push(MppInboundConfig {
                     name,
                     egress,
@@ -2562,6 +2679,7 @@ fn build_node_services(
                     tls,
                     destination_acl: destination_acl.into_config()?,
                     performance: performance.into_config(),
+                    tun_l3,
                 });
             }
         }
@@ -2590,10 +2708,16 @@ fn build_node_services(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    if local_ingresses.is_empty() && servers.is_empty() {
+    if local_ingresses.is_empty() && tun_l3_ingresses.is_empty() && servers.is_empty() {
         return Err(ConfigFileError::NoRuntimeServices);
     }
-    Ok((leaves, gateway_balancers, local_ingresses, servers))
+    Ok((
+        leaves,
+        gateway_balancers,
+        local_ingresses,
+        tun_l3_ingresses,
+        servers,
+    ))
 }
 
 fn resolve_egress(
@@ -3199,6 +3323,7 @@ pub enum ConfigFileError {
     MissingOutboundEndpoint,
     TunIpv4DisabledWithIpv4Options,
     ManagedVpnValue(String),
+    TunL3(String),
     ProxyUsernameRequired,
     ProxyPasswordRequired,
     PortForward(String),
@@ -3331,6 +3456,7 @@ impl std::fmt::Display for ConfigFileError {
             Self::ManagedVpnValue(error) => {
                 write!(f, "invalid managed VPN configuration: {error}")
             }
+            Self::TunL3(error) => write!(f, "invalid TUN-L3 configuration: {error}"),
             Self::ProxyUsernameRequired => write!(f, "proxy auth password requires username"),
             Self::ProxyPasswordRequired => write!(f, "proxy auth username requires password"),
             Self::PortForward(error) => write!(f, "invalid port-forward inbound: {error}"),
@@ -3389,6 +3515,7 @@ impl std::error::Error for ConfigFileError {
             | Self::MissingOutboundEndpoint
             | Self::TunIpv4DisabledWithIpv4Options
             | Self::ManagedVpnValue(_)
+            | Self::TunL3(_)
             | Self::ProxyUsernameRequired
             | Self::ProxyPasswordRequired
             | Self::PortForward(_)

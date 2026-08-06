@@ -1,13 +1,14 @@
 use super::{
-    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
-    PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
-    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IpPacketId, IpTunnelId,
+    OffsetRange, PathId, PathMetricDirection, PathMetrics, PathUsage, PeerPathState,
+    PeerPathStatus, PeerStatusCode, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
+    UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 104;
@@ -120,15 +121,18 @@ pub fn encoded_frame_capacity_hint(frame: &Frame) -> usize {
 
 fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
     match frame {
-        Frame::StreamData { payload, .. } | Frame::DatagramData { payload, .. } => {
-            payload.len().saturating_add(32)
-        }
+        Frame::StreamData { payload, .. }
+        | Frame::DatagramData { payload, .. }
+        | Frame::IpPacket { payload, .. } => payload.len().saturating_add(32),
         Frame::PathProofData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
             payload.len().saturating_add(16)
         }
         Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
         Frame::PeerStatusResponse { paths, .. } => PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN
             .saturating_add(paths.len().saturating_mul(PEER_PATH_STATUS_ENCODED_LEN)),
+        Frame::IpTunnelReady { addresses, .. } => {
+            16usize.saturating_add(addresses.len().saturating_mul(17))
+        }
         Frame::OpenStream { .. } => 128,
         _ => 64,
     }
@@ -466,6 +470,63 @@ fn encode_payload(
             }
             Ok(FrameKind::PeerStatusResponse)
         }
+        Frame::OpenIpTunnel { tunnel_id } => {
+            put_u64(out, tunnel_id.0);
+            Ok(FrameKind::OpenIpTunnel)
+        }
+        Frame::IpTunnelReady {
+            tunnel_id,
+            mtu,
+            addresses,
+        } => {
+            if *mtu < 576 || addresses.is_empty() || addresses.len() > 2 {
+                return Err(CodecError::InvalidIpTunnel);
+            }
+            put_u64(out, tunnel_id.0);
+            put_u16(out, *mtu);
+            put_u8(out, addresses.len() as u8);
+            let mut seen_v4 = false;
+            let mut seen_v6 = false;
+            for address in addresses {
+                match address {
+                    IpAddr::V4(address) if !seen_v4 => {
+                        seen_v4 = true;
+                        put_u8(out, 4);
+                        out.extend_from_slice(&address.octets());
+                    }
+                    IpAddr::V6(address) if !seen_v6 => {
+                        seen_v6 = true;
+                        put_u8(out, 6);
+                        out.extend_from_slice(&address.octets());
+                    }
+                    _ => return Err(CodecError::InvalidIpTunnel),
+                }
+            }
+            if seen_v6 && *mtu < 1280 {
+                return Err(CodecError::InvalidIpTunnel);
+            }
+            Ok(FrameKind::IpTunnelReady)
+        }
+        Frame::IpPacket {
+            tunnel_id,
+            packet_id,
+            payload,
+        } => {
+            encode_payload_bytes_len(payload.len(), limits)?;
+            if payload.is_empty() {
+                return Err(CodecError::InvalidIpPacket);
+            }
+            put_u64(out, tunnel_id.0);
+            put_u64(out, packet_id.0);
+            put_u32(out, payload.len() as u32);
+            out.extend_from_slice(payload);
+            Ok(FrameKind::IpPacket)
+        }
+        Frame::IpTunnelClose { tunnel_id, reason } => {
+            put_u64(out, tunnel_id.0);
+            put_u8(out, close_reason_to_u8(*reason));
+            Ok(FrameKind::IpTunnelClose)
+        }
         Frame::Ping { nonce } => {
             put_u64(out, *nonce);
             Ok(FrameKind::Ping)
@@ -668,6 +729,62 @@ fn decode_payload(
                 paths,
             })
         }
+        FrameKind::OpenIpTunnel => Ok(Frame::OpenIpTunnel {
+            tunnel_id: IpTunnelId(reader.get_u64()?),
+        }),
+        FrameKind::IpTunnelReady => {
+            let tunnel_id = IpTunnelId(reader.get_u64()?);
+            let mtu = reader.get_u16()?;
+            if mtu < 576 {
+                return Err(CodecError::InvalidIpTunnel);
+            }
+            let address_count = reader.get_u8()? as usize;
+            if address_count > 2 {
+                return Err(CodecError::InvalidIpTunnel);
+            }
+            let mut addresses = Vec::with_capacity(address_count);
+            let mut seen_v4 = false;
+            let mut seen_v6 = false;
+            for _ in 0..address_count {
+                let address = match reader.get_u8()? {
+                    4 if !seen_v4 => {
+                        seen_v4 = true;
+                        IpAddr::V4(Ipv4Addr::from(reader.get_array::<4>()?))
+                    }
+                    6 if !seen_v6 => {
+                        seen_v6 = true;
+                        IpAddr::V6(Ipv6Addr::from(reader.get_array::<16>()?))
+                    }
+                    _ => return Err(CodecError::InvalidIpTunnel),
+                };
+                addresses.push(address);
+            }
+            if addresses.is_empty() || (seen_v6 && mtu < 1280) {
+                return Err(CodecError::InvalidIpTunnel);
+            }
+            Ok(Frame::IpTunnelReady {
+                tunnel_id,
+                mtu,
+                addresses,
+            })
+        }
+        FrameKind::IpPacket => {
+            let tunnel_id = IpTunnelId(reader.get_u64()?);
+            let packet_id = IpPacketId(reader.get_u64()?);
+            let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
+            if payload.is_empty() {
+                return Err(CodecError::InvalidIpPacket);
+            }
+            Ok(Frame::IpPacket {
+                tunnel_id,
+                packet_id,
+                payload,
+            })
+        }
+        FrameKind::IpTunnelClose => Ok(Frame::IpTunnelClose {
+            tunnel_id: IpTunnelId(reader.get_u64()?),
+            reason: close_reason_from_u8(reader.get_u8()?)?,
+        }),
         FrameKind::Ping => Ok(Frame::Ping {
             nonce: reader.get_u64()?,
         }),
@@ -1134,7 +1251,10 @@ enum FrameKind {
     PathCapacityReceipt = 35,
     PeerStatusRequest = 36,
     PeerStatusResponse = 37,
-    // 38 through 41 are reserved.
+    OpenIpTunnel = 38,
+    IpTunnelReady = 39,
+    IpPacket = 40,
+    IpTunnelClose = 41,
 }
 
 impl FrameKind {
@@ -1169,6 +1289,10 @@ impl FrameKind {
             35 => Ok(Self::PathCapacityReceipt),
             36 => Ok(Self::PeerStatusRequest),
             37 => Ok(Self::PeerStatusResponse),
+            38 => Ok(Self::OpenIpTunnel),
+            39 => Ok(Self::IpTunnelReady),
+            40 => Ok(Self::IpPacket),
+            41 => Ok(Self::IpTunnelClose),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1326,6 +1450,8 @@ pub enum CodecError {
     InvalidUtf8,
     InvalidCredentialId,
     InvalidPeerStatus,
+    InvalidIpTunnel,
+    InvalidIpPacket,
     InvalidEnum,
     InvalidRange,
     InvalidPort,
@@ -1358,6 +1484,8 @@ impl std::fmt::Display for CodecError {
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
             Self::InvalidCredentialId => write!(f, "invalid credential ID"),
             Self::InvalidPeerStatus => write!(f, "non-OK peer status contains path entries"),
+            Self::InvalidIpTunnel => write!(f, "invalid IP tunnel frame"),
+            Self::InvalidIpPacket => write!(f, "invalid empty IP packet"),
             Self::InvalidEnum => write!(f, "invalid enum value"),
             Self::InvalidRange => write!(f, "invalid offset range"),
             Self::InvalidPort => write!(f, "port must be in 1..=65535"),

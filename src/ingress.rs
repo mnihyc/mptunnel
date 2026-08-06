@@ -2,6 +2,9 @@ mod config;
 pub mod http_connect;
 pub mod socks5;
 pub mod tun;
+pub mod tun_l3;
+
+pub use tun_l3::TunL3IngressConfig;
 
 pub use config::{
     DEFAULT_LOCAL_HANDSHAKE_TIMEOUT, DEFAULT_LOCAL_MAX_CONNECTIONS,

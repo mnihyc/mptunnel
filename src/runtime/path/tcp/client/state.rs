@@ -106,6 +106,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) peer_status_snapshot: PeerStatusSnapshotSource,
     pub(in crate::runtime) authenticated_carriers: AuthenticatedCarrierInventory,
+    pub(in crate::runtime) ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub,
     pub(in crate::runtime) endpoint_policy: Arc<ClientTcpEndpointPolicy>,
     pub(in crate::runtime) carrier_groups: Arc<ClientTcpCarrierGroups>,
 }

@@ -4,6 +4,14 @@ Proxy operation uses the portable runtime on every release target. Managed TUN
 uses native host facilities only where they improve lifecycle safety; Android
 and macOS keep VPN policy in their application host.
 
+Both TUN-L4 and TUN-L3 consume the same neutral packet-device interface.
+TUN-L3 is external-host mode on every platform: it configures only the
+configured server address or server-assigned client host address, plus MTU,
+when the provider supports those operations. It never changes routes, DNS,
+firewall policy, forwarding, or NAT. A process-managed TUN-L4 and any TUN-L3
+service are therefore rejected in one node generation instead of competing for
+the managed device.
+
 | Platform | Owner | Activation | TUN |
 | --- | --- | --- | --- |
 | Linux | Process | Two-phase | Native |

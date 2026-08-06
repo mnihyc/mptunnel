@@ -340,6 +340,7 @@ fn node_with_vpn(outbounds: Vec<OutboundLeafConfig>) -> NodeConfig {
         outbounds,
         gateway_balancers: Vec::new(),
         local_ingresses: vec![managed_tun("vpn")],
+        tun_l3_ingresses: Vec::new(),
         product_policy: Some(ProductPolicyConfig {
             generation: 1,
             routes: Vec::new(),
@@ -369,6 +370,7 @@ fn node_without_managed_tun_compiles_to_none_without_dns_side_effects() {
         outbounds: vec![direct_leaf("direct")],
         gateway_balancers: Vec::new(),
         local_ingresses: vec![external_tun("external")],
+        tun_l3_ingresses: Vec::new(),
         product_policy: None,
         dns_policy: DnsPolicyConfig::system_default(),
         servers: Vec::new(),

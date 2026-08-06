@@ -63,7 +63,7 @@ try:
         status = json.load(response)
     if not isinstance(status, dict):
         raise ValueError("management status is not a JSON object")
-    if status.get("schema") != "mptunnel.management.v5":
+    if status.get("schema") != "mptunnel.management.v6":
         raise ValueError(
             f"unexpected management status schema: {status.get('schema')!r}"
         )

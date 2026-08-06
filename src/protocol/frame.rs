@@ -106,9 +106,9 @@ pub(crate) fn reliable_stream_frame_accounted_bytes(frame: &Frame) -> usize {
 /// Returns the payload pressure a reliable carrier should use for pacing.
 pub(crate) fn reliable_path_frame_pacing_bytes(frame: &Frame) -> usize {
     match frame {
-        Frame::StreamData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
-            payload.len().max(1)
-        }
+        Frame::StreamData { payload, .. }
+        | Frame::PathCapacityData { payload, .. }
+        | Frame::IpPacket { payload, .. } => payload.len().max(1),
         Frame::StreamFin { .. }
         | Frame::StreamAck { .. }
         | Frame::StreamMaxData { .. }

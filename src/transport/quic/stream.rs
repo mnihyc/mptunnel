@@ -1,6 +1,6 @@
 //! Cancellation-safe MPP framing inside HTTP/3 request DATA.
 
-use super::native_datagram::{NativeDatagramReceiver, NativeDatagramSender};
+use super::native_datagram::{NativeDatagramReceiver, NativeDatagramSender, NativeReceivedFrame};
 use super::presentation::{H3RecvStream, H3SendStream};
 use super::{QuicCarrierError, QuicCarrierTelemetry};
 #[cfg(feature = "lab-diagnostics")]
@@ -8,7 +8,7 @@ use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::codec::{
     CodecLimits, decode_frame_bytes, encode_frame_into, encoded_frame_capacity_hint,
 };
-use crate::protocol::{DatagramFlowId, Frame};
+use crate::protocol::{DatagramFlowId, Frame, IpTunnelId};
 use bytes::{Bytes, BytesMut};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +24,7 @@ pub struct SendStream {
     pub(super) write_backlog: Arc<AtomicU64>,
     pub(super) telemetry: Arc<QuicCarrierTelemetry>,
     pub(super) known_datagram_flows: Arc<Mutex<DatagramFlowRegistry>>,
+    pub(super) known_ip_tunnel: Arc<Mutex<IpTunnelRegistry>>,
     pub(super) priority: i32,
 }
 
@@ -98,6 +99,7 @@ pub struct RecvStream {
     pub(super) stream: H3RecvStream,
     pub(super) native: NativeDatagramReceiver,
     pub(super) known_datagram_flows: Arc<Mutex<DatagramFlowRegistry>>,
+    pub(super) known_ip_tunnel: Arc<Mutex<IpTunnelRegistry>>,
     read_buffer: BytesMut,
     pending_h3_data: Bytes,
     deferred_native: VecDeque<DeferredNative>,
@@ -121,6 +123,19 @@ enum DatagramFlowState {
     Unknown,
     Active,
     Closed,
+}
+
+#[derive(Debug)]
+pub(super) struct IpTunnelRegistry {
+    state: IpTunnelState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpTunnelState {
+    Unknown,
+    Open(IpTunnelId),
+    Ready(IpTunnelId),
+    Closed(IpTunnelId),
 }
 
 #[derive(Debug)]
@@ -243,6 +258,90 @@ impl DatagramFlowRegistry {
     }
 }
 
+impl IpTunnelRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            state: IpTunnelState::Unknown,
+        }
+    }
+
+    fn state(&self, tunnel_id: IpTunnelId) -> IpTunnelState {
+        match self.state {
+            IpTunnelState::Unknown => IpTunnelState::Unknown,
+            IpTunnelState::Open(current) if current == tunnel_id => self.state,
+            IpTunnelState::Ready(current) if current == tunnel_id => self.state,
+            IpTunnelState::Closed(current) if current == tunnel_id => self.state,
+            // One request stream owns at most one tunnel association. A native
+            // packet for another identity is therefore terminal, not pending.
+            IpTunnelState::Open(_) | IpTunnelState::Ready(_) | IpTunnelState::Closed(_) => {
+                IpTunnelState::Closed(tunnel_id)
+            }
+        }
+    }
+
+    fn validate_transitions(&self, frames: &[Frame]) -> Result<(), QuicCarrierError> {
+        let mut state = self.state;
+        for frame in frames {
+            state = match (state, frame) {
+                (IpTunnelState::Unknown, Frame::OpenIpTunnel { tunnel_id }) => {
+                    IpTunnelState::Open(*tunnel_id)
+                }
+                (IpTunnelState::Open(current), Frame::IpTunnelReady { tunnel_id, .. })
+                    if current == *tunnel_id =>
+                {
+                    IpTunnelState::Ready(current)
+                }
+                (
+                    IpTunnelState::Open(current) | IpTunnelState::Ready(current),
+                    Frame::IpTunnelClose { tunnel_id, .. },
+                ) if current == *tunnel_id => IpTunnelState::Closed(current),
+                (IpTunnelState::Closed(current), Frame::IpTunnelClose { tunnel_id, .. })
+                    if current == *tunnel_id =>
+                {
+                    IpTunnelState::Closed(current)
+                }
+                (_, Frame::OpenIpTunnel { .. }) => {
+                    return Err(QuicCarrierError::InvalidNativeDatagram(
+                        "IP tunnel request cannot be reopened on the same request stream",
+                    ));
+                }
+                (_, Frame::IpTunnelReady { .. }) => {
+                    return Err(QuicCarrierError::InvalidNativeDatagram(
+                        "IP_TUNNEL_READY did not follow its reliable OPEN_IP_TUNNEL",
+                    ));
+                }
+                (_, Frame::IpTunnelClose { .. }) => {
+                    return Err(QuicCarrierError::InvalidNativeDatagram(
+                        "IP_TUNNEL_CLOSE did not match its request-stream association",
+                    ));
+                }
+                (current, _) => current,
+            };
+        }
+        Ok(())
+    }
+
+    fn apply_transitions(&mut self, frames: &[Frame]) -> Result<(), QuicCarrierError> {
+        self.validate_transitions(frames)?;
+        for frame in frames {
+            self.state = match (self.state, frame) {
+                (IpTunnelState::Unknown, Frame::OpenIpTunnel { tunnel_id }) => {
+                    IpTunnelState::Open(*tunnel_id)
+                }
+                (IpTunnelState::Open(current), Frame::IpTunnelReady { .. }) => {
+                    IpTunnelState::Ready(current)
+                }
+                (
+                    IpTunnelState::Open(current) | IpTunnelState::Ready(current),
+                    Frame::IpTunnelClose { .. },
+                ) => IpTunnelState::Closed(current),
+                (current, _) => current,
+            };
+        }
+        Ok(())
+    }
+}
+
 pub async fn write_frame(
     send: &mut SendStream,
     frame: &Frame,
@@ -265,26 +364,45 @@ pub async fn write_frames(
 
     let mut reliable_start = 0usize;
     for (index, frame) in frames.iter().enumerate() {
-        if !matches!(frame, Frame::DatagramData { .. }) {
+        if !matches!(frame, Frame::DatagramData { .. } | Frame::IpPacket { .. }) {
             continue;
         }
         write_reliable_frames(send, &frames[reliable_start..index], limits).await?;
-        let Frame::DatagramData { flow_id, .. } = frame else {
-            unreachable!("DATAGRAM_DATA matched above");
-        };
-        if send
-            .known_datagram_flows
-            .lock()
-            .expect("HTTP Datagram flow lock")
-            .state(*flow_id)
-            != DatagramFlowState::Active
-        {
-            return Err(QuicCarrierError::InvalidNativeDatagram(
-                "DATAGRAM_DATA preceded its reliable OPEN_DATAGRAM_FLOW",
-            ));
+        match frame {
+            Frame::DatagramData { flow_id, .. } => {
+                if send
+                    .known_datagram_flows
+                    .lock()
+                    .expect("HTTP Datagram flow lock")
+                    .state(*flow_id)
+                    != DatagramFlowState::Active
+                {
+                    return Err(QuicCarrierError::InvalidNativeDatagram(
+                        "DATAGRAM_DATA preceded its reliable OPEN_DATAGRAM_FLOW",
+                    ));
+                }
+            }
+            Frame::IpPacket { tunnel_id, .. } => {
+                if send
+                    .known_ip_tunnel
+                    .lock()
+                    .expect("native IP tunnel lock")
+                    .state(*tunnel_id)
+                    != IpTunnelState::Ready(*tunnel_id)
+                {
+                    return Err(QuicCarrierError::InvalidNativeDatagram(
+                        "IP_PACKET preceded its reliable IP_TUNNEL_READY",
+                    ));
+                }
+            }
+            _ => unreachable!("native frame matched above"),
         }
         send.stream.ensure_datagrams_negotiated().await?;
-        send.native.send_frame(frame, limits)?;
+        match frame {
+            Frame::DatagramData { .. } => send.native.send_frame(frame, limits)?,
+            Frame::IpPacket { .. } => send.native.send_ip_packet(frame, limits)?,
+            _ => unreachable!("native frame matched above"),
+        }
         reliable_start = index + 1;
     }
     write_reliable_frames(send, &frames[reliable_start..], limits).await
@@ -307,6 +425,17 @@ async fn write_reliable_frames(
         send.known_datagram_flows
             .lock()
             .expect("HTTP Datagram flow lock")
+            .validate_transitions(frames)?;
+    }
+    if frames.iter().any(|frame| {
+        matches!(
+            frame,
+            Frame::OpenIpTunnel { .. } | Frame::IpTunnelReady { .. } | Frame::IpTunnelClose { .. }
+        )
+    }) {
+        send.known_ip_tunnel
+            .lock()
+            .expect("native IP tunnel lock")
             .validate_transitions(frames)?;
     }
     let delivery_evidence_bytes = frames.iter().fold(0_u64, |total, frame| {
@@ -355,6 +484,17 @@ async fn write_reliable_frames(
         send.known_datagram_flows
             .lock()
             .expect("HTTP Datagram flow lock")
+            .apply_transitions(frames)?;
+    }
+    if frames.iter().any(|frame| {
+        matches!(
+            frame,
+            Frame::OpenIpTunnel { .. } | Frame::IpTunnelReady { .. } | Frame::IpTunnelClose { .. }
+        )
+    }) {
+        send.known_ip_tunnel
+            .lock()
+            .expect("native IP tunnel lock")
             .apply_transitions(frames)?;
     }
     #[cfg(feature = "lab-diagnostics")]
@@ -431,12 +571,14 @@ impl RecvStream {
         stream: H3RecvStream,
         native: NativeDatagramReceiver,
         known_datagram_flows: Arc<Mutex<DatagramFlowRegistry>>,
+        known_ip_tunnel: Arc<Mutex<IpTunnelRegistry>>,
         max_deferred_native_bytes: usize,
     ) -> Self {
         Self {
             stream,
             native,
             known_datagram_flows,
+            known_ip_tunnel,
             read_buffer: BytesMut::new(),
             pending_h3_data: Bytes::new(),
             deferred_native: VecDeque::new(),
@@ -498,8 +640,19 @@ impl RecvStream {
                 .expect("HTTP Datagram flow lock")
                 .apply_transitions(std::slice::from_ref(&frame))?;
         }
-        if let Frame::DatagramClose { flow_id } = frame {
-            self.purge_deferred_native(flow_id);
+        if matches!(
+            frame,
+            Frame::OpenIpTunnel { .. } | Frame::IpTunnelReady { .. } | Frame::IpTunnelClose { .. }
+        ) {
+            self.known_ip_tunnel
+                .lock()
+                .expect("native IP tunnel lock")
+                .apply_transitions(std::slice::from_ref(&frame))?;
+        }
+        match &frame {
+            Frame::DatagramClose { flow_id } => self.purge_deferred_datagrams(*flow_id),
+            Frame::IpTunnelClose { tunnel_id, .. } => self.purge_deferred_ip_packets(*tunnel_id),
+            _ => {}
         }
         Ok(frame)
     }
@@ -512,16 +665,8 @@ impl RecvStream {
         if self.deferred_native.is_empty() {
             return None;
         }
-        let known = self
-            .known_datagram_flows
-            .lock()
-            .expect("HTTP Datagram flow lock");
         let index = self.deferred_native.iter().position(|deferred| {
-            matches!(
-                deferred.frame,
-                Frame::DatagramData { flow_id, .. }
-                    if known.state(flow_id) == DatagramFlowState::Active
-            )
+            self.native_frame_state(&deferred.frame) == NativeFrameState::Ready
         })?;
         let deferred = self
             .deferred_native
@@ -529,37 +674,55 @@ impl RecvStream {
             .expect("deferred native frame index exists");
         self.deferred_native_bytes = self
             .deferred_native_bytes
-            .saturating_sub(deferred.frame.delivery_evidence_bytes() as usize);
+            .saturating_sub(native_frame_payload_bytes(&deferred.frame));
         Some(deferred.frame)
     }
 
-    fn native_flow_state(&self, frame: &Frame) -> DatagramFlowState {
-        let Frame::DatagramData { flow_id, .. } = frame else {
-            return DatagramFlowState::Unknown;
-        };
-        self.known_datagram_flows
-            .lock()
-            .expect("HTTP Datagram flow lock")
-            .state(*flow_id)
+    fn native_frame_state(&self, frame: &Frame) -> NativeFrameState {
+        match frame {
+            Frame::DatagramData { flow_id, .. } => match self
+                .known_datagram_flows
+                .lock()
+                .expect("HTTP Datagram flow lock")
+                .state(*flow_id)
+            {
+                DatagramFlowState::Active => NativeFrameState::Ready,
+                DatagramFlowState::Unknown => NativeFrameState::Pending,
+                DatagramFlowState::Closed => NativeFrameState::Closed,
+            },
+            Frame::IpPacket { tunnel_id, .. } => match self
+                .known_ip_tunnel
+                .lock()
+                .expect("native IP tunnel lock")
+                .state(*tunnel_id)
+            {
+                IpTunnelState::Ready(_) => NativeFrameState::Ready,
+                IpTunnelState::Unknown | IpTunnelState::Open(_) => NativeFrameState::Pending,
+                IpTunnelState::Closed(_) => NativeFrameState::Closed,
+            },
+            _ => NativeFrameState::Closed,
+        }
     }
 
-    fn defer_native(&mut self, frame: Frame) {
-        let bytes = frame.delivery_evidence_bytes() as usize;
+    fn defer_native(&mut self, received: NativeReceivedFrame) {
+        let bytes = native_frame_payload_bytes(&received.frame);
         if self.deferred_native_bytes.saturating_add(bytes) > self.max_deferred_native_bytes {
             return;
         }
-        let ttl_ms = match &frame {
-            Frame::DatagramData { ttl_ms, .. } => *ttl_ms,
+        let deadline = match &received.frame {
+            Frame::DatagramData { ttl_ms, .. } if *ttl_ms > 0 => {
+                std::time::Instant::now() + std::time::Duration::from_millis(u64::from(*ttl_ms))
+            }
+            Frame::IpPacket { .. } => match received.association_deadline {
+                Some(deadline) if deadline > std::time::Instant::now() => deadline,
+                _ => return,
+            },
             _ => return,
         };
-        if ttl_ms == 0 {
-            return;
-        }
         self.deferred_native_bytes = self.deferred_native_bytes.saturating_add(bytes);
         self.deferred_native.push_back(DeferredNative {
-            frame,
-            deadline: std::time::Instant::now()
-                + std::time::Duration::from_millis(u64::from(ttl_ms)),
+            frame: received.frame,
+            deadline,
         });
     }
 
@@ -569,15 +732,15 @@ impl RecvStream {
         self.deferred_native.retain(|deferred| {
             let retain = deferred.deadline > now;
             if retain {
-                retained_bytes = retained_bytes
-                    .saturating_add(deferred.frame.delivery_evidence_bytes() as usize);
+                retained_bytes =
+                    retained_bytes.saturating_add(native_frame_payload_bytes(&deferred.frame));
             }
             retain
         });
         self.deferred_native_bytes = retained_bytes;
     }
 
-    fn purge_deferred_native(&mut self, closed_flow_id: DatagramFlowId) {
+    fn purge_deferred_datagrams(&mut self, closed_flow_id: DatagramFlowId) {
         let mut retained_bytes = 0usize;
         self.deferred_native.retain(|deferred| {
             let retain = !matches!(
@@ -585,12 +748,42 @@ impl RecvStream {
                 Frame::DatagramData { flow_id, .. } if flow_id == closed_flow_id
             );
             if retain {
-                retained_bytes = retained_bytes
-                    .saturating_add(deferred.frame.delivery_evidence_bytes() as usize);
+                retained_bytes =
+                    retained_bytes.saturating_add(native_frame_payload_bytes(&deferred.frame));
             }
             retain
         });
         self.deferred_native_bytes = retained_bytes;
+    }
+
+    fn purge_deferred_ip_packets(&mut self, closed_tunnel_id: IpTunnelId) {
+        let mut retained_bytes = 0usize;
+        self.deferred_native.retain(|deferred| {
+            let retain = !matches!(
+                deferred.frame,
+                Frame::IpPacket { tunnel_id, .. } if tunnel_id == closed_tunnel_id
+            );
+            if retain {
+                retained_bytes =
+                    retained_bytes.saturating_add(native_frame_payload_bytes(&deferred.frame));
+            }
+            retain
+        });
+        self.deferred_native_bytes = retained_bytes;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFrameState {
+    Ready,
+    Pending,
+    Closed,
+}
+
+fn native_frame_payload_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::DatagramData { payload, .. } | Frame::IpPacket { payload, .. } => payload.len(),
+        _ => 0,
     }
 }
 
@@ -743,26 +936,26 @@ pub async fn read_frame(
                 recv.pending_h3_data = data;
             }
             frame = recv.native.recv_frame(limits) => {
-                let frame = match frame {
+                let received = match frame {
                     Ok(frame) => frame,
                     Err(error) => {
                         recv.native.retire_route();
                         return Err(error);
                     }
                 };
-                match recv.native_flow_state(&frame) {
-                    DatagramFlowState::Active => return Ok(frame),
-                    DatagramFlowState::Closed => {
+                match recv.native_frame_state(&received.frame) {
+                    NativeFrameState::Ready => return Ok(received.frame),
+                    NativeFrameState::Closed => {
                         // RFC 9297 requires datagrams associated with a closed
                         // request direction to be silently dropped. MPP also
                         // closes each inner flow reliably before this state.
                     }
-                    DatagramFlowState::Unknown => {
+                    NativeFrameState::Pending => {
                         // QUIC DATAGRAM can legally overtake the reliable
-                        // OPEN_DATAGRAM_FLOW DATA. Keep only a bounded amount
-                        // until that open is decoded; there is no cross-flow
-                        // reliable HOL.
-                        recv.defer_native(frame);
+                        // association DATA. Keep only a bounded amount until
+                        // its reliable open/ready transition is decoded; there
+                        // is no cross-flow reliable HOL.
+                        recv.defer_native(received);
                     }
                 }
             }

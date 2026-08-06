@@ -4,7 +4,7 @@
 //! congestion state, or endpoint-local configuration.
 
 use bytes::Bytes;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub u64);
@@ -20,6 +20,12 @@ pub struct DatagramFlowId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatagramId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IpTunnelId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IpPacketId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthNonce(pub [u8; 16]);
@@ -287,6 +293,29 @@ pub enum Frame {
         code: PeerStatusCode,
         paths: Vec<PeerPathStatus>,
     },
+    /// Opens one authenticated layer-3 packet service. The same logical
+    /// tunnel identity may attach to multiple carrier paths.
+    OpenIpTunnel {
+        tunnel_id: IpTunnelId,
+    },
+    /// Confirms the statically configured peer allocation. Addresses are host
+    /// identities; neither endpoint infers or installs routes from this list.
+    IpTunnelReady {
+        tunnel_id: IpTunnelId,
+        mtu: u16,
+        addresses: Vec<IpAddr>,
+    },
+    /// One complete IPv4 or IPv6 packet. MPP does not acknowledge or
+    /// retransmit this frame; reliability, if any, belongs to the carrier.
+    IpPacket {
+        tunnel_id: IpTunnelId,
+        packet_id: IpPacketId,
+        payload: Bytes,
+    },
+    IpTunnelClose {
+        tunnel_id: IpTunnelId,
+        reason: CloseReason,
+    },
     Ping {
         nonce: u64,
     },
@@ -343,6 +372,10 @@ impl Frame {
             Self::PathMetrics { .. } => "PATH_METRICS",
             Self::PeerStatusRequest { .. } => "PEER_STATUS_REQUEST",
             Self::PeerStatusResponse { .. } => "PEER_STATUS_RESPONSE",
+            Self::OpenIpTunnel { .. } => "OPEN_IP_TUNNEL",
+            Self::IpTunnelReady { .. } => "IP_TUNNEL_READY",
+            Self::IpPacket { .. } => "IP_PACKET",
+            Self::IpTunnelClose { .. } => "IP_TUNNEL_CLOSE",
             Self::Ping { .. } => "PING",
             Self::Pong { .. } => "PONG",
         }

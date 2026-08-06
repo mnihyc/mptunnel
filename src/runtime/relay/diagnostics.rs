@@ -117,6 +117,12 @@ fn frame_subject(frame: &Frame) -> String {
             "request_id={request_id} code={code:?} path_count={}",
             paths.len()
         ),
+        Frame::OpenIpTunnel { tunnel_id }
+        | Frame::IpTunnelReady { tunnel_id, .. }
+        | Frame::IpPacket { tunnel_id, .. }
+        | Frame::IpTunnelClose { tunnel_id, .. } => {
+            format!("tunnel_id={}", tunnel_id.0)
+        }
     }
 }
 

@@ -9,6 +9,7 @@ mod client_writer;
 pub(in crate::runtime) mod datagram;
 mod estimator;
 pub(in crate::runtime) mod io;
+pub(in crate::runtime) mod ip_tunnel;
 pub(in crate::runtime) mod metrics;
 pub(in crate::runtime) mod server;
 mod server_stream;

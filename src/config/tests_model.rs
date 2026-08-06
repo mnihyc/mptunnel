@@ -234,6 +234,7 @@ fn server_paths_reject_client_only_endpoint_options() {
         tls: crate::transport::encrypted::test_server_tls_config(),
         destination_acl: ServerDestinationAclConfig::default(),
         performance: MppPerformanceConfig::default(),
+        tun_l3: None,
     };
 
     assert_eq!(

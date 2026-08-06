@@ -51,6 +51,25 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
         frame @ (Frame::DatagramData { .. }
         | Frame::DatagramFeedback { .. }
         | Frame::DatagramClose { .. }) => datagrams.route_inbound(frame),
+        frame @ (Frame::IpTunnelReady { .. }
+        | Frame::IpPacket { .. }
+        | Frame::IpTunnelClose { .. }) => {
+            let packet_data = matches!(frame, Frame::IpPacket { .. });
+            let result = runtime
+                .ip_tunnels
+                .route(crate::runtime::tun_l3::ClientIpTunnelEvent {
+                    path: crate::model::path::RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index: runtime.path_index,
+                    },
+                    path_instance_id: connection.path_instance_id,
+                    frame,
+                });
+            match result {
+                Err(RuntimeError::SenderServiceBlocked) if packet_data => Ok(()),
+                result => result,
+            }
+        }
         Frame::Ping { nonce } => {
             connection
                 .carrier
@@ -145,6 +164,9 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
         )),
         Frame::PathClose { .. } => Err(RuntimeError::Protocol(
             "TCP path close preceded a client drain request",
+        )),
+        Frame::OpenIpTunnel { .. } => Err(RuntimeError::Protocol(
+            "TCP client received IP tunnel open request",
         )),
         _ => Err(RuntimeError::Protocol("unexpected TCP path session frame")),
     }

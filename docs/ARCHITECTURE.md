@@ -10,16 +10,19 @@ lifecycle stay below that boundary.
 ## Layer model
 
 ```text
-SOCKS5 / HTTP CONNECT / TUN ingress
-    -> canonical Product flow + routing/DNS/admission
-    -> optional Product balancer -> one outbound leaf
-    -> MPP stream or datagram identity (for an MPP leaf)
-    -> per-direction connection sequencing, flow control, Data ACKs, and reinjection
-    -> carrier-neutral path scheduler and sender queue
+SOCKS5 / HTTP CONNECT / port forward / TUN-L4
+    -> Product routing, DNS, admission, outbound selection
+    -> MPP stream or application-datagram plane
+       -> offsets, flow control, Data ACKs, bounded reinjection
+
+TUN-L3 packet device
+    -> authenticated static address ownership + packet-flow affinity
+    -> complete IPv4/IPv6 packet plane
+
+both MPP planes
+    -> exact carrier-instance selection
        -> TCP carrier -> kernel TCP congestion control and recovery
        -> QUIC carrier -> Quinn congestion control and recovery over UDP
-    -> peer data-level reassembly
-    -> target outbound
 ```
 
 MPP unifies TCP and QUIC above their native recovery layers. It does not try to
@@ -53,7 +56,13 @@ resolved carrier IP addresses rather than freezing one selected port before
 host routes are published. This local locator selection does not change MPP
 path or carrier-instance identity.
 
-## MPP v6 model
+TUN-L3 is deliberately parallel to the Product plane. It does not create a
+Product target, resolve DNS, run the TUN-L4 userspace stack, or select a normal
+outbound. The authenticated principal selects a server-configured address
+allocation. Host routing, forwarding, DNS, firewall policy, and NAT are outside
+the packet-copy boundary.
+
+## MPP v7 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
 or attaching a stream does not assign a persistent primary, validation, or
@@ -173,6 +182,35 @@ durable, the shared receive/reorder windows and configured resource envelope
 bound MPP work while writer/socket backpressure bounds carrier acceptance. The
 measured Data ACK rate ranks completion but is not fed back as a replacement
 TCP congestion window.
+
+## IP-packet data flow
+
+One logical IP tunnel attaches to every eligible authenticated TCP and QUIC
+carrier. The server accepts an attachment only when that carrier's principal
+has an explicit address allocation. Complete inner IPv4/IPv6 packets retain
+their bytes, TTL or Hop Limit, and transport headers.
+
+Each direction keeps independent inner-flow affinity to one exact carrier
+instance. A healthy binding performs no path-health lock or ranking allocation
+per packet. Exact carrier loss invalidates it immediately; an idle boundary
+derived from current carrier PTO permits fresh ranking from native RTT, rate,
+loss, queue, and flight evidence. Regular carriers precede backups. Queue
+fullness drops only the current packet and does not trigger a duplicate or
+declare the path failed. Recent packet-flow load distributes cold bursts across
+otherwise equal carriers and expires with flow activity instead of cache
+residency.
+
+On the client, accepted wire frames and carrier-membership updates enter one
+ordered handoff. Lifecycle entries reserve independent bounded headroom, while
+each packet retains a weighted byte permit through the separately bounded
+packet-device writer. Host backpressure therefore cannot invert accepted
+packet/close order, overtake attachment readiness or retirement, or grow packet
+memory without bound.
+
+TCP carries packet frames in its ordered carrier framing. QUIC carries
+lifecycle frames on one reliable request stream and complete packets in that
+stream's native QUIC Datagram association. MPP adds no packet ACK,
+retransmission, congestion window, global reorder buffer, or UDP-first policy.
 
 ## Identity and ownership
 

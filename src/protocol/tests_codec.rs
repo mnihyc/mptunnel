@@ -85,7 +85,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v6_has_no_attachment_role_field() {
+fn open_stream_v7_has_no_attachment_role_field() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -96,7 +96,7 @@ fn open_stream_v6_has_no_attachment_role_field() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 6, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 7, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2,
         ]
     );
@@ -138,14 +138,74 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_v5_frames_after_v6_wire_cut() {
+fn decoder_rejects_v6_frames_after_v7_wire_cut() {
     let mut encoded =
         encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
-    encoded[4] = 5;
+    encoded[4] = 6;
 
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
-        Err(CodecError::UnsupportedVersion(5))
+        Err(CodecError::UnsupportedVersion(6))
+    );
+}
+
+#[test]
+fn ip_tunnel_frames_round_trip_without_transport_semantics() {
+    let tunnel_id = IpTunnelId(17);
+    round_trip(Frame::OpenIpTunnel { tunnel_id });
+    round_trip(Frame::IpTunnelReady {
+        tunnel_id,
+        mtu: 1420,
+        addresses: vec![
+            "10.88.0.2".parse().expect("IPv4 address"),
+            "fd88::2".parse().expect("IPv6 address"),
+        ],
+    });
+    round_trip(Frame::IpPacket {
+        tunnel_id,
+        packet_id: IpPacketId(23),
+        payload: Bytes::from_static(&[
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 59, 0, 0, 10, 88, 0, 2, 10, 88, 0, 1,
+        ]),
+    });
+    round_trip(Frame::IpTunnelClose {
+        tunnel_id,
+        reason: CloseReason::Normal,
+    });
+}
+
+#[test]
+fn ip_tunnel_ready_rejects_duplicate_families_and_invalid_mtu() {
+    let empty = Frame::IpTunnelReady {
+        tunnel_id: IpTunnelId(1),
+        mtu: 1500,
+        addresses: Vec::new(),
+    };
+    assert_eq!(
+        encode_frame(&empty, CodecLimits::default()),
+        Err(CodecError::InvalidIpTunnel)
+    );
+
+    let duplicate = Frame::IpTunnelReady {
+        tunnel_id: IpTunnelId(1),
+        mtu: 1500,
+        addresses: vec![
+            "10.88.0.2".parse().expect("IPv4 address"),
+            "10.88.0.3".parse().expect("IPv4 address"),
+        ],
+    };
+    assert_eq!(
+        encode_frame(&duplicate, CodecLimits::default()),
+        Err(CodecError::InvalidIpTunnel)
+    );
+    let ipv6_small = Frame::IpTunnelReady {
+        tunnel_id: IpTunnelId(1),
+        mtu: 1279,
+        addresses: vec!["fd88::2".parse().expect("IPv6 address")],
+    };
+    assert_eq!(
+        encode_frame(&ipv6_small, CodecLimits::default()),
+        Err(CodecError::InvalidIpTunnel)
     );
 }
 
@@ -407,7 +467,7 @@ fn path_capacity_protocol_round_trips_without_product_stream_identity() {
 }
 
 #[test]
-fn path_join_v6_has_stable_canonical_layout() {
+fn path_join_has_stable_canonical_layout() {
     let frame = Frame::PathJoin {
         session_id: SessionId(0x0102_0304_0506_0708),
         credential_id: "a".to_string(),
@@ -419,7 +479,9 @@ fn path_join_v6_has_stable_canonical_layout() {
     };
     let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
 
-    assert_eq!(&encoded[..10], &[b'M', b'P', b'T', b'F', 6, 4, 0, 0, 0, 69]);
+    assert_eq!(&encoded[..4], b"MPTF");
+    assert_eq!(encoded[4], VERSION);
+    assert_eq!(&encoded[5..10], &[4, 0, 0, 0, 69]);
     assert_eq!(&encoded[10..18], &0x0102_0304_0506_0708_u64.to_be_bytes());
     assert_eq!(&encoded[18..20], &[1, b'a']);
     assert_eq!(&encoded[20..22], &0x1112_u16.to_be_bytes());

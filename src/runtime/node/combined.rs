@@ -3,11 +3,13 @@
 use super::{client, server};
 use crate::config::{ManagementConfig, NodeConfig, OutboundLeafConfig, SessionConfig};
 use crate::performance::ResourceLimits;
-use crate::platform::PacketDeviceProvider;
+use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
 use crate::product::{ProductAdmission, ProductAdmissionConfig};
 use crate::runtime::config_control::RuntimeConfigControl;
 use crate::runtime::error::RuntimeError;
-use crate::runtime::management::{ProductRuntimeInventory, spawn_node_management_services};
+use crate::runtime::management::{
+    ProductRuntimeInventory, TunL3RuntimeInventory, spawn_node_management_services,
+};
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistryShell};
 use crate::runtime::path::ClientPathRuntimeOptions;
 use crate::runtime::product_policy::ClientIngressRouter;
@@ -49,11 +51,13 @@ pub(super) async fn run(
         outbounds,
         gateway_balancers,
         local_ingresses,
+        tun_l3_ingresses,
         product_policy,
         dns_policy,
         servers,
     } = node;
     let product_inventory = ProductRuntimeInventory::from_config(&local_ingresses, &outbounds);
+    let tun_l3_inventory = TunL3RuntimeInventory::from_config(&tun_l3_ingresses, &servers);
     let product_telemetry =
         RuntimeTelemetry::generation_owner(active_flow_detail_capacity(resources.max_streams));
     let mut services = tokio::task::JoinSet::new();
@@ -146,6 +150,22 @@ pub(super) async fn run(
         }
     }
 
+    for ingress in tun_l3_ingresses {
+        let context = client_contexts
+            .iter()
+            .find(|context| context.outbound.as_ref() == Some(&ingress.config.outbound))
+            .cloned()
+            .ok_or_else(|| RuntimeError::OutboundUnavailable(ingress.config.outbound.clone()))?;
+        let ingress_readiness = readiness.require("TUN-L3 packet ingress");
+        services.spawn(crate::runtime::tun_l3::run_client_tun_l3(
+            ingress.name,
+            ingress.config,
+            context,
+            packet_devices.clone(),
+            ingress_readiness,
+        ));
+    }
+
     let mut server_contexts = Vec::with_capacity(servers.len());
     for server_config in servers {
         let server_readiness = readiness.require("MPP server listeners");
@@ -181,6 +201,7 @@ pub(super) async fn run(
             product_telemetry.clone(),
             session.retention_timeout,
             management.peer_diagnostics_enabled(),
+            server_config.tun_l3,
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -199,6 +220,28 @@ pub(super) async fn run(
             paths,
             reliable_relay,
         } = runtime;
+        if let Some(ip_tunnel) = paths.take_ip_tunnel_device() {
+            let device = match packet_devices.open(&PacketDeviceConfig {
+                interface_name: ip_tunnel.interface_name(),
+                ipv4: ip_tunnel.ipv4(),
+                ipv4_prefix: 32,
+                ipv4_gateway: None,
+                ipv6: ip_tunnel.ipv6(),
+                ipv6_prefix: 128,
+                mtu: ip_tunnel.mtu(),
+            }) {
+                Ok(device) => device,
+                Err(error) => {
+                    super::retire_runtime_services(&mut services).await;
+                    return Err(RuntimeError::TunDevice(error));
+                }
+            };
+            services.spawn(crate::runtime::tun_l3::run_server_tun_l3(
+                paths.name.clone(),
+                ip_tunnel,
+                device,
+            ));
+        }
         services.spawn(reliable_relay.run());
         server::spawn_listeners(bound, paths.clone(), &mut services);
         server_readiness.ready();
@@ -212,6 +255,7 @@ pub(super) async fn run(
             client_contexts,
             server_contexts,
             product_inventory,
+            tun_l3_inventory,
             product_telemetry,
             config_control.clone(),
             gateway_control,

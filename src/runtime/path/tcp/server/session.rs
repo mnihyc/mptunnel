@@ -6,6 +6,7 @@
 use super::super::io::encrypted_framed_peer_closed;
 use super::datagram::{ServerTcpDatagramEffect, ServerTcpDatagramState};
 use super::evidence::ServerTcpEvidenceState;
+use super::ip_tunnel::ServerTcpIpTunnelState;
 use super::stream::ServerTcpStreamState;
 use super::writer::ServerTcpWriter;
 #[cfg(feature = "lab-diagnostics")]
@@ -81,6 +82,7 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathSession {
     // Field order releases probe/flow RAII before queues and registration.
     evidence: ServerTcpEvidenceState,
     datagrams: ServerTcpDatagramState,
+    ip_tunnels: ServerTcpIpTunnelState,
     streams: ServerTcpStreamState,
     commands_rx: ReliablePathCommandReceivers,
     commands_tx: ReliablePathCommandSender,
@@ -100,6 +102,7 @@ impl ServerTcpPathSession {
             state: ServerTcpCarrierState::Active,
             evidence: admission.evidence,
             datagrams: ServerTcpDatagramState::new(),
+            ip_tunnels: ServerTcpIpTunnelState::new(),
             streams: ServerTcpStreamState::new(),
             commands_rx: admission.commands_rx,
             commands_tx: admission.commands_tx,
@@ -292,7 +295,7 @@ impl ServerTcpPathSession {
             }
         }
 
-        if !self.streams.is_empty() || !self.datagrams.is_empty() {
+        if !self.streams.is_empty() || !self.datagrams.is_empty() || !self.ip_tunnels.is_empty() {
             return Err(RuntimeError::Protocol(
                 "TCP path drain preceded product attachment retirement",
             ));
@@ -398,6 +401,37 @@ impl ServerTcpPathSession {
                 self.datagrams.remove(flow_id);
                 Ok(ServerTcpFrameDisposition::Continue)
             }
+            Frame::OpenIpTunnel { tunnel_id } if self.state == ServerTcpCarrierState::Active => {
+                let reply = self.ip_tunnels.open(
+                    &self.context,
+                    &self.path_registration,
+                    &self.commands_tx,
+                    tunnel_id,
+                )?;
+                self.write_reply(reply).await
+            }
+            Frame::OpenIpTunnel { tunnel_id } => {
+                self.write_reply(Frame::IpTunnelClose {
+                    tunnel_id,
+                    reason: CloseReason::PolicyRejected,
+                })
+                .await
+            }
+            Frame::IpPacket {
+                tunnel_id,
+                packet_id,
+                payload,
+            } => {
+                self.ip_tunnels.receive(tunnel_id, packet_id, payload)?;
+                Ok(ServerTcpFrameDisposition::Continue)
+            }
+            Frame::IpTunnelClose { tunnel_id, .. } => {
+                self.ip_tunnels.close(tunnel_id);
+                Ok(ServerTcpFrameDisposition::Continue)
+            }
+            Frame::IpTunnelReady { .. } => Err(RuntimeError::Protocol(
+                "TCP server received IP tunnel readiness",
+            )),
             frame @ (Frame::StreamData { stream_id, .. }
             | Frame::StreamAck { stream_id, .. }
             | Frame::StreamMaxData { stream_id, .. }
@@ -533,6 +567,7 @@ impl ServerTcpPathSession {
                 path_id: drain_path_id,
             } if drain_path_id == self.path_id => match self.state {
                 ServerTcpCarrierState::Active => {
+                    self.ip_tunnels.clear();
                     self.commands_tx.begin_path_drain();
                     self.state = ServerTcpCarrierState::Draining;
                     self.path_registration.set_state(PeerPathState::Draining);

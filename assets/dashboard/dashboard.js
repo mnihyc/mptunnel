@@ -5,7 +5,7 @@
   const STATUS_ENDPOINT = "/api/v2/status";
   const PEER_ENDPOINT = "/api/v2/diagnostics/peer";
   const BALANCER_ACTION_ENDPOINT = "/api/v2/balancers/actions";
-  const EXPECTED_SCHEMA = "mptunnel.management.v5";
+  const EXPECTED_SCHEMA = "mptunnel.management.v6";
   const TOKEN_STORAGE_KEY = "mptunnel.dashboard.bearer";
   const NAVIGATION_STORAGE_KEY = "mptunnel.dashboard.navigation-collapsed";
   const REFRESH_STORAGE_KEY = "mptunnel.dashboard.refresh-interval-ms";
@@ -64,6 +64,9 @@
     inboundServicesBody: byId("inbound-services-body"),
     inboundServicesEmpty: byId("inbound-services-empty"),
     inboundServicesCount: byId("inbound-services-count"),
+    tunL3ServicesBody: byId("tun-l3-services-body"),
+    tunL3ServicesEmpty: byId("tun-l3-services-empty"),
+    tunL3ServicesCount: byId("tun-l3-services-count"),
     outboundServicesBody: byId("outbound-services-body"),
     outboundServicesEmpty: byId("outbound-services-empty"),
     outboundServicesCount: byId("outbound-services-count"),
@@ -935,6 +938,7 @@
     appendMetric(elements.servicesList, "MPP outbounds", formatCount(services.mpp_outbounds));
     appendMetric(elements.servicesList, "MPP inbounds", formatCount(services.mpp_inbounds));
     appendMetric(elements.servicesList, "Local inbounds", formatCount(services.local_inbounds));
+    appendMetric(elements.servicesList, "TUN-L3 services", formatCount(services.tun_l3_services));
     appendMetric(elements.servicesList, "Outbounds", formatCount(services.outbounds));
     appendMetric(elements.servicesList, "Native outbounds", formatCount(services.local_outbounds));
     appendMetric(
@@ -1077,6 +1081,21 @@
       appendCell(row, "Flows", formatCount(inboundFlows.length));
       appendCell(row, "↑ / ↓ / pkt ↑↓", trafficCell(summarizeFlowIo(inboundFlows)));
       elements.inboundServicesBody.append(row);
+    });
+
+    const tunL3Services = asArray(state.status.tun_l3_services);
+    elements.tunL3ServicesBody.replaceChildren();
+    elements.tunL3ServicesEmpty.hidden = tunL3Services.length !== 0;
+    elements.tunL3ServicesCount.textContent = formatCount(tunL3Services.length) + " configured";
+    tunL3Services.forEach(function (service) {
+      const row = createElement("tr");
+      appendCell(row, "Role", titleCase(service.role));
+      appendCell(row, "Name", service.name || "TUN-L3", "cell-primary");
+      appendCell(row, "Interface", service.interface_name || "Host selected");
+      appendCell(row, "MPP binding", service.mpp_binding || "--");
+      appendCell(row, "MTU", service.mtu === undefined ? "Server assigned" : formatCount(service.mtu));
+      appendCell(row, "Allocations", service.allocation_count === undefined ? "--" : formatCount(service.allocation_count));
+      elements.tunL3ServicesBody.append(row);
     });
 
     const outbounds = asArray(state.status.outbounds);

@@ -6,6 +6,7 @@
 
 mod datagram;
 mod evidence;
+mod ip_tunnel;
 mod session;
 mod stream;
 mod writer;

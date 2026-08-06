@@ -287,6 +287,17 @@ listen = ["127.0.0.1:8080"]
 # capture_rule_priority = 10000
 # socket_mark = 0x4d505455
 
+# Optional first-class layer-3 tunnel. Unlike `protocol = "tun"`, this does
+# not enter Product routing or terminate inner TCP/UDP flows. The server assigns
+# the interface address after MPP authentication; this process opens only the
+# packet device. Host routes, DNS, firewall policy, forwarding, and NAT remain
+# external. The selected outbound must be MPP and may use both TCP and QUIC.
+# [[inbounds]]
+# name = "site-tunnel"
+# protocol = "tun-l3"
+# outbound = "edge-mpp"
+# interface_name = "mptun-l3"
+
 [[outbounds]]
 name = "edge-mpp"
 protocol = "mpp"
@@ -474,6 +485,28 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # auth_freshness_window_seconds = 300
 # authentication_timeout_ms = 5000
 # max_pending_authentications = 1024
+#
+# Optional server-owned TUN-L3 address plan. This packet plane is additive to
+# the inbound's ordinary proxy plane; finish the destination ACL with a
+# catch-all deny rule when the inbound is packet-only. Pools validate explicit
+# stable principal allocations; they are never learned from source IP
+# addresses. One live logical tunnel per principal is retained, and a new
+# authenticated session supersedes its previous attachment set. Additional
+# `allowed_ips` are routed to that principal only when the host has independently
+# installed the corresponding route/forwarding policy.
+# [inbounds.tun_l3]
+# interface_name = "mptun-l3-server"
+# ipv4_pool = "10.89.0.0/24"
+# ipv4 = "10.89.0.1"
+# ipv6_pool = "fd89::/64"
+# ipv6 = "fd89::1"
+# mtu = 1500
+#
+# [[inbounds.tun_l3.allocations]]
+# principal_id = "home"
+# ipv4 = "10.89.0.2"
+# ipv6 = "fd89::2"
+# allowed_ips = ["192.168.50.0/24"]
 #
 # Server-side destination policy is scoped to this MPP inbound. Restricted
 # addresses are denied whenever this node has IP evidence. A domain delegated

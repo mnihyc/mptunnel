@@ -184,10 +184,13 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                     connection,
                     &probe,
                     mux_limits.max_payload_bytes,
-                    streams,
-                    closed_streams,
-                    datagrams,
-                    mux_limits,
+                    ClientTcpCapacityProbeInterlock {
+                        streams,
+                        closed_streams,
+                        datagrams,
+                        runtime,
+                        mux_limits,
+                    },
                 )
                 .await;
                 commands.release_pending_command_bytes(pending_bytes);
@@ -386,11 +389,13 @@ pub(in crate::runtime::path::tcp) async fn write_client_tcp_frame_batch_interloc
                 incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() => {
                     match incoming {
                         Some(Ok(frame)) => {
-                            match try_route_client_tcp_frame_during_write(
+                            match try_route_client_tcp_frame_during_write_for_session(
                                 frame,
                                 streams,
                                 closed_streams,
                                 datagrams,
+                                runtime,
+                                connection.path_instance_id,
                             )? {
                                 ClientTcpWriteFrameRoute::Routed => {
                                     routed_frames = routed_frames.saturating_add(1);
@@ -449,15 +454,27 @@ pub(in crate::runtime::path::tcp) async fn write_client_tcp_frame_batch_interloc
     Ok(deferred_frame)
 }
 
+struct ClientTcpCapacityProbeInterlock<'a> {
+    streams: &'a mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &'a mut RecentIdCache<StreamId>,
+    datagrams: &'a mut ClientTcpDatagramState,
+    runtime: &'a ClientTcpPathSessionRuntime,
+    mux_limits: MuxLimits,
+}
+
 async fn client_write_tcp_capacity_probe_interlocked(
     connection: &mut ClientTcpPathConnection,
     probe: &TcpCapacityProbeCommand,
     max_payload_bytes: usize,
-    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
-    closed_streams: &mut RecentIdCache<StreamId>,
-    datagrams: &mut ClientTcpDatagramState,
-    mux_limits: MuxLimits,
+    interlock: ClientTcpCapacityProbeInterlock<'_>,
 ) -> Result<(ClientTcpCapacityProbeWriteOutcome, Vec<Frame>), RuntimeError> {
+    let ClientTcpCapacityProbeInterlock {
+        streams,
+        closed_streams,
+        datagrams,
+        runtime,
+        mux_limits,
+    } = interlock;
     let write = client_write_tcp_capacity_probe(
         &mut connection.carrier.writer,
         connection.carrier.tcp_metrics.as_ref(),
@@ -497,11 +514,13 @@ async fn client_write_tcp_capacity_probe_interlocked(
                     continue;
                 }
                 if !defer_all {
-                    match try_route_client_tcp_frame_during_write(
+                    match try_route_client_tcp_frame_during_write_for_session(
                         frame,
                         streams,
                         closed_streams,
                         datagrams,
+                        runtime,
+                        connection.path_instance_id,
                     )? {
                         ClientTcpWriteFrameRoute::Routed => {
                             routed_frames = routed_frames.saturating_add(1);
@@ -586,6 +605,47 @@ fn client_tcp_write_barrier_reason(
 enum ClientTcpWriteFrameRoute {
     Routed,
     Barrier(Frame),
+}
+
+fn try_route_client_tcp_frame_during_write_for_session(
+    frame: Frame,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    datagrams: &mut ClientTcpDatagramState,
+    runtime: &ClientTcpPathSessionRuntime,
+    path_instance_id: crate::model::path::CarrierPathInstanceId,
+) -> Result<ClientTcpWriteFrameRoute, RuntimeError> {
+    if matches!(
+        &frame,
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } | Frame::DatagramClose { .. }
+    ) {
+        datagrams.route_inbound(frame)?;
+        return Ok(ClientTcpWriteFrameRoute::Routed);
+    }
+    if matches!(
+        &frame,
+        Frame::IpTunnelReady { .. } | Frame::IpPacket { .. } | Frame::IpTunnelClose { .. }
+    ) {
+        let packet_data = matches!(&frame, Frame::IpPacket { .. });
+        let result = runtime
+            .ip_tunnels
+            .route(crate::runtime::tun_l3::ClientIpTunnelEvent {
+                path: crate::model::path::RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: runtime.path_index,
+                },
+                path_instance_id,
+                frame,
+            });
+        return match result {
+            Ok(()) | Err(RuntimeError::SenderServiceBlocked) if packet_data => {
+                Ok(ClientTcpWriteFrameRoute::Routed)
+            }
+            Ok(()) => Ok(ClientTcpWriteFrameRoute::Routed),
+            Err(error) => Err(error),
+        };
+    }
+    try_route_client_tcp_frame_during_write(frame, streams, closed_streams, datagrams)
 }
 
 fn try_route_client_tcp_frame_during_write(

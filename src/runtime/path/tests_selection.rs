@@ -1,8 +1,70 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
-use crate::model::capacity::adaptive_reliable_relay_inflight_bytes;
+use crate::model::capacity::{
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, adaptive_reliable_relay_inflight_bytes,
+};
 use crate::model::path::next_carrier_path_instance_id;
+use crate::protocol::PathUsage;
+use crate::runtime::path::{PacketPathAttachment, PacketPathSelectionInput};
 use crate::transport::PathSpec;
+use std::time::{Duration, Instant};
+
+fn packet_path_context(paths: &[&str]) -> ClientPathContext {
+    let paths = paths
+        .iter()
+        .map(|path| path.parse::<PathSpec>().expect("packet test path"))
+        .collect();
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("packet test secret"),
+    );
+    ClientPathContext::new(paths, security, ResourceLimits::default()).expect("packet path context")
+}
+
+fn install_packet_attachment(
+    context: &ClientPathContext,
+    key: RelayPathKey,
+    usage: PathUsage,
+) -> PacketPathAttachment {
+    let path_instance_id = next_carrier_path_instance_id();
+    let mut health = context.state.health().lock().expect("path health");
+    let record = health.path_record_mut(key).expect("packet path record");
+    match key.underlay {
+        UnderlayProtocol::Tcp => record.install_tcp_peer_usage(
+            PathId(u16::try_from(key.index).expect("test path ID")),
+            path_instance_id,
+            0,
+            usage,
+        ),
+        UnderlayProtocol::Udp => record.install_peer_usage(path_instance_id, 0, usage),
+    }
+    PacketPathAttachment {
+        key,
+        path_instance_id,
+    }
+}
+
+fn seed_native_packet_evidence(
+    context: &ClientPathContext,
+    attachment: PacketPathAttachment,
+    rate_bps: f64,
+    srtt_ms: f64,
+) {
+    let mut health = context.state.health().lock().expect("path health");
+    let record = health
+        .path_record_mut(attachment.key)
+        .expect("packet path record");
+    record.carrier_srtt_ms = Some(srtt_ms);
+    record.carrier_rttvar_ms = Some(srtt_ms / 8.0);
+    record.carrier_delivery_rate_bps = Some(rate_bps);
+    record.carrier_pacing_rate_bps = Some(rate_bps);
+    record.carrier_delivery_samples = 10;
+    record.carrier_delivery_sample_bytes = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
+    record.carrier_delivery_window_covered = true;
+    record.carrier_bulk_proof_expires_at = Some(Instant::now() + Duration::from_secs(60));
+    record.carrier_app_limited = false;
+    record.carrier_ack_derived_data_seen = true;
+}
 
 #[test]
 fn authenticated_output_uses_startup_prior_before_exact_measurement() {
@@ -43,4 +105,154 @@ fn authenticated_output_uses_startup_prior_before_exact_measurement() {
         )
     );
     assert!(admission.window_bytes > 0);
+}
+
+#[test]
+fn packet_candidates_require_the_current_instance_and_do_not_consume_product_state() {
+    let context = packet_path_context(&["udp://127.0.0.1:12720?rate-mbps=80"]);
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let stale = PacketPathAttachment {
+        key,
+        path_instance_id: next_carrier_path_instance_id(),
+    };
+    let current = install_packet_attachment(&context, key, PathUsage::Available);
+    {
+        let mut health = context.state.health().lock().expect("path health");
+        let record = health.path_record_mut(key).expect("packet path record");
+        record.measured_rate_bps = Some(8_000_000_000.0);
+        record.delivery_samples = 100;
+        record.product_delivery_rate_bps = Some(9_000_000_000.0);
+        record.product_delivery_sample_bytes =
+            (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).saturating_mul(2);
+        record.last_delivery_at = Some(Instant::now());
+        record.active_flows = 7;
+        record.active_latency_sensitive_flows = 3;
+        record.relay_queue_bytes = 64 * 1024;
+        record.relay_bytes_in_flight = 128 * 1024;
+        record.carrier_queue_bytes = 1_200;
+        record.carrier_bytes_in_flight = 2_400;
+        record.measured_loss_rate = Some(0.02);
+    }
+
+    let candidates = context.ordered_packet_path_candidates(
+        &[
+            PacketPathSelectionInput {
+                attachment: stale,
+                active_flows: 0,
+            },
+            PacketPathSelectionInput {
+                attachment: current,
+                active_flows: 0,
+            },
+        ],
+        1_400,
+    );
+    assert_eq!(candidates.len(), 1);
+    let candidate = candidates[0];
+    assert_eq!(candidate.attachment, current);
+    assert_eq!(candidate.snapshot.delivery_rate_bps, 80_000_000.0);
+    assert_eq!(candidate.snapshot.product_progress_rate_bps, None);
+    assert!(!candidate.snapshot.has_durable_product_progress);
+    assert_eq!(candidate.snapshot.data_level_queue_bytes, 0);
+    assert_eq!(candidate.snapshot.data_level_bytes_in_flight, 0);
+    assert_eq!(candidate.snapshot.active_flows, 0);
+    assert_eq!(candidate.snapshot.active_latency_sensitive_flows, 0);
+    assert_eq!(candidate.snapshot.queue_bytes, 1_200);
+    assert_eq!(candidate.snapshot.bytes_in_flight, 2_400);
+    assert_eq!(candidate.snapshot.loss_rate, 0.02);
+
+    let health = context.state.health().lock().expect("path health");
+    let record = health.path_record(key).expect("packet path record");
+    assert_eq!(record.active_flows, 7);
+    assert_eq!(record.active_latency_sensitive_flows, 3);
+    assert_eq!(record.relay_queue_bytes, 64 * 1024);
+    assert_eq!(record.relay_bytes_in_flight, 128 * 1024);
+    assert_eq!(record.product_delivery_rate_bps, Some(9_000_000_000.0));
+}
+
+#[test]
+fn packet_candidates_use_native_evidence_with_regular_before_backup() {
+    let context = packet_path_context(&[
+        "udp://127.0.0.1:12730",
+        "udp://127.0.0.1:12731",
+        "udp://127.0.0.1:12732?backup=true",
+        "udp://127.0.0.1:12733?probe-only=true",
+    ]);
+    let attachments = (0..4)
+        .map(|index| {
+            install_packet_attachment(
+                &context,
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                PathUsage::Available,
+            )
+        })
+        .collect::<Vec<_>>();
+    seed_native_packet_evidence(&context, attachments[0], 50_000_000.0, 40.0);
+    seed_native_packet_evidence(&context, attachments[1], 500_000_000.0, 10.0);
+    seed_native_packet_evidence(&context, attachments[2], 10_000_000_000.0, 1.0);
+    seed_native_packet_evidence(&context, attachments[3], 10_000_000_000.0, 1.0);
+
+    let inputs = attachments
+        .iter()
+        .copied()
+        .map(|attachment| PacketPathSelectionInput {
+            attachment,
+            active_flows: 0,
+        })
+        .collect::<Vec<_>>();
+    let candidates = context.ordered_packet_path_candidates(&inputs, 1_400);
+    assert_eq!(
+        candidates.len(),
+        3,
+        "probe-only paths are not packet outputs"
+    );
+    assert_eq!(candidates[0].attachment, attachments[1]);
+    assert_eq!(candidates[1].attachment, attachments[0]);
+    assert_eq!(
+        candidates[2].attachment, attachments[2],
+        "backup remains behind every schedulable regular attachment"
+    );
+    assert_eq!(candidates[0].snapshot.delivery_rate_bps, 500_000_000.0);
+    assert!(candidates[0].eta_ms < candidates[1].eta_ms);
+    assert!(candidates[2].eta_ms < candidates[0].eta_ms);
+}
+
+#[test]
+fn packet_candidates_balance_equal_paths_with_packet_plane_load() {
+    let context = packet_path_context(&[
+        "udp://127.0.0.1:12740?rate-mbps=500",
+        "udp://127.0.0.1:12741?rate-mbps=500",
+    ]);
+    let attachments = (0..2)
+        .map(|index| {
+            install_packet_attachment(
+                &context,
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                PathUsage::Available,
+            )
+        })
+        .collect::<Vec<_>>();
+    let candidates = context.ordered_packet_path_candidates(
+        &[
+            PacketPathSelectionInput {
+                attachment: attachments[0],
+                active_flows: 8,
+            },
+            PacketPathSelectionInput {
+                attachment: attachments[1],
+                active_flows: 0,
+            },
+        ],
+        1_400,
+    );
+    assert_eq!(candidates[0].attachment, attachments[1]);
 }

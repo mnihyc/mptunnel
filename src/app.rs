@@ -209,7 +209,8 @@ fn log_configuration_inventory(config: &AppConfig) {
         .product_policy
         .as_ref()
         .map_or(0, |policy| policy.routes.len());
-    let inbound_count = node.local_ingresses.len() + node.servers.len();
+    let inbound_count =
+        node.local_ingresses.len() + node.tun_l3_ingresses.len() + node.servers.len();
     crate::observability::emit_lifecycle(
         crate::config::LogLevel::Info,
         "configuration",

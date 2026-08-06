@@ -11,8 +11,8 @@ use super::schema::{
     ManagementControlStatus, ManagementControls, ManagementDiagnostics, ManagementFlowStatus,
     ManagementIngressStatus, ManagementIo, ManagementOutboundStatus, ManagementPathStatus,
     ManagementPeerPathStatus, ManagementPeerSession, ManagementPeerStatusResult,
-    ManagementServices, ManagementSnapshot, ManagementSummary, NumericIo, SCHEMA,
-    metric_direction_name, path_state_name, path_usage_name, peer_path_state_name,
+    ManagementServices, ManagementSnapshot, ManagementSummary, ManagementTunL3Status, NumericIo,
+    SCHEMA, metric_direction_name, path_state_name, path_usage_name, peer_path_state_name,
     peer_status_code_name, underlay_name,
 };
 use super::snapshot::{SessionInventory, TelemetryAggregate, unix_millis};
@@ -48,6 +48,7 @@ pub(super) fn collect_snapshot(
     services.mpp_outbounds = target.clients.len();
     services.mpp_inbounds = target.servers.len();
     services.local_inbounds = target.inventory.local_inbounds.len();
+    services.tun_l3_services = target.tun_l3_inventory.services.len();
     services.outbounds = target.inventory.outbounds.len();
     services.local_outbounds = target
         .inventory
@@ -228,6 +229,19 @@ pub(super) fn collect_snapshot(
                 .collect(),
         })
         .collect();
+    let tun_l3_services = target
+        .tun_l3_inventory
+        .services
+        .iter()
+        .map(|service| ManagementTunL3Status {
+            role: service.role.as_str(),
+            name: service.name.clone(),
+            interface_name: service.interface_name.clone(),
+            mpp_binding: service.mpp_binding.clone(),
+            mtu: service.mtu,
+            allocation_count: service.allocation_count,
+        })
+        .collect();
 
     ManagementSnapshot {
         schema: SCHEMA,
@@ -237,6 +251,7 @@ pub(super) fn collect_snapshot(
         uptime_ms: uptime.as_millis().min(u64::MAX as u128) as u64,
         services,
         local_inbounds,
+        tun_l3_services,
         outbounds,
         summary,
         admission,

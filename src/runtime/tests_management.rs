@@ -80,6 +80,7 @@ fn balancer_status_and_actions_share_the_generation_owned_balancer() {
         clients: Vec::new(),
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,
@@ -91,7 +92,7 @@ fn balancer_status_and_actions_share_the_generation_owned_balancer() {
 
     target.refresh_sample_snapshot();
     let initial = target.snapshot();
-    assert_eq!(initial.schema, "mptunnel.management.v5");
+    assert_eq!(initial.schema, "mptunnel.management.v6");
     assert_eq!(initial.services.balancers, 1);
     assert!(initial.controls.balancer.supported);
     assert_eq!(initial.balancers[0].ready_members, 2);
@@ -150,6 +151,7 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
         clients: Vec::new(),
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,
@@ -241,6 +243,7 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
         clients: vec![context.clone()],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,
@@ -303,6 +306,7 @@ fn node_path_control_can_select_client_by_outbound_name() {
         clients: vec![context.clone()],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,
@@ -378,6 +382,26 @@ fn client_status_exposes_named_inventory_without_credentials() {
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::from_config(&local_inbounds, &outbound_configs),
+        tun_l3_inventory: TunL3RuntimeInventory {
+            services: Arc::new(vec![
+                TunL3ServiceInventory {
+                    role: TunL3ServiceRole::Client,
+                    name: "packet-client".to_string(),
+                    interface_name: Some("mptun-client".to_string()),
+                    mpp_binding: "edge-mpp".to_string(),
+                    mtu: None,
+                    allocation_count: None,
+                },
+                TunL3ServiceInventory {
+                    role: TunL3ServiceRole::Server,
+                    name: "packet-server".to_string(),
+                    interface_name: Some("mptun-server".to_string()),
+                    mpp_binding: "packet-server".to_string(),
+                    mtu: Some(1_400),
+                    allocation_count: Some(3),
+                },
+            ]),
+        },
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,
@@ -403,6 +427,12 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert!(!status.local_inbounds[1].auth_required);
     assert_eq!(status.services.outbounds, 1);
     assert_eq!(status.services.local_outbounds, 1);
+    assert_eq!(status.services.tun_l3_services, 2);
+    assert_eq!(status.tun_l3_services[0].role, "client");
+    assert_eq!(status.tun_l3_services[0].mpp_binding, "edge-mpp");
+    assert_eq!(status.tun_l3_services[1].role, "server");
+    assert_eq!(status.tun_l3_services[1].mtu, Some(1_400));
+    assert_eq!(status.tun_l3_services[1].allocation_count, Some(3));
     assert_eq!(status.sessions.len(), 1);
     assert_eq!(status.sessions[0].state, "connecting");
     assert_eq!(status.sessions[0].carrier_count, 0);
@@ -448,6 +478,7 @@ fn status_projects_the_bounded_tcp_carrier_pool() {
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,
@@ -513,6 +544,7 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry,
         state: ManagementState::new("node"),
         config_control: None,
@@ -579,6 +611,7 @@ fn control_refresh_does_not_advance_one_hertz_trends() {
         clients: vec![context],
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,

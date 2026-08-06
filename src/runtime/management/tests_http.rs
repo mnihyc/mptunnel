@@ -1,6 +1,6 @@
 use super::*;
-use crate::runtime::management::ProductRuntimeInventory;
 use crate::runtime::management::snapshot::ManagementState;
+use crate::runtime::management::{ProductRuntimeInventory, TunL3RuntimeInventory};
 use crate::runtime::readiness::{
     RuntimeGenerationControl, RuntimeGenerationPhase, RuntimeReadinessBarrier,
 };
@@ -65,6 +65,7 @@ fn health_target(generation: RuntimeGenerationControl) -> ManagementTarget {
         clients: Vec::new(),
         servers: Vec::new(),
         inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
         product_telemetry: RuntimeTelemetry::new(8),
         state: ManagementState::new("node"),
         config_control: None,
@@ -318,6 +319,8 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         r#"id="sidebar-toggle""#,
         r#"id="overview-connections-body""#,
         r#"id="inbound-services-body""#,
+        r#"id="tun-l3-services-body""#,
+        r#"id="tun-l3-services-count""#,
         r#"id="admission-body""#,
         r#"id="overview-paths-body""#,
         r#"id="overview-peer-paths-body""#,

@@ -30,7 +30,9 @@ pub(in crate::runtime) use commands::{CapacityProbeCommandTicket, RequestTcpCapa
 pub(in crate::runtime) use health::{
     ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView,
 };
-pub(in crate::runtime) use model::{PathDeliveryStats, UdpPathCandidate};
+pub(in crate::runtime) use model::{
+    PacketPathAttachment, PacketPathSelectionInput, PathDeliveryStats, UdpPathCandidate,
+};
 pub(in crate::runtime) use ports::{
     AcceptedServerDatagramFlow, CarrierDeliveryRateSample, OpenedReliableCarrierStream,
     ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerCarrierPathRetirement,

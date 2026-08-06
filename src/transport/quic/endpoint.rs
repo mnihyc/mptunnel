@@ -7,7 +7,7 @@ use super::socket::{
 };
 #[cfg(windows)]
 use super::socket::{bind_client_udp_socket, bind_server_udp_socket};
-use super::stream::DatagramFlowRegistry;
+use super::stream::{DatagramFlowRegistry, IpTunnelRegistry};
 use super::{
     CongestionMetrics, InstrumentedBbrConfig, InstrumentedController, QuicCandidateSelector,
     QuicCandidateVerifier, QuicCarrierError, QuicCarrierTelemetry, RecvStream, SendStream,
@@ -249,6 +249,7 @@ impl Connection {
         let known_datagram_flows = Arc::new(std::sync::Mutex::new(DatagramFlowRegistry::new(
             self.max_datagram_flows,
         )));
+        let known_ip_tunnel = Arc::new(std::sync::Mutex::new(IpTunnelRegistry::new()));
         let native_send = self.native_datagrams.sender(stream.request_stream_id);
         let native_recv = self.native_datagrams.register(stream.request_stream_id)?;
         Ok((
@@ -258,12 +259,14 @@ impl Connection {
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
                 known_datagram_flows: known_datagram_flows.clone(),
+                known_ip_tunnel: known_ip_tunnel.clone(),
                 priority: 0,
             },
             RecvStream::new(
                 stream.recv,
                 native_recv,
                 known_datagram_flows,
+                known_ip_tunnel,
                 self.max_deferred_native_bytes,
             ),
         ))
@@ -274,6 +277,7 @@ impl Connection {
         let known_datagram_flows = Arc::new(std::sync::Mutex::new(DatagramFlowRegistry::new(
             self.max_datagram_flows,
         )));
+        let known_ip_tunnel = Arc::new(std::sync::Mutex::new(IpTunnelRegistry::new()));
         let native_send = self.native_datagrams.sender(stream.request_stream_id);
         let native_recv = self.native_datagrams.register(stream.request_stream_id)?;
         Ok((
@@ -283,12 +287,14 @@ impl Connection {
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
                 known_datagram_flows: known_datagram_flows.clone(),
+                known_ip_tunnel: known_ip_tunnel.clone(),
                 priority: 0,
             },
             RecvStream::new(
                 stream.recv,
                 native_recv,
                 known_datagram_flows,
+                known_ip_tunnel,
                 self.max_deferred_native_bytes,
             ),
         ))

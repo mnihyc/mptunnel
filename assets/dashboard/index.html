@@ -290,6 +290,35 @@
         </div>
       </section>
 
+      <section class="data-section data-section--wide" aria-labelledby="tun-l3-services-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="tun-l3-services-title">TUN-L3 services</h2>
+            <p class="section-meta">Raw IP packet devices kept separate from Product routing and flows.</p>
+          </div>
+          <span id="tun-l3-services-count" class="badge badge--neutral">0 configured</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--inventory">
+            <thead>
+              <tr>
+                <th scope="col">Role</th>
+                <th scope="col">Name</th>
+                <th scope="col">Interface</th>
+                <th scope="col">MPP binding</th>
+                <th scope="col">MTU</th>
+                <th scope="col">Allocations</th>
+              </tr>
+            </thead>
+            <tbody id="tun-l3-services-body"></tbody>
+          </table>
+        </div>
+        <div id="tun-l3-services-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No TUN-L3 services</h3>
+          <p>Raw IP packet tunneling is not enabled in this configuration.</p>
+        </div>
+      </section>
+
       <section class="data-section data-section--wide" aria-labelledby="overview-sessions-title">
         <div class="data-section__header data-section__header--actions">
           <div>

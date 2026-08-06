@@ -6554,3 +6554,158 @@ entry is authoritative.
   - malformed inline, multiline, and ordinary-field TOML canaries are absent
     from display, debug, source-chain, and packaged fatal diagnostics while
     safe line/column and unknown-field context remain available.
+
+## 2026-08-06T16:25:34+08:00: first-class TUN-L3 packet plane established
+
+- Name: authenticated multipath layer-3 tunnel
+- Category: Product packet service and transport-neutral data plane
+- State: implemented and verified locally; no commit, tag, release, or push
+  performed
+- Accepted contract:
+  - `protocol = "tun-l3"` binds one client packet device directly to one MPP
+    outbound, while an MPP inbound may own an IPv4 and/or IPv6 pool, one server
+    address per family, explicit principal allocations, and additional
+    principal-owned prefixes;
+  - authenticated MPP principal identity is the sole ownership authority.
+    Client-to-server source addresses and server-to-client destination
+    addresses are checked against the immutable plan; outer source locators
+    and claimed packet identity are never trusted;
+  - the packet plane is parallel to Product routing, DNS, destination ACLs,
+    outbound target handling, and TUN-L4. It configures only the assigned host
+    address and MTU, using `/32` and `/128`; it does not install peer or pool
+    routes, DNS, forwarding, firewall, or NAT state;
+  - complete IPv4 and IPv6 packets preserve headers, TTL/Hop Limit, and payload.
+    TCP uses ordered carrier frames; QUIC uses one reliable lifecycle stream and
+    request-associated native datagrams with a compact bounded fragmentation
+    envelope;
+  - TCP and QUIC attachments are equally eligible. Each direction has its own
+    bounded inner-flow affinity and transport-derived flowlet reselection;
+    exact failure retires only that carrier attachment. The packet plane adds
+    no acknowledgment, retransmission, congestion controller, pacing loop, or
+    global reorder buffer; and
+  - one ordered, memory-bounded client handoff preserves accepted packet and
+    lifecycle order through kernel-device backpressure. Server dispatch is
+    bounded, validates ownership before delivery, and uses the same dedicated
+    packet-ranking evidence rather than Product flow accounting.
+- Product and platform boundary:
+  - existing shipped client/server defaults remain unchanged; enabling the
+    packet plane is explicit and additive;
+  - Linux, Windows, macOS, and BSD use the neutral packet-device provider.
+    macOS/BSD automatic route association is explicitly disabled. Android uses
+    the existing host-provided descriptor boundary, and Apple Network Extension
+    hosts retain their documented packet-flow adapter boundary; and
+  - management reports a separate aggregate TUN-L3 service inventory without
+    credentials, principals, pools, assigned addresses, or allowed prefixes.
+    Repeated attachment failures now emit rate-limited operator warnings; the
+    healthy packet path has no new logging work.
+- Reproducible evidence:
+  - an isolated unprivileged Linux namespace created distinct client and server
+    network namespaces, actual kernel TUN devices, and external exact host
+    routes. Before those host routes were added, both IPv4 and IPv6 peer-route
+    assertions were empty;
+  - TCP-only, QUIC-only, and combined TCP+QUIC profiles each carried three
+    complete `1,400`-byte IPv4 packets and three complete `1,400`-byte IPv6
+    packets with zero loss. QUIC-only therefore exercised native fragmentation
+    and reassembly rather than falling back to TCP;
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings` passes;
+    `cargo test --locked --all-features` passes `1,505` library tests, `2`
+    allocation tests, `6` packaged daily-use tests, and documentation tests;
+  - patched Quinn passes `283` tests and `3` documentation tests; deterministic
+    benchmark/replay passes `5` tests; management Python contracts pass `31`
+    tests; dashboard JavaScript syntax, formatting, and `git diff --check` pass;
+    and
+  - compile-time checks pass for native Linux, static Linux, and Windows GNU.
+    Android and macOS reached native crypto build scripts but this Linux host
+    lacks the Android NDK compiler and Apple SDK/toolchain; their unchanged
+    platform matrix remains the full-build authority.
+
+## 2026-08-06T17:59:33+08:00: TUN-L3 performance matrix and Product guard completed
+
+- Name: real-packet performance and historical non-regression verification
+- Category: Performance evidence
+- State: documented locally; no source-model patch, commit, tag, release, or
+  push performed
+- Verification scope:
+  - the unchanged optimized candidate passes `cargo test --locked
+    --all-features`: `1,505` library tests, `2` allocation tests, `6` packaged
+    daily-use tests, and documentation tests;
+  - the original eight-cell TCP/QUIC guard was repeated at `500 Mbps`, `180 ms`
+    one-way delay, `20 ms` jitter, and zero configured loss, then compared with
+    the accepted historical rows and an exact `v0.2.2` binary control; and
+  - the current default TCP+QUIC ordinary/adverse guard was repeated without
+    changing path hints, production timing, congestion control, windows, or
+    queue parameters. A single ambiguous two-link download cell was closed by
+    an A-B-A candidate/`v0.2.2`/candidate sequence; the closing candidate
+    restored `775.864 Mbps` against the accepted `771.888 Mbps`.
+- Product conclusion:
+  - no broad accidental Product downgrade is demonstrated: current five-link
+    download/upload delivered `1,555.464/1,387.474 Mbps`, and ordinary
+    one-link upload delivered `426.737 Mbps`;
+  - pure-TCP and QUIC five-link download, QUIC five-link upload, adverse default
+    one-link download, and default two-link upload remain unresolved diagnostic
+    gaps. The matched parent was also low in the two-link upload cell, so that
+    observation does not establish candidate causality; and
+  - every new candidate cohort is non-publishable replacement evidence because
+    the tested source snapshot is uncommitted. Later cohorts satisfied host
+    load and external-container rules; source dirtiness was their sole validity
+    failure. No speculative scheduler, timing, or codec patch was retained.
+- Real TUN-L3 matrix:
+  - ten fresh network-namespace cells used actual `1,500`-byte kernel TUN
+    devices, exact externally installed peer routes, independent TCP and QUIC
+    veth links, both ICMP directions and sizes, four parallel inner-TCP flows,
+    and four parallel inner-UDP flows;
+  - clean, ordinary, adverse, and asymmetric conditions covered `500 Mbps`
+    links, `10–280 ms` RTT, `0–20 ms` per-direction jitter, `0–10%`
+    per-direction loss, and opposing `20/200 Mbps` asymmetric directions;
+  - TCP outer service preserved all ICMP packets but reached
+    `542–1,032 ms` mean echo RTT under the adverse profile. QUIC preserved
+    native packet semantics; small adverse echoes lost `20–26%` against the
+    approximate `19%` round-trip loss expected from independent `10%` loss in
+    each direction, while the full small/near-MTU range was `15–26%`;
+  - clean inner TCP delivered `441.509/442.685 Mbps` over TCP,
+    `389.672/401.550 Mbps` over QUIC, and `605.370/628.656 Mbps` over mixed
+    upload/download service. Inner TCP over QUIC became loss-limited under the
+    ordinary profile because it, not Product reliable MPP, owns recovery;
+  - clean UDP delivered `444.297/442.034 Mbps` over TCP and
+    `420.399/413.527 Mbps` over QUIC from `450 Mbps` requested per direction.
+    Netem and TUN qdiscs recorded no drops, but the run does not distinguish
+    wire overhead from a bounded internal attachment or QUIC queue; and
+  - mixed packet affinity currently sees one TCP endpoint's three carrier
+    members and one QUIC endpoint as four attachments. That topology can bias
+    cold placement and is consistent with the measured `864.380/443.569 Mbps`
+    clean UDP upload/download imbalance from `900 Mbps` requested, but per-flow
+    carrier assignment was not captured to establish causality. No selection
+    correction was accepted without proving that it preserves lossy-path
+    behavior.
+- Documentation and evidence:
+  - `docs/PERFORMANCE.md` now contains the complete ICMP, inner-TCP, and
+    inner-UDP matrix plus the historical/current guard classifications;
+  - `README.md` performance claims were intentionally not changed by this
+    verification pass; and
+  - raw artifacts remain below `./.tmp/tun-l3-performance/evidence/` and
+    `./.tmp/lab/results/tun-l3-*` for the current uncommitted audit.
+
+## 2026-08-06T18:35:21+08:00: TCP five-link download matched ABBA closed
+
+- Name: exact-binary TCP aggregation regression check
+- Category: Performance evidence
+- State: candidate downgrade not reproduced; no model or parameter change
+- Method:
+  - ran `v0.2.2`, candidate, candidate, then `v0.2.2` using the same
+    `mptunnel_tcp_multipath_equal_fat` case, without rebuilding either binary;
+  - each run used five `500 Mbps` TCP links, `180 ms` one-way delay, `20 ms`
+    jitter, zero configured loss, two flows, and a 20-second transfer; and
+  - both binaries were retained by SHA-256, and `target/release/mptunnel` was
+    restored byte-for-byte to the candidate after the sequence.
+- Evidence:
+  - `v0.2.2`: `631.461/686.330 Mbps`, mean `658.896 Mbps`;
+  - candidate: `755.907/704.200 Mbps`, mean `730.053 Mbps` (`10.8%` higher);
+  - every run completed with zero failed requests, zero early termination,
+    zero shaping drops, and material traffic on all five paths; and
+  - raw records are in `./.tmp/lab/results/tcp-five-abba-*`.
+- Conclusion:
+  - the bounded matched comparison rejects a TCP five-link candidate
+    downgrade; it does not claim a universal candidate improvement; and
+  - both cohorts remain below the accepted historical `793.576 Mbps`, so that
+    absolute gap is shared run/environment variance rather than evidence of a
+    regression introduced by the current candidate.

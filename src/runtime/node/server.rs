@@ -33,6 +33,7 @@ use crate::runtime::relay::{ServerReliableRelayContext, ServerReliableRelayServi
 use crate::runtime::telemetry::RuntimeTelemetry;
 #[cfg(test)]
 use crate::runtime::telemetry::active_flow_detail_capacity;
+use crate::runtime::tun_l3::ServerIpTunnelService;
 #[cfg(test)]
 use crate::transport::PathSpec;
 use crate::transport::encrypted::TcpServerTlsConfig;
@@ -102,6 +103,7 @@ pub(in crate::runtime) async fn run(
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         session.retention_timeout,
         management.peer_diagnostics_enabled(),
+        None,
     )?;
     let generation = config_control
         .as_ref()
@@ -126,6 +128,7 @@ pub(in crate::runtime) async fn run(
             Vec::new(),
             vec![paths],
             crate::runtime::management::ProductRuntimeInventory::default(),
+            crate::runtime::management::TunL3RuntimeInventory::default(),
             product_telemetry,
             config_control,
             None,
@@ -199,6 +202,7 @@ pub(in crate::runtime) fn new_identity_runtime(
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         SessionConfig::default().retention_timeout,
         false,
+        None,
     )
     .expect("test server identity runtime")
 }
@@ -218,6 +222,7 @@ pub(super) fn new_identity_runtime_with_metadata(
     telemetry: RuntimeTelemetry,
     session_retention_timeout: Duration,
     allow_peer_diagnostics: bool,
+    tun_l3: Option<crate::product::TunL3AddressPlan>,
 ) -> Result<ServerIdentityRuntime, RuntimeError> {
     let (configured_path_names, server_paths): (Vec<_>, Vec<_>) = configured_paths
         .into_iter()
@@ -260,6 +265,20 @@ pub(super) fn new_identity_runtime_with_metadata(
         reliable_streams: reliable_stream_port.clone(),
         telemetry: telemetry.clone(),
     });
+    let (ip_tunnels, ip_tunnel_device) = tun_l3.map_or((None, None), |plan| {
+        let packet_queue = mux_limits
+            .max_datagram_queue_bytes
+            .checked_div(usize::from(plan.mtu()))
+            .unwrap_or(0)
+            .max(1);
+        let (port, device) = ServerIpTunnelService::build(
+            plan,
+            reliable_stream_port.clone(),
+            resources.max_paths,
+            packet_queue,
+        );
+        (Some(port), Some(device))
+    });
     let credential_admission = ProductCredentialAdmission::from_security(&security);
     let pending_authentications = Arc::new(Semaphore::new(security.max_pending_authentications));
     let paths = ServerPathContext {
@@ -275,6 +294,8 @@ pub(super) fn new_identity_runtime_with_metadata(
         tls,
         reliable_streams: reliable_stream_port,
         datagrams: datagram_port,
+        ip_tunnels,
+        ip_tunnel_device: Arc::new(Mutex::new(ip_tunnel_device)),
         telemetry,
         peer_status: crate::runtime::peer_status::PeerStatusBroker::new(allow_peer_diagnostics),
         path_join_replay: Arc::new(Mutex::new(ExpiringReplayCache::new(

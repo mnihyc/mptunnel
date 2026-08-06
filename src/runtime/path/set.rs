@@ -82,6 +82,7 @@ pub struct ClientPathContext {
     pub(in crate::runtime) telemetry: RuntimeTelemetry,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) authenticated_carriers: AuthenticatedCarrierInventory,
+    pub(in crate::runtime) ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub,
     pub(in crate::runtime) mux_limits: MuxLimits,
     /// RFC 8684 break-before-make lifetime for established logical streams.
     pub(in crate::runtime) session_retention_timeout: std::time::Duration,
@@ -311,6 +312,7 @@ impl ClientPathContext {
         let session_id = random_session_id()?;
         let peer_status = PeerStatusBroker::new(allow_peer_diagnostics);
         let authenticated_carriers = AuthenticatedCarrierInventory::default();
+        let ip_tunnels = crate::runtime::tun_l3::ClientIpTunnelHub::default();
         let peer_status_snapshot = PeerStatusSnapshotSource::new({
             let tcp_paths = tcp_paths.clone();
             let udp_paths = udp_paths.clone();
@@ -352,6 +354,7 @@ impl ClientPathContext {
                     peer_status: peer_status.clone(),
                     peer_status_snapshot: peer_status_snapshot.clone(),
                     authenticated_carriers: authenticated_carriers.clone(),
+                    ip_tunnels: ip_tunnels.clone(),
                     endpoint_policy,
                     carrier_groups: tcp_carrier_groups.clone(),
                 })
@@ -382,6 +385,7 @@ impl ClientPathContext {
                     peer_status: peer_status.clone(),
                     peer_status_snapshot: peer_status_snapshot.clone(),
                     authenticated_carriers: authenticated_carriers.clone(),
+                    ip_tunnels: ip_tunnels.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -407,6 +411,7 @@ impl ClientPathContext {
             telemetry,
             peer_status,
             authenticated_carriers,
+            ip_tunnels,
             mux_limits,
             session_retention_timeout,
             session_send_buffer,

@@ -19,7 +19,9 @@ use self::schema::ManagementSnapshot;
 use self::snapshot::ManagementState;
 #[cfg(test)]
 use super::*;
-use crate::config::{LocalIngressConfig, ManagementConfig, OutboundLeafConfig};
+use crate::config::{
+    LocalIngressConfig, ManagementConfig, MppInboundConfig, NamedTunL3Config, OutboundLeafConfig,
+};
 use crate::dns::DnsGeneration;
 use crate::ingress::IngressConfig;
 use crate::outbound::OutboundConfig;
@@ -37,13 +39,14 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the generation composition boundary explicitly transfers each independent Product owner"
+    reason = "the generation composition boundary explicitly transfers each independent runtime owner"
 )]
 pub(super) async fn spawn_node_management_services(
     config: ManagementConfig,
     clients: Vec<ClientPathContext>,
     servers: Vec<ServerPathContext>,
     inventory: ProductRuntimeInventory,
+    tun_l3_inventory: TunL3RuntimeInventory,
     product_telemetry: RuntimeTelemetry,
     config_control: Option<RuntimeConfigControl>,
     gateway_control: Option<GatewayRuntimeControl>,
@@ -58,6 +61,7 @@ pub(super) async fn spawn_node_management_services(
         clients,
         servers,
         inventory,
+        tun_l3_inventory,
         product_telemetry,
         state,
         config_control,
@@ -96,6 +100,7 @@ struct ManagementTarget {
     clients: Vec<ClientPathContext>,
     servers: Vec<ServerPathContext>,
     inventory: ProductRuntimeInventory,
+    tun_l3_inventory: TunL3RuntimeInventory,
     product_telemetry: RuntimeTelemetry,
     state: ManagementState,
     config_control: Option<RuntimeConfigControl>,
@@ -109,6 +114,36 @@ struct ManagementTarget {
 pub(super) struct ProductRuntimeInventory {
     local_inbounds: Arc<Vec<ProductInboundInventory>>,
     outbounds: Arc<Vec<ProductOutboundInventory>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct TunL3RuntimeInventory {
+    services: Arc<Vec<TunL3ServiceInventory>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TunL3ServiceRole {
+    Client,
+    Server,
+}
+
+impl TunL3ServiceRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TunL3ServiceInventory {
+    role: TunL3ServiceRole,
+    name: String,
+    interface_name: Option<String>,
+    mpp_binding: String,
+    mtu: Option<u16>,
+    allocation_count: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +247,47 @@ impl ProductRuntimeInventory {
         Self {
             local_inbounds: Arc::new(local_inbounds),
             outbounds: Arc::new(outbounds),
+        }
+    }
+}
+
+impl TunL3RuntimeInventory {
+    pub(super) fn from_config(
+        client_ingresses: &[NamedTunL3Config],
+        mpp_inbounds: &[MppInboundConfig],
+    ) -> Self {
+        let mut services = Vec::with_capacity(
+            client_ingresses.len()
+                + mpp_inbounds
+                    .iter()
+                    .filter(|inbound| inbound.tun_l3.is_some())
+                    .count(),
+        );
+        services.extend(
+            client_ingresses
+                .iter()
+                .map(|ingress| TunL3ServiceInventory {
+                    role: TunL3ServiceRole::Client,
+                    name: ingress.name.clone(),
+                    interface_name: ingress.config.interface_name.clone(),
+                    mpp_binding: ingress.config.outbound.as_str().to_string(),
+                    mtu: None,
+                    allocation_count: None,
+                }),
+        );
+        services.extend(mpp_inbounds.iter().filter_map(|inbound| {
+            let plan = inbound.tun_l3.as_ref()?;
+            Some(TunL3ServiceInventory {
+                role: TunL3ServiceRole::Server,
+                name: inbound.name.clone(),
+                interface_name: plan.interface_name().map(ToOwned::to_owned),
+                mpp_binding: inbound.name.clone(),
+                mtu: Some(plan.mtu()),
+                allocation_count: Some(plan.peers().count()),
+            })
+        }));
+        Self {
+            services: Arc::new(services),
         }
     }
 }

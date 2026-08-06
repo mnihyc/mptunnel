@@ -9,6 +9,7 @@ use super::io::{
     udp_reliable_stream_frame_queue, usable_udp_path_socket_addrs,
     warn_unexpected_udp_runtime_error,
 };
+use super::ip_tunnel::open_client_udp_ip_tunnel;
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::log_quic_ack_poll_diagnostics;
 use super::metrics::{quic_path_metrics_ack_interval, quic_path_metrics_poll_interval};
@@ -160,6 +161,30 @@ impl ClientUdpPathSessionHandle {
             .map_err(|_| RuntimeError::PathOpenTimedOut)?
     }
 
+    pub(in crate::runtime) async fn open_ip_tunnel_attachment(
+        &self,
+        tunnel_id: crate::protocol::IpTunnelId,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<super::ip_tunnel::ClientUdpIpTunnelOpenOutcome, RuntimeError> {
+        let open = async {
+            let connection = self.ensure_connection(open_deadline).await?;
+            let path_instance_id = connection.path_instance_id;
+            let connection_lifetime = connection.connection.clone();
+            match open_client_udp_ip_tunnel(connection, self.runtime.clone(), tunnel_id).await {
+                Ok(attachment) => Ok(attachment),
+                Err(_err) if connection_lifetime.is_closed() => {
+                    self.drop_failed_connection_instance(path_instance_id).await;
+                    let connection = self.ensure_connection(open_deadline).await?;
+                    open_client_udp_ip_tunnel(connection, self.runtime.clone(), tunnel_id).await
+                }
+                Err(err) => Err(err),
+            }
+        };
+        tokio::time::timeout_at(open_deadline, open)
+            .await
+            .map_err(|_| RuntimeError::PathOpenTimedOut)?
+    }
+
     async fn ensure_connection(
         &self,
         open_deadline: tokio::time::Instant,
@@ -200,6 +225,41 @@ impl ClientUdpPathSessionHandle {
             connection.carrier.connection.close();
         }
     }
+
+    async fn drop_failed_connection_instance(&self, failed: CarrierPathInstanceId) {
+        let mut current = self.connection.lock().await;
+        if !current
+            .as_ref()
+            .is_some_and(|connection| connection.carrier.path_instance_id == failed)
+        {
+            return;
+        }
+        let connection = current.take().expect("matched QUIC carrier instance");
+        self.runtime.state.mark_path_instance_data_plane_failure(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: self.runtime.path_index,
+            },
+            connection.carrier.path_instance_id,
+        );
+        connection.carrier.connection.close();
+    }
+
+    pub(in crate::runtime) async fn wait_for_connection_instance_change(
+        &self,
+        previous: CarrierPathInstanceId,
+    ) {
+        let connection = {
+            let current = self.connection.lock().await;
+            match current.as_ref() {
+                Some(connection) if connection.carrier.path_instance_id == previous => {
+                    connection.carrier.connection.clone()
+                }
+                _ => return,
+            }
+        };
+        connection.wait_closed().await;
+    }
 }
 
 #[derive(Clone)]
@@ -221,6 +281,7 @@ pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) peer_status_snapshot: PeerStatusSnapshotSource,
     pub(in crate::runtime) authenticated_carriers:
         crate::runtime::path::AuthenticatedCarrierInventory,
+    pub(in crate::runtime) ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub,
 }
 
 impl ClientUdpPathSessionRuntime {
@@ -244,9 +305,9 @@ impl ClientUdpPathSessionRuntime {
 }
 
 #[derive(Clone)]
-struct ClientUdpCarrierInstance {
-    connection: UdpPathConnection,
-    path_instance_id: CarrierPathInstanceId,
+pub(super) struct ClientUdpCarrierInstance {
+    pub(super) connection: UdpPathConnection,
+    pub(super) path_instance_id: CarrierPathInstanceId,
 }
 
 struct ClientUdpPathConnection {

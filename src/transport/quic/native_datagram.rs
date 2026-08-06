@@ -1,12 +1,12 @@
 //! RFC 9297 HTTP Datagrams associated with an HTTP/3 request stream.
 //!
 //! Quinn owns unreliable delivery. This adapter adds only the Quarter Stream
-//! ID and a bounded fragment envelope so an MPP datagram keeps one directional
-//! `(flow_id, datagram_id)` identity when it exceeds the current path MTU.
+//! ID and bounded, versioned fragment envelopes so an MPP application datagram
+//! or IP packet keeps one directional identity when it exceeds the path MTU.
 
 use super::QuicCarrierError;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{DatagramFlowId, DatagramId, Frame};
+use crate::protocol::{DatagramFlowId, DatagramId, Frame, IpPacketId, IpTunnelId};
 use bytes::{Buf, Bytes};
 use quinn::Connection;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 
 const NATIVE_DATAGRAM_VERSION: u8 = 1;
 const NATIVE_FRAGMENT_HEADER_BYTES: usize = 1 + 8 + 8 + 4 + 2 + 2 + 4;
+const NATIVE_IP_PACKET_VERSION: u8 = 2;
+const NATIVE_IP_FRAGMENT_HEADER_BYTES: usize = 1 + 8 + 8 + 2 + 2 + 4;
 const MAX_NATIVE_FRAGMENTS: usize = 64;
 const MAX_QUARTER_STREAM_ID: u64 = (1_u64 << 60) - 1;
 
@@ -73,6 +75,15 @@ pub(super) struct NativeDatagramReceiver {
     state: Arc<HubState>,
     rx: mpsc::Receiver<BudgetedPacket>,
     reassemblies: HashMap<(DatagramFlowId, DatagramId), Reassembly>,
+    ip_reassemblies: HashMap<(IpTunnelId, IpPacketId), IpReassembly>,
+}
+
+#[derive(Debug)]
+pub(super) struct NativeReceivedFrame {
+    pub(super) frame: Frame,
+    /// Receiver-owned bound for a native IP packet that overtook the reliable
+    /// tunnel-ready transition. UDP datagrams retain their wire TTL instead.
+    pub(super) association_deadline: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -80,6 +91,7 @@ struct BudgetedPacket {
     bytes: Bytes,
     buffered_bytes: Arc<AtomicUsize>,
     received_at: Instant,
+    ip_deadline: Option<Instant>,
 }
 
 impl Drop for BudgetedPacket {
@@ -110,6 +122,27 @@ struct Fragment {
     packet: BudgetedPacket,
     payload_offset: usize,
     received_at: Instant,
+}
+
+#[derive(Debug)]
+struct IpReassembly {
+    _permit: ReassemblyPermit,
+    deadline: Instant,
+    total_len: usize,
+    received_len: usize,
+    parts: Vec<Option<BudgetedPacket>>,
+}
+
+#[derive(Debug)]
+struct IpFragment {
+    tunnel_id: IpTunnelId,
+    packet_id: IpPacketId,
+    index: usize,
+    count: usize,
+    total_len: usize,
+    packet: BudgetedPacket,
+    payload_offset: usize,
+    deadline: Instant,
 }
 
 #[derive(Debug)]
@@ -196,6 +229,7 @@ impl NativeDatagramHub {
             state: self.state.clone(),
             rx,
             reassemblies: HashMap::new(),
+            ip_reassemblies: HashMap::new(),
         })
     }
 
@@ -322,6 +356,74 @@ impl NativeDatagramSender {
         }
         Ok(())
     }
+
+    pub(super) fn send_ip_packet(
+        &self,
+        frame: &Frame,
+        limits: CodecLimits,
+    ) -> Result<(), QuicCarrierError> {
+        let Frame::IpPacket {
+            tunnel_id,
+            packet_id,
+            payload,
+        } = frame
+        else {
+            return Err(QuicCarrierError::InvalidNativeDatagram(
+                "only IP_PACKET may use the native IP envelope",
+            ));
+        };
+        if payload.is_empty() || payload.len() > limits.max_payload_bytes {
+            return Err(QuicCarrierError::NativeDatagramTooLarge);
+        }
+        let quarter_stream_id = self.request_stream_id.checked_div(4).ok_or(
+            QuicCarrierError::InvalidNativeDatagram("invalid HTTP/3 request stream ID"),
+        )?;
+        if !self.request_stream_id.is_multiple_of(4) {
+            return Err(QuicCarrierError::InvalidNativeDatagram(
+                "HTTP Datagram must reference a client request stream",
+            ));
+        }
+        let mut quarter_stream_id_bytes = Vec::with_capacity(8);
+        encode_varint(quarter_stream_id, &mut quarter_stream_id_bytes)?;
+        let maximum = self
+            .connection
+            .max_datagram_size()
+            .ok_or(QuicCarrierError::NativeDatagramUnavailable)?;
+        let fragment_payload_bytes = maximum
+            .checked_sub(quarter_stream_id_bytes.len() + NATIVE_IP_FRAGMENT_HEADER_BYTES)
+            .filter(|value| *value > 0)
+            .ok_or(QuicCarrierError::NativeDatagramTooLarge)?;
+        let fragment_count = payload.len().div_ceil(fragment_payload_bytes);
+        if fragment_count > MAX_NATIVE_FRAGMENTS {
+            return Err(QuicCarrierError::NativeDatagramTooLarge);
+        }
+        let fragment_count_u16 =
+            u16::try_from(fragment_count).map_err(|_| QuicCarrierError::NativeDatagramTooLarge)?;
+        let total_len =
+            u32::try_from(payload.len()).map_err(|_| QuicCarrierError::NativeDatagramTooLarge)?;
+
+        for index in 0..fragment_count {
+            let start = index.saturating_mul(fragment_payload_bytes);
+            let end = start
+                .saturating_add(fragment_payload_bytes)
+                .min(payload.len());
+            let mut packet = Vec::with_capacity(
+                quarter_stream_id_bytes.len() + NATIVE_IP_FRAGMENT_HEADER_BYTES + end - start,
+            );
+            packet.extend_from_slice(&quarter_stream_id_bytes);
+            packet.push(NATIVE_IP_PACKET_VERSION);
+            packet.extend_from_slice(&tunnel_id.0.to_be_bytes());
+            packet.extend_from_slice(&packet_id.0.to_be_bytes());
+            packet.extend_from_slice(&(index as u16).to_be_bytes());
+            packet.extend_from_slice(&fragment_count_u16.to_be_bytes());
+            packet.extend_from_slice(&total_len.to_be_bytes());
+            packet.extend_from_slice(&payload[start..end]);
+            self.connection
+                .send_datagram(Bytes::from(packet))
+                .map_err(QuicCarrierError::from)?;
+        }
+        Ok(())
+    }
 }
 
 impl NativeDatagramReceiver {
@@ -344,7 +446,7 @@ impl NativeDatagramReceiver {
     pub(super) async fn recv_frame(
         &mut self,
         limits: CodecLimits,
-    ) -> Result<Frame, QuicCarrierError> {
+    ) -> Result<NativeReceivedFrame, QuicCarrierError> {
         loop {
             self.expire_reassemblies();
             let packet = if let Some(deadline) = self.next_reassembly_expiry() {
@@ -359,13 +461,36 @@ impl NativeDatagramReceiver {
                 self.rx.recv().await
             }
             .ok_or(QuicCarrierError::H3DriverClosed)?;
-            match decode_fragment(packet, limits) {
-                Ok(fragment) => {
-                    if let Some(frame) = self.insert_fragment(fragment) {
-                        return Ok(frame);
+            match packet.bytes.first().copied() {
+                Some(NATIVE_DATAGRAM_VERSION) => match decode_fragment(packet, limits) {
+                    Ok(fragment) => {
+                        if let Some(frame) = self.insert_fragment(fragment) {
+                            return Ok(NativeReceivedFrame {
+                                frame,
+                                association_deadline: None,
+                            });
+                        }
                     }
-                }
-                Err(()) => {
+                    Err(()) => {
+                        self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                Some(NATIVE_IP_PACKET_VERSION) => match decode_ip_fragment(packet, limits) {
+                    Ok(fragment) => {
+                        if let Some((frame, association_deadline)) =
+                            self.insert_ip_fragment(fragment)
+                        {
+                            return Ok(NativeReceivedFrame {
+                                frame,
+                                association_deadline: Some(association_deadline),
+                            });
+                        }
+                    }
+                    Err(()) => {
+                        self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                _ => {
                     self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -457,9 +582,87 @@ impl NativeDatagramReceiver {
         })
     }
 
+    fn insert_ip_fragment(&mut self, fragment: IpFragment) -> Option<(Frame, Instant)> {
+        let now = Instant::now();
+        if fragment.deadline <= now {
+            self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let key = (fragment.tunnel_id, fragment.packet_id);
+        if !self.ip_reassemblies.contains_key(&key) {
+            let Some(permit) = try_acquire_reassembly(self.state.clone()) else {
+                self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            self.ip_reassemblies.insert(
+                key,
+                IpReassembly {
+                    _permit: permit,
+                    deadline: fragment.deadline,
+                    total_len: fragment.total_len,
+                    received_len: 0,
+                    parts: (0..fragment.count).map(|_| None).collect(),
+                },
+            );
+        }
+        let entry = self
+            .ip_reassemblies
+            .get_mut(&key)
+            .expect("native IP reassembly inserted");
+        if entry.total_len != fragment.total_len || entry.parts.len() != fragment.count {
+            self.ip_reassemblies.remove(&key);
+            self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        entry.deadline = entry.deadline.min(fragment.deadline);
+        let Some(slot) = entry.parts.get_mut(fragment.index) else {
+            self.ip_reassemblies.remove(&key);
+            self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if slot.is_none() {
+            let payload_len = fragment
+                .packet
+                .bytes
+                .len()
+                .saturating_sub(fragment.payload_offset);
+            entry.received_len = entry.received_len.saturating_add(payload_len);
+            *slot = Some(fragment.packet);
+        }
+        if entry.received_len != entry.total_len || entry.parts.iter().any(Option::is_none) {
+            return None;
+        }
+        let complete = self
+            .ip_reassemblies
+            .remove(&key)
+            .expect("completed native IP reassembly exists");
+        if complete.deadline <= Instant::now() {
+            return None;
+        }
+        let mut payload = Vec::with_capacity(complete.total_len);
+        for part in complete.parts {
+            let part = part.expect("native IP reassembly completeness checked");
+            payload.extend_from_slice(&part.bytes[NATIVE_IP_FRAGMENT_HEADER_BYTES..]);
+        }
+        if payload.len() != complete.total_len {
+            self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some((
+            Frame::IpPacket {
+                tunnel_id: key.0,
+                packet_id: key.1,
+                payload: Bytes::from(payload),
+            },
+            complete.deadline,
+        ))
+    }
+
     fn expire_reassemblies(&mut self) {
         let now = Instant::now();
         self.reassemblies
+            .retain(|_, reassembly| reassembly.deadline > now);
+        self.ip_reassemblies
             .retain(|_, reassembly| reassembly.deadline > now);
     }
 
@@ -467,6 +670,11 @@ impl NativeDatagramReceiver {
         self.reassemblies
             .values()
             .map(|reassembly| reassembly.deadline)
+            .chain(
+                self.ip_reassemblies
+                    .values()
+                    .map(|reassembly| reassembly.deadline),
+            )
             .min()
     }
 }
@@ -518,10 +726,13 @@ fn route_datagram(
         return Ok(());
     }
     let now = Instant::now();
+    let ip_deadline = (payload.first().copied() == Some(NATIVE_IP_PACKET_VERSION))
+        .then(|| now + pending_route_wait(connection));
     let budgeted = BudgetedPacket {
         bytes: payload,
         buffered_bytes: state.buffered_bytes.clone(),
         received_at: now,
+        ip_deadline,
     };
     let mut routing = state.routing.lock().expect("native datagram route lock");
     if let Some(route) = routing.active.get(&request_stream_id) {
@@ -552,8 +763,9 @@ fn route_datagram(
         state.dropped_packets.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    let route_wait = pending_route_wait(connection);
-    let deadline = pending_packet_deadline(&budgeted.bytes, now, route_wait);
+    let deadline = budgeted.ip_deadline.unwrap_or_else(|| {
+        pending_packet_deadline(&budgeted.bytes, now, pending_route_wait(connection))
+    });
     queue.push_back(PendingPacket {
         deadline,
         packet: budgeted,
@@ -584,6 +796,9 @@ fn pending_route_wait(connection: &Connection) -> Duration {
 
 fn pending_packet_deadline(payload: &Bytes, now: Instant, route_wait: Duration) -> Instant {
     const TTL_OFFSET: usize = 1 + 8 + 8;
+    if payload.first().copied() != Some(NATIVE_DATAGRAM_VERSION) {
+        return now + route_wait;
+    }
     let ttl = payload
         .get(TTL_OFFSET..TTL_OFFSET + 4)
         .and_then(|encoded| <[u8; 4]>::try_from(encoded).ok())
@@ -666,6 +881,45 @@ fn decode_fragment(packet: BudgetedPacket, limits: CodecLimits) -> Result<Fragme
         packet,
         payload_offset,
         received_at,
+    })
+}
+
+fn decode_ip_fragment(packet: BudgetedPacket, limits: CodecLimits) -> Result<IpFragment, ()> {
+    let deadline = packet.ip_deadline.ok_or(())?;
+    let bytes = &packet.bytes;
+    if bytes.len() < NATIVE_IP_FRAGMENT_HEADER_BYTES {
+        return Err(());
+    }
+    let mut cursor = bytes.clone();
+    let version = cursor.get_u8();
+    if version != NATIVE_IP_PACKET_VERSION {
+        return Err(());
+    }
+    let tunnel_id = IpTunnelId(cursor.get_u64());
+    let packet_id = IpPacketId(cursor.get_u64());
+    let index = usize::from(cursor.get_u16());
+    let count = usize::from(cursor.get_u16());
+    let total_len = cursor.get_u32() as usize;
+    if total_len == 0
+        || count == 0
+        || count > MAX_NATIVE_FRAGMENTS
+        || index >= count
+        || total_len > limits.max_payload_bytes
+        || count > total_len
+        || cursor.remaining() > total_len
+    {
+        return Err(());
+    }
+    let payload_offset = bytes.len().saturating_sub(cursor.remaining());
+    Ok(IpFragment {
+        tunnel_id,
+        packet_id,
+        index,
+        count,
+        total_len,
+        packet,
+        payload_offset,
+        deadline,
     })
 }
 

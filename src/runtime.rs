@@ -21,6 +21,7 @@ mod relay;
 mod sender;
 mod stream;
 mod telemetry;
+mod tun_l3;
 mod tun_l4;
 
 pub(crate) use config_control::RuntimeConfigControl;

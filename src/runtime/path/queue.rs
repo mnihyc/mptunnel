@@ -1160,7 +1160,7 @@ pub(in crate::runtime) fn reliable_path_effective_frame_lane(
         Frame::StreamData { .. }
         | Frame::PathCapacityData { .. }
         | Frame::PathCapacityFinish { .. } => stream_lane,
-        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } => {
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } | Frame::IpPacket { .. } => {
             TrafficClass::RealtimeDatagram
         }
         _ => TrafficClass::Control,
@@ -1185,6 +1185,8 @@ fn reliable_path_frame_requires_product_admission(frame: &Frame) -> bool {
             | Frame::StreamFin { .. }
             | Frame::OpenDatagramFlow { .. }
             | Frame::DatagramData { .. }
+            | Frame::OpenIpTunnel { .. }
+            | Frame::IpPacket { .. }
             | Frame::PathProofData { .. }
             | Frame::PathProofAck { .. }
             | Frame::PathCapacityData { .. }
@@ -1724,6 +1726,10 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::DatagramData { .. } => "datagram_data",
         Frame::DatagramClose { .. } => "datagram_close",
         Frame::DatagramFeedback { .. } => "datagram_feedback",
+        Frame::OpenIpTunnel { .. } => "open_ip_tunnel",
+        Frame::IpTunnelReady { .. } => "ip_tunnel_ready",
+        Frame::IpPacket { .. } => "ip_packet",
+        Frame::IpTunnelClose { .. } => "ip_tunnel_close",
         Frame::PathMetrics { .. } => "path_metrics",
         Frame::Ping { .. } => "ping",
         Frame::Pong { .. } => "pong",

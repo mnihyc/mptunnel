@@ -1164,6 +1164,198 @@ fn resource_file_config_exposes_sparse_node_limits() {
 }
 
 #[test]
+fn tun_l3_toml_compiles_client_binding_and_server_address_plan() {
+    let config = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "packet-client"
+protocol = "tun-l3"
+outbound = "edge"
+interface_name = "mptun-client"
+
+[[inbounds]]
+name = "packet-server"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
+outbound = "direct"
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain_file = "mptunnel-test-certificate.pem"
+tls_private_key_file = "mptunnel-test-private-key.pem"
+
+[inbounds.tun_l3]
+interface_name = "mptun-server"
+ipv4_pool = "10.88.0.0/24"
+ipv4 = "10.88.0.1"
+mtu = 1400
+
+[[inbounds.tun_l3.allocations]]
+principal_id = "test-peer"
+ipv4 = "10.88.0.2"
+allowed_ips = ["192.168.50.0/24"]
+
+[[outbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
+
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+"#,
+    )
+    .expect("TUN-L3 client and server configuration");
+
+    let CommandConfig::Node(node) = config.command;
+    let [client] = node.tun_l3_ingresses.as_slice() else {
+        panic!("expected one TUN-L3 client ingress");
+    };
+    assert_eq!(client.name, "packet-client");
+    assert_eq!(client.config.outbound.as_str(), "edge");
+    assert_eq!(
+        client.config.interface_name.as_deref(),
+        Some("mptun-client")
+    );
+
+    let [server] = node.servers.as_slice() else {
+        panic!("expected one MPP server inbound");
+    };
+    let plan = server.tun_l3.as_ref().expect("server TUN-L3 plan");
+    assert_eq!(plan.interface_name(), Some("mptun-server"));
+    assert_eq!(
+        plan.ipv4_pool(),
+        Some("10.88.0.0/24".parse().expect("pool"))
+    );
+    assert_eq!(plan.ipv4(), Some("10.88.0.1".parse().expect("address")));
+    assert_eq!(plan.mtu(), 1400);
+    let principal = PrincipalId::parse("test-peer").expect("principal");
+    let allocation = plan.peer(&principal).expect("peer allocation");
+    assert_eq!(
+        allocation.ipv4(),
+        Some("10.88.0.2".parse().expect("address"))
+    );
+    assert_eq!(
+        allocation.allowed_ips(),
+        &["192.168.50.0/24".parse().expect("allowed prefix")]
+    );
+}
+
+#[test]
+fn process_managed_tun_l4_rejects_client_and_server_tun_l3() {
+    let managed_host = r#"
+[inbounds.host]
+mode = "managed"
+route_mode = "full"
+dns_capture_servers = ["10.88.0.53"]
+"#;
+    let client = format!(
+        "{}\n{}",
+        managed_tun_document(managed_host),
+        r#"
+[[inbounds]]
+name = "packet-client"
+protocol = "tun-l3"
+outbound = "edge"
+"#
+    );
+    assert!(matches!(
+        load_config_toml_str(&client),
+        Err(ConfigFileError::Config(ConfigError::ManagedTunL3Conflict))
+    ));
+
+    let server = format!(
+        "{}\n{}",
+        managed_tun_document(managed_host),
+        r#"
+[[inbounds]]
+name = "packet-server"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
+outbound = "direct"
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain_file = "mptunnel-test-certificate.pem"
+tls_private_key_file = "mptunnel-test-private-key.pem"
+
+[inbounds.tun_l3]
+ipv4_pool = "10.89.0.0/24"
+ipv4 = "10.89.0.1"
+
+[[inbounds.tun_l3.allocations]]
+principal_id = "test-peer"
+ipv4 = "10.89.0.2"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+"#
+    );
+    assert!(matches!(
+        load_config_toml_str(&server),
+        Err(ConfigFileError::Config(ConfigError::ManagedTunL3Conflict))
+    ));
+}
+
+#[test]
+fn tun_l3_rejects_conflicting_explicit_packet_device_names() {
+    let document = r#"
+[[inbounds]]
+name = "packet-client"
+protocol = "tun-l3"
+outbound = "edge"
+interface_name = "mptun0"
+
+[[inbounds]]
+name = "packet-server"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
+outbound = "direct"
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain_file = "mptunnel-test-certificate.pem"
+tls_private_key_file = "mptunnel-test-private-key.pem"
+
+[inbounds.tun_l3]
+interface_name = "mptun0"
+ipv4_pool = "10.88.0.0/24"
+ipv4 = "10.88.0.1"
+
+[[inbounds.tun_l3.allocations]]
+principal_id = "test-peer"
+ipv4 = "10.88.0.2"
+
+[[outbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
+
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+"#;
+
+    assert!(matches!(
+        load_config_toml_str(document),
+        Err(ConfigFileError::Config(
+            ConfigError::DuplicatePacketDeviceName(name)
+        )) if name == "mptun0"
+    ));
+}
+
+#[test]
 fn toml_separates_logical_session_retention_from_carrier_liveness() {
     let config = load_config_toml_str(
         r#"
@@ -1240,6 +1432,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     let CommandConfig::Node(reference) = reference.command;
     assert!(reference.servers.is_empty());
     assert_eq!(reference.local_ingresses.len(), 2);
+    assert!(reference.tun_l3_ingresses.is_empty());
     assert_eq!(mpp_outbounds(&reference)[0].paths.len(), 2);
     assert!(
         mpp_outbounds(&reference)[0].paths[0]
@@ -1251,6 +1444,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     let CommandConfig::Node(client) = client.command;
     assert!(client.servers.is_empty());
     assert_eq!(client.local_ingresses.len(), 1);
+    assert!(client.tun_l3_ingresses.is_empty());
     assert_eq!(mpp_outbounds(&client)[0].paths.len(), 2);
     assert!(
         mpp_outbounds(&client)[0].paths[0]
@@ -1261,7 +1455,9 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     let server = load(include_str!("../../examples/server.toml"));
     let CommandConfig::Node(server) = server.command;
     assert!(server.local_ingresses.is_empty());
+    assert!(server.tun_l3_ingresses.is_empty());
     assert_eq!(server.servers.len(), 1);
+    assert!(server.servers[0].tun_l3.is_none());
     assert_eq!(server.servers[0].paths.len(), 2);
     assert!(server.servers[0].tls.shared_transport_secret_configured());
     assert!(mpp_outbounds(&server).is_empty());

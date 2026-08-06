@@ -6,6 +6,7 @@ fn budgeted(bytes: Bytes) -> BudgetedPacket {
         bytes,
         buffered_bytes,
         received_at: Instant::now(),
+        ip_deadline: None,
     }
 }
 
@@ -82,6 +83,61 @@ fn native_fragment_contract_is_compact_and_rejects_unbounded_metadata() {
     assert!(decode_fragment(budgeted(Bytes::from(excessive)), CodecLimits::default()).is_err());
 }
 
+#[test]
+fn native_ip_fragment_version_is_distinct_and_receiver_bounded() {
+    assert_eq!(NATIVE_IP_FRAGMENT_HEADER_BYTES, 25);
+    let received_at = Instant::now();
+    let deadline = received_at + Duration::from_millis(50);
+    let mut encoded = Vec::new();
+    encoded.push(NATIVE_IP_PACKET_VERSION);
+    encoded.extend_from_slice(&7_u64.to_be_bytes());
+    encoded.extend_from_slice(&11_u64.to_be_bytes());
+    encoded.extend_from_slice(&0_u16.to_be_bytes());
+    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.extend_from_slice(&1_u32.to_be_bytes());
+    encoded.push(0x45);
+    let bytes = Bytes::from(encoded);
+    let buffered_bytes = Arc::new(AtomicUsize::new(bytes.len()));
+    let fragment = decode_ip_fragment(
+        BudgetedPacket {
+            bytes,
+            buffered_bytes,
+            received_at,
+            ip_deadline: Some(deadline),
+        },
+        CodecLimits::default(),
+    )
+    .expect("decode native IP fragment");
+    assert_eq!(fragment.tunnel_id, IpTunnelId(7));
+    assert_eq!(fragment.packet_id, IpPacketId(11));
+    assert_eq!(fragment.deadline, deadline);
+    assert_eq!(fragment.total_len, 1);
+}
+
+#[test]
+fn pending_route_deadline_preserves_v1_ttl_and_uses_local_bound_for_v2() {
+    let now = Instant::now();
+    let route_wait = Duration::from_millis(100);
+    let mut v1 = Vec::new();
+    v1.push(NATIVE_DATAGRAM_VERSION);
+    v1.extend_from_slice(&7_u64.to_be_bytes());
+    v1.extend_from_slice(&11_u64.to_be_bytes());
+    v1.extend_from_slice(&7_u32.to_be_bytes());
+    assert_eq!(
+        pending_packet_deadline(&Bytes::from(v1), now, route_wait),
+        now + Duration::from_millis(7)
+    );
+
+    assert_eq!(
+        pending_packet_deadline(
+            &Bytes::from_static(&[NATIVE_IP_PACKET_VERSION]),
+            now,
+            route_wait,
+        ),
+        now + route_wait
+    );
+}
+
 #[tokio::test]
 async fn incomplete_native_reassembly_releases_budget_without_a_later_packet() {
     let buffered_bytes = Arc::new(AtomicUsize::new(0));
@@ -103,6 +159,7 @@ async fn incomplete_native_reassembly_releases_budget_without_a_later_packet() {
         state: state.clone(),
         rx,
         reassemblies: HashMap::new(),
+        ip_reassemblies: HashMap::new(),
     };
 
     let mut first_fragment = Vec::new();
@@ -120,6 +177,7 @@ async fn incomplete_native_reassembly_releases_budget_without_a_later_packet() {
         bytes: first_fragment,
         buffered_bytes: buffered_bytes.clone(),
         received_at: Instant::now(),
+        ip_deadline: None,
     })
     .await
     .expect("queue incomplete fragment");
@@ -164,6 +222,7 @@ async fn unregistered_route_packet_expires_under_global_bounds_without_traffic()
                 bytes: packet_bytes,
                 buffered_bytes: buffered_bytes.clone(),
                 received_at: Instant::now(),
+                ip_deadline: None,
             },
         }]),
     );
@@ -209,6 +268,7 @@ fn resolved_request_evicts_pending_route_without_exceeding_global_route_cap() {
                     bytes: Bytes::from(vec![0_u8; packet_len]),
                     buffered_bytes: buffered_bytes.clone(),
                     received_at: now,
+                    ip_deadline: None,
                 },
             }]),
         );

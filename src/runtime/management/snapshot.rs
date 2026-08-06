@@ -94,6 +94,7 @@ impl ManagementSnapshot {
             uptime_ms: 0,
             services: ManagementServices::default(),
             local_inbounds: Vec::new(),
+            tun_l3_services: Vec::new(),
             outbounds: Vec::new(),
             summary: NumericSummary::default().finish(),
             admission: Default::default(),

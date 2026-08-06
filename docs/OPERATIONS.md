@@ -197,6 +197,34 @@ expires source associations at `idle_timeout_ms`, and bounds each datagram by
 `datagram_ttl_ms`. Both use the ordinary route/DNS/ACL/outbound/balancer path;
 they do not dial around configured outbounds.
 
+`protocol = "tun-l3"` is the raw IP-tunnel ingress. It selects exactly one MPP
+outbound and receives its IPv4 and/or IPv6 host address from that MPP server's
+authenticated principal allocation. The server configures pools, its own TUN
+addresses, and explicit principal allocations under `[inbounds.tun_l3]`;
+`allowed_ips` adds externally routed prefixes owned by that principal. This
+packet plane does not use Product routing, DNS, destination ACLs, target
+outbounds, or the TUN-L4 userspace TCP/UDP stack. Carrier endpoint names still
+use normal carrier resolution; inner packet destinations do not. Operators
+remain responsible for host routes, IP forwarding, DNS, firewall rules, and
+NAT on both ends. TCP and QUIC carrier paths are both eligible.
+
+The nested server packet service is additive to that MPP inbound's ordinary
+reliable-stream and datagram proxy service, whose egress, DNS plan, and
+destination ACL remain active. For a packet-only inbound, finish its destination
+ACL with a catch-all deny rule:
+
+```toml
+[[inbounds.destination_acl.rules]]
+name = "deny-proxy-plane"
+effect = "deny"
+```
+
+One authenticated principal has one live logical IP tunnel per MPP inbound. A
+new session for the same principal supersedes the previous tunnel attachments;
+this provides locator-independent restart and roaming rather than deriving
+identity from a source address. See `examples/config.reference.toml` for the
+complete commented shape.
+
 Balancer strategies are `manual`, `ordered-failover`, `round-robin`, `random`,
 `weighted-random`, `least-latency`, and `least-load`. Members may start
 `enabled`, `draining`, or `disabled`; only enabled members receive new flows.
@@ -369,15 +397,16 @@ belong in TOML, argv, diagnostics, or the runtime configuration API.
 All data and controls are authenticated under `/api/v2/`:
 
 - `GET /api/v2/` returns the endpoint index with
-  `mptunnel.management.v5`.
+  `mptunnel.management.v6`.
 - `GET /api/v2/health`, `GET /api/v2/health/live`, and
   `GET /api/v2/health/ready` return `mptunnel.health.v2`. The latter two gate
   terminal generation failure and serving readiness respectively.
 - `GET /api/v2/status` returns the complete cached
-  `mptunnel.management.v5` snapshot, including sanitized named inbound and
-  outbound inventory. Credentials and native proxy connector endpoints are
-  absent; configured MPP carrier endpoints are present in the authenticated
-  local path inventory.
+  `mptunnel.management.v6` snapshot, including sanitized Product inbound and
+  outbound inventory plus a separate TUN-L3 service inventory. Credentials,
+  address pools, allocation contents and identities, and native proxy connector
+  endpoints are absent; configured MPP carrier endpoints are present in the
+  authenticated local path inventory.
 - `GET /api/v2/paths` returns configured named paths and live carrier
   instances with their lifecycle state.
 - `GET /api/v2/traffic` returns monotonic forwarded totals, one-second rates,
@@ -581,12 +610,14 @@ connects, or other flow-opening I/O. Defaults are finite:
 | `max_connects_per_target` | 32 |
 | `max_dns_work` | 128 |
 
-SOCKS5, HTTP CONNECT, fixed forwarding, TUN, and authenticated MPP server
+SOCKS5, HTTP CONNECT, fixed forwarding, TUN-L4, and authenticated MPP server
 opens share this one generation owner. Their listener/source/association
 limits still compose at their narrower boundary. Permits release exactly on
 close, error, cancellation, or generation retirement and never enter payload
-forwarding. These fields do not derive from `[resources]`; raising an MPP stream
-or queue budget never raises new-flow admission.
+forwarding. TUN-L3 packet forwarding has its own bounded packet queues and does
+not consume Product flow admission. These fields do not derive from
+`[resources]`; raising an MPP stream or queue budget never raises new-flow
+admission.
 
 An MPP client outbound that has previously authenticated a carrier rejects new
 new flows while its exact authenticated-carrier count is zero. Existing

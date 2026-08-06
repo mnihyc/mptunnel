@@ -14,7 +14,7 @@ class ManagementSnapshotTests(unittest.TestCase):
         payload = {
             "interfaces": {"eth0": {"ipv4": "172.31.10.10", "tx_bytes": 42}},
             "management": {
-                "schema": "mptunnel.management.v5",
+                "schema": "mptunnel.management.v6",
                 "role": "client",
                 "summary": {
                     "path_count": 1,
@@ -71,7 +71,7 @@ class ManagementSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot, payload)
         command = run_mock.call_args.args[0]
         self.assertIn("/api/v2/status", command[5])
-        self.assertIn("mptunnel.management.v5", command[5])
+        self.assertIn("mptunnel.management.v6", command[5])
         self.assertIn("Authorization", command[5])
         self.assertEqual(command[-2:], ["17600", "lab-management-token"])
 

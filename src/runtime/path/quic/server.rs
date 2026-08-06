@@ -9,6 +9,7 @@ use super::io::{
     udp_path_finish_stream, udp_path_read_frame, udp_path_reject_stream, udp_path_write_frame,
     warn_unexpected_udp_runtime_error,
 };
+use super::ip_tunnel::handle_server_udp_ip_tunnel;
 use super::metrics::run_server_quic_path_metrics;
 use super::server_stream::{ServerUdpReliableStreamContext, handle_server_udp_reliable_stream};
 use crate::protocol::{Frame, PathId, SessionId, UnderlayProtocol};
@@ -432,6 +433,9 @@ async fn handle_server_udp_bidi_stream(
                 },
             )
             .await
+        }
+        Frame::OpenIpTunnel { tunnel_id } => {
+            handle_server_udp_ip_tunnel(send, recv, context, path_registration, tunnel_id).await
         }
         Frame::Ping { nonce } => {
             send.set_traffic_class(TrafficClass::Control)?;

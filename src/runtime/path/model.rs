@@ -5,7 +5,7 @@ use crate::model::capacity::{
     RELIABLE_INITIAL_RTT, RELIABLE_INITIAL_WINDOW_PACKETS, UDP_BASELINE_PACKET_PAYLOAD_BYTES,
     adaptive_reliable_relay_inflight_bytes, product_delivery_samples_override_startup_prior,
 };
-use crate::model::path::RelayPathKey;
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::model::timing::{
     quic_bulk_proof_freshness_horizon, transport_pto_from_ms, transport_pto_from_snapshot,
 };
@@ -22,6 +22,33 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::runtime) struct UdpPathCandidate {
     pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) eta_ms: f64,
+}
+
+/// One layer-3 tunnel attachment on an exact authenticated carrier lifetime.
+///
+/// The packet service owns attachment readiness. Path health owns only the
+/// carrier identity and observations, so callers pass the ready set into the
+/// immutable candidate projection instead of letting it infer readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::runtime) struct PacketPathAttachment {
+    pub(in crate::runtime) key: RelayPathKey,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+}
+
+/// Packet-plane load paired with one ready exact attachment for one coherent
+/// selection. It never reads or mutates Product flow accounting.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct PacketPathSelectionInput {
+    pub(in crate::runtime) attachment: PacketPathAttachment,
+    pub(in crate::runtime) active_flows: u32,
+}
+
+/// One immutable carrier candidate for layer-3 packet affinity.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct PacketPathCandidate {
+    pub(in crate::runtime) attachment: PacketPathAttachment,
+    pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) eta_ms: f64,
 }
 
@@ -546,6 +573,36 @@ pub(in crate::runtime) fn path_snapshot(
         path,
         observation.wire_path_id.unwrap_or(PathId(index as u16)),
         observation,
+    )
+}
+
+/// Projects carrier evidence for the independent layer-3 packet plane.
+///
+/// Product data-level queues, flow ownership, and goodput samples must not
+/// become packet-plane state. Native carrier observations and common path
+/// timing/loss remain shared because they describe the physical output that
+/// every data plane uses.
+pub(in crate::runtime) fn packet_path_snapshot(
+    path: &PathSpec,
+    index: usize,
+    observation: ClientPathObservation,
+) -> PathSnapshot {
+    path_snapshot(
+        path,
+        index,
+        ClientPathObservation {
+            measured_rate_bps: None,
+            delivery_samples: 0,
+            product_delivery_rate_bps: None,
+            product_delivery_sample_bytes: 0,
+            datagram_feedback_samples: 0,
+            last_delivery_at: None,
+            active_flows: 0,
+            active_latency_sensitive_flows: 0,
+            relay_bytes_in_flight: 0,
+            relay_queue_bytes: 0,
+            ..observation
+        },
     )
 }
 

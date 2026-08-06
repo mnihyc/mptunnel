@@ -153,10 +153,14 @@ impl AppConfig {
 }
 
 fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<(), ConfigError> {
-    if node.local_ingresses.is_empty() && node.servers.is_empty() {
+    if node.local_ingresses.is_empty()
+        && node.tun_l3_ingresses.is_empty()
+        && node.servers.is_empty()
+    {
         return Err(ConfigError::NoRuntimeServices);
     }
-    validate_inbound_names(&node.local_ingresses, &node.servers)?;
+    validate_inbound_names(&node.local_ingresses, &node.tun_l3_ingresses, &node.servers)?;
+    validate_packet_device_names(node)?;
 
     let mut leaf_networks = HashMap::with_capacity(node.outbounds.len());
     for leaf in &node.outbounds {
@@ -183,6 +187,8 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
         }
     }
 
+    validate_tun_l3_ingresses(&node.tun_l3_ingresses, &node.outbounds)?;
+
     let dns_policy = node
         .dns_policy
         .compile()
@@ -202,6 +208,7 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
         validate_mpp_inbound_egress(&server.egress, &node.gateway_balancers, &node.outbounds)?;
     }
     validate_local_ingresses(&node.local_ingresses)?;
+    validate_managed_tun_l3_ownership(node)?;
     validate_fake_dns_tun_routes(&node.local_ingresses, &dns_policy)?;
     match (&node.product_policy, node.local_ingresses.is_empty()) {
         (Some(policy), _) => {
@@ -646,6 +653,9 @@ pub struct NodeConfig {
     /// by any one carrier/path group because routing selects that group per
     /// normalized flow.
     pub local_ingresses: Vec<LocalIngressConfig>,
+    /// Raw layer-3 packet services. These bind directly to one MPP outbound
+    /// and never pass through Product's L4 routing or DNS policy.
+    pub tun_l3_ingresses: Vec<NamedTunL3Config>,
     /// Immutable new-flow policy generation for local SOCKS/HTTP/TUN traffic.
     pub product_policy: Option<ProductPolicyConfig>,
     /// Immutable named split-DNS policy used whenever this node needs address
@@ -817,6 +827,12 @@ pub struct LocalIngressConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedTunL3Config {
+    pub name: String,
+    pub config: crate::ingress::TunL3IngressConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPathConfig {
     /// Stable Product name of one configured carrier path. Core scheduling
     /// continues to use protocol path identities and never this name.
@@ -857,6 +873,9 @@ pub struct MppInboundConfig {
     pub destination_acl: ServerDestinationAclConfig,
     /// MPP sender behavior for streams accepted by this inbound path group.
     pub performance: MppPerformanceConfig,
+    /// Optional first-class layer-3 packet service for authenticated peers.
+    /// Host routing, DNS, firewall, and NAT remain external policy.
+    pub tun_l3: Option<crate::product::TunL3AddressPlan>,
 }
 
 fn validate_mpp_outbound(
@@ -922,12 +941,15 @@ fn validate_local_ingresses(ingresses: &[LocalIngressConfig]) -> Result<(), Conf
 
 fn validate_inbound_names(
     local_ingresses: &[LocalIngressConfig],
+    tun_l3_ingresses: &[NamedTunL3Config],
     mpp_inbounds: &[MppInboundConfig],
 ) -> Result<(), ConfigError> {
-    let mut seen = HashSet::with_capacity(local_ingresses.len() + mpp_inbounds.len());
+    let mut seen =
+        HashSet::with_capacity(local_ingresses.len() + tun_l3_ingresses.len() + mpp_inbounds.len());
     for name in local_ingresses
         .iter()
         .map(|inbound| inbound.name.as_str())
+        .chain(tun_l3_ingresses.iter().map(|inbound| inbound.name.as_str()))
         .chain(mpp_inbounds.iter().map(|inbound| inbound.name.as_str()))
     {
         let canonical = InboundId::parse(name).map_err(|_| ConfigError::InboundNameInvalid)?;
@@ -937,6 +959,78 @@ fn validate_inbound_names(
         if !seen.insert(name) {
             return Err(ConfigError::DuplicateInboundName(name.to_string()));
         }
+    }
+    Ok(())
+}
+
+fn validate_tun_l3_ingresses(
+    ingresses: &[NamedTunL3Config],
+    outbounds: &[OutboundLeafConfig],
+) -> Result<(), ConfigError> {
+    let mut selected = HashSet::with_capacity(ingresses.len());
+    for ingress in ingresses {
+        let outbound = &ingress.config.outbound;
+        let Some(leaf) = outbounds.iter().find(|leaf| leaf.id() == outbound) else {
+            return Err(ConfigError::TunL3OutboundMissing(
+                outbound.as_str().to_string(),
+            ));
+        };
+        if !matches!(leaf, OutboundLeafConfig::Mpp { .. }) {
+            return Err(ConfigError::TunL3OutboundNotMpp(
+                outbound.as_str().to_string(),
+            ));
+        }
+        if !selected.insert(outbound) {
+            return Err(ConfigError::TunL3OutboundBoundTwice(
+                outbound.as_str().to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_packet_device_names(node: &NodeConfig) -> Result<(), ConfigError> {
+    let tun_l4_names = node.local_ingresses.iter().filter_map(|ingress| {
+        if let IngressConfig::TunL4(tun) = &ingress.config {
+            tun.interface_name.as_deref()
+        } else {
+            None
+        }
+    });
+    let tun_l3_client_names = node
+        .tun_l3_ingresses
+        .iter()
+        .filter_map(|ingress| ingress.config.interface_name.as_deref());
+    let tun_l3_server_names = node
+        .servers
+        .iter()
+        .filter_map(|server| server.tun_l3.as_ref()?.interface_name());
+    let mut seen = HashSet::new();
+    for name in tun_l4_names
+        .chain(tun_l3_client_names)
+        .chain(tun_l3_server_names)
+    {
+        if name.trim().is_empty() {
+            return Err(ConfigError::PacketDeviceNameEmpty);
+        }
+        if !seen.insert(name) {
+            return Err(ConfigError::DuplicatePacketDeviceName(name.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_tun_l3_ownership(node: &NodeConfig) -> Result<(), ConfigError> {
+    let has_managed_tun_l4 = node.local_ingresses.iter().any(|ingress| {
+        matches!(
+            &ingress.config,
+            IngressConfig::TunL4(tun) if tun.managed_vpn().is_some()
+        )
+    });
+    let has_tun_l3 = !node.tun_l3_ingresses.is_empty()
+        || node.servers.iter().any(|server| server.tun_l3.is_some());
+    if has_managed_tun_l4 && has_tun_l3 {
+        return Err(ConfigError::ManagedTunL3Conflict);
     }
     Ok(())
 }
@@ -1133,6 +1227,12 @@ pub enum ConfigError {
     TunDnsResolverPortZero,
     ManagedVpn(String),
     MultipleManagedTunInbounds { actual: usize },
+    ManagedTunL3Conflict,
+    TunL3OutboundMissing(String),
+    TunL3OutboundNotMpp(String),
+    TunL3OutboundBoundTwice(String),
+    PacketDeviceNameEmpty,
+    DuplicatePacketDeviceName(String),
     DnsPolicy(String),
     OutboundConnectTimeoutZero,
     InboundNameInvalid,
@@ -1382,6 +1482,29 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "node config defines {actual} managed TUN inbounds; at most one may own host VPN state"
             ),
+            Self::ManagedTunL3Conflict => write!(
+                f,
+                "process-managed TUN L4 cannot coexist with TUN-L3 because the managed VPN lifecycle owns one packet device"
+            ),
+            Self::TunL3OutboundMissing(name) => {
+                write!(f, "TUN-L3 references missing outbound {name:?}")
+            }
+            Self::TunL3OutboundNotMpp(name) => {
+                write!(f, "TUN-L3 outbound {name:?} must use protocol mpp")
+            }
+            Self::TunL3OutboundBoundTwice(name) => write!(
+                f,
+                "MPP outbound {name:?} is bound by more than one TUN-L3 ingress"
+            ),
+            Self::PacketDeviceNameEmpty => {
+                write!(f, "packet-device interface name must not be empty")
+            }
+            Self::DuplicatePacketDeviceName(name) => {
+                write!(
+                    f,
+                    "packet-device interface name {name:?} is configured more than once"
+                )
+            }
             Self::DnsPolicy(error) => write!(f, "invalid DNS policy: {error}"),
             Self::OutboundConnectTimeoutZero => {
                 write!(f, "outbound connect timeout must be greater than zero")

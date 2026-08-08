@@ -6789,3 +6789,23 @@ entry is authoritative.
 - Artifacts:
   - `./.tmp/lab/results/l4-current-quick/`; and
   - `./.tmp/lab/results/l4-v022-quick/`.
+
+## 2026-08-08T23:30:29+08:00: v0.2.3 release candidate locally gated
+
+- Name: immutable release candidate freeze
+- Category: Release verification
+- State: local gate passed; remote CI and release preflight pending
+- Content:
+  - synchronized the package and both lockfile identities at `0.2.3`; and
+  - added the requested CI, release-build, and Apache-2.0 badges without
+    changing product behavior or release contents.
+- Evidence:
+  - formatting and strict all-target/all-feature Clippy passed;
+  - root, patched Quinn, lab-contract, deterministic benchmark, and packaging
+    test suites passed;
+  - the performance registry, shell syntax, and release-version gate passed;
+    and
+  - the candidate diff contains only the three version identities, README
+    badges, and this release milestone.
+- Release rule: push and tag only this exact clean commit after both ordinary CI
+  and the non-publishing Release Check succeed for its commit SHA.

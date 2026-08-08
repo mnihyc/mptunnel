@@ -1,5 +1,9 @@
 # MPTUNNEL
 
+[![CI](https://github.com/mnihyc/mptunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/mnihyc/mptunnel/actions/workflows/ci.yml)
+[![Release Build](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml/badge.svg)](https://github.com/mnihyc/mptunnel/actions/workflows/release.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 MPTUNNEL is an encrypted multipath proxy and tunnel for everyday Internet use.
 It lets one application connection use several independent TCP and QUIC paths,
 chooses paths from live latency and delivery evidence, and keeps the connection

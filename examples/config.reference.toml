@@ -243,7 +243,7 @@ listen = ["127.0.0.1:8080"]
 # idle_timeout_ms = 60000
 # datagram_ttl_ms = 30000
 
-# Optional TUN ingress. It uses the same routing policy as local proxy
+# Experimental TUN-L4 ingress. It uses the same routing policy as local proxy
 # inbounds. Omitting `host` is explicit external/manual mode: MPTUNNEL opens
 # the device, while the operator owns host routes and DNS.
 # [[inbounds]]
@@ -287,7 +287,7 @@ listen = ["127.0.0.1:8080"]
 # capture_rule_priority = 10000
 # socket_mark = 0x4d505455
 
-# Optional first-class layer-3 tunnel. Unlike `protocol = "tun"`, this does
+# Experimental first-class TUN-L3 tunnel. Unlike `protocol = "tun"`, this does
 # not enter Product routing or terminate inner TCP/UDP flows. The server assigns
 # the interface address after MPP authentication; this process opens only the
 # packet device. Host routes, DNS, firewall policy, forwarding, and NAT remain
@@ -486,7 +486,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # authentication_timeout_ms = 5000
 # max_pending_authentications = 1024
 #
-# Optional server-owned TUN-L3 address plan. This packet plane is additive to
+# Experimental server-owned TUN-L3 address plan. This packet plane is additive to
 # the inbound's ordinary proxy plane; finish the destination ACL with a
 # catch-all deny rule when the inbound is packet-only. Pools validate explicit
 # stable principal allocations; they are never learned from source IP

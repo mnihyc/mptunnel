@@ -4,6 +4,7 @@
 //! Product router nor installs host routes, DNS, firewall policy, or NAT.
 
 use super::flow::PacketFlowTable;
+use super::queue::{IpPacketQueueBudget, IpPacketQueuePermit};
 use crate::ingress::TunL3IngressConfig;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::model::timing::{path_open_timeout, transport_pto_from_snapshot};
@@ -23,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot, watch};
 use tun_rs::async_framed::{BytesCodec, DeviceFramed};
 
 const MIN_TUN_L3_MTU: usize = 576;
@@ -44,13 +45,8 @@ pub(in crate::runtime) struct ClientIpTunnelHub {
 #[derive(Debug, Clone)]
 struct ClientIpTunnelSink {
     events: mpsc::UnboundedSender<ClientIpTunnelInput>,
-    packet_budget: Arc<Semaphore>,
-    minimum_packet_charge: usize,
-    lifecycle_slots: Arc<Semaphore>,
-}
-
-struct ClientIpPacketBudget {
-    _permit: OwnedSemaphorePermit,
+    packet_budget: IpPacketQueueBudget,
+    lifecycle_slots: Arc<tokio::sync::Semaphore>,
 }
 
 enum ClientIpTunnelInput {
@@ -60,7 +56,7 @@ enum ClientIpTunnelInput {
     },
     Packet {
         event: ClientIpTunnelEvent,
-        budget: ClientIpPacketBudget,
+        budget: IpPacketQueuePermit,
     },
     CarrierUpdate {
         update: ClientIpCarrierUpdate,
@@ -71,7 +67,7 @@ enum ClientIpTunnelInput {
 
 struct BudgetedTunWrite {
     payload: Bytes,
-    _budget: ClientIpPacketBudget,
+    _budget: IpPacketQueuePermit,
 }
 
 pub(in crate::runtime) struct ClientIpTunnelHubRegistration {
@@ -110,30 +106,22 @@ impl ClientIpTunnelSink {
         packet_budget: usize,
         lifecycle_slots: usize,
     ) -> Self {
-        let packet_budget = packet_budget.clamp(1, Semaphore::MAX_PERMITS);
         Self {
             events,
-            packet_budget: Arc::new(Semaphore::new(packet_budget)),
-            minimum_packet_charge: MIN_TUN_L3_MTU.min(packet_budget),
-            lifecycle_slots: Arc::new(Semaphore::new(
-                lifecycle_slots.clamp(1, Semaphore::MAX_PERMITS),
+            packet_budget: IpPacketQueueBudget::new(packet_budget),
+            lifecycle_slots: Arc::new(tokio::sync::Semaphore::new(
+                lifecycle_slots.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             )),
         }
     }
 
     fn route_event(&self, event: ClientIpTunnelEvent) -> Result<(), RuntimeError> {
         if let Frame::IpPacket { payload, .. } = &event.frame {
-            let charge = payload.len().max(self.minimum_packet_charge);
-            let permits = u32::try_from(charge).map_err(|_| RuntimeError::SenderServiceBlocked)?;
-            let permit = self
-                .packet_budget
-                .clone()
-                .try_acquire_many_owned(permits)
-                .map_err(|_| RuntimeError::SenderServiceBlocked)?;
+            let permit = self.packet_budget.try_reserve(payload.len())?;
             self.events
                 .send(ClientIpTunnelInput::Packet {
                     event,
-                    budget: ClientIpPacketBudget { _permit: permit },
+                    budget: permit,
                 })
                 .map_err(|_| RuntimeError::Protocol("TUN-L3 packet event sink closed"))
         } else {
@@ -189,10 +177,18 @@ enum ClientIpCarrier {
 }
 
 impl ClientIpCarrier {
-    fn try_send(&self, packet_id: IpPacketId, payload: Bytes) -> Result<(), RuntimeError> {
+    fn try_send(
+        &self,
+        packet_id: IpPacketId,
+        payload: Bytes,
+        budget: &IpPacketQueueBudget,
+    ) -> Result<(), RuntimeError> {
         match self {
             Self::Tcp(attachment) => attachment.try_send(packet_id, payload),
-            Self::Quic(attachment) => attachment.try_send(packet_id, payload),
+            Self::Quic(attachment) => {
+                let permit = budget.try_reserve(payload.len())?;
+                attachment.try_send(packet_id, payload, permit)
+            }
         }
     }
 }
@@ -296,11 +292,12 @@ struct ClientIpTunnelState {
     deferred_ready: HashMap<ClientIpCarrierKey, ClientIpTunnelParameters>,
     flows: PacketFlowTable<ClientIpCarrierKey>,
     received_packet_ids: crate::runtime::recent_ids::RecentIdCache<IpPacketId>,
+    carrier_packet_budget: IpPacketQueueBudget,
     next_packet_id: u64,
 }
 
 impl ClientIpTunnelState {
-    fn new(tunnel_id: IpTunnelId, capacity: usize) -> Self {
+    fn new(tunnel_id: IpTunnelId, capacity: usize, packet_queue_bytes: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
             tunnel_id,
@@ -311,6 +308,7 @@ impl ClientIpTunnelState {
             received_packet_ids: crate::runtime::recent_ids::RecentIdCache::new(
                 capacity.saturating_mul(2),
             ),
+            carrier_packet_budget: IpPacketQueueBudget::new(packet_queue_bytes),
             next_packet_id: 1,
         }
     }
@@ -426,7 +424,7 @@ impl ClientIpTunnelState {
             .get(&carrier)
             .ok_or(RuntimeError::ReliablePathRetired)?
             .carrier
-            .try_send(packet_id, payload.clone());
+            .try_send(packet_id, payload.clone(), &self.carrier_packet_budget);
         match result {
             Ok(()) => Ok(true),
             Err(RuntimeError::SenderServiceBlocked) => Ok(false),
@@ -443,7 +441,7 @@ impl ClientIpTunnelState {
                     .get(&replacement)
                     .ok_or(RuntimeError::ReliablePathRetired)?
                     .carrier
-                    .try_send(packet_id, payload)
+                    .try_send(packet_id, payload, &self.carrier_packet_budget)
                 {
                     Ok(()) => Ok(true),
                     Err(RuntimeError::SenderServiceBlocked) => Ok(false),
@@ -527,7 +525,7 @@ pub(in crate::runtime) async fn run_client_tun_l3(
     let event_sink = ClientIpTunnelSink::new(events_tx, packet_bytes, lifecycle_slots);
     let _registration = context.ip_tunnels.register(event_sink.clone())?;
     let supervisors = spawn_carrier_supervisors(&context, tunnel_id, event_sink);
-    let mut state = ClientIpTunnelState::new(tunnel_id, 1);
+    let mut state = ClientIpTunnelState::new(tunnel_id, 1, packet_bytes);
 
     while state.parameters.is_none() || !state.has_ready_carrier() {
         let Some(input) = events_rx.recv().await else {

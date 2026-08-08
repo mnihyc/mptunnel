@@ -6,13 +6,15 @@
 
 mod client;
 mod flow;
+mod queue;
 mod server;
 mod service;
 
 pub(in crate::runtime) use client::{ClientIpTunnelEvent, ClientIpTunnelHub, run_client_tun_l3};
+pub(in crate::runtime) use queue::{IpPacketQueueBudget, IpPacketQueuePermit};
 pub(in crate::runtime) use server::run_server_tun_l3;
 pub(in crate::runtime) use service::{
-    AcceptedServerIpTunnel, IpTunnelCarrierCommand, ServerIpTunnelDevice,
+    AcceptedServerIpTunnel, IpTunnelPacketSendOutcome, ServerIpTunnelCarrier, ServerIpTunnelDevice,
     ServerIpTunnelOpenRequest, ServerIpTunnelPort, ServerIpTunnelService,
 };
 

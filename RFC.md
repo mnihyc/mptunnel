@@ -175,17 +175,29 @@ third transport protocol.
 : A direction-local stable classification derived from an inner IP packet for
   carrier affinity. It is local scheduling state and is not a wire identity.
 
+**IP packet admission**
+: The local, directional handoff that either retains one complete IP packet
+  through final carrier enqueue, rejects the current packet because the
+  bounded packet envelope is full, or reports that the selected exact carrier
+  retired before acceptance. Admission is not delivery acknowledgment or
+  congestion control.
+
 ## 4. Architecture and Authority
 
 The ownership boundary is:
 
 ```text
 application
-    MPP reliable stream | datagram | IP packet service
+    MPP reliable stream
         per-direction offsets, Data ACK, shared credit, bounded reinjection
             regular-before-backup carrier selection
                 TCP controller | QUIC controller
                     network
+
+application datagram | IP packet service
+    bounded datagram/packet admission and carrier selection
+        TCP controller | QUIC controller
+            network
 ```
 
 ### 4.1 MPP authority
@@ -1262,6 +1274,37 @@ four frames use the carrier's ordered framing. TCP reliability therefore
 applies to a TCP attachment; MPP MUST NOT add another retry or copy after the
 frame is accepted by that carrier.
 
+Each direction has one byte-bounded IP packet admission envelope shared by the
+logical tunnel's attachments. Its bound MUST NOT be multiplied by attachment
+count or derived from an application-stream record size. Packet lifecycle
+commands use separate bounded headroom so packet pressure cannot prevent
+attachment retirement or close processing.
+
+Admission has exactly three outcomes:
+
+- `Accepted`: the complete packet is retained until every byte has entered the
+  selected carrier's final local queue;
+- `Full`: the current packet is discarded before acceptance; and
+- `Retired`: the exact carrier ceased to be usable before acceptance, so the
+  sender MAY re-evaluate another eligible attachment once for that unaccepted
+  packet.
+
+An accepted packet MUST NOT later be displaced by a newer local packet. QUIC
+therefore uses non-evicting native datagram admission: if its native send
+buffer is full, the current IP packet is discarded and older queued packets
+remain intact. TCP hands the frame to its existing bounded ordered carrier
+queue. Recovery after either handoff belongs solely to the exact TCP or QUIC
+transport. It does not create an MPP acknowledgment or authorize cross-carrier
+retransmission.
+
+Before the native QUIC datagram queue, an attachment retains at most the live
+native QUIC congestion window of complete IP packets. This starts at QUIC's
+initial flight, follows native path growth and contraction, and never exceeds
+the shared directional byte envelope. TCP needs no duplicate handoff envelope
+because its existing final ordered carrier queue performs admission. These are
+packet-plane rules: they MUST NOT reuse or alter an application-stream record
+count, reliable-stream window, or application-datagram admission rule.
+
 TCP and QUIC attachments are equally eligible after authentication,
 validation, readiness, usage, MTU, and queue admission. An implementation MUST
 NOT select a carrier family from protocol name alone. Each direction selects
@@ -1272,11 +1315,14 @@ The packet scheduler SHOULD retain a healthy exact-carrier binding for one
 inner flow to avoid transport-damaging reordering. It MAY reselect immediately
 after exact carrier failure, retirement, MTU incompatibility, or terminal queue
 loss, and MAY reselect at a flowlet boundary derived from current transport
-timing. Queue fullness drops the current packet; it does not prove path failure
-or authorize a duplicate. Opposite directions have independent affinity, so
-asymmetric carriers may be selected independently. Selection MAY include
-direction-local packet-flow load, but that evidence MUST age with actual flow
-activity and MUST NOT be borrowed from Product flow accounting.
+timing. A `Full` result drops the current packet, preserves the healthy flow
+binding, and does not prove path failure or authorize a duplicate. Opposite
+directions have independent affinity, so asymmetric carriers may be selected
+independently. Selection MAY include direction-local packet-flow load, but that
+evidence MUST age with actual flow activity and MUST NOT be borrowed from
+Product flow accounting. IP packet admission and its queue evidence are
+independent of reliable-stream and application-datagram queues; changing them
+MUST NOT change L4 proxy admission, retry, scheduling, or transport behavior.
 
 ## 10. Core Scheduling Requirements
 

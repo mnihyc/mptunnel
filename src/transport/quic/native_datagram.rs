@@ -26,6 +26,7 @@ const MAX_QUARTER_STREAM_ID: u64 = (1_u64 << 60) - 1;
 struct Route {
     generation: u64,
     tx: mpsc::Sender<BudgetedPacket>,
+    ip_tx: Option<mpsc::UnboundedSender<BudgetedPacket>>,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +75,7 @@ pub(super) struct NativeDatagramReceiver {
     generation: u64,
     state: Arc<HubState>,
     rx: mpsc::Receiver<BudgetedPacket>,
+    ip_rx: Option<mpsc::UnboundedReceiver<BudgetedPacket>>,
     reassemblies: HashMap<(DatagramFlowId, DatagramId), Reassembly>,
     ip_reassemblies: HashMap<(IpTunnelId, IpPacketId), IpReassembly>,
 }
@@ -211,7 +213,9 @@ impl NativeDatagramHub {
         if let Some(pending) = pending {
             let now = Instant::now();
             for pending in pending {
-                if pending.deadline <= now || tx.try_send(pending.packet).is_err() {
+                if pending.deadline <= now
+                    || route_active_packet(&tx, None, pending.packet).is_err()
+                {
                     self.state.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -219,15 +223,21 @@ impl NativeDatagramHub {
         // Publish the active route only after the pre-route queue is drained
         // while holding the same lock used by the router. A newly arriving
         // packet therefore cannot jump ahead of the retained first flight.
-        routing
-            .active
-            .insert(request_stream_id, Route { generation, tx });
+        routing.active.insert(
+            request_stream_id,
+            Route {
+                generation,
+                tx,
+                ip_tx: None,
+            },
+        );
         drop(routing);
         Ok(NativeDatagramReceiver {
             request_stream_id,
             generation,
             state: self.state.clone(),
             rx,
+            ip_rx: None,
             reassemblies: HashMap::new(),
             ip_reassemblies: HashMap::new(),
         })
@@ -357,7 +367,7 @@ impl NativeDatagramSender {
         Ok(())
     }
 
-    pub(super) fn send_ip_packet(
+    pub(super) async fn send_ip_packet(
         &self,
         frame: &Frame,
         limits: CodecLimits,
@@ -419,14 +429,34 @@ impl NativeDatagramSender {
             packet.extend_from_slice(&total_len.to_be_bytes());
             packet.extend_from_slice(&payload[start..end]);
             self.connection
-                .send_datagram(Bytes::from(packet))
-                .map_err(QuicCarrierError::from)?;
+                .send_datagram_wait(Bytes::from(packet))
+                .await?;
         }
         Ok(())
     }
 }
 
 impl NativeDatagramReceiver {
+    pub(super) fn enable_ip_packets(&mut self) -> Result<(), QuicCarrierError> {
+        if self.ip_rx.is_some() {
+            return Ok(());
+        }
+        let (ip_tx, ip_rx) = mpsc::unbounded_channel();
+        let mut routing = self
+            .state
+            .routing
+            .lock()
+            .expect("native datagram route lock");
+        let route = routing
+            .active
+            .get_mut(&self.request_stream_id)
+            .filter(|route| route.generation == self.generation)
+            .ok_or(QuicCarrierError::H3DriverClosed)?;
+        route.ip_tx = Some(ip_tx);
+        self.ip_rx = Some(ip_rx);
+        Ok(())
+    }
+
     pub(super) fn retire_route(&self) {
         let mut routing = self
             .state
@@ -449,11 +479,26 @@ impl NativeDatagramReceiver {
     ) -> Result<NativeReceivedFrame, QuicCarrierError> {
         loop {
             self.expire_reassemblies();
-            let packet = if let Some(deadline) = self.next_reassembly_expiry() {
+            let deadline = self.next_reassembly_expiry();
+            let packet = if let Some(ip_rx) = self.ip_rx.as_mut() {
+                if let Some(deadline) = deadline {
+                    tokio::select! {
+                        packet = self.rx.recv() => packet,
+                        packet = ip_rx.recv() => packet,
+                        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            continue;
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        packet = self.rx.recv() => packet,
+                        packet = ip_rx.recv() => packet,
+                    }
+                }
+            } else if let Some(deadline) = deadline {
                 tokio::select! {
                     packet = self.rx.recv() => packet,
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        self.expire_reassemblies();
                         continue;
                     }
                 }
@@ -736,7 +781,7 @@ fn route_datagram(
     };
     let mut routing = state.routing.lock().expect("native datagram route lock");
     if let Some(route) = routing.active.get(&request_stream_id) {
-        if route.tx.try_send(budgeted).is_err() {
+        if route_active_packet(&route.tx, route.ip_tx.as_ref(), budgeted).is_err() {
             state.dropped_packets.fetch_add(1, Ordering::Relaxed);
         }
         return Ok(());
@@ -771,6 +816,20 @@ fn route_datagram(
         packet: budgeted,
     });
     Ok(())
+}
+
+fn route_active_packet(
+    tx: &mpsc::Sender<BudgetedPacket>,
+    ip_tx: Option<&mpsc::UnboundedSender<BudgetedPacket>>,
+    packet: BudgetedPacket,
+) -> Result<(), ()> {
+    if packet.bytes.first().copied() == Some(NATIVE_IP_PACKET_VERSION)
+        && let Some(ip_tx) = ip_tx
+    {
+        ip_tx.send(packet).map_err(|_| ())
+    } else {
+        tx.try_send(packet).map_err(|_| ())
+    }
 }
 
 fn remember_retired_route(state: &HubState, routing: &mut RoutingTable, request_stream_id: u64) {

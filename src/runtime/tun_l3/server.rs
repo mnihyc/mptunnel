@@ -24,7 +24,9 @@ pub(in crate::runtime) async fn run_server_tun_l3(
     let mut tun_writer = tokio::task::JoinSet::new();
     tun_writer.spawn(async move {
         while let Some(packet) = peer_packets.recv().await {
-            tun_sink.send(BytesMut::from(packet.as_ref())).await?;
+            tun_sink
+                .send(BytesMut::from(packet.payload.as_ref()))
+                .await?;
         }
         Err::<(), RuntimeError>(RuntimeError::Protocol("TUN-L3 peer packet source closed"))
     });

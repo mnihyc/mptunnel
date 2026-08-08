@@ -8,6 +8,50 @@ use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::{ServerLocalPath, ServerLocalPathProperties};
 use bytes::Bytes;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+
+#[derive(Debug)]
+enum TestCarrierEvent {
+    Packet {
+        tunnel_id: IpTunnelId,
+        packet_id: IpPacketId,
+        payload: Bytes,
+    },
+    Close {
+        tunnel_id: IpTunnelId,
+        reason: crate::protocol::CloseReason,
+    },
+}
+
+#[derive(Debug)]
+struct TestCarrier {
+    events: tokio::sync::mpsc::UnboundedSender<TestCarrierEvent>,
+}
+
+impl ServerIpTunnelCarrier for TestCarrier {
+    fn try_send_packet(
+        &self,
+        tunnel_id: IpTunnelId,
+        packet_id: IpPacketId,
+        payload: Bytes,
+        _budget: &IpPacketQueueBudget,
+    ) -> Result<IpTunnelPacketSendOutcome, crate::runtime::error::RuntimeError> {
+        self.events
+            .send(TestCarrierEvent::Packet {
+                tunnel_id,
+                packet_id,
+                payload,
+            })
+            .map(|()| IpTunnelPacketSendOutcome::Accepted)
+            .map_err(|_| crate::runtime::error::RuntimeError::ReliablePathRetired)
+    }
+
+    fn close(&self, tunnel_id: IpTunnelId, reason: crate::protocol::CloseReason) {
+        let _ = self
+            .events
+            .send(TestCarrierEvent::Close { tunnel_id, reason });
+    }
+}
 
 fn server_context() -> (
     crate::runtime::path::ServerPathContext,
@@ -92,8 +136,12 @@ fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Bytes {
 #[tokio::test]
 async fn packet_service_enforces_ownership_and_preserves_packets() {
     let (context, security) = server_context();
-    let (port, mut device) =
-        ServerIpTunnelService::build(plan(&security), context.reliable_streams.clone(), 4, 16);
+    let (port, mut device) = ServerIpTunnelService::build(
+        plan(&security),
+        context.reliable_streams.clone(),
+        4,
+        16 * 1_500,
+    );
     let local_path: crate::transport::PathSpec = "tcp://127.0.0.1:9000?srtt-ms=20&rate-mbps=500"
         .parse()
         .expect("path");
@@ -108,12 +156,14 @@ async fn packet_service_enforces_ownership_and_preserves_packets() {
             initial_metrics: Some(local.startup_metrics(PathId(0))),
         },
     );
-    let (commands, mut carrier_commands) = tokio::sync::mpsc::channel(8);
+    let (carrier_events, mut carrier_commands) = tokio::sync::mpsc::unbounded_channel();
     let attachment = port
         .open(ServerIpTunnelOpenRequest {
             tunnel_id: IpTunnelId(7),
             path: &registration,
-            commands,
+            carrier: Arc::new(TestCarrier {
+                events: carrier_events,
+            }),
         })
         .expect("open IP tunnel");
     assert_eq!(
@@ -141,26 +191,32 @@ async fn packet_service_enforces_ownership_and_preserves_packets() {
             .expect("dispatch reply")
     );
     match carrier_commands.recv().await.expect("carrier packet") {
-        IpTunnelCarrierCommand::Packet {
-            tunnel_id, payload, ..
+        TestCarrierEvent::Packet {
+            tunnel_id,
+            packet_id,
+            payload,
         } => {
             assert_eq!(tunnel_id, IpTunnelId(7));
+            assert_eq!(packet_id, IpPacketId(1));
             assert_eq!(payload, reply);
         }
-        IpTunnelCarrierCommand::Close { .. } => panic!("unexpected close"),
+        TestCarrierEvent::Close { .. } => panic!("unexpected close"),
     }
 
-    let (replacement_commands, mut replacement_carrier_commands) = tokio::sync::mpsc::channel(8);
+    let (replacement_events, mut replacement_carrier_commands) =
+        tokio::sync::mpsc::unbounded_channel();
     let replacement = port
         .open(ServerIpTunnelOpenRequest {
             tunnel_id: IpTunnelId(7),
             path: &registration,
-            commands: replacement_commands,
+            carrier: Arc::new(TestCarrier {
+                events: replacement_events,
+            }),
         })
         .expect("replace exact carrier attachment");
     assert!(matches!(
         carrier_commands.recv().await,
-        Some(IpTunnelCarrierCommand::Close {
+        Some(TestCarrierEvent::Close {
             tunnel_id: IpTunnelId(7),
             reason: crate::protocol::CloseReason::Normal,
         })
@@ -178,7 +234,11 @@ async fn packet_service_enforces_ownership_and_preserves_packets() {
     );
     assert!(matches!(
         replacement_carrier_commands.recv().await,
-        Some(IpTunnelCarrierCommand::Packet { payload, .. }) if payload == reply
+        Some(TestCarrierEvent::Packet {
+            packet_id: IpPacketId(2),
+            payload,
+            ..
+        }) if payload == reply
     ));
 
     drop(replacement);

@@ -6709,3 +6709,83 @@ entry is authoritative.
   - both cohorts remain below the accepted historical `793.576 Mbps`, so that
     absolute gap is shared run/environment variance rather than evidence of a
     regression introduced by the current candidate.
+
+## 2026-08-06T23:49:18+08:00: TUN-L3 QUIC loss collapse isolated
+
+- Name: native QUIC packet-plane service-rate diagnosis
+- Category: Performance root cause
+- State: root cause proven; temporary instrumentation removed; no congestion
+  model change retained
+- Causal finding:
+  - Quinn calls the congestion controller's `on_end_acks` before it detects
+    packets lost by that ACK event. The resulting `on_congestion_event` reaches
+    BBR after the ACK epoch has already been finalized and reset, so BBR
+    consumes those losses with the following ACK epoch;
+  - under persistent random loss this stale epoch pairing repeatedly moves BBR
+    from `NotInRecovery` to `Conservation` and reinitializes its recovery window
+    from the following event's instantaneous flight. In the captured ordinary
+    profile there were `37` recovery re-entries, `11` of which cut the effective
+    window by more than half;
+  - the recovery window fell from several MiB toward approximately `100 KiB`.
+    Controller-limited delivery samples then aged the ten-round maximum
+    bandwidth estimate from `63.2 MB/s` to `1.44 MB/s`, causing the later pacing
+    and throughput collapse; and
+  - this ordering is inherited from Quinn's BBR integration. It is not caused
+    by TUN packet parsing, fragmentation, packet-device service, MPP path
+    selection, source starvation, or the network shaper.
+- Exclusion evidence:
+  - one `1,028`-byte TUN packet mapped to one `1,054`-byte native envelope and
+    one approximately `1,084`-byte protected QUIC packet without fragmentation;
+  - acknowledged QUIC bytes predicted delivered TUN bytes within `0.025%`, both
+    TUN qdiscs reported zero drops, and the outer shaper dropped only the
+    configured loss cohort;
+  - the sender remained non-application-limited and reached more than `1 Gbps`
+    pacing during startup, excluding the serial packet worker and CPU feed as
+    the sustained service-rate limit; and
+  - the exact traces are retained in
+    `./.tmp/tun-l3-performance/tun-bbr-state-trace-300/` and the preceding
+    admission traces below `./.tmp/tun-l3-performance/`.
+- Scope decision:
+  - the current transport has no TUN-L3-only congestion-controller boundary.
+    One controller is created before request streams are classified, and a
+    QUIC connection may carry reliable L4 streams, application datagrams, and
+    IP packets;
+  - changing callback order, BBR recovery, or the controller factory would
+    therefore also change the established L4 proxy model. That is outside the
+    accepted TUN-L3-only scope; and
+  - a startup-only recovery guard produced approximately `19.98/8.52 Mbps` and
+    was rejected. An earlier broad ACK/loss-coherence attempt produced
+    approximately `5.90/11.14 Mbps` and is not promotion evidence. No threshold,
+    recovery guard, controller swap, or global Quinn patch remains in the
+    source tree. A future correction must first establish an isolated TUN QUIC
+    connection or an explicit per-connection controller mode, then pass matched
+    TUN and unchanged-L4 controls.
+
+## 2026-08-08T23:11:44+08:00: current L4 proxy non-regression gate closed
+
+- Name: exact-current mixed-carrier L4 control
+- Category: Product and performance verification
+- State: no L4 behavior or performance regression demonstrated; no source
+  change, commit, or push performed
+- Source audit:
+  - the current changes do not alter Quinn congestion control, MPP scheduling,
+    mux, Product routing, the TCP L4 path, or reliable QUIC framing;
+  - L4 QUIC datagram send behavior is unchanged. Receive admission retains the
+    same byte budget, bounded queue, order, and drop behavior, with only the IP
+    packet classifier preceding the original L4 queue operation; and
+  - enabling TUN-L3 creates a separate client path context. A configuration
+    without TUN-L3 follows the original L4 construction and data path.
+- Matched evidence:
+  - ran the exact current optimized binary `bf5cda8e…` immediately against the
+    frozen `v0.2.2` binary `0f160453…` on the same mixed TCP+QUIC single-fat
+    L4 case: two downloads for 20 seconds, 500 Mbps paths, 180 ms one-way
+    delay, 20 ms jitter, and zero configured loss;
+  - current delivered `296.104 Mbps`; `v0.2.2` delivered `281.325 Mbps`.
+    Both completed with zero failed requests and zero early terminations; and
+  - the `+5.3%` matched difference rejects a current L4 regression but is not
+    claimed as an improvement. Both absolute values were below older cohorts,
+    so the shared run condition is treated as variance rather than a source
+    effect.
+- Artifacts:
+  - `./.tmp/lab/results/l4-current-quick/`; and
+  - `./.tmp/lab/results/l4-v022-quick/`.

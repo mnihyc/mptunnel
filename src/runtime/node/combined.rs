@@ -16,6 +16,7 @@ use crate::runtime::product_policy::ClientIngressRouter;
 use crate::runtime::readiness::{RuntimeGenerationControl, RuntimeReadinessBarrier};
 use crate::runtime::telemetry::{RuntimeTelemetry, active_flow_detail_capacity};
 use crate::transport::NativeSocketConfigurator;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub(super) struct NodeRuntimeEnvironment {
@@ -58,23 +59,29 @@ pub(super) async fn run(
     } = node;
     let product_inventory = ProductRuntimeInventory::from_config(&local_ingresses, &outbounds);
     let tun_l3_inventory = TunL3RuntimeInventory::from_config(&tun_l3_ingresses, &servers);
+    let tun_l3_outbounds = tun_l3_ingresses
+        .iter()
+        .map(|ingress| ingress.config.outbound.clone())
+        .collect::<HashSet<_>>();
     let product_telemetry =
         RuntimeTelemetry::generation_owner(active_flow_detail_capacity(resources.max_streams));
     let mut services = tokio::task::JoinSet::new();
     let mut path_probe_services = Vec::new();
     let mut runtime_leaves = Vec::with_capacity(outbounds.len());
     let mut client_contexts = Vec::new();
+    let mut tun_l3_contexts = Vec::new();
     let mut path_group_ordinal = 0;
     for outbound in outbounds {
         match outbound {
             OutboundLeafConfig::Mpp { id, config } => {
+                let outbound_path_group_ordinal = path_group_ordinal;
                 let context = client::new_path_context(
                     &config,
                     resources,
                     id.clone(),
                     ClientPathRuntimeOptions {
                         session_retention_timeout: session.retention_timeout,
-                        path_group_ordinal,
+                        path_group_ordinal: outbound_path_group_ordinal,
                         carrier_network: runtime_carrier_network.clone(),
                         allow_peer_diagnostics: management.peer_diagnostics_enabled(),
                     },
@@ -86,6 +93,26 @@ pub(super) async fn run(
                     config.path_probe_interval,
                     config.path_probe_timeout,
                 ));
+                if tun_l3_outbounds.contains(&id) {
+                    let tun_l3_context = client::new_path_context(
+                        &config,
+                        resources,
+                        id.clone(),
+                        ClientPathRuntimeOptions {
+                            session_retention_timeout: session.retention_timeout,
+                            path_group_ordinal: outbound_path_group_ordinal,
+                            carrier_network: runtime_carrier_network.clone(),
+                            allow_peer_diagnostics: management.peer_diagnostics_enabled(),
+                        },
+                        RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
+                    )?;
+                    path_probe_services.push((
+                        tun_l3_context.clone(),
+                        config.path_probe_interval,
+                        config.path_probe_timeout,
+                    ));
+                    tun_l3_contexts.push(tun_l3_context);
+                }
                 runtime_leaves.push(RuntimeOutboundLeaf::Mpp {
                     id,
                     context: context.clone(),
@@ -151,7 +178,7 @@ pub(super) async fn run(
     }
 
     for ingress in tun_l3_ingresses {
-        let context = client_contexts
+        let context = tun_l3_contexts
             .iter()
             .find(|context| context.outbound.as_ref() == Some(&ingress.config.outbound))
             .cloned()

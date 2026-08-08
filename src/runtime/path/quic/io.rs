@@ -39,6 +39,24 @@ pub(in crate::runtime) struct UdpPathRecvStream {
     stream: quic_transport::RecvStream,
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct UdpIpPacketSender {
+    sender: quic_transport::IpPacketSender,
+    limits: CodecLimits,
+}
+
+impl UdpIpPacketSender {
+    pub(super) async fn send(&self, frame: &Frame) -> Result<(), RuntimeError> {
+        match self.sender.send(frame, self.limits).await {
+            Ok(()) => Ok(()),
+            Err(quic_transport::QuicCarrierError::NativeDatagram(
+                quinn::SendDatagramError::ConnectionLost(_),
+            )) => Err(RuntimeError::ReliablePathRetired),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 const QUIC_DEFAULT_STREAM_PRIORITY: i32 = 0;
 const QUIC_LATENCY_STREAM_PRIORITY: i32 = 1;
 
@@ -55,6 +73,23 @@ impl UdpPathSendStream {
     /// owns connection flow control, congestion control, pacing, and recovery.
     pub(super) fn set_traffic_class(&mut self, lane: TrafficClass) -> Result<(), RuntimeError> {
         self.stream.set_priority(quic_stream_priority(lane))?;
+        Ok(())
+    }
+
+    pub(super) async fn ip_packet_sender(
+        &mut self,
+        limits: CodecLimits,
+    ) -> Result<UdpIpPacketSender, RuntimeError> {
+        Ok(UdpIpPacketSender {
+            sender: self.stream.ip_packet_sender().await?,
+            limits,
+        })
+    }
+}
+
+impl UdpPathRecvStream {
+    pub(super) fn enable_ip_packets(&mut self) -> Result<(), RuntimeError> {
+        self.stream.enable_ip_packets()?;
         Ok(())
     }
 }

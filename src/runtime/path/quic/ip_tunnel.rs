@@ -5,30 +5,28 @@
 
 use super::client::{ClientUdpCarrierInstance, ClientUdpPathSessionRuntime};
 use super::io::{
-    UdpPathRecvStream, UdpPathSendStream, udp_path_finish_stream, udp_path_input_finished,
-    udp_path_read_frame, udp_path_write_frame,
+    UdpIpPacketSender, UdpPathRecvStream, UdpPathSendStream, udp_path_finish_stream,
+    udp_path_input_finished, udp_path_read_frame, udp_path_write_frame,
 };
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::protocol::{CloseReason, Frame, IpPacketId, IpTunnelId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::commands::reliable_stream_frame_queue;
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerPathContext};
-use crate::runtime::tun_l3::{IpTunnelCarrierCommand, ServerIpTunnelOpenRequest};
+use crate::runtime::tun_l3::{
+    IpPacketQueueBudget, IpPacketQueuePermit, IpTunnelPacketSendOutcome, ServerIpTunnelCarrier,
+    ServerIpTunnelOpenRequest,
+};
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
 
-enum ClientUdpIpTunnelCommand {
-    Packet {
-        packet_id: IpPacketId,
-        payload: Bytes,
-    },
-    Close,
-}
-
 pub(in crate::runtime) struct ClientUdpIpTunnelAttachment {
-    commands: mpsc::Sender<ClientUdpIpTunnelCommand>,
+    packets: mpsc::UnboundedSender<QueuedUdpIpPacket>,
+    close: mpsc::UnboundedSender<()>,
     retired: watch::Receiver<bool>,
+    tunnel_id: IpTunnelId,
     path_instance_id: CarrierPathInstanceId,
 }
 
@@ -51,15 +49,16 @@ impl ClientUdpIpTunnelAttachment {
         &self,
         packet_id: IpPacketId,
         payload: Bytes,
+        budget: IpPacketQueuePermit,
     ) -> Result<(), RuntimeError> {
-        match self
-            .commands
-            .try_send(ClientUdpIpTunnelCommand::Packet { packet_id, payload })
-        {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(RuntimeError::SenderServiceBlocked),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::ReliablePathRetired),
-        }
+        self.packets
+            .send(QueuedUdpIpPacket {
+                tunnel_id: self.tunnel_id,
+                packet_id,
+                payload,
+                _budget: budget,
+            })
+            .map_err(|_| RuntimeError::ReliablePathRetired)
     }
 
     pub(in crate::runtime) async fn wait_retired(&self) {
@@ -70,7 +69,7 @@ impl ClientUdpIpTunnelAttachment {
 
 impl Drop for ClientUdpIpTunnelAttachment {
     fn drop(&mut self) {
-        let _ = self.commands.try_send(ClientUdpIpTunnelCommand::Close);
+        let _ = self.close.send(());
     }
 }
 
@@ -86,7 +85,9 @@ struct ClientUdpIpTunnelTask {
     runtime: ClientUdpPathSessionRuntime,
     path_instance_id: CarrierPathInstanceId,
     tunnel_id: IpTunnelId,
-    commands: mpsc::Receiver<ClientUdpIpTunnelCommand>,
+    close: mpsc::UnboundedReceiver<()>,
+    packet_sender: UdpIpPacketSender,
+    packets: mpsc::UnboundedReceiver<QueuedUdpIpPacket>,
     started: oneshot::Receiver<()>,
     _lifetime: ClientUdpIpTunnelLifetime,
 }
@@ -124,6 +125,7 @@ pub(super) async fn open_client_udp_ip_tunnel(
             ));
         }
     }
+    recv.enable_ip_packets()?;
     runtime
         .ip_tunnels
         .route(crate::runtime::tun_l3::ClientIpTunnelEvent {
@@ -134,8 +136,9 @@ pub(super) async fn open_client_udp_ip_tunnel(
             path_instance_id: carrier.path_instance_id,
             frame: ready,
         })?;
-    let queue = runtime.stream_frame_queue.max(1);
-    let (commands, receiver) = mpsc::channel(queue);
+    let packet_sender = send.ip_packet_sender(runtime.codec_limits).await?;
+    let (packets, packets_rx) = mpsc::unbounded_channel();
+    let (close, close_rx) = mpsc::unbounded_channel();
     let (retired, retired_rx) = watch::channel(false);
     let (start, started) = oneshot::channel();
     tokio::spawn(run_client_udp_ip_tunnel(
@@ -145,15 +148,19 @@ pub(super) async fn open_client_udp_ip_tunnel(
             runtime,
             path_instance_id: carrier.path_instance_id,
             tunnel_id,
-            commands: receiver,
+            close: close_rx,
+            packet_sender,
+            packets: packets_rx,
             started,
             _lifetime: ClientUdpIpTunnelLifetime(retired),
         },
     ));
     Ok(ClientUdpIpTunnelOpenOutcome::Attached {
         attachment: ClientUdpIpTunnelAttachment {
-            commands,
+            packets,
+            close,
             retired: retired_rx,
+            tunnel_id,
             path_instance_id: carrier.path_instance_id,
         },
         start,
@@ -169,13 +176,17 @@ async fn run_client_udp_ip_tunnel(
         runtime,
         path_instance_id,
         tunnel_id,
-        mut commands,
+        mut close,
+        packet_sender,
+        packets,
         started,
         _lifetime,
     } = task;
     if started.await.is_err() {
         return;
     }
+    let mut packet_writer = tokio::task::JoinSet::new();
+    packet_writer.spawn(run_udp_ip_packet_sender(packet_sender, packets));
     let result = async {
         loop {
             tokio::select! {
@@ -228,28 +239,26 @@ async fn run_client_udp_ip_tunnel(
                         )),
                     }
                 }
-                command = commands.recv() => {
-                    match command {
-                        Some(ClientUdpIpTunnelCommand::Packet { packet_id, payload }) => {
-                            udp_path_write_frame(
-                                &mut send,
-                                &Frame::IpPacket { tunnel_id, packet_id, payload },
-                                runtime.codec_limits,
-                            ).await?;
-                        }
-                        Some(ClientUdpIpTunnelCommand::Close) | None => {
-                            let _ = udp_path_write_frame(
-                                &mut send,
-                                &Frame::IpTunnelClose {
-                                    tunnel_id,
-                                    reason: CloseReason::Normal,
-                                },
-                                runtime.codec_limits,
-                            ).await;
-                            let _ = udp_path_finish_stream(&mut send).await;
-                            return Ok(());
-                        }
-                    }
+                _ = close.recv() => {
+                    let _ = udp_path_write_frame(
+                        &mut send,
+                        &Frame::IpTunnelClose {
+                            tunnel_id,
+                            reason: CloseReason::Normal,
+                        },
+                        runtime.codec_limits,
+                    ).await;
+                    let _ = udp_path_finish_stream(&mut send).await;
+                    return Ok(());
+                }
+                writer = packet_writer.join_next() => {
+                    return match writer {
+                        Some(Ok(result)) => result,
+                        Some(Err(error)) => Err(RuntimeError::TaskJoin(error)),
+                        None => Err(RuntimeError::Protocol(
+                            "QUIC IP packet sender stopped",
+                        )),
+                    };
                 }
             }
         }
@@ -260,6 +269,79 @@ async fn run_client_udp_ip_tunnel(
             "client QUIC IP tunnel attachment failed",
             &error,
         );
+    }
+}
+
+#[derive(Debug)]
+struct QueuedUdpIpPacket {
+    tunnel_id: IpTunnelId,
+    packet_id: IpPacketId,
+    payload: Bytes,
+    _budget: IpPacketQueuePermit,
+}
+
+async fn run_udp_ip_packet_sender(
+    sender: UdpIpPacketSender,
+    mut packets: mpsc::UnboundedReceiver<QueuedUdpIpPacket>,
+) -> Result<(), RuntimeError> {
+    while let Some(packet) = packets.recv().await {
+        sender
+            .send(&Frame::IpPacket {
+                tunnel_id: packet.tunnel_id,
+                packet_id: packet.packet_id,
+                payload: packet.payload,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ServerUdpIpTunnelClose {
+    tunnel_id: IpTunnelId,
+    reason: CloseReason,
+}
+
+#[derive(Debug)]
+struct ServerUdpIpTunnelCarrier {
+    packets: mpsc::UnboundedSender<QueuedUdpIpPacket>,
+    close: mpsc::UnboundedSender<ServerUdpIpTunnelClose>,
+    ready: AtomicBool,
+}
+
+impl ServerIpTunnelCarrier for ServerUdpIpTunnelCarrier {
+    fn try_send_packet(
+        &self,
+        tunnel_id: IpTunnelId,
+        packet_id: IpPacketId,
+        payload: Bytes,
+        budget: &IpPacketQueueBudget,
+    ) -> Result<IpTunnelPacketSendOutcome, RuntimeError> {
+        if !self.ready.load(Ordering::Acquire) {
+            return Ok(IpTunnelPacketSendOutcome::Full);
+        }
+        let permit = match budget.try_reserve(payload.len()) {
+            Ok(permit) => permit,
+            Err(RuntimeError::SenderServiceBlocked) => {
+                return Ok(IpTunnelPacketSendOutcome::Full);
+            }
+            Err(error) => return Err(error),
+        };
+        match self.packets.send(QueuedUdpIpPacket {
+            tunnel_id,
+            packet_id,
+            payload,
+            _budget: permit,
+        }) {
+            Ok(()) => Ok(IpTunnelPacketSendOutcome::Accepted),
+            Err(_) => Ok(IpTunnelPacketSendOutcome::Retired),
+        }
+    }
+
+    fn close(&self, tunnel_id: IpTunnelId, reason: CloseReason) {
+        let _ = self
+            .close
+            .send(ServerUdpIpTunnelClose { tunnel_id, reason });
     }
 }
 
@@ -284,11 +366,18 @@ pub(super) async fn handle_server_udp_ip_tunnel(
         udp_path_finish_stream(&mut send).await?;
         return Ok(());
     };
-    let (commands, mut receiver) = mpsc::channel(reliable_stream_frame_queue(context.mux_limits));
+    let packet_sender = send.ip_packet_sender(context.codec_limits).await?;
+    let (packets, packets_rx) = mpsc::unbounded_channel();
+    let (close, mut close_rx) = mpsc::unbounded_channel();
+    let carrier = Arc::new(ServerUdpIpTunnelCarrier {
+        packets,
+        close,
+        ready: AtomicBool::new(false),
+    });
     let accepted = match service.open(ServerIpTunnelOpenRequest {
         tunnel_id,
         path: &path_registration,
-        commands,
+        carrier: carrier.clone(),
     }) {
         Ok(accepted) => accepted,
         Err(_) => {
@@ -305,6 +394,7 @@ pub(super) async fn handle_server_udp_ip_tunnel(
             return Ok(());
         }
     };
+    recv.enable_ip_packets()?;
     udp_path_write_frame(
         &mut send,
         &Frame::IpTunnelReady {
@@ -315,8 +405,12 @@ pub(super) async fn handle_server_udp_ip_tunnel(
         context.codec_limits,
     )
     .await?;
-    loop {
-        tokio::select! {
+    carrier.ready.store(true, Ordering::Release);
+    let mut packet_writer = tokio::task::JoinSet::new();
+    packet_writer.spawn(run_udp_ip_packet_sender(packet_sender, packets_rx));
+    async {
+        loop {
+            tokio::select! {
             frame = udp_path_read_frame(&mut recv, context.codec_limits) => {
                 match frame {
                     Ok(Frame::IpPacket {
@@ -345,20 +439,9 @@ pub(super) async fn handle_server_udp_ip_tunnel(
                     )),
                 }
             }
-            command = receiver.recv() => {
+            command = close_rx.recv() => {
                 match command {
-                    Some(IpTunnelCarrierCommand::Packet {
-                        tunnel_id: packet_tunnel,
-                        packet_id,
-                        payload,
-                    }) if packet_tunnel == tunnel_id => {
-                        udp_path_write_frame(
-                            &mut send,
-                            &Frame::IpPacket { tunnel_id, packet_id, payload },
-                            context.codec_limits,
-                        ).await?;
-                    }
-                    Some(IpTunnelCarrierCommand::Close {
+                    Some(ServerUdpIpTunnelClose {
                         tunnel_id: closed_tunnel,
                         reason,
                     }) if closed_tunnel == tunnel_id => {
@@ -376,6 +459,17 @@ pub(super) async fn handle_server_udp_ip_tunnel(
                     )),
                 }
             }
+            writer = packet_writer.join_next() => {
+                return match writer {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) => Err(RuntimeError::TaskJoin(error)),
+                    None => Err(RuntimeError::Protocol(
+                        "QUIC IP packet sender stopped",
+                    )),
+                };
+            }
+            }
         }
     }
+    .await
 }

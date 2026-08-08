@@ -16,6 +16,7 @@ mod stream;
 
 pub use congestion::CongestionMetrics;
 pub use endpoint::{Connection, Endpoint};
+pub use stream::IpPacketSender;
 pub use stream::{RecvStream, SendStream, finish_stream, read_frame, write_frame, write_frames};
 
 use congestion::{InstrumentedBbrConfig, InstrumentedController, QuicCarrierTelemetry};

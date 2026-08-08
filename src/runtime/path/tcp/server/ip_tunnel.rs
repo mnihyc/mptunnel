@@ -2,16 +2,15 @@
 
 use crate::protocol::{CloseReason, Frame, IpPacketId, IpTunnelId};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandSender, reliable_stream_frame_queue,
-};
+use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerPathContext};
 use crate::runtime::tun_l3::{
-    AcceptedServerIpTunnel, IpTunnelCarrierCommand, ServerIpTunnelOpenRequest,
+    AcceptedServerIpTunnel, IpPacketQueueBudget, IpTunnelPacketSendOutcome, ServerIpTunnelCarrier,
+    ServerIpTunnelOpenRequest,
 };
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use std::sync::Arc;
 
 pub(super) struct ServerTcpIpTunnelState {
     attachment: Option<ServerTcpIpTunnelAttachment>,
@@ -20,7 +19,57 @@ pub(super) struct ServerTcpIpTunnelState {
 struct ServerTcpIpTunnelAttachment {
     tunnel_id: IpTunnelId,
     accepted: AcceptedServerIpTunnel,
-    forwarding: tokio::task::JoinHandle<()>,
+}
+
+struct ServerTcpIpTunnelCarrier {
+    path: ReliablePathCommandSender,
+}
+
+impl std::fmt::Debug for ServerTcpIpTunnelCarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerTcpIpTunnelCarrier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerIpTunnelCarrier for ServerTcpIpTunnelCarrier {
+    fn try_send_packet(
+        &self,
+        tunnel_id: IpTunnelId,
+        packet_id: IpPacketId,
+        payload: Bytes,
+        _budget: &IpPacketQueueBudget,
+    ) -> Result<IpTunnelPacketSendOutcome, RuntimeError> {
+        match self.path.try_enqueue_admitted_frame(
+            Frame::IpPacket {
+                tunnel_id,
+                packet_id,
+                payload,
+            },
+            TrafficClass::RealtimeDatagram,
+        ) {
+            Ok(()) => Ok(IpTunnelPacketSendOutcome::Accepted),
+            Err(RuntimeError::SenderServiceBlocked) => Ok(IpTunnelPacketSendOutcome::Full),
+            Err(RuntimeError::ReliablePathRetired)
+            | Err(RuntimeError::ReliablePathSessionClosed) => {
+                Ok(IpTunnelPacketSendOutcome::Retired)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn close(&self, tunnel_id: IpTunnelId, reason: CloseReason) {
+        let path = self.path.clone();
+        tokio::spawn(async move {
+            let _ = path
+                .send_control(ReliablePathCommand::SendFrame(Frame::IpTunnelClose {
+                    tunnel_id,
+                    reason,
+                }))
+                .await;
+        });
+    }
 }
 
 impl ServerTcpIpTunnelState {
@@ -49,11 +98,12 @@ impl ServerTcpIpTunnelState {
                 reason: CloseReason::PolicyRejected,
             });
         };
-        let (commands, receiver) = mpsc::channel(reliable_stream_frame_queue(context.mux_limits));
         let accepted = match service.open(ServerIpTunnelOpenRequest {
             tunnel_id,
             path,
-            commands,
+            carrier: Arc::new(ServerTcpIpTunnelCarrier {
+                path: path_commands.clone(),
+            }),
         }) {
             Ok(accepted) => accepted,
             Err(_) => {
@@ -64,11 +114,9 @@ impl ServerTcpIpTunnelState {
             }
         };
         let addresses = accepted.allocation().assigned_addresses().collect();
-        let forwarding = tokio::spawn(forward_ip_tunnel_commands(receiver, path_commands.clone()));
         self.attachment = Some(ServerTcpIpTunnelAttachment {
             tunnel_id,
             accepted,
-            forwarding,
         });
         Ok(Frame::IpTunnelReady {
             tunnel_id,
@@ -103,49 +151,6 @@ impl ServerTcpIpTunnelState {
             .is_some_and(|attachment| attachment.tunnel_id == tunnel_id)
         {
             self.attachment = None;
-        }
-    }
-}
-
-impl Drop for ServerTcpIpTunnelAttachment {
-    fn drop(&mut self) {
-        self.forwarding.abort();
-    }
-}
-
-async fn forward_ip_tunnel_commands(
-    mut commands: mpsc::Receiver<IpTunnelCarrierCommand>,
-    path: ReliablePathCommandSender,
-) {
-    while let Some(command) = commands.recv().await {
-        match command {
-            IpTunnelCarrierCommand::Packet {
-                tunnel_id,
-                packet_id,
-                payload,
-            } => {
-                let result = path.try_enqueue_admitted_frame(
-                    Frame::IpPacket {
-                        tunnel_id,
-                        packet_id,
-                        payload,
-                    },
-                    TrafficClass::RealtimeDatagram,
-                );
-                match result {
-                    Ok(()) | Err(RuntimeError::SenderServiceBlocked) => {}
-                    Err(_) => return,
-                }
-            }
-            IpTunnelCarrierCommand::Close { tunnel_id, reason } => {
-                let _ = path
-                    .send_control(ReliablePathCommand::SendFrame(Frame::IpTunnelClose {
-                        tunnel_id,
-                        reason,
-                    }))
-                    .await;
-                return;
-            }
         }
     }
 }

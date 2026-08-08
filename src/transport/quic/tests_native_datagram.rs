@@ -158,6 +158,7 @@ async fn incomplete_native_reassembly_releases_budget_without_a_later_packet() {
         generation: 1,
         state: state.clone(),
         rx,
+        ip_rx: None,
         reassemblies: HashMap::new(),
         ip_reassemblies: HashMap::new(),
     };
@@ -282,7 +283,14 @@ fn resolved_request_evicts_pending_route_without_exceeding_global_route_cap() {
     assert_eq!(buffered_bytes.load(Ordering::Acquire), packet_len);
 
     let (tx, _rx) = mpsc::channel(1);
-    routing.active.insert(12, Route { generation: 1, tx });
+    routing.active.insert(
+        12,
+        Route {
+            generation: 1,
+            tx,
+            ip_tx: None,
+        },
+    );
     assert_eq!(
         routing.active.len() + routing.pending.len(),
         state.max_routes

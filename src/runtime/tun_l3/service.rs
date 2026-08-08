@@ -1,6 +1,7 @@
 //! Transport-neutral server packet ownership and dispatch.
 
 use super::flow::PacketFlowTable;
+use super::{IpPacketQueueBudget, IpPacketQueuePermit};
 use crate::model::path::CarrierPathInstanceId;
 use crate::model::tun_l3::{IpPacketFlowKey, parse_ip_packet};
 use crate::product::{PrincipalId, TunL3AddressPlan, TunL3PeerAllocation};
@@ -17,23 +18,31 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-#[derive(Debug)]
-pub(in crate::runtime) enum IpTunnelCarrierCommand {
-    Packet {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum IpTunnelPacketSendOutcome {
+    Accepted,
+    Full,
+    Retired,
+}
+
+pub(in crate::runtime) trait ServerIpTunnelCarrier:
+    std::fmt::Debug + Send + Sync
+{
+    fn try_send_packet(
+        &self,
         tunnel_id: IpTunnelId,
         packet_id: IpPacketId,
         payload: Bytes,
-    },
-    Close {
-        tunnel_id: IpTunnelId,
-        reason: CloseReason,
-    },
+        budget: &IpPacketQueueBudget,
+    ) -> Result<IpTunnelPacketSendOutcome, RuntimeError>;
+
+    fn close(&self, tunnel_id: IpTunnelId, reason: CloseReason);
 }
 
 pub(in crate::runtime) struct ServerIpTunnelOpenRequest<'a> {
     pub(in crate::runtime) tunnel_id: IpTunnelId,
     pub(in crate::runtime) path: &'a ServerCarrierPathRegistration,
-    pub(in crate::runtime) commands: mpsc::Sender<IpTunnelCarrierCommand>,
+    pub(in crate::runtime) carrier: Arc<dyn ServerIpTunnelCarrier>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,7 +61,7 @@ struct ServerIpAttachment {
     startup_metrics: Option<crate::protocol::PathMetrics>,
     attachment_generation: u64,
     lifetime: Weak<()>,
-    commands: mpsc::Sender<IpTunnelCarrierCommand>,
+    carrier: Arc<dyn ServerIpTunnelCarrier>,
 }
 
 #[derive(Debug)]
@@ -76,7 +85,9 @@ struct ServerIpTunnelInner {
     plan: TunL3AddressPlan,
     paths: ServerStreamPort,
     state: Mutex<ServerIpTunnelState>,
-    device_packets: mpsc::Sender<Bytes>,
+    device_packets: mpsc::UnboundedSender<BudgetedServerTunPacket>,
+    device_packet_budget: IpPacketQueueBudget,
+    carrier_packet_budget: IpPacketQueueBudget,
     recent_packet_capacity: usize,
     flow_capacity: usize,
     max_paths_per_tunnel: usize,
@@ -99,7 +110,12 @@ impl std::fmt::Debug for ServerIpTunnelPort {
 
 pub(in crate::runtime) struct ServerIpTunnelDevice {
     inner: Arc<ServerIpTunnelInner>,
-    packets: mpsc::Receiver<Bytes>,
+    packets: mpsc::UnboundedReceiver<BudgetedServerTunPacket>,
+}
+
+pub(super) struct BudgetedServerTunPacket {
+    pub(super) payload: Bytes,
+    _budget: IpPacketQueuePermit,
 }
 
 pub(in crate::runtime) struct ServerIpTunnelOutput {
@@ -125,15 +141,21 @@ impl ServerIpTunnelService {
         plan: TunL3AddressPlan,
         paths: ServerStreamPort,
         max_paths_per_tunnel: usize,
-        packet_queue: usize,
+        packet_queue_bytes: usize,
     ) -> (ServerIpTunnelPort, ServerIpTunnelDevice) {
-        let packet_queue = packet_queue.max(1);
-        let (device_packets, packets) = mpsc::channel(packet_queue);
+        let packet_queue_bytes = packet_queue_bytes.max(1);
+        let packet_queue = packet_queue_bytes
+            .checked_div(usize::from(plan.mtu()))
+            .unwrap_or(0)
+            .max(1);
+        let (device_packets, packets) = mpsc::unbounded_channel();
         let inner = Arc::new(ServerIpTunnelInner {
             plan,
             paths,
             state: Mutex::new(ServerIpTunnelState::default()),
             device_packets,
+            device_packet_budget: IpPacketQueueBudget::new(packet_queue_bytes),
+            carrier_packet_budget: IpPacketQueueBudget::new(packet_queue_bytes),
             recent_packet_capacity: packet_queue.saturating_mul(2),
             flow_capacity: packet_queue,
             max_paths_per_tunnel: max_paths_per_tunnel.max(1),
@@ -197,6 +219,7 @@ impl ServerIpTunnelPort {
         };
         state.next_attachment_generation = state.next_attachment_generation.wrapping_add(1).max(1);
         let attachment_generation = state.next_attachment_generation;
+        let startup_metrics = request.path.initial_metrics();
         let tunnel = state
             .tunnels
             .get_mut(&principal)
@@ -215,13 +238,15 @@ impl ServerIpTunnelPort {
                 key: carrier,
                 config_ordinal: request.path.local_config_ordinal(),
                 backup: request.path.local_policy().backup,
-                startup_metrics: request.path.initial_metrics(),
+                startup_metrics,
                 attachment_generation,
                 lifetime: Arc::downgrade(&lifetime),
-                commands: request.commands,
+                carrier: request.carrier,
             },
         ) {
-            send_attachment_close(previous.commands, request.tunnel_id, CloseReason::Normal);
+            previous
+                .carrier
+                .close(request.tunnel_id, CloseReason::Normal);
         }
         drop(state);
         Ok(AcceptedServerIpTunnel {
@@ -262,6 +287,11 @@ impl AcceptedServerIpTunnel {
         if !self.allocation.owns(metadata.source) {
             return Ok(false);
         }
+        let budget = match self.inner.device_packet_budget.try_reserve(payload.len()) {
+            Ok(budget) => budget,
+            Err(RuntimeError::SenderServiceBlocked) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let mut state = self.inner.state.lock().expect("server IP tunnel lock");
         let Some(tunnel) = state.tunnels.get_mut(&self.principal) else {
             return Ok(false);
@@ -281,13 +311,14 @@ impl AcceptedServerIpTunnel {
         }
         tunnel.received_packet_ids.insert(packet_id);
         drop(state);
-        match self.inner.device_packets.try_send(payload) {
-            Ok(()) => Ok(true),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(RuntimeError::Protocol("TUN-L3 device packet sink closed"))
-            }
-        }
+        self.inner
+            .device_packets
+            .send(BudgetedServerTunPacket {
+                payload,
+                _budget: budget,
+            })
+            .map(|()| true)
+            .map_err(|_| RuntimeError::Protocol("TUN-L3 device packet sink closed"))
     }
 }
 
@@ -332,10 +363,15 @@ impl ServerIpTunnelDevice {
 
     #[cfg(test)]
     pub(in crate::runtime) async fn receive_from_peer(&mut self) -> Option<Bytes> {
-        self.packets.recv().await
+        self.packets.recv().await.map(|packet| packet.payload)
     }
 
-    pub(in crate::runtime) fn into_parts(self) -> (ServerIpTunnelOutput, mpsc::Receiver<Bytes>) {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        ServerIpTunnelOutput,
+        mpsc::UnboundedReceiver<BudgetedServerTunPacket>,
+    ) {
         (ServerIpTunnelOutput { inner: self.inner }, self.packets)
     }
 
@@ -386,15 +422,15 @@ fn try_send_server_packet(
         let Some(attachment) = tunnel.attachments.get(&carrier) else {
             return Ok(false);
         };
-        let command = IpTunnelCarrierCommand::Packet {
-            tunnel_id: tunnel.tunnel_id,
+        match attachment.carrier.try_send_packet(
+            tunnel.tunnel_id,
             packet_id,
-            payload: payload.clone(),
-        };
-        match attachment.commands.try_send(command) {
-            Ok(()) => return Ok(true),
-            Err(mpsc::error::TrySendError::Full(_)) => return Ok(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            payload.clone(),
+            &inner.carrier_packet_budget,
+        )? {
+            IpTunnelPacketSendOutcome::Accepted => return Ok(true),
+            IpTunnelPacketSendOutcome::Full => return Ok(false),
+            IpTunnelPacketSendOutcome::Retired => {
                 tunnel.attachments.remove(&carrier);
                 remove_server_carrier_bindings(tunnel, carrier);
             }
@@ -563,19 +599,6 @@ fn close_attachments(
     reason: CloseReason,
 ) {
     for attachment in attachments.into_values() {
-        send_attachment_close(attachment.commands, tunnel_id, reason);
-    }
-}
-
-fn send_attachment_close(
-    commands: mpsc::Sender<IpTunnelCarrierCommand>,
-    tunnel_id: IpTunnelId,
-    reason: CloseReason,
-) {
-    let command = IpTunnelCarrierCommand::Close { tunnel_id, reason };
-    if let Err(mpsc::error::TrySendError::Full(command)) = commands.try_send(command) {
-        tokio::spawn(async move {
-            let _ = commands.send(command).await;
-        });
+        attachment.carrier.close(tunnel_id, reason);
     }
 }

@@ -15,6 +15,8 @@ packet tunnel with server-owned address pools and explicit per-principal
 allocations. TUN-L3 can use TCP and QUIC together and leaves host routes, DNS,
 firewall policy, forwarding, and NAT under operator control.
 
+Both TUN-L4 and TUN-L3 are experimental.
+
 ## Contents
 
 - [Why MPTUNNEL?](#why-mptunnel)

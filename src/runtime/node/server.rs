@@ -266,16 +266,11 @@ pub(super) fn new_identity_runtime_with_metadata(
         telemetry: telemetry.clone(),
     });
     let (ip_tunnels, ip_tunnel_device) = tun_l3.map_or((None, None), |plan| {
-        let packet_queue = mux_limits
-            .max_datagram_queue_bytes
-            .checked_div(usize::from(plan.mtu()))
-            .unwrap_or(0)
-            .max(1);
         let (port, device) = ServerIpTunnelService::build(
             plan,
             reliable_stream_port.clone(),
             resources.max_paths,
-            packet_queue,
+            mux_limits.max_datagram_queue_bytes,
         );
         (Some(port), Some(device))
     });

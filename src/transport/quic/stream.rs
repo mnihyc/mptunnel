@@ -28,6 +28,34 @@ pub struct SendStream {
     pub(super) priority: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct IpPacketSender {
+    native: NativeDatagramSender,
+    known_ip_tunnel: Arc<Mutex<IpTunnelRegistry>>,
+}
+
+impl IpPacketSender {
+    pub async fn send(&self, frame: &Frame, limits: CodecLimits) -> Result<(), QuicCarrierError> {
+        let Frame::IpPacket { tunnel_id, .. } = frame else {
+            return Err(QuicCarrierError::InvalidNativeDatagram(
+                "only IP_PACKET may use the direct packet sender",
+            ));
+        };
+        if self
+            .known_ip_tunnel
+            .lock()
+            .expect("native IP tunnel lock")
+            .state(*tunnel_id)
+            != IpTunnelState::Ready(*tunnel_id)
+        {
+            return Err(QuicCarrierError::InvalidNativeDatagram(
+                "IP_PACKET preceded its reliable IP_TUNNEL_READY",
+            ));
+        }
+        self.native.send_ip_packet(frame, limits).await
+    }
+}
+
 impl SendStream {
     /// H3's current Quinn adapter does not expose the raw request stream after
     /// construction. Product/Core still schedule writes by traffic class; this
@@ -36,6 +64,14 @@ impl SendStream {
     pub fn set_priority(&mut self, priority: i32) -> Result<(), QuicCarrierError> {
         self.priority = priority;
         Ok(())
+    }
+
+    pub async fn ip_packet_sender(&mut self) -> Result<IpPacketSender, QuicCarrierError> {
+        self.stream.ensure_datagrams_negotiated().await?;
+        Ok(IpPacketSender {
+            native: self.native.clone(),
+            known_ip_tunnel: self.known_ip_tunnel.clone(),
+        })
     }
 
     #[cfg(test)]
@@ -397,10 +433,15 @@ pub async fn write_frames(
             }
             _ => unreachable!("native frame matched above"),
         }
-        send.stream.ensure_datagrams_negotiated().await?;
         match frame {
-            Frame::DatagramData { .. } => send.native.send_frame(frame, limits)?,
-            Frame::IpPacket { .. } => send.native.send_ip_packet(frame, limits)?,
+            Frame::DatagramData { .. } => {
+                send.stream.ensure_datagrams_negotiated().await?;
+                send.native.send_frame(frame, limits)?;
+            }
+            Frame::IpPacket { .. } => {
+                send.stream.ensure_datagrams_negotiated().await?;
+                send.native.send_ip_packet(frame, limits).await?;
+            }
             _ => unreachable!("native frame matched above"),
         }
         reliable_start = index + 1;
@@ -567,6 +608,11 @@ fn encode_length_prefixed_frame(
 }
 
 impl RecvStream {
+    pub fn enable_ip_packets(&mut self) -> Result<(), QuicCarrierError> {
+        self.native.enable_ip_packets()?;
+        Ok(())
+    }
+
     pub(super) fn new(
         stream: H3RecvStream,
         native: NativeDatagramReceiver,

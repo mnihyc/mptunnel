@@ -197,6 +197,8 @@ expires source associations at `idle_timeout_ms`, and bounds each datagram by
 `datagram_ttl_ms`. Both use the ordinary route/DNS/ACL/outbound/balancer path;
 they do not dial around configured outbounds.
 
+Both `protocol = "tun"` (TUN-L4) and `protocol = "tun-l3"` are experimental.
+
 `protocol = "tun-l3"` is the raw IP-tunnel ingress. It selects exactly one MPP
 outbound and receives its IPv4 and/or IPv6 host address from that MPP server's
 authenticated principal allocation. The server configures pools, its own TUN

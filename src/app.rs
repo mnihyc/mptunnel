@@ -205,6 +205,16 @@ fn log_command_line_configuration(config: &AppConfig) {
 
 fn log_configuration_inventory(config: &AppConfig) {
     let CommandConfig::Node(node) = &config.command;
+    let forwarding_mode = match node.forwarding_mode {
+        crate::config::ForwardingMode::L4 => "L4",
+        crate::config::ForwardingMode::L3 => "L3 (experimental)",
+    };
+    crate::observability::emit_lifecycle(
+        crate::config::LogLevel::Info,
+        "configuration",
+        "forwarding_mode",
+        format_args!("Forwarding mode {forwarding_mode}"),
+    );
     let route_count = node
         .product_policy
         .as_ref()

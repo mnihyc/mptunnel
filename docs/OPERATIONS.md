@@ -197,9 +197,16 @@ expires source associations at `idle_timeout_ms`, and bounds each datagram by
 `datagram_ttl_ms`. Both use the ordinary route/DNS/ACL/outbound/balancer path;
 they do not dial around configured outbounds.
 
-Both `protocol = "tun"` (TUN-L4) and `protocol = "tun-l3"` are experimental.
+`forwarding_mode` is a root setting for the complete runtime generation.
+Omitting it selects `l4`, which preserves SOCKS5, HTTP CONNECT, fixed port
+forwarding, `protocol = "tun"`, and ordinary MPP server forwarding. L4 rejects
+all TUN-L3 configuration. Explicit `forwarding_mode = "l3"` is experimental;
+it requires at least one TUN-L3 client or server service, rejects every local
+L4 inbound, and requires each MPP server inbound to define its L3 address plan.
+A mode change is applied only by validated generation replacement, never as an
+in-place data-plane adjustment. Both TUN-L4 and TUN-L3 remain experimental.
 
-`protocol = "tun-l3"` is the raw IP-tunnel ingress. It selects exactly one MPP
+In L3 mode, `protocol = "tun-l3"` is the raw IP-tunnel ingress. It selects exactly one MPP
 outbound and receives its IPv4 and/or IPv6 host address from that MPP server's
 authenticated principal allocation. The server configures pools, its own TUN
 addresses, and explicit principal allocations under `[inbounds.tun_l3]`;
@@ -210,16 +217,10 @@ use normal carrier resolution; inner packet destinations do not. Operators
 remain responsible for host routes, IP forwarding, DNS, firewall rules, and
 NAT on both ends. TCP and QUIC carrier paths are both eligible.
 
-The nested server packet service is additive to that MPP inbound's ordinary
-reliable-stream and datagram proxy service, whose egress, DNS plan, and
-destination ACL remain active. For a packet-only inbound, finish its destination
-ACL with a catch-all deny rule:
-
-```toml
-[[inbounds.destination_acl.rules]]
-name = "deny-proxy-plane"
-effect = "deny"
-```
+The nested server address plan belongs only to L3 mode. Reliable-stream and
+application-datagram forwarding opens are rejected before they can enter the
+server's L4 egress services. L3 transport policy is isolated from the default
+L4 forwarding family.
 
 One authenticated principal has one live logical IP tunnel per MPP inbound. A
 new session for the same principal supersedes the previous tunnel attachments;

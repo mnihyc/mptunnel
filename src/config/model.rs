@@ -153,6 +153,7 @@ impl AppConfig {
 }
 
 fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<(), ConfigError> {
+    validate_forwarding_mode(node)?;
     if node.local_ingresses.is_empty()
         && node.tun_l3_ingresses.is_empty()
         && node.servers.is_empty()
@@ -208,7 +209,6 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
         validate_mpp_inbound_egress(&server.egress, &node.gateway_balancers, &node.outbounds)?;
     }
     validate_local_ingresses(&node.local_ingresses)?;
-    validate_managed_tun_l3_ownership(node)?;
     validate_fake_dns_tun_routes(&node.local_ingresses, &dns_policy)?;
     match (&node.product_policy, node.local_ingresses.is_empty()) {
         (Some(policy), _) => {
@@ -642,8 +642,32 @@ pub enum CommandConfig {
     Node(NodeConfig),
 }
 
+/// Generation-scoped forwarding family.
+///
+/// L4 retains the Product stream/datagram forwarding graph. L3 selects the
+/// raw authenticated IP-packet service. The two families are deliberately
+/// exclusive so transport policy can evolve independently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ForwardingMode {
+    #[default]
+    L4,
+    L3,
+}
+
+impl ForwardingMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::L4 => "l4",
+            Self::L3 => "l3",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
+    /// Selects one forwarding family for this runtime generation. Omission in
+    /// TOML and the simple CLI both select L4.
+    pub forwarding_mode: ForwardingMode,
     /// One canonical namespace for MPP and native outbound leaves.
     pub outbounds: Vec<OutboundLeafConfig>,
     /// Product balancers over compatible leaf outbounds. They never
@@ -1020,17 +1044,26 @@ fn validate_packet_device_names(node: &NodeConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_managed_tun_l3_ownership(node: &NodeConfig) -> Result<(), ConfigError> {
-    let has_managed_tun_l4 = node.local_ingresses.iter().any(|ingress| {
-        matches!(
-            &ingress.config,
-            IngressConfig::TunL4(tun) if tun.managed_vpn().is_some()
-        )
-    });
-    let has_tun_l3 = !node.tun_l3_ingresses.is_empty()
-        || node.servers.iter().any(|server| server.tun_l3.is_some());
-    if has_managed_tun_l4 && has_tun_l3 {
-        return Err(ConfigError::ManagedTunL3Conflict);
+fn validate_forwarding_mode(node: &NodeConfig) -> Result<(), ConfigError> {
+    match node.forwarding_mode {
+        ForwardingMode::L4 => {
+            if !node.tun_l3_ingresses.is_empty()
+                || node.servers.iter().any(|server| server.tun_l3.is_some())
+            {
+                return Err(ConfigError::L4ContainsTunL3);
+            }
+        }
+        ForwardingMode::L3 => {
+            if let Some(inbound) = node.local_ingresses.first() {
+                return Err(ConfigError::L3ContainsL4Inbound(inbound.name.clone()));
+            }
+            if let Some(server) = node.servers.iter().find(|server| server.tun_l3.is_none()) {
+                return Err(ConfigError::L3ServerMissingTunL3(server.name.clone()));
+            }
+            if node.tun_l3_ingresses.is_empty() && node.servers.is_empty() {
+                return Err(ConfigError::L3ServiceRequired);
+            }
+        }
     }
     Ok(())
 }
@@ -1227,7 +1260,10 @@ pub enum ConfigError {
     TunDnsResolverPortZero,
     ManagedVpn(String),
     MultipleManagedTunInbounds { actual: usize },
-    ManagedTunL3Conflict,
+    L4ContainsTunL3,
+    L3ContainsL4Inbound(String),
+    L3ServerMissingTunL3(String),
+    L3ServiceRequired,
     TunL3OutboundMissing(String),
     TunL3OutboundNotMpp(String),
     TunL3OutboundBoundTwice(String),
@@ -1482,9 +1518,20 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "node config defines {actual} managed TUN inbounds; at most one may own host VPN state"
             ),
-            Self::ManagedTunL3Conflict => write!(
+            Self::L4ContainsTunL3 => write!(
                 f,
-                "process-managed TUN L4 cannot coexist with TUN-L3 because the managed VPN lifecycle owns one packet device"
+                "forwarding mode l4 cannot contain a TUN-L3 client or server service"
+            ),
+            Self::L3ContainsL4Inbound(name) => {
+                write!(f, "forwarding mode l3 cannot contain L4 inbound {name:?}")
+            }
+            Self::L3ServerMissingTunL3(name) => write!(
+                f,
+                "forwarding mode l3 requires MPP inbound {name:?} to define its TUN-L3 service"
+            ),
+            Self::L3ServiceRequired => write!(
+                f,
+                "forwarding mode l3 requires at least one TUN-L3 client or server service"
             ),
             Self::TunL3OutboundMissing(name) => {
                 write!(f, "TUN-L3 references missing outbound {name:?}")

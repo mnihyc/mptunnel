@@ -5,12 +5,12 @@ use super::{
     DEFAULT_MAX_PENDING_AUTHENTICATIONS, DEFAULT_MPP_TLS_SERVER_NAME,
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_PROBE_INTERVAL_MS,
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, GatewayBalancerConfig,
-    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
-    MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NamedTunL3Config, NodeConfig,
-    OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits,
-    SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
-    SessionConfig, SharedSecret,
+    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, ForwardingMode,
+    GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
+    ManagementConfig, MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NamedPathConfig,
+    NamedTunL3Config, NodeConfig, OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig,
+    ResourceLimits, SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig,
+    ServiceConfig, SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -146,6 +146,8 @@ fn toml_unknown_field(message: &str) -> Option<String> {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
+    forwarding_mode: ForwardingModeFileValue,
+    #[serde(default)]
     logging: LoggingFileConfig,
     #[serde(default)]
     check_config: bool,
@@ -219,6 +221,7 @@ impl FileConfig {
             admission: self.admission.into_config(),
             management: self.management.into_config(material_base)?,
             command: CommandConfig::Node(NodeConfig {
+                forwarding_mode: self.forwarding_mode.into(),
                 outbounds,
                 gateway_balancers,
                 local_ingresses,
@@ -230,6 +233,23 @@ impl FileConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ForwardingModeFileValue {
+    #[default]
+    L4,
+    L3,
+}
+
+impl From<ForwardingModeFileValue> for ForwardingMode {
+    fn from(value: ForwardingModeFileValue) -> Self {
+        match value {
+            ForwardingModeFileValue::L4 => Self::L4,
+            ForwardingModeFileValue::L3 => Self::L3,
+        }
     }
 }
 

@@ -1,7 +1,9 @@
 //! Combined-node composition for multiple client and server identities.
 
 use super::{client, server};
-use crate::config::{ManagementConfig, NodeConfig, OutboundLeafConfig, SessionConfig};
+use crate::config::{
+    ForwardingMode, ManagementConfig, NodeConfig, OutboundLeafConfig, SessionConfig,
+};
 use crate::performance::ResourceLimits;
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
 use crate::product::{ProductAdmission, ProductAdmissionConfig};
@@ -49,6 +51,7 @@ pub(super) async fn run(
     let runtime_carrier_network = carrier_network.provider.clone();
     let readiness = RuntimeReadinessBarrier::new(generation.clone());
     let NodeConfig {
+        forwarding_mode,
         outbounds,
         gateway_balancers,
         local_ingresses,
@@ -58,11 +61,17 @@ pub(super) async fn run(
         servers,
     } = node;
     let product_inventory = ProductRuntimeInventory::from_config(&local_ingresses, &outbounds);
-    let tun_l3_inventory = TunL3RuntimeInventory::from_config(&tun_l3_ingresses, &servers);
-    let tun_l3_outbounds = tun_l3_ingresses
-        .iter()
-        .map(|ingress| ingress.config.outbound.clone())
-        .collect::<HashSet<_>>();
+    let tun_l3_inventory = match forwarding_mode {
+        ForwardingMode::L4 => TunL3RuntimeInventory::default(),
+        ForwardingMode::L3 => TunL3RuntimeInventory::from_config(&tun_l3_ingresses, &servers),
+    };
+    let tun_l3_outbounds = match forwarding_mode {
+        ForwardingMode::L4 => HashSet::new(),
+        ForwardingMode::L3 => tun_l3_ingresses
+            .iter()
+            .map(|ingress| ingress.config.outbound.clone())
+            .collect::<HashSet<_>>(),
+    };
     let product_telemetry =
         RuntimeTelemetry::generation_owner(active_flow_detail_capacity(resources.max_streams));
     let mut services = tokio::task::JoinSet::new();
@@ -94,24 +103,10 @@ pub(super) async fn run(
                     config.path_probe_timeout,
                 ));
                 if tun_l3_outbounds.contains(&id) {
-                    let tun_l3_context = client::new_path_context(
-                        &config,
-                        resources,
-                        id.clone(),
-                        ClientPathRuntimeOptions {
-                            session_retention_timeout: session.retention_timeout,
-                            path_group_ordinal: outbound_path_group_ordinal,
-                            carrier_network: runtime_carrier_network.clone(),
-                            allow_peer_diagnostics: management.peer_diagnostics_enabled(),
-                        },
-                        RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
-                    )?;
-                    path_probe_services.push((
-                        tun_l3_context.clone(),
-                        config.path_probe_interval,
-                        config.path_probe_timeout,
-                    ));
-                    tun_l3_contexts.push(tun_l3_context);
+                    // One MPP outbound owns one path context and probe
+                    // lifecycle within a runtime generation, independent of
+                    // the selected forwarding family.
+                    tun_l3_contexts.push(context.clone());
                 }
                 runtime_leaves.push(RuntimeOutboundLeaf::Mpp {
                     id,
@@ -228,6 +223,7 @@ pub(super) async fn run(
             product_telemetry.clone(),
             session.retention_timeout,
             management.peer_diagnostics_enabled(),
+            forwarding_mode,
             server_config.tun_l3,
         ) {
             Ok(runtime) => runtime,

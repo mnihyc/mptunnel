@@ -209,7 +209,9 @@ the aggregation opportunity measured above.
 
 ## TUN-L3 packet service
 
-These diagnostic candidate measurements used two unprivileged network
+These diagnostic candidate measurements selected experimental
+`forwarding_mode = "l3"`; they are a separate performance family from the
+default L4 proxy results above. They used two unprivileged network
 namespaces and real kernel TUN interfaces rather than the containerized SOCKS
 or local-forwarding Product data plane. Their host load and container inventory
 were valid; the uncommitted source snapshot was the sole provenance failure, so
@@ -323,7 +325,8 @@ these results.
 
 ## Current-candidate regression guard
 
-The TUN-L3 candidate was also checked against the original transport guard and
+The L3 candidate was also checked against the original default-L4 transport
+guard and
 the current default TCP+QUIC guard. These diagnostic runs used the exact
 optimized candidate binary. The final pure-TCP candidate and current mixed
 A-B-A cohorts had acceptable host load, no external containers, and only the

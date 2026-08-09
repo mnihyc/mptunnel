@@ -396,6 +396,19 @@ async fn handle_server_udp_bidi_stream(
     path_registration: ServerCarrierPathRegistration,
 ) -> Result<(), RuntimeError> {
     match udp_path_read_frame(&mut recv, context.codec_limits).await? {
+        Frame::OpenStream { stream_id, .. }
+            if context.forwarding_mode == crate::config::ForwardingMode::L3 =>
+        {
+            send.set_traffic_class(TrafficClass::Control)?;
+            udp_path_write_frame(
+                &mut send,
+                &Frame::StreamDetach { stream_id },
+                context.codec_limits,
+            )
+            .await?;
+            udp_path_finish_stream(&mut send).await?;
+            Ok(())
+        }
         Frame::OpenStream {
             stream_id,
             target,
@@ -416,6 +429,19 @@ async fn handle_server_udp_bidi_stream(
                 },
             )
             .await
+        }
+        Frame::OpenDatagramFlow { flow_id, .. }
+            if context.forwarding_mode == crate::config::ForwardingMode::L3 =>
+        {
+            send.set_traffic_class(TrafficClass::Control)?;
+            udp_path_write_frame(
+                &mut send,
+                &Frame::DatagramClose { flow_id },
+                context.codec_limits,
+            )
+            .await?;
+            udp_path_finish_stream(&mut send).await?;
+            Ok(())
         }
         Frame::OpenDatagramFlow {
             flow_id, target, ..

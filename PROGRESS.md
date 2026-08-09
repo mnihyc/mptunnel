@@ -6809,3 +6809,32 @@ entry is authoritative.
     badges, and this release milestone.
 - Release rule: push and tag only this exact clean commit after both ordinary CI
   and the non-publishing Release Check succeed for its commit SHA.
+
+## 2026-08-09T16:01:07+08:00: forwarding families made explicit
+
+- Name: generation-scoped L4/L3 forwarding boundary
+- Category: Product and runtime architecture
+- State: implemented and verified; no congestion or scheduling model changed
+- Model:
+  - omitted `forwarding_mode` remains L4; shipped examples show the L4 default
+    as a commented root setting;
+  - experimental L3 is an explicit alternative profile with its own dedicated
+    section in `config.reference.toml`; and
+  - contradictory mixed-family configurations fail validation instead of
+    silently starting only part of the requested graph.
+- Runtime:
+  - L4 retains its existing inbound, outbound, stream, datagram, and TUN-L4
+    construction;
+  - L3 reuses one MPP client context rather than constructing a duplicate; and
+  - an L3 server rejects L4 stream/datagram opens before egress on both TCP and
+    QUIC carriers.
+- Evidence:
+  - `cargo fmt --all -- --check` passed;
+  - strict all-target/all-feature Clippy passed;
+  - the full locked test gate passed: 1,509 library, 2 allocation-integration,
+    and 6 daily-use acceptance tests; and
+  - focused configuration contracts (45 tests) and the TCP L3 admission test
+    passed.
+- Scope: no scheduler, congestion-control, timing, resource-threshold, or L4
+  data-path policy changed. Subsequent TUN-L3 performance work is isolated to
+  the explicitly selected L3 family.

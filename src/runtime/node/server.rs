@@ -1,6 +1,6 @@
 //! Server listener composition; carrier loops remain under `runtime::path`.
 
-use crate::config::{EgressRef, NamedPathConfig, ServerSecurityConfig};
+use crate::config::{EgressRef, ForwardingMode, NamedPathConfig, ServerSecurityConfig};
 #[cfg(test)]
 use crate::config::{ManagementConfig, ServerDestinationAclConfig, SessionConfig};
 use crate::outbound;
@@ -103,6 +103,7 @@ pub(in crate::runtime) async fn run(
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         session.retention_timeout,
         management.peer_diagnostics_enabled(),
+        ForwardingMode::L4,
         None,
     )?;
     let generation = config_control
@@ -202,6 +203,7 @@ pub(in crate::runtime) fn new_identity_runtime(
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         SessionConfig::default().retention_timeout,
         false,
+        ForwardingMode::L4,
         None,
     )
     .expect("test server identity runtime")
@@ -222,6 +224,7 @@ pub(super) fn new_identity_runtime_with_metadata(
     telemetry: RuntimeTelemetry,
     session_retention_timeout: Duration,
     allow_peer_diagnostics: bool,
+    forwarding_mode: ForwardingMode,
     tun_l3: Option<crate::product::TunL3AddressPlan>,
 ) -> Result<ServerIdentityRuntime, RuntimeError> {
     let (configured_path_names, server_paths): (Vec<_>, Vec<_>) = configured_paths
@@ -278,6 +281,7 @@ pub(super) fn new_identity_runtime_with_metadata(
     let pending_authentications = Arc::new(Semaphore::new(security.max_pending_authentications));
     let paths = ServerPathContext {
         name,
+        forwarding_mode,
         configured_path_names: Arc::new(configured_path_names),
         server_paths: Arc::new(server_paths),
         codec_limits: resources.into(),

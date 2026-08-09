@@ -65,6 +65,7 @@ fn tun_host_runtime_config(host: TunHostConfig) -> AppConfig {
         admission: ProductAdmissionConfig::default(),
         management: ManagementConfig::default(),
         command: CommandConfig::Node(NodeConfig {
+            forwarding_mode: crate::config::ForwardingMode::L4,
             outbounds: Vec::new(),
             gateway_balancers: Vec::new(),
             local_ingresses: vec![LocalIngressConfig {

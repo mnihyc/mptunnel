@@ -118,12 +118,26 @@ async fn server_tcp_test_session(
     mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
     crate::runtime::relay::ServerReliableRelayService,
 ) {
+    server_tcp_test_session_with_mode(session_id, path_id, crate::config::ForwardingMode::L4).await
+}
+
+async fn server_tcp_test_session_with_mode(
+    session_id: SessionId,
+    path_id: PathId,
+    forwarding_mode: crate::config::ForwardingMode,
+) -> (
+    ServerTcpPathSession,
+    EncryptedFramedStream<TcpStream>,
+    crate::runtime::path::commands::ReliablePathCommandSender,
+    mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
+    crate::runtime::relay::ServerReliableRelayService,
+) {
     let security = ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret"),
     );
     let ServerIdentityRuntime {
-        paths: context,
+        paths: mut context,
         reliable_relay,
     } = new_identity_runtime(
         Vec::new(),
@@ -133,6 +147,7 @@ async fn server_tcp_test_session(
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
     );
+    context.forwarding_mode = forwarding_mode;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test TCP carrier");
@@ -206,6 +221,43 @@ async fn server_tcp_test_session(
         path_frames_tx,
         reliable_relay,
     )
+}
+
+#[tokio::test]
+async fn server_tcp_l3_mode_rejects_l4_forwarding_opens() {
+    let (mut session, mut client, _commands, _path_frames, _relay) =
+        server_tcp_test_session_with_mode(
+            SessionId(207),
+            PathId(0),
+            crate::config::ForwardingMode::L3,
+        )
+        .await;
+    let stream_id = StreamId(1);
+    session
+        .handle_frame(Frame::OpenStream {
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            demand: StreamDemandHint::Latency,
+        })
+        .await
+        .expect("reject L4 stream open in L3 mode");
+    assert_eq!(
+        client.read_frame().await.expect("stream rejection"),
+        Frame::StreamDetach { stream_id }
+    );
+
+    let flow_id = crate::protocol::DatagramFlowId(2);
+    session
+        .handle_frame(Frame::OpenDatagramFlow {
+            flow_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 53))),
+        })
+        .await
+        .expect("reject L4 datagram open in L3 mode");
+    assert_eq!(
+        client.read_frame().await.expect("datagram rejection"),
+        Frame::DatagramClose { flow_id }
+    );
 }
 
 #[tokio::test]

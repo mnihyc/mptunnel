@@ -1240,6 +1240,7 @@ impl ClientArgs {
             destination_acl: Vec::new(),
         };
         Ok(NodeConfig {
+            forwarding_mode: crate::config::ForwardingMode::L4,
             outbounds: vec![OutboundLeafConfig::Mpp {
                 id,
                 config: Box::new(outbound),
@@ -1557,6 +1558,7 @@ impl ServerArgs {
             tun_l3: None,
         };
         Ok(NodeConfig {
+            forwarding_mode: crate::config::ForwardingMode::L4,
             outbounds: vec![OutboundLeafConfig::Local {
                 id,
                 config: outbound,

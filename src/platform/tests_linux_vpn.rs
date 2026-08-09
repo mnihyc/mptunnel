@@ -337,6 +337,7 @@ fn mpp_leaf(id: &str, paths: impl IntoIterator<Item = PathSpec>) -> OutboundLeaf
 
 fn node_with_vpn(outbounds: Vec<OutboundLeafConfig>) -> NodeConfig {
     NodeConfig {
+        forwarding_mode: crate::config::ForwardingMode::L4,
         outbounds,
         gateway_balancers: Vec::new(),
         local_ingresses: vec![managed_tun("vpn")],
@@ -367,6 +368,7 @@ fn app_with_node(node: NodeConfig) -> AppConfig {
 #[test]
 fn node_without_managed_tun_compiles_to_none_without_dns_side_effects() {
     let node = NodeConfig {
+        forwarding_mode: crate::config::ForwardingMode::L4,
         outbounds: vec![direct_leaf("direct")],
         gateway_balancers: Vec::new(),
         local_ingresses: vec![external_tun("external")],

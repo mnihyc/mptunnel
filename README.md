@@ -14,12 +14,12 @@ CONNECT, TCP/UDP port forwarding, TUN, routing, DNS policy, outbound selection,
 balancing, persistent configuration, live management, and connection
 diagnostics.
 
-TUN is available either as routed Product TUN-L4 or as a first-class TUN-L3
-packet tunnel with server-owned address pools and explicit per-principal
-allocations. TUN-L3 can use TCP and QUIC together and leaves host routes, DNS,
-firewall policy, forwarding, and NAT under operator control.
-
-Both TUN-L4 and TUN-L3 are experimental.
+The global forwarding mode defaults to L4 for SOCKS5, HTTP CONNECT, port
+forwarding, and TUN-L4. An explicit experimental L3 mode instead carries
+complete IP packets, with server-owned address pools and per-principal
+allocations. L3 can use TCP and QUIC together while host routes, DNS, firewall
+policy, forwarding, and NAT remain under operator control. Both TUN modes are
+experimental and cannot be mixed in one runtime generation.
 
 ## Contents
 
@@ -52,6 +52,7 @@ rank paths from live latency and delivery evidence, choose differently for
 upload and download, and move undelivered ranges to a surviving carrier.
 
 ```text
+forwarding_mode = l4 (default)
 SOCKS5 / HTTP CONNECT / port forward / TUN-L4
                        |
              routing, DNS, outbounds
@@ -61,6 +62,9 @@ SOCKS5 / HTTP CONNECT / port forward / TUN-L4
         live ranking + Data ACK + reinjection
               /             |             \
         TCP path A      QUIC path B     TCP path C
+
+forwarding_mode = l3 (experimental)
+TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 ```
 
 ![Live MPTUNNEL Overview with real connections, paths, sessions, and transfer speed](docs/assets/dashboard.png)

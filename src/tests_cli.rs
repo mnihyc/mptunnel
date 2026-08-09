@@ -154,6 +154,7 @@ fn client_cli_builds_default_socks_config() {
     assert_eq!(config.session, SessionConfig::default());
     assert_eq!(config.resources, ResourceLimits::default());
     let node = command_node(config.command);
+    assert_eq!(node.forwarding_mode, crate::config::ForwardingMode::L4);
     let client = only_mpp_outbound(&node);
     assert_eq!(client.paths.len(), 2);
     assert_eq!(client.paths[0].spec.endpoint.ports().first(), 443);
@@ -822,6 +823,7 @@ fn server_outbound_dns_is_parsed() {
     let config = cli.into_config().expect("config");
 
     let node = command_node(config.command);
+    assert_eq!(node.forwarding_mode, crate::config::ForwardingMode::L4);
     let dns = node.dns_policy.compile().expect("DNS policy");
     assert_eq!(
         dns.upstreams()

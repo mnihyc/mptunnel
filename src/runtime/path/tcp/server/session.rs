@@ -321,6 +321,11 @@ impl ServerTcpPathSession {
         frame: Frame,
     ) -> Result<ServerTcpFrameDisposition, RuntimeError> {
         match frame {
+            Frame::OpenStream { stream_id, .. }
+                if self.context.forwarding_mode == crate::config::ForwardingMode::L3 =>
+            {
+                self.write_reply(Frame::StreamDetach { stream_id }).await
+            }
             Frame::OpenStream {
                 stream_id,
                 target,
@@ -348,6 +353,11 @@ impl ServerTcpPathSession {
             }
             Frame::OpenStream { stream_id, .. } => {
                 self.write_reply(Frame::StreamDetach { stream_id }).await
+            }
+            Frame::OpenDatagramFlow { flow_id, .. }
+                if self.context.forwarding_mode == crate::config::ForwardingMode::L3 =>
+            {
+                self.write_reply(Frame::DatagramClose { flow_id }).await
             }
             Frame::OpenDatagramFlow {
                 flow_id, target, ..

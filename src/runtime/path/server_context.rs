@@ -139,6 +139,9 @@ impl ServerLocalPath {
 pub(in crate::runtime) struct ServerPathContext {
     /// Stable configured Product inbound name; never serialized on the wire.
     pub(in crate::runtime) name: String,
+    /// Generation-wide forwarding family. It gates data-plane admission but is
+    /// never serialized or inferred from a carrier.
+    pub(in crate::runtime) forwarding_mode: crate::config::ForwardingMode,
     /// Stable Product names aligned with `server_paths`; never serialized.
     pub(in crate::runtime) configured_path_names: Arc<Vec<String>>,
     pub(in crate::runtime) server_paths: Arc<Vec<PathSpec>>,

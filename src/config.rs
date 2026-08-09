@@ -33,11 +33,11 @@ pub use model::{
     DEFAULT_PATH_PROBE_INTERVAL, DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT,
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF, DEFAULT_RESTART_BACKOFF_MS,
     DEFAULT_RESTART_MAX_BACKOFF, DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT,
-    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, GatewayBalancerConfig,
-    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
-    MppOutboundConfig, NamedPathConfig, NamedTunL3Config, NodeConfig, OutboundLeafConfig,
-    ProductPolicyConfig, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
-    SessionConfig,
+    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, ForwardingMode,
+    GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
+    ManagementConfig, MppInboundConfig, MppOutboundConfig, NamedPathConfig, NamedTunL3Config,
+    NodeConfig, OutboundLeafConfig, ProductPolicyConfig, ServerDestinationAclConfig,
+    ServerSecurityConfig, ServiceConfig, SessionConfig,
 };
 pub(crate) use secret::{
     SecretMaterialError, normalize_secret_bytes, read_secret_environment, read_secret_file,

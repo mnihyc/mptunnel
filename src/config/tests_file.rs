@@ -235,6 +235,32 @@ fn mpp_outbounds(node: &NodeConfig) -> Vec<&MppOutboundConfig> {
         .collect()
 }
 
+#[test]
+fn forwarding_mode_is_strict_global_and_defaults_to_l4() {
+    let omitted = load_config_toml_str(&managed_tun_document("")).expect("omitted forwarding mode");
+    let CommandConfig::Node(omitted) = omitted.command;
+    assert_eq!(omitted.forwarding_mode, ForwardingMode::L4);
+
+    let explicit = format!(
+        "forwarding_mode = \"l4\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
+        managed_tun_document("")
+    );
+    let explicit = load_config_toml_str(&explicit).expect("explicit L4 forwarding mode");
+    let CommandConfig::Node(explicit) = explicit.command;
+    assert_eq!(explicit.forwarding_mode, ForwardingMode::L4);
+
+    for unsupported in ["L4", "layer-4", "auto", ""] {
+        let document = format!(
+            "forwarding_mode = {unsupported:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
+            managed_tun_document("")
+        );
+        assert!(matches!(
+            load_config_toml_str(&document),
+            Err(ConfigFileError::Toml(_))
+        ));
+    }
+}
+
 fn mpp_outbound_security_document(extra_security: &str) -> String {
     format!(
         r#"
@@ -1165,7 +1191,8 @@ fn resource_file_config_exposes_sparse_node_limits() {
 
 #[test]
 fn tun_l3_toml_compiles_client_binding_and_server_address_plan() {
-    let config = load_config_toml_str(
+    let document = format!(
+        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
         r#"
 [[inbounds]]
 name = "packet-client"
@@ -1208,11 +1235,12 @@ tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 [[outbounds]]
 name = "direct"
 protocol = "direct"
-"#,
-    )
-    .expect("TUN-L3 client and server configuration");
+"#
+    );
+    let config = load_config_toml_str(&document).expect("TUN-L3 client and server configuration");
 
     let CommandConfig::Node(node) = config.command;
+    assert_eq!(node.forwarding_mode, ForwardingMode::L3);
     let [client] = node.tun_l3_ingresses.as_slice() else {
         panic!("expected one TUN-L3 client ingress");
     };
@@ -1247,7 +1275,7 @@ protocol = "direct"
 }
 
 #[test]
-fn process_managed_tun_l4_rejects_client_and_server_tun_l3() {
+fn l4_forwarding_mode_rejects_client_and_server_tun_l3() {
     let managed_host = r#"
 [inbounds.host]
 mode = "managed"
@@ -1266,7 +1294,7 @@ outbound = "edge"
     );
     assert!(matches!(
         load_config_toml_str(&client),
-        Err(ConfigFileError::Config(ConfigError::ManagedTunL3Conflict))
+        Err(ConfigFileError::Config(ConfigError::L4ContainsTunL3))
     ));
 
     let server = format!(
@@ -1299,13 +1327,38 @@ protocol = "direct"
     );
     assert!(matches!(
         load_config_toml_str(&server),
-        Err(ConfigFileError::Config(ConfigError::ManagedTunL3Conflict))
+        Err(ConfigFileError::Config(ConfigError::L4ContainsTunL3))
+    ));
+}
+
+#[test]
+fn l3_forwarding_mode_rejects_l4_services() {
+    let local = format!(
+        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
+        managed_tun_document("")
+    );
+    assert!(matches!(
+        load_config_toml_str(&local),
+        Err(ConfigFileError::Config(ConfigError::L3ContainsL4Inbound(name)))
+            if name == "local-tun"
+    ));
+
+    let server = format!(
+        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
+        mpp_inbound_security_document("")
+    );
+    assert!(matches!(
+        load_config_toml_str(&server),
+        Err(ConfigFileError::Config(ConfigError::L3ServerMissingTunL3(name)))
+            if name == "edge"
     ));
 }
 
 #[test]
 fn tun_l3_rejects_conflicting_explicit_packet_device_names() {
-    let document = r#"
+    let document = format!(
+        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
+        r#"
 [[inbounds]]
 name = "packet-client"
 protocol = "tun-l3"
@@ -1345,10 +1398,11 @@ tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 [[outbounds]]
 name = "direct"
 protocol = "direct"
-"#;
+"#
+    );
 
     assert!(matches!(
-        load_config_toml_str(document),
+        load_config_toml_str(&document),
         Err(ConfigFileError::Config(
             ConfigError::DuplicatePacketDeviceName(name)
         )) if name == "mptun0"
@@ -1430,6 +1484,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     assert_eq!(reference.session, SessionConfig::default());
     assert_eq!(reference.resources, ResourceLimits::default());
     let CommandConfig::Node(reference) = reference.command;
+    assert_eq!(reference.forwarding_mode, ForwardingMode::L4);
     assert!(reference.servers.is_empty());
     assert_eq!(reference.local_ingresses.len(), 2);
     assert!(reference.tun_l3_ingresses.is_empty());
@@ -1442,6 +1497,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
 
     let client = load(include_str!("../../examples/client.toml"));
     let CommandConfig::Node(client) = client.command;
+    assert_eq!(client.forwarding_mode, ForwardingMode::L4);
     assert!(client.servers.is_empty());
     assert_eq!(client.local_ingresses.len(), 1);
     assert!(client.tun_l3_ingresses.is_empty());
@@ -1454,6 +1510,7 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
 
     let server = load(include_str!("../../examples/server.toml"));
     let CommandConfig::Node(server) = server.command;
+    assert_eq!(server.forwarding_mode, ForwardingMode::L4);
     assert!(server.local_ingresses.is_empty());
     assert!(server.tun_l3_ingresses.is_empty());
     assert_eq!(server.servers.len(), 1);

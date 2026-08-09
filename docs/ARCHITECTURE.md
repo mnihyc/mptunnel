@@ -9,17 +9,25 @@ lifecycle stay below that boundary.
 
 ## Layer model
 
+One runtime generation selects one forwarding family. L4 is the default and
+retains the existing Product graph. Explicit experimental L3 mode selects the
+raw IP-packet graph and does not admit L4 streams or application datagrams.
+Carrier authentication and lifecycle remain shared; forwarding policy and
+performance changes stay inside the selected family.
+
 ```text
-SOCKS5 / HTTP CONNECT / port forward / TUN-L4
+forwarding_mode = l4 (default)
+  SOCKS5 / HTTP CONNECT / port forward / TUN-L4
     -> Product routing, DNS, admission, outbound selection
     -> MPP stream or application-datagram plane
        -> offsets, flow control, Data ACKs, bounded reinjection
 
-TUN-L3 packet device
+forwarding_mode = l3 (experimental)
+  TUN-L3 packet device
     -> authenticated static address ownership + packet-flow affinity
     -> complete IPv4/IPv6 packet plane
 
-both MPP planes
+selected MPP plane
     -> exact carrier-instance selection
        -> TCP carrier -> kernel TCP congestion control and recovery
        -> QUIC carrier -> Quinn congestion control and recovery over UDP
@@ -56,7 +64,7 @@ resolved carrier IP addresses rather than freezing one selected port before
 host routes are published. This local locator selection does not change MPP
 path or carrier-instance identity.
 
-TUN-L3 is deliberately parallel to the Product plane. It does not create a
+TUN-L3 is deliberately separate from the Product plane. It does not create a
 Product target, resolve DNS, run the TUN-L4 userspace stack, or select a normal
 outbound. The authenticated principal selects a server-configured address
 allocation. Host routing, forwarding, DNS, firewall policy, and NAT are outside

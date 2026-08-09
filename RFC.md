@@ -200,6 +200,14 @@ application datagram | IP packet service
             network
 ```
 
+One runtime generation MUST activate exactly one forwarding family. The L4
+family admits reliable streams and application datagrams and MUST NOT construct
+an IP-tunnel service. The L3 family admits IP-tunnel attachments and MUST reject
+reliable-stream and application-datagram opens before they enter L4 egress
+services. Carrier authentication, path control, and liveness remain common.
+This selection is local generation configuration, defaults to L4, and is never
+serialized or inferred from traffic.
+
 ### 4.1 MPP authority
 
 MPP owns stream, datagram, and IP-tunnel identity, offset assignment, Data ACK processing,

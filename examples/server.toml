@@ -6,6 +6,10 @@
 # Transport protection uses a different raw 32-byte file shared by the two
 # endpoints: umask 077; openssl rand -out mpp-transport.key 32
 
+# L4 is the default. The separate experimental L3 profile is documented in
+# config.reference.toml.
+# forwarding_mode = "l4"
+
 [logging]
 level = "info"
 

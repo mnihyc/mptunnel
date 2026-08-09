@@ -6838,3 +6838,26 @@ entry is authoritative.
 - Scope: no scheduler, congestion-control, timing, resource-threshold, or L4
   data-path policy changed. Subsequent TUN-L3 performance work is isolated to
   the explicitly selected L3 family.
+
+## 2026-08-09T16:21:52+08:00: v0.2.4 release candidate prepared
+
+- Name: forwarding-family release freeze
+- Category: Release verification
+- State: local candidate complete; exact-commit GitHub gates pending
+- Content:
+  - synchronized the package and both lockfile identities at `0.2.4`;
+  - confirmed no local tag, remote tag, draft, or published release collision;
+    and
+  - retained the existing seven-platform archive and generated `version.json`
+    contract without packaging changes.
+- Evidence:
+  - the complete forwarding-mode implementation passed the full locked test,
+    formatting, and strict all-target/all-feature Clippy gates before the
+    version-only release edit;
+  - the `0.2.4` checked build, all 45 configuration contracts, and the focused
+    L3 server admission contract passed; and
+  - locked metadata, whitespace, and monotonic release-version checks passed.
+- Release rule: push this exact clean release-preparation commit, require both
+  ordinary CI and the non-publishing Release Check on its SHA, then create the
+  annotated immutable `v0.2.4` tag. The tag-triggered workflow alone owns the
+  release and its assets.

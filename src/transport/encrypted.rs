@@ -7,11 +7,11 @@
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_perf_record;
-use crate::protocol::Frame;
 use crate::protocol::codec::{
     CodecError, CodecLimits, FRAME_HEADER_LEN, decode_frame_bytes, decode_payload_len_from_header,
     encode_frame_into,
 };
+use crate::protocol::{Frame, UnderlayProtocol};
 use bytes::BytesMut;
 use hmac::{Hmac, KeyInit, Mac};
 use rustls::client::WebPkiServerVerifier;
@@ -64,6 +64,24 @@ const TCP_NOISE_SERVER_RECORD_LABEL: &[u8] = b"mptunnel noise server record leng
 const TCP_NOISE_ADMISSION_LABEL: &[u8] = b"mptunnel noise admission binding v1";
 const TCP_NOISE_PSK_LABEL: &[u8] = b"mptunnel tcp noise psk v1";
 const QUIC_PRIVATE_INITIAL_LABEL: &[u8] = b"mptunnel quic private initial key v1";
+
+/// Operator-facing description of the effective carrier protection selected
+/// by the endpoint-wide transport-secret setting.
+pub(crate) const fn carrier_security_description(
+    underlay: UnderlayProtocol,
+    shared_transport_secret: bool,
+) -> &'static str {
+    match (underlay, shared_transport_secret) {
+        (UnderlayProtocol::Tcp, true) => "TCP with Noise (transport_secret_file configured)",
+        (UnderlayProtocol::Tcp, false) => "TCP with TLS 1.3 (transport_secret_file not configured)",
+        (UnderlayProtocol::Udp, true) => {
+            "QUIC with TLS 1.3 and private Initial keys (transport_secret_file configured)"
+        }
+        (UnderlayProtocol::Udp, false) => {
+            "QUIC with TLS 1.3 and standard public Initial keys (transport_secret_file not configured)"
+        }
+    }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -220,7 +238,6 @@ impl TcpClientTlsConfig {
         self.transport_secret.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn shared_transport_secret_configured(&self) -> bool {
         self.transport_secret.is_some()
     }
@@ -342,7 +359,6 @@ impl TcpServerTlsConfig {
         self.transport_secret.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn shared_transport_secret_configured(&self) -> bool {
         self.transport_secret.is_some()
     }

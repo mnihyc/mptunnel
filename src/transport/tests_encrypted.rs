@@ -255,6 +255,35 @@ async fn wrong_shared_transport_secret_is_rejected_before_transport_mode() {
 }
 
 #[tokio::test]
+async fn transport_secret_configuration_is_symmetric_and_never_downgrades() {
+    let (tls_client, tls_server) = test_tls_configs();
+    let noise_client = test_client_tls_config_with_transport_secret([0x5a; 32]);
+    let noise_server = test_server_tls_config_with_transport_secret([0x5a; 32]);
+
+    for (client, server) in [(&noise_client, tls_server), (tls_client, &noise_server)] {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let (client_result, server_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(
+                    EncryptedFramedStream::connect(client_io, client, CodecLimits::default()),
+                    EncryptedFramedStream::accept(server_io, server, CodecLimits::default()),
+                )
+            })
+            .await
+            .expect("mismatched transport modes terminate promptly");
+
+        assert!(
+            client_result.is_err(),
+            "client must reject the mode mismatch"
+        );
+        assert!(
+            server_result.is_err(),
+            "server must reject the mode mismatch"
+        );
+    }
+}
+
+#[tokio::test]
 async fn replayed_noise_client_hello_is_rejected_without_server_bytes() {
     let secret = [0x5a; 32];
     let client_config = test_client_tls_config_with_transport_secret(secret);

@@ -336,16 +336,20 @@ pub(super) async fn bind_paths(
         }
     }
     for path in &bound {
-        let (local_path, local_address, transport) = match path {
+        let (local_path, local_address, underlay) = match path {
             BoundServerPath::Tcp {
                 listener,
                 local_path,
-            } => (local_path, listener.local_addr()?, "TCP"),
+            } => (local_path, listener.local_addr()?, UnderlayProtocol::Tcp),
             BoundServerPath::Udp {
                 endpoint,
                 local_path,
-            } => (local_path, endpoint.local_addr()?, "QUIC"),
+            } => (local_path, endpoint.local_addr()?, UnderlayProtocol::Udp),
         };
+        let transport = crate::transport::encrypted::carrier_security_description(
+            underlay,
+            context.tls.shared_transport_secret_configured(),
+        );
         let path_name = context
             .configured_path_names
             .get(local_path.config_ordinal())

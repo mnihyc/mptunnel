@@ -6861,3 +6861,64 @@ entry is authoritative.
   ordinary CI and the non-publishing Release Check on its SHA, then create the
   annotated immutable `v0.2.4` tag. The tag-triggered workflow alone owns the
   release and its assets.
+
+## 2026-08-11T01:05:16+08:00: default carrier classification audit closed
+
+- Name: v0.2.4 TCP+QUIC adversarial wire audit
+- Category: Security and traffic classification
+- State: evidence and threat model complete; no product or protocol code
+  changed
+- Scope:
+  - froze the shipped shared-secret L4 profile at tag `v0.2.4` and commit
+    `c5ae126f…`;
+  - modeled a source-aware on-path censor that knows the endpoint and source but
+    possesses neither the transport secret nor an MPP credential; and
+  - inspected passive traffic, standard/public controls, chosen-length probes,
+    wrong-secret behavior, captured-flight replay, and relevant primary
+    censorship research.
+- Principal evidence:
+  - all 15 TCP first flights from five cold starts were unique but failed every
+    exemption in the published GFW fully-encrypted-traffic classifier;
+  - the protected QUIC Initial retained visible QUIC-v1 structure and 1,200-byte
+    size while failing public RFC 9001 decryption; no protected ClientHello,
+    SNI, ALPN, certificate, MPP marker, or credential was visible;
+  - one default endpoint established three TCP carriers and one QUIC carrier to
+    the same IP/port, and the idle TCP carriers exchanged synchronized 36-byte
+    request/response records every 10.001 seconds;
+  - chosen-length TCP probes confirmed a sharp boundary: 32--33 bytes closed at
+    the 10-second authentication timeout, while 34 bytes or more normally
+    closed in about one millisecond; and
+  - same-generation TCP replay was rejected, while captured TCP and private
+    QUIC first flights elicited responses after a server restart.
+- Conclusion:
+  - the shared-secret profile is encrypted, authenticated, and probe-gated, but
+    is not covert against source-aware classification;
+  - TCP has a high conditional blocking risk under the measured historical GFW
+    random-traffic model; private QUIC hides SNI from the measured QUIC-SNI
+    system but exposes a deterministic non-standard-QUIC anomaly; and
+  - printable/TLS prefixes, QUIC-version changes, padding-only changes, and
+    heartbeat jitter were rejected as narrow tweaks rather than clean protocol
+    models.
+- Durable report: `./docs-dev/mptunnel-threat-model.md`.
+- Reproducible ignored artifacts:
+  `./.tmp/traffic-fingerprint-v024/analysis.json`, PCAPs, probe scripts, and
+  `pcap-sha256.txt`.
+
+## 2026-08-11T22:44:35+08:00: effective carrier security is explicit in logs
+
+- Name: transport-secret mode visibility
+- Category: Product observability and security
+- State: implemented and verified
+- Content:
+  - every configured outbound path and bound inbound path now reports its
+    effective security profile at `INFO`;
+  - a configured `transport_secret_file` reports TCP Noise and QUIC TLS 1.3
+    with private Initial keys;
+  - an omitted field reports TCP TLS 1.3 and QUIC TLS 1.3 with standard public
+    Initial keys; and
+  - no secret value or path is logged.
+- Invariant: asymmetric configuration is rejected in both directions; there is
+  no transport negotiation, fallback, or downgrade.
+- Evidence: the two-direction mismatch contract and existing optional-secret
+  configuration contract passed; strict all-target/all-feature Clippy and
+  formatting/whitespace gates passed.

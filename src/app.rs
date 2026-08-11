@@ -253,7 +253,13 @@ fn log_configuration_inventory(config: &AppConfig) {
                     ),
                 );
                 for path in &config.paths {
-                    log_mpp_path("outbound", id.as_str(), &path.name, &path.spec);
+                    log_mpp_path(
+                        "outbound",
+                        id.as_str(),
+                        &path.name,
+                        &path.spec,
+                        path.tls.shared_transport_secret_configured(),
+                    );
                 }
             }
             OutboundLeafConfig::Local { id, config, .. } => {
@@ -263,11 +269,17 @@ fn log_configuration_inventory(config: &AppConfig) {
     }
 }
 
-fn log_mpp_path(owner_kind: &str, owner: &str, name: &str, path: &crate::transport::PathSpec) {
-    let transport = match path.underlay {
-        crate::protocol::UnderlayProtocol::Tcp => "TCP",
-        crate::protocol::UnderlayProtocol::Udp => "QUIC",
-    };
+fn log_mpp_path(
+    owner_kind: &str,
+    owner: &str,
+    name: &str,
+    path: &crate::transport::PathSpec,
+    shared_transport_secret: bool,
+) {
+    let transport = crate::transport::encrypted::carrier_security_description(
+        path.underlay,
+        shared_transport_secret,
+    );
     if let Some(carriers) = path.tcp_carrier_range() {
         crate::observability::emit_lifecycle(
             crate::config::LogLevel::Info,

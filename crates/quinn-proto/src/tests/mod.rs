@@ -1532,6 +1532,102 @@ fn keep_alive() {
 }
 
 #[test]
+fn bounded_keep_alive_renewal_spans_the_configured_window() {
+    let minimum = Duration::from_millis(8);
+    let maximum = Duration::from_millis(10);
+    assert_eq!(
+        crate::connection::bounded_renewal_delay(minimum, maximum, 0),
+        minimum
+    );
+    assert_eq!(
+        crate::connection::bounded_renewal_delay(minimum, maximum, u64::MAX),
+        maximum
+    );
+    for sample in [1, u64::MAX / 4, u64::MAX / 2, 3 * (u64::MAX / 4)] {
+        assert!(
+            (minimum..=maximum)
+                .contains(&crate::connection::bounded_renewal_delay(
+                    minimum, maximum, sample
+                ))
+        );
+    }
+}
+
+#[test]
+fn bounded_keep_alive_renews_on_the_client_only() {
+    let _guard = subscribe();
+    let minimum = Duration::from_millis(80);
+    let maximum = Duration::from_millis(100);
+
+    let mut endpoint = EndpointConfig::default();
+    endpoint.rng_seed(Some([0x51; 32]));
+
+    let mut server_transport = TransportConfig::default();
+    server_transport
+        .max_idle_timeout(Some(VarInt::from_u32(500).into()))
+        .mtu_discovery_config(None);
+    let server = ServerConfig {
+        transport: Arc::new(server_transport),
+        ..server_config()
+    };
+
+    let mut client = client_config();
+    Arc::get_mut(&mut client.transport)
+        .unwrap()
+        .max_idle_timeout(Some(VarInt::from_u32(500).into()))
+        .mtu_discovery_config(None)
+        .keep_alive_interval_range(minimum, maximum);
+
+    let mut pair = Pair::new(Arc::new(endpoint), server);
+    let (client_ch, server_ch) = pair.connect_with(client);
+    let mut client_pings = pair.client_conn_mut(client_ch).stats().frame_tx.ping;
+    let server_pings = pair.server_conn_mut(server_ch).stats().frame_tx.ping;
+    let mut client_acks = pair.client_conn_mut(client_ch).stats().frame_rx.acks;
+    let mut last_authenticated_activity = pair.time;
+    let mut observed_delays = Vec::new();
+
+    for _ in 0..2_000 {
+        pair.drive_client();
+        pair.drive_server();
+        let stats = pair.client_conn_mut(client_ch).stats();
+        if stats.frame_rx.acks > client_acks {
+            client_acks = stats.frame_rx.acks;
+            last_authenticated_activity = pair.time;
+        }
+        if stats.frame_tx.ping > client_pings {
+            observed_delays.push(pair.time.duration_since(last_authenticated_activity));
+            client_pings = stats.frame_tx.ping;
+            if observed_delays.len() == 8 {
+                break;
+            }
+        }
+        pair.time = pair.time.max(
+            min_opt(pair.client.next_wakeup(), pair.server.next_wakeup())
+                .expect("live connection has a wakeup"),
+        );
+    }
+
+    assert_eq!(observed_delays.len(), 8);
+    assert!(
+        observed_delays
+            .iter()
+            .all(|delay| (minimum..=maximum).contains(delay)),
+        "renewed idle delays left the configured range: {observed_delays:?}"
+    );
+    assert!(
+        observed_delays.windows(2).any(|pair| pair[0] != pair[1]),
+        "deterministic connection seed did not renew the delay"
+    );
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stats().frame_tx.ping,
+        server_pings,
+        "the passive server emitted a native keep-alive"
+    );
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
+    assert!(!pair.server_conn_mut(server_ch).is_closed());
+}
+
+#[test]
 fn cid_rotation() {
     let _guard = subscribe();
     const CID_TIMEOUT: Duration = Duration::from_secs(2);

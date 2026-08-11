@@ -562,7 +562,7 @@ async fn quic_destination_port_migration_preserves_connection_and_streams() {
 #[test]
 fn quic_transport_profile_follows_mux_resource_envelope() {
     let mux_limits = MuxLimits::default();
-    let transport = quic_transport_config(mux_limits).expect("transport config");
+    let transport = quic_transport_config(mux_limits, true).expect("client transport config");
     let rendered = format!("{transport:?}");
     let stream_window = mux_limits.max_stream_window_bytes;
     let receive_window = stream_window
@@ -578,7 +578,13 @@ fn quic_transport_profile_follows_mux_resource_envelope() {
     assert!(rendered.contains(&format!("max_concurrent_bidi_streams: {bidi_streams}")));
     assert!(rendered.contains("max_concurrent_uni_streams: 4"));
     assert!(rendered.contains("max_idle_timeout: Some(30000)"));
+    assert!(rendered.contains("keep_alive_interval_min: Some(8s)"));
     assert!(rendered.contains("keep_alive_interval: Some(10s)"));
+
+    let server = quic_transport_config(mux_limits, false).expect("server transport config");
+    let server = format!("{server:?}");
+    assert!(server.contains("keep_alive_interval_min: None"));
+    assert!(server.contains("keep_alive_interval: None"));
 }
 
 #[tokio::test]
@@ -805,17 +811,20 @@ fn quic_stream_limit_is_independent_from_receive_window_ratio() {
         max_quic_concurrent_bidi_streams: 4096,
         ..MuxLimits::default()
     };
-    let transport = quic_transport_config(mux_limits).expect("transport config");
+    let transport = quic_transport_config(mux_limits, true).expect("transport config");
     let rendered = format!("{transport:?}");
 
     assert!(rendered.contains("max_concurrent_bidi_streams: 4096"));
     assert!(!rendered.contains("max_concurrent_bidi_streams: 4,"));
 
-    let session_limited = quic_transport_config(MuxLimits {
-        max_streams: 32,
-        max_quic_concurrent_bidi_streams: 4096,
-        ..MuxLimits::default()
-    })
+    let session_limited = quic_transport_config(
+        MuxLimits {
+            max_streams: 32,
+            max_quic_concurrent_bidi_streams: 4096,
+            ..MuxLimits::default()
+        },
+        true,
+    )
     .expect("session-limited QUIC transport");
     assert!(
         format!("{session_limited:?}").contains("max_concurrent_bidi_streams: 32"),

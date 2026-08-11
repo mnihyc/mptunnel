@@ -284,7 +284,7 @@ async fn transport_secret_configuration_is_symmetric_and_never_downgrades() {
 }
 
 #[tokio::test]
-async fn replayed_noise_client_hello_is_rejected_without_server_bytes() {
+async fn replayed_noise_client_hello_is_rejected_across_equivalent_generations() {
     let secret = [0x5a; 32];
     let client_config = test_client_tls_config_with_transport_secret(secret);
     let server_config = test_server_tls_config_with_transport_secret(secret);
@@ -303,6 +303,11 @@ async fn replayed_noise_client_hello_is_rejected_without_server_bytes() {
     let first_flight = captured.lock().expect("captured first flight").clone();
     assert!(!first_flight.is_empty());
 
+    let mut replacement = test_server_tls_config_with_transport_secret(secret);
+    assert!(replacement.inherit_transport_replay_state(&server_config));
+    let mut changed_secret = test_server_tls_config_with_transport_secret([0x33; 32]);
+    assert!(!changed_secret.inherit_transport_replay_state(&server_config));
+
     let (mut replay_io, server_io) = duplex(64 * 1024);
     let server_written = Arc::new(AtomicU64::new(0));
     let server_io = CountWrites {
@@ -314,7 +319,7 @@ async fn replayed_noise_client_hello_is_rejected_without_server_bytes() {
             replay_io.write_all(&first_flight).await?;
             replay_io.shutdown().await
         },
-        EncryptedFramedStream::accept(server_io, &server_config, CodecLimits::default()),
+        EncryptedFramedStream::accept(server_io, &replacement, CodecLimits::default()),
     );
     replay_result.expect("replay reached server");
     assert!(matches!(
@@ -326,6 +331,87 @@ async fn replayed_noise_client_hello_is_rejected_without_server_bytes() {
         0,
         "replayed protected first flight must not expose a response or certificate"
     );
+}
+
+#[tokio::test]
+async fn production_noise_rejections_share_one_silent_deadline() {
+    let server = test_server_tls_config_with_transport_secret([0x5a; 32]);
+    let limits = CodecLimits::default();
+    let lengths = [
+        0_usize, 1, 31, 32, 33, 34, 35, 50, 82, 83, 115, 138, 139, 221,
+    ];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+    let mut attempts = Vec::new();
+
+    for length in lengths {
+        let (mut client_io, server_io) = duplex(1024);
+        let server_written = Arc::new(AtomicU64::new(0));
+        let counted_server = CountWrites {
+            inner: server_io,
+            bytes: server_written.clone(),
+        };
+        client_io
+            .write_all(&vec![0_u8; length])
+            .await
+            .expect("write invalid first-flight prefix");
+        client_io
+            .shutdown()
+            .await
+            .expect("half-close invalid probe");
+        let server = server.clone();
+        attempts.push((
+            length,
+            server_written,
+            tokio::spawn(async move {
+                EncryptedFramedStream::accept_with_authentication_deadline(
+                    counted_server,
+                    &server,
+                    limits,
+                    deadline,
+                )
+                .await
+            }),
+        ));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    for (length, written, attempt) in &attempts {
+        assert!(!attempt.is_finished(), "{length}-byte probe closed early");
+        assert_eq!(written.load(Ordering::Relaxed), 0);
+    }
+
+    for (length, written, attempt) in attempts {
+        let result = tokio::time::timeout(std::time::Duration::from_millis(250), attempt)
+            .await
+            .unwrap_or_else(|_| panic!("{length}-byte probe exceeded rejection deadline"))
+            .expect("rejection task");
+        assert!(result.is_err(), "{length}-byte probe was accepted");
+        assert_eq!(written.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[tokio::test]
+async fn valid_noise_admission_never_waits_for_the_rejection_deadline() {
+    let secret = [0x5a; 32];
+    let client = test_client_tls_config_with_transport_secret(secret);
+    let server = test_server_tls_config_with_transport_secret(secret);
+    let (client_io, server_io) = duplex(64 * 1024);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let completed = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        tokio::join!(
+            EncryptedFramedStream::connect(client_io, &client, CodecLimits::default()),
+            EncryptedFramedStream::accept_with_authentication_deadline(
+                server_io,
+                &server,
+                CodecLimits::default(),
+                deadline,
+            ),
+        )
+    })
+    .await
+    .expect("valid Noise admission completed before rejection deadline");
+    assert!(completed.0.is_ok());
+    assert!(completed.1.is_ok());
 }
 
 #[tokio::test]

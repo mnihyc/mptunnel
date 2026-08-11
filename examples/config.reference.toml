@@ -100,7 +100,8 @@ max_path_flight_bytes = 67108864
 max_reliable_relay_chunk_bytes = 524288
 
 # TCP record heartbeats and native QUIC liveness are separate carrier
-# mechanisms. Both remain below the logical session-retention layer.
+# mechanisms. The interval is the maximum idle delay; clients renew each idle
+# probe within 80%-100% of it. Both remain below logical session retention.
 tcp_path_heartbeat_interval_ms = 10000
 tcp_path_heartbeat_timeout_ms = 30000
 quic_path_keep_alive_interval_ms = 10000

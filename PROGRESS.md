@@ -6922,3 +6922,69 @@ entry is authoritative.
 - Evidence: the two-direction mismatch contract and existing optional-secret
   configuration contract passed; strict all-target/all-feature Clippy and
   formatting/whitespace gates passed.
+
+## 2026-08-12T00:35:51+08:00: bounded carrier-classification hardening complete
+
+- Name: idle-renewal, TCP rejection, and replay-authority refinement
+- Category: Protocol security and performance preservation
+- State: implemented and locally verified; no release action taken
+- Authority:
+  - `RFC.md` now defines client-owned idle renewal, one absolute TCP
+    pre-authentication rejection deadline, and the exact replay-authority
+    boundary before implementation details;
+  - no scheduler, congestion controller, framing, routing, L3/L4 forwarding,
+    carrier-count, or platform-adapter behavior changed; and
+  - the fixed heartbeat and QUIC idle/failure limits remain unchanged.
+- Content:
+  - each quiet TCP or QUIC client carrier renews its idle lease independently
+    in `[0.8I, I]`; active authenticated traffic reuses and defers the current
+    lease, sampling occurs only at connection creation or a completed idle
+    probe, and an outstanding TCP `PONG` deadline is never extended;
+  - the QUIC server no longer creates a redundant native keep-alive schedule;
+  - every attacker-controlled TCP Noise failure before the responder flight
+    remains silent through the same absolute authentication deadline, while a
+    valid flight proceeds immediately;
+  - equivalent clean configuration generations retain only the bounded Noise
+    replay authority of the same named inbound and identical security policy;
+    source IP is never part of the identity; and
+  - whole-process restart remains an explicit replay boundary. Stateless
+    client-first admission cannot distinguish a fresh byte sequence from its
+    replay; a generic challenge would add RTT or create a stronger public
+    oracle, so neither was introduced.
+- RTT decision:
+  - QUIC/H3 application 0-RTT remains disabled. Under the required rule that
+    replay insertion, carrier registration, scheduling, and `SESSION_READY`
+    wait for TLS confirmation, early H3 becomes usable at the same network
+    point as the existing request sent with Client Finished and saves no RTT;
+  - an early server reply would instead create replayable work and a response
+    fingerprint, while the current H3 stack cannot safely recover rejected
+    early critical streams; and
+  - ordinary TLS 1.3 in-memory session resumption remains available.
+- Wire evidence:
+  - a 70-second default 3-TCP+1-QUIC capture observed all idle gaps inside
+    8--10 seconds; per-carrier means were 8.765, 9.142, 9.260, and 9.049
+    seconds, with 31.424 ms minimum separation across 28 client liveness
+    events instead of the baseline 44--63 microsecond cluster;
+  - open-write 32, 33, 34, 35, 50, and 221-byte TCP probes all received zero
+    server payload and terminated only at 10.002--10.004 seconds; and
+  - ignored evidence and SHA-256 identities are recorded in
+    `./docs-dev/mptunnel-threat-model.md` and
+    `./.tmp/traffic-hardening-candidate/`.
+- Workload evidence:
+  - 60-second full browser load completed 664/664 one-MiB flows with 20 peak
+    concurrency, zero incomplete/rejected flows, and 89.708 Mbps payload
+    goodput;
+  - symmetric mixed TCP+QUIC download and upload completed at 343.547 and
+    379.680 Mbps with no failure, early termination, or recovery gap; and
+  - these dirty-tree runs are regression triage, not new publication-grade
+    measurements. Their active data path is unchanged and the download exceeds
+    both available same-case historical runs.
+- Verification:
+  - strict locked all-target/all-feature Clippy and formatting passed;
+  - the locked all-feature suite passed 1,513 library and 8 integration tests;
+  - the standalone patched Quinn suite passed 285 unit and 3 documentation
+    tests, including a deterministic client-only renewal state-machine test;
+  - 213 lab contracts, 9 packaging contracts, 5 deterministic benchmark tests,
+    the performance registry, shell syntax, and release-version self-test all
+    passed; and
+  - the full internal report is `./docs-dev/mptunnel-threat-model.md`.

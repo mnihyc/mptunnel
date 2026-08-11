@@ -403,7 +403,7 @@ fn server_config(
         crypto.initial_packet_secret(secret);
     }
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport = Arc::new(quic_transport_config(mux_limits)?);
+    config.transport = Arc::new(quic_transport_config(mux_limits, false)?);
     Ok(config)
 }
 
@@ -416,11 +416,14 @@ fn client_config(
         crypto.initial_packet_secret(secret);
     }
     let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(quic_transport_config(mux_limits)?));
+    config.transport_config(Arc::new(quic_transport_config(mux_limits, true)?));
     Ok(config)
 }
 
-fn quic_transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicCarrierError> {
+fn quic_transport_config(
+    mux_limits: MuxLimits,
+    client_keep_alive: bool,
+) -> Result<TransportConfig, QuicCarrierError> {
     let stream_receive_window = mux_limits.max_stream_window_bytes.max(1);
     let connection_receive_window = stream_receive_window
         .saturating_add(mux_limits.max_repair_bytes as u64)
@@ -449,8 +452,11 @@ fn quic_transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicC
         .datagram_receive_buffer_size(Some(mux_limits.max_datagram_queue_bytes))
         .datagram_send_buffer_size(mux_limits.max_datagram_queue_bytes)
         .max_idle_timeout(Some(mux_limits.quic_path_idle_timeout.try_into()?))
-        .keep_alive_interval(Some(mux_limits.quic_path_keep_alive_interval))
         .congestion_controller_factory(Arc::new(InstrumentedBbrConfig));
+    if client_keep_alive {
+        let maximum = mux_limits.quic_path_keep_alive_interval;
+        transport.keep_alive_interval_range(maximum - maximum / 5, maximum);
+    }
     Ok(transport)
 }
 

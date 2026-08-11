@@ -91,6 +91,36 @@ mod timer;
 use crate::congestion::Controller;
 use timer::{Timer, TimerTable};
 
+fn sample_keep_alive_interval(config: &TransportConfig, rng: &mut StdRng) -> Option<Duration> {
+    let maximum = config.keep_alive_interval?;
+    let minimum = config.keep_alive_interval_min.unwrap_or(maximum);
+    if minimum == maximum {
+        return Some(maximum);
+    }
+    Some(bounded_renewal_delay(minimum, maximum, rng.random::<u64>()))
+}
+
+pub(crate) fn bounded_renewal_delay(
+    minimum: Duration,
+    maximum: Duration,
+    sample: u64,
+) -> Duration {
+    debug_assert!(minimum <= maximum);
+    let minimum_nanos = minimum.as_nanos();
+    let maximum_nanos = maximum.as_nanos();
+    let span = maximum_nanos.saturating_sub(minimum_nanos);
+    let offset = (u128::from(sample).saturating_mul(span.saturating_add(1))) >> 64;
+    duration_from_nanos(minimum_nanos.saturating_add(offset).min(maximum_nanos))
+}
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    Duration::new(
+        u64::try_from(nanos / NANOS_PER_SECOND).unwrap_or(u64::MAX),
+        (nanos % NANOS_PER_SECOND) as u32,
+    )
+}
+
 /// Protocol state and logic for a single QUIC connection
 ///
 /// Objects of this type receive [`ConnectionEvent`]s and emit [`EndpointEvent`]s and application
@@ -188,6 +218,9 @@ pub struct Connection {
     accepted_0rtt: bool,
     /// Whether the idle timer should be reset the next time an ack-eliciting packet is transmitted.
     permit_idle_reset: bool,
+    /// Current bounded-renewal keep-alive delay. Authenticated traffic defers
+    /// this value; only an expired keep-alive draws the next value.
+    current_keep_alive_interval: Option<Duration>,
     /// Negotiated idle timeout
     idle_timeout: Option<Duration>,
     timers: TimerTable,
@@ -271,6 +304,7 @@ impl Connection {
             client_hello: None,
         });
         let mut rng = StdRng::from_seed(rng_seed);
+        let current_keep_alive_interval = sample_keep_alive_interval(&config, &mut rng);
         let mut this = Self {
             endpoint_config,
             crypto,
@@ -313,6 +347,7 @@ impl Connection {
             next_crypto: None,
             accepted_0rtt: false,
             permit_idle_reset: true,
+            current_keep_alive_interval,
             idle_timeout: match config.max_idle_timeout {
                 None | Some(VarInt(0)) => None,
                 Some(dur) => Some(Duration::from_millis(dur.0)),
@@ -1180,6 +1215,8 @@ impl Connection {
                 }
                 Timer::KeepAlive => {
                     trace!("sending keep-alive");
+                    self.current_keep_alive_interval =
+                        sample_keep_alive_interval(&self.config, &mut self.rng);
                     self.ping();
                 }
                 Timer::LossDetection => {
@@ -1967,7 +2004,7 @@ impl Connection {
     }
 
     fn reset_keep_alive(&mut self, now: Instant) {
-        let interval = match self.config.keep_alive_interval {
+        let interval = match self.current_keep_alive_interval {
             Some(x) if self.state.is_established() => x,
             _ => return,
         };

@@ -11,6 +11,9 @@ mod receive;
 pub(super) mod session;
 pub(super) mod state;
 mod stream;
+#[cfg(test)]
+#[path = "client/tests_connection.rs"]
+mod tests_connection;
 mod writer;
 
 use self::datagram::ClientTcpDatagramOpenCancellation;

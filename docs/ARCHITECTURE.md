@@ -321,6 +321,9 @@ At zero live attachments it preserves the existing sequence/ACK/FIN state,
 stops source reads, and rotates one reconnect attempt at a time until the
 absolute configured deadline. TCP heartbeat and native QUIC keep-alive/idle
 timers only determine carrier liveness and never reset that logical deadline.
+The client owns their bounded idle-renewal schedule; ordinary authenticated
+traffic defers the current lease without changing an outstanding failure
+deadline.
 
 Shared locks protect one coherent aggregate. Scheduling does not hold them
 while doing I/O. Hot frame and ACK paths use local actor state or immutable

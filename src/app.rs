@@ -873,7 +873,7 @@ async fn run_config_file_generations(
                         "rejected configuration generation {runtime_revision} before activation: {error}; restored {}",
                         restored.revision
                     );
-                    config = restored.config;
+                    config = config_with_inherited_transport_state(&config, restored.config);
                     config_control = config_control.next_generation();
                     restarts = 0;
                     backoff = config.service.restart_backoff;
@@ -896,7 +896,7 @@ async fn run_config_file_generations(
                         "configuration generation {runtime_revision} reached readiness but could not be activated: {error}; restored {}",
                         restored.revision
                     );
-                    config = restored.config;
+                    config = config_with_inherited_transport_state(&config, restored.config);
                     config_control = config_control.next_generation();
                     restarts = 0;
                     backoff = config.service.restart_backoff;
@@ -919,7 +919,10 @@ async fn run_config_file_generations(
                     rollback_unactivated_desired(&config_control)?;
                     return Ok(());
                 }
-                config = config_control.store().current_config();
+                config = config_with_inherited_transport_state(
+                    &config,
+                    config_control.store().current_config(),
+                );
                 crate::observability::emit_lifecycle(
                     crate::config::LogLevel::Info,
                     "configuration",
@@ -950,7 +953,7 @@ async fn run_config_file_generations(
                         "rejected configuration generation {runtime_revision}: {error}; restored {}",
                         restored.revision
                     );
-                    config = restored.config;
+                    config = config_with_inherited_transport_state(&config, restored.config);
                     config_control = config_control.next_generation();
                     restarts = 0;
                     backoff = config.service.restart_backoff;
@@ -961,7 +964,10 @@ async fn run_config_file_generations(
                     return Ok(());
                 }
                 if config_control.store().pending_revision().is_some() {
-                    config = config_control.store().current_config();
+                    config = config_with_inherited_transport_state(
+                        &config,
+                        config_control.store().current_config(),
+                    );
                     config_control = config_control.next_generation();
                     restarts = 0;
                     backoff = config.service.restart_backoff;
@@ -998,7 +1004,7 @@ async fn run_config_file_generations(
                         reopened.config_control.store(),
                     )?;
                 }
-                config = reopened.config;
+                config = config_with_inherited_transport_state(&config, reopened.config);
                 config_control = reopened.config_control;
                 if config_control.runtime_revision() == previous_revision {
                     backoff = next_backoff.min(config.service.restart_max_backoff);
@@ -1018,6 +1024,24 @@ async fn run_config_file_generations(
             }
         }
     }
+}
+
+fn config_with_inherited_transport_state(previous: &AppConfig, mut next: AppConfig) -> AppConfig {
+    let CommandConfig::Node(previous) = &previous.command;
+    let CommandConfig::Node(next_node) = &mut next.command;
+    for next_inbound in &mut next_node.servers {
+        let Some(previous_inbound) = previous
+            .servers
+            .iter()
+            .find(|inbound| inbound.name == next_inbound.name)
+        else {
+            continue;
+        };
+        let _ = next_inbound
+            .tls
+            .inherit_transport_replay_state(&previous_inbound.tls);
+    }
+    next
 }
 
 async fn run_canonical_generation(

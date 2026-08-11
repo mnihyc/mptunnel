@@ -579,6 +579,11 @@ transmission modes and not desired memory occupancy.
 | `quic_path_keep_alive_interval_ms` | 10,000 ms |
 | `quic_path_idle_timeout_ms` | 30,000 ms |
 
+Each heartbeat/keep-alive interval is a maximum idle delay. The client renews
+the next idle probe within 80%--100% of that interval; authenticated activity
+defers it, while an outstanding response deadline is never extended. The
+server does not originate a second QUIC keep-alive schedule.
+
 The four byte-window fields compose rather than replace one another. Estimate
 aggregate BDP as `sum(rate_bps × RTT_seconds) / 8`. Aggregate admitted work is
 bounded by the applicable `max_stream_window_bytes`, `max_repair_bytes`, and

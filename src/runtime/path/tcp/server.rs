@@ -57,8 +57,16 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     }
     let mut tcp_metrics = TcpMetricPublisher::capture(&stream);
     let tls = &context.tls;
-    let admitted = tokio::time::timeout(context.security.authentication_timeout, async {
-        let mut framed = EncryptedFramedStream::accept(stream, tls, context.codec_limits).await?;
+    let authentication_deadline =
+        tokio::time::Instant::now() + context.security.authentication_timeout;
+    let admitted = tokio::time::timeout_at(authentication_deadline, async {
+        let mut framed = EncryptedFramedStream::accept_with_authentication_deadline(
+            stream,
+            tls,
+            context.codec_limits,
+            authentication_deadline,
+        )
+        .await?;
         let transport_binding = framed.tcp_admission_binding()?;
         let encoded = framed.read_tcp_admission().await?;
         let Some(authenticated_session) = authenticate_prelude(

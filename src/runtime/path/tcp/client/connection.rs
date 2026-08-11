@@ -28,6 +28,7 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     pub(in crate::runtime) writer: EncryptedTcpWriter,
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     heartbeat_interval: Duration,
+    heartbeat_delay: Duration,
     heartbeat_timeout: Duration,
     next_heartbeat_at: tokio::time::Instant,
     pending_heartbeat: Option<(u64, tokio::time::Instant)>,
@@ -63,7 +64,7 @@ impl ClientTcpCarrierConnection {
     }
 
     pub(in crate::runtime) fn schedule_next_heartbeat(&mut self) {
-        self.next_heartbeat_at = tokio::time::Instant::now() + self.heartbeat_interval;
+        self.next_heartbeat_at = tokio::time::Instant::now() + self.heartbeat_delay;
     }
 
     /// Reschedules the idle probe only while no response is outstanding.
@@ -71,7 +72,7 @@ impl ClientTcpCarrierConnection {
     pub(in crate::runtime) fn refresh_liveness(&mut self) {
         refresh_client_tcp_path_liveness_state(
             &mut self.next_heartbeat_at,
-            self.heartbeat_interval,
+            self.heartbeat_delay,
             self.pending_heartbeat.is_some(),
         );
     }
@@ -92,7 +93,8 @@ impl ClientTcpCarrierConnection {
             ));
         }
         self.pending_heartbeat = None;
-        self.next_heartbeat_at = tokio::time::Instant::now() + self.heartbeat_interval;
+        self.heartbeat_delay = heartbeat_renewal_delay(self.heartbeat_interval, random_u64()?);
+        self.next_heartbeat_at = tokio::time::Instant::now() + self.heartbeat_delay;
         Ok(())
     }
 
@@ -214,6 +216,8 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
 
         let (reader, writer) = framed.split()?;
         let now = tokio::time::Instant::now();
+        let heartbeat_delay =
+            heartbeat_renewal_delay(mux_limits.tcp_path_heartbeat_interval, random_u64()?);
         Ok(ClientTcpCarrierConnection {
             path_id,
             remote_port,
@@ -223,8 +227,9 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
                 reliable_path_writer_frame_queue(mux_limits),
             ),
             heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
+            heartbeat_delay,
             heartbeat_timeout: mux_limits.tcp_path_heartbeat_timeout,
-            next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
+            next_heartbeat_at: now + heartbeat_delay,
             pending_heartbeat: None,
             tcp_metrics,
             peer_usage_sequence: 0,
@@ -239,10 +244,33 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
 
 pub(in crate::runtime) fn refresh_client_tcp_path_liveness_state(
     next_heartbeat_at: &mut tokio::time::Instant,
-    heartbeat_interval: Duration,
+    heartbeat_delay: Duration,
     heartbeat_pending: bool,
 ) {
     if !heartbeat_pending {
-        *next_heartbeat_at = tokio::time::Instant::now() + heartbeat_interval;
+        *next_heartbeat_at = tokio::time::Instant::now() + heartbeat_delay;
     }
+}
+
+/// Maps one uniformly random sample onto the RFC heartbeat renewal window.
+///
+/// The configured interval remains the maximum delay. Integer multiplication
+/// avoids floating-point drift and introduces at most one-sample quantization
+/// imbalance across a nanosecond-sized range.
+pub(in crate::runtime::path::tcp) fn heartbeat_renewal_delay(
+    maximum: Duration,
+    sample: u64,
+) -> Duration {
+    let maximum_nanos = maximum.as_nanos();
+    let minimum_nanos = maximum_nanos.saturating_mul(4) / 5;
+    let span = maximum_nanos.saturating_sub(minimum_nanos);
+    let offset = (u128::from(sample).saturating_mul(span.saturating_add(1))) >> 64;
+    duration_from_nanos(minimum_nanos.saturating_add(offset).min(maximum_nanos))
+}
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let seconds = nanos / NANOS_PER_SECOND;
+    let subsecond_nanos = (nanos % NANOS_PER_SECOND) as u32;
+    Duration::new(u64::try_from(seconds).unwrap_or(u64::MAX), subsecond_nanos)
 }

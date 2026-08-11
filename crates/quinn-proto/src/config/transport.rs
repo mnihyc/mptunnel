@@ -43,6 +43,7 @@ pub struct TransportConfig {
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
+    pub(crate) keep_alive_interval_min: Option<Duration>,
     pub(crate) keep_alive_interval: Option<Duration>,
     pub(crate) crypto_buffer_size: usize,
     pub(crate) allow_spin: bool,
@@ -257,7 +258,26 @@ impl TransportConfig {
     /// enabled for the connection to be preserved. Must be set lower than the idle_timeout of both
     /// peers to be effective.
     pub fn keep_alive_interval(&mut self, value: Option<Duration>) -> &mut Self {
+        self.keep_alive_interval_min = value;
         self.keep_alive_interval = value;
+        self
+    }
+
+    /// Specifies a bounded renewal range for keep-alive inactivity timers.
+    ///
+    /// A fresh interval is selected when a keep-alive timer fires. Ordinary
+    /// authenticated traffic reuses that interval when it defers the timer, so
+    /// random sampling never enters the application-data hot path. `maximum`
+    /// retains the same liveness bound as [`Self::keep_alive_interval`].
+    pub fn keep_alive_interval_range(
+        &mut self,
+        minimum: Duration,
+        maximum: Duration,
+    ) -> &mut Self {
+        assert!(!minimum.is_zero(), "keep-alive minimum is zero");
+        assert!(minimum <= maximum, "keep-alive minimum exceeds maximum");
+        self.keep_alive_interval_min = Some(minimum);
+        self.keep_alive_interval = Some(maximum);
         self
     }
 
@@ -378,6 +398,7 @@ impl Default for TransportConfig {
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
+            keep_alive_interval_min: None,
             keep_alive_interval: None,
             crypto_buffer_size: 16 * 1024,
             allow_spin: true,
@@ -414,6 +435,7 @@ impl fmt::Debug for TransportConfig {
             pad_to_mtu,
             ack_frequency_config,
             persistent_congestion_threshold,
+            keep_alive_interval_min,
             keep_alive_interval,
             crypto_buffer_size,
             allow_spin,
@@ -446,6 +468,7 @@ impl fmt::Debug for TransportConfig {
                 "persistent_congestion_threshold",
                 persistent_congestion_threshold,
             )
+            .field("keep_alive_interval_min", keep_alive_interval_min)
             .field("keep_alive_interval", keep_alive_interval)
             .field("crypto_buffer_size", crypto_buffer_size)
             .field("allow_spin", allow_spin)

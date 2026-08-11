@@ -363,6 +363,23 @@ impl TcpServerTlsConfig {
         self.transport_secret.is_some()
     }
 
+    /// Carries only bounded Noise replay authority into an equivalent runtime
+    /// generation. Every other TLS, MPP, session, and carrier owner remains
+    /// generation-local.
+    pub(crate) fn inherit_transport_replay_state(&mut self, previous: &Self) -> bool {
+        if self != previous {
+            return false;
+        }
+        let (Some(current), Some(previous)) = (
+            self.transport_secret.as_mut(),
+            previous.transport_secret.as_ref(),
+        ) else {
+            return false;
+        };
+        current.replay = previous.replay.clone();
+        true
+    }
+
     /// QUIC-facing TLS identity. TCP uses the separate Noise configuration.
     pub(in crate::transport) fn rustls_config(&self) -> Arc<ServerConfig> {
         self.config.clone()
@@ -906,9 +923,19 @@ where
         transport_secret: &ServerSharedTransportSecret,
         limits: CodecLimits,
     ) -> Result<Self, EncryptedFramedTransportError> {
+        Self::accept_with_rejection_deadline(stream, transport_secret, limits, None).await
+    }
+
+    async fn accept_with_rejection_deadline(
+        stream: S,
+        transport_secret: &ServerSharedTransportSecret,
+        limits: CodecLimits,
+        rejection_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Self, EncryptedFramedTransportError> {
         let wire_bytes = WireByteCounter::default();
         let mut stream = CountingIo::new(stream, wire_bytes.clone());
-        let handshake = noise_server_handshake(&mut stream, transport_secret).await?;
+        let handshake =
+            noise_server_handshake(&mut stream, transport_secret, rejection_deadline).await?;
         Ok(Self {
             stream,
             transport: handshake.transport,
@@ -1145,6 +1172,31 @@ where
         let inner = match tls.shared_transport_secret() {
             Some(secret) => EncryptedFramedStreamInner::Noise(
                 NoiseFramedStream::accept(stream, secret, limits).await?,
+            ),
+            None => {
+                EncryptedFramedStreamInner::Tls(TlsFramedStream::accept(stream, tls, limits).await?)
+            }
+        };
+        Ok(Self { inner })
+    }
+
+    /// Production server admission with a single externally uniform Noise
+    /// rejection boundary. TLS retains its native handshake behavior.
+    pub(crate) async fn accept_with_authentication_deadline(
+        stream: S,
+        tls: &TcpServerTlsConfig,
+        limits: CodecLimits,
+        authentication_deadline: tokio::time::Instant,
+    ) -> Result<Self, EncryptedFramedTransportError> {
+        let inner = match tls.shared_transport_secret() {
+            Some(secret) => EncryptedFramedStreamInner::Noise(
+                NoiseFramedStream::accept_with_rejection_deadline(
+                    stream,
+                    secret,
+                    limits,
+                    Some(authentication_deadline),
+                )
+                .await?,
             ),
             None => {
                 EncryptedFramedStreamInner::Tls(TlsFramedStream::accept(stream, tls, limits).await?)
@@ -1567,6 +1619,7 @@ where
 async fn noise_server_handshake<S>(
     stream: &mut S,
     transport_secret: &ServerSharedTransportSecret,
+    rejection_deadline: Option<tokio::time::Instant>,
 ) -> Result<NoiseHandshakeResult, EncryptedFramedTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1583,16 +1636,25 @@ where
         .and_then(|builder| builder.psk(0, &noise_psk))
         .and_then(NoiseBuilder::build_responder)
         .map_err(EncryptedFramedTransportError::NoiseHandshake)?;
-    let client_hello = read_noise_handshake(
-        stream,
-        &mut handshake,
-        &client_length_key,
-        TCP_NOISE_CLIENT_HANDSHAKE_LABEL,
-        TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MIN_PADDING,
-        TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MAX_PADDING,
-    )
-    .await?;
-    admit_noise_client_hello(&client_hello, transport_secret)?;
+    let admission = async {
+        let client_hello = read_noise_handshake(
+            stream,
+            &mut handshake,
+            &client_length_key,
+            TCP_NOISE_CLIENT_HANDSHAKE_LABEL,
+            TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MIN_PADDING,
+            TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MAX_PADDING,
+        )
+        .await?;
+        admit_noise_client_hello(&client_hello, transport_secret)
+    }
+    .await;
+    if let Err(error) = admission {
+        if let Some(deadline) = rejection_deadline {
+            tokio::time::sleep_until(deadline).await;
+        }
+        return Err(error);
+    }
     let server_padding = random_handshake_padding()?;
     write_noise_handshake(
         stream,

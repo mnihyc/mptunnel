@@ -406,6 +406,13 @@ MUST NOT be evicted merely to accept another authentication. Process restart
 is the persistence boundary unless an implementation explicitly provides
 durable replay state.
 
+An implementation MAY retain replay authority across a clean runtime
+configuration replacement only when the transport secret, TLS identity,
+inbound identity, protocol settings, freshness window, and replay-capacity
+policy are unchanged. This state is endpoint authority and MUST NOT be selected
+or partitioned by source IP. A change to any identity or policy starts a new
+boundary.
+
 ### 5.3 Readiness and identity fences
 
 After accepting carrier authentication, `PATH_JOIN`, and sequence-zero
@@ -488,15 +495,21 @@ complete responder Noise message length MUST be 56 through 111 bytes.
 
 The responder MUST authenticate the complete initiator Noise message, validate
 its version and issue time against the configured authentication freshness
-window, and atomically admit its nonce to a bounded endpoint-local replay
-cache before writing any bytes. A malformed, stale, future, duplicate, or
-capacity-exceeding first flight is rejected without a response. Replay state
-is shared by every carrier created from that endpoint configuration and lives
-for that runtime configuration generation. A clean generation replacement,
-process restart, or independent process creates a new replay boundary unless
-the host supplies shared durable replay state. Reusing one transport secret
-across independent MPP inbounds therefore also creates independent replay
-boundaries and is NOT RECOMMENDED.
+window, and atomically admit its nonce to a bounded endpoint-local replay cache
+before writing any bytes. Every failure before the responder flight—including
+an incomplete header or body, invalid decoded length, malformed, stale, future,
+duplicate, or capacity-exceeding input—MUST send no bytes and remain externally
+indistinguishable until the one absolute authentication deadline. A valid
+flight proceeds immediately. Parsing and storage remain bounded by the fixed
+wire limits and pending-authentication budget.
+
+Replay state is shared by every carrier created from that endpoint
+configuration. It MAY survive a clean generation replacement under the exact
+identity and policy conditions in Section 5.2. Process restart or an
+independent process creates a new replay boundary unless the host supplies
+shared durable replay state. Reusing one transport secret across independent
+MPP inbounds therefore also creates independent replay boundaries and is NOT
+RECOMMENDED.
 
 Let `h` be the completed Noise handshake hash. The Noise profile's
 `transport_binding` is:
@@ -554,6 +567,15 @@ Section 13.
 
 One TCP carrier instance multiplexes path control, stream attachments, and
 datagram-flow attachments. `PING` and `PONG` may provide MPP-level heartbeat.
+The TCP client alone initiates an idle heartbeat. The configured heartbeat
+interval `I` is the maximum idle delay, not a periodic wire cadence. At
+connection start and after each completed idle heartbeat, the client selects a
+fresh cryptographically random delay uniformly from `[0.8I, I]`. Authenticated
+traffic defers the current delay without drawing another value; it MUST NOT
+extend an outstanding `PONG` deadline. A late wake coalesces missed timer work
+into at most one probe and never emits a catch-up burst. Thus the maximum
+last-activity-to-failure bound remains `I` plus the configured heartbeat
+timeout.
 `PATH_DRAIN` and `PATH_CLOSE` are valid only on TCP carriers. The TCP carrier
 client alone sends `PATH_DRAIN`; the TCP carrier server sends `PATH_CLOSE` only
 as the response that completes that drain. Their `path_id` MUST match the TCP
@@ -688,7 +710,12 @@ an unsigned 32-bit network-order integer. HTTP/3 DATA boundaries are
 independent of MPP record boundaries. A receiver MUST enforce its frame limit
 before buffering a declared record.
 
-QUIC native liveness and connection retirement remain transport-owned.
+QUIC native liveness and connection retirement remain transport-owned. The
+QUIC client alone enables native keep-alive. Its configured interval has the
+same maximum-delay and `[0.8I, I]` renewal semantics as the TCP heartbeat; an
+authenticated packet or send defers the current delay, a fired keep-alive draws
+the next delay, and a late wake emits no catch-up sequence. The server relies on
+the client's PING and its transport ACK to keep both idle timers live.
 `PING` and `PONG` on a QUIC request stream may prove MPP response-direction
 reachability, but they do not govern QUIC connection liveness or retirement.
 `PATH_DRAIN`, `PATH_CLOSE`, and all `PATH_CAPACITY_*` frames are invalid on a
@@ -1705,8 +1732,10 @@ The QUIC candidate selector prevents a party without an active credential from
 reaching the MPP frame parser or eliciting an MPP-specific response. The TCP
 prelude and all MPP frames are encrypted. In the optional shared-secret
 profile, a public or wrong-secret probe cannot elicit TCP response bytes or a
-QUIC certificate flight. A replayed TCP first flight is rejected before a
-response while it remains in the endpoint replay cache.
+QUIC certificate flight. All rejected TCP first-flight prefixes and contents
+remain silent through the same absolute authentication deadline. A replayed
+TCP first flight is rejected before a response while it remains in the
+endpoint replay cache.
 
 These properties do not provide indistinguishability. In the default profile,
 passive observers can still observe TLS and QUIC fingerprints, SNI and
@@ -1714,10 +1743,12 @@ certificate identity, the `h3` ALPN, QUIC transport parameters, HTTP/3
 settings, packet sizes, and timing. The optional profile removes the public
 TCP ClientHello and prevents public QUIC Initial decryption, but Noise X25519
 ephemerals and QUIC version, header shape, connection IDs, size, and timing
-remain visible. Replay state is generation-local, so a captured, still-fresh
-Noise first flight can elicit a padded Noise response after a clean generation
-replacement or restart, or against an independent server process; it cannot
-disclose a certificate or admit MPP state. A party holding the endpoint
+remain visible. Idle liveness uses independently renewed bounded delays rather
+than an exact cross-carrier period, but encrypted frame sizes and the bounded
+delay distribution remain observable. A captured, still-fresh Noise first
+flight can elicit a padded Noise response after a process restart or against an
+independent server process; it cannot disclose a certificate, authenticate
+MPP, or admit Product state. A party holding the endpoint
 transport secret can identify the transport service, and a party also holding
 an authorized MPP credential can authenticate as that credential.
 

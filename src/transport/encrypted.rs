@@ -490,6 +490,29 @@ impl<S> CountingIo<S> {
     }
 }
 
+/// A syntactically or cryptographically rejected Noise opener whose socket is
+/// still owned by the caller. The runtime may retain it to a common rejection
+/// deadline without retaining scarce authentication work capacity.
+pub(crate) struct RejectedEncryptedStream<S> {
+    _stream: CountingIo<S>,
+    error: EncryptedFramedTransportError,
+}
+
+impl<S> RejectedEncryptedStream<S> {
+    pub(crate) fn into_error(self) -> EncryptedFramedTransportError {
+        self.error
+    }
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "server admission consumes this stack-local outcome immediately; boxing would allocate on every valid carrier handshake"
+)]
+pub(crate) enum ServerEncryptedStreamAdmission<S> {
+    Accepted(EncryptedFramedStream<S>),
+    Rejected(RejectedEncryptedStream<S>),
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for CountingIo<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -818,6 +841,16 @@ struct NoiseHandshakeResult {
     write_length_key: [u8; 32],
 }
 
+enum NoiseServerHandshakeFailure {
+    /// The peer supplied an incomplete, malformed, unauthenticated, stale, or
+    /// replayed opener. The caller retains the socket for uniform rejection.
+    Rejected(EncryptedFramedTransportError),
+    /// Local setup or post-authentication response failed; delaying this does
+    /// not hide peer-controlled parser behavior and would mask an operator
+    /// fault.
+    Fatal(EncryptedFramedTransportError),
+}
+
 struct NoiseReadState {
     nonce: u64,
     length_key: [u8; 32],
@@ -867,6 +900,15 @@ struct NoiseFramedStream<S> {
     limits: CodecLimits,
     wire_bytes: WireByteCounter,
     encode_buffer: Vec<u8>,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Noise admission consumes this stack-local outcome immediately; boxing would allocate on every valid carrier handshake"
+)]
+enum NoiseServerStreamAdmission<S> {
+    Accepted(NoiseFramedStream<S>),
+    Rejected(RejectedEncryptedStream<S>),
 }
 
 struct NoiseFramedReader<S> {
@@ -923,20 +965,32 @@ where
         transport_secret: &ServerSharedTransportSecret,
         limits: CodecLimits,
     ) -> Result<Self, EncryptedFramedTransportError> {
-        Self::accept_with_rejection_deadline(stream, transport_secret, limits, None).await
+        match Self::accept_for_server_authentication(stream, transport_secret, limits).await? {
+            NoiseServerStreamAdmission::Accepted(stream) => Ok(stream),
+            NoiseServerStreamAdmission::Rejected(rejected) => Err(rejected.into_error()),
+        }
     }
 
-    async fn accept_with_rejection_deadline(
+    async fn accept_for_server_authentication(
         stream: S,
         transport_secret: &ServerSharedTransportSecret,
         limits: CodecLimits,
-        rejection_deadline: Option<tokio::time::Instant>,
-    ) -> Result<Self, EncryptedFramedTransportError> {
+    ) -> Result<NoiseServerStreamAdmission<S>, EncryptedFramedTransportError> {
         let wire_bytes = WireByteCounter::default();
         let mut stream = CountingIo::new(stream, wire_bytes.clone());
-        let handshake =
-            noise_server_handshake(&mut stream, transport_secret, rejection_deadline).await?;
-        Ok(Self {
+        let handshake = match noise_server_handshake(&mut stream, transport_secret).await {
+            Ok(handshake) => handshake,
+            Err(NoiseServerHandshakeFailure::Rejected(error)) => {
+                return Ok(NoiseServerStreamAdmission::Rejected(
+                    RejectedEncryptedStream {
+                        _stream: stream,
+                        error,
+                    },
+                ));
+            }
+            Err(NoiseServerHandshakeFailure::Fatal(error)) => return Err(error),
+        };
+        Ok(NoiseServerStreamAdmission::Accepted(Self {
             stream,
             transport: handshake.transport,
             admission_binding: handshake.admission_binding,
@@ -945,7 +999,7 @@ where
             limits,
             wire_bytes,
             encode_buffer: Vec::new(),
-        })
+        }))
     }
 
     /// Channel binding shared only by the endpoints of this Noise session.
@@ -1180,29 +1234,35 @@ where
         Ok(Self { inner })
     }
 
-    /// Production server admission with a single externally uniform Noise
-    /// rejection boundary. TLS retains its native handshake behavior.
-    pub(crate) async fn accept_with_authentication_deadline(
+    /// Production server admission preserves rejected Noise socket ownership
+    /// so the runtime can enforce a uniform deadline without retaining an
+    /// authentication-work slot. TLS retains its native handshake behavior.
+    pub(crate) async fn accept_for_server_authentication(
         stream: S,
         tls: &TcpServerTlsConfig,
         limits: CodecLimits,
-        authentication_deadline: tokio::time::Instant,
-    ) -> Result<Self, EncryptedFramedTransportError> {
-        let inner = match tls.shared_transport_secret() {
-            Some(secret) => EncryptedFramedStreamInner::Noise(
-                NoiseFramedStream::accept_with_rejection_deadline(
-                    stream,
-                    secret,
-                    limits,
-                    Some(authentication_deadline),
-                )
-                .await?,
-            ),
-            None => {
-                EncryptedFramedStreamInner::Tls(TlsFramedStream::accept(stream, tls, limits).await?)
+    ) -> Result<ServerEncryptedStreamAdmission<S>, EncryptedFramedTransportError> {
+        match tls.shared_transport_secret() {
+            Some(secret) => {
+                match NoiseFramedStream::accept_for_server_authentication(stream, secret, limits)
+                    .await?
+                {
+                    NoiseServerStreamAdmission::Accepted(stream) => {
+                        Ok(ServerEncryptedStreamAdmission::Accepted(Self {
+                            inner: EncryptedFramedStreamInner::Noise(stream),
+                        }))
+                    }
+                    NoiseServerStreamAdmission::Rejected(rejected) => {
+                        Ok(ServerEncryptedStreamAdmission::Rejected(rejected))
+                    }
+                }
             }
-        };
-        Ok(Self { inner })
+            None => Ok(ServerEncryptedStreamAdmission::Accepted(Self {
+                inner: EncryptedFramedStreamInner::Tls(
+                    TlsFramedStream::accept(stream, tls, limits).await?,
+                ),
+            })),
+        }
     }
 
     pub fn limits(&self) -> CodecLimits {
@@ -1619,8 +1679,7 @@ where
 async fn noise_server_handshake<S>(
     stream: &mut S,
     transport_secret: &ServerSharedTransportSecret,
-    rejection_deadline: Option<tokio::time::Instant>,
-) -> Result<NoiseHandshakeResult, EncryptedFramedTransportError>
+) -> Result<NoiseHandshakeResult, NoiseServerHandshakeFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1631,12 +1690,14 @@ where
     let server_length_key = transport_secret
         .secret
         .derive(TCP_NOISE_SERVER_HANDSHAKE_LABEL);
-    let mut handshake = NoiseBuilder::new(noise_parameters()?)
-        .prologue(b"mptunnel tcp carrier v1")
-        .and_then(|builder| builder.psk(0, &noise_psk))
-        .and_then(NoiseBuilder::build_responder)
-        .map_err(EncryptedFramedTransportError::NoiseHandshake)?;
-    let admission = async {
+    let mut handshake =
+        NoiseBuilder::new(noise_parameters().map_err(NoiseServerHandshakeFailure::Fatal)?)
+            .prologue(b"mptunnel tcp carrier v1")
+            .and_then(|builder| builder.psk(0, &noise_psk))
+            .and_then(NoiseBuilder::build_responder)
+            .map_err(EncryptedFramedTransportError::NoiseHandshake)
+            .map_err(NoiseServerHandshakeFailure::Fatal)?;
+    async {
         let client_hello = read_noise_handshake(
             stream,
             &mut handshake,
@@ -1648,14 +1709,9 @@ where
         .await?;
         admit_noise_client_hello(&client_hello, transport_secret)
     }
-    .await;
-    if let Err(error) = admission {
-        if let Some(deadline) = rejection_deadline {
-            tokio::time::sleep_until(deadline).await;
-        }
-        return Err(error);
-    }
-    let server_padding = random_handshake_padding()?;
+    .await
+    .map_err(NoiseServerHandshakeFailure::Rejected)?;
+    let server_padding = random_handshake_padding().map_err(NoiseServerHandshakeFailure::Fatal)?;
     write_noise_handshake(
         stream,
         &mut handshake,
@@ -1663,8 +1719,10 @@ where
         TCP_NOISE_SERVER_HANDSHAKE_LABEL,
         &server_padding,
     )
-    .await?;
+    .await
+    .map_err(NoiseServerHandshakeFailure::Fatal)?;
     finish_noise_handshake(handshake, &transport_secret.secret, false)
+        .map_err(NoiseServerHandshakeFailure::Fatal)
 }
 
 fn noise_rekey_boundary(nonce: u64) -> bool {

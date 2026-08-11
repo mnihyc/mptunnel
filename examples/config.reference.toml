@@ -493,6 +493,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # transport_secret_file = "mpp-transport.key"
 # auth_freshness_window_seconds = 300
 # authentication_timeout_ms = 5000
+# Independently caps authentication work and silent Noise-rejection retention.
 # max_pending_authentications = 1024
 #
 # Experimental server-owned L3 address plan. It is valid only when the document

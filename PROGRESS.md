@@ -6941,9 +6941,10 @@ entry is authoritative.
     lease, sampling occurs only at connection creation or a completed idle
     probe, and an outstanding TCP `PONG` deadline is never extended;
   - the QUIC server no longer creates a redundant native keep-alive schedule;
-  - every attacker-controlled TCP Noise failure before the responder flight
-    remains silent through the same absolute authentication deadline, while a
-    valid flight proceeds immediately;
+  - every final TCP Noise rejection releases authentication work immediately;
+    a separate equal-capacity pool retains only the rejected socket through the
+    same absolute deadline, while retention overload is shed without response
+    and a valid flight proceeds immediately;
   - equivalent clean configuration generations retain only the bounded Noise
     replay authority of the same named inbound and identical security policy;
     source IP is never part of the identity; and
@@ -6988,3 +6989,49 @@ entry is authoritative.
     the performance registry, shell syntax, and release-version self-test all
     passed; and
   - the full internal report is `./docs-dev/mptunnel-threat-model.md`.
+
+## 2026-08-12T01:24:00+08:00: Noise rejection capacity separated from authentication work
+
+- Name: bounded silent-rejection lifecycle
+- Category: Protocol security and availability
+- State: implemented and verified; release action remains pending
+- Root cause:
+  - the first uniform-deadline implementation retained the shared
+    authentication permit after a malformed Noise opener was conclusively
+    rejected;
+  - with 128 permits and a ten-second deadline, 256 completed invalid openers
+    delayed the first legitimate proxied request until 11.286 seconds; and
+  - this was a lifecycle ownership defect, not a framing, cryptographic,
+    scheduler, congestion, or forwarding defect.
+- Correction:
+  - transport admission now returns a typed accepted/rejected outcome while a
+    rejected outcome still owns only its socket;
+  - the TCP runtime immediately releases authentication work, drops the native
+    telemetry duplicate, and nonblockingly transfers the socket to a separate
+    generation-wide silent-rejection pool with the same configured capacity;
+  - retained rejections close at the original accept-anchored deadline;
+    retention overload is shed immediately with zero response bytes, and valid
+    Noise/TLS plus MPP admission never waits for retention capacity; and
+  - both pools are endpoint-local, bounded, and independent of source IP.
+- Adversarial evidence:
+  - the same 256-probe gate admitted the legitimate request on its first
+    attempt at 1.364 seconds from flood start, 0.321 seconds after the invalid
+    cohort finished; the server stayed live;
+  - peak descriptors fell from 266 to 141 and recovered to 12; and
+  - representative 32-, 34-, and 221-byte probes each received zero response
+    bytes and terminated at 10.002--10.003 seconds while retention was
+    available.
+- Verification:
+  - a durable capacity-one runtime test proves auth-to-retention ownership
+    transfer, valid-client admission, silent bounded retention, overload
+    shedding, and permit recovery;
+  - the 17-test encrypted-transport subset and 6-test runtime-node subset pass;
+  - strict locked all-target/all-feature Clippy passes; and
+  - the locked all-feature suite passes 1,514 library tests and 8 integration
+    tests.
+- Residual boundary:
+  - an incomplete prefix still consumes authentication work until its absolute
+    deadline, and finite-capacity overload shedding remains observable;
+  - eliminating both while retaining bounded state, zero server response, and
+    no additional RTT is impossible, so no source-IP quota, decoy response,
+    challenge flight, or timing tweak was added.

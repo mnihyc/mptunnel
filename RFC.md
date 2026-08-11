@@ -498,10 +498,17 @@ its version and issue time against the configured authentication freshness
 window, and atomically admit its nonce to a bounded endpoint-local replay cache
 before writing any bytes. Every failure before the responder flight—including
 an incomplete header or body, invalid decoded length, malformed, stale, future,
-duplicate, or capacity-exceeding input—MUST send no bytes and remain externally
-indistinguishable until the one absolute authentication deadline. A valid
-flight proceeds immediately. Parsing and storage remain bounded by the fixed
-wire limits and pending-authentication budget.
+duplicate, or capacity-exceeding input—MUST send no bytes. Once such a failure
+is final, it MUST release authentication-work capacity immediately. A separate
+endpoint-local silent-rejection budget, equal to the configured pending-
+authentication capacity in this profile, retains only the rejected socket
+until the original absolute authentication deadline. While that budget is
+available, failures remain externally indistinguishable until the deadline. If
+it is exhausted, the implementation MUST shed the rejected socket immediately,
+without a response and without delaying valid authentication. A valid flight
+proceeds immediately and never waits for silent-rejection capacity. Parsing,
+storage, authentication work, and retained rejected sockets all remain bounded;
+neither budget is selected or partitioned by source IP.
 
 Replay state is shared by every carrier created from that endpoint
 configuration. It MAY survive a clean generation replacement under the exact
@@ -1697,9 +1704,9 @@ ephemerals provide forward secrecy for completed TCP transport keys, but the
 group PSK does not identify an individual client.
 
 The receiver MUST bound unauthenticated parsing, concurrent admission work,
-transport and MPP replay state, credential scans, and total admission duration.
-It MUST compare authentication material without data-dependent early exit that
-discloses the matching credential.
+silent rejection retention, transport and MPP replay state, credential scans,
+and total admission duration. It MUST compare authentication material without
+data-dependent early exit that discloses the matching credential.
 
 Target authorization is enforced under the authenticated principal at the
 receiving endpoint. A peer-supplied target, metric, usage, or `PathId` does not
@@ -1733,9 +1740,11 @@ reaching the MPP frame parser or eliciting an MPP-specific response. The TCP
 prelude and all MPP frames are encrypted. In the optional shared-secret
 profile, a public or wrong-secret probe cannot elicit TCP response bytes or a
 QUIC certificate flight. All rejected TCP first-flight prefixes and contents
-remain silent through the same absolute authentication deadline. A replayed
-TCP first flight is rejected before a response while it remains in the
-endpoint replay cache.
+send no response; while bounded silent-rejection capacity is available they
+remain connected through the same absolute authentication deadline. Resource
+exhaustion sheds excess rejected sockets immediately rather than consuming
+authentication capacity. A replayed TCP first flight is rejected before a
+response while it remains in the endpoint replay cache.
 
 These properties do not provide indistinguishability. In the default profile,
 passive observers can still observe TLS and QUIC fingerprints, SNI and

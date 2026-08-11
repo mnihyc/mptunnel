@@ -279,6 +279,7 @@ pub(super) fn new_identity_runtime_with_metadata(
     });
     let credential_admission = ProductCredentialAdmission::from_security(&security);
     let pending_authentications = Arc::new(Semaphore::new(security.max_pending_authentications));
+    let silent_rejections = Arc::new(Semaphore::new(security.max_pending_authentications));
     let paths = ServerPathContext {
         name,
         forwarding_mode,
@@ -290,6 +291,7 @@ pub(super) fn new_identity_runtime_with_metadata(
         credential_admission,
         credential_retirements: CredentialRetirementControl::new(),
         pending_authentications,
+        silent_rejections,
         tls,
         reliable_streams: reliable_stream_port,
         datagrams: datagram_port,

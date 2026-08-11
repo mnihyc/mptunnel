@@ -24,7 +24,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_channels, reliable_path_command_queue, reliable_path_writer_frame_queue,
 };
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
-use crate::transport::encrypted::EncryptedFramedStream;
+use crate::transport::encrypted::{EncryptedFramedStream, ServerEncryptedStreamAdmission};
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -59,14 +59,26 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     let tls = &context.tls;
     let authentication_deadline =
         tokio::time::Instant::now() + context.security.authentication_timeout;
+    let mut authentication_slot = Some(authentication_slot);
+    let transport_admission = tokio::time::timeout_at(
+        authentication_deadline,
+        EncryptedFramedStream::accept_for_server_authentication(stream, tls, context.codec_limits),
+    )
+    .await
+    .map_err(|_| RuntimeError::AuthenticationRejected("authentication timed out"))??;
+    let mut framed = match transport_admission {
+        ServerEncryptedStreamAdmission::Accepted(framed) => framed,
+        ServerEncryptedStreamAdmission::Rejected(rejected) => {
+            drop(authentication_slot.take());
+            drop(tcp_metrics.take());
+            if let Some(_retention_slot) = context.try_retain_silent_rejection() {
+                tokio::time::sleep_until(authentication_deadline).await;
+            }
+            drop(rejected);
+            return Ok(());
+        }
+    };
     let admitted = tokio::time::timeout_at(authentication_deadline, async {
-        let mut framed = EncryptedFramedStream::accept_with_authentication_deadline(
-            stream,
-            tls,
-            context.codec_limits,
-            authentication_deadline,
-        )
-        .await?;
         let transport_binding = framed.tcp_admission_binding()?;
         let encoded = framed.read_tcp_admission().await?;
         let Some(authenticated_session) = authenticate_prelude(
@@ -108,7 +120,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     })
     .await
     .map_err(|_| RuntimeError::AuthenticationRejected("authentication timed out"))??;
-    drop(authentication_slot);
+    drop(authentication_slot.take());
     let Some((mut framed, path_join, peer_usage)) = admitted else {
         return Ok(());
     };

@@ -22,7 +22,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
 struct DropNotice(Option<oneshot::Sender<()>>);
@@ -353,4 +353,146 @@ async fn tcp_pending_authentication_is_reserved_before_task_spawn() {
     );
     drop(held);
     assert_eq!(runtime.paths.pending_authentications.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn rejected_noise_socket_releases_authentication_work_into_bounded_retention() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let address = listener.local_addr().expect("listener address");
+    let path = format!("tcp://{address}")
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let secret = [0x5a; 32];
+    let security = ServerSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("test secret"),
+    )
+    .with_authentication_timeout(Duration::from_millis(500))
+    .with_max_pending_authentications(1);
+    let mut runtime = server::new_identity_runtime(
+        vec![path.clone()],
+        OutboundConfig::Direct,
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        security,
+        MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+    );
+    runtime.paths.tls =
+        crate::transport::encrypted::test_server_tls_config_with_transport_secret(secret);
+    let context = runtime.paths.clone();
+    let local_path = ServerLocalPath::new(0, path);
+    let mut tasks = JoinSet::new();
+
+    let first_client = tokio::net::TcpStream::connect(address);
+    let first_accepted = listener.accept();
+    let (mut first_client, (first_server, _)) =
+        tokio::try_join!(first_client, first_accepted).expect("first connected TCP pair");
+    assert!(server::try_spawn_server_tcp_connection(
+        &mut tasks,
+        first_server,
+        local_path.clone(),
+        context.clone(),
+    ));
+    first_client
+        .write_all(&[0_u8; 34])
+        .await
+        .expect("write rejected Noise opener");
+    first_client
+        .shutdown()
+        .await
+        .expect("half-close rejected Noise opener");
+
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while context.pending_authentications.available_permits() != 1
+            || context.silent_rejections.available_permits() != 0
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("rejected opener transfers out of authentication work");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), first_client.read_u8())
+            .await
+            .is_err(),
+        "retained rejection must remain silent before the shared deadline"
+    );
+
+    let valid_client = tokio::net::TcpStream::connect(address);
+    let valid_accepted = listener.accept();
+    let (valid_client, (valid_server, _)) =
+        tokio::try_join!(valid_client, valid_accepted).expect("valid connected TCP pair");
+    assert!(server::try_spawn_server_tcp_connection(
+        &mut tasks,
+        valid_server,
+        local_path.clone(),
+        context.clone(),
+    ));
+    let valid = tokio::time::timeout(
+        Duration::from_millis(150),
+        crate::transport::encrypted::EncryptedFramedStream::connect(
+            valid_client,
+            &crate::transport::encrypted::test_client_tls_config_with_transport_secret(secret),
+            crate::protocol::codec::CodecLimits::default(),
+        ),
+    )
+    .await
+    .expect("valid Noise handshake is not blocked by retained rejection")
+    .expect("valid Noise handshake");
+    drop(valid);
+
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while context.pending_authentications.available_permits() != 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("valid peer close releases authentication work");
+
+    let overflow_client = tokio::net::TcpStream::connect(address);
+    let overflow_accepted = listener.accept();
+    let (mut overflow_client, (overflow_server, _)) =
+        tokio::try_join!(overflow_client, overflow_accepted).expect("overflow connected TCP pair");
+    assert!(server::try_spawn_server_tcp_connection(
+        &mut tasks,
+        overflow_server,
+        local_path,
+        context.clone(),
+    ));
+    overflow_client
+        .write_all(&[0_u8; 34])
+        .await
+        .expect("write overflow Noise opener");
+    overflow_client
+        .shutdown()
+        .await
+        .expect("half-close overflow Noise opener");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(100), overflow_client.read_u8())
+            .await
+            .expect("retention overload sheds promptly")
+            .expect_err("shed rejection has no response byte")
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof,
+        "retention overload must close without response bytes"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while context.pending_authentications.available_permits() != 1
+            || context.silent_rejections.available_permits() != 1
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("both admission budgets recover after the absolute deadline");
+    assert_eq!(
+        first_client
+            .read_u8()
+            .await
+            .expect_err("retained rejection closes without a response byte")
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
 }

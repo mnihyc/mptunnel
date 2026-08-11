@@ -334,7 +334,7 @@ async fn replayed_noise_client_hello_is_rejected_across_equivalent_generations()
 }
 
 #[tokio::test]
-async fn production_noise_rejections_share_one_silent_deadline() {
+async fn rejected_noise_openers_retain_the_socket_for_one_runtime_deadline() {
     let server = test_server_tls_config_with_transport_secret([0x5a; 32]);
     let limits = CodecLimits::default();
     let lengths = [
@@ -363,13 +363,19 @@ async fn production_noise_rejections_share_one_silent_deadline() {
             length,
             server_written,
             tokio::spawn(async move {
-                EncryptedFramedStream::accept_with_authentication_deadline(
+                match EncryptedFramedStream::accept_for_server_authentication(
                     counted_server,
                     &server,
                     limits,
-                    deadline,
                 )
-                .await
+                .await?
+                {
+                    ServerEncryptedStreamAdmission::Accepted(_) => Ok(()),
+                    ServerEncryptedStreamAdmission::Rejected(rejected) => {
+                        tokio::time::sleep_until(deadline).await;
+                        Err(rejected.into_error())
+                    }
+                }
             }),
         ));
     }
@@ -396,22 +402,23 @@ async fn valid_noise_admission_never_waits_for_the_rejection_deadline() {
     let client = test_client_tls_config_with_transport_secret(secret);
     let server = test_server_tls_config_with_transport_secret(secret);
     let (client_io, server_io) = duplex(64 * 1024);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     let completed = tokio::time::timeout(std::time::Duration::from_millis(250), async {
         tokio::join!(
             EncryptedFramedStream::connect(client_io, &client, CodecLimits::default()),
-            EncryptedFramedStream::accept_with_authentication_deadline(
+            EncryptedFramedStream::accept_for_server_authentication(
                 server_io,
                 &server,
                 CodecLimits::default(),
-                deadline,
             ),
         )
     })
     .await
     .expect("valid Noise admission completed before rejection deadline");
     assert!(completed.0.is_ok());
-    assert!(completed.1.is_ok());
+    assert!(matches!(
+        completed.1,
+        Ok(ServerEncryptedStreamAdmission::Accepted(_))
+    ));
 }
 
 #[tokio::test]

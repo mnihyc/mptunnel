@@ -591,7 +591,8 @@ pub struct ServerSecurityConfig {
     /// Absolute bound covering application authentication and admission after
     /// carrier accept. It is not consulted after the path is registered.
     pub authentication_timeout: Duration,
-    /// Endpoint-local cap on unauthenticated TCP/QUIC carrier tasks.
+    /// Endpoint-local cap applied independently to active authentication work
+    /// and silent TCP Noise rejection retention.
     pub max_pending_authentications: usize,
 }
 

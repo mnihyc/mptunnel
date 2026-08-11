@@ -151,6 +151,12 @@ pub(in crate::runtime) struct ServerPathContext {
     pub(in crate::runtime) credential_admission: Arc<ProductCredentialAdmission>,
     pub(in crate::runtime) credential_retirements: CredentialRetirementControl,
     pub(in crate::runtime) pending_authentications: Arc<Semaphore>,
+    /// Bounds sockets retained solely to make ordinary Noise rejection timing
+    /// uniform. This budget is deliberately independent of authentication
+    /// work so rejected peers cannot starve valid admission. Its capacity
+    /// equals `pending_authentications`, keeping one configured resource
+    /// envelope with at most N working and N silently retained peers.
+    pub(in crate::runtime) silent_rejections: Arc<Semaphore>,
     pub(in crate::runtime) tls: TcpServerTlsConfig,
     pub(in crate::runtime) reliable_streams: ServerStreamPort,
     pub(in crate::runtime) datagrams: ServerDatagramPort,
@@ -224,6 +230,10 @@ impl ServerPathContext {
             .clone()
             .try_acquire_owned()
             .map_err(|_| RuntimeError::CredentialAdmission(CredentialAdmissionError::Overloaded))
+    }
+
+    pub(in crate::runtime) fn try_retain_silent_rejection(&self) -> Option<OwnedSemaphorePermit> {
+        self.silent_rejections.clone().try_acquire_owned().ok()
     }
 
     pub(in crate::runtime) fn peer_status_snapshot(

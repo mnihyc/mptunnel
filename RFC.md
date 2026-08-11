@@ -509,6 +509,8 @@ without a response and without delaying valid authentication. A valid flight
 proceeds immediately and never waits for silent-rejection capacity. Parsing,
 storage, authentication work, and retained rejected sockets all remain bounded;
 neither budget is selected or partitioned by source IP.
+Failure of local clock or replay authority is an endpoint fault, not a peer
+rejection, and MUST remain operator-visible and fatal to that admission.
 
 Replay state is shared by every carrier created from that endpoint
 configuration. It MAY survive a clean generation replacement under the exact

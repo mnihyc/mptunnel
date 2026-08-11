@@ -334,6 +334,45 @@ async fn replayed_noise_client_hello_is_rejected_across_equivalent_generations()
 }
 
 #[tokio::test]
+async fn local_noise_replay_authority_failure_is_fatal_not_a_silent_peer_rejection() {
+    let secret = [0x5a; 32];
+    let client = test_client_tls_config_with_transport_secret(secret);
+    let server = test_server_tls_config_with_transport_secret(secret);
+    let replay = server
+        .shared_transport_secret()
+        .expect("shared transport secret")
+        .replay
+        .clone();
+    let poisoned = std::panic::catch_unwind(|| {
+        let _guard = replay
+            .lock()
+            .expect("lock replay authority before poisoning");
+        panic!("poison replay authority for test");
+    });
+    assert!(poisoned.is_err());
+
+    let (client_io, server_io) = duplex(64 * 1024);
+    let (client_result, server_result) =
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::join!(
+                EncryptedFramedStream::connect(client_io, &client, CodecLimits::default()),
+                EncryptedFramedStream::accept_for_server_authentication(
+                    server_io,
+                    &server,
+                    CodecLimits::default(),
+                ),
+            )
+        })
+        .await
+        .expect("local replay-authority failure is reported promptly");
+    assert!(client_result.is_err());
+    assert!(matches!(
+        server_result,
+        Err(EncryptedFramedTransportError::NoiseReplayStatePoisoned)
+    ));
+}
+
+#[tokio::test]
 async fn rejected_noise_openers_retain_the_socket_for_one_runtime_deadline() {
     let server = test_server_tls_config_with_transport_secret([0x5a; 32]);
     let limits = CodecLimits::default();

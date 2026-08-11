@@ -1697,20 +1697,24 @@ where
             .and_then(NoiseBuilder::build_responder)
             .map_err(EncryptedFramedTransportError::NoiseHandshake)
             .map_err(NoiseServerHandshakeFailure::Fatal)?;
-    async {
-        let client_hello = read_noise_handshake(
-            stream,
-            &mut handshake,
-            &client_length_key,
-            TCP_NOISE_CLIENT_HANDSHAKE_LABEL,
-            TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MIN_PADDING,
-            TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MAX_PADDING,
-        )
-        .await?;
-        admit_noise_client_hello(&client_hello, transport_secret)
-    }
+    let client_hello = read_noise_handshake(
+        stream,
+        &mut handshake,
+        &client_length_key,
+        TCP_NOISE_CLIENT_HANDSHAKE_LABEL,
+        TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MIN_PADDING,
+        TCP_NOISE_CLIENT_HELLO_HEADER_LEN + TCP_NOISE_MAX_PADDING,
+    )
     .await
     .map_err(NoiseServerHandshakeFailure::Rejected)?;
+    if let Err(error) = admit_noise_client_hello(&client_hello, transport_secret) {
+        return Err(match error {
+            EncryptedFramedTransportError::NoiseClientHelloRejected => {
+                NoiseServerHandshakeFailure::Rejected(error)
+            }
+            _ => NoiseServerHandshakeFailure::Fatal(error),
+        });
+    }
     let server_padding = random_handshake_padding().map_err(NoiseServerHandshakeFailure::Fatal)?;
     write_noise_handshake(
         stream,

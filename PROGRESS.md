@@ -7012,6 +7012,9 @@ entry is authoritative.
   - retained rejections close at the original accept-anchored deadline;
     retention overload is shed immediately with zero response bytes, and valid
     Noise/TLS plus MPP admission never waits for retention capacity; and
+  - only peer-controlled parse, authentication, freshness, and replay denial
+    enter silent retention; local clock or replay-authority failure remains an
+    operator-visible fatal error; and
   - both pools are endpoint-local, bounded, and independent of source IP.
 - Adversarial evidence:
   - the same 256-probe gate admitted the legitimate request on its first
@@ -7025,10 +7028,21 @@ entry is authoritative.
   - a durable capacity-one runtime test proves auth-to-retention ownership
     transfer, valid-client admission, silent bounded retention, overload
     shedding, and permit recovery;
-  - the 17-test encrypted-transport subset and 6-test runtime-node subset pass;
+  - the 18-test encrypted-transport subset and 6-test runtime-node subset pass,
+    including an explicit local replay-authority fault classification;
   - strict locked all-target/all-feature Clippy passes; and
-  - the locked all-feature suite passes 1,514 library tests and 8 integration
+  - the locked all-feature suite passes 1,515 library tests and 8 integration
     tests.
+- Performance guard:
+  - the exact clean lifecycle commit completed 744/744 one-MiB browser flows
+    over 60 seconds at 20 peak concurrency, with zero incomplete or rejected
+    flows and 102.314 Mbps payload goodput;
+  - its immediately preceding clean carrier-hardening run completed 760/760 at
+    103.302 Mbps, so the 0.96% movement is ordinary run variance rather than a
+    regression; and
+  - the final operator-fault classification changes only the already-failed
+    local replay-authority branch and does not enter valid admission or payload
+    processing.
 - Residual boundary:
   - an incomplete prefix still consumes authentication work until its absolute
     deadline, and finite-capacity overload shedding remains observable;

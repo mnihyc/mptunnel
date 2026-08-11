@@ -488,9 +488,9 @@ async fn rejected_noise_socket_releases_authentication_work_into_bounded_retenti
     .await
     .expect("both admission budgets recover after the absolute deadline");
     assert_eq!(
-        first_client
-            .read_u8()
+        tokio::time::timeout(Duration::from_millis(100), first_client.read_u8())
             .await
+            .expect("retained rejection closes at the absolute deadline")
             .expect_err("retained rejection closes without a response byte")
             .kind(),
         std::io::ErrorKind::UnexpectedEof

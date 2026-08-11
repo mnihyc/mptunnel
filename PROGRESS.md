@@ -7049,3 +7049,29 @@ entry is authoritative.
   - eliminating both while retaining bounded state, zero server response, and
     no additional RTT is impossible, so no source-IP quota, decoy response,
     challenge flight, or timing tweak was added.
+
+## 2026-08-12T01:46:05+08:00: v0.2.5 release candidate prepared
+
+- Name: carrier-security release freeze
+- Category: Release verification
+- State: local candidate complete; exact-commit GitHub gates pending
+- Content:
+  - synchronized the package and both lockfile identities at `0.2.5`;
+  - froze the effective carrier-security logging, bounded client-owned
+    liveness renewal, uniform Noise rejection timing, bounded rejection
+    lifecycle, and equivalent-generation replay-state continuity; and
+  - retained the established seven-platform archive plus generated
+    `version.json` contract without packaging changes.
+- Evidence:
+  - the final source passed formatting, strict locked all-target/all-feature
+    Clippy, 1,515 library tests, 8 integration tests, and the standalone
+    patched Quinn suite;
+  - clean representative gates covered 60-second browser load, symmetric
+    mixed download/upload, hostile latency/jitter/loss, and fat-path
+    blackhole recovery without a material regression; and
+  - the bounded rejection lifecycle admitted a legitimate client promptly
+    during an invalid-opener flood while preserving zero response bytes.
+- Release rule: push this exact clean release-preparation commit, require both
+  ordinary CI and the non-publishing Release Check on its SHA, then create the
+  annotated immutable `v0.2.5` tag. The tag-triggered workflow alone owns the
+  release and its assets.

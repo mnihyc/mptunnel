@@ -8,17 +8,9 @@ fn mixed_ingress_classification_is_strict_and_non_consuming_by_design() {
     );
     assert_eq!(
         classify_mixed_ingress_byte(b'C').expect("HTTP CONNECT byte"),
-        MixedIngressProtocol::HttpProxy
+        MixedIngressProtocol::HttpConnect
     );
-    assert_eq!(
-        classify_mixed_ingress_byte(b'G').expect("HTTP GET byte"),
-        MixedIngressProtocol::HttpProxy
-    );
-    assert_eq!(
-        classify_mixed_ingress_byte(b'p').expect("HTTP extension method byte"),
-        MixedIngressProtocol::HttpProxy
-    );
-    for unsupported in [0x04, b' ', 0x16, 0xff] {
+    for unsupported in [0x04, b' ', b'G', b'p', 0x16, 0xff] {
         assert!(classify_mixed_ingress_byte(unsupported).is_err());
     }
 }

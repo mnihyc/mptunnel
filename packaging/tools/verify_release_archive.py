@@ -12,8 +12,7 @@ import zipfile
 
 from release_contract import (
     ReleaseContractError,
-    ReleaseBundle,
-    bundle_for_name,
+    ReleaseTarget,
     expected_directories,
     target_for_rust_triple,
 )
@@ -128,7 +127,7 @@ def read_zip(archive: pathlib.Path, package: str) -> ArchiveInventory:
     return ArchiveInventory(files, directories, tuple(order))
 
 
-def verify_inventory(inventory: ArchiveInventory, target: ReleaseBundle) -> None:
+def verify_inventory(inventory: ArchiveInventory, target: ReleaseTarget) -> None:
     expected_files = set(target.expected_files)
     expected_dirs = set(expected_directories(expected_files))
     actual_files = set(inventory.files)
@@ -183,7 +182,7 @@ def verify_inventory(inventory: ArchiveInventory, target: ReleaseBundle) -> None
             raise ReleaseArchiveError(f"release archive file is empty: {relative}")
 
 
-def verify_archive(archive: pathlib.Path, target: ReleaseBundle) -> None:
+def verify_archive(archive: pathlib.Path, target: ReleaseTarget) -> None:
     if not archive.is_file():
         raise ReleaseArchiveError(f"release archive does not exist: {archive}")
     if archive.name != target.archive_name:
@@ -206,20 +205,14 @@ def verify_archive(archive: pathlib.Path, target: ReleaseBundle) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=pathlib.Path, required=True)
-    selector = parser.add_mutually_exclusive_group(required=True)
-    selector.add_argument("--target")
-    selector.add_argument("--bundle", choices=("android-jni",))
+    parser.add_argument("--target", required=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     try:
-        target = (
-            target_for_rust_triple(args.target)
-            if args.target is not None
-            else bundle_for_name(args.bundle)
-        )
+        target = target_for_rust_triple(args.target)
         verify_archive(args.archive, target)
     except ReleaseContractError as error:
         raise SystemExit(str(error)) from error

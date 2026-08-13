@@ -92,6 +92,9 @@ jobs:
           - os: ubuntu-24.04
             target: aarch64-linux-android
             kind: android
+          - os: ubuntu-24.04
+            target: x86_64-linux-android
+            kind: android
     steps:
       - name: Checkout tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,12 +128,24 @@ jobs:
           sdkmanager="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
           "$sdkmanager" "ndk;${ndk_version}"
           toolchain="${ANDROID_HOME}/ndk/${ndk_version}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          cc="${toolchain}/aarch64-linux-android21-clang"
+          case "${{ matrix.target }}" in
+            aarch64-linux-android)
+              cc="${toolchain}/aarch64-linux-android24-clang"
+              target_env="AARCH64_LINUX_ANDROID"
+              cc_env="aarch64_linux_android"
+              ;;
+            x86_64-linux-android)
+              cc="${toolchain}/x86_64-linux-android24-clang"
+              target_env="X86_64_LINUX_ANDROID"
+              cc_env="x86_64_linux_android"
+              ;;
+            *) exit 1 ;;
+          esac
           test -x "$cc"
           {
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$cc"
-            echo "CC_aarch64_linux_android=$cc"
-            echo "AR_aarch64_linux_android=${toolchain}/llvm-ar"
+            echo "CARGO_TARGET_${target_env}_LINKER=$cc"
+            echo "CC_${cc_env}=$cc"
+            echo "AR_${cc_env}=${toolchain}/llvm-ar"
           } >> "$GITHUB_ENV"
 
       - name: Package Unix artifact
@@ -343,54 +358,9 @@ jobs:
           compression-level: 0
           include-hidden-files: true
 
-  android-jni:
-    name: Package Android JNI
-    needs: [quality, version]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - name: Checkout tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Android Rust targets
-        run: rustup target add aarch64-linux-android x86_64-linux-android
-
-      - name: Install pinned Android NDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          ndk_version="27.3.13750724"
-          sdkmanager="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
-          "$sdkmanager" "ndk;${ndk_version}"
-          ndk_root="${ANDROID_HOME}/ndk/${ndk_version}"
-          test -x "${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-          test -x "${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang"
-          echo "ANDROID_NDK_HOME=${ndk_root}" >> "$GITHUB_ENV"
-
-      - name: Build, inspect, and package Android JNI libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-          packaging/android/build-jni-libs.sh .tmp/android/release-jni
-          archive="$(packaging/android/package-jni-release.sh .tmp/android/release-jni)"
-          expected="$(python3 packaging/tools/release_contract.py android-jni | jq -r .archive_name)"
-          test "$archive" = ".tmp/release/dist/${expected}"
-
-      - name: Upload ephemeral Android JNI staging
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-stage-android-jni
-          path: .tmp/release/dist/mptunnel-*-android-jni.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-          include-hidden-files: true
-
   publish:
     name: Publish and verify
-    needs: [package, android-jni]
+    needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:

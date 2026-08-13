@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 mod android;
 pub mod app;
 pub mod cli;

@@ -10,14 +10,14 @@ chooses paths from live latency and delivery evidence, and keeps the connection
 alive when a path disappears.
 
 It provides the daily-use surface expected from a modern proxy: SOCKS5, HTTP
-CONNECT and cleartext forwarding, a single-port mixed SOCKS5/HTTP listener,
-TCP/UDP port forwarding, TUN, routing, DNS policy, outbound selection,
+CONNECT, a single-port mixed SOCKS5/HTTP CONNECT listener, TCP/UDP port
+forwarding, TUN, routing, DNS policy, outbound selection,
 balancing, persistent configuration, live management, and connection
 diagnostics.
 
-The global forwarding mode defaults to L4 for SOCKS5, HTTP proxy, mixed proxy,
-port forwarding, and TUN-L4. An explicit experimental L3 mode instead carries
-complete IP packets, with server-owned address pools and per-principal
+The global forwarding mode defaults to L4 for SOCKS5, HTTP CONNECT, mixed
+proxy, port forwarding, and TUN-L4. An explicit experimental L3 mode instead
+carries complete IP packets, with server-owned address pools and per-principal
 allocations. L3 can use TCP and QUIC together while host routes, DNS, firewall
 policy, forwarding, and NAT remain under operator control. Both TUN modes are
 experimental and cannot be mixed in one runtime generation.
@@ -54,7 +54,7 @@ upload and download, and move undelivered ranges to a surviving carrier.
 
 ```text
 forwarding_mode = l4 (default)
-SOCKS5 / HTTP proxy / port forward / TUN-L4
+SOCKS5 / HTTP CONNECT / mixed proxy / port forward / TUN-L4
                        |
              routing, DNS, outbounds
                        |
@@ -270,7 +270,7 @@ See [the reference configuration](examples/config.reference.toml) and
 | Linux amd64/arm64 | ✓ | ✓ | Native |
 | Windows amd64/arm64 | ✓ | ✓ | Wintun |
 | macOS amd64/arm64 | ✓ | ✓ | NE |
-| Android arm64 | ✓ | ✓ | `VpnService` |
+| Android arm64/x86_64 | ✓ | ✓ | `VpnService` |
 
 Linux is the primary performance platform. Windows builds and tests natively
 in GitHub Actions. macOS product VPN requires a signed Network Extension host;
@@ -308,7 +308,11 @@ Each immutable release publishes:
 - `mptunnel-<version>-macos-amd64.zip`
 - `mptunnel-<version>-macos-arm64.zip`
 - `mptunnel-<version>-android-arm64.tar.gz`
+- `mptunnel-<version>-android-x86_64.tar.gz`
 - `version.json`
+
+Each Android archive contains the command-line binary and the matching JNI
+library under `arm64-v8a/libmptunnel.so` or `x86_64/libmptunnel.so`.
 
 `version.json` records the tag, source commit, asset names, and immutable
 tag-specific download URLs. GitHub supplies each asset digest. Published tags

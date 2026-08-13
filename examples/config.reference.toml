@@ -1,5 +1,5 @@
 # Exhaustive configuration reference with one runnable common-client profile.
-# Active values expose local SOCKS5 and HTTP proxying through one TCP/QUIC MPP
+# Active values expose local SOCKS5 and HTTP CONNECT through one TCP/QUIC MPP
 # peer. Commented blocks cover every other supported TOML shape without
 # opening extra listeners. Create the referenced credential file, replace the
 # example endpoint and TLS material, then run:
@@ -39,7 +39,7 @@ secret = { from = "file", path = "mpp-credential.key" }
 # revoked = false
 # revocation_grace_seconds = 30
 
-# Optional named users for local SOCKS5 and HTTP proxy authentication.
+# Optional named users for local SOCKS5 and HTTP CONNECT authentication.
 # Login names and passwords are protocol credentials; `principal_id` is the
 # stable principal identity used by routing and admission. Passwords are never
 # accepted inline.
@@ -207,10 +207,7 @@ prefetch_max_ms = 30000
 
 # One listener may accept both proxy protocols by using `protocol = "mixed"`;
 # it shares the same `local_users` and admission policy and defaults to IPv4
-# loopback port 1080. HTTP supports CONNECT tunnels and one absolute-form
-# cleartext request per connection; the proxy rewrites it to origin-form,
-# strips proxy credentials and hop-by-hop headers, and supports fixed
-# Content-Length bodies (not Transfer-Encoding). The separate listeners below
+# loopback port 1080. HTTP is CONNECT-only. The separate listeners below
 # document each dedicated protocol form.
 # [[inbounds]]
 # name = "local-mixed"
@@ -238,8 +235,7 @@ handshake_timeout_ms = 10000
 [[inbounds]]
 name = "local-http"
 protocol = "http-connect"
-# Despite the compatibility name, this accepts CONNECT and absolute-form
-# cleartext HTTP requests. An empty list defaults to IPv4 loopback port 8080.
+# An empty list defaults to IPv4 loopback port 8080.
 listen = ["127.0.0.1:8080"]
 # local_users = ["phone-login"]
 

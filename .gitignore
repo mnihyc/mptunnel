@@ -6,4 +6,5 @@ __pycache__/
 *.py[cod]
 /config.toml
 /AGENTS.md
+/PROGRESS.md
 /docs-dev

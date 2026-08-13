@@ -15,8 +15,9 @@ providers open their device when the runtime starts.
 
 ## Privileges
 
-SOCKS5 and HTTP CONNECT ingress need no elevated privilege when bound to normal
-user ports. TUN mode needs host-approved network privileges.
+SOCKS5, HTTP proxy, and mixed SOCKS5/HTTP ingress need no elevated
+privilege when bound to normal user ports. TUN mode needs host-approved network
+privileges.
 
 - **Linux**: TUN and route setup need `CAP_NET_ADMIN` or equivalent service
   capability. Ports below 1024 need `CAP_NET_BIND_SERVICE`.
@@ -198,7 +199,7 @@ expires source associations at `idle_timeout_ms`, and bounds each datagram by
 they do not dial around configured outbounds.
 
 `forwarding_mode` is a root setting for the complete runtime generation.
-Omitting it selects `l4`, which preserves SOCKS5, HTTP CONNECT, fixed port
+Omitting it selects `l4`, which preserves SOCKS5, HTTP proxy, fixed port
 forwarding, `protocol = "tun"`, and ordinary MPP server forwarding. L4 rejects
 all TUN-L3 configuration. Explicit `forwarding_mode = "l3"` is experimental;
 it requires at least one TUN-L3 client or server service, rejects every local
@@ -618,7 +619,7 @@ connects, or other flow-opening I/O. Defaults are finite:
 | `max_connects_per_target` | 32 |
 | `max_dns_work` | 128 |
 
-SOCKS5, HTTP CONNECT, fixed forwarding, TUN-L4, and authenticated MPP server
+SOCKS5, HTTP proxy, fixed forwarding, TUN-L4, and authenticated MPP server
 opens share this one generation owner. Their listener/source/association
 limits still compose at their narrower boundary. Permits release exactly on
 close, error, cancellation, or generation retirement and never enter payload
@@ -829,12 +830,18 @@ against the configured freshness window, 300 seconds by default. Revocation
 rejects new authentication immediately and retires only work admitted by that
 credential after its configured grace.
 
-Local SOCKS5 and HTTP CONNECT logins are declared once in `[[local_users]]`
+Local SOCKS5 and HTTP proxy logins are declared once in `[[local_users]]`
 with a canonical `name` and referenced by inbound `local_users = [...]`. Each
 login maps explicitly to a `principal_id`, so routing and per-principal
 admission do not depend on the presented username. Local and upstream proxy
 passwords use the same
 file/environment reference shape as MPP credentials and the management token.
+The `http-connect` compatibility name accepts both CONNECT tunnels and one
+absolute-form `http://` request per connection. Cleartext requests are rewritten
+to origin-form, use a canonical Host header, force connection close, and remove
+proxy credentials plus hop-by-hop headers before relay. Fixed Content-Length
+bodies are supported; Transfer-Encoding, absolute `https://` targets, ambiguous
+framing, and pipelined follow-up requests are rejected or withheld.
 Local proxy inbounds separately bound total connections, connections per
 source IP, connections per principal, and their authentication/header deadline
 under `[inbounds.admission]`; these limits never derive from MPP capacity.

@@ -14,6 +14,8 @@ import zipfile
 
 from build_release_archive import build_archive
 from release_contract import (
+    ANDROID_JNI_ABIS,
+    ANDROID_JNI_BUNDLE,
     PACKAGE_VERSION,
     RELEASE_TARGETS,
     VERSION_ASSET,
@@ -68,6 +70,34 @@ class ReleaseArchiveTests(unittest.TestCase):
                     verify_archive(first, target)
                     verify_archive(second, target)
 
+    def test_android_jni_archive_is_exact_reproducible_and_verifies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stage = root / ANDROID_JNI_BUNDLE.package
+            for relative in sorted(ANDROID_JNI_BUNDLE.expected_files):
+                path = stage / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"android-jni:{relative}\n".encode())
+            first = root / "first" / ANDROID_JNI_BUNDLE.archive_name
+            second = root / "second" / ANDROID_JNI_BUNDLE.archive_name
+            build_archive(stage, first, ANDROID_JNI_BUNDLE, TEST_EPOCH)
+            build_archive(stage, second, ANDROID_JNI_BUNDLE, TEST_EPOCH)
+            self.assertEqual(sha256(first), sha256(second))
+            verify_archive(first, ANDROID_JNI_BUNDLE)
+            verify_archive(second, ANDROID_JNI_BUNDLE)
+            self.assertEqual(ANDROID_JNI_ABIS, ("arm64-v8a", "x86_64"))
+            self.assertEqual(
+                ANDROID_JNI_BUNDLE.expected_files,
+                frozenset(
+                    {
+                        "LICENSE",
+                        "README.md",
+                        "arm64-v8a/libmptunnel.so",
+                        "x86_64/libmptunnel.so",
+                    }
+                ),
+            )
+
     def test_archive_verifier_rejects_extra_ci_payload(self) -> None:
         target = next(target for target in RELEASE_TARGETS if target.os == "macos")
         index = RELEASE_TARGETS.index(target)
@@ -95,14 +125,14 @@ class ReleaseArchiveTests(unittest.TestCase):
                     TEST_EPOCH,
                 )
 
-    def test_public_inventory_has_version_metadata_and_seven_archives(self) -> None:
+    def test_public_inventory_has_version_metadata_and_eight_archives(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for name in archive_asset_names():
                 (root / name).write_bytes(f"archive:{name}\n".encode())
             version_asset = write_test_version_asset(root)
-            self.assertEqual(len(archive_asset_names()), 7)
-            self.assertEqual(len(public_asset_names()), 8)
+            self.assertEqual(len(archive_asset_names()), 8)
+            self.assertEqual(len(public_asset_names()), 9)
             self.assertEqual(version_asset.name, VERSION_ASSET)
             self.assertIn(VERSION_ASSET, public_asset_names())
             self.assertNotIn("SHA256SUMS", public_asset_names())
@@ -119,7 +149,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             )
             self.assertEqual(
                 [set(asset) for asset in metadata["assets"]],
-                [{"name", "download_url"}] * 7,
+                [{"name", "download_url"}] * 8,
             )
             verify_public_assets(root)
 
@@ -161,7 +191,10 @@ class ReleaseArchiveTests(unittest.TestCase):
 
     def test_packaging_sources_and_documented_names_match_contract(self) -> None:
         required_sources = (
+            "LICENSE",
             "packaging/README.md",
+            "packaging/android/README.md",
+            "packaging/android/package-jni-release.sh",
             "packaging/service/systemd/mptunnel.service",
             "examples/client.toml",
             "examples/server.toml",
@@ -244,6 +277,43 @@ class ReleaseArchiveTests(unittest.TestCase):
         )
         self.assertNotIn("actions/upload-artifact", ci_workflow)
         self.assertNotIn("gh release", ci_workflow)
+
+    def test_android_jni_release_build_is_actions_owned_and_two_abi_only(
+        self,
+    ) -> None:
+        helper = (
+            REPOSITORY_ROOT / "packaging/android/build-jni-libs.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"arm64-v8a:aarch64-linux-android:aarch64-linux-android"', helper
+        )
+        self.assertIn(
+            '"x86_64:x86_64-linux-android:x86_64-linux-android"', helper
+        )
+        self.assertNotIn("armv7-linux-androideabi", helper)
+        self.assertNotIn("i686-linux-android", helper)
+        self.assertEqual(
+            helper.count("Java_com_v2ray_ang_mpp_MptunnelNative_"),
+            7,
+        )
+        self.assertIn("llvm-strip", helper)
+        self.assertIn("llvm-nm", helper)
+        self.assertIn("0x4000", helper)
+
+        for name in ("release-check.yml", "release.yml"):
+            with self.subTest(workflow=name):
+                workflow = (
+                    REPOSITORY_ROOT / ".github/workflows" / name
+                ).read_text(encoding="utf-8")
+                self.assertIn("android-jni:", workflow)
+                self.assertIn(
+                    "rustup target add aarch64-linux-android x86_64-linux-android",
+                    workflow,
+                )
+                self.assertIn('ndk_version="27.3.13750724"', workflow)
+                self.assertIn('echo "ANDROID_NDK_HOME=${ndk_root}"', workflow)
+                self.assertIn("packaging/android/build-jni-libs.sh", workflow)
+                self.assertIn("packaging/android/package-jni-release.sh", workflow)
 
 
 if __name__ == "__main__":

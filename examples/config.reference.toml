@@ -1,5 +1,5 @@
 # Exhaustive configuration reference with one runnable common-client profile.
-# Active values expose local SOCKS5 and HTTP CONNECT through one TCP/QUIC MPP
+# Active values expose local SOCKS5 and HTTP proxying through one TCP/QUIC MPP
 # peer. Commented blocks cover every other supported TOML shape without
 # opening extra listeners. Create the referenced credential file, replace the
 # example endpoint and TLS material, then run:
@@ -39,7 +39,7 @@ secret = { from = "file", path = "mpp-credential.key" }
 # revoked = false
 # revocation_grace_seconds = 30
 
-# Optional named users for local SOCKS5 and HTTP CONNECT authentication.
+# Optional named users for local SOCKS5 and HTTP proxy authentication.
 # Login names and passwords are protocol credentials; `principal_id` is the
 # stable principal identity used by routing and admission. Passwords are never
 # accepted inline.
@@ -205,6 +205,19 @@ prefetch_max_ms = 30000
 # domain = "router.home.arpa"
 # addresses = ["192.168.1.1", "fd00::1"]
 
+# One listener may accept both proxy protocols by using `protocol = "mixed"`;
+# it shares the same `local_users` and admission policy and defaults to IPv4
+# loopback port 1080. HTTP supports CONNECT tunnels and one absolute-form
+# cleartext request per connection; the proxy rewrites it to origin-form,
+# strips proxy credentials and hop-by-hop headers, and supports fixed
+# Content-Length bodies (not Transfer-Encoding). The separate listeners below
+# document each dedicated protocol form.
+# [[inbounds]]
+# name = "local-mixed"
+# protocol = "mixed"
+# listen = ["127.0.0.1:1080"]
+# local_users = ["phone-login"]
+#
 [[inbounds]]
 name = "local-socks"
 protocol = "socks5"
@@ -225,7 +238,8 @@ handshake_timeout_ms = 10000
 [[inbounds]]
 name = "local-http"
 protocol = "http-connect"
-# An empty list defaults to IPv4 loopback port 8080.
+# Despite the compatibility name, this accepts CONNECT and absolute-form
+# cleartext HTTP requests. An empty list defaults to IPv4 loopback port 8080.
 listen = ["127.0.0.1:8080"]
 # local_users = ["phone-login"]
 

@@ -998,6 +998,15 @@ enum InboundFileConfig {
         #[serde(default)]
         admission: LocalIngressAdmissionFileConfig,
     },
+    Mixed {
+        name: String,
+        #[serde(default)]
+        listen: Vec<SocketAddr>,
+        #[serde(default)]
+        local_users: Vec<String>,
+        #[serde(default)]
+        admission: LocalIngressAdmissionFileConfig,
+    },
     TcpForward {
         name: String,
         listen: Vec<SocketAddr>,
@@ -2081,6 +2090,7 @@ fn configured_local_inbound_names(
         let name = match inbound {
             InboundFileConfig::Socks5 { name, .. }
             | InboundFileConfig::HttpConnect { name, .. }
+            | InboundFileConfig::Mixed { name, .. }
             | InboundFileConfig::TcpForward { name, .. }
             | InboundFileConfig::UdpForward { name, .. }
             | InboundFileConfig::Tun { name, .. } => name,
@@ -2546,6 +2556,23 @@ fn build_node_services(
                     name,
                     config: IngressConfig::HttpConnect {
                         listen: listen_or_default(listen, 8080),
+                        proxy_auth: local_user_catalog.auth_for(local_users)?,
+                        admission: admission.into_config()?,
+                    },
+                });
+            }
+            InboundFileConfig::Mixed {
+                name,
+                listen,
+                local_users,
+                admission,
+            } => {
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
+                local_ingresses.push(LocalIngressConfig {
+                    name,
+                    config: IngressConfig::Mixed {
+                        listen: listen_or_default(listen, 1080),
                         proxy_auth: local_user_catalog.auth_for(local_users)?,
                         admission: admission.into_config()?,
                     },

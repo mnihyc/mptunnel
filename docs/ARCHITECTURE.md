@@ -17,7 +17,7 @@ performance changes stay inside the selected family.
 
 ```text
 forwarding_mode = l4 (default)
-  SOCKS5 / HTTP CONNECT / port forward / TUN-L4
+  SOCKS5 / HTTP proxy / port forward / TUN-L4
     -> Product routing, DNS, admission, outbound selection
     -> MPP stream or application-datagram plane
        -> offsets, flow control, Data ACKs, bounded reinjection

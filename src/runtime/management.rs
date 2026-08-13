@@ -191,6 +191,15 @@ impl ProductRuntimeInventory {
                             None,
                             proxy_auth.is_required(),
                         ),
+                        IngressConfig::Mixed {
+                            listen, proxy_auth, ..
+                        } => (
+                            "mixed",
+                            listen.iter().map(ToString::to_string).collect(),
+                            None,
+                            None,
+                            proxy_auth.is_required(),
+                        ),
                         IngressConfig::TcpForward(config) => (
                             "tcp-forward",
                             config.listen().iter().map(ToString::to_string).collect(),

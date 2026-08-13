@@ -1149,7 +1149,9 @@ fn validate_server_security_config(security: &ServerSecurityConfig) -> Result<()
 
 fn validate_ingress(ingress: &IngressConfig) -> Result<(), ConfigError> {
     match ingress {
-        IngressConfig::Socks5 { listen, .. } | IngressConfig::HttpConnect { listen, .. } => {
+        IngressConfig::Socks5 { listen, .. }
+        | IngressConfig::HttpConnect { listen, .. }
+        | IngressConfig::Mixed { listen, .. } => {
             if listen.is_empty() {
                 return Err(ConfigError::NoListenAddresses);
             }

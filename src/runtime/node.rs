@@ -15,6 +15,7 @@ use crate::dns::DnsGeneration;
 use crate::platform::{PacketDeviceProvider, SystemPacketDeviceProvider};
 use crate::runtime::config_control::RuntimeConfigControl;
 use crate::runtime::error::RuntimeError;
+use crate::runtime::host_control::RuntimeHostControl;
 use crate::runtime::readiness::{RuntimeGenerationControl, RuntimeGenerationStopReason};
 use crate::transport::{
     CarrierNetworkProvider, CarrierResolutionFuture, CarrierResolutionRequest,
@@ -160,6 +161,7 @@ pub(crate) async fn run_with_generation_control(
         CarrierResolutionAuthority::ProductDns,
         Arc::new(SystemNativeSocketConfigurator),
         None,
+        None,
         generation,
     )
     .await
@@ -176,6 +178,7 @@ pub(crate) async fn run_with_config_control(
         Arc::new(SystemCarrierNetworkProvider),
         CarrierResolutionAuthority::ProductDns,
         Arc::new(SystemNativeSocketConfigurator),
+        None,
         Some(config_control),
         generation,
     )
@@ -196,6 +199,7 @@ pub(crate) async fn run_with_all_host_providers_and_config_control(
         carrier_network,
         CarrierResolutionAuthority::Host,
         native_sockets,
+        None,
         Some(config_control),
         generation,
     )
@@ -215,6 +219,7 @@ pub(crate) async fn run_with_all_host_providers_and_generation_control(
         carrier_network,
         CarrierResolutionAuthority::Host,
         native_sockets,
+        None,
         None,
         generation,
     )
@@ -298,6 +303,50 @@ pub async fn run_with_vpn_host_providers(
     .await
 }
 
+/// Runs an embedded VPN generation with host-visible readiness, shutdown, and
+/// aggregate Product traffic counters.
+///
+/// This is the controlled counterpart of [`run_with_vpn_host_providers`]. The
+/// supplied control must have been created for this same configuration with
+/// [`RuntimeHostControl::for_config`]. A host can await the actual listener
+/// startup barrier before publishing the VPN as connected, and request a
+/// cooperative shutdown without relying on process signals.
+pub async fn run_with_vpn_host_providers_and_control(
+    config: AppConfig,
+    packet_devices: Arc<dyn PacketDeviceProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
+    socket_protector: Arc<dyn HostSocketProtector>,
+    control: RuntimeHostControl,
+) -> Result<(), RuntimeError> {
+    require_external_tun_host(&config)?;
+    require_protectable_vpn_dns(&config)?;
+    if control.active_flow_capacity()
+        != crate::runtime::telemetry::active_flow_detail_capacity(config.resources.max_streams)
+    {
+        return Err(RuntimeError::Protocol(
+            "runtime host control was created for a different resource envelope",
+        ));
+    }
+    let carrier_network: Arc<dyn CarrierNetworkProvider> = Arc::new(
+        ProtectedCarrierNetworkProvider::new(carrier_network, socket_protector.clone()),
+    );
+    let native_sockets: Arc<dyn NativeSocketConfigurator> =
+        Arc::new(ProtectedNativeSocketConfigurator::new(socket_protector));
+    public_runtime_result(
+        run_with_generation_and_host_providers(
+            config,
+            packet_devices,
+            carrier_network,
+            CarrierResolutionAuthority::Host,
+            native_sockets,
+            Some(control.telemetry()),
+            None,
+            control.generation(),
+        )
+        .await,
+    )
+}
+
 /// Runs with independent host adapters for packet devices, MPP carriers, and
 /// native target/proxy/DNS sockets. Embedded VPNs should prefer
 /// [`run_with_vpn_host_providers`], which derives both socket adapters from one
@@ -355,6 +404,7 @@ async fn run_validated_public_generation(
             carrier_resolution_authority,
             native_sockets,
             None,
+            None,
             RuntimeGenerationControl::new(),
         )
         .await,
@@ -389,12 +439,14 @@ fn require_protectable_vpn_dns(config: &AppConfig) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_with_generation_and_host_providers(
     config: AppConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
     carrier_network: Arc<dyn CarrierNetworkProvider>,
     carrier_resolution_authority: CarrierResolutionAuthority,
     native_sockets: Arc<dyn NativeSocketConfigurator>,
+    product_telemetry: Option<crate::runtime::telemetry::RuntimeTelemetry>,
     config_control: Option<RuntimeConfigControl>,
     generation: RuntimeGenerationControl,
 ) -> RuntimeGenerationOutcome {
@@ -413,6 +465,7 @@ async fn run_with_generation_and_host_providers(
             native_sockets,
             config_control,
             generation: generation.clone(),
+            product_telemetry,
         },
     )
     .await;

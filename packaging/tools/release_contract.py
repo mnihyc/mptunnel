@@ -28,6 +28,8 @@ COMMON_ARCHIVE_FILES = frozenset(
         "examples/server.toml",
     }
 )
+ANDROID_JNI_BUNDLE_NAME = "android-jni"
+ANDROID_JNI_ABIS = ("arm64-v8a", "x86_64")
 
 
 class ReleaseContractError(ValueError):
@@ -107,6 +109,42 @@ class ReleaseTarget:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class AndroidJniBundle:
+    """One Android host archive containing the two supported JNI libraries."""
+
+    archive_format: str = "tar.gz"
+    os: str = "android"
+    binary_name: str = ""
+
+    @property
+    def package(self) -> str:
+        return f"{PRODUCT}-{PACKAGE_VERSION}-android-jni"
+
+    @property
+    def archive_name(self) -> str:
+        return f"{self.package}.{self.archive_format}"
+
+    @property
+    def expected_files(self) -> frozenset[str]:
+        libraries = {
+            f"{abi}/libmptunnel.so"
+            for abi in ANDROID_JNI_ABIS
+        }
+        return frozenset({"LICENSE", "README.md", *libraries})
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": ANDROID_JNI_BUNDLE_NAME,
+            "version": PACKAGE_VERSION,
+            "os": self.os,
+            "abis": list(ANDROID_JNI_ABIS),
+            "package": self.package,
+            "archive_name": self.archive_name,
+            "archive_format": self.archive_format,
+        }
+
+
 RELEASE_TARGETS = (
     ReleaseTarget("x86_64-unknown-linux-musl", "linux", "amd64", "tar.gz"),
     ReleaseTarget("aarch64-unknown-linux-musl", "linux", "arm64", "tar.gz"),
@@ -116,6 +154,8 @@ RELEASE_TARGETS = (
     ReleaseTarget("aarch64-apple-darwin", "macos", "arm64", "zip"),
     ReleaseTarget("aarch64-linux-android", "android", "arm64", "tar.gz"),
 )
+ANDROID_JNI_BUNDLE = AndroidJniBundle()
+ReleaseBundle = ReleaseTarget | AndroidJniBundle
 TARGET_BY_RUST_TRIPLE = {target.rust_target: target for target in RELEASE_TARGETS}
 if len(TARGET_BY_RUST_TRIPLE) != len(RELEASE_TARGETS):
     raise AssertionError("release target triples must be unique")
@@ -131,8 +171,23 @@ def target_for_rust_triple(rust_target: str) -> ReleaseTarget:
         ) from error
 
 
+def bundle_for_name(name: str) -> ReleaseBundle:
+    if name == ANDROID_JNI_BUNDLE_NAME:
+        return ANDROID_JNI_BUNDLE
+    raise ReleaseContractError(
+        f"unsupported release bundle {name!r}; expected {ANDROID_JNI_BUNDLE_NAME!r}"
+    )
+
+
 def archive_asset_names() -> tuple[str, ...]:
-    return tuple(sorted(target.archive_name for target in RELEASE_TARGETS))
+    return tuple(
+        sorted(
+            (
+                *(target.archive_name for target in RELEASE_TARGETS),
+                ANDROID_JNI_BUNDLE.archive_name,
+            )
+        )
+    )
 
 
 def public_asset_names() -> tuple[str, ...]:
@@ -266,9 +321,9 @@ def verify_version_asset(path: pathlib.Path) -> None:
     ):
         raise ReleaseContractError("release version metadata has an invalid commit")
     assets = metadata["assets"]
-    if not isinstance(assets, list) or len(assets) != len(RELEASE_TARGETS):
+    if not isinstance(assets, list) or len(assets) != len(archive_asset_names()):
         raise ReleaseContractError(
-            "release version metadata must index exactly seven bundles"
+            "release version metadata must index exactly eight bundles"
         )
     expected_names = archive_asset_names()
     actual_names: list[str] = []
@@ -327,6 +382,15 @@ def parse_args() -> argparse.Namespace:
 
     subparsers.add_parser("targets", help="list supported Rust target triples")
 
+    jni_parser = subparsers.add_parser(
+        "android-jni", help="describe the Android JNI release bundle"
+    )
+    jni_parser.add_argument(
+        "--format",
+        choices=("json", "tsv"),
+        default="json",
+    )
+
     subparsers.add_parser("assets", help="list normalized public release assets")
 
     version_parser = subparsers.add_parser(
@@ -366,6 +430,19 @@ def main() -> None:
         elif args.command == "targets":
             for target in RELEASE_TARGETS:
                 print(target.rust_target)
+        elif args.command == "android-jni":
+            if args.format == "json":
+                print(json.dumps(ANDROID_JNI_BUNDLE.as_dict(), sort_keys=True))
+            else:
+                print(
+                    "\t".join(
+                        (
+                            ANDROID_JNI_BUNDLE.package,
+                            ANDROID_JNI_BUNDLE.archive_name,
+                            ANDROID_JNI_BUNDLE.archive_format,
+                        )
+                    )
+                )
         elif args.command == "assets":
             print("\n".join(public_asset_names()))
         elif args.command == "write-version":

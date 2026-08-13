@@ -10,8 +10,9 @@ use crate::runtime::error::RuntimeError;
 #[cfg(test)]
 use crate::runtime::ingress_runtime::probe_tcp_client_path;
 use crate::runtime::ingress_runtime::{
-    probe_udp_client_path, spawn_http_connect_client_ingress, spawn_socks5_client_ingress,
-    spawn_tcp_forward_client_ingress, spawn_udp_forward_client_ingress,
+    probe_udp_client_path, spawn_http_connect_client_ingress, spawn_mixed_client_ingress,
+    spawn_socks5_client_ingress, spawn_tcp_forward_client_ingress,
+    spawn_udp_forward_client_ingress,
 };
 use crate::runtime::path::tcp::group::ClientTcpMemberRetry;
 use crate::runtime::path::{ClientPathContext, ClientPathRuntimeOptions};
@@ -77,6 +78,24 @@ pub(super) async fn spawn_ingresses(
                 let ingress_readiness = readiness.require("HTTP CONNECT ingress listeners");
                 spawn_http_connect_client_ingress(
                     listen,
+                    router,
+                    inbound,
+                    proxy_auth,
+                    admission,
+                    ingress_readiness,
+                    tasks,
+                )
+                .await?;
+            }
+            IngressConfig::Mixed {
+                listen,
+                proxy_auth,
+                admission,
+            } => {
+                let ingress_readiness = readiness.require("mixed proxy ingress listeners");
+                spawn_mixed_client_ingress(
+                    listen,
+                    mux_limits,
                     router,
                     inbound,
                     proxy_auth,

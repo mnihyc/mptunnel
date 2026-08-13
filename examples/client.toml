@@ -42,8 +42,9 @@ upstreams = ["system"]
 # allow_peer_diagnostics = false
 
 [[inbounds]]
-name = "local-socks"
-protocol = "socks5"
+name = "local-proxy"
+# One port accepts SOCKS5 (including UDP) plus HTTP CONNECT and cleartext forwarding.
+protocol = "mixed"
 listen = ["127.0.0.1:1080"]
 
 [[outbounds]]

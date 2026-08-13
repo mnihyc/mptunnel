@@ -7,6 +7,7 @@ mod config_control;
 mod datagram;
 mod error;
 mod gateway;
+mod host_control;
 mod identity;
 mod ingress_runtime;
 mod management;
@@ -27,6 +28,10 @@ mod tun_l4;
 pub(crate) use config_control::RuntimeConfigControl;
 pub use datagram::{client_udp_datagram_round_trip, client_udp_datagram_round_trip_with_provider};
 pub use error::RuntimeError;
+pub use host_control::{
+    RuntimeHostControl, RuntimeHostFlowStats, RuntimeHostIoStats, RuntimeHostPhase,
+    RuntimeHostReadinessError, RuntimeHostStats,
+};
 pub(crate) use node::{
     RuntimeGenerationOutcome, run_with_all_host_providers_and_config_control,
     run_with_all_host_providers_and_generation_control, run_with_config_control,
@@ -34,7 +39,7 @@ pub(crate) use node::{
 };
 pub use node::{
     run, run_with_all_host_providers, run_with_host_providers, run_with_packet_device_provider,
-    run_with_vpn_host_providers,
+    run_with_vpn_host_providers, run_with_vpn_host_providers_and_control,
 };
 pub(crate) use readiness::RuntimeGenerationControl;
 #[cfg(test)]

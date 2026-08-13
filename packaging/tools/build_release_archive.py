@@ -14,7 +14,8 @@ import zipfile
 
 from release_contract import (
     ReleaseContractError,
-    ReleaseTarget,
+    ReleaseBundle,
+    bundle_for_name,
     expected_directories,
     target_for_rust_triple,
 )
@@ -24,7 +25,7 @@ DEFAULT_SOURCE_DATE_EPOCH = 315_532_800  # 1980-01-01, ZIP's minimum timestamp.
 MAX_ZIP_EPOCH = 4_354_819_198  # 2107-12-31 23:59:58 UTC.
 
 
-def archive_mode(target: ReleaseTarget, relative: str, *, directory: bool) -> int:
+def archive_mode(target: ReleaseBundle, relative: str, *, directory: bool) -> int:
     if directory:
         return 0o755
     if relative == target.binary_name and target.os != "windows":
@@ -32,7 +33,7 @@ def archive_mode(target: ReleaseTarget, relative: str, *, directory: bool) -> in
     return 0o644
 
 
-def validate_stage(stage: pathlib.Path, target: ReleaseTarget) -> None:
+def validate_stage(stage: pathlib.Path, target: ReleaseBundle) -> None:
     if not stage.is_dir():
         raise ReleaseContractError(f"release staging directory does not exist: {stage}")
     if stage.name != target.package:
@@ -92,7 +93,7 @@ def stage_entries(stage: pathlib.Path) -> list[tuple[pathlib.Path, str, bool]]:
 def build_tar_gz(
     stage: pathlib.Path,
     archive: pathlib.Path,
-    target: ReleaseTarget,
+    target: ReleaseBundle,
     epoch: int,
 ) -> None:
     with archive.open("wb") as output:
@@ -135,7 +136,7 @@ def build_tar_gz(
 def build_zip(
     stage: pathlib.Path,
     archive: pathlib.Path,
-    target: ReleaseTarget,
+    target: ReleaseBundle,
     epoch: int,
 ) -> None:
     zip_epoch = min(max(epoch, DEFAULT_SOURCE_DATE_EPOCH), MAX_ZIP_EPOCH)
@@ -176,7 +177,7 @@ def build_zip(
 def build_archive(
     stage: pathlib.Path,
     archive: pathlib.Path,
-    target: ReleaseTarget,
+    target: ReleaseBundle,
     epoch: int,
 ) -> None:
     validate_stage(stage, target)
@@ -206,7 +207,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", type=pathlib.Path, required=True)
     parser.add_argument("--archive", type=pathlib.Path, required=True)
-    parser.add_argument("--target", required=True)
+    selector = parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--target")
+    selector.add_argument("--bundle", choices=("android-jni",))
     parser.add_argument(
         "--source-date-epoch",
         type=int,
@@ -218,7 +221,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     try:
-        target = target_for_rust_triple(args.target)
+        target = (
+            target_for_rust_triple(args.target)
+            if args.target is not None
+            else bundle_for_name(args.bundle)
+        )
         build_archive(
             args.stage,
             args.archive,

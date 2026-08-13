@@ -1,9 +1,10 @@
 # MPTUNNEL release package
 
-Each archive contains one MPTUNNEL command-line binary, two editable
+Each CLI archive contains one MPTUNNEL command-line binary, two editable
 client/server examples, and this package guide. It is the same MPTUNNEL binary
 for client and server use. Windows archives additionally contain the signed,
-architecture-matched Wintun runtime and its required license.
+architecture-matched Wintun runtime and its required license. The separate
+Android JNI archive has its exact contents documented below.
 
 ## First run
 
@@ -111,8 +112,10 @@ and DNS publication still require the host adapter described by `mptunnel
 platform`.
 
 MPTUNNEL is a foreground console process on Windows. A native Windows Service
-wrapper and installer are not included. The Android archive is a command-line
-binary, not an APK or one-click `VpnService` application. Android VPN hosts
+wrapper and installer are not included. The Android CLI archive is not an APK
+or one-click `VpnService` application. The separate Android JNI archive
+contains the `arm64-v8a` and `x86_64` `libmptunnel.so` libraries for an
+embedding application. Android VPN hosts
 must establish the TUN descriptor, bind carrier sockets to the selected
 network, protect every carrier, target, proxy, and DNS socket before I/O, and
 use external TUN host mode. Low-level host-provider APIs reject process-managed
@@ -129,10 +132,11 @@ Every release uses versioned bundle names:
 - `mptunnel-<version>-macos-amd64.zip`
 - `mptunnel-<version>-macos-arm64.zip`
 - `mptunnel-<version>-android-arm64.tar.gz`
+- `mptunnel-<version>-android-jni.tar.gz`
 
 The release's `version.json` records its schema, product, version, tag, source
 commit, and the exact name and tag-specific GitHub download URL of every
-bundle. GitHub supplies the digest for each uploaded asset. The extracted
+bundle. GitHub supplies the digest for each uploaded asset. Each extracted CLI
 binary also reports its version with `--version`.
 
 Once a draft is published, GitHub release immutability freezes its tag, title,

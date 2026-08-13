@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "mptunnel"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1390,6 +1390,7 @@ dependencies = [
  "httparse",
  "idna",
  "ipnet",
+ "jni",
  "libc",
  "netstack-smoltcp",
  "percent-encoding",

@@ -26,13 +26,15 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, hash_map::Entry};
 use std::future::pending;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Semaphore, mpsc};
 
-const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_PROXY_HEADER_BYTES: usize = 64 * 1024;
 const ROUTE_DROP_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTE_DROP_READ_BUFFER_BYTES: usize = 4 * 1024;
 
@@ -245,6 +247,205 @@ async fn run_socks5_client_listener(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener composition boundary transfers each independent Product owner"
+)]
+pub(super) async fn spawn_mixed_client_ingress(
+    listen: Vec<SocketAddr>,
+    mux_limits: MuxLimits,
+    router: ClientIngressRouter,
+    inbound: InboundId,
+    proxy_auth: ProxyAuthConfig,
+    admission: LocalIngressAdmissionConfig,
+    readiness: RequiredServiceReadiness,
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+) -> Result<(), RuntimeError> {
+    let mut bound = Vec::with_capacity(listen.len());
+    for addr in listen {
+        bound.push(TcpListener::bind(addr).await?);
+    }
+    if bound.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "mixed proxy ingress has no listener tasks",
+        ));
+    }
+    let admission = LocalIngressAdmission::new(admission);
+    for listener in bound {
+        let local_address = listener.local_addr()?;
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "inbound",
+            "listening",
+            format_args!("{inbound}: mixed SOCKS5/HTTP proxy listening on {local_address}"),
+        );
+        let router = router.clone();
+        let inbound = inbound.clone();
+        let proxy_auth = proxy_auth.clone();
+        let admission = admission.clone();
+        services.spawn(async move {
+            run_mixed_client_listener(listener, mux_limits, router, inbound, proxy_auth, admission)
+                .await
+        });
+    }
+    readiness.ready();
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixedIngressProtocol {
+    Socks5,
+    HttpProxy,
+}
+
+fn classify_mixed_ingress_byte(first: u8) -> Result<MixedIngressProtocol, RuntimeError> {
+    match first {
+        0x05 => Ok(MixedIngressProtocol::Socks5),
+        byte if byte.is_ascii_alphabetic() => Ok(MixedIngressProtocol::HttpProxy),
+        _ => Err(RuntimeError::Protocol(
+            "mixed proxy connection uses an unsupported protocol",
+        )),
+    }
+}
+
+async fn detect_mixed_ingress_protocol(
+    stream: &TcpStream,
+    handshake_deadline: tokio::time::Instant,
+) -> Result<MixedIngressProtocol, RuntimeError> {
+    let mut first = [0_u8; 1];
+    let received = tokio::time::timeout_at(handshake_deadline, stream.peek(&mut first))
+        .await
+        .map_err(|_| RuntimeError::Protocol("mixed proxy protocol detection timed out"))??;
+    if received == 0 {
+        return Err(RuntimeError::Protocol(
+            "mixed proxy connection closed before protocol detection",
+        ));
+    }
+    classify_mixed_ingress_byte(first[0])
+}
+
+async fn run_mixed_client_listener(
+    listener: TcpListener,
+    mux_limits: MuxLimits,
+    router: ClientIngressRouter,
+    inbound: InboundId,
+    proxy_auth: ProxyAuthConfig,
+    admission: LocalIngressAdmission,
+) -> Result<(), RuntimeError> {
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, source) = accepted?;
+                stream.set_nodelay(true)?;
+                let permit = match admission.try_admit_source(source.ip()) {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        drop(stream);
+                        continue;
+                    }
+                };
+                let router = router.clone();
+                let inbound = inbound.clone();
+                let proxy_auth = proxy_auth.clone();
+                connections.spawn(async move {
+                    if let Err(err) = handle_mixed_client_stream(
+                        stream,
+                        mux_limits,
+                        router,
+                        inbound,
+                        source,
+                        proxy_auth,
+                        permit,
+                    )
+                    .await
+                    {
+                        crate::observability::process_event!(
+                            Warn,
+                            "mixed",
+                            "client_failed",
+                            "mixed proxy client handler failed: {err}"
+                        );
+                    }
+                });
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = result {
+                    crate::observability::process_event!(
+                        Warn,
+                        "mixed",
+                        "client_task_failed",
+                        "mixed proxy client handler task failed: {err}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::runtime) async fn run_mixed_client_listener_for_test(
+    listener: TcpListener,
+    mux_limits: MuxLimits,
+    router: ClientIngressRouter,
+    inbound: InboundId,
+    proxy_auth: ProxyAuthConfig,
+    admission: LocalIngressAdmissionConfig,
+) -> Result<(), RuntimeError> {
+    run_mixed_client_listener(
+        listener,
+        mux_limits,
+        router,
+        inbound,
+        proxy_auth,
+        LocalIngressAdmission::new(admission),
+    )
+    .await
+}
+
+async fn handle_mixed_client_stream(
+    stream: TcpStream,
+    mux_limits: MuxLimits,
+    router: ClientIngressRouter,
+    inbound: InboundId,
+    source: SocketAddr,
+    proxy_auth: ProxyAuthConfig,
+    permit: LocalIngressAdmissionPermit,
+) -> Result<(), RuntimeError> {
+    let handshake_deadline =
+        tokio::time::Instant::now() + permit.admission.limits.handshake_timeout();
+    let protocol = detect_mixed_ingress_protocol(&stream, handshake_deadline).await?;
+    match protocol {
+        MixedIngressProtocol::Socks5 => {
+            let udp_relay_ip = stream.local_addr()?.ip();
+            handle_socks5_client_stream_until(
+                stream,
+                mux_limits,
+                router,
+                inbound,
+                source,
+                proxy_auth,
+                udp_relay_ip,
+                permit,
+                handshake_deadline,
+            )
+            .await
+        }
+        MixedIngressProtocol::HttpProxy => {
+            handle_http_connect_client_stream_until(
+                stream,
+                router,
+                inbound,
+                source,
+                proxy_auth,
+                permit,
+                handshake_deadline,
+            )
+            .await
+        }
+    }
+}
+
 pub(super) async fn spawn_http_connect_client_ingress(
     listen: Vec<SocketAddr>,
     router: ClientIngressRouter,
@@ -260,7 +461,7 @@ pub(super) async fn spawn_http_connect_client_ingress(
     }
     if bound.is_empty() {
         return Err(RuntimeError::Protocol(
-            "HTTP CONNECT ingress has no listener tasks",
+            "HTTP proxy ingress has no listener tasks",
         ));
     }
     let admission = LocalIngressAdmission::new(admission);
@@ -270,7 +471,7 @@ pub(super) async fn spawn_http_connect_client_ingress(
             crate::config::LogLevel::Info,
             "inbound",
             "listening",
-            format_args!("{inbound}: HTTP CONNECT listening on {local_address}"),
+            format_args!("{inbound}: HTTP proxy listening on {local_address}"),
         );
         let router = router.clone();
         let inbound = inbound.clone();
@@ -323,7 +524,7 @@ async fn run_http_connect_client_listener(
                             Warn,
                             "http_connect",
                             "client_failed",
-                            "HTTP CONNECT client handler failed: {err}"
+                            "HTTP proxy client handler failed: {err}"
                         );
                     }
                 });
@@ -334,12 +535,30 @@ async fn run_http_connect_client_listener(
                         Warn,
                         "http_connect",
                         "client_task_failed",
-                        "HTTP CONNECT client handler task failed: {err}"
+                        "HTTP proxy client handler task failed: {err}"
                     );
                 }
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(in crate::runtime) async fn run_http_connect_client_listener_for_test(
+    listener: TcpListener,
+    router: ClientIngressRouter,
+    inbound: InboundId,
+    proxy_auth: ProxyAuthConfig,
+    admission: LocalIngressAdmissionConfig,
+) -> Result<(), RuntimeError> {
+    run_http_connect_client_listener(
+        listener,
+        router,
+        inbound,
+        proxy_auth,
+        LocalIngressAdmission::new(admission),
+    )
+    .await
 }
 
 pub(super) async fn spawn_tcp_forward_client_ingress(
@@ -787,6 +1006,39 @@ where
     reason = "the accepted-connection actor keeps immutable ingress identity and admission ownership explicit"
 )]
 pub(super) async fn handle_socks5_client_stream_with_auth<S>(
+    stream: S,
+    mux_limits: MuxLimits,
+    router: ClientIngressRouter,
+    inbound: InboundId,
+    source: SocketAddr,
+    proxy_auth: ProxyAuthConfig,
+    udp_relay_ip: IpAddr,
+    admission_permit: LocalIngressAdmissionPermit,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let handshake_deadline =
+        tokio::time::Instant::now() + admission_permit.admission.limits.handshake_timeout();
+    handle_socks5_client_stream_until(
+        stream,
+        mux_limits,
+        router,
+        inbound,
+        source,
+        proxy_auth,
+        udp_relay_ip,
+        admission_permit,
+        handshake_deadline,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the accepted-connection actor keeps immutable ingress identity, admission, and its absolute handshake deadline explicit"
+)]
+async fn handle_socks5_client_stream_until<S>(
     mut stream: S,
     mux_limits: MuxLimits,
     router: ClientIngressRouter,
@@ -795,12 +1047,11 @@ pub(super) async fn handle_socks5_client_stream_with_auth<S>(
     proxy_auth: ProxyAuthConfig,
     udp_relay_ip: IpAddr,
     mut admission_permit: LocalIngressAdmissionPermit,
+    handshake_deadline: tokio::time::Instant,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let handshake_deadline =
-        tokio::time::Instant::now() + admission_permit.admission.limits.handshake_timeout();
     let principal = tokio::time::timeout_at(
         handshake_deadline,
         authenticate_socks5_client(&mut stream, &proxy_auth),
@@ -915,24 +1166,51 @@ where
 }
 
 pub(super) async fn handle_http_connect_client_stream_with_auth<S>(
+    stream: S,
+    router: ClientIngressRouter,
+    inbound: InboundId,
+    source: SocketAddr,
+    proxy_auth: ProxyAuthConfig,
+    admission_permit: LocalIngressAdmissionPermit,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let handshake_deadline =
+        tokio::time::Instant::now() + admission_permit.admission.limits.handshake_timeout();
+    handle_http_connect_client_stream_until(
+        stream,
+        router,
+        inbound,
+        source,
+        proxy_auth,
+        admission_permit,
+        handshake_deadline,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the accepted-connection actor keeps immutable ingress identity, admission, and its absolute handshake deadline explicit"
+)]
+async fn handle_http_connect_client_stream_until<S>(
     mut stream: S,
     router: ClientIngressRouter,
     inbound: InboundId,
     source: SocketAddr,
     proxy_auth: ProxyAuthConfig,
     mut admission_permit: LocalIngressAdmissionPermit,
+    handshake_deadline: tokio::time::Instant,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = tokio::time::timeout(
-        admission_permit.admission.limits.handshake_timeout(),
-        read_http_connect(&mut stream),
-    )
-    .await
-    .map_err(|_| RuntimeError::Protocol("HTTP CONNECT request header timed out"))??;
+    let request = tokio::time::timeout_at(handshake_deadline, read_http_proxy_request(&mut stream))
+        .await
+        .map_err(|_| RuntimeError::Protocol("HTTP proxy request header timed out"))??;
     let principal = if proxy_auth.is_required() {
-        match proxy_auth.authenticate_basic_header(request.proxy_authorization.as_deref()) {
+        match proxy_auth.authenticate_basic_header(request.proxy_authorization()) {
             Some(principal) => principal,
             None => {
                 stream
@@ -950,7 +1228,7 @@ where
     admission_permit
         .admit_principal(&principal)
         .map_err(RuntimeError::Protocol)?;
-    let target = request.target;
+    let target = request.target().clone();
     let route = router.route_tcp(&target, source, principal, inbound)?;
     let plan = match route {
         ClientRoute::Open(plan) => plan,
@@ -980,13 +1258,110 @@ where
             return Err(err);
         }
     };
-    let result = async {
-        stream.write_all(http_connect::success_response()).await?;
-        stream.flush().await?;
-        relay_opened_tcp(stream, opened).await
-    }
-    .await;
+    let result = match request {
+        http_connect::HttpProxyRequest::Connect(_) => {
+            stream.write_all(http_connect::success_response()).await?;
+            stream.flush().await?;
+            relay_opened_tcp(stream, opened).await
+        }
+        http_connect::HttpProxyRequest::Forward(request) => {
+            relay_opened_tcp(
+                HttpForwardClient::new(stream, request.rewritten_header, request.body_len),
+                opened,
+            )
+            .await
+        }
+    };
     result.map(|_| ())
+}
+
+/// Presents one sanitized HTTP request as the client-to-origin byte stream.
+///
+/// Reads stop after the declared body, so pipelined proxy requests and their
+/// credentials cannot cross the already-selected origin connection. Writes
+/// remain connected to the client until the origin closes its forced-close
+/// response.
+struct HttpForwardClient<S> {
+    stream: S,
+    rewritten_header: Vec<u8>,
+    header_offset: usize,
+    body_remaining: u64,
+}
+
+impl<S> HttpForwardClient<S> {
+    fn new(stream: S, rewritten_header: Vec<u8>, body_len: u64) -> Self {
+        Self {
+            stream,
+            rewritten_header,
+            header_offset: 0,
+            body_remaining: body_len,
+        }
+    }
+}
+
+impl<S> AsyncRead for HttpForwardClient<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.header_offset < this.rewritten_header.len() {
+            let available = &this.rewritten_header[this.header_offset..];
+            let copied = available.len().min(buf.remaining());
+            buf.put_slice(&available[..copied]);
+            this.header_offset += copied;
+            return Poll::Ready(Ok(()));
+        }
+        if this.body_remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let limit = usize::try_from(this.body_remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.remaining());
+        let mut limited = buf.take(limit);
+        let buffer_start = limited.filled().as_ptr();
+        match Pin::new(&mut this.stream).poll_read(cx, &mut limited) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {
+                assert_eq!(limited.filled().as_ptr(), buffer_start);
+                let read = limited.filled().len();
+                // The nested ReadBuf covers the outer buffer's unfilled region.
+                unsafe {
+                    buf.assume_init(read);
+                }
+                buf.advance(read);
+                this.body_remaining -= read as u64;
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for HttpForwardClient<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
 }
 
 async fn apply_socks5_policy_disposition<S>(
@@ -1499,22 +1874,22 @@ where
     Ok(command)
 }
 
-pub(super) async fn read_http_connect<S>(
+pub(super) async fn read_http_proxy_request<S>(
     stream: &mut S,
-) -> Result<http_connect::ConnectRequest, RuntimeError>
+) -> Result<http_connect::HttpProxyRequest, RuntimeError>
 where
     S: AsyncRead + Unpin,
 {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        if buf.len() >= MAX_HTTP_CONNECT_HEADER_BYTES {
+        if buf.len() >= MAX_HTTP_PROXY_HEADER_BYTES {
             return Err(RuntimeError::HttpConnect(HttpConnectError::HeaderTooLarge));
         }
         stream.read_exact(&mut byte).await?;
         buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {
-            return Ok(http_connect::parse_connect_request(&buf)?);
+            return Ok(http_connect::parse_proxy_request(&buf)?);
         }
     }
 }

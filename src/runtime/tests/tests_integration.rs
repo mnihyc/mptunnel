@@ -1503,6 +1503,223 @@ async fn path_probe_skips_udp_path_with_active_session() {
 }
 
 #[tokio::test]
+async fn mixed_ingress_dispatches_socks5_tcp_udp_and_http_connect_on_one_listener() {
+    let (target_addr, target) = spawn_echo_target_count(2).await;
+    let (udp_target_addr, udp_target) = spawn_udp_echo_target().await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mixed ingress");
+    let listen_addr = listener.local_addr().expect("mixed ingress address");
+    let mixed = tokio::spawn(run_mixed_client_listener_for_test(
+        listener,
+        MuxLimits::default(),
+        local_port_forward_router(),
+        crate::product::InboundId::parse("local-mixed").expect("mixed inbound ID"),
+        crate::ingress::ProxyAuthConfig::disabled(),
+        crate::ingress::LocalIngressAdmissionConfig::default(),
+    ));
+
+    let mut socks_client = TcpStream::connect(listen_addr)
+        .await
+        .expect("connect SOCKS5 client to mixed ingress");
+    open_socks5_tcp_tunnel(&mut socks_client, target_addr).await;
+    socks_client
+        .write_all(b"ping")
+        .await
+        .expect("write SOCKS5 payload");
+    socks_client
+        .shutdown()
+        .await
+        .expect("finish SOCKS5 request");
+    let mut socks_reply = [0_u8; 4];
+    socks_client
+        .read_exact(&mut socks_reply)
+        .await
+        .expect("read SOCKS5 reply");
+    assert_eq!(&socks_reply, b"pong");
+    drop(socks_client);
+
+    let mut http_client = TcpStream::connect(listen_addr)
+        .await
+        .expect("connect HTTP client to mixed ingress");
+    http_client
+        .write_all(
+            format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .expect("write HTTP CONNECT request");
+    let mut response = vec![0_u8; http_connect::success_response().len()];
+    http_client
+        .read_exact(&mut response)
+        .await
+        .expect("read HTTP CONNECT response");
+    assert_eq!(response, http_connect::success_response());
+    http_client
+        .write_all(b"ping")
+        .await
+        .expect("write HTTP tunnel payload");
+    http_client
+        .shutdown()
+        .await
+        .expect("finish HTTP tunnel request");
+    let mut http_reply = [0_u8; 4];
+    http_client
+        .read_exact(&mut http_reply)
+        .await
+        .expect("read HTTP tunnel reply");
+    assert_eq!(&http_reply, b"pong");
+    drop(http_client);
+
+    let mut udp_control = TcpStream::connect(listen_addr)
+        .await
+        .expect("connect SOCKS5 UDP client to mixed ingress");
+    let udp_relay = open_socks5_udp_associate(&mut udp_control).await;
+    let udp_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind SOCKS5 UDP client");
+    send_socks5_udp_ping(&udp_client, udp_relay, udp_target_addr).await;
+    drop(udp_client);
+    drop(udp_control);
+
+    target.await.expect("target join");
+    udp_target.await.expect("UDP target join");
+    mixed.abort();
+    let _ = mixed.await;
+}
+
+#[tokio::test]
+async fn mixed_and_dedicated_http_ingresses_forward_one_sanitized_absolute_request() {
+    async fn send_forward_request(proxy: SocketAddr, origin: SocketAddr, label: &str) -> Vec<u8> {
+        let mut client = TcpStream::connect(proxy)
+            .await
+            .expect("connect to HTTP proxy ingress");
+        let request = format!(
+            "POST http://{origin}/{label}?source=android HTTP/1.1\r\n\
+Host: attacker.invalid\r\n\
+Proxy-Authorization: Basic b3BlcmF0b3I6c2VjcmV0\r\n\
+Proxy-Connection: keep-alive\r\n\
+Connection: keep-alive, X-Remove\r\n\
+X-Remove: private-hop\r\n\
+X-End-To-End: {label}\r\n\
+Content-Length: 4\r\n\r\n\
+ping\
+GET http://{origin}/must-not-forward HTTP/1.1\r\n\
+Proxy-Authorization: Basic bGVhazpjcmVkZW50aWFs\r\n\r\n"
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write absolute-form proxy request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read forwarded origin response");
+        response
+    }
+
+    let origin_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind HTTP origin");
+    let origin_addr = origin_listener.local_addr().expect("HTTP origin address");
+    let origin = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = origin_listener
+                .accept()
+                .await
+                .expect("accept origin request");
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 64 * 1024, "origin request header bound");
+                stream
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("read origin request header");
+                request.push(byte[0]);
+            }
+            let mut body = [0_u8; 4];
+            stream
+                .read_exact(&mut body)
+                .await
+                .expect("read origin request body");
+            request.extend_from_slice(&body);
+            let mut trailing = Vec::new();
+            stream
+                .read_to_end(&mut trailing)
+                .await
+                .expect("read bounded origin request end");
+            assert!(trailing.is_empty(), "pipelined proxy bytes reached origin");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .expect("write origin response");
+            stream.shutdown().await.expect("close origin response");
+            captured.push(request);
+        }
+        captured
+    });
+
+    let mixed_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mixed HTTP proxy");
+    let mixed_addr = mixed_listener.local_addr().expect("mixed proxy address");
+    let mixed = tokio::spawn(run_mixed_client_listener_for_test(
+        mixed_listener,
+        MuxLimits::default(),
+        local_port_forward_router(),
+        crate::product::InboundId::parse("mixed-http").expect("mixed inbound ID"),
+        local_proxy_auth(),
+        crate::ingress::LocalIngressAdmissionConfig::default(),
+    ));
+
+    let dedicated_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dedicated HTTP proxy");
+    let dedicated_addr = dedicated_listener
+        .local_addr()
+        .expect("dedicated proxy address");
+    let dedicated = tokio::spawn(run_http_connect_client_listener_for_test(
+        dedicated_listener,
+        local_port_forward_router(),
+        crate::product::InboundId::parse("dedicated-http").expect("dedicated inbound ID"),
+        local_proxy_auth(),
+        crate::ingress::LocalIngressAdmissionConfig::default(),
+    ));
+
+    let mixed_response = send_forward_request(mixed_addr, origin_addr, "mixed").await;
+    let dedicated_response = send_forward_request(dedicated_addr, origin_addr, "dedicated").await;
+    let expected_response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+    assert_eq!(mixed_response, expected_response);
+    assert_eq!(dedicated_response, expected_response);
+
+    let captured = origin.await.expect("origin join");
+    assert_eq!(captured.len(), 2);
+    for (request, label) in captured.iter().zip(["mixed", "dedicated"]) {
+        let request = std::str::from_utf8(request).expect("origin HTTP request");
+        assert!(request.starts_with(&format!(
+            "POST /{label}?source=android HTTP/1.1\r\nHost: {origin_addr}\r\n"
+        )));
+        assert!(request.contains(&format!("X-End-To-End: {label}\r\n")));
+        assert!(request.contains("Content-Length: 4\r\n"));
+        assert!(request.contains("Connection: close\r\n"));
+        assert!(request.ends_with("\r\n\r\nping"));
+        assert!(!request.contains("http://"));
+        assert!(!request.to_ascii_lowercase().contains("proxy-authorization"));
+        assert!(!request.to_ascii_lowercase().contains("proxy-connection"));
+        assert!(!request.contains("X-Remove"));
+        assert!(!request.contains("must-not-forward"));
+        assert!(!request.contains("bGVhazpjcmVkZW50aWFs"));
+    }
+
+    mixed.abort();
+    dedicated.abort();
+    let _ = mixed.await;
+    let _ = dedicated.await;
+}
+
+#[tokio::test]
 async fn socks5_ingress_relays_tcp_payload_over_encrypted_internal_stream() {
     let (target_addr, target) = spawn_echo_target().await;
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
@@ -2770,6 +2987,69 @@ async fn http_connect_ingress_relays_tcp_payload_over_encrypted_internal_stream(
         .expect("server join")
         .expect("server path");
     target.await.expect("target join");
+}
+
+#[tokio::test]
+async fn http_forward_ingress_relays_sanitized_request_over_encrypted_internal_stream() {
+    let origin_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind HTTP origin");
+    let origin_addr = origin_listener.local_addr().expect("HTTP origin address");
+    let origin = tokio::spawn(async move {
+        let (mut stream, _) = origin_listener.accept().await.expect("origin accept");
+        let mut request = Vec::new();
+        stream
+            .read_to_end(&mut request)
+            .await
+            .expect("origin request");
+        assert_eq!(
+            request,
+            format!(
+                "GET /over-mpp HTTP/1.1\r\nHost: {origin_addr}\r\nX-End-To-End: retained\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes()
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nMPP")
+            .await
+            .expect("origin response");
+        stream.shutdown().await.expect("origin shutdown");
+    });
+    let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+    let (mut client, server) = duplex(4096);
+    let handler = tokio::spawn(handle_http_connect_client_stream(server, context));
+
+    client
+        .write_all(
+            format!(
+                "GET http://{origin_addr}/over-mpp HTTP/1.1\r\n\
+Host: ignored.invalid\r\n\
+Proxy-Authorization: Basic cHJveHk6c2VjcmV0\r\n\
+X-End-To-End: retained\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("absolute-form request");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .await
+        .expect("proxy response");
+    assert_eq!(
+        response,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nMPP"
+    );
+
+    handler.await.expect("join").expect("handler");
+    server_path
+        .await
+        .expect("server join")
+        .expect("server path");
+    origin.await.expect("origin join");
 }
 
 #[tokio::test]

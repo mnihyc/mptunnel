@@ -31,6 +31,7 @@ pub(super) struct NodeRuntimeEnvironment {
     pub(super) native_sockets: Arc<dyn NativeSocketConfigurator>,
     pub(super) config_control: Option<RuntimeConfigControl>,
     pub(super) generation: RuntimeGenerationControl,
+    pub(super) product_telemetry: Option<RuntimeTelemetry>,
 }
 
 pub(super) async fn run(
@@ -47,6 +48,7 @@ pub(super) async fn run(
         native_sockets,
         config_control,
         generation,
+        product_telemetry,
     } = environment;
     let runtime_carrier_network = carrier_network.provider.clone();
     let readiness = RuntimeReadinessBarrier::new(generation.clone());
@@ -72,8 +74,9 @@ pub(super) async fn run(
             .map(|ingress| ingress.config.outbound.clone())
             .collect::<HashSet<_>>(),
     };
-    let product_telemetry =
-        RuntimeTelemetry::generation_owner(active_flow_detail_capacity(resources.max_streams));
+    let product_telemetry = product_telemetry.unwrap_or_else(|| {
+        RuntimeTelemetry::generation_owner(active_flow_detail_capacity(resources.max_streams))
+    });
     let mut services = tokio::task::JoinSet::new();
     let mut path_probe_services = Vec::new();
     let mut runtime_leaves = Vec::with_capacity(outbounds.len());

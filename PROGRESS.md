@@ -7075,3 +7075,185 @@ entry is authoritative.
   ordinary CI and the non-publishing Release Check on its SHA, then create the
   annotated immutable `v0.2.5` tag. The tag-triggered workflow alone owns the
   release and its assets.
+
+## 2026-08-12T18:01:01+08:00: v2rayNG Android MPP port study complete
+
+- Name: HEV/SOCKS core-substitution boundary
+- Category: Android integration architecture
+- State: preliminary study complete; no runtime or Android implementation made
+- Decision:
+  - retain `CoreVpnService` and `hev-socks5-tunnel` for the first port;
+  - replace Xray's loopback role with MPTUNNEL SOCKS5 CONNECT plus UDP
+    ASSOCIATE;
+  - use an arm64 packaged CLI only as a feasibility spike; and
+  - target a Rust `cdylib`/JNI controller for production lifecycle,
+    `VpnService.protect`, and Android network-specific MPP carrier binding.
+- Compatibility findings:
+  - the fork already defaults to HEV and starts Xray with no TUN descriptor in
+    that mode, so the local SOCKS listener is an exact narrow seam;
+  - MPTUNNEL's SOCKS implementation and focused encrypted TCP/UDP integration
+    tests cover HEV's required commands;
+  - v2rayNG assumes one port can serve both SOCKS and HTTP proxy consumers,
+    while MPTUNNEL exposes separate SOCKS and CONNECT-only HTTP listeners; and
+  - the fork currently retains one default Android `Network`, so true
+    simultaneous Wi-Fi/cellular paths require a JNI `CarrierNetworkProvider`,
+    not merely multiple configured carriers.
+- Packaging findings:
+  - MPTUNNEL currently ships Android arm64 CLI output only and has no JNI/AAR;
+  - the Android fork advertises arm64-v8a, armeabi-v7a, x86_64, and x86; and
+  - a production port needs four Rust targets, modern page-size checks, Cargo
+    notices, and awaited lifecycle tests.
+- Evidence:
+  - read-only source traces covered both `./` and `../v2rayNG-MPP/`;
+  - the focused locked SOCKS UDP-over-MPP tests passed for both UDP and
+    encrypted-TCP carrier variants; and
+  - the durable design, compatibility matrix, milestones, and exit criteria
+    are in `./docs-dev/V2RAYNG_ANDROID_MPP_PORT_STUDY.md`.
+
+## 2026-08-12T23:32:29+08:00: single-port mixed proxy ingress implemented
+
+- Name: mixed SOCKS5 and HTTP proxy compatibility listener
+- Category: Product ingress compatibility
+- State: implementation and focused verification complete
+- Follow-up: 2026-08-13T00:08:55+08:00 added safe absolute-form
+  cleartext HTTP forwarding after compatibility review.
+- Content:
+  - added strict TOML `protocol = "mixed"` with the same listener, local-user,
+    admission, routing, and management-inventory ownership as existing local
+    proxy ingresses;
+  - dispatches an accepted TCP connection by a non-consuming first-byte peek:
+    SOCKS5 version `0x05` or an alphabetic HTTP method prefix, with the HTTP
+    parser making the final CONNECT versus cleartext-forward decision;
+  - preserves one accept-anchored handshake deadline across protocol detection
+    and the selected protocol handler;
+  - accepts one absolute-form `http://` request per connection on both the mixed
+    and dedicated `http-connect` inbounds, rewrites it to origin-form with a
+    canonical Host header, strips proxy credentials and hop-by-hop headers,
+    forces connection close, and forwards exactly the declared Content-Length
+    body so pipelined credentials cannot cross the selected origin connection;
+  - rejects ambiguous body framing, Transfer-Encoding, user-info, fragments,
+    and absolute `https://` requests, which continue to require CONNECT; and
+  - changed the shipped client example to expose SOCKS5 CONNECT, SOCKS5 UDP
+    ASSOCIATE, HTTP CONNECT, and cleartext HTTP forwarding on
+    `127.0.0.1:1080`.
+- Evidence:
+  - focused configuration/default/authentication and shipped-document schema
+    tests pass under `--locked`;
+  - strict byte-classification test passes under `--locked`;
+  - an actual one-listener loopback runtime test passes SOCKS5 TCP, SOCKS5 UDP,
+    and HTTP CONNECT relay through the normal Product outbound pipeline;
+  - parser tests cover absolute-target rewriting, default port 80, header and
+    debug redaction, and rejection of unsafe framing;
+  - a two-listener capture-origin test passes the same authenticated POST
+    through mixed and dedicated HTTP listeners and proves a pipelined second
+    request and its credentials never reach the origin;
+  - a cleartext GET passes through the encrypted MPP stream relay with its
+    absolute target and proxy credential removed; and
+  - `cargo fmt --all -- --check`, `git diff --check`, and locked Clippy for the
+    library target pass with warnings denied.
+
+## 2026-08-13T01:24:00+08:00: Android JNI runtime host and four-ABI packaging implemented
+
+- Name: MPTUNNEL embedded Android core boundary
+- Category: Android integration implementation
+- State: source, host verification, and final combined four-ABI rebuild complete
+- Contract:
+  - builds one `libmptunnel.so` Rust `cdylib` and exports static JNI methods for
+    `com.v2ray.ang.mpp.MptunnelNative`: `nativeStart`, `nativeStop`,
+    `nativeIsRunning`, `nativeState`, `nativeVersion`, `nativeStatsJson`, and
+    `nativeDeleteProfile`;
+  - `nativeStart` takes the app's infrastructure-only `noBackupFilesDir`, an
+    opaque profile id, rendered TOML, four byte arrays in fixed order
+    `[credential, pinned certificate PEM, optional raw 32-byte transport
+    secret, optional local-proxy password]`, a synchronous
+    `SocketProtector.protect(int fd)` callback, and a listener-readiness timeout;
+  - substitutes the exact semantic material tokens with fixed relative
+    basenames, confines all file references, rejects unresolved tokens,
+    `*_file`, and literal `file` escape paths, writes private material files,
+    eagerly loads them through the existing strict TOML compiler, then removes
+    plaintext files before the runtime thread starts; and
+  - protects every MPTUNNEL-created carrier/target/proxy/DNS socket fail-closed
+    through `VpnService.protect`, exposes monotonic Product-boundary traffic
+    counters, and uses the existing runtime listener barrier for real readiness.
+- Lifecycle guarantees:
+  - only one generation can reserve/start at a time;
+  - `Starting -> Ready` and `Starting|Ready -> Stopping` are atomic, so
+    readiness cannot resurrect stopping state and stop/timeout cannot erase an
+    already terminal failure;
+  - stop requests the existing cooperative generation shutdown, waits within
+    its deadline, then deterministically joins/reaps that terminal worker and
+    cleans the private profile directory; and
+  - host status, error, version, and JSON aggregate stats cross JNI, while no
+    packet buffers or secret values do.
+- ABI/build contract:
+  - `./packaging/android/build-jni-libs.sh` builds and strips `arm64-v8a`,
+    `armeabi-v7a`, `x86_64`, and `x86` with API 24, locked Cargo dependencies,
+    explicit NDK linkers, and 16 KiB ELF `LOAD` alignment verification;
+  - the output can be directed to `../v2rayNG-MPP/V2rayNG/app/libs`, matching
+    the fork's existing `jniLibs.srcDirs("libs")`; and
+  - the exact JNI/material/build contract is documented in
+    `./packaging/android/README.md`.
+- Verification:
+  - host `cargo fmt --all -- --check`, `git diff --check`, and
+    `cargo clippy --locked --all-targets --all-features -- -D warnings` pass;
+  - all 8 focused Android bridge tests pass, including repeated concurrent
+    ready-versus-stop and failed-versus-stop transition races, token/presence
+    validation, path confinement, private material substitution, and cleanup;
+  - cross-checks passed for both `x86_64-linux-android` and
+    `aarch64-linux-android` with NDK r29/API 24; and
+  - the final combined source built all four stripped Android ELFs, exported
+    all seven JNI symbols, and passed 16 KiB alignment before the Android APK
+    and instrumentation runs.
+- Known follow-up:
+  - the first production seam retains `SystemCarrierNetworkProvider`; use a
+    literal server IP for catch-all VPN tests while preserving the TLS server
+    name. Domain resolution and true simultaneous Android `Network` binding
+    require a Java-backed `CarrierNetworkProvider` follow-up.
+
+## 2026-08-13T02:00:00+08:00: Final Android engine and application verification complete
+
+- Name: MPP Android delivery verification
+- Category: release evidence
+- State: complete
+- Native evidence:
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+    `cargo test --locked --all-features`, `cargo fmt --all -- --check`, and
+    `git diff --check` pass;
+  - the full Rust suite passes 1,533 library tests, classification and
+    daily-use acceptance integration tests, and doc tests; and
+  - `./packaging/android/build-jni-libs.sh` produced final API-24, NDK-r29,
+    16-KiB-aligned libraries for `arm64-v8a`, `armeabi-v7a`, `x86_64`, and
+    `x86`, which were staged into the Android fork.
+- Device evidence:
+  - the x86_64 Android 36 emulator test repeatedly completed five authenticated
+    start/SOCKS5/HTTP-407/stop/cleanup cycles against the real cdylib;
+  - the final x86_64 APK installed and cold-launched to its main activity with
+    no fatal exception or native-link failure; and
+  - the requested Android 36 arm64-v8a image and AVD were installed, but QEMU2
+    correctly refuses to execute that guest architecture on this x86_64 host.
+
+## 2026-08-13T10:26:04+08:00: v0.2.6 two-ABI Android JNI release contract prepared
+
+- Name: MPTUNNEL v0.2.6 Actions-owned Android JNI bundle
+- Category: Release packaging
+- State: source and CI contract complete; publication intentionally pending
+- Content:
+  - bumped the package and both locked workspace identities to `0.2.6`;
+  - preserved the seven existing CLI archives and added the deterministic
+    `mptunnel-0.2.6-android-jni.tar.gz` public asset;
+  - fixed its extracted inventory at `LICENSE`, `README.md`,
+    `arm64-v8a/libmptunnel.so`, and `x86_64/libmptunnel.so`;
+  - added tag-release and release-check jobs that install pinned NDK
+    `27.3.13750724`, export its exact path through `ANDROID_NDK_HOME`, and build
+    only the two requested Android Rust targets; and
+  - made the helper strip each ELF and require the expected ELF64 machine,
+    seven JNI exports, and at least 16 KiB `LOAD` alignment before deterministic
+    packaging and exact public inventory assembly.
+- Evidence:
+  - all 11 deterministic release-contract tests and the version-gate self-test
+    pass;
+  - Action workflow lint, shell syntax, Python compilation, Cargo formatting,
+    locked metadata for both workspaces, and all 8 focused Android bridge tests
+    pass; and
+  - no release library or public release bundle was built locally; GitHub
+    Actions remains the only production build and publication path.

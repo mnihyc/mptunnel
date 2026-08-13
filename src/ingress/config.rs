@@ -309,6 +309,12 @@ pub enum IngressConfig {
         proxy_auth: ProxyAuthConfig,
         admission: LocalIngressAdmissionConfig,
     },
+    /// One TCP listener that dispatches SOCKS5 and HTTP proxy requests.
+    Mixed {
+        listen: Vec<SocketAddr>,
+        proxy_auth: ProxyAuthConfig,
+        admission: LocalIngressAdmissionConfig,
+    },
     TcpForward(TcpForwardConfig),
     UdpForward(UdpForwardConfig),
     TunL4(TunL4Config),

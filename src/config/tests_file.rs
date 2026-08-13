@@ -1584,6 +1584,67 @@ outbound = "mpp-main"
 }
 
 #[test]
+fn mixed_inbound_uses_one_listener_and_shared_proxy_policy() {
+    let config = load_config_toml_str(
+        r#"
+[[local_users]]
+name = "phone-login"
+principal_id = "family"
+username = "mobile-user"
+password = { from = "file", path = "proxy-password.key" }
+
+[[inbounds]]
+name = "local-mixed"
+protocol = "mixed"
+local_users = ["phone-login"]
+
+[inbounds.admission]
+max_connections = 40
+max_connections_per_source = 20
+max_connections_per_principal = 10
+handshake_timeout_ms = 5000
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+action = "outbound"
+outbound = "direct"
+"#,
+    )
+    .expect("mixed inbound config");
+
+    let CommandConfig::Node(node) = config.command;
+    assert_eq!(node.local_ingresses[0].name, "local-mixed");
+    let IngressConfig::Mixed {
+        listen,
+        proxy_auth,
+        admission,
+    } = &node.local_ingresses[0].config
+    else {
+        panic!("expected mixed inbound");
+    };
+    assert_eq!(
+        listen,
+        &["127.0.0.1:1080".parse().expect("default mixed listen")]
+    );
+    assert_eq!(
+        proxy_auth
+            .authenticate("mobile-user", "proxy-password")
+            .expect("shared proxy authentication")
+            .as_str(),
+        "family"
+    );
+    assert_eq!(admission.max_connections(), 40);
+    assert_eq!(admission.max_connections_per_source(), 20);
+    assert_eq!(admission.max_connections_per_principal(), 10);
+    assert_eq!(admission.handshake_timeout(), Duration::from_secs(5));
+}
+
+#[test]
 fn node_config_toml_preserves_local_inbound_names() {
     let config = load_config_toml_str(
         r#"

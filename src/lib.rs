@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "android", test))]
+mod android;
 pub mod app;
 pub mod cli;
 pub mod config;

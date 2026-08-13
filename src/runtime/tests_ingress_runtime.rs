@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn mixed_ingress_classification_is_strict_and_non_consuming_by_design() {
+    assert_eq!(
+        classify_mixed_ingress_byte(0x05).expect("SOCKS5 byte"),
+        MixedIngressProtocol::Socks5
+    );
+    assert_eq!(
+        classify_mixed_ingress_byte(b'C').expect("HTTP CONNECT byte"),
+        MixedIngressProtocol::HttpProxy
+    );
+    assert_eq!(
+        classify_mixed_ingress_byte(b'G').expect("HTTP GET byte"),
+        MixedIngressProtocol::HttpProxy
+    );
+    assert_eq!(
+        classify_mixed_ingress_byte(b'p').expect("HTTP extension method byte"),
+        MixedIngressProtocol::HttpProxy
+    );
+    for unsupported in [0x04, b' ', 0x16, 0xff] {
+        assert!(classify_mixed_ingress_byte(unsupported).is_err());
+    }
+}
+
+#[test]
 fn socks_udp_lane_identity_includes_selected_context_and_target() {
     let peer = SocketAddr::from(([127, 0, 0, 1], 40_000));
     let first = SocksUdpLaneKey {

@@ -1,6 +1,6 @@
 [package]
 name = "mptunnel"
-version = "0.2.5"
+version = "0.2.6"
 authors = ["mnihyc"]
 edition = "2024"
 description = "Encrypted multipath proxy and tunnel"
@@ -11,6 +11,9 @@ publish = false
 rust-version = "1.96"
 keywords = ["multipath", "proxy", "quic", "tunnel"]
 categories = ["network-programming"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
@@ -71,7 +74,11 @@ windows-sys = { version = "0.61.2", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 route_manager = "0.2.13"
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22.4"
+
 [dev-dependencies]
+jni = "0.22.4"
 rcgen = "0.14.8"
 
 [patch.crates-io]

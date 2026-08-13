@@ -7271,3 +7271,20 @@ entry is authoritative.
 - Evidence:
   - `cargo test --locked --manifest-path lab/benchmarks/Cargo.toml` now passes.
   - The lock diff is one added `jni` dependency entry for `mptunnel 0.2.6`.
+
+## 2026-08-13T10:57:07+08:00 — macOS HTTP-forward test framing correction
+
+- Category: release-check portability
+- Status: fixed and stress-verified
+- Content:
+  - The HTTP-forward integration test previously waited for EOF after receiving
+    its complete `Content-Length` response. Because its deliberate pipelined
+    probe remains unread, macOS can surface the peer close as
+    `ConnectionReset` after delivering that complete frame.
+  - The test now reads exactly the known response frame before asserting its
+    bytes; runtime behavior and the pipelined-request isolation assertions are
+    unchanged.
+- Evidence:
+  - The focused integration test passed 25 consecutive loopback runs.
+  - `cargo fmt --all -- --check`, all-target/all-feature Clippy with warnings
+    denied, and `git diff --check` pass.

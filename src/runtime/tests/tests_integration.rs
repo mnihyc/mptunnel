@@ -1589,7 +1589,12 @@ async fn mixed_ingress_dispatches_socks5_tcp_udp_and_http_connect_on_one_listene
 
 #[tokio::test]
 async fn mixed_and_dedicated_http_ingresses_forward_one_sanitized_absolute_request() {
-    async fn send_forward_request(proxy: SocketAddr, origin: SocketAddr, label: &str) -> Vec<u8> {
+    async fn send_forward_request(
+        proxy: SocketAddr,
+        origin: SocketAddr,
+        label: &str,
+        response_len: usize,
+    ) -> Vec<u8> {
         let mut client = TcpStream::connect(proxy)
             .await
             .expect("connect to HTTP proxy ingress");
@@ -1610,11 +1615,11 @@ Proxy-Authorization: Basic bGVhazpjcmVkZW50aWFs\r\n\r\n"
             .write_all(request.as_bytes())
             .await
             .expect("write absolute-form proxy request");
-        let mut response = Vec::new();
+        let mut response = vec![0_u8; response_len];
         client
-            .read_to_end(&mut response)
+            .read_exact(&mut response)
             .await
-            .expect("read forwarded origin response");
+            .expect("read framed forwarded origin response");
         response
     }
 
@@ -1688,9 +1693,16 @@ Proxy-Authorization: Basic bGVhazpjcmVkZW50aWFs\r\n\r\n"
         crate::ingress::LocalIngressAdmissionConfig::default(),
     ));
 
-    let mixed_response = send_forward_request(mixed_addr, origin_addr, "mixed").await;
-    let dedicated_response = send_forward_request(dedicated_addr, origin_addr, "dedicated").await;
     let expected_response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+    let mixed_response =
+        send_forward_request(mixed_addr, origin_addr, "mixed", expected_response.len()).await;
+    let dedicated_response = send_forward_request(
+        dedicated_addr,
+        origin_addr,
+        "dedicated",
+        expected_response.len(),
+    )
+    .await;
     assert_eq!(mixed_response, expected_response);
     assert_eq!(dedicated_response, expected_response);
 

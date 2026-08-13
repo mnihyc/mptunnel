@@ -7257,3 +7257,17 @@ entry is authoritative.
     pass; and
   - no release library or public release bundle was built locally; GitHub
     Actions remains the only production build and publication path.
+## 2026-08-13T10:44:00+08:00 — v0.2.6 nested benchmark lock synchronization
+
+- Category: GitHub release gate
+- Status: fixed and locally reproduced
+- Content:
+  - The first v0.2.6 GitHub CI and release-check runs passed formatting,
+    Clippy, 1,541 Rust tests, the patched Quinn suite, and performance-registry
+    validation, then correctly stopped because `lab/benchmarks/Cargo.lock`
+    lacked the new target-specific `jni` edge from the root package.
+  - Regenerated only that nested lock dependency list; no runtime or release
+    behavior changed.
+- Evidence:
+  - `cargo test --locked --manifest-path lab/benchmarks/Cargo.toml` now passes.
+  - The lock diff is one added `jni` dependency entry for `mptunnel 0.2.6`.

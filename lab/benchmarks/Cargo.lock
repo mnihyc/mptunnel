@@ -1310,6 +1310,7 @@ dependencies = [
  "httparse",
  "idna",
  "ipnet",
+ "jni",
  "libc",
  "netstack-smoltcp",
  "percent-encoding",

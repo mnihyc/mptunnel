@@ -214,6 +214,13 @@ impl ProductRuntimeInventory {
                             Some(config.target().to_string()),
                             false,
                         ),
+                        IngressConfig::MixedForward(config) => (
+                            "mixed-forward",
+                            config.listen().iter().map(ToString::to_string).collect(),
+                            None,
+                            Some(config.target().to_string()),
+                            false,
+                        ),
                         IngressConfig::TunL4(tun) => {
                             ("tun", Vec::new(), tun.interface_name.clone(), None, false)
                         }

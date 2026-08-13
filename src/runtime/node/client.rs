@@ -122,6 +122,28 @@ pub(super) async fn spawn_ingresses(
                 )
                 .await?;
             }
+            IngressConfig::MixedForward(config) => {
+                let tcp_readiness = readiness.require("mixed-forward TCP ingress listeners");
+                let udp_readiness = readiness.require("mixed-forward UDP ingress listeners");
+                let (tcp, udp) = config.into_configs();
+                spawn_tcp_forward_client_ingress(
+                    tcp,
+                    router.clone(),
+                    inbound.clone(),
+                    tcp_readiness,
+                    tasks,
+                )
+                .await?;
+                spawn_udp_forward_client_ingress(
+                    udp,
+                    mux_limits,
+                    router,
+                    inbound,
+                    udp_readiness,
+                    tasks,
+                )
+                .await?;
+            }
             IngressConfig::TunL4(tun) => {
                 let packet_devices = packet_devices.clone();
                 let ingress_readiness = readiness.require("TUN packet stack");

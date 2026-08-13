@@ -14,6 +14,6 @@ pub use config::{
     DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS, DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS, IngressConfig,
     LocalIngressAdmissionConfig, LocalIngressAdmissionConfigError, LocalProxyUser,
     MAX_LOCAL_CONNECTIONS, MAX_LOCAL_PROXY_USERS, MAX_TCP_FORWARD_CONNECTIONS,
-    MAX_UDP_FORWARD_ASSOCIATIONS, PortForwardConfigError, PortForwardTarget, ProxyAuthConfig,
-    ProxyAuthConfigError, TcpForwardConfig, UdpForwardConfig,
+    MAX_UDP_FORWARD_ASSOCIATIONS, MixedForwardConfig, PortForwardConfigError, PortForwardTarget,
+    ProxyAuthConfig, ProxyAuthConfigError, TcpForwardConfig, UdpForwardConfig,
 };

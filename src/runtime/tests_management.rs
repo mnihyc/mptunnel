@@ -350,6 +350,17 @@ fn client_status_exposes_named_inventory_without_credentials() {
                 .expect("forward config"),
             ),
         },
+        LocalIngressConfig {
+            name: "local-mixed-forward".to_string(),
+            config: IngressConfig::MixedForward(
+                crate::ingress::MixedForwardConfig::with_defaults(
+                    vec!["127.0.0.1:853".parse().expect("mixed forward listen")],
+                    crate::ingress::PortForwardTarget::parse("DNS.Example.:853")
+                        .expect("mixed forward target"),
+                )
+                .expect("mixed forward config"),
+            ),
+        },
     ];
     let outbound_configs = vec![crate::config::OutboundLeafConfig::Local {
         id: OutboundId::parse("daily-direct").expect("outbound"),
@@ -413,7 +424,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
 
     target.refresh_sample_snapshot();
     let status = target.snapshot();
-    assert_eq!(status.local_inbounds.len(), 2);
+    assert_eq!(status.local_inbounds.len(), 3);
     assert_eq!(status.local_inbounds[0].name, "local-socks");
     assert_eq!(status.local_inbounds[0].protocol, "socks5");
     assert!(status.local_inbounds[0].target.is_none());
@@ -425,6 +436,13 @@ fn client_status_exposes_named_inventory_without_credentials() {
     );
     assert!(status.local_inbounds[1].interface_name.is_none());
     assert!(!status.local_inbounds[1].auth_required);
+    assert_eq!(status.local_inbounds[2].name, "local-mixed-forward");
+    assert_eq!(status.local_inbounds[2].protocol, "mixed-forward");
+    assert_eq!(
+        status.local_inbounds[2].target.as_deref(),
+        Some("dns.example:853")
+    );
+    assert!(!status.local_inbounds[2].auth_required);
     assert_eq!(status.services.outbounds, 1);
     assert_eq!(status.services.local_outbounds, 1);
     assert_eq!(status.services.tun_l3_services, 2);

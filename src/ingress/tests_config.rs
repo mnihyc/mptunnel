@@ -104,6 +104,17 @@ fn port_forward_configs_reject_unbounded_or_ambiguous_runtime_values() {
         ),
         Err(PortForwardConfigError::TooManyTcpConnections)
     );
+    let mixed = MixedForwardConfig::with_defaults(
+        vec!["127.0.0.1:5400".parse().expect("mixed listener")],
+        target.clone(),
+    )
+    .expect("mixed forward defaults");
+    assert_eq!(mixed.target(), &target);
+    assert_eq!(mixed.max_connections(), DEFAULT_TCP_FORWARD_MAX_CONNECTIONS);
+    assert_eq!(
+        mixed.max_associations(),
+        DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS
+    );
     assert_eq!(
         UdpForwardConfig::new(
             vec!["127.0.0.1:5300".parse().expect("listener")],

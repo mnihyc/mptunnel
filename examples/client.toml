@@ -42,9 +42,16 @@ upstreams = ["system"]
 # allow_peer_diagnostics = false
 
 [[inbounds]]
-name = "local-socks"
-protocol = "socks5"
+name = "local-mixed"
+protocol = "mixed"
 listen = ["127.0.0.1:1080"]
+
+# Optional fixed-target TCP+UDP forwarding on one local address and port.
+# [[inbounds]]
+# name = "local-mixed-forward"
+# protocol = "mixed-forward"
+# listen = ["127.0.0.1:853"]
+# target = "resolver.example:853"
 
 [[outbounds]]
 name = "remote-mpp"

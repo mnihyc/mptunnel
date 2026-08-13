@@ -241,10 +241,13 @@ resource noun (`outbound`, `balancer`, `dns_plan`); `_id` fields identify
 protocol credentials, principals, or signed artifacts. `target` means an
 application destination, while `endpoint` means a listener or connector.
 
-Fixed-target listeners use `tcp-forward` or `udp-forward`. Domain-capable
-SOCKS5/HTTP/MPP outbounds can receive a domain unchanged; DNS resolution is
-performed only when routing or the selected outbound requires an IP. Ranged
-carrier endpoints use syntax such as `udp://server.example:20000-40000`.
+Fixed-target listeners use `tcp-forward`, `udp-forward`, or `mixed-forward`;
+the mixed form binds both transports on the same addresses and sends them to
+one target.
+Domain-capable SOCKS5/HTTP/MPP outbounds can receive a domain unchanged; DNS
+resolution is performed only when routing or the selected outbound requires an
+IP. Ranged carrier endpoints use syntax such as
+`udp://server.example:20000-40000`.
 
 Logging starts with the running version, configuration source, safe inbound and
 outbound inventory, bound listeners, runtime readiness, and shutdown. The

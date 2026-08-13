@@ -258,6 +258,19 @@ listen = ["127.0.0.1:8080"]
 # max_associations = 1024
 # idle_timeout_ms = 60000
 # datagram_ttl_ms = 30000
+#
+# One `mixed-forward` inbound binds TCP and UDP on every listed address/port
+# and forwards both transports to the same fixed target. TCP connection and
+# UDP association limits remain independent.
+# [[inbounds]]
+# name = "local-mixed-forward"
+# protocol = "mixed-forward"
+# listen = ["127.0.0.1:853"]
+# target = "resolver.example:853"
+# max_connections = 1024
+# max_associations = 1024
+# idle_timeout_ms = 60000
+# datagram_ttl_ms = 30000
 
 # Experimental TUN-L4 ingress. It uses the same routing policy as local proxy
 # inbounds. Omitting `host` is explicit external/manual mode: MPTUNNEL opens

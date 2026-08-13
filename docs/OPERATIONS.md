@@ -191,12 +191,13 @@ certificate. Shipped configurations set `transport_secret_file` to one raw
 32-byte endpoint-wide secret shared by the two peers; it is optional and is not
 an MPP client credential.
 
-`tcp-forward` and `udp-forward` local inbounds require explicit non-zero
-listeners and one canonical `target`. TCP overload is closed immediately at
+`tcp-forward`, `udp-forward`, and `mixed-forward` local inbounds require
+explicit non-zero listeners and one canonical `target`; `mixed-forward` binds
+both transports on every listed address. TCP overload is closed immediately at
 `max_connections`; UDP silently drops new sources at `max_associations`,
 expires source associations at `idle_timeout_ms`, and bounds each datagram by
-`datagram_ttl_ms`. Both use the ordinary route/DNS/ACL/outbound/balancer path;
-they do not dial around configured outbounds.
+`datagram_ttl_ms`. All three use the ordinary route/DNS/ACL/outbound/balancer
+path; they do not dial around configured outbounds.
 
 `forwarding_mode` is a root setting for the complete runtime generation.
 Omitting it selects `l4`, which preserves SOCKS5, HTTP CONNECT, mixed proxy,

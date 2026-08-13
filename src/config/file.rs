@@ -20,8 +20,8 @@ use crate::ingress::{
     DEFAULT_TCP_FORWARD_MAX_CONNECTIONS, DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS,
     DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS, DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS, IngressConfig,
     LocalIngressAdmissionConfig, LocalIngressAdmissionConfigError, LocalProxyUser,
-    MAX_LOCAL_PROXY_USERS, PortForwardTarget, ProxyAuthConfig, ProxyAuthConfigError,
-    TcpForwardConfig, TunL3IngressConfig, UdpForwardConfig,
+    MAX_LOCAL_PROXY_USERS, MixedForwardConfig, PortForwardTarget, ProxyAuthConfig,
+    ProxyAuthConfigError, TcpForwardConfig, TunL3IngressConfig, UdpForwardConfig,
 };
 use crate::outbound::{
     HttpsProxyConfig, OutboundConfig, OutboundError, ProxyConfig, ProxyCredentials,
@@ -1017,6 +1017,15 @@ enum InboundFileConfig {
         name: String,
         listen: Vec<SocketAddr>,
         target: String,
+        max_associations: Option<u32>,
+        idle_timeout_ms: Option<u64>,
+        datagram_ttl_ms: Option<u64>,
+    },
+    MixedForward {
+        name: String,
+        listen: Vec<SocketAddr>,
+        target: String,
+        max_connections: Option<u32>,
         max_associations: Option<u32>,
         idle_timeout_ms: Option<u64>,
         datagram_ttl_ms: Option<u64>,
@@ -2102,6 +2111,7 @@ fn configured_local_inbound_names(
             | InboundFileConfig::Mixed { name, .. }
             | InboundFileConfig::TcpForward { name, .. }
             | InboundFileConfig::UdpForward { name, .. }
+            | InboundFileConfig::MixedForward { name, .. }
             | InboundFileConfig::Tun { name, .. } => name,
             InboundFileConfig::TunL3 { .. } | InboundFileConfig::Mpp { .. } => continue,
         };
@@ -2639,6 +2649,45 @@ fn build_node_services(
                 local_ingresses.push(LocalIngressConfig {
                     name,
                     config: IngressConfig::UdpForward(config),
+                });
+            }
+            InboundFileConfig::MixedForward {
+                name,
+                listen,
+                target,
+                max_connections,
+                max_associations,
+                idle_timeout_ms,
+                datagram_ttl_ms,
+            } => {
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
+                let target = PortForwardTarget::parse(&target)
+                    .map_err(|error| ConfigFileError::PortForward(error.to_string()))?;
+                let max_connections = max_connections
+                    .map(|limit| limit as usize)
+                    .unwrap_or(DEFAULT_TCP_FORWARD_MAX_CONNECTIONS);
+                let max_associations = max_associations
+                    .map(|limit| limit as usize)
+                    .unwrap_or(DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS);
+                let idle_timeout = Duration::from_millis(
+                    idle_timeout_ms.unwrap_or(DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS),
+                );
+                let datagram_ttl = Duration::from_millis(
+                    datagram_ttl_ms.unwrap_or(DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS),
+                );
+                let config = MixedForwardConfig::new(
+                    listen,
+                    target,
+                    max_connections,
+                    max_associations,
+                    idle_timeout,
+                    datagram_ttl,
+                )
+                .map_err(|error| ConfigFileError::PortForward(error.to_string()))?;
+                local_ingresses.push(LocalIngressConfig {
+                    name,
+                    config: IngressConfig::MixedForward(config),
                 });
             }
             InboundFileConfig::Tun {

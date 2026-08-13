@@ -1166,6 +1166,11 @@ fn validate_ingress(ingress: &IngressConfig) -> Result<(), ConfigError> {
                 return Err(ConfigError::NoListenAddresses);
             }
         }
+        IngressConfig::MixedForward(config) => {
+            if config.listen().is_empty() {
+                return Err(ConfigError::NoListenAddresses);
+            }
+        }
         IngressConfig::TunL4(_) => {}
     }
     Ok(())

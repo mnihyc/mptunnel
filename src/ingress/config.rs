@@ -148,6 +148,75 @@ pub struct UdpForwardConfig {
     datagram_ttl_ms: u32,
 }
 
+/// One fixed-target inbound that listens for TCP and UDP on the same addresses.
+///
+/// The contained protocol configurations deliberately reuse the dedicated
+/// forward validation and limits so mixed forwarding behaves identically to
+/// configuring matching `tcp-forward` and `udp-forward` inbounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedForwardConfig {
+    tcp: TcpForwardConfig,
+    udp: UdpForwardConfig,
+}
+
+impl MixedForwardConfig {
+    pub fn new(
+        listen: Vec<SocketAddr>,
+        target: PortForwardTarget,
+        max_connections: usize,
+        max_associations: usize,
+        idle_timeout: Duration,
+        datagram_ttl: Duration,
+    ) -> Result<Self, PortForwardConfigError> {
+        let tcp = TcpForwardConfig::new(listen.clone(), target.clone(), max_connections)?;
+        let udp =
+            UdpForwardConfig::new(listen, target, max_associations, idle_timeout, datagram_ttl)?;
+        Ok(Self { tcp, udp })
+    }
+
+    pub fn with_defaults(
+        listen: Vec<SocketAddr>,
+        target: PortForwardTarget,
+    ) -> Result<Self, PortForwardConfigError> {
+        Self::new(
+            listen,
+            target,
+            DEFAULT_TCP_FORWARD_MAX_CONNECTIONS,
+            DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS,
+            DEFAULT_UDP_FORWARD_IDLE_TIMEOUT,
+            DEFAULT_UDP_FORWARD_DATAGRAM_TTL,
+        )
+    }
+
+    pub fn listen(&self) -> &[SocketAddr] {
+        self.tcp.listen()
+    }
+
+    pub const fn target(&self) -> &PortForwardTarget {
+        self.tcp.target()
+    }
+
+    pub const fn max_connections(&self) -> usize {
+        self.tcp.max_connections()
+    }
+
+    pub const fn max_associations(&self) -> usize {
+        self.udp.max_associations()
+    }
+
+    pub const fn idle_timeout(&self) -> Duration {
+        self.udp.idle_timeout()
+    }
+
+    pub const fn datagram_ttl_ms(&self) -> u32 {
+        self.udp.datagram_ttl_ms()
+    }
+
+    pub fn into_configs(self) -> (TcpForwardConfig, UdpForwardConfig) {
+        (self.tcp, self.udp)
+    }
+}
+
 impl UdpForwardConfig {
     pub fn new(
         listen: Vec<SocketAddr>,
@@ -317,6 +386,7 @@ pub enum IngressConfig {
     },
     TcpForward(TcpForwardConfig),
     UdpForward(UdpForwardConfig),
+    MixedForward(MixedForwardConfig),
     TunL4(TunL4Config),
 }
 

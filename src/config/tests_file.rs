@@ -1801,6 +1801,16 @@ max_associations = 16
 idle_timeout_ms = 5000
 datagram_ttl_ms = 1500
 
+[[inbounds]]
+name = "local-mixed-forward"
+protocol = "mixed-forward"
+listen = ["127.0.0.1:9443"]
+target = "service.example:443"
+max_connections = 24
+max_associations = 12
+idle_timeout_ms = 4000
+datagram_ttl_ms = 1200
+
 [[outbounds]]
 name = "mpp-main"
 protocol = "mpp"
@@ -1822,8 +1832,8 @@ outbound = "mpp-main"
     .expect("fixed-target inbound config");
 
     let CommandConfig::Node(node) = config.command;
-    let [tcp, udp] = node.local_ingresses.as_slice() else {
-        panic!("expected TCP and UDP fixed-target inbounds");
+    let [tcp, udp, mixed] = node.local_ingresses.as_slice() else {
+        panic!("expected TCP, UDP, and mixed fixed-target inbounds");
     };
     assert_eq!(tcp.name, "local-tcp-forward");
     let IngressConfig::TcpForward(tcp) = &tcp.config else {
@@ -1845,6 +1855,20 @@ outbound = "mpp-main"
     assert_eq!(udp.max_associations(), 16);
     assert_eq!(udp.idle_timeout(), Duration::from_secs(5));
     assert_eq!(udp.datagram_ttl_ms(), 1500);
+
+    assert_eq!(mixed.name, "local-mixed-forward");
+    let IngressConfig::MixedForward(mixed) = &mixed.config else {
+        panic!("expected mixed fixed-target inbound");
+    };
+    assert_eq!(
+        mixed.listen(),
+        &["127.0.0.1:9443".parse().expect("mixed listen")]
+    );
+    assert_eq!(mixed.target().to_string(), "service.example:443");
+    assert_eq!(mixed.max_connections(), 24);
+    assert_eq!(mixed.max_associations(), 12);
+    assert_eq!(mixed.idle_timeout(), Duration::from_secs(4));
+    assert_eq!(mixed.datagram_ttl_ms(), 1200);
 }
 
 #[test]

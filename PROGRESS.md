@@ -7288,3 +7288,19 @@ entry is authoritative.
   - The focused integration test passed 25 consecutive loopback runs.
   - `cargo fmt --all -- --check`, all-target/all-feature Clippy with warnings
     denied, and `git diff --check` pass.
+
+## 2026-08-13T11:05:08+08:00 — slow SOCKS load-deadline assertion hardened
+
+- Category: GitHub quality gate
+- Status: fixed and stress-verified
+- Content:
+  - The slow SOCKS handshake can reach the same load deadline through either
+    the blocking socket timeout (`TimeoutError: timed out`) or the immediately
+    following deadline check (`TimeoutError: upload load deadline expired`).
+  - The test now accepts those two scheduler-boundary renderings while still
+    requiring stream 0, the `TimeoutError` exception type, and explicit timeout
+    or load-deadline semantics; arbitrary probe failures remain rejected.
+  - Production behavior and deadline durations are unchanged.
+- Evidence:
+  - The focused loopback test passed 100 consecutive executions.
+  - All 213 lab unittests pass.

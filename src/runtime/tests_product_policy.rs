@@ -217,6 +217,85 @@ async fn udp_rules_select_their_own_context_and_datagram_traffic_class() {
 }
 
 #[tokio::test]
+async fn explicit_bind_family_makes_matching_route_fall_through_after_resolution() {
+    let cases = [
+        (
+            "v6-only",
+            OutboundConfig::BindSourceIps {
+                ipv4: None,
+                ipv6: Some("2001:db8::2".parse().expect("IPv6 source")),
+            },
+            "8.8.8.8:443",
+            "8.8.8.8/32",
+        ),
+        (
+            "v4-only",
+            OutboundConfig::BindSourceIps {
+                ipv4: Some(Ipv4Addr::new(198, 51, 100, 2)),
+                ipv6: None,
+            },
+            "[2001:4860:4860::8888]:443",
+            "2001:4860:4860::8888/128",
+        ),
+    ];
+
+    for (bound_name, bound_config, target, destination_cidr) in cases {
+        let bound_id = OutboundId::parse(bound_name).expect("bound outbound");
+        let fallback_id = OutboundId::parse("fallback-mpp").expect("fallback outbound");
+        let fallback_context = context(9443);
+        let fallback_session = fallback_context.session_id;
+        let config = policy(vec![
+            rule(
+                "family-constrained",
+                RouteMatchSpec {
+                    destination_cidrs: vec![destination_cidr.parse().expect("destination CIDR")],
+                    ..RouteMatchSpec::default()
+                },
+                EgressAction::Outbound(bound_id.clone()),
+            ),
+            rule(
+                "fallback",
+                RouteMatchSpec::default(),
+                EgressAction::Outbound(fallback_id.clone()),
+            ),
+        ]);
+        let registry = RuntimeOutboundRegistry::compile(
+            [
+                RuntimeOutboundLeaf::Local {
+                    id: bound_id,
+                    config: bound_config,
+                    connect_timeout: Duration::from_millis(100),
+                    native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+                },
+                RuntimeOutboundLeaf::Mpp {
+                    id: fallback_id,
+                    context: fallback_context,
+                    performance: MppPerformanceConfig::default(),
+                },
+            ],
+            &[],
+            crate::runtime::outbound_registry::test_dns_generation(),
+        )
+        .expect("family-aware registry");
+        let router = ClientIngressRouter::new(&config, registry).expect("family-aware router");
+        let target = TargetAddr::Ip(target.parse().expect("literal target"));
+        let ClientRoute::Open(plan) = router
+            .route_udp(&target, source(), anonymous(), inbound())
+            .expect("route plan")
+        else {
+            panic!("expected open plan");
+        };
+        let OpenedUdpOutbound::Mpp {
+            context: selected, ..
+        } = plan.open_udp(&target).await.expect("fallback open")
+        else {
+            panic!("expected MPP fallback");
+        };
+        assert_eq!(selected.session_id, fallback_session);
+    }
+}
+
+#[tokio::test]
 async fn stable_domain_route_delegates_canonical_target_without_dns() {
     let edge = context(7443);
     let config = policy(vec![rule(

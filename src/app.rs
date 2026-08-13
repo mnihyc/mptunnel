@@ -311,6 +311,17 @@ fn log_native_outbound(name: &str, outbound: &crate::outbound::OutboundConfig) {
         crate::outbound::OutboundConfig::BindSourceIp(address) => {
             ("direct", Some(address.to_string()), None)
         }
+        crate::outbound::OutboundConfig::BindSourceIps { ipv4, ipv6 } => {
+            let bindings = [
+                ipv4.map(|address| format!("IPv4 {address}")),
+                ipv6.map(|address| format!("IPv6 {address}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            ("direct", Some(bindings), None)
+        }
         crate::outbound::OutboundConfig::Socks5(proxy) => (
             "SOCKS5 proxy",
             Some(proxy.endpoint().authority()),

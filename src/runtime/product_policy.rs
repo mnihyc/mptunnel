@@ -210,14 +210,20 @@ impl ClientOutboundPlan {
         let mut groups: Vec<PendingRouteGroup> = Vec::new();
         let mut terminal_disposition = None;
         for authorized_target in authorized {
-            let decision = self
+            let Some(decision) = self
                 .authorizer
                 .policy
                 .routes()
-                .classify(RouteInput::post_resolution(
-                    &self.authorizer.flow,
-                    authorized_target.address(),
-                ));
+                .classify_with_action_eligibility(
+                    RouteInput::post_resolution(&self.authorizer.flow, authorized_target.address()),
+                    |action| {
+                        self.registry
+                            .action_supports_ip_family(action.egress(), authorized_target.address())
+                    },
+                )
+            else {
+                continue;
+            };
             let traffic_class = traffic_class(decision.action().initial_demand(), network);
             let selection = match decision.action().egress() {
                 EgressAction::Outbound(_) | EgressAction::Balancer(_) => self
@@ -424,8 +430,11 @@ impl ClientIngressRouter {
             principal,
             inbound,
         ));
-        let (decision, route_requires_post_resolution) =
+        let (decision, mut route_requires_post_resolution) =
             self.policy.routes().classify_pre_resolution(flow.as_ref());
+        route_requires_post_resolution |= self
+            .registry
+            .action_requires_family_resolution(decision.action().egress())?;
         let selection = match decision.action().egress() {
             EgressAction::Reject if !route_requires_post_resolution => {
                 return Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject));

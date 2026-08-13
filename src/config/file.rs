@@ -1405,6 +1405,8 @@ enum OutboundFileConfig {
     Direct {
         name: String,
         bind_ip: Option<IpAddr>,
+        bind_ipv4: Option<Ipv4Addr>,
+        bind_ipv6: Option<Ipv6Addr>,
         connect_timeout_ms: Option<u64>,
     },
     Socks5 {
@@ -1853,10 +1855,20 @@ fn parse_outbounds(
             OutboundFileConfig::Direct {
                 name,
                 bind_ip,
+                bind_ipv4,
+                bind_ipv6,
                 connect_timeout_ms,
             } => {
                 let name = canonical_config_name(&name)?;
                 insert_outbound_name(&parsed, &name)?;
+                let config = match (bind_ip, bind_ipv4, bind_ipv6) {
+                    (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                        return Err(ConfigFileError::DirectBindFieldConflict);
+                    }
+                    (Some(ip), None, None) => OutboundConfig::BindSourceIp(ip),
+                    (None, None, None) => OutboundConfig::Direct,
+                    (None, ipv4, ipv6) => OutboundConfig::BindSourceIps { ipv4, ipv6 },
+                };
                 let id = OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
                 parsed.order.push(name.clone());
@@ -1864,10 +1876,7 @@ fn parse_outbounds(
                     name,
                     OutboundLeafConfig::Local {
                         id,
-                        config: match bind_ip {
-                            Some(ip) => OutboundConfig::BindSourceIp(ip),
-                            None => OutboundConfig::Direct,
-                        },
+                        config,
                         connect_timeout: outbound_connect_timeout(connect_timeout_ms),
                     },
                 );
@@ -2896,7 +2905,9 @@ impl DnsFileConfig {
             .values()
             .map(|leaf| match leaf {
                 OutboundLeafConfig::Local { id, config, .. } => match config {
-                    OutboundConfig::Direct | OutboundConfig::BindSourceIp(_) => {
+                    OutboundConfig::Direct
+                    | OutboundConfig::BindSourceIp(_)
+                    | OutboundConfig::BindSourceIps { .. } => {
                         DnsOutboundCapabilitySpec::new(id.clone(), leaf.networks(), true)
                     }
                     OutboundConfig::Socks5(_)
@@ -3359,6 +3370,7 @@ pub enum ConfigFileError {
     RuleSet(String),
     DnsPolicy(String),
     DnsValue(String),
+    DirectBindFieldConflict,
     DestinationAclPolicy(String),
     DestinationAclValue(String),
     RoutingRuleMissingInbound { rule: String, inbound: String },
@@ -3462,6 +3474,10 @@ impl std::fmt::Display for ConfigFileError {
             Self::RuleSet(error) => write!(f, "invalid routing rule set: {error}"),
             Self::DnsPolicy(error) => write!(f, "invalid DNS policy: {error}"),
             Self::DnsValue(error) => write!(f, "invalid DNS value: {error}"),
+            Self::DirectBindFieldConflict => write!(
+                f,
+                "direct outbound bind_ip cannot be combined with bind_ipv4 or bind_ipv6"
+            ),
             Self::DestinationAclPolicy(error) => {
                 write!(f, "invalid server destination ACL policy: {error}")
             }
@@ -3551,6 +3567,7 @@ impl std::error::Error for ConfigFileError {
             | Self::RuleSet(_)
             | Self::DnsPolicy(_)
             | Self::DnsValue(_)
+            | Self::DirectBindFieldConflict
             | Self::DestinationAclPolicy(_)
             | Self::DestinationAclValue(_)
             | Self::RoutingRuleMissingInbound { .. }

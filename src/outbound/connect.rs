@@ -173,6 +173,12 @@ pub enum OutboundConfig {
     Direct,
     /// Direct target dialing with an operator-selected source IP.
     BindSourceIp(IpAddr),
+    /// Direct target dialing with independently selected source addresses for
+    /// each explicitly enabled IP family.
+    BindSourceIps {
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    },
     /// Upstream SOCKS5 proxy egress.
     Socks5(ProxyConfig),
     /// Upstream HTTP CONNECT egress for TCP targets.
@@ -187,7 +193,10 @@ impl OutboundConfig {
     }
 
     pub fn supports_udp_targets(&self) -> bool {
-        matches!(self, Self::Direct | Self::BindSourceIp(_) | Self::Socks5(_))
+        matches!(
+            self,
+            Self::Direct | Self::BindSourceIp(_) | Self::BindSourceIps { .. } | Self::Socks5(_)
+        )
     }
 
     pub fn ensure_supports(&self, target_protocol: TargetProtocol) -> Result<(), OutboundError> {
@@ -204,7 +213,43 @@ impl OutboundConfig {
     /// Resolution for an IP-only leaf uses the selected Product DNS plan; its
     /// upstream transport may be system, direct, or routed.
     pub const fn requires_ip_target(&self) -> bool {
-        matches!(self, Self::Direct | Self::BindSourceIp(_))
+        matches!(
+            self,
+            Self::Direct | Self::BindSourceIp(_) | Self::BindSourceIps { .. }
+        )
+    }
+
+    pub(crate) const fn source_binding_for(&self, remote: IpAddr) -> DirectSourceBinding {
+        match (self, remote) {
+            (Self::Direct, _) => DirectSourceBinding::Default,
+            (Self::BindSourceIp(source), remote) if source.is_ipv4() == remote.is_ipv4() => {
+                DirectSourceBinding::Bound(*source)
+            }
+            (Self::BindSourceIp(_), _) => DirectSourceBinding::Ineligible,
+            (
+                Self::BindSourceIps {
+                    ipv4: Some(source), ..
+                },
+                IpAddr::V4(_),
+            ) => DirectSourceBinding::Bound(IpAddr::V4(*source)),
+            (
+                Self::BindSourceIps {
+                    ipv6: Some(source), ..
+                },
+                IpAddr::V6(_),
+            ) => DirectSourceBinding::Bound(IpAddr::V6(*source)),
+            (Self::BindSourceIps { .. }, _) => DirectSourceBinding::Ineligible,
+            (Self::Socks5(_) | Self::HttpConnect(_) | Self::HttpsConnect(_), _) => {
+                DirectSourceBinding::Default
+            }
+        }
+    }
+
+    pub(crate) const fn supports_ip_family(&self, remote: IpAddr) -> bool {
+        !matches!(
+            self.source_binding_for(remote),
+            DirectSourceBinding::Ineligible
+        )
     }
 
     /// Returns the process-owned native proxy control endpoint, when this leaf
@@ -214,9 +259,16 @@ impl OutboundConfig {
         match self {
             Self::Socks5(proxy) | Self::HttpConnect(proxy) => Some(proxy.endpoint()),
             Self::HttpsConnect(proxy) => Some(proxy.proxy().endpoint()),
-            Self::Direct | Self::BindSourceIp(_) => None,
+            Self::Direct | Self::BindSourceIp(_) | Self::BindSourceIps { .. } => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectSourceBinding {
+    Ineligible,
+    Default,
+    Bound(IpAddr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,7 +472,9 @@ pub(crate) async fn connect_tcp_target_with_configurator(
             let target = super::destination::protocol_target_addr(domain.flow().target());
             validate_target(&target)?;
             match config {
-                OutboundConfig::Direct | OutboundConfig::BindSourceIp(_) => {
+                OutboundConfig::Direct
+                | OutboundConfig::BindSourceIp(_)
+                | OutboundConfig::BindSourceIps { .. } => {
                     Err(OutboundConnectError::TargetResolutionRequired)
                 }
                 OutboundConfig::Socks5(proxy) => {
@@ -450,11 +504,10 @@ async fn connect_tcp_leaf_to_addresses(
     configurator: &dyn NativeSocketConfigurator,
 ) -> Result<OutboundTcpStream, OutboundConnectError> {
     match config {
-        OutboundConfig::Direct => connect_direct_tcp(addresses, None, deadline, configurator)
-            .await
-            .map(OutboundTcpStream::Plain),
-        OutboundConfig::BindSourceIp(ip) => {
-            connect_direct_tcp(addresses, Some(*ip), deadline, configurator)
+        OutboundConfig::Direct
+        | OutboundConfig::BindSourceIp(_)
+        | OutboundConfig::BindSourceIps { .. } => {
+            connect_direct_tcp(config, addresses, deadline, configurator)
                 .await
                 .map(OutboundTcpStream::Plain)
         }
@@ -584,13 +637,10 @@ pub(crate) async fn connect_udp_target_with_configurator(
         ConnectorTarget::Resolved(authorized) => {
             let addresses = authorized_socket_addrs(authorized, Network::Udp)?;
             match config {
-                OutboundConfig::Direct => {
-                    connect_direct_udp(&addresses, None, deadline, configurator)
-                        .await
-                        .map(OutboundUdpSocket::Direct)
-                }
-                OutboundConfig::BindSourceIp(ip) => {
-                    connect_direct_udp(&addresses, Some(*ip), deadline, configurator)
+                OutboundConfig::Direct
+                | OutboundConfig::BindSourceIp(_)
+                | OutboundConfig::BindSourceIps { .. } => {
+                    connect_direct_udp(config, &addresses, deadline, configurator)
                         .await
                         .map(OutboundUdpSocket::Direct)
                 }
@@ -605,7 +655,9 @@ pub(crate) async fn connect_udp_target_with_configurator(
             }
         }
         ConnectorTarget::Domain(domain) => match config {
-            OutboundConfig::Direct | OutboundConfig::BindSourceIp(_) => {
+            OutboundConfig::Direct
+            | OutboundConfig::BindSourceIp(_)
+            | OutboundConfig::BindSourceIps { .. } => {
                 Err(OutboundConnectError::TargetResolutionRequired)
             }
             OutboundConfig::Socks5(proxy) => {
@@ -753,6 +805,79 @@ impl Socks5UdpAssociation {
 }
 
 async fn connect_direct_tcp(
+    config: &OutboundConfig,
+    addresses: &[SocketAddr],
+    deadline: tokio::time::Instant,
+    configurator: &dyn NativeSocketConfigurator,
+) -> Result<TcpStream, OutboundConnectError> {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    let mut default = Vec::new();
+    for address in addresses.iter().copied() {
+        match config.source_binding_for(address.ip()) {
+            DirectSourceBinding::Ineligible => {}
+            DirectSourceBinding::Default => default.push(address),
+            DirectSourceBinding::Bound(IpAddr::V4(source)) => ipv4.push((address, source)),
+            DirectSourceBinding::Bound(IpAddr::V6(source)) => ipv6.push((address, source)),
+        }
+    }
+    if !default.is_empty() {
+        return connect_direct_tcp_addresses(&default, None, deadline, configurator).await;
+    }
+    let ipv4_source = ipv4.first().map(|(_, source)| IpAddr::V4(*source));
+    let ipv6_source = ipv6.first().map(|(_, source)| IpAddr::V6(*source));
+    let ipv4 = ipv4
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect::<Vec<_>>();
+    let ipv6 = ipv6
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect::<Vec<_>>();
+    match (ipv4_source, ipv6_source) {
+        (Some(source), None) => {
+            connect_direct_tcp_addresses(&ipv4, Some(source), deadline, configurator).await
+        }
+        (None, Some(source)) => {
+            connect_direct_tcp_addresses(&ipv6, Some(source), deadline, configurator).await
+        }
+        (Some(ipv4_source), Some(ipv6_source)) => {
+            tokio::select! {
+                result = connect_direct_tcp_addresses(
+                    &ipv4,
+                    Some(ipv4_source),
+                    deadline,
+                    configurator,
+                ) => match result {
+                    Ok(stream) => Ok(stream),
+                    Err(_) => connect_direct_tcp_addresses(
+                        &ipv6,
+                        Some(ipv6_source),
+                        deadline,
+                        configurator,
+                    ).await,
+                },
+                result = connect_direct_tcp_addresses(
+                    &ipv6,
+                    Some(ipv6_source),
+                    deadline,
+                    configurator,
+                ) => match result {
+                    Ok(stream) => Ok(stream),
+                    Err(_) => connect_direct_tcp_addresses(
+                        &ipv4,
+                        Some(ipv4_source),
+                        deadline,
+                        configurator,
+                    ).await,
+                },
+            }
+        }
+        (None, None) => Err(TcpTransportError::NoCompatibleAddress.into()),
+    }
+}
+
+async fn connect_direct_tcp_addresses(
     addresses: &[SocketAddr],
     source_ip: Option<IpAddr>,
     deadline: tokio::time::Instant,
@@ -777,18 +902,18 @@ async fn connect_direct_tcp(
 }
 
 async fn connect_direct_udp(
+    config: &OutboundConfig,
     addresses: &[SocketAddr],
-    source_ip: Option<IpAddr>,
     deadline: tokio::time::Instant,
     configurator: &dyn NativeSocketConfigurator,
 ) -> Result<UdpSocket, OutboundConnectError> {
     let mut last_error = None;
     for addr in addresses.iter().copied() {
-        if let Some(source_ip) = source_ip
-            && source_ip.is_ipv4() != addr.is_ipv4()
-        {
-            continue;
-        }
+        let source_ip = match config.source_binding_for(addr.ip()) {
+            DirectSourceBinding::Ineligible => continue,
+            DirectSourceBinding::Default => None,
+            DirectSourceBinding::Bound(source_ip) => Some(source_ip),
+        };
         let timeout = remaining_timeout(deadline)?;
         match operation_before(
             deadline,

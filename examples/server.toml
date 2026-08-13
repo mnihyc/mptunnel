@@ -61,7 +61,13 @@ transport_secret_file = "mpp-transport.key"
 [[outbounds]]
 name = "direct-egress"
 protocol = "direct"
-# bind_ip = "192.0.2.10" # Replace with an address assigned to this server.
+# Omit all bind fields for OS-selected IPv4 and IPv6 sources. Legacy bind_ip is
+# single-family and cannot be combined with bind_ipv4 or bind_ipv6.
+# bind_ip = "192.0.2.10"
+# Prefer one or both explicit-family fields; only configured families are then
+# eligible. A temporarily absent address fails a dial, not the node process.
+# bind_ipv4 = "192.0.2.10"
+# bind_ipv6 = "2001:db8::10"
 # Replace the global `system` upstream with named UDP/TCP/DoT/DoH/DoQ upstreams
 # for explicit or encrypted resolution.
 

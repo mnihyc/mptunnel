@@ -176,14 +176,24 @@ impl DnsTcpConnector for DirectDnsTcpConnector {
 #[derive(Clone)]
 pub struct DnsNativeSocketPolicy {
     native_sockets: Arc<dyn NativeSocketConfigurator>,
-    source_ip: Option<IpAddr>,
+    source_binding: DnsSourceBinding,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DnsSourceBinding {
+    Default,
+    Single(IpAddr),
+    Families {
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    },
 }
 
 impl std::fmt::Debug for DnsNativeSocketPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DnsNativeSocketPolicy")
-            .field("source_ip", &self.source_ip)
+            .field("source_binding", &self.source_binding)
             .finish_non_exhaustive()
     }
 }
@@ -192,7 +202,7 @@ impl DnsNativeSocketPolicy {
     pub fn direct(native_sockets: Arc<dyn NativeSocketConfigurator>) -> Self {
         Self {
             native_sockets,
-            source_ip: None,
+            source_binding: DnsSourceBinding::Default,
         }
     }
 
@@ -202,12 +212,53 @@ impl DnsNativeSocketPolicy {
     ) -> Self {
         Self {
             native_sockets,
-            source_ip: Some(source_ip),
+            source_binding: DnsSourceBinding::Single(source_ip),
+        }
+    }
+
+    pub fn bind_sources(
+        native_sockets: Arc<dyn NativeSocketConfigurator>,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    ) -> Self {
+        Self {
+            native_sockets,
+            source_binding: DnsSourceBinding::Families { ipv4, ipv6 },
         }
     }
 
     pub const fn source_ip(&self) -> Option<IpAddr> {
-        self.source_ip
+        match self.source_binding {
+            DnsSourceBinding::Single(source_ip) => Some(source_ip),
+            DnsSourceBinding::Default | DnsSourceBinding::Families { .. } => None,
+        }
+    }
+
+    const fn has_explicit_binding(&self) -> bool {
+        !matches!(self.source_binding, DnsSourceBinding::Default)
+    }
+
+    fn source_ip_for(&self, remote: IpAddr) -> io::Result<Option<IpAddr>> {
+        match (self.source_binding, remote) {
+            (DnsSourceBinding::Default, _) => Ok(None),
+            (DnsSourceBinding::Single(source), remote) if source.is_ipv4() == remote.is_ipv4() => {
+                Ok(Some(source))
+            }
+            (DnsSourceBinding::Single(_), _) => Err(incompatible_dns_source_family()),
+            (
+                DnsSourceBinding::Families {
+                    ipv4: Some(source), ..
+                },
+                IpAddr::V4(_),
+            ) => Ok(Some(IpAddr::V4(source))),
+            (
+                DnsSourceBinding::Families {
+                    ipv6: Some(source), ..
+                },
+                IpAddr::V6(_),
+            ) => Ok(Some(IpAddr::V6(source))),
+            (DnsSourceBinding::Families { .. }, _) => Err(incompatible_dns_source_family()),
+        }
     }
 }
 
@@ -2642,12 +2693,12 @@ impl DohDnsBackend {
         socket_policy: DnsNativeSocketPolicy,
     ) -> Result<Self, DnsRuntimeError> {
         if let Some(bootstrap) = upstream.endpoint().bootstrap() {
-            ensure_source_family(socket_policy.source_ip, bootstrap.ip()).map_err(|error| {
-                DnsRuntimeError::Build {
+            socket_policy
+                .source_ip_for(bootstrap.ip())
+                .map_err(|error| DnsRuntimeError::Build {
                     upstream: upstream.id().clone(),
                     message: error.to_string(),
-                }
-            })?;
+                })?;
         }
         Self::compile_with_connector(
             plan,
@@ -3006,7 +3057,7 @@ impl RuntimeProvider for ConfiguredDnsRuntimeProvider {
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
         let socket_policy = self.socket_policy.clone();
         Box::pin(async move {
-            if bind_addr.is_some() && socket_policy.source_ip.is_some() {
+            if bind_addr.is_some() && socket_policy.has_explicit_binding() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "DNS runtime and upstream both requested a source bind",
@@ -3034,11 +3085,8 @@ impl RuntimeProvider for ConfiguredDnsRuntimeProvider {
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
         let socket_policy = self.socket_policy.clone();
         Box::pin(async move {
-            let bind_addr = match socket_policy.source_ip {
-                Some(source_ip) => {
-                    ensure_source_family(Some(source_ip), server_addr.ip())?;
-                    SocketAddr::new(source_ip, 0)
-                }
+            let bind_addr = match socket_policy.source_ip_for(server_addr.ip())? {
+                Some(source_ip) => SocketAddr::new(source_ip, 0),
                 None => local_addr,
             };
             let socket = StdUdpSocket::bind(bind_addr)?;
@@ -3065,11 +3113,8 @@ impl QuicSocketBinder for ConfiguredDnsRuntimeProvider {
         local_addr: SocketAddr,
         server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
-        let bind_addr = match self.socket_policy.source_ip {
-            Some(source_ip) => {
-                ensure_source_family(Some(source_ip), server_addr.ip())?;
-                SocketAddr::new(source_ip, 0)
-            }
+        let bind_addr = match self.socket_policy.source_ip_for(server_addr.ip())? {
+            Some(source_ip) => SocketAddr::new(source_ip, 0),
             None => local_addr,
         };
         let socket = StdUdpSocket::bind(bind_addr)?;
@@ -3089,12 +3134,12 @@ fn configured_tcp_socket(
     remote: SocketAddr,
     policy: &DnsNativeSocketPolicy,
 ) -> io::Result<TcpSocket> {
-    ensure_source_family(policy.source_ip, remote.ip())?;
+    let source_ip = policy.source_ip_for(remote.ip())?;
     let socket = match remote {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
-    if let Some(source_ip) = policy.source_ip {
+    if let Some(source_ip) = source_ip {
         socket.bind(SocketAddr::new(source_ip, 0))?;
     }
     socket.set_nodelay(true)?;
@@ -3116,6 +3161,13 @@ fn ensure_source_family(source: Option<IpAddr>, remote: IpAddr) -> io::Result<()
         ));
     }
     Ok(())
+}
+
+fn incompatible_dns_source_family() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "DNS source and bootstrap IP families differ",
+    )
 }
 
 struct HickoryDnsBackend {
@@ -3149,12 +3201,12 @@ impl HickoryDnsBackend {
         options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
         options.try_tcp_on_error =
             matches!(upstream.endpoint(), DnsUpstreamEndpoint::UdpTcp { .. });
-        ensure_source_family(socket_policy.source_ip, bootstrap_ip).map_err(|error| {
-            DnsRuntimeError::Build {
+        socket_policy
+            .source_ip_for(bootstrap_ip)
+            .map_err(|error| DnsRuntimeError::Build {
                 upstream: upstream.id().clone(),
                 message: error.to_string(),
-            }
-        })?;
+            })?;
         let resolver = Resolver::builder_with_config(
             resolver_config,
             ConfiguredDnsRuntimeProvider::new(socket_policy),

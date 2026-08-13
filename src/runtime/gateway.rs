@@ -161,6 +161,17 @@ impl ClientGatewayRuntime {
         })
     }
 
+    pub(in crate::runtime) fn member_handle(
+        &self,
+        member: &OutboundId,
+    ) -> Result<GatewayMemberHandle, RuntimeError> {
+        self.lock()?.balancer.handle_for(member).ok_or_else(|| {
+            RuntimeError::ProductPolicy(
+                "balancer runtime member has no selection handle".to_string(),
+            )
+        })
+    }
+
     pub(in crate::runtime) const fn probe_policy(&self) -> Option<&GatewayProbePolicy> {
         self.probe.as_ref()
     }

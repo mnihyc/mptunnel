@@ -355,6 +355,26 @@ impl CompiledRouteTable {
         }
     }
 
+    /// Classify in declared order while allowing a runtime egress constraint
+    /// to make an otherwise matching rule ineligible. Unlike `classify`, this
+    /// can return `None` because an explicit family constraint may also make
+    /// the final catch-all rule unusable for this destination address.
+    pub fn classify_with_action_eligibility<'table>(
+        &'table self,
+        input: RouteInput<'_>,
+        mut eligible: impl FnMut(&RouteAction) -> bool,
+    ) -> Option<RouteDecision<'table>> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matcher.matches(input) && eligible(&rule.action))
+            .map(|rule| RouteDecision {
+                generation: self.generation,
+                rule_id: &rule.id,
+                action: &rule.action,
+                explanation: &rule.explanation,
+            })
+    }
+
     /// Classify a pre-resolution flow and determine, in the same ordered rule
     /// pass, whether any earlier rule can require IP routing evidence or the
     /// selected rule cannot remain first after resolution.

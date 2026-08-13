@@ -169,6 +169,197 @@ async fn balancer_skips_offline_mpp_without_masking_native_availability() {
 }
 
 #[tokio::test]
+async fn balancer_pre_excludes_member_without_matching_bind_family() {
+    let v6_only_id = OutboundId::parse("v6-only").expect("outbound ID");
+    let fallback_id = OutboundId::parse("fallback-v4").expect("outbound ID");
+    let balancer_id = BalancerId::parse("family-aware").expect("balancer ID");
+    let balancers = [GatewayBalancerConfig {
+        id: balancer_id.clone(),
+        generation: 1,
+        spec: GatewayBalancerSpec::new(
+            GatewayStrategy::OrderedFailover,
+            vec![
+                GatewayMemberSpec::new(v6_only_id.clone(), 1, NetworkSet::TCP_UDP),
+                GatewayMemberSpec::new(fallback_id.clone(), 1, NetworkSet::TCP_UDP),
+            ],
+        ),
+    }];
+    let registry = RuntimeOutboundRegistry::compile(
+        [
+            local_leaf(
+                v6_only_id.as_str(),
+                OutboundConfig::BindSourceIps {
+                    ipv4: None,
+                    ipv6: Some("2001:db8::2".parse().expect("IPv6 source")),
+                },
+            ),
+            mpp_leaf(fallback_id.as_str(), mpp_context(9443)),
+        ],
+        &balancers,
+        test_dns_generation(),
+    )
+    .expect("family-aware registry");
+    let target = TargetAddr::Ip("8.8.8.8:443".parse().expect("target address"));
+    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+        .test_principal_policy();
+    assert!(matches!(
+        registry
+            .open_udp(
+                &EgressSelection::Balancer(balancer_id),
+                &target,
+                None,
+                &policy,
+            )
+            .await,
+        Ok(OpenedUdpOutbound::Mpp { .. })
+    ));
+    let snapshots = registry
+        .gateway_control()
+        .snapshots()
+        .expect("balancer snapshot");
+    assert_eq!(snapshots[0].runtime.members[0].counters.selections, 0);
+    assert_eq!(snapshots[0].runtime.members[0].counters.open_attempts, 0);
+    assert_eq!(snapshots[0].runtime.members[1].counters.selections, 1);
+    assert_eq!(snapshots[0].runtime.members[1].counters.open_attempts, 1);
+}
+
+#[test]
+fn complementary_family_balancer_resolves_before_member_selection() {
+    let v4_id = OutboundId::parse("v4-only").expect("outbound ID");
+    let v6_id = OutboundId::parse("v6-only").expect("outbound ID");
+    let balancer_id = BalancerId::parse("family-pair").expect("balancer ID");
+    let balancers = [GatewayBalancerConfig {
+        id: balancer_id.clone(),
+        generation: 1,
+        spec: GatewayBalancerSpec::new(
+            GatewayStrategy::OrderedFailover,
+            vec![
+                GatewayMemberSpec::new(v4_id.clone(), 1, NetworkSet::TCP_UDP),
+                GatewayMemberSpec::new(v6_id.clone(), 1, NetworkSet::TCP_UDP),
+            ],
+        ),
+    }];
+    let registry = RuntimeOutboundRegistry::compile(
+        [
+            local_leaf(
+                v4_id.as_str(),
+                OutboundConfig::BindSourceIps {
+                    ipv4: Some("198.51.100.2".parse().expect("IPv4 source")),
+                    ipv6: None,
+                },
+            ),
+            local_leaf(
+                v6_id.as_str(),
+                OutboundConfig::BindSourceIps {
+                    ipv4: None,
+                    ipv6: Some("2001:db8::2".parse().expect("IPv6 source")),
+                },
+            ),
+        ],
+        &balancers,
+        test_dns_generation(),
+    )
+    .expect("family-pair registry");
+
+    assert!(
+        registry
+            .action_requires_family_resolution(&EgressAction::Balancer(balancer_id))
+            .expect("family-resolution requirement")
+    );
+}
+
+#[test]
+fn active_probe_skips_family_ineligible_member_without_health_feedback() {
+    let v6_id = OutboundId::parse("v6-only-probe").expect("outbound ID");
+    let balancer_id = BalancerId::parse("probe-family").expect("balancer ID");
+    let mut spec = GatewayBalancerSpec::new(
+        GatewayStrategy::OrderedFailover,
+        vec![GatewayMemberSpec::new(
+            v6_id.clone(),
+            1,
+            NetworkSet::TCP_UDP,
+        )],
+    );
+    spec.probe = Some(crate::product::GatewayProbePolicy {
+        target: ProtocolTarget::parse_authority("192.0.2.1:443").expect("probe target"),
+        interval: Duration::from_millis(100),
+        timeout: Duration::from_millis(20),
+    });
+    let registry = RuntimeOutboundRegistry::compile(
+        [local_leaf(
+            v6_id.as_str(),
+            OutboundConfig::BindSourceIps {
+                ipv4: None,
+                ipv6: Some("2001:db8::2".parse().expect("IPv6 source")),
+            },
+        )],
+        &[GatewayBalancerConfig {
+            id: balancer_id,
+            generation: 1,
+            spec,
+        }],
+        test_dns_generation(),
+    )
+    .expect("probe-family registry");
+    let runtime = registry
+        .shell
+        .balancers
+        .values()
+        .next()
+        .expect("balancer runtime");
+    let target = runtime.probe_policy().expect("probe policy").target.clone();
+
+    assert!(
+        !registry
+            .gateway_member_supports_probe_target(&v6_id, &target)
+            .expect("probe eligibility")
+    );
+    let snapshot = runtime.snapshot().expect("balancer snapshot");
+    let member = &snapshot.members[0];
+    assert!(!member.probe_in_flight);
+    assert_eq!(member.consecutive_failures, 0);
+    assert_eq!(member.counters.probes, 0);
+    assert_eq!(member.counters.probe_failures, 0);
+    assert!(member.last_error.is_none());
+}
+
+#[tokio::test]
+async fn temporarily_unassigned_source_is_a_flow_error_and_runtime_remains_usable() {
+    let registry = RuntimeOutboundRegistry::compile(
+        [
+            local_leaf(
+                "temporarily-down",
+                OutboundConfig::BindSourceIps {
+                    ipv4: Some("198.51.100.254".parse().expect("unassigned source")),
+                    ipv6: None,
+                },
+            ),
+            mpp_leaf("available-mpp", mpp_context(10443)),
+        ],
+        &[],
+        test_dns_generation(),
+    )
+    .expect("runtime registry");
+    let target = TargetAddr::Ip("8.8.8.8:443".parse().expect("target address"));
+    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+        .test_principal_policy();
+
+    let unavailable = selection(&registry, "temporarily-down");
+    assert!(matches!(
+        registry
+            .open_udp(&unavailable, &target, None, &policy)
+            .await,
+        Err(RuntimeError::OutboundConnect(_))
+    ));
+
+    let available = selection(&registry, "available-mpp");
+    assert!(matches!(
+        registry.open_udp(&available, &target, None, &policy).await,
+        Ok(OpenedUdpOutbound::Mpp { .. })
+    ));
+}
+
+#[tokio::test]
 async fn all_offline_balancer_members_return_typed_unavailability() {
     let first = mpp_context(7443);
     let second = mpp_context(8443);

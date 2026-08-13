@@ -399,6 +399,96 @@ fn local_outbound<'a>(node: &'a NodeConfig, id: &str) -> &'a OutboundConfig {
         .expect("local outbound")
 }
 
+fn direct_outbound_document(bind_fields: &str) -> String {
+    format!(
+        r#"
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+{bind_fields}
+
+[routing]
+[[routing.rules]]
+name = "default"
+action = "outbound"
+outbound = "direct"
+"#,
+    )
+}
+
+#[test]
+fn direct_outbound_source_bindings_parse_with_legacy_compatibility() {
+    let load_direct = |bind_fields: &str| {
+        let config = load_config_toml_str(&direct_outbound_document(bind_fields))
+            .expect("direct outbound source binding");
+        let CommandConfig::Node(node) = config.command;
+        local_outbound(&node, "direct").clone()
+    };
+
+    assert!(matches!(load_direct(""), OutboundConfig::Direct));
+    assert!(matches!(
+        load_direct(r#"bind_ip = "192.0.2.10""#),
+        OutboundConfig::BindSourceIp(std::net::IpAddr::V4(address))
+            if address == std::net::Ipv4Addr::new(192, 0, 2, 10)
+    ));
+    assert!(matches!(
+        load_direct(r#"bind_ip = "2001:db8::10""#),
+        OutboundConfig::BindSourceIp(std::net::IpAddr::V6(address))
+            if address == "2001:db8::10".parse::<std::net::Ipv6Addr>().expect("IPv6")
+    ));
+    assert!(matches!(
+        load_direct(r#"bind_ipv4 = "192.0.2.11""#),
+        OutboundConfig::BindSourceIps { ipv4: Some(ipv4), ipv6: None }
+            if ipv4 == std::net::Ipv4Addr::new(192, 0, 2, 11)
+    ));
+    assert!(matches!(
+        load_direct(r#"bind_ipv6 = "2001:db8::11""#),
+        OutboundConfig::BindSourceIps { ipv4: None, ipv6: Some(ipv6) }
+            if ipv6 == "2001:db8::11".parse::<std::net::Ipv6Addr>().expect("IPv6")
+    ));
+    assert!(matches!(
+        load_direct(
+            r#"bind_ipv4 = "192.0.2.12"
+    bind_ipv6 = "2001:db8::12""#
+        ),
+        OutboundConfig::BindSourceIps { ipv4: Some(ipv4), ipv6: Some(ipv6) }
+            if ipv4 == std::net::Ipv4Addr::new(192, 0, 2, 12)
+                && ipv6 == "2001:db8::12".parse::<std::net::Ipv6Addr>().expect("IPv6")
+    ));
+}
+
+#[test]
+fn direct_outbound_source_bindings_reject_ambiguous_or_wrong_family_fields() {
+    for bind_fields in [
+        r#"bind_ip = "192.0.2.10"
+bind_ipv4 = "192.0.2.11""#,
+        r#"bind_ip = "2001:db8::10"
+bind_ipv6 = "2001:db8::11""#,
+        r#"bind_ip = "192.0.2.10"
+bind_ipv4 = "192.0.2.11"
+bind_ipv6 = "2001:db8::11""#,
+    ] {
+        assert!(matches!(
+            load_config_toml_str(&direct_outbound_document(bind_fields)),
+            Err(ConfigFileError::DirectBindFieldConflict)
+        ));
+    }
+
+    for bind_fields in [
+        r#"bind_ipv4 = "2001:db8::10""#,
+        r#"bind_ipv6 = "192.0.2.10""#,
+    ] {
+        assert!(matches!(
+            load_config_toml_str(&direct_outbound_document(bind_fields)),
+            Err(ConfigFileError::Toml(_))
+        ));
+    }
+}
+
 fn managed_tun_document(host: &str) -> String {
     format!(
         r#"

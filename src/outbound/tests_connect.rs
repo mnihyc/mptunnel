@@ -8,7 +8,7 @@ use crate::product::{
     PortRange, RouteMatchSpec, RuleId,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -197,6 +197,59 @@ fn outbound_support_matrix_matches_protocol_semantics() {
     assert_eq!(
         http_connect.ensure_supports(TargetProtocol::Udp),
         Err(OutboundError::UdpNotSupported)
+    );
+}
+
+#[test]
+fn direct_source_bindings_select_only_the_explicit_destination_family() {
+    let v4_remote = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let v6_remote = IpAddr::V6("2001:db8::1".parse().expect("IPv6 remote"));
+    let v4_source = Ipv4Addr::new(198, 51, 100, 2);
+    let v6_source: Ipv6Addr = "2001:db8::2".parse().expect("IPv6 source");
+
+    assert_eq!(
+        OutboundConfig::Direct.source_binding_for(v4_remote),
+        DirectSourceBinding::Default
+    );
+    assert_eq!(
+        OutboundConfig::Direct.source_binding_for(v6_remote),
+        DirectSourceBinding::Default
+    );
+
+    let legacy = OutboundConfig::BindSourceIp(IpAddr::V4(v4_source));
+    assert_eq!(
+        legacy.source_binding_for(v4_remote),
+        DirectSourceBinding::Bound(IpAddr::V4(v4_source))
+    );
+    assert_eq!(
+        legacy.source_binding_for(v6_remote),
+        DirectSourceBinding::Ineligible
+    );
+
+    let dual = OutboundConfig::BindSourceIps {
+        ipv4: Some(v4_source),
+        ipv6: Some(v6_source),
+    };
+    assert_eq!(
+        dual.source_binding_for(v4_remote),
+        DirectSourceBinding::Bound(IpAddr::V4(v4_source))
+    );
+    assert_eq!(
+        dual.source_binding_for(v6_remote),
+        DirectSourceBinding::Bound(IpAddr::V6(v6_source))
+    );
+
+    let v6_only = OutboundConfig::BindSourceIps {
+        ipv4: None,
+        ipv6: Some(v6_source),
+    };
+    assert_eq!(
+        v6_only.source_binding_for(v4_remote),
+        DirectSourceBinding::Ineligible
+    );
+    assert_eq!(
+        v6_only.source_binding_for(v6_remote),
+        DirectSourceBinding::Bound(IpAddr::V6(v6_source))
     );
 }
 

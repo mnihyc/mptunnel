@@ -1,6 +1,6 @@
 [package]
 name = "mptunnel"
-version = "0.2.6"
+version = "0.2.7"
 authors = ["mnihyc"]
 edition = "2024"
 description = "Encrypted multipath proxy and tunnel"

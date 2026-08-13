@@ -240,7 +240,9 @@ impl ProductRuntimeInventory {
                     id: id.clone(),
                     protocol: match config {
                         OutboundConfig::Direct => "direct",
-                        OutboundConfig::BindSourceIp(_) => "bind-source",
+                        OutboundConfig::BindSourceIp(_) | OutboundConfig::BindSourceIps { .. } => {
+                            "bind-source"
+                        }
                         OutboundConfig::Socks5(_) => "socks5",
                         OutboundConfig::HttpConnect(_) => "http-connect",
                         OutboundConfig::HttpsConnect(_) => "https-connect",

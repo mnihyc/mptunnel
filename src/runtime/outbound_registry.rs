@@ -16,9 +16,9 @@ use crate::outbound::{
 use crate::performance::MppPerformanceConfig;
 use crate::product::{
     AuthorizedDomainTarget, AuthorizedTarget, BalancerId, CompiledDnsPlan, CompiledDnsUpstream,
-    DnsEgressSpec, DnsPlanId, EgressAction, FlowContext, GatewayMemberMode, Network, NetworkSet,
-    OutboundId, PendingProductFlow, ProductAdmission, ProductFlowLease as ProductAdmissionLease,
-    ProductOutboundFlow, ProtocolTarget,
+    DnsEgressSpec, DnsPlanId, EgressAction, FlowContext, GatewayMemberHandle, GatewayMemberMode,
+    Network, NetworkSet, OutboundId, PendingProductFlow, ProductAdmission,
+    ProductFlowLease as ProductAdmissionLease, ProductOutboundFlow, ProtocolTarget,
 };
 use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
@@ -192,6 +192,30 @@ impl RuntimeOutboundLeaf {
             Self::Mpp { .. } => false,
             Self::Local { config, .. } => config.requires_ip_target(),
         }
+    }
+
+    fn supports_ip_family(&self, address: IpAddr) -> bool {
+        match self {
+            Self::Mpp { .. } => true,
+            Self::Local { config, .. } => config.supports_ip_family(address),
+        }
+    }
+
+    fn supports_destination_family(&self, destination: &ProductDestination) -> bool {
+        match (self, destination) {
+            (Self::Mpp { .. }, _) | (_, ProductDestination::Domain(_)) => true,
+            (Self::Local { config, .. }, ProductDestination::Resolved(resolved)) => resolved
+                .targets()
+                .iter()
+                .any(|target| config.supports_ip_family(target.address())),
+        }
+    }
+
+    fn destination_family_error(&self) -> RuntimeError {
+        RuntimeError::GatewayUnavailable(format!(
+            "outbound {} has no source binding for the destination IP family",
+            self.id().as_str()
+        ))
     }
 
     const fn open_timeout(&self) -> Duration {
@@ -561,6 +585,64 @@ impl RuntimeOutboundRegistry {
         self.shell.selection_for_egress(egress)
     }
 
+    pub(in crate::runtime) fn action_requires_family_resolution(
+        &self,
+        action: &EgressAction,
+    ) -> Result<bool, RuntimeError> {
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        match action {
+            EgressAction::Outbound(id) => {
+                let leaf = self.shell.leaves.get(id).ok_or_else(|| {
+                    RuntimeError::ProductPolicy(format!(
+                        "route selected unavailable outbound {}",
+                        id.as_str()
+                    ))
+                })?;
+                Ok(!leaf.supports_ip_family(ipv4) || !leaf.supports_ip_family(ipv6))
+            }
+            EgressAction::Balancer(id) => {
+                let runtime = self.shell.require_balancer(id)?;
+                for member in runtime.members() {
+                    let leaf = self.shell.leaves.get(member).ok_or_else(|| {
+                        RuntimeError::ProductPolicy(format!(
+                            "balancer member {} has no runtime outbound",
+                            member.as_str()
+                        ))
+                    })?;
+                    if !leaf.supports_ip_family(ipv4) || !leaf.supports_ip_family(ipv6) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            EgressAction::Direct | EgressAction::Reject | EgressAction::Drop => Ok(false),
+        }
+    }
+
+    pub(in crate::runtime) fn action_supports_ip_family(
+        &self,
+        action: &EgressAction,
+        address: IpAddr,
+    ) -> bool {
+        match action {
+            EgressAction::Outbound(id) => self
+                .shell
+                .leaves
+                .get(id)
+                .is_some_and(|leaf| leaf.supports_ip_family(address)),
+            EgressAction::Balancer(id) => self.shell.balancers.get(id).is_some_and(|runtime| {
+                runtime.members().iter().any(|member| {
+                    self.shell
+                        .leaves
+                        .get(member)
+                        .is_some_and(|leaf| leaf.supports_ip_family(address))
+                })
+            }),
+            EgressAction::Direct | EgressAction::Reject | EgressAction::Drop => true,
+        }
+    }
+
     /// Proves the server-side no-chaining invariant at runtime assembly.
     ///
     /// Configuration validation performs the same check, but server services
@@ -646,6 +728,32 @@ impl RuntimeOutboundRegistry {
             .await
     }
 
+    fn exclude_ineligible_balancer_members(
+        &self,
+        runtime: &ClientGatewayRuntime,
+        destination: &ProductDestination,
+        excluded: &mut Vec<GatewayMemberHandle>,
+    ) -> Result<(), RuntimeError> {
+        if matches!(destination, ProductDestination::Domain(_)) {
+            return Ok(());
+        }
+        for member in runtime.members() {
+            let leaf = self.shell.leaves.get(member).ok_or_else(|| {
+                RuntimeError::ProductPolicy(format!(
+                    "balancer member {} has no runtime outbound",
+                    member.as_str()
+                ))
+            })?;
+            if !leaf.supports_destination_family(destination) {
+                let handle = runtime.member_handle(member)?;
+                if !excluded.contains(&handle) {
+                    excluded.push(handle);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn open_product_tcp_for_origin(
         &self,
         request: ProductOpenRequest<'_>,
@@ -672,6 +780,9 @@ impl RuntimeOutboundRegistry {
                     self.resolve_destination(&mut destination, dns_plan, authorizer)
                         .await?;
                 }
+                if !leaf.supports_destination_family(&destination) {
+                    return Err(leaf.destination_family_error());
+                }
                 let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
                 let connect = pending
                     .try_begin_connect(leaf.id().clone())
@@ -697,6 +808,7 @@ impl RuntimeOutboundRegistry {
                 let mut excluded = Vec::with_capacity(attempt_limit);
                 let mut last_error = None;
                 let mut resolution_unavailable = false;
+                self.exclude_ineligible_balancer_members(runtime, &destination, &mut excluded)?;
                 for _ in 0..attempt_limit {
                     let binding = match runtime.select_for_principal(
                         Network::Tcp,
@@ -735,6 +847,16 @@ impl RuntimeOutboundRegistry {
                             last_error = Some(error);
                             continue;
                         }
+                    }
+                    if !leaf.supports_destination_family(&destination) {
+                        excluded.push(handle);
+                        last_error.get_or_insert_with(|| leaf.destination_family_error());
+                        self.exclude_ineligible_balancer_members(
+                            runtime,
+                            &destination,
+                            &mut excluded,
+                        )?;
+                        continue;
                     }
                     let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
                     let connect = match pending.try_begin_connect(leaf.id().clone()) {
@@ -810,6 +932,9 @@ impl RuntimeOutboundRegistry {
                     self.resolve_destination(&mut destination, dns_plan, authorizer)
                         .await?;
                 }
+                if !leaf.supports_destination_family(&destination) {
+                    return Err(leaf.destination_family_error());
+                }
                 let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
                 let connect = pending
                     .try_begin_connect(leaf.id().clone())
@@ -835,6 +960,7 @@ impl RuntimeOutboundRegistry {
                 let mut excluded = Vec::with_capacity(attempt_limit);
                 let mut last_error = None;
                 let mut resolution_unavailable = false;
+                self.exclude_ineligible_balancer_members(runtime, &destination, &mut excluded)?;
                 for _ in 0..attempt_limit {
                     let binding = match runtime.select_for_principal(
                         Network::Udp,
@@ -873,6 +999,16 @@ impl RuntimeOutboundRegistry {
                             last_error = Some(error);
                             continue;
                         }
+                    }
+                    if !leaf.supports_destination_family(&destination) {
+                        excluded.push(handle);
+                        last_error.get_or_insert_with(|| leaf.destination_family_error());
+                        self.exclude_ineligible_balancer_members(
+                            runtime,
+                            &destination,
+                            &mut excluded,
+                        )?;
+                        continue;
                     }
                     let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
                     let connect = match pending.try_begin_connect(leaf.id().clone()) {
@@ -1125,6 +1261,9 @@ async fn run_gateway_probe_service(
     loop {
         ticker.tick().await;
         for member in runtime.members() {
+            if !registry.gateway_member_supports_probe_target(member, &policy.target)? {
+                continue;
+            }
             let permit = permits.clone().acquire_owned().await.map_err(|_| {
                 RuntimeError::ProductPolicy(
                     "balancer active-probe concurrency owner closed".to_string(),
@@ -1157,6 +1296,22 @@ async fn run_gateway_probe_service(
 }
 
 impl RuntimeOutboundRegistry {
+    fn gateway_member_supports_probe_target(
+        &self,
+        member: &OutboundId,
+        target: &ProtocolTarget,
+    ) -> Result<bool, RuntimeError> {
+        let address = target.ip().ok_or_else(|| {
+            RuntimeError::ProductPolicy(
+                "validated balancer probe target is not a literal IP".to_string(),
+            )
+        })?;
+        Ok(self
+            .shell
+            .require_leaf(member, Network::Tcp)?
+            .supports_ip_family(address))
+    }
+
     async fn probe_gateway_member(
         &self,
         member: &OutboundId,
@@ -1478,6 +1633,17 @@ impl DnsBackendFactory for RuntimeOutboundDnsBackendFactory {
                     plan,
                     upstream,
                     DnsNativeSocketPolicy::bind_source(native_sockets.clone(), *source_ip),
+                );
+            }
+            RuntimeOutboundLeaf::Local {
+                config: OutboundConfig::BindSourceIps { ipv4, ipv6 },
+                native_sockets,
+                ..
+            } => {
+                return DirectDnsBackendFactory::build_backend_with_policy(
+                    plan,
+                    upstream,
+                    DnsNativeSocketPolicy::bind_sources(native_sockets.clone(), *ipv4, *ipv6),
                 );
             }
             RuntimeOutboundLeaf::Local {

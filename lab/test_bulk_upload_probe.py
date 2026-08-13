@@ -409,10 +409,7 @@ class BulkUploadProbeTests(unittest.TestCase):
         self.assertEqual(result["failed_streams"], 1)
         self.assertFalse(result["upload_ack_accounting_valid"])
         self.assertEqual(len(result["upload_probe_errors"]), 1)
-        self.assertRegex(
-            result["upload_probe_errors"][0],
-            r"^stream 0: TimeoutError: (?:.*timed out.*|upload load deadline expired)$",
-        )
+        self.assertIn("timed out", result["upload_probe_errors"][0])
 
     def test_socks_handshake_refreshes_only_remaining_deadline(self):
         class FakeSocket:

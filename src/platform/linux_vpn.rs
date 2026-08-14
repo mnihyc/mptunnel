@@ -19,7 +19,7 @@ use crate::platform::{
     SystemLinuxHostNetworkBackend, SystemTunDeviceFactory, TransactionalLinuxVpnController,
     snapshot_linux_environment,
 };
-use crate::product::{CompiledDnsPolicy, DnsCompileError, DomainName};
+use crate::product::{CompiledDnsPolicy, DnsActivation, DnsCompileError, DomainName};
 use crate::transport::{
     CarrierNetworkProvider, CarrierPathIdentity, Endpoint, LinuxMarkedCarrierNetworkProvider,
     LinuxMarkedNativeSocketConfigurator, NativeSocketConfigurator, PathSpec,
@@ -62,6 +62,7 @@ pub struct LinuxVpnPrepareRequest {
     /// routes are published. An empty set means preparation is literal-only.
     pub prepublication_domains: Vec<DomainName>,
     pub dns_policy: Arc<CompiledDnsPolicy>,
+    pub dns_activation: DnsActivation,
     pub resolution_timeout: Duration,
 }
 
@@ -101,6 +102,7 @@ pub fn compile_node_linux_vpn_prepare_request(
         native_proxy_endpoints,
         prepublication_domains,
         dns_policy,
+        dns_activation,
         resolution_timeout,
     } = spec;
     let interface = LinuxInterfaceName::parse(interface_name).map_err(|source| {
@@ -125,6 +127,7 @@ pub fn compile_node_linux_vpn_prepare_request(
         native_proxy_endpoints,
         prepublication_domains,
         dns_policy,
+        dns_activation,
         resolution_timeout,
     }))
 }
@@ -504,7 +507,7 @@ pub async fn prepare_linux_vpn(
     .await?;
     let bootstrap_dns = request
         .dns_policy
-        .bootstrap_endpoints()
+        .bootstrap_endpoints_for_activation(&request.dns_activation)
         .map(|endpoint| endpoint.ip())
         .collect::<Vec<_>>();
 
@@ -547,10 +550,16 @@ pub async fn prepare_linux_vpn(
 }
 
 fn validate_dns_preflight(request: &LinuxVpnPrepareRequest) -> Result<(), LinuxVpnPrepareError> {
-    if request.dns_policy.uses_system_resolution() {
+    if request
+        .dns_policy
+        .uses_system_resolution_for_activation(&request.dns_activation)
+    {
         return Err(LinuxVpnPrepareError::SystemDnsUnsupported);
     }
-    if !request.dns_policy.is_encrypted_only() {
+    if !request
+        .dns_policy
+        .is_encrypted_only_for_activation(&request.dns_activation)
+    {
         return Err(LinuxVpnPrepareError::EncryptedDnsRequired);
     }
     if request.config.dns().is_none()

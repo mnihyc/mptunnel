@@ -2,7 +2,7 @@ use super::*;
 use crate::config::CommandConfig;
 use crate::product::{
     DomainName, EgressAction, FlowContext, InboundId, InitialDemand, Network, PrincipalId,
-    ProtocolTarget, RouteInput, RouteMismatch, SourceEndpoint,
+    ProtocolTarget, RouteDisposition, RouteInput, RouteMismatch, SourceEndpoint,
 };
 
 const TEST_CERTIFICATE_FILE: &str = "mptunnel-test-certificate.pem";
@@ -241,22 +241,15 @@ fn mpp_outbounds(node: &NodeConfig) -> Vec<&MppOutboundConfig> {
 }
 
 #[test]
-fn forwarding_mode_is_strict_global_and_defaults_to_l4() {
-    let omitted = load_config_toml_str(&managed_tun_document("")).expect("omitted forwarding mode");
-    let CommandConfig::Node(omitted) = omitted.command;
-    assert_eq!(omitted.forwarding_mode, ForwardingMode::L4);
+fn forwarding_family_is_inferred_and_the_removed_global_switch_is_rejected() {
+    let inferred = load_config_toml_str(&managed_tun_document(""))
+        .expect("L4 family inferred from TUN inbound");
+    let CommandConfig::Node(inferred) = inferred.command;
+    assert_eq!(inferred.forwarding_mode, ForwardingMode::L4);
 
-    let explicit = format!(
-        "forwarding_mode = \"l4\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
-        managed_tun_document("")
-    );
-    let explicit = load_config_toml_str(&explicit).expect("explicit L4 forwarding mode");
-    let CommandConfig::Node(explicit) = explicit.command;
-    assert_eq!(explicit.forwarding_mode, ForwardingMode::L4);
-
-    for unsupported in ["L4", "layer-4", "auto", ""] {
+    for removed in ["l4", "l3", "auto"] {
         let document = format!(
-            "forwarding_mode = {unsupported:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
+            "forwarding_mode = {removed:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
             managed_tun_document("")
         );
         assert!(matches!(
@@ -286,7 +279,7 @@ tls_pinned_certificate = {{ from = "file", path = "{TEST_CERTIFICATE_FILE}" }}
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "edge"
 "#,
     )
@@ -299,7 +292,6 @@ fn mpp_inbound_security_document(extra_security: &str) -> String {
 name = "edge"
 protocol = "mpp"
 paths = [{{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }}]
-outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
@@ -310,6 +302,12 @@ tls_private_key = {{ from = "file", path = "{TEST_PRIVATE_KEY_FILE}" }}
 [[outbounds]]
 name = "direct"
 protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+decision = "allow-restricted"
+outbound = "direct"
 "#,
     )
 }
@@ -447,7 +445,7 @@ transport_secret = {{ from = "hex", value = "{transport_hex}" }}
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "edge"
 "#,
     );
@@ -471,7 +469,6 @@ secret = {{ from = "base64", value = "{credential}" }}
 name = "edge"
 protocol = "mpp"
 paths = [{{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }}]
-outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["inline"]
@@ -482,6 +479,12 @@ transport_secret = {{ from = "base64", value = "{transport_base64}" }}
 [[outbounds]]
 name = "direct"
 protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+decision = "allow-restricted"
+outbound = "direct"
 "#,
         credential = BASE64.encode([0xaa; 32]),
     );
@@ -524,7 +527,7 @@ protocol = "direct"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "direct"
 "#,
     );
@@ -548,7 +551,7 @@ protocol = "direct"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "direct"
 "#,
     );
@@ -581,7 +584,7 @@ protocol = "direct"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "direct"
 "#,
             )
@@ -627,7 +630,7 @@ protocol = "direct"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "direct"
 "#,
     )
@@ -730,23 +733,24 @@ tls_pinned_certificate = {{ from = "file", path = "mptunnel-test-certificate.pem
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "edge"
 "#
     )
 }
 
-fn managed_fake_dns_document(host: &str) -> String {
+fn managed_synthetic_capture_document(host: &str) -> String {
     format!(
         r#"
 [dns]
 default = "secure"
 
-[dns.override]
+[[dns.synthetic_capture]]
+name = "vpn-capture"
 ipv4_pool = "198.18.0.0/16"
-max_entries = 4096
-answer_ttl_ms = 30000
-recovery_ttl_ms = 120000
+capacity = 4096
+answer_ttl_seconds = 30
+recovery_ttl_seconds = 120
 
 [[dns.servers]]
 name = "dot"
@@ -758,11 +762,47 @@ tls_name = "cloudflare-dns.com"
 name = "secure"
 servers = ["dot"]
 security = "require-encrypted"
+synthetic_capture = "vpn-capture"
 
 {}
 "#,
         managed_tun_document(host)
     )
+}
+
+fn dual_synthetic_capture_dns() -> &'static str {
+    r#"
+[dns]
+default = "capture-a-policy"
+
+[[dns.servers]]
+name = "system"
+protocol = "system"
+
+[[dns.synthetic_capture]]
+name = "capture-a"
+ipv4_pool = "198.18.0.0/24"
+capacity = 128
+answer_ttl_seconds = 30
+recovery_ttl_seconds = 120
+
+[[dns.synthetic_capture]]
+name = "capture-b"
+ipv4_pool = "198.18.1.0/24"
+capacity = 128
+answer_ttl_seconds = 30
+recovery_ttl_seconds = 120
+
+[[dns.policies]]
+name = "capture-a-policy"
+servers = ["system"]
+synthetic_capture = "capture-a"
+
+[[dns.policies]]
+name = "capture-b-policy"
+servers = ["system"]
+synthetic_capture = "capture-b"
+"#
 }
 
 fn only_tun(node: &NodeConfig) -> &crate::ingress::tun::TunL4Config {
@@ -886,8 +926,8 @@ exclude_cidrs = ["10.9.8.7/16"]
 }
 
 #[test]
-fn managed_vpn_must_capture_and_must_not_exclude_fake_dns_pools() {
-    let valid = load_config_toml_str(&managed_fake_dns_document(
+fn managed_vpn_must_capture_and_must_not_exclude_synthetic_capture_pools() {
+    let valid = load_config_toml_str(&managed_synthetic_capture_document(
         r#"
 [inbounds.host]
 mode = "managed"
@@ -897,10 +937,10 @@ include_cidrs = ["198.18.0.0/16"]
     ));
     assert!(
         valid.is_ok(),
-        "captured FakeDNS pool should compile: {valid:?}"
+        "captured synthetic capture pool should compile: {valid:?}"
     );
 
-    let missing = load_config_toml_str(&managed_fake_dns_document(
+    let missing = load_config_toml_str(&managed_synthetic_capture_document(
         r#"
 [inbounds.host]
 mode = "managed"
@@ -908,14 +948,14 @@ route_mode = "split"
 include_cidrs = ["10.0.0.0/8"]
 "#,
     ))
-    .expect_err("uncaptured FakeDNS pool must fail closed");
+    .expect_err("uncaptured synthetic capture pool must fail closed");
     assert!(matches!(
         missing,
         ConfigFileError::Config(ConfigError::DnsPolicy(message))
-            if message.contains("does not capture DNS override pool")
+            if message.contains("does not capture DNS synthetic-capture pool")
     ));
 
-    let excluded = load_config_toml_str(&managed_fake_dns_document(
+    let excluded = load_config_toml_str(&managed_synthetic_capture_document(
         r#"
 [inbounds.host]
 mode = "managed"
@@ -924,7 +964,7 @@ include_cidrs = ["198.18.0.0/16"]
 exclude_cidrs = ["198.18.0.0/24"]
 "#,
     ))
-    .expect_err("excluded FakeDNS pool must fail closed");
+    .expect_err("excluded synthetic capture pool must fail closed");
     assert!(matches!(
         excluded,
         ConfigFileError::Config(ConfigError::DnsPolicy(message))
@@ -1029,6 +1069,7 @@ address = "[2606:4700:4700::1111]:53"
 [[policies]]
 name = "default"
 servers = ["v4", "v6"]
+override_records = ["router-home"]
 family = "ipv6-and-ipv4"
 strategy = "race"
 fallback_ms = 50
@@ -1036,7 +1077,8 @@ answer_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
 query = { timeout_ms = 1500, inflight = 32, answers = 24 }
 cache = { entries = 2048, positive_ttl_ms = 120000, negative_ttl_ms = 15000, stale_ms = 45000, prefetch_ms = 12000 }
 
-[[records]]
+[[override_records]]
+name = "router-home"
 domain = "router.home.arpa"
 addresses = ["192.0.2.1", "2001:db8::1"]
 "#,
@@ -1047,8 +1089,9 @@ addresses = ["192.0.2.1", "2001:db8::1"]
         balancers: HashMap::new(),
         order: Vec::new(),
         balancer_order: Vec::new(),
+        explicit_mpp_performance: HashSet::new(),
     };
-    let config = file.into_config(&outbounds).expect("DNS config");
+    let config = file.into_config(1, &outbounds).expect("DNS config");
     let compiled = config.compile().expect("compiled DNS");
     let default = crate::product::DnsPlanId::parse("default").expect("plan ID");
     let plan = compiled.plan(&default).expect("default plan");
@@ -1085,8 +1128,12 @@ addresses = ["192.0.2.1", "2001:db8::1"]
     assert_eq!(plan.limits().prefetch_max, Duration::from_millis(12_000));
     assert_eq!(
         compiled
-            .host(&DomainName::parse("router.home.arpa").expect("host"))
-            .expect("compiled host")
+            .override_record_for_plan(
+                &default,
+                &DomainName::parse("router.home.arpa").expect("host")
+            )
+            .expect("compiled override record")
+            .addresses()
             .as_ref(),
         &[
             "192.0.2.1".parse::<IpAddr>().expect("IPv4"),
@@ -1146,12 +1193,16 @@ servers = ["system", "udp", "tcp", "udp-tcp", "dot", "doh", "doq"]
     )
     .expect("canonical DNS schema");
     let compiled = file
-        .into_config(&ParsedOutbounds {
-            leaves: HashMap::new(),
-            balancers: HashMap::new(),
-            order: Vec::new(),
-            balancer_order: Vec::new(),
-        })
+        .into_config(
+            1,
+            &ParsedOutbounds {
+                leaves: HashMap::new(),
+                balancers: HashMap::new(),
+                order: Vec::new(),
+                balancer_order: Vec::new(),
+                explicit_mpp_performance: HashSet::new(),
+            },
+        )
         .expect("canonical DNS config")
         .compile()
         .expect("compiled canonical DNS config");
@@ -1182,6 +1233,8 @@ fn dns_file_schema_rejects_removed_names_and_invalid_field_applicability() {
         r#"plans = []"#,
         r#"hosts = []"#,
         r#"fake_dns = {}"#,
+        r#"records = []"#,
+        r#"override = {}"#,
         r#"servers = [{ name = "old", transport = "udp", bootstrap = "1.1.1.1:53" }]"#,
         r#"policies = [{ name = "default", servers = ["system"], lookup_timeout_ms = 5000 }]"#,
         r#"rules = [{ name = "old", exact = "example.test", dns_plan = "default" }]"#,
@@ -1239,12 +1292,16 @@ strategy = "race"
         let parsed = toml::from_str::<DnsFileConfig>(invalid).expect("valid TOML shape");
         assert!(
             parsed
-                .into_config(&ParsedOutbounds {
-                    leaves: HashMap::new(),
-                    balancers: HashMap::new(),
-                    order: Vec::new(),
-                    balancer_order: Vec::new(),
-                })
+                .into_config(
+                    1,
+                    &ParsedOutbounds {
+                        leaves: HashMap::new(),
+                        balancers: HashMap::new(),
+                        order: Vec::new(),
+                        balancer_order: Vec::new(),
+                        explicit_mpp_performance: HashSet::new(),
+                    }
+                )
                 .is_err(),
             "invalid DNS field combination unexpectedly compiled: {invalid}"
         );
@@ -1252,17 +1309,18 @@ strategy = "race"
 }
 
 #[test]
-fn dns_file_config_strictly_compiles_doq_and_fake_dns() {
+fn dns_file_config_strictly_compiles_doq_and_synthetic_capture() {
     let file: DnsFileConfig = toml::from_str(
         r#"
 default = "secure"
 
-[override]
+[[synthetic_capture]]
+name = "vpn-capture"
 ipv4_pool = "198.18.0.0/16"
 ipv6_pool = "fd00:4d50::/112"
-max_entries = 4096
-answer_ttl_ms = 30000
-recovery_ttl_ms = 120000
+capacity = 4096
+answer_ttl_seconds = 30
+recovery_ttl_seconds = 120
 
 [[servers]]
 name = "doq"
@@ -1274,18 +1332,23 @@ tls_name = "cloudflare-dns.com"
 name = "secure"
 servers = ["doq"]
 security = "require-encrypted"
+synthetic_capture = "vpn-capture"
 "#,
     )
-    .expect("strict DoQ/FakeDNS file");
+    .expect("strict DoQ/synthetic capture file");
     let config = file
-        .into_config(&ParsedOutbounds {
-            leaves: HashMap::new(),
-            balancers: HashMap::new(),
-            order: Vec::new(),
-            balancer_order: Vec::new(),
-        })
-        .expect("DoQ/FakeDNS config");
-    let compiled = config.compile().expect("compiled DoQ/FakeDNS");
+        .into_config(
+            1,
+            &ParsedOutbounds {
+                leaves: HashMap::new(),
+                balancers: HashMap::new(),
+                order: Vec::new(),
+                balancer_order: Vec::new(),
+                explicit_mpp_performance: HashSet::new(),
+            },
+        )
+        .expect("DoQ/synthetic capture config");
+    let compiled = config.compile().expect("compiled DoQ/synthetic capture");
     let doq = compiled
         .upstream(&crate::product::DnsUpstreamId::parse("doq").expect("upstream"))
         .expect("DoQ upstream");
@@ -1293,7 +1356,11 @@ security = "require-encrypted"
         doq.endpoint().transport(),
         crate::product::DnsTransport::Quic
     );
-    let fake = compiled.fake_dns().expect("FakeDNS policy");
+    let fake = compiled
+        .synthetic_capture(
+            &crate::product::DnsSyntheticCaptureId::parse("vpn-capture").expect("capture"),
+        )
+        .expect("synthetic capture policy");
     assert_eq!(fake.max_entries, 4096);
     assert_eq!(fake.answer_ttl, Duration::from_secs(30));
     assert_eq!(fake.recovery_ttl, Duration::from_secs(120));
@@ -1301,27 +1368,33 @@ security = "require-encrypted"
     let invalid_pool = toml::from_str::<DnsFileConfig>(
         r#"
 default = "default"
-[override]
+[[synthetic_capture]]
+name = "bad-pool"
 ipv4_pool = "203.0.113.0/24"
-max_entries = 32
-answer_ttl_ms = 30000
-recovery_ttl_ms = 120000
+capacity = 32
+answer_ttl_seconds = 30
+recovery_ttl_seconds = 120
 [[servers]]
 name = "system"
 protocol = "system"
 [[policies]]
 name = "default"
 servers = ["system"]
+synthetic_capture = "bad-pool"
 "#,
     )
     .expect("file shape")
-    .into_config(&ParsedOutbounds {
-        leaves: HashMap::new(),
-        balancers: HashMap::new(),
-        order: Vec::new(),
-        balancer_order: Vec::new(),
-    })
-    .expect_err("public FakeDNS pool must fail closed");
+    .into_config(
+        1,
+        &ParsedOutbounds {
+            leaves: HashMap::new(),
+            balancers: HashMap::new(),
+            order: Vec::new(),
+            balancer_order: Vec::new(),
+            explicit_mpp_performance: HashSet::new(),
+        },
+    )
+    .expect_err("public synthetic capture pool must fail closed");
     assert!(matches!(
         invalid_pool,
         ConfigFileError::DnsPolicy(message)
@@ -1343,12 +1416,16 @@ servers = ["doq"]
 "#,
     )
     .expect("file shape")
-    .into_config(&ParsedOutbounds {
-        leaves: HashMap::new(),
-        balancers: HashMap::new(),
-        order: Vec::new(),
-        balancer_order: Vec::new(),
-    })
+    .into_config(
+        1,
+        &ParsedOutbounds {
+            leaves: HashMap::new(),
+            balancers: HashMap::new(),
+            order: Vec::new(),
+            balancer_order: Vec::new(),
+            explicit_mpp_performance: HashSet::new(),
+        },
+    )
     .expect_err("DoQ must reject HTTP path");
     assert!(matches!(
         invalid_doq_path,
@@ -1387,7 +1464,7 @@ endpoint = "127.0.0.1:1080"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "proxy"
 "#,
     );
@@ -1425,7 +1502,7 @@ endpoint = "proxy.example:1080"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "proxy"
 "#,
     )
@@ -1465,7 +1542,7 @@ endpoint = "127.0.0.1:1080"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "proxy"
 "#,
     )
@@ -1514,7 +1591,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "edge"
 "#,
     );
@@ -1571,7 +1648,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "edge"
 "#,
     )
@@ -1645,7 +1722,7 @@ fn resource_file_config_exposes_sparse_node_limits() {
 #[test]
 fn tun_l3_toml_compiles_client_binding_and_server_address_plan() {
     let document = format!(
-        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
+        "{TEST_CREDENTIAL_CATALOG}\n{}",
         r#"
 [[inbounds]]
 name = "packet-client"
@@ -1655,9 +1732,8 @@ interface_name = "mptun-client"
 
 [[inbounds]]
 name = "packet-server"
-protocol = "mpp"
+protocol = "mpp-l3"
 paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
-outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
@@ -1728,7 +1804,202 @@ protocol = "direct"
 }
 
 #[test]
-fn l4_forwarding_mode_rejects_client_and_server_tun_l3() {
+fn inferred_forwarding_family_requires_or_forbids_the_routing_section() {
+    let missing_l4_routing = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+"#,
+    );
+    assert!(matches!(
+        missing_l4_routing,
+        Err(ConfigFileError::L4RoutingSectionRequired)
+    ));
+
+    let l3_with_empty_routing = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "packet-client"
+protocol = "tun-l3"
+outbound = "edge"
+
+[[outbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
+
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
+
+[routing]
+"#,
+    );
+    assert!(matches!(
+        l3_with_empty_routing,
+        Err(ConfigFileError::L3RoutingSectionForbidden)
+    ));
+}
+
+#[test]
+fn mpp_l3_schema_is_distinct_and_l4_only_fields_are_rejected() {
+    let legacy_nested_l3 = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "packet-server"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
+
+[inbounds.tun_l3]
+ipv4_pool = "10.88.0.0/24"
+ipv4 = "10.88.0.1"
+"#,
+    );
+    assert!(matches!(legacy_nested_l3, Err(ConfigFileError::Toml(_))));
+
+    let l3_with_performance = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "packet-server"
+protocol = "mpp-l3"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
+
+[inbounds.performance]
+extra_traffic_hint_percent = 1
+
+[inbounds.tun_l3]
+ipv4_pool = "10.88.0.0/24"
+ipv4 = "10.88.0.1"
+
+[[inbounds.tun_l3.allocations]]
+principal_id = "test-peer"
+ipv4 = "10.88.0.2"
+"#,
+    );
+    assert!(matches!(l3_with_performance, Err(ConfigFileError::Toml(_))));
+}
+
+#[test]
+fn l3_admission_and_bound_outbound_performance_are_strict() {
+    let l4_admission = load_config_toml_str(
+        r#"
+[admission]
+max_live_flows = 1
+
+[[inbounds]]
+name = "packet-client"
+protocol = "tun-l3"
+outbound = "edge"
+"#,
+    );
+    assert!(matches!(
+        l4_admission,
+        Err(ConfigFileError::L3AdmissionField("max_live_flows"))
+    ));
+
+    let explicit_performance = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "packet-client"
+protocol = "tun-l3"
+outbound = "edge"
+
+[[outbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
+
+[outbounds.security]
+credential_id = "test-default"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
+
+[outbounds.performance]
+"#,
+    );
+    assert!(matches!(
+        explicit_performance,
+        Err(ConfigFileError::TunL3OutboundPerformance(name)) if name == "edge"
+    ));
+}
+
+#[test]
+fn inbound_peer_diagnostics_selector_is_explicit_and_principal_scoped() {
+    let document = |selector: Option<&str>| {
+        format!(
+            r#"
+[admission]
+max_dns_work = 1
+
+[[inbounds]]
+name = "packet-server"
+protocol = "mpp-l3"
+paths = [{{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }}]
+{}
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain = {{ from = "file", path = "mptunnel-test-certificate.pem" }}
+tls_private_key = {{ from = "file", path = "mptunnel-test-private-key.pem" }}
+
+[inbounds.tun_l3]
+ipv4_pool = "10.88.0.0/24"
+ipv4 = "10.88.0.1"
+
+[[inbounds.tun_l3.allocations]]
+principal_id = "test-peer"
+ipv4 = "10.88.0.2"
+"#,
+            selector.unwrap_or_default()
+        )
+    };
+    let principal = PrincipalId::parse("test-peer").expect("principal");
+    let other = PrincipalId::parse("later-peer").expect("principal");
+
+    let config = load_config_toml_str(&document(Some(
+        "peer_diagnostics_principal_ids = [\"test-peer\"]",
+    )))
+    .expect("concrete diagnostics principal");
+    assert_eq!(config.admission.max_dns_work, 1);
+    assert_eq!(config.admission.max_concurrent_work, 1);
+    let CommandConfig::Node(node) = config.command;
+    let policy = &node.servers[0].peer_diagnostics_principals;
+    assert!(policy.allows(&principal));
+    assert!(!policy.allows(&other));
+
+    let config = load_config_toml_str(&document(Some("peer_diagnostics_principal_ids = \"*\"")))
+        .expect("wildcard diagnostics principals");
+    let CommandConfig::Node(node) = config.command;
+    assert!(node.servers[0].peer_diagnostics_principals.allows(&other));
+
+    let config = load_config_toml_str(&document(None)).expect("omitted diagnostics principals");
+    let CommandConfig::Node(node) = config.command;
+    assert!(
+        !node.servers[0]
+            .peer_diagnostics_principals
+            .allows(&principal)
+    );
+
+    let unknown = load_config_toml_str(&document(Some(
+        "peer_diagnostics_principal_ids = [\"missing-peer\"]",
+    )));
+    assert!(matches!(unknown, Err(ConfigFileError::PeerDiagnostics(_))));
+}
+
+#[test]
+fn inferred_forwarding_family_rejects_mixed_l4_and_l3_inbounds() {
     let managed_host = r#"
 [inbounds.host]
 mode = "managed"
@@ -1747,7 +2018,7 @@ outbound = "edge"
     );
     assert!(matches!(
         load_config_toml_str(&client),
-        Err(ConfigFileError::Config(ConfigError::L4ContainsTunL3))
+        Err(ConfigFileError::MixedForwardingFamilies)
     ));
 
     let server = format!(
@@ -1756,9 +2027,8 @@ outbound = "edge"
         r#"
 [[inbounds]]
 name = "packet-server"
-protocol = "mpp"
+protocol = "mpp-l3"
 paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
-outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
@@ -1780,37 +2050,14 @@ protocol = "direct"
     );
     assert!(matches!(
         load_config_toml_str(&server),
-        Err(ConfigFileError::Config(ConfigError::L4ContainsTunL3))
-    ));
-}
-
-#[test]
-fn l3_forwarding_mode_rejects_l4_services() {
-    let local = format!(
-        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
-        managed_tun_document("")
-    );
-    assert!(matches!(
-        load_config_toml_str(&local),
-        Err(ConfigFileError::Config(ConfigError::L3ContainsL4Inbound(name)))
-            if name == "local-tun"
-    ));
-
-    let server = format!(
-        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
-        mpp_inbound_security_document("")
-    );
-    assert!(matches!(
-        load_config_toml_str(&server),
-        Err(ConfigFileError::Config(ConfigError::L3ServerMissingTunL3(name)))
-            if name == "edge"
+        Err(ConfigFileError::MixedForwardingFamilies)
     ));
 }
 
 #[test]
 fn tun_l3_rejects_conflicting_explicit_packet_device_names() {
     let document = format!(
-        "forwarding_mode = \"l3\"\n{TEST_CREDENTIAL_CATALOG}\n{}",
+        "{TEST_CREDENTIAL_CATALOG}\n{}",
         r#"
 [[inbounds]]
 name = "packet-client"
@@ -1820,9 +2067,8 @@ interface_name = "mptun0"
 
 [[inbounds]]
 name = "packet-server"
-protocol = "mpp"
+protocol = "mpp-l3"
 paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
-outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
@@ -1896,7 +2142,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "mpp"
 "#,
     )
@@ -2004,7 +2250,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "mpp-main"
 "#,
     )
@@ -2064,7 +2310,7 @@ protocol = "direct"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "direct"
 "#,
     )
@@ -2125,7 +2371,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "mpp-main"
 "#,
     )
@@ -2188,7 +2434,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "mpp-main"
 "#,
     )
@@ -2255,6 +2501,11 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
+
+[routing]
+[[routing.rules]]
+name = "default"
+decision = "reject"
 "#,
     )
     .expect_err("duplicate inbound name should fail");
@@ -2298,8 +2549,6 @@ listen = ["127.0.0.1:8081"]
 name = "edge-mpp"
 protocol = "mpp"
 paths = [{ name = "path-1", endpoint = "tcp://0.0.0.0:8443" }, { name = "path-2", endpoint = "quic://0.0.0.0:8443" }]
-outbound = "proxy-egress"
-dns_policy = "egress"
 
 [inbounds.security]
 credential_ids = ["test-default"]
@@ -2327,9 +2576,21 @@ endpoint = "127.0.0.1:8080"
 [routing]
 
 [[routing.rules]]
-name = "default"
-action = "outbound"
+name = "edge-mpp-egress"
+inbounds = ["edge-mpp"]
+decision = "allow-restricted"
+outbound = "proxy-egress"
+dns_policy = "egress"
+
+[[routing.rules]]
+name = "local-http-egress"
+inbounds = ["local-http"]
+decision = "allow"
 outbound = "mpp-main"
+
+[[routing.rules]]
+name = "default-reject"
+decision = "reject"
 "#,
     )
     .expect("config");
@@ -2340,11 +2601,24 @@ outbound = "mpp-main"
     let server = &node.servers[0];
     assert_eq!(server.name, "edge-mpp");
     assert_eq!(server.performance.extra_traffic_hint_percent, 200);
-    assert!(matches!(
-        &server.egress,
-        EgressRef::Outbound(outbound) if outbound.as_str() == "proxy-egress"
-    ));
     assert_eq!(server.paths.len(), 2);
+    let policy = node.product_policy.as_ref().expect("routing policy");
+    let server_route = policy
+        .routes
+        .iter()
+        .find(|rule| rule.id.as_str() == "edge-mpp-egress")
+        .expect("MPP inbound route");
+    assert!(matches!(
+        server_route.action.egress(),
+        Some(EgressAction::Outbound(outbound)) if outbound.as_str() == "proxy-egress"
+    ));
+    assert_eq!(
+        server_route
+            .action
+            .dns_plan()
+            .map(crate::product::DnsPlanId::as_str),
+        Some("egress")
+    );
     assert_eq!(
         node.dns_policy
             .spec
@@ -2355,17 +2629,9 @@ outbound = "mpp-main"
         ["mpp-main", "proxy-egress"],
         "compiled config identity must not depend on map iteration order"
     );
-    assert_eq!(
-        server
-            .dns_plan
-            .as_ref()
-            .map(crate::product::DnsPlanId::as_str),
-        Some("egress")
-    );
     let dns = node.dns_policy.compile().expect("DNS policy");
-    let plan = dns
-        .plan(server.dns_plan.as_ref().expect("DNS plan"))
-        .expect("plan");
+    let egress_dns = crate::product::DnsPlanId::parse("egress").expect("DNS policy ID");
+    let plan = dns.plan(&egress_dns).expect("plan");
     assert_eq!(plan.ip_strategy(), DnsIpStrategy::Ipv4AndIpv6);
     assert_eq!(plan.limits().lookup_timeout, Duration::from_millis(1500));
     assert_eq!(plan.limits().cache_capacity, 2048);
@@ -2407,7 +2673,7 @@ password = { from = "file", path = "proxy-password.key" }
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "secure-proxy"
 "#,
     )
@@ -2433,7 +2699,6 @@ fn outbound_proxy_auth_requires_a_complete_credential_pair() {
 name = "edge"
 protocol = "mpp"
 paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:8443" }]
-outbound = "proxy"
 
 [inbounds.security]
 credential_ids = ["test-default"]
@@ -2467,7 +2732,6 @@ protocol = "socks5"
 name = "edge"
 protocol = "mpp"
 paths = [{ name = "path-1", endpoint = "tcp://0.0.0.0:8443" }]
-outbound = "direct-a"
 
 [inbounds.security]
 credential_ids = ["test-a"]
@@ -2506,9 +2770,20 @@ strategy = "round-robin"
 members = [{ outbound = "mpp-a" }, { outbound = "mpp-b" }]
 
 [[routing.rules]]
-name = "default"
-action = "balancer"
+name = "edge-native-egress"
+inbounds = ["edge"]
+decision = "allow-restricted"
+outbound = "direct-a"
+
+[[routing.rules]]
+name = "local-gateway"
+inbounds = ["local-socks"]
+decision = "allow"
 balancer = "edge-gateway"
+
+[[routing.rules]]
+name = "default-reject"
+decision = "reject"
 "#,
     )
     .expect("config");
@@ -2528,9 +2803,17 @@ balancer = "edge-gateway"
     assert_eq!(node.gateway_balancers[0].id.as_str(), "edge-gateway");
     assert_eq!(node.gateway_balancers[0].spec.members.len(), 2);
     assert_eq!(node.servers.len(), 1);
+    let edge_route = node
+        .product_policy
+        .as_ref()
+        .expect("routing policy")
+        .routes
+        .iter()
+        .find(|rule| rule.id.as_str() == "edge-native-egress")
+        .expect("MPP inbound route");
     assert!(matches!(
-        &node.servers[0].egress,
-        EgressRef::Outbound(outbound) if outbound.as_str() == "direct-a"
+        edge_route.action.egress(),
+        Some(EgressAction::Outbound(outbound)) if outbound.as_str() == "direct-a"
     ));
     assert!(matches!(
         local_outbound(&node, "direct-a"),
@@ -2555,7 +2838,6 @@ name = "edge-b"
 protocol = "direct"
 
 [routing]
-generation = 9
 
 [[routing.balancers]]
 name = "manual-edge"
@@ -2579,7 +2861,7 @@ members = [
 
 [[routing.rules]]
 name = "default"
-action = "balancer"
+decision = "allow"
 balancer = "manual-edge"
 "#,
     )
@@ -2706,9 +2988,16 @@ members = [{ outbound = "inner" }, { outbound = "direct-b" }]
 fn routing_rules_compile_every_match_category_and_select_named_mpp_targets() {
     let config = load_config_toml_str(
         r#"
+[[local_users]]
+name = "alice-login"
+principal_id = "alice"
+username = "alice"
+password = { from = "raw", value = "test-password" }
+
 [[inbounds]]
 name = "local-socks"
 protocol = "socks5"
+local_users = ["alice-login"]
 
 [[inbounds]]
 name = "local-http"
@@ -2733,7 +3022,6 @@ tls_server_name = "mptunnel.test"
 tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
-generation = 42
 
 [[routing.balancers]]
 name = "all-edges"
@@ -2754,14 +3042,14 @@ networks = ["tcp"]
 inbounds = ["local-socks"]
 principal_ids = ["alice"]
 stages = ["pre-resolution"]
-action = "outbound"
+decision = "allow"
 outbound = "edge-a"
 initial_demand = "throughput"
 explanation = "API traffic uses edge A"
 
 [[routing.rules]]
 name = "default"
-action = "balancer"
+decision = "allow"
 balancer = "all-edges"
 initial_demand = "automatic"
 "#,
@@ -2774,7 +3062,7 @@ initial_demand = "automatic"
         .expect("local Product policy")
         .compile()
         .expect("compiled generation");
-    assert_eq!(policy.generation(), 42);
+    assert_ne!(policy.generation(), 0);
     let flow = FlowContext::new(
         Network::Tcp,
         ProtocolTarget::from_host_port("API.EXAMPLE.COM", 443).expect("target"),
@@ -2790,7 +3078,7 @@ initial_demand = "automatic"
     );
     assert!(matches!(
         decision.action().egress(),
-        EgressAction::Outbound(outbound) if outbound.as_str() == "edge-a"
+        Some(EgressAction::Outbound(outbound)) if outbound.as_str() == "edge-a"
     ));
 
     let default_flow = FlowContext::new(
@@ -2805,8 +3093,129 @@ initial_demand = "automatic"
         .classify(RouteInput::pre_resolution(&default_flow));
     assert!(matches!(
         decision.action().egress(),
-        EgressAction::Balancer(balancer) if balancer.as_str() == "all-edges"
+        Some(EgressAction::Balancer(balancer)) if balancer.as_str() == "all-edges"
     ));
+}
+
+#[test]
+fn routing_rejects_dns_selection_that_depends_on_destination_address() {
+    let error = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "address-dependent"
+destination_cidrs = ["203.0.113.0/24"]
+outbound = "direct"
+dns_policy = "default"
+"#,
+    )
+    .expect_err("a DNS selector cannot be chosen by evidence obtained after DNS");
+
+    assert!(matches!(
+        error,
+        ConfigFileError::RoutingPolicy(message)
+            if message.contains("address-dependent")
+                && message.contains("requires destination address evidence")
+    ));
+}
+
+#[test]
+fn disjoint_domains_may_select_distinct_named_synthetic_capture_policies() {
+    let document = format!(
+        r#"
+{}
+
+[[inbounds]]
+name = "local-tun"
+protocol = "tun"
+interface_name = "capture0"
+ipv4 = "10.88.0.1"
+ipv4_prefix = 24
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "domain-a"
+domain_suffix = ["a.example"]
+inbounds = ["local-tun"]
+outbound = "direct"
+dns_policy = "capture-a-policy"
+
+[[routing.rules]]
+name = "domain-b"
+domain_suffix = ["b.example"]
+inbounds = ["local-tun"]
+outbound = "direct"
+dns_policy = "capture-b-policy"
+
+[[routing.rules]]
+name = "default-reject"
+decision = "reject"
+"#,
+        dual_synthetic_capture_dns()
+    );
+
+    load_config_toml_str(&document)
+        .expect("domain-disjoint routes preserve each synthetic capture's policy provenance");
+}
+
+#[test]
+fn principal_ineligible_tun_route_does_not_create_cross_policy_conflict() {
+    let document = format!(
+        r#"
+{}
+
+[[local_users]]
+name = "alice-login"
+principal_id = "alice"
+username = "alice"
+password = {{ from = "raw", value = "test-password" }}
+
+[[inbounds]]
+name = "local-tun"
+protocol = "tun"
+interface_name = "capture0"
+ipv4 = "10.88.0.1"
+ipv4_prefix = 24
+
+[[inbounds]]
+name = "authenticated-socks"
+protocol = "socks5"
+local_users = ["alice-login"]
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "alice-only"
+domain_suffix = ["alice.example"]
+principal_ids = ["alice"]
+outbound = "direct"
+dns_policy = "capture-b-policy"
+
+[[routing.rules]]
+name = "default-reject"
+decision = "reject"
+"#,
+        dual_synthetic_capture_dns()
+    );
+
+    load_config_toml_str(&document).expect(
+        "the Alice-only rule is reachable on authenticated SOCKS but cannot receive anonymous TUN leases",
+    );
 }
 
 #[test]
@@ -2882,18 +3291,18 @@ file = "geo-public.ruleset.json"
 [[routing.rules]]
 name = "signed-domain"
 domain_rule_set_ids = ["geo-public"]
-action = "outbound"
+decision = "allow"
 outbound = "edge"
 
 [[routing.rules]]
 name = "signed-network"
 destination_rule_set_ids = ["geo-public"]
 stages = ["post-resolution"]
-action = "reject"
+decision = "reject"
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "edge"
 "#
         )
@@ -2969,8 +3378,85 @@ outbound = "edge"
 }
 
 #[test]
-fn routing_rules_require_a_final_default_and_existing_typed_target() {
-    let missing_default = load_config_toml_str(
+fn routing_rejects_a_dead_concrete_inbound_network_source_intersection() {
+    let error = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
+
+[inbounds.security]
+credential_ids = ["test-default"]
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "dead-source-selector"
+inbounds = ["edge"]
+networks = ["tcp"]
+source_cidrs = ["198.51.100.0/24"]
+decision = "allow"
+outbound = "direct"
+
+[[routing.rules]]
+name = "default-reject"
+decision = "reject"
+"#,
+    )
+    .expect_err("MPP inbound cannot satisfy a source endpoint selector");
+
+    assert!(matches!(
+        error,
+        ConfigFileError::Config(ConfigError::ProductPolicy(message))
+            if message.contains("dead-source-selector")
+                && message.contains("cannot match any configured L4 inbound")
+    ));
+}
+
+#[test]
+fn routing_rejects_a_concrete_principal_unreachable_on_selected_inbound() {
+    let error = load_config_toml_str(
+        r#"
+[[inbounds]]
+name = "local"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "unreachable-principal"
+inbounds = ["local"]
+principal_ids = ["alice"]
+decision = "allow"
+outbound = "direct"
+
+[[routing.rules]]
+name = "default-reject"
+decision = "reject"
+"#,
+    )
+    .expect_err("unauthenticated local proxy exposes only anonymous");
+
+    assert!(matches!(
+        error,
+        ConfigFileError::Config(ConfigError::ProductPolicy(message))
+            if message.contains("unreachable-principal")
+                && message.contains("principal alice is not reachable")
+    ));
+}
+
+#[test]
+fn routing_rules_allow_an_implicit_reject_default_and_require_existing_typed_targets() {
+    let implicit_default = load_config_toml_str(
         r#"
 [[inbounds]]
 name = "local-socks"
@@ -2989,15 +3475,31 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 [[routing.rules]]
 name = "only-specific"
 domain_suffix = ["example.com"]
-action = "outbound"
 outbound = "edge"
 "#,
     )
-    .expect_err("final default is mandatory");
+    .expect("an omitted decision selects the sole egress and unmatched traffic rejects");
+    let CommandConfig::Node(node) = implicit_default.command;
+    let policy = node
+        .product_policy
+        .expect("L4 policy")
+        .compile()
+        .expect("compiled routing policy");
+    let unmatched = FlowContext::new(
+        Network::Tcp,
+        ProtocolTarget::from_host_port("outside.test", 443).expect("target"),
+        SourceEndpoint::new("192.0.2.10".parse().expect("source"), 40_000),
+        PrincipalId::parse("anonymous").expect("principal"),
+        InboundId::parse("local-socks").expect("inbound"),
+    );
+    let decision = policy
+        .routes()
+        .classify(RouteInput::pre_resolution(&unmatched));
     assert!(matches!(
-        missing_default,
-        ConfigFileError::RoutingPolicy(message) if message.contains("final catch-all")
+        decision.action().disposition(),
+        RouteDisposition::Reject
     ));
+    assert!(decision.is_implicit());
 
     let missing_target = load_config_toml_str(
         r#"
@@ -3017,7 +3519,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
+decision = "allow"
 outbound = "missing"
 "#,
     )
@@ -3026,6 +3528,78 @@ outbound = "missing"
         missing_target,
         ConfigFileError::RoutingRuleMissingOutbound { outbound, .. } if outbound == "missing"
     ));
+}
+
+#[test]
+fn routing_generation_is_internal_and_reloads_receive_distinct_shared_identities() {
+    let document = r#"
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.balancers]]
+name = "all-direct"
+strategy = "round-robin"
+members = [{ outbound = "direct" }]
+
+[[routing.rules]]
+name = "default"
+balancer = "all-direct"
+"#;
+    let first = load_config_toml_str(document).expect("first config generation");
+    let second = load_config_toml_str(document).expect("replacement config generation");
+    let CommandConfig::Node(first) = first.command;
+    let CommandConfig::Node(second) = second.command;
+    let first_routing = first.product_policy.as_ref().expect("routing generation");
+    let second_routing = second.product_policy.as_ref().expect("routing generation");
+
+    assert_ne!(first_routing.generation, 0);
+    assert_eq!(first_routing.generation, first.dns_policy.generation);
+    assert_eq!(
+        first_routing.generation,
+        first.gateway_balancers[0].generation
+    );
+    assert_ne!(first_routing.generation, second_routing.generation);
+
+    let public_generation = document.replacen("[routing]", "[routing]\ngeneration = 7", 1);
+    assert!(matches!(
+        load_config_toml_str(&public_generation),
+        Err(ConfigFileError::Toml(_))
+    ));
+}
+
+#[test]
+fn routing_omitted_identity_selectors_and_scalar_wildcards_both_mean_any() {
+    for selectors in ["", "inbounds = \"*\"\nprincipal_ids = \"*\""] {
+        let document = format!(
+            r#"
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+{selectors}
+outbound = "direct"
+"#
+        );
+        let config = load_config_toml_str(&document).expect("identity wildcard route");
+        let CommandConfig::Node(node) = config.command;
+        let rule = &node.product_policy.expect("routing policy").routes[0];
+        assert!(rule.matcher.inbounds.is_empty());
+        assert!(rule.matcher.principals.is_empty());
+        assert_eq!(rule.action.disposition(), RouteDisposition::Allow);
+    }
 }
 
 #[test]
@@ -3053,7 +3627,7 @@ protocol = "direct"
 [[routing.rules]]
 name = "default"
 {field} = []
-action = "outbound"
+decision = "allow"
 outbound = "direct"
 "#
         );
@@ -3087,8 +3661,7 @@ tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem"
 [routing]
 [[routing.rules]]
 name = "default-deny"
-action = "reject"
-initial_demand = "automatic"
+decision = "reject"
 "#,
     )
     .expect("reject policy");
@@ -3106,7 +3679,8 @@ initial_demand = "automatic"
         InboundId::parse("local-socks").expect("inbound"),
     );
     let decision = policy.routes().classify(RouteInput::pre_resolution(&flow));
-    assert_eq!(decision.action().egress(), &EgressAction::Reject);
+    assert_eq!(decision.action().disposition(), RouteDisposition::Reject);
+    assert!(decision.action().egress().is_none());
     assert_eq!(decision.action().initial_demand(), InitialDemand::Automatic);
 
     let unsupported_reset = load_config_toml_str(
@@ -3118,7 +3692,7 @@ protocol = "socks5"
 [routing]
 [[routing.rules]]
 name = "default-deny"
-action = "reset"
+decision = "reset"
 "#,
     )
     .expect_err("generic reset action must not be accepted");
@@ -3146,7 +3720,7 @@ protocol = "socks5"
 [routing]
 [[routing.rules]]
 name = "default-deny"
-action = "reject"
+decision = "reject"
 "#
         )
     };

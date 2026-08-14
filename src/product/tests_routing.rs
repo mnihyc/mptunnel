@@ -70,7 +70,7 @@ fn exact_suffix_keyword_and_regex_are_deterministic() {
                 RouteRuleSpec::new(
                     id(rule_name),
                     matcher,
-                    RouteAction::new(
+                    RouteAction::allow(
                         EgressAction::Outbound(id("edge")),
                         Some(id("secure")),
                         InitialDemand::Throughput,
@@ -100,7 +100,7 @@ fn suffix_matching_observes_label_boundaries_and_apex() {
                     domain_suffix: vec![DomainName::parse("example.com").expect("domain")],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
+                RouteAction::reject(),
             ),
             default_rule(),
         ],
@@ -141,7 +141,7 @@ fn match_categories_are_anded_and_values_are_ored() {
                     principals: vec![id("alice")],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Balancer(id("fastest")),
                     None,
                     InitialDemand::Automatic,
@@ -181,7 +181,7 @@ fn destination_cidr_uses_literal_pre_dns_and_answer_post_dns() {
                     destination_cidrs: vec![private],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
+                RouteAction::reject(),
             ),
             default_rule(),
         ],
@@ -209,7 +209,7 @@ fn destination_cidr_uses_literal_pre_dns_and_answer_post_dns() {
     let literal = FlowContext::new(
         Network::Tcp,
         ProtocolTarget::from_ip("10.1.2.3".parse().expect("address"), 443).expect("target"),
-        name.source(),
+        name.source().expect("local flow has source"),
         name.principal().clone(),
         name.inbound().clone(),
     );
@@ -242,7 +242,7 @@ fn first_match_order_determines_domain_resolution_demand() {
                 domain_exact: vec![DomainName::parse("service.example").expect("domain")],
                 ..RouteMatchSpec::default()
             },
-            RouteAction::new(
+            RouteAction::allow(
                 EgressAction::Outbound(id("domain-edge")),
                 None,
                 InitialDemand::Automatic,
@@ -256,7 +256,7 @@ fn first_match_order_determines_domain_resolution_demand() {
                 destination_cidrs: vec!["203.0.113.0/24".parse().expect("CIDR")],
                 ..RouteMatchSpec::default()
             },
-            RouteAction::new(
+            RouteAction::allow(
                 EgressAction::Outbound(id("address-edge")),
                 None,
                 InitialDemand::Automatic,
@@ -285,7 +285,7 @@ fn first_match_order_determines_domain_resolution_demand() {
                     networks: vec![Network::Udp],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Outbound(id("udp-edge")),
                     None,
                     InitialDemand::Automatic,
@@ -311,7 +311,7 @@ fn first_match_order_determines_domain_resolution_demand() {
                     stages: vec![RouteStage::PostResolution],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
+                RouteAction::reject(),
             ),
             default_rule(),
         ],
@@ -333,7 +333,7 @@ fn source_cidr_ports_and_stage_match() {
                     stages: vec![RouteStage::PostResolution],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(EgressAction::Drop, None, InitialDemand::Automatic),
+                RouteAction::drop(),
             ),
             default_rule(),
         ],
@@ -370,7 +370,7 @@ fn first_match_precedence_and_action_fields_are_stable() {
                     domain_suffix: vec![DomainName::parse("example").expect("domain")],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Outbound(id("primary")),
                     Some(id("privacy")),
                     InitialDemand::Automatic,
@@ -382,7 +382,7 @@ fn first_match_precedence_and_action_fields_are_stable() {
                     domain_exact: vec![DomainName::parse("call.example").expect("domain")],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
+                RouteAction::reject(),
             ),
             default_rule(),
         ],
@@ -393,7 +393,7 @@ fn first_match_precedence_and_action_fields_are_stable() {
     assert_eq!(decision.rule_id().as_str(), "first");
     assert_eq!(
         decision.action().egress(),
-        &EgressAction::Outbound(id("primary"))
+        Some(&EgressAction::Outbound(id("primary")))
     );
     assert_eq!(
         decision.action().dns_plan().expect("DNS plan").as_str(),
@@ -401,6 +401,43 @@ fn first_match_precedence_and_action_fields_are_stable() {
     );
     assert_eq!(decision.action().initial_demand(), InitialDemand::Automatic);
     assert_eq!(decision.explanation(), "matched route rule 'first'");
+}
+
+#[test]
+fn explanation_egress_filter_falls_through_to_implicit_reject() {
+    let table = CompiledRouteTable::compile(
+        10,
+        vec![RouteRuleSpec::new(
+            id("family-bound"),
+            RouteMatchSpec {
+                networks: vec![Network::Tcp],
+                ..RouteMatchSpec::default()
+            },
+            RouteAction::allow(
+                EgressAction::Outbound(id("ipv6-only")),
+                None,
+                InitialDemand::Automatic,
+            ),
+        )],
+    )
+    .expect("table");
+    let current = flow("service.example", Network::Tcp);
+
+    let explanation = table.explain_with_egress_eligibility(
+        RouteInput::post_resolution(&current, "192.0.2.42".parse().expect("IPv4 destination")),
+        |_| false,
+    );
+
+    assert!(explanation.selected().is_implicit());
+    assert_eq!(
+        explanation.selected().action().disposition(),
+        RouteDisposition::Reject
+    );
+    assert_eq!(
+        explanation.rules()[0].first_mismatch(),
+        Some(RouteMismatch::EgressIpFamily)
+    );
+    assert!(explanation.rules().last().expect("fallback").selected());
 }
 
 #[test]
@@ -431,17 +468,39 @@ fn compile_rejects_ambiguous_precedence_and_unbounded_inputs() {
             | Err(RouteCompileError::DuplicateRuleId(_))
     ));
 
+    let address_dependent_dns_plan = CompiledRouteTable::compile(
+        1,
+        vec![
+            RouteRuleSpec::new(
+                id("address-dependent"),
+                RouteMatchSpec {
+                    destination_cidrs: vec!["1.1.1.0/24".parse().expect("CIDR")],
+                    ..RouteMatchSpec::default()
+                },
+                RouteAction::allow(
+                    EgressAction::Outbound(id("edge")),
+                    Some(id("too-late")),
+                    InitialDemand::Automatic,
+                ),
+            ),
+            default_rule(),
+        ],
+    );
+    assert!(matches!(
+        address_dependent_dns_plan,
+        Err(RouteCompileError::PostResolutionDnsPlan(rule)) if rule.as_str() == "address-dependent"
+    ));
+
     let post_dns_plan = CompiledRouteTable::compile(
         1,
         vec![
             RouteRuleSpec::new(
                 id("post-only"),
                 RouteMatchSpec {
-                    destination_cidrs: vec!["1.1.1.0/24".parse().expect("CIDR")],
                     stages: vec![RouteStage::PostResolution],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Outbound(id("edge")),
                     Some(id("too-late")),
                     InitialDemand::Automatic,
@@ -503,7 +562,7 @@ fn replay_vectors_produce_identical_rule_ids() {
                     networks: vec![Network::Udp],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Outbound(id("datagram-edge")),
                     None,
                     InitialDemand::Automatic,
@@ -515,7 +574,7 @@ fn replay_vectors_produce_identical_rule_ids() {
                     domain_suffix: vec![DomainName::parse("example").expect("domain")],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Balancer(id("web")),
                     Some(id("split")),
                     InitialDemand::Automatic,

@@ -1,7 +1,6 @@
 use super::*;
 use crate::config::{
-    ClientPathConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, ServerDestinationAclConfig,
-    SessionConfig,
+    ClientPathConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SessionConfig,
 };
 use crate::outbound::OutboundConfig;
 use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId};
@@ -55,16 +54,11 @@ fn local_port_forward_runtime() -> (
         routes: vec![crate::product::RouteRuleSpec::new(
             crate::product::RuleId::parse("default").expect("route rule ID"),
             crate::product::RouteMatchSpec::default(),
-            crate::product::RouteAction::new(
+            crate::product::RouteAction::allow_restricted(
                 crate::product::EgressAction::Outbound(outbound.clone()),
                 None,
                 crate::product::InitialDemand::Automatic,
             ),
-        )],
-        destination_acl: vec![crate::product::AclRuleSpec::new(
-            crate::product::RuleId::parse("allow-local-test-target").expect("ACL rule ID"),
-            crate::product::RouteMatchSpec::default(),
-            crate::product::AclEffect::AllowRestricted,
         )],
     };
     let telemetry = crate::runtime::telemetry::RuntimeTelemetry::generation_owner(8);
@@ -91,17 +85,6 @@ fn local_port_forward_runtime() -> (
 
 fn port_forward_inbound() -> crate::product::InboundId {
     crate::product::InboundId::parse("local-forward").expect("inbound ID")
-}
-
-fn test_server_destination_acl() -> ServerDestinationAclConfig {
-    ServerDestinationAclConfig {
-        generation: 1,
-        rules: vec![crate::product::AclRuleSpec::new(
-            crate::product::RuleId::parse("test-allow-restricted").expect("test rule ID"),
-            crate::product::RouteMatchSpec::default(),
-            crate::product::AclEffect::AllowRestricted,
-        )],
-    }
 }
 
 #[tokio::test]
@@ -576,7 +559,11 @@ impl RangedTcpCarrierServer {
             paths,
             reliable_relay,
         } = server_runtime(OutboundConfig::Direct);
-        let relay = tokio::spawn(reliable_relay.run());
+        let relay = tokio::spawn(
+            reliable_relay
+                .expect("L4 test server has a reliable relay")
+                .run(),
+        );
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let maximum_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accepted = Arc::new([
@@ -648,7 +635,6 @@ async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id()
         vec![tcp_path.clone(), udp_path.clone()],
         OutboundConfig::Direct,
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        test_server_destination_acl(),
         server_security(),
         crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
@@ -721,7 +707,11 @@ async fn session_owner_reconciles_bounded_target_and_retires_disabled_group() {
         reliable_relay,
     } = server_runtime(OutboundConfig::Direct);
     let snapshot_context = server_context.clone();
-    let server_relay = tokio::spawn(reliable_relay.run());
+    let server_relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let (server_control, mut server_commands) = mpsc::unbounded_channel::<CarrierServerControl>();
     let carrier_server = tokio::spawn(async move {
         let mut sessions = tokio::task::JoinSet::new();
@@ -1903,7 +1893,11 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         paths: server_context,
         reliable_relay,
     } = server_runtime(OutboundConfig::Direct);
-    let server_relay = tokio::spawn(reliable_relay.run());
+    let server_relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let (accepted_tx, mut accepted_rx) = mpsc::channel(8);
     let (stop_servers_tx, stop_servers_rx) = tokio::sync::watch::channel(false);
     let low_latency_context = server_context.clone();
@@ -2135,7 +2129,11 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
         paths: server_context,
         reliable_relay,
     } = server_runtime(OutboundConfig::Direct);
-    let server_relay = tokio::spawn(reliable_relay.run());
+    let server_relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let first_server_context = server_context.clone();
     let first_server = tokio::spawn(async move {
         let (stream, _) = first_listener.accept().await.expect("first accept");
@@ -2262,7 +2260,11 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
         paths: server_context,
         reliable_relay,
     } = server_runtime(OutboundConfig::Direct);
-    let server_relay = tokio::spawn(reliable_relay.run());
+    let server_relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let tcp_server_context = server_context.clone();
     let tcp_server = tokio::spawn(async move {
         let (stream, _) = tcp_listener.accept().await.expect("TCP path accept");
@@ -2373,7 +2375,11 @@ async fn disconnected_logical_stream_expires_at_configured_retention_timeout() {
         paths: server_context,
         reliable_relay,
     } = server_runtime(OutboundConfig::Direct);
-    let server_relay = tokio::spawn(reliable_relay.run());
+    let server_relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let server_path = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("path accept");
         handle_server_path(stream, local_path, server_context).await
@@ -3363,7 +3369,6 @@ async fn server_runtime_binds_udp_path_and_relays_direct_udp_datagram() {
         vec![path.clone()],
         OutboundConfig::Direct,
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        test_server_destination_acl(),
         server_security(),
         crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
@@ -3401,7 +3406,6 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
         vec![path.clone()],
         OutboundConfig::Direct,
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        test_server_destination_acl(),
         server_security(),
         crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
@@ -3957,7 +3961,6 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
         vec![path.clone()],
         OutboundConfig::Direct,
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        test_server_destination_acl(),
         server_security(),
         crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
@@ -4048,7 +4051,6 @@ async fn assert_tcp_server_rejects_wrong_mpp_credential(transport_secret: Option
         vec![path.clone()],
         OutboundConfig::Direct,
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        test_server_destination_acl(),
         ServerSecurityConfig::for_test(
             SharedSecret::new(b"fedcba9876543210fedcba9876543210".to_vec())
                 .expect("server MPP credential"),

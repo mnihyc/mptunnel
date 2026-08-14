@@ -307,6 +307,22 @@ impl H3Presentation {
 }
 
 impl H3SendStream {
+    /// Cancels an unanswered server request without publishing HTTP response
+    /// headers. This is the transport representation of a policy `drop`:
+    /// the request stream is reset while its shared QUIC connection survives.
+    pub(super) fn cancel_pending_response(&mut self) -> bool {
+        if self.response_state != ResponseState::ServerPending {
+            return false;
+        }
+        let Some(mut half) = self.inner.take() else {
+            return false;
+        };
+        half.cancel();
+        self.response_state = ResponseState::ServerRejected;
+        self.finished = true;
+        true
+    }
+
     pub(super) async fn ensure_datagrams_negotiated(&mut self) -> Result<(), QuicCarrierError> {
         if self.finished {
             return Err(QuicCarrierError::H3StreamFinished);

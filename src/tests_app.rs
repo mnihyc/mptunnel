@@ -32,7 +32,6 @@ tls_pinned_certificate = { from = "file", path = "certificate.pem" }
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "edge"
 "#;
 
@@ -61,7 +60,6 @@ tls_pinned_certificate = { from = "file", path = "certificate.pem" }
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "edge"
 "#;
 
@@ -695,10 +693,49 @@ fn supervised_restart_reopens_disk_into_a_fresh_canonical_store() {
         ),
         "supervised restart reused the stale canonical store"
     );
+    let mut expected =
+        crate::config::load_config_toml(&path).expect("parse expected edited config");
+    let crate::config::CommandConfig::Node(reopened_node) = &reopened.config.command;
+    let crate::config::CommandConfig::Node(expected_node) = &mut expected.command;
+    let reopened_generation = reopened_node.dns_policy.generation;
+    let expected_generation = expected_node.dns_policy.generation;
+    assert_ne!(reopened_generation, 0);
+    assert_ne!(expected_generation, 0);
+    assert_ne!(reopened_generation, expected_generation);
     assert_eq!(
-        reopened.config,
-        crate::config::load_config_toml(&path).expect("parse expected edited config")
+        reopened_node
+            .product_policy
+            .as_ref()
+            .map(|policy| policy.generation),
+        Some(reopened_generation)
     );
+    assert_eq!(
+        expected_node
+            .product_policy
+            .as_ref()
+            .map(|policy| policy.generation),
+        Some(expected_generation)
+    );
+    assert!(
+        reopened_node
+            .gateway_balancers
+            .iter()
+            .all(|balancer| balancer.generation == reopened_generation)
+    );
+    assert!(
+        expected_node
+            .gateway_balancers
+            .iter()
+            .all(|balancer| balancer.generation == expected_generation)
+    );
+    expected_node.dns_policy.generation = reopened_generation;
+    if let Some(policy) = &mut expected_node.product_policy {
+        policy.generation = reopened_generation;
+    }
+    for balancer in &mut expected_node.gateway_balancers {
+        balancer.generation = reopened_generation;
+    }
+    assert_eq!(reopened.config, expected);
 
     fs::write(&path, "unknown_supervised_field = true\n").expect("write invalid external edit");
     let invalid = reopen_supervised_config_file_generation(&invocation)

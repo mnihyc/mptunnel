@@ -62,7 +62,11 @@ async fn authenticated_peer_status_round_trips_through_tcp_carrier_actors() {
     } = server_runtime(OutboundConfig::Direct);
     paths.peer_status = PeerStatusBroker::new(true);
     let server_context = paths.clone();
-    let relay = tokio::spawn(reliable_relay.run());
+    let relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept TCP carrier");
         handle_server_path(stream, local_path, paths).await
@@ -107,7 +111,11 @@ async fn authenticated_peer_status_round_trips_through_quic_carrier_actors() {
         .await
         .expect("bind QUIC carrier");
     let local_path = ServerLocalPath::new(0, path.clone());
-    let relay = tokio::spawn(reliable_relay.run());
+    let relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let server = tokio::spawn(run_server_udp_listener(endpoint, local_path, paths));
     let (target_addr, target) = hold_tcp_target().await;
     let context =

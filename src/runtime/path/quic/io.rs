@@ -3,7 +3,7 @@
 use super::client::ClientUdpPathSessionRuntime;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{CloseReason, Frame};
+use crate::protocol::{CloseReason, DatagramFlowId, Frame};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
@@ -84,6 +84,13 @@ impl UdpPathSendStream {
             sender: self.stream.ip_packet_sender().await?,
             limits,
         })
+    }
+
+    /// Cancels only a still-unanswered HTTP/3 request stream. Once an MPP
+    /// response has started this is a no-op, preserving sibling flows sharing
+    /// the same native datagram request stream.
+    pub(super) fn cancel_pending_response(&mut self) -> bool {
+        self.stream.cancel_pending_response()
     }
 }
 
@@ -235,6 +242,34 @@ pub(in crate::runtime) async fn udp_path_write_frame(
 ) -> Result<(), RuntimeError> {
     ensure_quic_data_plane_frames(std::slice::from_ref(frame))?;
     quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
+    Ok(())
+}
+
+pub(super) async fn udp_path_write_datagram_refusal(
+    send: &mut UdpPathSendStream,
+    flow_id: DatagramFlowId,
+    evicted: Option<DatagramFlowId>,
+    max_refusals: usize,
+    codec_limits: CodecLimits,
+) -> Result<(), RuntimeError> {
+    quic_transport::write_datagram_refusal(
+        &mut send.stream,
+        flow_id,
+        evicted,
+        max_refusals,
+        codec_limits,
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) fn udp_path_retain_datagram_denial(
+    send: &mut UdpPathSendStream,
+    flow_id: DatagramFlowId,
+    evicted: Option<DatagramFlowId>,
+    max_refusals: usize,
+) -> Result<(), RuntimeError> {
+    quic_transport::retain_datagram_denial(&mut send.stream, flow_id, evicted, max_refusals)?;
     Ok(())
 }
 

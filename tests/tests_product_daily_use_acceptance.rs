@@ -31,7 +31,11 @@ const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_DNS_TARGET: &str = "daily-use.test";
 const DELEGATED_HTTP_TARGET: &str = "remote-resolution.invalid:443";
 
-fn reject_runtime_config(socks: &[SocketAddr], management: SocketAddr, generation: u64) -> String {
+fn reject_runtime_config(
+    socks: &[SocketAddr],
+    management: SocketAddr,
+    route_revision: u64,
+) -> String {
     let socks = socks
         .iter()
         .map(|address| format!("\"{address}\""))
@@ -54,12 +58,10 @@ protocol = "socks5"
 listen = [{socks}]
 
 [routing]
-generation = {generation}
 
 [[routing.rules]]
-name = "default-reject"
-action = "reject"
-initial_demand = "automatic"
+name = "default-reject-{route_revision}"
+decision = "reject"
 "#
     )
 }
@@ -97,8 +99,10 @@ protocol = "system"
 name = "local"
 servers = ["system"]
 family = "ipv4-only"
+override_records = ["local-target"]
 
-[[dns.records]]
+[[dns.override_records]]
+name = "local-target"
 domain = "{LOCAL_DNS_TARGET}"
 addresses = ["127.0.0.1"]
 
@@ -139,33 +143,25 @@ endpoint = "{http_proxy}"
 connect_timeout_ms = 2000
 
 [routing]
-generation = 1
-
-[routing.destination_acl]
-
-[[routing.destination_acl.rules]]
-name = "allow-delegated-test-authority"
-effect = "allow"
-domain_exact = ["remote-resolution.invalid"]
-destination_ports = [443]
-networks = ["tcp"]
-
-[[routing.destination_acl.rules]]
-name = "allow-loopback-test-targets"
-effect = "allow-restricted"
-destination_cidrs = ["127.0.0.1/32"]
-destination_ports = [{direct_tcp_port}, {direct_udp_port}]
-networks = ["tcp", "udp"]
 
 [[routing.rules]]
 name = "tcp-forward-through-http"
 inbounds = ["local-tcp-forward"]
-action = "outbound"
+domain_exact = ["remote-resolution.invalid"]
+destination_ports = [443]
+networks = ["tcp"]
 outbound = "http-egress"
 
 [[routing.rules]]
+name = "allow-loopback-test-targets"
+destination_cidrs = ["127.0.0.1/32"]
+destination_ports = [{direct_tcp_port}, {direct_udp_port}]
+networks = ["tcp", "udp"]
+decision = "allow-restricted"
+outbound = "direct-egress"
+
+[[routing.rules]]
 name = "default-direct"
-action = "outbound"
 outbound = "direct-egress"
 "#,
         direct_tcp_port = direct_tcp_target.port(),
@@ -325,7 +321,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         "pre-reload SOCKS5 listener",
     );
 
-    let unauthorized_health = http_request(management, "GET", "/api/v3/health", None, &[], &[])
+    let unauthorized_health = http_request(management, "GET", "/api/v4/health", None, &[], &[])
         .expect("unauthenticated health response");
     assert_eq!(unauthorized_health.status, 401);
     let removed_legacy_health = http_request(
@@ -341,7 +337,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let health = http_request(
         management,
         "GET",
-        "/api/v3/health/ready",
+        "/api/v4/health/ready",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -350,14 +346,14 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     assert_eq!(health.status, 200);
     assert_eq!(health.json()["ready"], true);
 
-    let unauthorized = http_request(management, "GET", "/api/v3/config", None, &[], &[])
+    let unauthorized = http_request(management, "GET", "/api/v4/config", None, &[], &[])
         .expect("unauthenticated config status");
     assert_eq!(unauthorized.status, 401);
 
     let status = http_request(
         management,
         "GET",
-        "/api/v3/config",
+        "/api/v4/config",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -377,7 +373,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let invalid = http_request(
         management,
         "POST",
-        "/api/v3/config/validate",
+        "/api/v4/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         invalid_candidate.as_bytes(),
@@ -404,7 +400,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         let collision = http_request(
             management,
             "POST",
-            "/api/v3/config/validate",
+            "/api/v4/config/validate",
             Some(OPERATOR_TOKEN),
             &[("Content-Type", "application/toml")],
             store_collision.as_bytes(),
@@ -420,7 +416,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let validated = http_request(
         management,
         "POST",
-        "/api/v3/config/validate",
+        "/api/v4/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         candidate.as_bytes(),
@@ -435,7 +431,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let missing_precondition = http_request(
         management,
         "POST",
-        "/api/v3/config/apply",
+        "/api/v4/config/apply",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         candidate.as_bytes(),
@@ -446,7 +442,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let stale = http_request(
         management,
         "POST",
-        "/api/v3/config/apply",
+        "/api/v4/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -467,7 +463,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v3/config/apply",
+        "/api/v4/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -495,7 +491,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         if let Ok(response) = http_request(
             management,
             "GET",
-            "/api/v3/config",
+            "/api/v4/config",
             Some(OPERATOR_TOKEN),
             &[],
             &[],
@@ -573,7 +569,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let validated = http_request(
         management,
         "POST",
-        "/api/v3/config/validate",
+        "/api/v4/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         unusable_logging_candidate.as_bytes(),
@@ -586,7 +582,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v3/config/apply",
+        "/api/v4/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -606,7 +602,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let status = http_request(
         management,
         "GET",
-        "/api/v3/config",
+        "/api/v4/config",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -622,7 +618,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let validated = http_request(
         management,
         "POST",
-        "/api/v3/config/validate",
+        "/api/v4/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         live_logging_candidate.as_bytes(),
@@ -636,7 +632,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v3/config/apply",
+        "/api/v4/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -672,12 +668,15 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let rotated_log_path = directory.path().join("applied-runtime.rotated.jsonl");
     fs::rename(&applied_log_path, &rotated_log_path).expect("rotate active log descriptor");
     fs::create_dir(&applied_log_path).expect("make configured sink path unreopenable");
-    let non_logging_candidate =
-        live_logging_candidate.replacen("generation = 2", "generation = 3", 1);
+    let non_logging_candidate = live_logging_candidate.replacen(
+        "name = \"default-reject-2\"",
+        "name = \"default-reject-3\"",
+        1,
+    );
     let validated = http_request(
         management,
         "POST",
-        "/api/v3/config/validate",
+        "/api/v4/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         non_logging_candidate.as_bytes(),
@@ -691,7 +690,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v3/config/apply",
+        "/api/v4/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -709,7 +708,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         if let Ok(response) = http_request(
             management,
             "GET",
-            "/api/v3/config",
+            "/api/v4/config",
             Some(OPERATOR_TOKEN),
             &[],
             &[],
@@ -933,26 +932,27 @@ secret = {{ from = "file", path = "mpp-credential.key" }}
 name = "mpp-server"
 protocol = "mpp"
 paths = [{{ name = "path-1", endpoint = "tcp://{mpp}" }}]
-outbound = "direct-egress"
 
 [inbounds.security]
 credential_ids = ["daily-use"]
 tls_certificate_chain = {{ from = "file", path = "{certificate}" }}
 tls_private_key = {{ from = "file", path = "{private_key}" }}
 
-[inbounds.destination_acl]
-generation = 1
-
-[[inbounds.destination_acl.rules]]
-name = "allow-loopback-test-target"
-effect = "allow-restricted"
-destination_cidrs = ["127.0.0.1/32"]
-destination_ports = [{direct_target_port}]
-networks = ["tcp"]
-
 [[outbounds]]
 name = "direct-egress"
 protocol = "direct"
+
+[routing]
+
+[[routing.rules]]
+name = "allow-loopback-test-target"
+inbounds = ["mpp-server"]
+principal_ids = ["daily-use"]
+destination_cidrs = ["127.0.0.1/32"]
+destination_ports = [{direct_target_port}]
+networks = ["tcp"]
+decision = "allow-restricted"
+outbound = "direct-egress"
 "#,
         direct_target_port = direct_target.port(),
     )
@@ -1019,15 +1019,6 @@ name = "direct-default"
 protocol = "direct"
 
 [routing]
-generation = 7
-
-[routing.destination_acl]
-
-[[routing.destination_acl.rules]]
-name = "allow-localhost-test-target"
-effect = "allow-restricted"
-domain_exact = ["localhost"]
-networks = ["tcp"]
 
 [[routing.balancers]]
 name = "native-failover"
@@ -1046,23 +1037,22 @@ maximum_backoff_ms = 100
 [[routing.rules]]
 name = "reject-blocked"
 domain_exact = ["blocked.example"]
-action = "reject"
+decision = "reject"
 
 [[routing.rules]]
 name = "native-proxy"
 destination_cidrs = ["8.8.8.8/32"]
-action = "balancer"
 balancer = "native-failover"
 
 [[routing.rules]]
 name = "mpp-local-service"
 domain_exact = ["localhost"]
-action = "outbound"
+networks = ["tcp"]
+decision = "allow-restricted"
 outbound = "edge-mpp"
 
 [[routing.rules]]
 name = "direct-default"
-action = "outbound"
 outbound = "direct-default"
 "#
     )
@@ -1080,7 +1070,7 @@ fn wait_for_mpp_outbound_availability(
         if let Ok(response) = http_request(
             management,
             "GET",
-            "/api/v3/sessions",
+            "/api/v4/sessions",
             Some(OPERATOR_TOKEN),
             &[],
             &[],
@@ -1327,7 +1317,7 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     let status = http_request(
         management,
         "GET",
-        "/api/v3/config",
+        "/api/v4/config",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -1345,7 +1335,7 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     let applied = http_request(
         management,
         "POST",
-        "/api/v3/config/apply",
+        "/api/v4/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -1572,7 +1562,7 @@ listen = ["127.0.0.1:1080"]
 
 [[routing.rules]]
 name = "default-reject"
-action = "reject"
+decision = "reject"
 "#
 }
 
@@ -1682,6 +1672,7 @@ async fn strict_toml_drives_split_dot_selection_and_local_dns_capture_boundary()
         },
     )
     .expect("split DNS generation");
+    let generation = runtime.generation();
 
     let corp = runtime
         .resolve(&DomainName::parse("service.corp.example").expect("corp domain"))
@@ -1691,7 +1682,7 @@ async fn strict_toml_drives_split_dot_selection_and_local_dns_capture_boundary()
         corp.addresses().as_ref(),
         &["10.42.0.53".parse::<IpAddr>().expect("corp answer")]
     );
-    assert_eq!(corp.metadata().generation(), 1);
+    assert_eq!(corp.metadata().generation(), generation);
     assert_eq!(corp.metadata().plan().as_str(), "corp");
     assert_eq!(
         corp.metadata().rule().map(|rule| rule.as_str()),

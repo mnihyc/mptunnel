@@ -79,6 +79,41 @@ fn responder_policy_is_independent_of_live_sessions() {
 }
 
 #[test]
+fn scoped_responder_authorizes_only_selected_sessions_and_global_overrides() {
+    let broker = PeerStatusBroker::with_scoped_incoming(false, true);
+    assert!(broker.allows_incoming());
+    let denied = broker.register_with_incoming(SessionId(20), false);
+    let allowed = broker.register_with_incoming(SessionId(21), true);
+    assert_eq!(
+        denied.response_frame(1, CodecLimits::default(), || {
+            panic!("denied scoped response sampled paths")
+        }),
+        Frame::PeerStatusResponse {
+            request_id: 1,
+            code: PeerStatusCode::Disabled,
+            paths: Vec::new(),
+        }
+    );
+    assert!(matches!(
+        allowed.response_frame(2, CodecLimits::default(), || Some(vec![status(1)])),
+        Frame::PeerStatusResponse {
+            code: PeerStatusCode::Ok,
+            ..
+        }
+    ));
+
+    let global = PeerStatusBroker::with_scoped_incoming(true, false);
+    let carrier = global.register_with_incoming(SessionId(22), false);
+    assert!(matches!(
+        carrier.response_frame(3, CodecLimits::default(), || Some(vec![status(2)])),
+        Frame::PeerStatusResponse {
+            code: PeerStatusCode::Ok,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn incoming_requests_are_rate_limited_across_session_carriers() {
     let broker = PeerStatusBroker::new(true);
     let first = broker.register(SessionId(12));

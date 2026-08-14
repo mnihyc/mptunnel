@@ -4,8 +4,11 @@ use crate::ingress::ProxyAuthConfig;
 use crate::outbound::{OutboundConfig, ProxyConfig};
 use crate::performance::MppPerformanceConfig;
 use crate::product::{
-    BalancerId, DomainName, GatewayBalancerSpec, GatewayMemberSpec, GatewayStrategy, InitialDemand,
-    NetworkSet, OutboundId, RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage, RuleId,
+    BalancerId, CompiledDnsPolicy, DnsOverrideRecordId, DnsOverrideRecordSpec, DnsPlanId,
+    DnsPlanSpec, DnsPolicySpec, DnsRuleId, DnsRuleMatch, DnsRuleSpec, DnsUpstreamEndpoint,
+    DnsUpstreamId, DnsUpstreamSpec, DomainName, GatewayBalancerSpec, GatewayMemberSpec,
+    GatewayStrategy, InitialDemand, NetworkSet, OutboundId, RouteAction, RouteMatchSpec,
+    RouteRuleSpec, RouteStage, RuleId,
 };
 use crate::runtime::ingress_runtime::{
     handle_http_connect_client_stream_with_auth, handle_socks5_client_stream_with_auth,
@@ -69,15 +72,18 @@ fn rule(id: &str, matcher: RouteMatchSpec, egress: EgressAction) -> RouteRuleSpe
     RouteRuleSpec::new(
         RuleId::parse(id).expect("rule ID"),
         matcher,
-        RouteAction::new(egress, None, InitialDemand::Automatic),
+        RouteAction::allow(egress, None, InitialDemand::Automatic),
     )
+}
+
+fn terminal_rule(id: &str, matcher: RouteMatchSpec, action: RouteAction) -> RouteRuleSpec {
+    RouteRuleSpec::new(RuleId::parse(id).expect("rule ID"), matcher, action)
 }
 
 fn policy(rules: Vec<RouteRuleSpec>) -> ProductPolicyConfig {
     ProductPolicyConfig {
         generation: 9,
         routes: rules,
-        destination_acl: Vec::new(),
     }
 }
 
@@ -296,6 +302,127 @@ async fn explicit_bind_family_makes_matching_route_fall_through_after_resolution
 }
 
 #[tokio::test]
+async fn family_fallthrough_cannot_relabel_an_answer_from_another_dns_policy() {
+    let domain = DomainName::parse("family-policy.example").expect("domain");
+    let upstream = DnsUpstreamId::parse("system").expect("upstream");
+    let policy_a = DnsPlanId::parse("policy-a").expect("policy A");
+    let policy_b = DnsPlanId::parse("policy-b").expect("policy B");
+    let record_a = DnsOverrideRecordId::parse("record-a").expect("record A");
+    let record_b = DnsOverrideRecordId::parse("record-b").expect("record B");
+    let mut plan_a = DnsPlanSpec::new(policy_a.clone(), vec![upstream.clone()]);
+    plan_a.override_records = vec![record_a.clone()];
+    let mut plan_b = DnsPlanSpec::new(policy_b.clone(), vec![upstream.clone()]);
+    plan_b.override_records = vec![record_b.clone()];
+    let dns = crate::dns::DnsGeneration::compile(Arc::new(
+        CompiledDnsPolicy::compile(
+            31,
+            DnsPolicySpec {
+                upstreams: vec![DnsUpstreamSpec::direct(
+                    upstream,
+                    DnsUpstreamEndpoint::System,
+                )],
+                outbound_capabilities: Vec::new(),
+                plans: vec![plan_a, plan_b],
+                rules: vec![DnsRuleSpec {
+                    id: DnsRuleId::parse("activate-policy-b").expect("DNS rule"),
+                    matcher: DnsRuleMatch::Exact(
+                        DomainName::parse("activate-b.example").expect("activation domain"),
+                    ),
+                    plan: policy_b.clone(),
+                    explanation: None,
+                }],
+                override_records: vec![
+                    DnsOverrideRecordSpec {
+                        id: record_a,
+                        domain: domain.clone(),
+                        addresses: vec!["2001:4860:4860::8888".parse().expect("IPv6 answer")],
+                    },
+                    DnsOverrideRecordSpec {
+                        id: record_b,
+                        domain: domain.clone(),
+                        addresses: vec!["8.8.8.8".parse().expect("IPv4 answer")],
+                    },
+                ],
+                synthetic_captures: Vec::new(),
+                default_plan: policy_a.clone(),
+            },
+        )
+        .expect("DNS policy"),
+    ))
+    .expect("DNS generation");
+
+    let v4 = OutboundId::parse("v4-only").expect("IPv4 outbound");
+    let v6 = OutboundId::parse("v6-only").expect("IPv6 outbound");
+    let domain_match = || RouteMatchSpec {
+        domain_exact: vec![domain.clone()],
+        ..RouteMatchSpec::default()
+    };
+    let config = policy(vec![
+        RouteRuleSpec::new(
+            RuleId::parse("first-policy-a").expect("first rule"),
+            domain_match(),
+            RouteAction::allow(
+                EgressAction::Outbound(v4.clone()),
+                Some(policy_a),
+                InitialDemand::Automatic,
+            ),
+        ),
+        RouteRuleSpec::new(
+            RuleId::parse("second-policy-b").expect("second rule"),
+            domain_match(),
+            RouteAction::allow(
+                EgressAction::Outbound(v6.clone()),
+                Some(policy_b),
+                InitialDemand::Automatic,
+            ),
+        ),
+        terminal_rule("default", RouteMatchSpec::default(), RouteAction::reject()),
+    ]);
+    let leaf = |id, config| RuntimeOutboundLeaf::Local {
+        id,
+        config,
+        connect_timeout: Duration::from_millis(100),
+        native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+    };
+    let registry = RuntimeOutboundRegistry::compile(
+        [
+            leaf(
+                v4,
+                OutboundConfig::BindSourceIps {
+                    ipv4: Some(Ipv4Addr::new(198, 51, 100, 2)),
+                    ipv6: None,
+                },
+            ),
+            leaf(
+                v6,
+                OutboundConfig::BindSourceIps {
+                    ipv4: None,
+                    ipv6: Some("2001:db8::2".parse().expect("IPv6 source")),
+                },
+            ),
+        ],
+        &[],
+        dns,
+    )
+    .expect("registry");
+    let router = ClientIngressRouter::new(&config, registry).expect("router");
+    let target = TargetAddr::Domain {
+        host: domain.to_string(),
+        port: 443,
+    };
+    let ClientRoute::Open(plan) = router
+        .route_udp(&target, source(), anonymous(), inbound())
+        .expect("provisional route")
+    else {
+        panic!("expected provisional open plan");
+    };
+    assert!(matches!(
+        plan.open_udp(&target).await,
+        Err(RuntimeError::RouteRejected)
+    ));
+}
+
+#[tokio::test]
 async fn stable_domain_route_delegates_canonical_target_without_dns() {
     let edge = context(7443);
     let config = policy(vec![rule(
@@ -340,34 +467,111 @@ async fn stable_domain_route_delegates_canonical_target_without_dns() {
 }
 
 #[tokio::test]
+async fn explicit_route_dns_policy_resolves_before_domain_capable_egress() {
+    let edge = context(7443);
+    let edge_session = edge.session_id;
+    let outbound = OutboundId::parse("edge").expect("outbound");
+    let dns_policy = DnsPlanId::parse("test-default").expect("DNS policy");
+    let config = policy(vec![RouteRuleSpec::new(
+        RuleId::parse("default").expect("rule"),
+        RouteMatchSpec::default(),
+        RouteAction::allow(
+            EgressAction::Outbound(outbound),
+            Some(dns_policy),
+            InitialDemand::Automatic,
+        ),
+    )]);
+    let router = ClientIngressRouter::new(
+        &config,
+        registry_with_dns(
+            [("edge", edge)],
+            &[],
+            crate::dns::DnsGeneration::from_test_answers(HashMap::from([
+                (
+                    "policy-selected.example".to_string(),
+                    vec!["8.8.8.8".parse().expect("answer")],
+                ),
+                (
+                    "policy-selected-private.example".to_string(),
+                    vec!["127.0.0.1".parse().expect("restricted answer")],
+                ),
+            ])),
+        ),
+    )
+    .expect("router");
+    let target = TargetAddr::Domain {
+        host: "policy-selected.example".to_string(),
+        port: 443,
+    };
+
+    let ClientRoute::Open(plan) = router
+        .route_udp(&target, source(), anonymous(), inbound())
+        .expect("route")
+    else {
+        panic!("expected open plan");
+    };
+    let OpenedUdpOutbound::Mpp {
+        context: selected,
+        target: delegated,
+        ..
+    } = plan.open_udp(&target).await.expect("resolved open")
+    else {
+        panic!("expected MPP UDP outbound");
+    };
+    assert_eq!(selected.session_id, edge_session);
+    assert_eq!(
+        delegated,
+        TargetAddr::Ip("8.8.8.8:443".parse().expect("literal target"))
+    );
+
+    let restricted = TargetAddr::Domain {
+        host: "policy-selected-private.example".to_string(),
+        port: 443,
+    };
+    let ClientRoute::Open(plan) = router
+        .route_udp(&restricted, source(), anonymous(), inbound())
+        .expect("restricted provisional route")
+    else {
+        panic!("expected provisional open plan");
+    };
+    assert!(matches!(
+        plan.open_udp(&restricted).await,
+        Err(RuntimeError::DestinationDenied(_))
+    ));
+}
+
+#[tokio::test]
 async fn post_dns_routing_authorizes_the_complete_answer_and_opens_only_a_literal_action() {
     let routed_context = context(8443);
     let routed_session = routed_context.session_id;
     let routed_id = OutboundId::parse("routed-edge").expect("outbound");
     let config = policy(vec![
-        rule(
+        terminal_rule(
             "skip-first-address",
             RouteMatchSpec {
                 destination_cidrs: vec!["8.8.8.0/24".parse().expect("CIDR")],
                 stages: vec![RouteStage::PostResolution],
                 ..RouteMatchSpec::default()
             },
-            EgressAction::Reject,
+            RouteAction::reject(),
         ),
         RouteRuleSpec::new(
             RuleId::parse("route-second-address").expect("rule"),
             RouteMatchSpec {
-                destination_cidrs: vec!["1.1.1.0/24".parse().expect("CIDR")],
+                destination_cidrs: vec![
+                    "1.1.1.0/24".parse().expect("public CIDR"),
+                    "127.0.0.0/8".parse().expect("restricted CIDR"),
+                ],
                 stages: vec![RouteStage::PostResolution],
                 ..RouteMatchSpec::default()
             },
-            RouteAction::new(
+            RouteAction::allow(
                 EgressAction::Outbound(routed_id.clone()),
                 None,
                 InitialDemand::Throughput,
             ),
         ),
-        rule("default", RouteMatchSpec::default(), EgressAction::Reject),
+        terminal_rule("default", RouteMatchSpec::default(), RouteAction::reject()),
     ]);
     let dns = crate::dns::DnsGeneration::from_test_answers(HashMap::from([
         (
@@ -539,7 +743,7 @@ async fn post_resolution_route_groups_keep_independent_member_deadlines() {
             },
             EgressAction::Outbound(second.clone()),
         ),
-        rule("default", RouteMatchSpec::default(), EgressAction::Reject),
+        terminal_rule("default", RouteMatchSpec::default(), RouteAction::reject()),
     ];
     let dns = crate::dns::DnsGeneration::from_test_answers(HashMap::from([(
         "route-group.example".to_string(),
@@ -590,17 +794,17 @@ async fn post_resolution_route_groups_keep_independent_member_deadlines() {
 }
 
 #[test]
-fn deny_actions_finish_before_target_lookup_or_acl_open_authority() {
+fn deny_actions_finish_before_target_lookup_or_destination_open_authority() {
     let config = policy(vec![
-        rule(
+        terminal_rule(
             "drop",
             RouteMatchSpec {
                 domain_exact: vec![DomainName::parse("drop.example").expect("domain")],
                 ..RouteMatchSpec::default()
             },
-            EgressAction::Drop,
+            RouteAction::drop(),
         ),
-        rule("reject", RouteMatchSpec::default(), EgressAction::Reject),
+        terminal_rule("reject", RouteMatchSpec::default(), RouteAction::reject()),
     ]);
     let router = ClientIngressRouter::new(&config, registry([], &[]))
         .expect("router without outbound bindings");
@@ -627,8 +831,8 @@ fn deny_actions_finish_before_target_lookup_or_acl_open_authority() {
     }
 }
 
-#[test]
-fn safe_acl_denies_restricted_literal_before_mpp_open() {
+#[tokio::test]
+async fn plain_allow_denies_restricted_literal_before_mpp_open() {
     let context = context(7443);
     let config = policy(vec![rule(
         "default",
@@ -638,8 +842,14 @@ fn safe_acl_denies_restricted_literal_before_mpp_open() {
     let router =
         ClientIngressRouter::new(&config, registry([("edge", context)], &[])).expect("router");
     let target = TargetAddr::Ip("127.0.0.1:443".parse().expect("target"));
+    let ClientRoute::Open(plan) = router
+        .route_tcp(&target, source(), anonymous(), inbound())
+        .expect("provisional route")
+    else {
+        panic!("expected an open plan before destination authorization");
+    };
     assert!(matches!(
-        router.route_tcp(&target, source(), anonymous(), inbound()),
+        plan.open_tcp(&target).await,
         Err(RuntimeError::DestinationDenied(_))
     ));
 }
@@ -658,7 +868,7 @@ async fn socks5_post_resolution_reject_returns_connection_not_allowed() {
             },
             EgressAction::Outbound(edge_id),
         ),
-        rule("default", RouteMatchSpec::default(), EgressAction::Reject),
+        terminal_rule("default", RouteMatchSpec::default(), RouteAction::reject()),
     ]);
     let router = ClientIngressRouter::new(
         &config,
@@ -698,10 +908,10 @@ async fn socks5_post_resolution_reject_returns_connection_not_allowed() {
     assert_eq!(&response[..2], &[0x05, 0x00]);
     assert_eq!(response[3], 0x02);
 
-    let config = policy(vec![rule(
+    let config = policy(vec![terminal_rule(
         "default",
         RouteMatchSpec::default(),
-        EgressAction::Drop,
+        RouteAction::drop(),
     )]);
     let router = ClientIngressRouter::new(&config, registry([], &[])).expect("router");
     let udp_context = context(7443);
@@ -741,10 +951,10 @@ async fn socks5_post_resolution_reject_returns_connection_not_allowed() {
 
 #[tokio::test]
 async fn http_connect_reject_returns_forbidden_without_mpp_open() {
-    let config = policy(vec![rule(
+    let config = policy(vec![terminal_rule(
         "default",
         RouteMatchSpec::default(),
-        EgressAction::Reject,
+        RouteAction::reject(),
     )]);
     let router = ClientIngressRouter::new(&config, registry([], &[])).expect("router");
     let (mut client, server) = tokio::io::duplex(1024);
@@ -765,10 +975,10 @@ async fn http_connect_reject_returns_forbidden_without_mpp_open() {
     task.await.expect("handler task").expect("policy reject");
     assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
 
-    let config = policy(vec![rule(
+    let config = policy(vec![terminal_rule(
         "default",
         RouteMatchSpec::default(),
-        EgressAction::Drop,
+        RouteAction::drop(),
     )]);
     let router = ClientIngressRouter::new(&config, registry([], &[])).expect("router");
     let (mut client, server) = tokio::io::duplex(1024);

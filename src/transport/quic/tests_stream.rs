@@ -271,24 +271,162 @@ fn native_flow_registry_bounds_live_state_without_exhausting_on_churn() {
         Err(QuicCarrierError::NativeDatagramFlowsExhausted)
     ));
     registry
+        .apply_received_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: DatagramFlowId(202),
+            target: target.clone(),
+        }])
+        .expect("receive side provisionally admits an over-cap OPEN");
+    assert_eq!(
+        registry.state(DatagramFlowId(202)),
+        DatagramFlowState::Active,
+    );
+    assert_eq!(registry.active.len(), 3);
+    registry
+        .retain_refusal(DatagramFlowId(202), None, 2)
+        .expect("runtime turns the excess candidate into a capacity refusal");
+    assert_eq!(
+        registry.state(DatagramFlowId(202)),
+        DatagramFlowState::Refused,
+    );
+    assert_eq!(registry.active.len(), 2);
+    registry
         .apply_transitions(&[Frame::DatagramClose {
             flow_id: DatagramFlowId(200),
         }])
         .expect("release one live flow");
     registry
         .apply_transitions(&[Frame::OpenDatagramFlow {
-            flow_id: DatagramFlowId(202),
+            flow_id: DatagramFlowId(203),
             target: target.clone(),
         }])
         .expect("a new flow may consume the released live slot");
+    assert_eq!(
+        registry.state(DatagramFlowId(203)),
+        DatagramFlowState::Active,
+    );
 
-    assert!(matches!(
-        registry.apply_transitions(&[Frame::OpenDatagramFlow {
+    registry
+        .apply_transitions(&[Frame::OpenDatagramFlow {
             flow_id: DatagramFlowId(50),
             target,
-        }]),
-        Err(QuicCarrierError::InvalidNativeDatagram(_))
-    ));
+        }])
+        .expect("a terminal historical ID is ignored without failing the carrier");
+    assert_eq!(
+        registry.state(DatagramFlowId(50)),
+        DatagramFlowState::Closed,
+    );
+}
+
+#[test]
+fn native_flow_registry_bounds_refusals_and_terminalizes_evictions() {
+    let target = TargetAddr::Ip("127.0.0.1:53".parse().expect("target"));
+    let refused = DatagramFlowId(1);
+    let mut registry = DatagramFlowRegistry::new(2);
+    registry
+        .apply_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: refused,
+            target: target.clone(),
+        }])
+        .expect("open refused flow");
+    registry
+        .retain_refusal(refused, None, 2)
+        .expect("mark refusal");
+    assert_eq!(registry.state(refused), DatagramFlowState::Refused);
+    assert!(registry.active.is_empty());
+
+    registry
+        .apply_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: refused,
+            target: target.clone(),
+        }])
+        .expect("accept an in-flight repeated open");
+    registry
+        .retain_refusal(refused, None, 2)
+        .expect("repeat refusal");
+    assert_eq!(registry.state(refused), DatagramFlowState::Refused);
+
+    let accepted = DatagramFlowId(2);
+    registry
+        .apply_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: accepted,
+            target,
+        }])
+        .expect("refusal does not consume live capacity");
+    assert_eq!(registry.state(accepted), DatagramFlowState::Active);
+
+    let mut retained = std::collections::VecDeque::from([refused]);
+    for value in 3..103 {
+        let flow_id = DatagramFlowId(value);
+        registry
+            .apply_transitions(&[Frame::OpenDatagramFlow {
+                flow_id,
+                target: TargetAddr::Ip("127.0.0.1:53".parse().expect("denied target")),
+            }])
+            .expect("open denial-flood flow");
+        let evicted = if retained.len() == 2 {
+            retained.pop_front()
+        } else {
+            None
+        };
+        retained.push_back(flow_id);
+        registry
+            .retain_refusal(flow_id, evicted, 2)
+            .expect("retain bounded denial");
+        assert!(registry.refused.len() <= 2);
+        assert!(registry.refused_lru.len() <= 2);
+    }
+    assert_eq!(
+        registry.state(refused),
+        DatagramFlowState::Closed,
+        "the runtime-selected LRU eviction becomes terminal in transport",
+    );
+    registry
+        .apply_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: refused,
+            target: TargetAddr::Ip("127.0.0.1:53".parse().expect("terminal target")),
+        }])
+        .expect("ignore a terminal duplicate without failing the carrier");
+    assert_eq!(registry.state(refused), DatagramFlowState::Closed);
+    assert_eq!(registry.active.len(), 1, "accepted capacity is unchanged");
+
+    registry
+        .apply_transitions(&[Frame::DatagramClose { flow_id: refused }])
+        .expect("close refused flow");
+    assert_eq!(registry.state(refused), DatagramFlowState::Closed);
+}
+
+#[test]
+fn native_receive_registry_allows_later_burst_candidate_after_earlier_denials() {
+    let target = TargetAddr::Ip("127.0.0.1:53".parse().expect("target"));
+    let first = DatagramFlowId(10);
+    let second = DatagramFlowId(11);
+    let later = DatagramFlowId(12);
+    let mut registry = DatagramFlowRegistry::new(2);
+    registry
+        .apply_received_transitions(&[
+            Frame::OpenDatagramFlow {
+                flow_id: first,
+                target: target.clone(),
+            },
+            Frame::OpenDatagramFlow {
+                flow_id: second,
+                target: target.clone(),
+            },
+            Frame::OpenDatagramFlow {
+                flow_id: later,
+                target,
+            },
+        ])
+        .expect("bounded reader queue provisionally admits the burst");
+    assert_eq!(registry.active.len(), 3);
+    registry
+        .retain_refusal(first, None, 2)
+        .expect("deny first candidate");
+    registry
+        .retain_refusal(second, None, 2)
+        .expect("deny second candidate");
+    assert_eq!(registry.active.len(), 1);
+    assert_eq!(registry.state(later), DatagramFlowState::Active);
 }
 
 #[test]

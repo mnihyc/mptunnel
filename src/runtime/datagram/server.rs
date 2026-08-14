@@ -2,17 +2,17 @@
 
 use crate::model::datagram::{DatagramAdmission, DatagramPayloadIdentity, DatagramReceiveWindow};
 use crate::mux::MuxLimits;
-use crate::outbound::{self, ServerDestinationPolicy};
-use crate::product::{DnsPlanId, Network};
+use crate::outbound;
+use crate::product::InboundId;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::outbound_registry::{EgressSelection, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, ServerDatagramOpenError, ServerDatagramOpenRequest,
     ServerDatagramPort, ServerDatagramPortBackend, ServerDatagramSendOutcome,
     ServerDatagramWorkerMessage, ServerStreamPort,
 };
+use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 use crate::runtime::telemetry::{ProductFlowLease, RuntimeTelemetry};
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
@@ -37,10 +37,8 @@ type ServerDatagramFlowRegistry =
 
 /// Composition-owned UDP target policy and session-level flow registry.
 pub(in crate::runtime) struct ServerDatagramService {
-    outbound_registry: RuntimeOutboundRegistry,
-    egress_selection: EgressSelection,
-    dns_plan: Option<DnsPlanId>,
-    destination_policy: Arc<ServerDestinationPolicy>,
+    router: ClientIngressRouter,
+    inbound: InboundId,
     session_retention_timeout: Duration,
     mux_limits: MuxLimits,
     reliable_streams: ServerStreamPort,
@@ -77,10 +75,8 @@ impl Drop for ServerDatagramAttachment {
 }
 
 pub(in crate::runtime) struct ServerDatagramServiceConfig {
-    pub(in crate::runtime) outbound_registry: RuntimeOutboundRegistry,
-    pub(in crate::runtime) egress_selection: EgressSelection,
-    pub(in crate::runtime) dns_plan: Option<DnsPlanId>,
-    pub(in crate::runtime) destination_policy: Arc<ServerDestinationPolicy>,
+    pub(in crate::runtime) router: ClientIngressRouter,
+    pub(in crate::runtime) inbound: InboundId,
     pub(in crate::runtime) session_retention_timeout: Duration,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) reliable_streams: ServerStreamPort,
@@ -90,20 +86,16 @@ pub(in crate::runtime) struct ServerDatagramServiceConfig {
 impl ServerDatagramService {
     pub(in crate::runtime) fn path_port(config: ServerDatagramServiceConfig) -> ServerDatagramPort {
         let ServerDatagramServiceConfig {
-            outbound_registry,
-            egress_selection,
-            dns_plan,
-            destination_policy,
+            router,
+            inbound,
             session_retention_timeout,
             mux_limits,
             reliable_streams,
             telemetry,
         } = config;
         ServerDatagramPort::new(Arc::new(Self {
-            outbound_registry,
-            egress_selection,
-            dns_plan,
-            destination_policy,
+            router,
+            inbound,
             session_retention_timeout,
             mux_limits,
             reliable_streams,
@@ -116,13 +108,13 @@ impl ServerDatagramService {
         &self,
         key: ServerDatagramFlowKey,
         target: TargetAddr,
-    ) -> Result<Arc<ServerDatagramFlowSlot>, RuntimeError> {
+    ) -> Result<Arc<ServerDatagramFlowSlot>, ServerDatagramOpenError> {
         let mut flows = self.flows.lock().expect("server datagram registry lock");
         if let Some(slot) = flows.get(&key) {
             if slot.target != target {
-                return Err(RuntimeError::Protocol(
+                return Err(ServerDatagramOpenError::new(RuntimeError::Protocol(
                     "datagram flow reopened with a different target",
-                ));
+                )));
             }
             return Ok(slot.clone());
         }
@@ -133,7 +125,7 @@ impl ServerDatagramService {
         if flows.len() >= self.mux_limits.max_streams
             || session_flows >= self.mux_limits.max_streams
         {
-            return Err(RuntimeError::Protocol("server datagram flow limit reached"));
+            return Err(ServerDatagramOpenError::capacity());
         }
         let slot = Arc::new(ServerDatagramFlowSlot {
             target,
@@ -179,33 +171,32 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                 target,
                 commands,
             } = request;
-            let principal_destination_policy = self
-                .destination_policy
-                .for_principal(principal_permit.principal().clone());
             outbound::validate_target(&target)
                 .map_err(|error| ServerDatagramOpenError::new(error.into()))?;
-            principal_destination_policy
-                .evaluate_pre(Network::Udp, &target)
-                .map_err(|error| {
-                    ServerDatagramOpenError::new(RuntimeError::DestinationDenied(error.to_string()))
-                })?;
+            let route = self
+                .router
+                .route_mpp_udp(
+                    &target,
+                    principal_permit.principal().clone(),
+                    self.inbound.clone(),
+                )
+                .map_err(ServerDatagramOpenError::new)?;
+            let plan = match route {
+                ClientRoute::Open(plan) => plan,
+                ClientRoute::Deny(ClientPolicyDisposition::Reject) => {
+                    return Err(ServerDatagramOpenError::new(RuntimeError::RouteRejected));
+                }
+                ClientRoute::Deny(ClientPolicyDisposition::Drop) => {
+                    return Err(ServerDatagramOpenError::new(RuntimeError::RouteDropped));
+                }
+            };
 
             let key = (session_id, flow_id);
-            let slot = self
-                .flow_slot(key, target.clone())
-                .map_err(ServerDatagramOpenError::new)?;
+            let slot = self.flow_slot(key, target.clone())?;
             let worker = slot
                 .worker
                 .get_or_try_init(|| async {
-                    let opened = self
-                        .outbound_registry
-                        .open_udp(
-                            &self.egress_selection,
-                            &target,
-                            self.dns_plan.as_ref(),
-                            &principal_destination_policy,
-                        )
-                        .await?;
+                    let opened = plan.open_udp(&target).await?;
                     let crate::runtime::outbound_registry::OpenedUdpOutbound::Local {
                         socket: outbound_socket,
                         _gateway_lease,

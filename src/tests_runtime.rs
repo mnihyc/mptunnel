@@ -431,7 +431,11 @@ async fn spawn_server_path_count(
             paths,
             reliable_relay,
         } = server_runtime(outbound);
-        let relay = tokio::spawn(reliable_relay.run());
+        let relay = tokio::spawn(
+            reliable_relay
+                .expect("L4 test server has a reliable relay")
+                .run(),
+        );
         let result = async {
             let mut sessions = tokio::task::JoinSet::new();
             for _ in 0..count {
@@ -582,7 +586,11 @@ async fn spawn_notified_server_path(
             paths,
             reliable_relay,
         } = server_runtime(outbound);
-        let relay = tokio::spawn(reliable_relay.run());
+        let relay = tokio::spawn(
+            reliable_relay
+                .expect("L4 test server has a reliable relay")
+                .run(),
+        );
         let (stream, _) = listener.accept().await.expect("accept");
         let _ = accepted.send(marker).await;
         let result = handle_server_path(stream, local_path, paths).await;
@@ -612,7 +620,7 @@ async fn spawn_udp_server_path(
     let server = tokio::spawn(async move {
         tokio::select! {
             result = run_server_udp_listener(endpoint, local_path, paths) => result,
-            result = reliable_relay.run() => result,
+            result = reliable_relay.expect("L4 test server has a reliable relay").run() => result,
         }
     });
     (path, server)
@@ -742,7 +750,7 @@ async fn server_udp_listener_accepts_probe_after_noise() {
     let server = tokio::spawn(async move {
         tokio::select! {
             result = run_server_udp_listener(endpoint, local_path, paths) => result,
-            result = reliable_relay.run() => result,
+            result = reliable_relay.expect("L4 test server has a reliable relay").run() => result,
         }
     });
 

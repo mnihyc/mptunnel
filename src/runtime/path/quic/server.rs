@@ -110,7 +110,8 @@ async fn handle_server_udp_connection(
     drop(authentication_slot);
     let session_id = path_registration.session_id();
     let path_id = path_registration.path_id();
-    let peer_status = context.peer_status.register(session_id);
+    let peer_status =
+        context.register_peer_status(session_id, path_registration.principal_permit().principal());
     let control = run_server_udp_control_stream(
         control_send,
         control_recv,
@@ -387,7 +388,7 @@ async fn run_server_udp_control_stream(
     }
 }
 
-async fn handle_server_udp_bidi_stream(
+pub(super) async fn handle_server_udp_bidi_stream(
     mut send: UdpPathSendStream,
     mut recv: UdpPathRecvStream,
     context: ServerPathContext,

@@ -259,7 +259,7 @@ dist_dir=".tmp/release/dist"
 stage="${dist_dir}/${package}"
 
 release_files=(packaging/README.md)
-release_examples=(examples/client.toml examples/server.toml)
+release_examples=(examples/client.toml examples/server.toml examples/config.reference.toml)
 for release_file in "${release_files[@]}" "${release_examples[@]}"; do
   if [[ ! -f "$release_file" ]]; then
     echo "required release file is missing: $release_file" >&2

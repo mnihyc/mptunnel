@@ -135,7 +135,11 @@ try {
     $DistDir = ".tmp/release/dist"
     $Stage = Join-Path $DistDir $Package
     $ReleaseFiles = @("packaging/README.md")
-    $ReleaseExamples = @("examples/client.toml", "examples/server.toml")
+    $ReleaseExamples = @(
+        "examples/client.toml",
+        "examples/server.toml",
+        "examples/config.reference.toml"
+    )
     foreach ($ReleaseFile in $ReleaseFiles + $ReleaseExamples) {
         if (-not (Test-Path -PathType Leaf $ReleaseFile)) {
             throw "Required release file is missing: $ReleaseFile"

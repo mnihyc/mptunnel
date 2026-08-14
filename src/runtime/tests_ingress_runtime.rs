@@ -66,13 +66,12 @@ fn socks_udp_classifies_once_per_cached_target() {
         routes: vec![RouteRuleSpec::new(
             RuleId::parse("default").expect("rule"),
             RouteMatchSpec::default(),
-            RouteAction::new(
+            RouteAction::allow(
                 EgressAction::Balancer(gateway_id.clone()),
                 None,
                 InitialDemand::Automatic,
             ),
         )],
-        destination_acl: Vec::new(),
     };
     let gateways = [GatewayBalancerConfig {
         id: gateway_id,

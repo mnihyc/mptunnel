@@ -2,14 +2,15 @@ use crate::ingress::IngressConfig;
 use crate::outbound::OutboundConfig;
 use crate::performance::{MppPerformanceConfig, ResourceLimitError, ResourceLimits};
 use crate::product::{
-    AclError, AclRuleSpec, BalancerId, CompiledDnsPolicy, CredentialAuthority, CredentialRecord,
-    DestinationAcl, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId,
-    DnsUpstreamSpec, EgressAction, GatewayBalancer, GatewayBalancerSpec, InboundId, NetworkSet,
-    OutboundId, ProductAdmissionConfig, ProductAdmissionConfigError, ProductPolicyCompileError,
-    ProductPolicyGeneration, RouteRuleSpec, SecurityPolicyError,
+    BalancerId, CompiledDnsPolicy, CredentialAuthority, CredentialRecord, DnsActivation,
+    DnsCompileError, DnsEgressSpec, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsUpstreamEndpoint,
+    DnsUpstreamId, DnsUpstreamSpec, EgressAction, GatewayBalancer, GatewayBalancerSpec, InboundId,
+    Network, NetworkSet, OutboundId, PrincipalId, ProductAdmissionConfig,
+    ProductAdmissionConfigError, ProductPolicyCompileError, ProductPolicyGeneration, RouteRuleSpec,
+    SecurityPolicyError,
 };
 #[cfg(test)]
-use crate::product::{CredentialCatalog, CredentialId, PrincipalId, SharedSecret};
+use crate::product::{CredentialCatalog, CredentialId, SharedSecret};
 use crate::transport::PathSpec;
 use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
 use ipnet::IpNet;
@@ -17,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_PATH_PROBE_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_PATH_PROBE_TIMEOUT_MS: u64 = 2_000;
@@ -190,52 +191,62 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
 
     validate_tun_l3_ingresses(&node.tun_l3_ingresses, &node.outbounds)?;
 
-    let dns_policy = node
+    let route_dns_plans = node
+        .product_policy
+        .iter()
+        .flat_map(|policy| &policy.routes)
+        .filter_map(|rule| rule.action.dns_plan());
+    let (dns_policy, dns_activation) = node
         .dns_policy
-        .compile()
+        .compile_active(route_dns_plans)
         .map_err(|error| ConfigError::DnsPolicy(error.to_string()))?;
     validate_gateway_balancers(&leaf_networks, &node.gateway_balancers)?;
     for server in &node.servers {
         validate_mpp_inbound(server, resources)?;
-        if let Some(plan) = &server.dns_plan
-            && dns_policy.plan(plan).is_none()
-        {
-            return Err(ConfigError::DnsPolicy(format!(
-                "MPP inbound references missing DNS policy {}",
-                plan.as_str()
-            )));
-        }
-        validate_egress(&server.egress, &leaf_networks, &node.gateway_balancers)?;
-        validate_mpp_inbound_egress(&server.egress, &node.gateway_balancers, &node.outbounds)?;
     }
     validate_local_ingresses(&node.local_ingresses)?;
-    validate_fake_dns_tun_routes(&node.local_ingresses, &dns_policy)?;
-    match (&node.product_policy, node.local_ingresses.is_empty()) {
+    validate_synthetic_capture_tun_routes(&node.local_ingresses, &dns_policy, &dns_activation)?;
+    // Do not approximate cross-policy synthetic-capture reachability here:
+    // domain and principal selectors can make active policies disjoint. The
+    // TUN runtime binds every recovered lease to its DNS generation, policy,
+    // and capture, then rejects a route selecting different provenance.
+    let has_l4_inbound = !node.local_ingresses.is_empty()
+        || node.servers.iter().any(|server| server.tun_l3.is_none());
+    match (&node.product_policy, has_l4_inbound) {
         (Some(policy), _) => {
             policy
                 .compile()
                 .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?;
             validate_product_policy_targets(policy, &leaf_networks, &node.gateway_balancers)?;
             validate_product_policy_dns_plans(policy, &dns_policy)?;
+            validate_product_policy_reachability(
+                policy,
+                node,
+                &leaf_networks,
+                &node.gateway_balancers,
+            )?;
         }
-        (None, false) => return Err(ConfigError::LocalIngressRoutingRequired),
-        (None, true) => {}
+        (None, true) => return Err(ConfigError::LocalIngressRoutingRequired),
+        (None, false) => {}
     }
     Ok(())
 }
 
-fn validate_fake_dns_tun_routes(
+fn validate_synthetic_capture_tun_routes(
     ingresses: &[LocalIngressConfig],
     dns_policy: &CompiledDnsPolicy,
+    activation: &crate::product::DnsActivation,
 ) -> Result<(), ConfigError> {
-    let Some(fake_dns) = dns_policy.fake_dns() else {
-        return Ok(());
-    };
-    let pools = fake_dns
-        .ipv4_pool
-        .map(IpNet::V4)
-        .into_iter()
-        .chain(fake_dns.ipv6_pool.map(IpNet::V6));
+    let pools = dns_policy
+        .synthetic_captures_for_activation(activation)
+        .flat_map(|capture| {
+            capture
+                .ipv4_pool
+                .map(IpNet::V4)
+                .into_iter()
+                .chain(capture.ipv6_pool.map(IpNet::V6))
+        })
+        .collect::<Vec<_>>();
     for ingress in ingresses {
         let IngressConfig::TunL4(tun) = &ingress.config else {
             continue;
@@ -243,14 +254,14 @@ fn validate_fake_dns_tun_routes(
         let Some(managed) = tun.managed_vpn() else {
             continue;
         };
-        for pool in pools.clone() {
+        for pool in pools.iter().copied() {
             if managed
                 .excludes
                 .iter()
                 .any(|excluded| ip_nets_overlap(*excluded, pool))
             {
                 return Err(ConfigError::DnsPolicy(format!(
-                    "DNS override pool {pool} overlaps a managed VPN exclude"
+                    "DNS synthetic-capture pool {pool} overlaps a managed VPN exclude"
                 )));
             }
             if let crate::platform::RouteMode::Split(includes) = &managed.route_mode
@@ -259,7 +270,7 @@ fn validate_fake_dns_tun_routes(
                     .any(|included| ip_net_contains(*included, pool))
             {
                 return Err(ConfigError::DnsPolicy(format!(
-                    "managed split VPN does not capture DNS override pool {pool}"
+                    "managed split VPN does not capture DNS synthetic-capture pool {pool}"
                 )));
             }
         }
@@ -292,38 +303,6 @@ fn validate_product_policy_dns_plans(
                 plan.as_str()
             )));
         }
-    }
-    Ok(())
-}
-
-fn validate_mpp_inbound_egress(
-    egress: &EgressRef,
-    balancers: &[GatewayBalancerConfig],
-    outbounds: &[OutboundLeafConfig],
-) -> Result<(), ConfigError> {
-    let member_ids = match egress {
-        EgressRef::Outbound(outbound) => vec![outbound.clone()],
-        EgressRef::Balancer(selected) => balancers
-            .iter()
-            .find(|balancer| &balancer.id == selected)
-            .map(|balancer| {
-                balancer
-                    .spec
-                    .members
-                    .iter()
-                    .map(|member| member.id.clone())
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
-    if member_ids.iter().any(|id| {
-        outbounds.iter().any(
-            |outbound| matches!(outbound, OutboundLeafConfig::Mpp { id: leaf, .. } if leaf == id),
-        )
-    }) {
-        return Err(ConfigError::ProductPolicy(
-            "MPP inbound egress cannot select an MPP outbound".to_string(),
-        ));
     }
     Ok(())
 }
@@ -362,32 +341,6 @@ fn validate_gateway_balancers(
     Ok(())
 }
 
-fn validate_egress(
-    egress: &EgressRef,
-    leaves: &HashMap<OutboundId, NetworkSet>,
-    balancers: &[GatewayBalancerConfig],
-) -> Result<(), ConfigError> {
-    match egress {
-        EgressRef::Outbound(outbound) => {
-            if !leaves.contains_key(outbound) {
-                return Err(ConfigError::ProductPolicy(format!(
-                    "egress references missing outbound {}",
-                    outbound.as_str()
-                )));
-            }
-        }
-        EgressRef::Balancer(selected) => {
-            if !balancers.iter().any(|balancer| &balancer.id == selected) {
-                return Err(ConfigError::ProductPolicy(format!(
-                    "egress references missing balancer {}",
-                    selected.as_str()
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_product_policy_targets(
     policy: &ProductPolicyConfig,
     leaves: &HashMap<OutboundId, NetworkSet>,
@@ -395,21 +348,23 @@ fn validate_product_policy_targets(
 ) -> Result<(), ConfigError> {
     for rule in &policy.routes {
         match rule.action.egress() {
-            EgressAction::Outbound(id) if !leaves.contains_key(id) => {
+            Some(EgressAction::Outbound(id)) if !leaves.contains_key(id) => {
                 return Err(ConfigError::ProductPolicy(format!(
                     "route {} references missing outbound {}",
                     rule.id.as_str(),
                     id.as_str()
                 )));
             }
-            EgressAction::Balancer(id) if !balancers.iter().any(|balancer| &balancer.id == id) => {
+            Some(EgressAction::Balancer(id))
+                if !balancers.iter().any(|balancer| &balancer.id == id) =>
+            {
                 return Err(ConfigError::ProductPolicy(format!(
                     "route {} references missing balancer {}",
                     rule.id.as_str(),
                     id.as_str()
                 )));
             }
-            EgressAction::Direct => {
+            Some(EgressAction::Direct) => {
                 return Err(ConfigError::ProductPolicy(format!(
                     "route {} must select a configured direct outbound",
                     rule.id.as_str()
@@ -419,6 +374,234 @@ fn validate_product_policy_targets(
         }
     }
     Ok(())
+}
+
+struct L4InboundReachability {
+    id: InboundId,
+    is_mpp: bool,
+    has_source: bool,
+    networks: NetworkSet,
+    principals: HashSet<PrincipalId>,
+}
+
+fn validate_product_policy_reachability(
+    policy: &ProductPolicyConfig,
+    node: &NodeConfig,
+    leaf_networks: &HashMap<OutboundId, NetworkSet>,
+    balancers: &[GatewayBalancerConfig],
+) -> Result<(), ConfigError> {
+    let inbounds = l4_inbound_reachability(node)?;
+    for rule in &policy.routes {
+        for selected in &rule.matcher.inbounds {
+            if !inbounds.iter().any(|inbound| &inbound.id == selected) {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route {} references unavailable L4 inbound {}",
+                    rule.id, selected
+                )));
+            }
+        }
+        for principal in &rule.matcher.principals {
+            if !inbounds.iter().any(|inbound| {
+                route_selects_inbound(rule, inbound)
+                    && route_can_match_inbound_network(rule, inbound)
+                    && route_can_match_inbound_source(rule, inbound)
+                    && inbound.principals.contains(principal)
+            }) {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route {} principal {} is not reachable on any selected L4 inbound",
+                    rule.id, principal
+                )));
+            }
+        }
+
+        if !inbounds
+            .iter()
+            .any(|inbound| route_can_match_inbound(rule, inbound))
+        {
+            return Err(ConfigError::ProductPolicy(format!(
+                "route {} cannot match any configured L4 inbound after applying its inbound, principal, network, and source selectors",
+                rule.id
+            )));
+        }
+
+        let Some(egress) = rule.action.egress() else {
+            continue;
+        };
+        let reachable_networks = inbounds
+            .iter()
+            .filter(|inbound| route_can_match_inbound(rule, inbound))
+            .fold(NetworkSet::NONE, |networks, inbound| {
+                networks.union(route_inbound_networks(rule, inbound))
+            });
+        let egress_networks = match egress {
+            EgressAction::Outbound(id) => {
+                leaf_networks.get(id).copied().unwrap_or(NetworkSet::NONE)
+            }
+            EgressAction::Balancer(id) => balancers
+                .iter()
+                .find(|balancer| &balancer.id == id)
+                .map(|balancer| {
+                    balancer
+                        .spec
+                        .members
+                        .iter()
+                        .fold(NetworkSet::NONE, |networks, member| {
+                            networks.union(member.networks)
+                        })
+                })
+                .unwrap_or(NetworkSet::NONE),
+            EgressAction::Direct => NetworkSet::TCP_UDP,
+        };
+        for network in [Network::Tcp, Network::Udp] {
+            if reachable_networks.contains(network) && !egress_networks.contains(network) {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route {} can match {network} but its selected egress does not support {network}",
+                    rule.id
+                )));
+            }
+        }
+
+        if inbounds
+            .iter()
+            .any(|inbound| inbound.is_mpp && route_can_match_inbound(rule, inbound))
+            && route_egress_contains_mpp(egress, node, balancers)
+        {
+            return Err(ConfigError::ProductPolicy(format!(
+                "route {} is reachable from an MPP inbound and cannot select an MPP outbound",
+                rule.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn l4_inbound_reachability(node: &NodeConfig) -> Result<Vec<L4InboundReachability>, ConfigError> {
+    let anonymous = PrincipalId::parse("anonymous")
+        .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?;
+    let mut inbounds = Vec::with_capacity(node.local_ingresses.len() + node.servers.len());
+    for ingress in &node.local_ingresses {
+        let (networks, proxy_auth) = match &ingress.config {
+            IngressConfig::Socks5 { proxy_auth, .. } | IngressConfig::Mixed { proxy_auth, .. } => {
+                (NetworkSet::TCP_UDP, Some(proxy_auth))
+            }
+            IngressConfig::HttpConnect { proxy_auth, .. } => (NetworkSet::TCP, Some(proxy_auth)),
+            IngressConfig::TcpForward(_) => (NetworkSet::TCP, None),
+            IngressConfig::UdpForward(_) => (NetworkSet::UDP, None),
+            IngressConfig::MixedForward(_) | IngressConfig::TunL4(_) => (NetworkSet::TCP_UDP, None),
+        };
+        let principals = match proxy_auth {
+            Some(auth) if auth.is_required() => auth.principals().cloned().collect(),
+            Some(_) | None => HashSet::from([anonymous.clone()]),
+        };
+        inbounds.push(L4InboundReachability {
+            id: InboundId::parse(&ingress.name)
+                .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?,
+            is_mpp: false,
+            has_source: true,
+            networks,
+            principals,
+        });
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ConfigError::ProductPolicy("system clock is before Unix epoch".to_string()))?
+        .as_secs();
+    for server in node.servers.iter().filter(|server| server.tun_l3.is_none()) {
+        let principals = server
+            .security
+            .credential_authority
+            .credentials()
+            .into_iter()
+            .filter(|credential| {
+                !credential.revoked()
+                    && credential
+                        .expires_at_unix_secs()
+                        .is_none_or(|expiry| now < expiry)
+            })
+            .map(|credential| credential.principal().clone())
+            .collect();
+        inbounds.push(L4InboundReachability {
+            id: InboundId::parse(&server.name)
+                .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?,
+            is_mpp: true,
+            has_source: false,
+            networks: NetworkSet::TCP_UDP,
+            principals,
+        });
+    }
+    Ok(inbounds)
+}
+
+fn route_selects_inbound(rule: &RouteRuleSpec, inbound: &L4InboundReachability) -> bool {
+    rule.matcher.inbounds.is_empty() || rule.matcher.inbounds.contains(&inbound.id)
+}
+
+fn route_can_match_inbound_source(rule: &RouteRuleSpec, inbound: &L4InboundReachability) -> bool {
+    inbound.has_source
+        || (rule.matcher.source_cidrs.is_empty() && rule.matcher.source_ports.is_empty())
+}
+
+fn route_can_match_inbound_network(rule: &RouteRuleSpec, inbound: &L4InboundReachability) -> bool {
+    rule.matcher.networks.is_empty()
+        || rule
+            .matcher
+            .networks
+            .iter()
+            .any(|network| inbound.networks.contains(*network))
+}
+
+fn route_can_match_inbound(rule: &RouteRuleSpec, inbound: &L4InboundReachability) -> bool {
+    route_selects_inbound(rule, inbound)
+        && route_can_match_inbound_source(rule, inbound)
+        && route_can_match_inbound_network(rule, inbound)
+        && (rule.matcher.principals.is_empty()
+            || rule
+                .matcher
+                .principals
+                .iter()
+                .any(|principal| inbound.principals.contains(principal)))
+        && !inbound.principals.is_empty()
+}
+
+fn route_inbound_networks(rule: &RouteRuleSpec, inbound: &L4InboundReachability) -> NetworkSet {
+    if rule.matcher.networks.is_empty() {
+        inbound.networks
+    } else {
+        rule.matcher
+            .networks
+            .iter()
+            .filter(|network| inbound.networks.contains(**network))
+            .fold(NetworkSet::NONE, |networks, network| {
+                networks.union((*network).into())
+            })
+    }
+}
+
+fn route_egress_contains_mpp(
+    egress: &EgressAction,
+    node: &NodeConfig,
+    balancers: &[GatewayBalancerConfig],
+) -> bool {
+    let is_mpp = |id: &OutboundId| {
+        node.outbounds.iter().any(
+            |outbound| matches!(outbound, OutboundLeafConfig::Mpp { id: leaf, .. } if leaf == id),
+        )
+    };
+    match egress {
+        EgressAction::Outbound(id) => is_mpp(id),
+        EgressAction::Balancer(id) => balancers
+            .iter()
+            .find(|balancer| &balancer.id == id)
+            .is_some_and(|balancer| {
+                balancer
+                    .spec
+                    .members
+                    .iter()
+                    .any(|member| is_mpp(&member.id))
+            }),
+        EgressAction::Direct => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,7 +687,6 @@ impl ManagementConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceConfig {
-    pub service_mode: bool,
     pub supervise: bool,
     pub restart_backoff: Duration,
     pub restart_max_backoff: Duration,
@@ -514,7 +696,6 @@ pub struct ServiceConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
-            service_mode: false,
             supervise: false,
             restart_backoff: DEFAULT_RESTART_BACKOFF,
             restart_max_backoff: DEFAULT_RESTART_MAX_BACKOFF,
@@ -666,8 +847,8 @@ impl ForwardingMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
-    /// Selects one forwarding family for this runtime generation. Omission in
-    /// TOML and the simple CLI both select L4.
+    /// Selects one forwarding family for this runtime generation. TOML derives
+    /// it from the inbound protocols; the simple CLI constructs L4 directly.
     pub forwarding_mode: ForwardingMode,
     /// One canonical namespace for MPP and native outbound leaves.
     pub outbounds: Vec<OutboundLeafConfig>,
@@ -689,6 +870,83 @@ pub struct NodeConfig {
     pub servers: Vec<MppInboundConfig>,
 }
 
+/// Selector-reachable runtime graph compiled from one fully validated node.
+///
+/// Catalog entries outside these sets remain part of configuration validation,
+/// but runtime and managed-VPN preparation must not instantiate or publish
+/// host state for them.
+#[derive(Debug)]
+pub(crate) struct ActiveNodeGraph {
+    pub(crate) dns_policy: CompiledDnsPolicy,
+    pub(crate) dns_activation: DnsActivation,
+    active_outbounds: HashSet<OutboundId>,
+    active_balancers: HashSet<BalancerId>,
+}
+
+impl ActiveNodeGraph {
+    pub(crate) fn contains_outbound(&self, outbound: &OutboundId) -> bool {
+        self.active_outbounds.contains(outbound)
+    }
+
+    pub(crate) fn contains_balancer(&self, balancer: &BalancerId) -> bool {
+        self.active_balancers.contains(balancer)
+    }
+}
+
+impl NodeConfig {
+    /// Compile the active DNS and egress closure without mutating the complete
+    /// configuration catalog. Callers use this only after `AppConfig::validate`
+    /// has checked every definition, including inactive ones.
+    pub(crate) fn compile_active_graph(&self) -> Result<ActiveNodeGraph, DnsCompileError> {
+        let route_dns_plans = self
+            .product_policy
+            .iter()
+            .flat_map(|policy| &policy.routes)
+            .filter_map(|rule| rule.action.dns_plan());
+        let (dns_policy, dns_activation) = self.dns_policy.compile_active(route_dns_plans)?;
+
+        let mut active_outbounds = HashSet::new();
+        let mut active_balancers = HashSet::new();
+        if let Some(policy) = &self.product_policy {
+            for egress in policy.routes.iter().filter_map(|rule| rule.action.egress()) {
+                match egress {
+                    EgressAction::Outbound(id) => {
+                        active_outbounds.insert(id.clone());
+                    }
+                    EgressAction::Balancer(id) => {
+                        active_balancers.insert(id.clone());
+                    }
+                    EgressAction::Direct => {}
+                }
+            }
+        }
+        for upstream in dns_policy.upstreams_for_activation(&dns_activation) {
+            if let DnsEgressSpec::Outbound(id) = upstream.egress() {
+                active_outbounds.insert(id.clone());
+            }
+        }
+        active_outbounds.extend(
+            self.tun_l3_ingresses
+                .iter()
+                .map(|ingress| ingress.config.outbound.clone()),
+        );
+        for balancer in self
+            .gateway_balancers
+            .iter()
+            .filter(|balancer| active_balancers.contains(&balancer.id))
+        {
+            active_outbounds.extend(balancer.spec.members.iter().map(|member| member.id.clone()));
+        }
+
+        Ok(ActiveNodeGraph {
+            dns_policy,
+            dns_activation,
+            active_outbounds,
+            active_balancers,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayBalancerConfig {
     /// The operator-facing `[[balancers]].name`, compiled once into a typed
@@ -702,16 +960,11 @@ pub struct GatewayBalancerConfig {
 pub struct ProductPolicyConfig {
     pub generation: u64,
     pub routes: Vec<RouteRuleSpec>,
-    pub destination_acl: Vec<AclRuleSpec>,
 }
 
 impl ProductPolicyConfig {
     pub fn compile(&self) -> Result<ProductPolicyGeneration, ProductPolicyCompileError> {
-        ProductPolicyGeneration::compile(
-            self.generation,
-            self.routes.clone(),
-            self.destination_acl.clone(),
-        )
+        ProductPolicyGeneration::compile(self.generation, self.routes.clone())
     }
 }
 
@@ -738,8 +991,8 @@ impl DnsPolicyConfig {
                 outbound_capabilities: Vec::new(),
                 plans: vec![DnsPlanSpec::new(plan.clone(), vec![upstream])],
                 rules: Vec::new(),
-                hosts: Vec::new(),
-                fake_dns: None,
+                override_records: Vec::new(),
+                synthetic_captures: Vec::new(),
                 default_plan: plan,
             },
         }
@@ -748,35 +1001,24 @@ impl DnsPolicyConfig {
     pub fn compile(&self) -> Result<CompiledDnsPolicy, crate::product::DnsCompileError> {
         CompiledDnsPolicy::compile(self.generation, self.spec.clone())
     }
+
+    /// Compile the complete catalog, then freeze the selector-reachable DNS
+    /// closure for this runtime generation. Split-DNS default/rule roots are
+    /// intrinsic; routing contributes only its explicit policy selectors.
+    pub fn compile_active<'a>(
+        &self,
+        route_plans: impl IntoIterator<Item = &'a crate::product::DnsPlanId>,
+    ) -> Result<(CompiledDnsPolicy, crate::product::DnsActivation), crate::product::DnsCompileError>
+    {
+        let compiled = self.compile()?;
+        let activation = compiled.activate(route_plans)?;
+        Ok((compiled, activation))
+    }
 }
 
 impl Default for DnsPolicyConfig {
     fn default() -> Self {
         Self::system_default()
-    }
-}
-
-/// Immutable destination-authorization generation for flows accepted by one
-/// MPP server inbound. An empty rule list retains Product's safe restricted-IP
-/// default; only an explicit `AllowRestricted` rule can opt a scoped target in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerDestinationAclConfig {
-    pub generation: u64,
-    pub rules: Vec<AclRuleSpec>,
-}
-
-impl Default for ServerDestinationAclConfig {
-    fn default() -> Self {
-        Self {
-            generation: 1,
-            rules: Vec::new(),
-        }
-    }
-}
-
-impl ServerDestinationAclConfig {
-    pub fn compile(&self) -> Result<DestinationAcl, AclError> {
-        DestinationAcl::compile(self.generation, self.rules.clone())
     }
 }
 
@@ -808,6 +1050,9 @@ pub struct MppOutboundConfig {
     pub paths: Vec<ClientPathConfig>,
     pub path_probe_interval: Duration,
     pub path_probe_timeout: Duration,
+    /// Permits this MPP peer to request a sanitized local path snapshot.
+    /// The management-global override may also enable it process-wide.
+    pub allow_peer_diagnostics: bool,
     /// MPP sender behavior for this outbound path group.
     pub performance: MppPerformanceConfig,
 }
@@ -884,23 +1129,54 @@ pub struct MppInboundConfig {
     /// Required canonical operator-assigned name used by Product policy and
     /// management. It never enters the MPP wire protocol.
     pub name: String,
-    /// Egress outbound or egress balancer selected for accepted MPP flows.
-    pub egress: EgressRef,
-    /// Optional DNS policy for target resolution before native egress.
-    pub dns_plan: Option<crate::product::DnsPlanId>,
     /// Named carrier listen/bind paths owned by this MPP inbound.
     pub paths: Vec<NamedPathConfig>,
     /// Security scoped to peers that join this MPP inbound.
     pub security: ServerSecurityConfig,
     /// QUIC identity and TLS-fallback TCP identity shared by this MPP inbound.
     pub tls: TcpServerTlsConfig,
-    /// Immutable Product destination authorization for accepted TCP/UDP flows.
-    pub destination_acl: ServerDestinationAclConfig,
     /// MPP sender behavior for streams accepted by this inbound path group.
     pub performance: MppPerformanceConfig,
+    /// Principals allowed to request a sanitized path snapshot from this
+    /// inbound. Process-wide management policy can still override this gate.
+    pub peer_diagnostics_principals: PeerDiagnosticsPrincipalPolicy,
     /// Optional first-class layer-3 packet service for authenticated peers.
     /// Host routing, DNS, firewall, and NAT remain external policy.
     pub tun_l3: Option<crate::product::TunL3AddressPlan>,
+}
+
+/// Endpoint-local authorization for incoming MPP peer diagnostics.
+///
+/// `All` deliberately remains open to principals admitted by later authority
+/// publications. A concrete list is frozen with the configuration generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PeerDiagnosticsPrincipalPolicy {
+    All,
+    #[default]
+    Deny,
+    Selected(Vec<PrincipalId>),
+}
+
+impl PeerDiagnosticsPrincipalPolicy {
+    pub fn selected(principals: Vec<PrincipalId>) -> Self {
+        if principals.is_empty() {
+            Self::Deny
+        } else {
+            Self::Selected(principals)
+        }
+    }
+
+    pub const fn has_authorized_principals(&self) -> bool {
+        !matches!(self, Self::Deny)
+    }
+
+    pub fn allows(&self, principal: &PrincipalId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Deny => false,
+            Self::Selected(principals) => principals.contains(principal),
+        }
+    }
 }
 
 fn validate_mpp_outbound(
@@ -1055,6 +1331,9 @@ fn validate_forwarding_mode(node: &NodeConfig) -> Result<(), ConfigError> {
             }
         }
         ForwardingMode::L3 => {
+            if node.product_policy.is_some() {
+                return Err(ConfigError::L3ContainsRouting);
+            }
             if let Some(inbound) = node.local_ingresses.first() {
                 return Err(ConfigError::L3ContainsL4Inbound(inbound.name.clone()));
             }
@@ -1119,10 +1398,6 @@ fn validate_mpp_inbound(
         return Err(ConfigError::ServerPathPortRange);
     }
     validate_server_security_config(&server.security)?;
-    server
-        .destination_acl
-        .compile()
-        .map_err(|error| ConfigError::ServerDestinationAcl(error.to_string()))?;
     Ok(())
 }
 
@@ -1285,6 +1560,7 @@ pub enum ConfigError {
     ManagedVpn(String),
     MultipleManagedTunInbounds { actual: usize },
     L4ContainsTunL3,
+    L3ContainsRouting,
     L3ContainsL4Inbound(String),
     L3ServerMissingTunL3(String),
     L3ServiceRequired,
@@ -1299,7 +1575,6 @@ pub enum ConfigError {
     DuplicateInboundName(String),
     LocalIngressRoutingRequired,
     ProductPolicy(String),
-    ServerDestinationAcl(String),
     ManagementListenPortZero,
     ManagementTokenEmpty,
     ManagementTokenInvalid,
@@ -1554,6 +1829,9 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "forwarding mode l4 cannot contain a TUN-L3 client or server service"
             ),
+            Self::L3ContainsRouting => {
+                write!(f, "forwarding mode l3 cannot contain an L4 routing policy")
+            }
             Self::L3ContainsL4Inbound(name) => {
                 write!(f, "forwarding mode l3 cannot contain L4 inbound {name:?}")
             }
@@ -1598,9 +1876,6 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "local inbounds require a compiled routing policy")
             }
             Self::ProductPolicy(error) => write!(f, "{error}"),
-            Self::ServerDestinationAcl(error) => {
-                write!(f, "invalid server destination ACL policy: {error}")
-            }
             Self::ManagementListenPortZero => {
                 write!(f, "management API listen port must be nonzero")
             }

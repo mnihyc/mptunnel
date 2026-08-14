@@ -186,12 +186,12 @@ where
         )
         .await;
     }
-    let target = match router.recover_tun_target(remote) {
+    let recovered = match router.recover_tun_target(remote) {
         Ok(target) => target,
         Err(RuntimeError::DestinationDenied(_)) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let route = match router.route_tcp(&target, local, principal, inbound) {
+    let route = match router.route_tun_tcp(&recovered, local, principal, inbound) {
         Ok(route) => route,
         Err(RuntimeError::DestinationDenied(_)) => return Ok(()),
         Err(err) => return Err(err),
@@ -204,7 +204,7 @@ where
             return Ok(());
         }
     };
-    let opened = match plan.open_tcp(&target).await {
+    let opened = match plan.open_tcp(recovered.target()).await {
         Ok(opened) => opened,
         Err(RuntimeError::RouteRejected) => return Ok(()),
         Err(RuntimeError::RouteDropped) => {
@@ -638,9 +638,12 @@ fn route_tun_udp_flow(
     principal: PrincipalId,
     inbound: InboundId,
 ) -> Result<Option<TunUdpFlowBinding>, RuntimeError> {
-    let target = router.recover_tun_target(tun_udp_target_for_remote(key.remote, tun))?;
-    match router.route_udp(&target, key.local, principal, inbound) {
-        Ok(ClientRoute::Open(plan)) => Ok(Some(TunUdpFlowBinding { target, plan })),
+    let recovered = router.recover_tun_target(tun_udp_target_for_remote(key.remote, tun))?;
+    match router.route_tun_udp(&recovered, key.local, principal, inbound) {
+        Ok(ClientRoute::Open(plan)) => Ok(Some(TunUdpFlowBinding {
+            target: recovered.target().clone(),
+            plan,
+        })),
         Ok(ClientRoute::Deny(_)) | Err(RuntimeError::DestinationDenied(_)) => Ok(None),
         Err(err) => Err(err),
     }

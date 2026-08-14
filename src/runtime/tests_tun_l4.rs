@@ -4,9 +4,10 @@ use crate::ingress::tun::{ManagedVpnConfig, ManagedVpnPlatformConfig, TunHostCon
 use crate::performance::MppPerformanceConfig;
 use crate::platform::{LinuxPolicyConfig, RouteMode};
 use crate::product::{
-    CompiledDnsPolicy, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId,
-    DnsUpstreamSpec, EgressAction, FakeDnsSpec, InitialDemand, Network, OutboundId, PortRange,
-    RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
+    CompiledDnsPolicy, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsSyntheticCaptureId,
+    DnsSyntheticCaptureSpec, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, EgressAction,
+    InitialDemand, Network, OutboundId, PortRange, RouteAction, RouteMatchSpec, RouteRuleSpec,
+    RuleId,
 };
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
@@ -35,13 +36,12 @@ fn test_router_with_dns(dns: crate::dns::DnsGeneration) -> ClientIngressRouter {
         routes: vec![RouteRuleSpec::new(
             RuleId::parse("default").expect("rule"),
             RouteMatchSpec::default(),
-            RouteAction::new(
+            RouteAction::allow(
                 EgressAction::Outbound(id.clone()),
                 None,
                 InitialDemand::Automatic,
             ),
         )],
-        destination_acl: Vec::new(),
     };
     let registry = RuntimeOutboundRegistry::compile(
         [RuntimeOutboundLeaf::Mpp {
@@ -142,9 +142,12 @@ async fn managed_dns_tcp_capture_serves_bounded_framed_queries_locally() {
 }
 
 #[tokio::test]
-async fn tun_flow_recovers_fake_dns_domain_before_product_routing() {
+async fn tun_flow_recovers_synthetic_capture_domain_before_product_routing() {
     let upstream = DnsUpstreamId::parse("system").expect("upstream");
     let plan = DnsPlanId::parse("default").expect("plan");
+    let capture = DnsSyntheticCaptureId::parse("vpn-capture").expect("capture");
+    let mut plan_spec = DnsPlanSpec::new(plan.clone(), vec![upstream.clone()]);
+    plan_spec.synthetic_capture = Some(capture.clone());
     let policy = Arc::new(
         CompiledDnsPolicy::compile(
             9,
@@ -154,50 +157,68 @@ async fn tun_flow_recovers_fake_dns_domain_before_product_routing() {
                     DnsUpstreamEndpoint::System,
                 )],
                 outbound_capabilities: Vec::new(),
-                plans: vec![DnsPlanSpec::new(plan.clone(), vec![upstream])],
+                plans: vec![plan_spec],
                 rules: Vec::new(),
-                hosts: Vec::new(),
-                fake_dns: Some(FakeDnsSpec {
+                override_records: Vec::new(),
+                synthetic_captures: vec![DnsSyntheticCaptureSpec {
+                    id: capture,
                     ipv4_pool: Some("198.18.0.0/24".parse().expect("pool")),
                     ipv6_pool: None,
                     max_entries: 32,
                     answer_ttl: Duration::from_secs(30),
                     recovery_ttl: Duration::from_secs(60),
-                }),
+                }],
                 default_plan: plan,
             },
         )
-        .expect("FakeDNS policy"),
+        .expect("synthetic capture policy"),
     );
-    let dns = crate::dns::DnsGeneration::compile(policy).expect("FakeDNS generation");
+    let dns = crate::dns::DnsGeneration::compile(policy).expect("synthetic capture generation");
     let capture = dns
         .answer_wire_query(
-            &dns_wire_query(0x5151, "video.example.", RecordType::A),
+            &dns_wire_query(0x5151, "localhost.", RecordType::A),
             Duration::from_secs(30),
             1_232,
         )
         .await
-        .expect("FakeDNS answer");
-    let capture = Message::from_vec(&capture).expect("decoded FakeDNS answer");
-    let fake = match &capture.answers[0].data {
+        .expect("synthetic capture answer");
+    let capture = Message::from_vec(&capture).expect("decoded synthetic capture answer");
+    let synthetic = match &capture.answers[0].data {
         RData::A(address) => IpAddr::V4(address.0),
-        other => panic!("unexpected FakeDNS record {other:?}"),
+        other => panic!("unexpected synthetic capture record {other:?}"),
     };
     let router = test_router_with_dns(dns);
+    let recovered = router
+        .recover_tun_target(SocketAddr::new(synthetic, 443))
+        .expect("recovered target");
     assert_eq!(
-        router
-            .recover_tun_target(SocketAddr::new(fake, 443))
-            .expect("recovered target"),
-        TargetAddr::Domain {
-            host: "video.example".to_string(),
+        recovered.target(),
+        &TargetAddr::Domain {
+            host: "localhost".to_string(),
             port: 443,
         }
     );
+    let ClientRoute::Open(open) = router
+        .route_tun_tcp(
+            &recovered,
+            "10.0.0.2:43000".parse().expect("source"),
+            PrincipalId::parse("anonymous").expect("principal"),
+            InboundId::parse("tun-main").expect("inbound"),
+        )
+        .expect("recovered route")
+    else {
+        panic!("expected provisional recovered route");
+    };
+    assert!(matches!(
+        open.open_tcp(recovered.target()).await,
+        Err(RuntimeError::DestinationDenied(_))
+    ));
     assert_eq!(
         router
             .recover_tun_target("192.0.2.20:443".parse().expect("ordinary target"))
-            .expect("ordinary target"),
-        TargetAddr::Ip("192.0.2.20:443".parse().expect("ordinary target"))
+            .expect("ordinary target")
+            .target(),
+        &TargetAddr::Ip("192.0.2.20:443".parse().expect("ordinary target"))
     );
 }
 
@@ -219,7 +240,7 @@ fn tun_udp_flow_routes_once_with_local_identity_and_effective_target() {
                     principals: vec![principal.clone()],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Outbound(OutboundId::parse("dns-edge").expect("outbound")),
                     None,
                     InitialDemand::Automatic,
@@ -228,10 +249,9 @@ fn tun_udp_flow_routes_once_with_local_identity_and_effective_target() {
             RouteRuleSpec::new(
                 RuleId::parse("default").expect("rule"),
                 RouteMatchSpec::default(),
-                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
+                RouteAction::reject(),
             ),
         ],
-        destination_acl: Vec::new(),
     };
     let registry = RuntimeOutboundRegistry::compile(
         [RuntimeOutboundLeaf::Mpp {

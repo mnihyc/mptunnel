@@ -36,13 +36,14 @@ pub(in crate::runtime) use model::{
 pub(in crate::runtime) use ports::{
     AcceptedServerDatagramFlow, CarrierDeliveryRateSample, OpenedReliableCarrierStream,
     ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerCarrierPathRetirement,
-    ServerCarrierPathStatusSnapshot, ServerDatagramOpenError, ServerDatagramOpenRequest,
-    ServerDatagramPort, ServerDatagramPortBackend, ServerDatagramRequest,
-    ServerDatagramSendOutcome, ServerDatagramWorkerMessage, ServerLocalPathProperties,
+    ServerCarrierPathStatusSnapshot, ServerDatagramOpenError, ServerDatagramOpenFailure,
+    ServerDatagramOpenRequest, ServerDatagramPort, ServerDatagramPortBackend,
+    ServerDatagramRequest, ServerDatagramSendOutcome, ServerDatagramTombstone,
+    ServerDatagramTombstoneCache, ServerDatagramWorkerMessage, ServerLocalPathProperties,
     ServerNewStreamPolicy, ServerPathValidation, ServerRealtimeFlowLease,
     ServerSessionManagementSnapshot, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
     ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort,
-    ServerStreamPortBackend,
+    ServerStreamPortBackend, ServerTargetAdmission,
 };
 #[cfg(test)]
 pub(super) use proof::*;

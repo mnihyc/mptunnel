@@ -5,12 +5,11 @@ use super::{
     DEFAULT_MAX_PENDING_AUTHENTICATIONS, DEFAULT_MPP_TLS_SERVER_NAME,
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_PROBE_INTERVAL_MS,
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, ForwardingMode,
-    GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
-    ManagementConfig, MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NamedPathConfig,
-    NamedTunL3Config, NodeConfig, OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig,
-    ResourceLimits, SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig,
-    ServiceConfig, SessionConfig, SharedSecret,
+    DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, ForwardingMode, GatewayBalancerConfig,
+    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
+    MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NamedTunL3Config, NodeConfig,
+    OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits,
+    SecurityPolicyError, ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -20,8 +19,8 @@ use crate::ingress::{
     DEFAULT_TCP_FORWARD_MAX_CONNECTIONS, DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS,
     DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS, DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS, IngressConfig,
     LocalIngressAdmissionConfig, LocalIngressAdmissionConfigError, LocalProxyUser,
-    MAX_LOCAL_PROXY_USERS, MixedForwardConfig, PortForwardTarget, ProxyAuthConfig,
-    ProxyAuthConfigError, TcpForwardConfig, TunL3IngressConfig, UdpForwardConfig,
+    MixedForwardConfig, PortForwardTarget, ProxyAuthConfig, ProxyAuthConfigError, TcpForwardConfig,
+    TunL3IngressConfig, UdpForwardConfig,
 };
 use crate::outbound::{
     HttpsProxyConfig, OutboundConfig, OutboundError, ProxyConfig, ProxyCredentials,
@@ -32,17 +31,17 @@ use crate::platform::{
     RouteMode,
 };
 use crate::product::{
-    AclEffect, AclRuleSpec, BalancerId, CompiledRuleSetRegistry, CredentialCatalog, CredentialId,
-    CredentialRecord, DnsEgressSpec, DnsHostSpec, DnsIpStrategy, DnsOutboundCapabilitySpec,
-    DnsPlanLimits, DnsPlanSpec, DnsPolicySpec, DnsRuleId, DnsRuleMatch, DnsRuleSpec,
-    DnsSecurityPolicy, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, DnsUpstreamStrategy,
-    DomainName, EgressAction, FakeDnsSpec, GatewayBalancer, GatewayBalancerSpec,
-    GatewayHealthPolicy, GatewayMemberMode, GatewayMemberSpec, GatewayProbePolicy,
-    GatewayStickinessKey, GatewayStickinessPolicy, GatewayStrategy, InboundId, InitialDemand,
-    MAX_RULE_SET_ENVELOPE_BYTES, Network, OutboundId, PortRange, PrincipalId, ProtocolTarget,
-    RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage, RuleId, RuleSetId, RuleSetPublisher,
-    RuleSetPublisherCatalog, RuleSetPublisherId, TunL3AddressPlan, TunL3AllocationSpec,
-    TunL3ServerSpec, VerifiedRuleSet,
+    BalancerId, CompiledRuleSetRegistry, CredentialCatalog, CredentialId, CredentialRecord,
+    DnsEgressSpec, DnsIpStrategy, DnsOutboundCapabilitySpec, DnsOverrideRecordId,
+    DnsOverrideRecordSpec, DnsPlanLimits, DnsPlanSpec, DnsPolicySpec, DnsRuleId, DnsRuleMatch,
+    DnsRuleSpec, DnsSecurityPolicy, DnsSyntheticCaptureId, DnsSyntheticCaptureSpec,
+    DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, DnsUpstreamStrategy, DomainName,
+    EgressAction, GatewayBalancer, GatewayBalancerSpec, GatewayHealthPolicy, GatewayMemberMode,
+    GatewayMemberSpec, GatewayProbePolicy, GatewayStickinessKey, GatewayStickinessPolicy,
+    GatewayStrategy, InboundId, InitialDemand, MAX_RULE_SET_ENVELOPE_BYTES, Network, OutboundId,
+    PortRange, PrincipalId, ProtocolTarget, RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage,
+    RuleId, RuleSetId, RuleSetPublisher, RuleSetPublisherCatalog, RuleSetPublisherId,
+    TunL3AddressPlan, TunL3AllocationSpec, TunL3ServerSpec, VerifiedRuleSet,
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{EndpointParseError, PathSpecParseError};
@@ -53,9 +52,22 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
+
+// Runtime generations are internal identities rather than operator policy.
+// One non-zero identity is shared by every component compiled from a document.
+static NEXT_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_config_generation() -> Result<u64, ConfigFileError> {
+    NEXT_CONFIG_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+            generation.checked_add(1)
+        })
+        .map_err(|_| ConfigFileError::GenerationExhausted)
+}
 
 pub fn load_config_toml(path: impl AsRef<Path>) -> Result<AppConfig, ConfigFileError> {
     let path = path.as_ref();
@@ -144,8 +156,6 @@ fn toml_unknown_field(message: &str) -> Option<String> {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
-    forwarding_mode: ForwardingModeFileValue,
-    #[serde(default)]
     logging: LoggingFileConfig,
     #[serde(default)]
     check_config: bool,
@@ -169,8 +179,7 @@ struct FileConfig {
     inbounds: Vec<InboundFileConfig>,
     #[serde(default)]
     outbounds: Vec<OutboundFileConfig>,
-    #[serde(default)]
-    routing: RoutingFileConfig,
+    routing: Option<RoutingFileConfig>,
 }
 
 impl FileConfig {
@@ -178,30 +187,42 @@ impl FileConfig {
         if self.inbounds.is_empty() {
             return Err(ConfigFileError::NoRuntimeServices);
         }
+        let forwarding_mode = infer_forwarding_mode(&self.inbounds)?;
+        let generation = next_config_generation()?;
+        self.admission.validate_for_mode(forwarding_mode)?;
         let credential_catalog = parse_credential_catalog(self.credentials, material_base)?;
         let local_user_catalog = LocalUserCatalog::compile(self.local_users, material_base)?;
         let mut parsed_outbounds =
             parse_outbounds(self.outbounds, material_base, &credential_catalog)?;
-        let dns_policy = self.dns.into_config(&parsed_outbounds)?;
-        let RoutingFileConfig {
-            generation,
-            balancers,
-            rule_set_publishers,
-            rule_sets,
-            rules,
-            destination_acl,
-        } = self.routing;
-        let rule_sets = compile_rule_set_registry(rule_set_publishers, rule_sets, material_base)?;
-        apply_routing(generation, balancers, &mut parsed_outbounds)?;
-        let local_inbound_names = configured_local_inbound_names(&self.inbounds)?;
-        let product_policy = compile_product_policy(
-            generation,
-            rules,
-            destination_acl,
-            &rule_sets,
-            &local_inbound_names,
-            &parsed_outbounds,
-        )?;
+        let dns_policy = self.dns.into_config(generation, &parsed_outbounds)?;
+        let product_policy = match (forwarding_mode, self.routing) {
+            (ForwardingMode::L4, Some(routing)) => {
+                let RoutingFileConfig {
+                    balancers,
+                    rule_set_publishers,
+                    rule_sets,
+                    rules,
+                } = routing;
+                let rule_sets =
+                    compile_rule_set_registry(rule_set_publishers, rule_sets, material_base)?;
+                apply_routing(generation, balancers, &mut parsed_outbounds)?;
+                let local_inbound_names = configured_routed_inbound_names(&self.inbounds)?;
+                compile_product_policy(
+                    generation,
+                    rules,
+                    &rule_sets,
+                    &local_inbound_names,
+                    &parsed_outbounds,
+                )?
+            }
+            (ForwardingMode::L4, None) => {
+                return Err(ConfigFileError::L4RoutingSectionRequired);
+            }
+            (ForwardingMode::L3, Some(_)) => {
+                return Err(ConfigFileError::L3RoutingSectionForbidden);
+            }
+            (ForwardingMode::L3, None) => None,
+        };
         let (outbounds, gateway_balancers, local_ingresses, tun_l3_ingresses, servers) =
             build_node_services(
                 self.inbounds,
@@ -216,10 +237,10 @@ impl FileConfig {
             service: self.service.into_config(),
             session: self.session.into_config(),
             resources: self.resources.into_limits(),
-            admission: self.admission.into_config(),
+            admission: self.admission.into_config(forwarding_mode),
             management: self.management.into_config(material_base)?,
             command: CommandConfig::Node(NodeConfig {
-                forwarding_mode: self.forwarding_mode.into(),
+                forwarding_mode,
                 outbounds,
                 gateway_balancers,
                 local_ingresses,
@@ -231,23 +252,6 @@ impl FileConfig {
         };
         config.validate()?;
         Ok(config)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ForwardingModeFileValue {
-    #[default]
-    L4,
-    L3,
-}
-
-impl From<ForwardingModeFileValue> for ForwardingMode {
-    fn from(value: ForwardingModeFileValue) -> Self {
-        match value {
-            ForwardingModeFileValue::L4 => Self::L4,
-            ForwardingModeFileValue::L3 => Self::L3,
-        }
     }
 }
 
@@ -281,14 +285,7 @@ impl LocalUserCatalog {
         values: Vec<LocalUserFileConfig>,
         material_base: &Path,
     ) -> Result<Self, ConfigFileError> {
-        if values.len() > MAX_LOCAL_PROXY_USERS {
-            return Err(ConfigFileError::LocalUser(format!(
-                "local user catalog defines {} users; maximum is {MAX_LOCAL_PROXY_USERS}",
-                values.len()
-            )));
-        }
         let mut users = HashMap::with_capacity(values.len());
-        let mut all = Vec::with_capacity(values.len());
         for value in values {
             let name = canonical_config_name(&value.name)?;
             let principal = PrincipalId::parse(&value.principal_id)
@@ -306,10 +303,6 @@ impl LocalUserCatalog {
                     "duplicate local user name {name:?}"
                 )));
             }
-            all.push(user);
-        }
-        if !all.is_empty() {
-            ProxyAuthConfig::required(all).map_err(ConfigFileError::ProxyAuth)?;
         }
         Ok(Self { users })
     }
@@ -434,8 +427,6 @@ impl LoggingFileConfig {
 #[serde(deny_unknown_fields)]
 struct ServiceFileConfig {
     #[serde(default)]
-    service_mode: bool,
-    #[serde(default)]
     supervise: bool,
     restart_backoff_ms: Option<u64>,
     restart_max_backoff_ms: Option<u64>,
@@ -445,7 +436,6 @@ struct ServiceFileConfig {
 impl ServiceFileConfig {
     fn into_config(self) -> ServiceConfig {
         ServiceConfig {
-            service_mode: self.service_mode,
             supervise: self.supervise,
             restart_backoff: Duration::from_millis(
                 self.restart_backoff_ms
@@ -529,8 +519,61 @@ struct ProductAdmissionFileConfig {
 }
 
 impl ProductAdmissionFileConfig {
-    fn into_config(self) -> ProductAdmissionConfig {
+    fn validate_for_mode(&self, forwarding_mode: ForwardingMode) -> Result<(), ConfigFileError> {
+        if forwarding_mode != ForwardingMode::L3 {
+            return Ok(());
+        }
+        let l4_field = [
+            ("max_live_flows", self.max_live_flows.is_some()),
+            ("max_concurrent_work", self.max_concurrent_work.is_some()),
+            (
+                "max_live_flows_per_principal",
+                self.max_live_flows_per_principal.is_some(),
+            ),
+            (
+                "max_live_flows_per_outbound",
+                self.max_live_flows_per_outbound.is_some(),
+            ),
+            (
+                "max_connects_per_outbound",
+                self.max_connects_per_outbound.is_some(),
+            ),
+            (
+                "max_live_flows_per_target",
+                self.max_live_flows_per_target.is_some(),
+            ),
+            (
+                "max_connects_per_target",
+                self.max_connects_per_target.is_some(),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(field, configured)| configured.then_some(field));
+        if let Some(field) = l4_field {
+            return Err(ConfigFileError::L3AdmissionField(field));
+        }
+        Ok(())
+    }
+
+    fn into_config(self, forwarding_mode: ForwardingMode) -> ProductAdmissionConfig {
         let defaults = ProductAdmissionConfig::default();
+        if forwarding_mode == ForwardingMode::L3 {
+            let max_dns_work = self.max_dns_work.unwrap_or(defaults.max_dns_work);
+            // ProductAdmission retains one shared accounting implementation.
+            // Keep its unused L4 dimensions minimally valid and make the
+            // shared concurrent-work ceiling identical to the only L3 knob,
+            // so no hidden L4 default can further restrict DNS work.
+            return ProductAdmissionConfig {
+                max_live_flows: 1,
+                max_concurrent_work: max_dns_work,
+                max_live_flows_per_principal: 1,
+                max_live_flows_per_outbound: 1,
+                max_connects_per_outbound: 1,
+                max_live_flows_per_target: 1,
+                max_connects_per_target: 1,
+                max_dns_work,
+            };
+        }
         ProductAdmissionConfig {
             max_live_flows: self.max_live_flows.unwrap_or(defaults.max_live_flows),
             max_concurrent_work: self
@@ -708,6 +751,12 @@ impl SecurityFileConfig {
         &self,
         catalog: &CredentialCatalog,
     ) -> Result<ClientSecurityConfig, ConfigFileError> {
+        if self.authentication_timeout_ms.is_some() || self.max_pending_authentications.is_some() {
+            return Err(ConfigFileError::Credential(
+                "MPP outbound security cannot set inbound-only authentication_timeout_ms or max_pending_authentications"
+                    .to_string(),
+            ));
+        }
         if !self.credential_ids.is_empty() {
             return Err(ConfigFileError::Credential(
                 "MPP outbound security accepts exactly one credential_id".to_string(),
@@ -1090,14 +1139,120 @@ enum InboundFileConfig {
         #[serde(default)]
         performance: MppPerformanceFileConfig,
         #[serde(default)]
-        destination_acl: ServerDestinationAclFileConfig,
+        paths: Vec<MppPathFileConfig>,
+        #[serde(default)]
+        peer_diagnostics_principal_ids: PeerDiagnosticsPrincipalSelectorFileValue,
+    },
+    MppL3 {
+        name: String,
+        security: Box<SecurityFileConfig>,
         #[serde(default)]
         paths: Vec<MppPathFileConfig>,
-        outbound: Option<String>,
-        balancer: Option<String>,
-        dns_policy: Option<String>,
-        tun_l3: Option<TunL3ServerFileConfig>,
+        #[serde(default)]
+        peer_diagnostics_principal_ids: PeerDiagnosticsPrincipalSelectorFileValue,
+        tun_l3: TunL3ServerFileConfig,
     },
+}
+
+fn infer_forwarding_mode(
+    inbounds: &[InboundFileConfig],
+) -> Result<ForwardingMode, ConfigFileError> {
+    let has_l3 = inbounds.iter().any(|inbound| {
+        matches!(
+            inbound,
+            InboundFileConfig::TunL3 { .. } | InboundFileConfig::MppL3 { .. }
+        )
+    });
+    let has_l4 = inbounds.iter().any(|inbound| {
+        !matches!(
+            inbound,
+            InboundFileConfig::TunL3 { .. } | InboundFileConfig::MppL3 { .. }
+        )
+    });
+    match (has_l4, has_l3) {
+        (true, false) => Ok(ForwardingMode::L4),
+        (false, true) => Ok(ForwardingMode::L3),
+        (true, true) => Err(ConfigFileError::MixedForwardingFamilies),
+        (false, false) => Err(ConfigFileError::NoRuntimeServices),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PeerDiagnosticsPrincipalSelectorFileValue {
+    Scalar(String),
+    Concrete(Vec<String>),
+}
+
+impl Default for PeerDiagnosticsPrincipalSelectorFileValue {
+    fn default() -> Self {
+        Self::Concrete(Vec::new())
+    }
+}
+
+impl PeerDiagnosticsPrincipalSelectorFileValue {
+    fn into_policy(
+        self,
+        inbound: &str,
+        authority: &crate::product::CredentialAuthority,
+    ) -> Result<crate::config::PeerDiagnosticsPrincipalPolicy, ConfigFileError> {
+        let values = match self {
+            Self::Scalar(value) if value == "*" => {
+                return Ok(crate::config::PeerDiagnosticsPrincipalPolicy::All);
+            }
+            Self::Scalar(value) => {
+                return Err(ConfigFileError::PeerDiagnostics(format!(
+                    "MPP inbound {inbound:?} peer_diagnostics_principal_ids scalar must be exactly \"*\", got {value:?}"
+                )));
+            }
+            Self::Concrete(values) if values.iter().any(|value| value == "*") => {
+                return Err(ConfigFileError::PeerDiagnostics(format!(
+                    "MPP inbound {inbound:?} peer diagnostics wildcard must be the scalar \"*\" and cannot be mixed with concrete principals"
+                )));
+            }
+            Self::Concrete(values) => values,
+        };
+
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| {
+                ConfigFileError::PeerDiagnostics(
+                    "system clock is before the Unix epoch".to_string(),
+                )
+            })?
+            .as_secs();
+        let active_principals = authority
+            .credentials()
+            .into_iter()
+            .filter(|credential| {
+                !credential.revoked()
+                    && credential
+                        .expires_at_unix_secs()
+                        .is_none_or(|expiry| now_unix_secs < expiry)
+            })
+            .map(|credential| credential.principal().clone())
+            .collect::<HashSet<_>>();
+        let mut selected = Vec::with_capacity(values.len());
+        let mut unique = HashSet::with_capacity(values.len());
+        for value in values {
+            let principal = PrincipalId::parse(&value)
+                .map_err(|error| ConfigFileError::PeerDiagnostics(error.to_string()))?;
+            if !unique.insert(principal.clone()) {
+                return Err(ConfigFileError::PeerDiagnostics(format!(
+                    "MPP inbound {inbound:?} repeats peer diagnostics principal {principal}"
+                )));
+            }
+            if !active_principals.contains(&principal) {
+                return Err(ConfigFileError::PeerDiagnostics(format!(
+                    "MPP inbound {inbound:?} peer diagnostics principal {principal} has no active, unrevoked, unexpired accepted credential"
+                )));
+            }
+            selected.push(principal);
+        }
+        Ok(crate::config::PeerDiagnosticsPrincipalPolicy::selected(
+            selected,
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1128,6 +1283,23 @@ impl TunL3ServerFileConfig {
         self,
         authority: &crate::product::CredentialAuthority,
     ) -> Result<TunL3AddressPlan, ConfigFileError> {
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| {
+                ConfigFileError::TunL3("system clock is before the Unix epoch".to_string())
+            })?
+            .as_secs();
+        let active_principals = authority
+            .credentials()
+            .into_iter()
+            .filter(|credential| {
+                !credential.revoked()
+                    && credential
+                        .expires_at_unix_secs()
+                        .is_none_or(|expiry| now_unix_secs < expiry)
+            })
+            .map(|credential| credential.principal().clone())
+            .collect::<HashSet<_>>();
         let ipv4_pool = self
             .ipv4_pool
             .map(|value| {
@@ -1150,6 +1322,11 @@ impl TunL3ServerFileConfig {
             .map(|allocation| {
                 let principal_id = PrincipalId::parse(&allocation.principal_id)
                     .map_err(|error| ConfigFileError::TunL3(error.to_string()))?;
+                if !active_principals.contains(&principal_id) {
+                    return Err(ConfigFileError::TunL3(format!(
+                        "TUN-L3 allocation principal {principal_id} has no active, unrevoked, unexpired accepted credential"
+                    )));
+                }
                 let allowed_ips = allocation
                     .allowed_ips
                     .into_iter()
@@ -1435,7 +1612,8 @@ enum OutboundFileConfig {
         name: String,
         security: SecurityFileConfig,
         #[serde(default)]
-        performance: MppPerformanceFileConfig,
+        allow_peer_diagnostics: bool,
+        performance: Option<MppPerformanceFileConfig>,
         #[serde(default)]
         paths: Vec<MppPathFileConfig>,
         path_probe_interval_ms: Option<u64>,
@@ -1473,8 +1651,6 @@ enum OutboundFileConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoutingFileConfig {
-    #[serde(default = "default_product_policy_generation")]
-    generation: u64,
     #[serde(default)]
     balancers: Vec<RoutingBalancerFileConfig>,
     #[serde(default)]
@@ -1483,8 +1659,6 @@ struct RoutingFileConfig {
     rule_sets: Vec<RoutingRuleSetFileConfig>,
     #[serde(default)]
     rules: Vec<RoutingRuleFileConfig>,
-    #[serde(default)]
-    destination_acl: RoutingDestinationAclFileConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1622,10 +1796,6 @@ enum RoutingStrategyFileValue {
     LeastLoad,
 }
 
-const fn default_product_policy_generation() -> u64 {
-    1
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoutingRuleFileConfig {
@@ -1653,17 +1823,16 @@ struct RoutingRuleFileConfig {
     #[serde(default)]
     networks: Vec<RoutingNetworkFileValue>,
     #[serde(default)]
-    inbounds: Vec<String>,
+    inbounds: RoutingIdentitySelectorFileValue,
     #[serde(default)]
-    principal_ids: Vec<String>,
+    principal_ids: RoutingIdentitySelectorFileValue,
     #[serde(default)]
     stages: Vec<RoutingStageFileValue>,
-    action: RoutingActionFileValue,
+    decision: Option<RoutingDecisionFileValue>,
     outbound: Option<String>,
     balancer: Option<String>,
     dns_policy: Option<String>,
-    #[serde(default)]
-    initial_demand: RoutingInitialDemandFileValue,
+    initial_demand: Option<RoutingInitialDemandFileValue>,
     explanation: Option<String>,
 }
 
@@ -1672,6 +1841,36 @@ struct RoutingRuleFileConfig {
 enum RoutingPortFileValue {
     Single(u16),
     Range(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RoutingIdentitySelectorFileValue {
+    Scalar(String),
+    Concrete(Vec<String>),
+}
+
+impl Default for RoutingIdentitySelectorFileValue {
+    fn default() -> Self {
+        Self::Concrete(Vec::new())
+    }
+}
+
+impl RoutingIdentitySelectorFileValue {
+    fn into_concrete(self, field: &'static str) -> Result<Vec<String>, ConfigFileError> {
+        match self {
+            Self::Scalar(value) if value == "*" => Ok(Vec::new()),
+            Self::Scalar(value) => Err(ConfigFileError::RoutingValue(format!(
+                "routing {field} scalar must be exactly \"*\", got {value:?}"
+            ))),
+            Self::Concrete(values) if values.iter().any(|value| value == "*") => {
+                Err(ConfigFileError::RoutingValue(format!(
+                    "routing {field} wildcard must be the scalar \"*\" and cannot be mixed with concrete values"
+                )))
+            }
+            Self::Concrete(values) => Ok(values),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1688,130 +1887,11 @@ enum RoutingStageFileValue {
     PostResolution,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RoutingDestinationAclFileConfig {
-    #[serde(default)]
-    rules: Vec<ServerDestinationAclRuleFileConfig>,
-}
-
-impl RoutingDestinationAclFileConfig {
-    fn into_rules(self) -> Result<Vec<AclRuleSpec>, ConfigFileError> {
-        self.rules
-            .into_iter()
-            .map(ServerDestinationAclRuleFileConfig::into_spec)
-            .collect()
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ServerDestinationAclFileConfig {
-    #[serde(default = "default_product_policy_generation")]
-    generation: u64,
-    #[serde(default)]
-    rules: Vec<ServerDestinationAclRuleFileConfig>,
-}
-
-impl ServerDestinationAclFileConfig {
-    fn into_config(self) -> Result<ServerDestinationAclConfig, ConfigFileError> {
-        let rules = self
-            .rules
-            .into_iter()
-            .map(ServerDestinationAclRuleFileConfig::into_spec)
-            .collect::<Result<Vec<_>, _>>()?;
-        let config = ServerDestinationAclConfig {
-            generation: self.generation,
-            rules,
-        };
-        config
-            .compile()
-            .map_err(|error| ConfigFileError::DestinationAclPolicy(error.to_string()))?;
-        Ok(config)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ServerDestinationAclRuleFileConfig {
-    name: String,
-    effect: DestinationAclEffectFileValue,
-    #[serde(default)]
-    domain_exact: Vec<String>,
-    #[serde(default)]
-    domain_suffix: Vec<String>,
-    #[serde(default)]
-    domain_keyword: Vec<String>,
-    #[serde(default)]
-    domain_regex: Vec<String>,
-    #[serde(default)]
-    destination_cidrs: Vec<String>,
-    #[serde(default)]
-    destination_ports: Vec<RoutingPortFileValue>,
-    #[serde(default)]
-    networks: Vec<RoutingNetworkFileValue>,
-    #[serde(default)]
-    stages: Vec<RoutingStageFileValue>,
-}
-
-impl ServerDestinationAclRuleFileConfig {
-    fn into_spec(self) -> Result<AclRuleSpec, ConfigFileError> {
-        let name = canonical_config_name(&self.name)?;
-        let id = RuleId::parse(&name)
-            .map_err(|error| ConfigFileError::DestinationAclValue(error.to_string()))?;
-        let matcher = RouteMatchSpec {
-            domain_exact: parse_destination_acl_values(self.domain_exact, DomainName::parse)?,
-            domain_suffix: parse_destination_acl_values(self.domain_suffix, DomainName::parse)?,
-            domain_keyword: self.domain_keyword,
-            domain_regex: self.domain_regex,
-            destination_cidrs: parse_destination_acl_values(self.destination_cidrs, |value| {
-                value.parse::<ipnet::IpNet>()
-            })?,
-            destination_ports: self
-                .destination_ports
-                .into_iter()
-                .map(parse_destination_acl_port)
-                .collect::<Result<Vec<_>, _>>()?,
-            networks: self
-                .networks
-                .into_iter()
-                .map(|network| match network {
-                    RoutingNetworkFileValue::Tcp => Network::Tcp,
-                    RoutingNetworkFileValue::Udp => Network::Udp,
-                })
-                .collect(),
-            stages: self
-                .stages
-                .into_iter()
-                .map(|stage| match stage {
-                    RoutingStageFileValue::PreResolution => RouteStage::PreResolution,
-                    RoutingStageFileValue::PostResolution => RouteStage::PostResolution,
-                })
-                .collect(),
-            ..RouteMatchSpec::default()
-        };
-        let effect = match self.effect {
-            DestinationAclEffectFileValue::Deny => AclEffect::Deny,
-            DestinationAclEffectFileValue::Allow => AclEffect::Allow,
-            DestinationAclEffectFileValue::AllowRestricted => AclEffect::AllowRestricted,
-        };
-        Ok(AclRuleSpec::new(id, matcher, effect))
-    }
-}
-
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum DestinationAclEffectFileValue {
-    Deny,
+enum RoutingDecisionFileValue {
     Allow,
     AllowRestricted,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum RoutingActionFileValue {
-    Outbound,
-    Balancer,
     Reject,
     Drop,
 }
@@ -1830,6 +1910,7 @@ struct ParsedOutbounds {
     balancers: HashMap<String, GatewayBalancerConfig>,
     order: Vec<String>,
     balancer_order: Vec<String>,
+    explicit_mpp_performance: HashSet<String>,
 }
 
 fn parse_outbounds(
@@ -1842,12 +1923,14 @@ fn parse_outbounds(
         balancers: HashMap::new(),
         order: Vec::new(),
         balancer_order: Vec::new(),
+        explicit_mpp_performance: HashSet::new(),
     };
     for value in values {
         match value {
             OutboundFileConfig::Mpp {
                 name,
                 security,
+                allow_peer_diagnostics,
                 performance,
                 paths,
                 path_probe_interval_ms,
@@ -1855,6 +1938,7 @@ fn parse_outbounds(
             } => {
                 let name = canonical_config_name(&name)?;
                 insert_outbound_name(&parsed, &name)?;
+                let explicit_performance = performance.is_some();
                 let named_paths = parse_named_path_specs(paths)?;
                 if named_paths.is_empty() {
                     return Err(ConfigFileError::MppOutboundRequiresPath(name));
@@ -1873,6 +1957,9 @@ fn parse_outbounds(
                 let id = OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
                 parsed.order.push(name.clone());
+                if explicit_performance {
+                    parsed.explicit_mpp_performance.insert(name.clone());
+                }
                 parsed.leaves.insert(
                     name,
                     OutboundLeafConfig::Mpp {
@@ -1886,7 +1973,8 @@ fn parse_outbounds(
                             path_probe_timeout: Duration::from_millis(
                                 path_probe_timeout_ms.unwrap_or(DEFAULT_PATH_PROBE_TIMEOUT_MS),
                             ),
-                            performance: performance.into_config(),
+                            allow_peer_diagnostics,
+                            performance: performance.unwrap_or_default().into_config(),
                         }),
                     },
                 );
@@ -2136,7 +2224,7 @@ fn insert_balancer_name(parsed: &ParsedOutbounds, name: &str) -> Result<(), Conf
     Ok(())
 }
 
-fn configured_local_inbound_names(
+fn configured_routed_inbound_names(
     inbounds: &[InboundFileConfig],
 ) -> Result<HashSet<String>, ConfigFileError> {
     let mut names = HashSet::new();
@@ -2148,8 +2236,9 @@ fn configured_local_inbound_names(
             | InboundFileConfig::TcpForward { name, .. }
             | InboundFileConfig::UdpForward { name, .. }
             | InboundFileConfig::MixedForward { name, .. }
-            | InboundFileConfig::Tun { name, .. } => name,
-            InboundFileConfig::TunL3 { .. } | InboundFileConfig::Mpp { .. } => continue,
+            | InboundFileConfig::Tun { name, .. }
+            | InboundFileConfig::Mpp { name, .. } => name,
+            InboundFileConfig::TunL3 { .. } | InboundFileConfig::MppL3 { .. } => continue,
         };
         let name = canonical_config_name(name)?;
         InboundId::parse(&name)
@@ -2251,18 +2340,12 @@ fn compile_rule_set_registry(
 fn compile_product_policy(
     generation: u64,
     rules: Vec<RoutingRuleFileConfig>,
-    destination_acl: RoutingDestinationAclFileConfig,
     rule_sets: &CompiledRuleSetRegistry,
     local_inbounds: &HashSet<String>,
     outbounds: &ParsedOutbounds,
 ) -> Result<Option<ProductPolicyConfig>, ConfigFileError> {
     if rules.is_empty() && local_inbounds.is_empty() {
         return Ok(None);
-    }
-    if rules.is_empty() {
-        return Err(ConfigFileError::RoutingPolicy(
-            "routing.rules requires a final catch-all rule".to_string(),
-        ));
     }
 
     let rules = rules
@@ -2272,7 +2355,6 @@ fn compile_product_policy(
     let policy = ProductPolicyConfig {
         generation,
         routes: rules,
-        destination_acl: destination_acl.into_rules()?,
     };
     policy
         .compile()
@@ -2291,6 +2373,7 @@ fn compile_product_route_rule(
         RuleId::parse(&name).map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
     let inbounds = rule
         .inbounds
+        .into_concrete("inbounds")?
         .into_iter()
         .map(|name| {
             let name = canonical_config_name(&name)?;
@@ -2345,7 +2428,10 @@ fn compile_product_route_rule(
             })
             .collect(),
         inbounds,
-        principals: parse_route_values(rule.principal_ids, PrincipalId::parse)?,
+        principals: parse_route_values(
+            rule.principal_ids.into_concrete("principal_ids")?,
+            PrincipalId::parse,
+        )?,
         stages: rule
             .stages
             .into_iter()
@@ -2355,58 +2441,98 @@ fn compile_product_route_rule(
             })
             .collect(),
     };
-    let dns_plan = rule
-        .dns_policy
-        .map(|plan| {
-            let plan = canonical_config_name(&plan)?;
-            crate::product::DnsPlanId::parse(&plan)
-                .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
-        })
-        .transpose()?;
-    let egress = match rule.action {
-        RoutingActionFileValue::Outbound => {
-            let name = required_route_reference(&id, rule.outbound, rule.balancer, "outbound")?;
-            if !outbounds.leaves.contains_key(&name) {
-                return Err(ConfigFileError::RoutingRuleMissingOutbound {
-                    rule: id.as_str().to_string(),
-                    outbound: name,
-                });
+    // Selecting one egress is the ordinary allow form used by mature proxy
+    // configurations. Only exceptional terminal or restricted behavior needs
+    // an explicit decision.
+    let decision = rule.decision.unwrap_or(RoutingDecisionFileValue::Allow);
+    let action = match decision {
+        decision
+        @ (RoutingDecisionFileValue::Allow | RoutingDecisionFileValue::AllowRestricted) => {
+            let egress = match (rule.outbound, rule.balancer) {
+                (Some(name), None) => {
+                    let name = canonical_config_name(&name)?;
+                    if !outbounds.leaves.contains_key(&name) {
+                        return Err(ConfigFileError::RoutingRuleMissingOutbound {
+                            rule: id.as_str().to_string(),
+                            outbound: name,
+                        });
+                    }
+                    EgressAction::Outbound(
+                        OutboundId::parse(&name)
+                            .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?,
+                    )
+                }
+                (None, Some(name)) => {
+                    let name = canonical_config_name(&name)?;
+                    if !outbounds.balancers.contains_key(&name) {
+                        return Err(ConfigFileError::RoutingRuleMissingBalancer {
+                            rule: id.as_str().to_string(),
+                            balancer: name,
+                        });
+                    }
+                    EgressAction::Balancer(
+                        BalancerId::parse(&name)
+                            .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?,
+                    )
+                }
+                (None, None) | (Some(_), Some(_)) => {
+                    return Err(ConfigFileError::RoutingPolicy(format!(
+                        "routing rule {} with an allow decision requires exactly one of outbound or balancer",
+                        id.as_str()
+                    )));
+                }
+            };
+            let dns_plan = rule
+                .dns_policy
+                .map(|plan| {
+                    let plan = canonical_config_name(&plan)?;
+                    crate::product::DnsPlanId::parse(&plan)
+                        .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
+                })
+                .transpose()?;
+            let initial_demand = match rule
+                .initial_demand
+                .unwrap_or(RoutingInitialDemandFileValue::Automatic)
+            {
+                RoutingInitialDemandFileValue::Automatic => InitialDemand::Automatic,
+                RoutingInitialDemandFileValue::Throughput => InitialDemand::Throughput,
+            };
+            match decision {
+                RoutingDecisionFileValue::Allow => {
+                    RouteAction::allow(egress, dns_plan, initial_demand)
+                }
+                RoutingDecisionFileValue::AllowRestricted => {
+                    RouteAction::allow_restricted(egress, dns_plan, initial_demand)
+                }
+                RoutingDecisionFileValue::Reject | RoutingDecisionFileValue::Drop => {
+                    unreachable!("allow decision pattern")
+                }
             }
-            EgressAction::Outbound(
-                OutboundId::parse(&name)
-                    .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?,
-            )
         }
-        RoutingActionFileValue::Balancer => {
-            let name = required_route_reference(&id, rule.balancer, rule.outbound, "balancer")?;
-            if !outbounds.balancers.contains_key(&name) {
-                return Err(ConfigFileError::RoutingRuleMissingBalancer {
-                    rule: id.as_str().to_string(),
-                    balancer: name,
-                });
+        decision @ (RoutingDecisionFileValue::Reject | RoutingDecisionFileValue::Drop) => {
+            if rule.outbound.is_some()
+                || rule.balancer.is_some()
+                || rule.dns_policy.is_some()
+                || rule.initial_demand.is_some()
+            {
+                return Err(ConfigFileError::RoutingPolicy(format!(
+                    "routing rule {} with a reject/drop decision forbids outbound, balancer, dns_policy, and initial_demand",
+                    id.as_str()
+                )));
             }
-            EgressAction::Balancer(
-                BalancerId::parse(&name)
-                    .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?,
-            )
+            match decision {
+                RoutingDecisionFileValue::Reject => RouteAction::reject(),
+                RoutingDecisionFileValue::Drop => RouteAction::drop(),
+                RoutingDecisionFileValue::Allow | RoutingDecisionFileValue::AllowRestricted => {
+                    unreachable!("terminal pattern")
+                }
+            }
         }
-        RoutingActionFileValue::Reject => {
-            reject_route_references(&id, rule.outbound, rule.balancer)?;
-            EgressAction::Reject
-        }
-        RoutingActionFileValue::Drop => {
-            reject_route_references(&id, rule.outbound, rule.balancer)?;
-            EgressAction::Drop
-        }
-    };
-    let initial_demand = match rule.initial_demand {
-        RoutingInitialDemandFileValue::Automatic => InitialDemand::Automatic,
-        RoutingInitialDemandFileValue::Throughput => InitialDemand::Throughput,
     };
     Ok(RouteRuleSpec {
         id,
         matcher,
-        action: RouteAction::new(egress, dns_plan, initial_demand),
+        action,
         explanation: rule.explanation,
     })
 }
@@ -2473,84 +2599,6 @@ fn parse_route_port(
         ));
     }
     PortRange::new(start, end).map_err(|error| ConfigFileError::RoutingValue(error.to_string()))
-}
-
-fn parse_destination_acl_values<T, E>(
-    values: Vec<String>,
-    parse: impl Fn(&str) -> Result<T, E>,
-) -> Result<Vec<T>, ConfigFileError>
-where
-    E: std::fmt::Display,
-{
-    values
-        .into_iter()
-        .map(|value| {
-            parse(&value).map_err(|error| ConfigFileError::DestinationAclValue(error.to_string()))
-        })
-        .collect()
-}
-
-fn parse_destination_acl_port(value: RoutingPortFileValue) -> Result<PortRange, ConfigFileError> {
-    let (start, end) = match value {
-        RoutingPortFileValue::Single(port) => (port, port),
-        RoutingPortFileValue::Range(value) => {
-            let (start, end) = value.split_once('-').ok_or_else(|| {
-                ConfigFileError::DestinationAclValue(format!(
-                    "destination ACL port range {value:?} must be START-END"
-                ))
-            })?;
-            let start = start.parse::<u16>().map_err(|_| {
-                ConfigFileError::DestinationAclValue(format!(
-                    "invalid destination ACL port {start:?}"
-                ))
-            })?;
-            let end = end.parse::<u16>().map_err(|_| {
-                ConfigFileError::DestinationAclValue(format!(
-                    "invalid destination ACL port {end:?}"
-                ))
-            })?;
-            (start, end)
-        }
-    };
-    if start == 0 {
-        return Err(ConfigFileError::DestinationAclValue(
-            "destination ACL ports must be non-zero".to_string(),
-        ));
-    }
-    PortRange::new(start, end)
-        .map_err(|error| ConfigFileError::DestinationAclValue(error.to_string()))
-}
-
-fn required_route_reference(
-    rule: &RuleId,
-    selected: Option<String>,
-    other: Option<String>,
-    field: &'static str,
-) -> Result<String, ConfigFileError> {
-    if other.is_some() {
-        return Err(ConfigFileError::RoutingRuleReferenceConflict {
-            rule: rule.as_str().to_string(),
-            field,
-        });
-    }
-    let name = selected.ok_or_else(|| ConfigFileError::RoutingRuleReferenceRequired {
-        rule: rule.as_str().to_string(),
-        field,
-    })?;
-    canonical_config_name(&name)
-}
-
-fn reject_route_references(
-    rule: &RuleId,
-    outbound: Option<String>,
-    balancer: Option<String>,
-) -> Result<(), ConfigFileError> {
-    if outbound.is_some() || balancer.is_some() {
-        return Err(ConfigFileError::RoutingRuleReferenceForbidden {
-            rule: rule.as_str().to_string(),
-        });
-    }
-    Ok(())
 }
 
 type BuiltNodeServices = (
@@ -2765,6 +2813,9 @@ fn build_node_services(
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
                 let outbound = canonical_config_name(&outbound)?;
+                if outbounds.explicit_mpp_performance.contains(&outbound) {
+                    return Err(ConfigFileError::TunL3OutboundPerformance(outbound));
+                }
                 let outbound = OutboundId::parse(&outbound)
                     .map_err(|error| ConfigFileError::TunL3(error.to_string()))?;
                 tun_l3_ingresses.push(NamedTunL3Config {
@@ -2779,41 +2830,55 @@ fn build_node_services(
                 name,
                 security,
                 performance,
-                destination_acl,
                 paths,
-                outbound,
-                balancer,
-                dns_policy,
-                tun_l3,
+                peer_diagnostics_principal_ids,
             } => {
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
-                let egress = resolve_egress(outbound, balancer, &outbounds)?;
                 let paths = parse_named_path_specs(paths)?;
                 if paths.is_empty() {
                     return Err(ConfigFileError::MppInboundRequiresPath);
                 }
                 let server_security = security.server_auth_config(credential_catalog)?;
                 let tls = security.server_tls(material_base, &server_security)?;
-                let tun_l3 = tun_l3
-                    .map(|tun_l3| tun_l3.into_plan(&server_security.credential_authority))
-                    .transpose()?;
+                let peer_diagnostics_principals = peer_diagnostics_principal_ids
+                    .into_policy(&name, &server_security.credential_authority)?;
                 servers.push(MppInboundConfig {
                     name,
-                    egress,
-                    dns_plan: dns_policy
-                        .map(|plan| {
-                            let plan = canonical_config_name(&plan)?;
-                            crate::product::DnsPlanId::parse(&plan)
-                                .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
-                        })
-                        .transpose()?,
                     paths,
                     security: server_security,
                     tls,
-                    destination_acl: destination_acl.into_config()?,
                     performance: performance.into_config(),
-                    tun_l3,
+                    peer_diagnostics_principals,
+                    tun_l3: None,
+                });
+            }
+            InboundFileConfig::MppL3 {
+                name,
+                security,
+                paths,
+                peer_diagnostics_principal_ids,
+                tun_l3,
+            } => {
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
+                let paths = parse_named_path_specs(paths)?;
+                if paths.is_empty() {
+                    return Err(ConfigFileError::MppInboundRequiresPath);
+                }
+                let server_security = security.server_auth_config(credential_catalog)?;
+                let tls = security.server_tls(material_base, &server_security)?;
+                let peer_diagnostics_principals = peer_diagnostics_principal_ids
+                    .into_policy(&name, &server_security.credential_authority)?;
+                let tun_l3 = tun_l3.into_plan(&server_security.credential_authority)?;
+                servers.push(MppInboundConfig {
+                    name,
+                    paths,
+                    security: server_security,
+                    tls,
+                    performance: MppPerformanceConfig::default(),
+                    peer_diagnostics_principals,
+                    tun_l3: Some(tun_l3),
                 });
             }
         }
@@ -2854,41 +2919,6 @@ fn build_node_services(
     ))
 }
 
-fn resolve_egress(
-    outbound: Option<String>,
-    balancer: Option<String>,
-    outbounds: &ParsedOutbounds,
-) -> Result<EgressRef, ConfigFileError> {
-    match (outbound, balancer) {
-        (Some(_), Some(_)) => Err(ConfigFileError::InboundEgressConflict),
-        (Some(name), None) => {
-            let name = canonical_config_name(&name)?;
-            if outbounds.leaves.contains_key(&name) {
-                return OutboundId::parse(&name)
-                    .map(EgressRef::Outbound)
-                    .map_err(|error| ConfigFileError::RoutingValue(error.to_string()));
-            }
-            if outbounds.balancers.contains_key(&name) {
-                return Err(ConfigFileError::OutboundFieldReferencesBalancer(name));
-            }
-            Err(ConfigFileError::MissingOutboundName(name))
-        }
-        (None, Some(name)) => {
-            let name = canonical_config_name(&name)?;
-            if outbounds.leaves.contains_key(&name) {
-                return Err(ConfigFileError::BalancerFieldReferencesOutbound(name));
-            }
-            if outbounds.balancers.contains_key(&name) {
-                return BalancerId::parse(&name)
-                    .map(EgressRef::Balancer)
-                    .map_err(|error| ConfigFileError::RoutingValue(error.to_string()));
-            }
-            Err(ConfigFileError::MissingBalancerName(name))
-        }
-        (None, None) => Err(ConfigFileError::MppInboundRequiresEgress),
-    }
-}
-
 fn validate_unique_inbound_name(
     name: &str,
     seen: &mut HashSet<String>,
@@ -2913,8 +2943,9 @@ struct DnsFileConfig {
     #[serde(default)]
     rules: Vec<DnsRuleFileConfig>,
     #[serde(default)]
-    records: Vec<DnsRecordFileConfig>,
-    r#override: Option<DnsOverrideFileConfig>,
+    override_records: Vec<DnsOverrideRecordFileConfig>,
+    #[serde(default)]
+    synthetic_capture: Vec<DnsSyntheticCaptureFileConfig>,
     #[serde(default = "default_dns_policy_name")]
     default: String,
 }
@@ -2925,8 +2956,8 @@ impl Default for DnsFileConfig {
             servers: default_dns_servers(),
             policies: default_dns_policies(),
             rules: Vec::new(),
-            records: Vec::new(),
-            r#override: None,
+            override_records: Vec::new(),
+            synthetic_capture: Vec::new(),
             default: default_dns_policy_name(),
         }
     }
@@ -2958,11 +2989,17 @@ fn default_dns_policies() -> Vec<DnsPolicyFileConfig> {
         answer_cidrs: Vec::new(),
         query: DnsQueryFileConfig::default(),
         cache: DnsCacheFileConfig::default(),
+        override_records: Vec::new(),
+        synthetic_capture: None,
     }]
 }
 
 impl DnsFileConfig {
-    fn into_config(self, outbounds: &ParsedOutbounds) -> Result<DnsPolicyConfig, ConfigFileError> {
+    fn into_config(
+        self,
+        generation: u64,
+        outbounds: &ParsedOutbounds,
+    ) -> Result<DnsPolicyConfig, ConfigFileError> {
         let upstreams = self
             .servers
             .into_iter()
@@ -2978,12 +3015,16 @@ impl DnsFileConfig {
             .into_iter()
             .map(DnsRuleFileConfig::into_spec)
             .collect::<Result<Vec<_>, _>>()?;
-        let hosts = self
-            .records
+        let override_records = self
+            .override_records
             .into_iter()
-            .map(DnsRecordFileConfig::into_spec)
+            .map(DnsOverrideRecordFileConfig::into_spec)
             .collect::<Result<Vec<_>, _>>()?;
-        let fake_dns = self.r#override.map(DnsOverrideFileConfig::into_spec);
+        let synthetic_captures = self
+            .synthetic_capture
+            .into_iter()
+            .map(DnsSyntheticCaptureFileConfig::into_spec)
+            .collect::<Result<Vec<_>, _>>()?;
         let mut outbound_capabilities = outbounds
             .leaves
             .values()
@@ -3030,18 +3071,15 @@ impl DnsFileConfig {
             outbound_capabilities,
             plans,
             rules,
-            hosts,
-            fake_dns,
+            override_records,
+            synthetic_captures,
             default_plan: {
                 let name = canonical_config_name(&self.default)?;
                 crate::product::DnsPlanId::parse(&name)
                     .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?
             },
         };
-        let config = DnsPolicyConfig {
-            generation: default_product_policy_generation(),
-            spec,
-        };
+        let config = DnsPolicyConfig { generation, spec };
         config
             .compile()
             .map_err(|error| ConfigFileError::DnsPolicy(error.to_string()))?;
@@ -3051,23 +3089,27 @@ impl DnsFileConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DnsOverrideFileConfig {
+struct DnsSyntheticCaptureFileConfig {
+    name: String,
     ipv4_pool: Option<ipnet::Ipv4Net>,
     ipv6_pool: Option<ipnet::Ipv6Net>,
-    max_entries: usize,
-    answer_ttl_ms: u64,
-    recovery_ttl_ms: u64,
+    capacity: usize,
+    answer_ttl_seconds: u64,
+    recovery_ttl_seconds: u64,
 }
 
-impl DnsOverrideFileConfig {
-    fn into_spec(self) -> FakeDnsSpec {
-        FakeDnsSpec {
+impl DnsSyntheticCaptureFileConfig {
+    fn into_spec(self) -> Result<DnsSyntheticCaptureSpec, ConfigFileError> {
+        let name = canonical_config_name(&self.name)?;
+        Ok(DnsSyntheticCaptureSpec {
+            id: DnsSyntheticCaptureId::parse(&name)
+                .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             ipv4_pool: self.ipv4_pool,
             ipv6_pool: self.ipv6_pool,
-            max_entries: self.max_entries,
-            answer_ttl: Duration::from_millis(self.answer_ttl_ms),
-            recovery_ttl: Duration::from_millis(self.recovery_ttl_ms),
-        }
+            max_entries: self.capacity,
+            answer_ttl: Duration::from_secs(self.answer_ttl_seconds),
+            recovery_ttl: Duration::from_secs(self.recovery_ttl_seconds),
+        })
     }
 }
 
@@ -3222,6 +3264,9 @@ struct DnsPolicyFileConfig {
     query: DnsQueryFileConfig,
     #[serde(default)]
     cache: DnsCacheFileConfig,
+    #[serde(default)]
+    override_records: Vec<String>,
+    synthetic_capture: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3292,6 +3337,23 @@ impl DnsPolicyFileConfig {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            override_records: self
+                .override_records
+                .into_iter()
+                .map(|value| {
+                    let value = canonical_config_name(&value)?;
+                    DnsOverrideRecordId::parse(&value)
+                        .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            synthetic_capture: self
+                .synthetic_capture
+                .map(|value| {
+                    let value = canonical_config_name(&value)?;
+                    DnsSyntheticCaptureId::parse(&value)
+                        .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
+                })
+                .transpose()?,
             limits: DnsPlanLimits {
                 lookup_timeout: Duration::from_millis(
                     self.query
@@ -3336,14 +3398,18 @@ enum DnsServerStrategyFileValue {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DnsRecordFileConfig {
+struct DnsOverrideRecordFileConfig {
+    name: String,
     domain: String,
     addresses: Vec<IpAddr>,
 }
 
-impl DnsRecordFileConfig {
-    fn into_spec(self) -> Result<DnsHostSpec, ConfigFileError> {
-        Ok(DnsHostSpec {
+impl DnsOverrideRecordFileConfig {
+    fn into_spec(self) -> Result<DnsOverrideRecordSpec, ConfigFileError> {
+        let name = canonical_config_name(&self.name)?;
+        Ok(DnsOverrideRecordSpec {
+            id: DnsOverrideRecordId::parse(&name)
+                .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             domain: DomainName::parse(&self.domain)
                 .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             addresses: self.addresses,
@@ -3448,6 +3514,8 @@ pub enum ConfigFileError {
     Outbound(OutboundError),
     PathSpec(PathSpecParseError),
     NoRuntimeServices,
+    GenerationExhausted,
+    MixedForwardingFamilies,
     EmptyName,
     NonCanonicalName(String),
     DuplicateInboundName(String),
@@ -3455,12 +3523,12 @@ pub enum ConfigFileError {
     DuplicateBalancerName(String),
     MissingOutboundName(String),
     MissingBalancerName(String),
-    InboundEgressConflict,
-    OutboundFieldReferencesBalancer(String),
-    BalancerFieldReferencesOutbound(String),
-    MppInboundRequiresEgress,
     MppInboundRequiresPath,
     MppOutboundRequiresPath(String),
+    L4RoutingSectionRequired,
+    L3RoutingSectionForbidden,
+    L3AdmissionField(&'static str),
+    TunL3OutboundPerformance(String),
     RoutingBalancerRequiresMembers(String),
     RoutingPolicy(String),
     RoutingValue(String),
@@ -3468,18 +3536,14 @@ pub enum ConfigFileError {
     DnsPolicy(String),
     DnsValue(String),
     DirectBindFieldConflict,
-    DestinationAclPolicy(String),
-    DestinationAclValue(String),
     RoutingRuleMissingInbound { rule: String, inbound: String },
     RoutingRuleMissingOutbound { rule: String, outbound: String },
     RoutingRuleMissingBalancer { rule: String, balancer: String },
-    RoutingRuleReferenceRequired { rule: String, field: &'static str },
-    RoutingRuleReferenceConflict { rule: String, field: &'static str },
-    RoutingRuleReferenceForbidden { rule: String },
     MissingOutboundEndpoint,
     TunIpv4DisabledWithIpv4Options,
     ManagedVpnValue(String),
     TunL3(String),
+    PeerDiagnostics(String),
     ProxyUsernameRequired,
     ProxyPasswordRequired,
     PortForward(String),
@@ -3519,6 +3583,13 @@ impl std::fmt::Display for ConfigFileError {
             Self::NoRuntimeServices => {
                 write!(f, "config must define at least one [[inbounds]] entry")
             }
+            Self::GenerationExhausted => {
+                write!(f, "runtime configuration generation space is exhausted")
+            }
+            Self::MixedForwardingFamilies => write!(
+                f,
+                "one config cannot mix L4 inbounds with tun-l3 or mpp-l3 inbounds"
+            ),
             Self::EmptyName => write!(f, "configured resource names must not be empty"),
             Self::NonCanonicalName(name) => write!(
                 f,
@@ -3539,27 +3610,29 @@ impl std::fmt::Display for ConfigFileError {
             Self::MissingBalancerName(name) => {
                 write!(f, "balancer name {name:?} does not exist")
             }
-            Self::InboundEgressConflict => {
-                write!(f, "inbound cannot set both outbound and balancer")
-            }
-            Self::OutboundFieldReferencesBalancer(name) => write!(
-                f,
-                "inbound outbound field references balancer {name:?}; use balancer instead"
-            ),
-            Self::BalancerFieldReferencesOutbound(name) => write!(
-                f,
-                "inbound balancer field references outbound {name:?}; use outbound instead"
-            ),
-            Self::MppInboundRequiresEgress => write!(
-                f,
-                "MPP inbound must set exactly one of outbound or balancer"
-            ),
             Self::MppInboundRequiresPath => {
                 write!(f, "MPP inbound requires at least one named path")
             }
             Self::MppOutboundRequiresPath(name) => {
                 write!(f, "MPP outbound {name:?} requires at least one named path")
             }
+            Self::L4RoutingSectionRequired => {
+                write!(f, "L4 inbounds require an explicit [routing] section")
+            }
+            Self::L3RoutingSectionForbidden => {
+                write!(
+                    f,
+                    "tun-l3 and mpp-l3 inbounds forbid the [routing] section, even when empty"
+                )
+            }
+            Self::L3AdmissionField(field) => write!(
+                f,
+                "tun-l3 and mpp-l3 accept only admission.max_dns_work; admission.{field} is L4-only"
+            ),
+            Self::TunL3OutboundPerformance(name) => write!(
+                f,
+                "TUN-L3 outbound {name:?} must not configure the L4 MPP performance table"
+            ),
             Self::RoutingBalancerRequiresMembers(name) => {
                 write!(
                     f,
@@ -3575,12 +3648,6 @@ impl std::fmt::Display for ConfigFileError {
                 f,
                 "direct outbound bind_ip cannot be combined with bind_ipv4 or bind_ipv6"
             ),
-            Self::DestinationAclPolicy(error) => {
-                write!(f, "invalid server destination ACL policy: {error}")
-            }
-            Self::DestinationAclValue(error) => {
-                write!(f, "invalid server destination ACL value: {error}")
-            }
             Self::RoutingRuleMissingInbound { rule, inbound } => write!(
                 f,
                 "routing rule {rule:?} references missing local inbound {inbound:?}"
@@ -3592,17 +3659,6 @@ impl std::fmt::Display for ConfigFileError {
             Self::RoutingRuleMissingBalancer { rule, balancer } => write!(
                 f,
                 "routing rule {rule:?} references missing MPP balancer {balancer:?}"
-            ),
-            Self::RoutingRuleReferenceRequired { rule, field } => {
-                write!(f, "routing rule {rule:?} action requires {field}")
-            }
-            Self::RoutingRuleReferenceConflict { rule, field } => write!(
-                f,
-                "routing rule {rule:?} action selects {field} and cannot set the other egress reference"
-            ),
-            Self::RoutingRuleReferenceForbidden { rule } => write!(
-                f,
-                "routing rule {rule:?} reject/drop action cannot set outbound or balancer"
             ),
             Self::MissingOutboundEndpoint => {
                 write!(f, "proxied outbound requires endpoint")
@@ -3617,6 +3673,9 @@ impl std::fmt::Display for ConfigFileError {
                 write!(f, "invalid managed VPN configuration: {error}")
             }
             Self::TunL3(error) => write!(f, "invalid TUN-L3 configuration: {error}"),
+            Self::PeerDiagnostics(error) => {
+                write!(f, "invalid peer diagnostics configuration: {error}")
+            }
             Self::ProxyUsernameRequired => write!(f, "proxy auth password requires username"),
             Self::ProxyPasswordRequired => write!(f, "proxy auth username requires password"),
             Self::PortForward(error) => write!(f, "invalid port-forward inbound: {error}"),
@@ -3645,6 +3704,8 @@ impl std::error::Error for ConfigFileError {
             Self::Outbound(err) => Some(err),
             Self::PathSpec(err) => Some(err),
             Self::NoRuntimeServices
+            | Self::GenerationExhausted
+            | Self::MixedForwardingFamilies
             | Self::EmptyName
             | Self::NonCanonicalName(_)
             | Self::DuplicateInboundName(_)
@@ -3652,12 +3713,12 @@ impl std::error::Error for ConfigFileError {
             | Self::DuplicateBalancerName(_)
             | Self::MissingOutboundName(_)
             | Self::MissingBalancerName(_)
-            | Self::InboundEgressConflict
-            | Self::OutboundFieldReferencesBalancer(_)
-            | Self::BalancerFieldReferencesOutbound(_)
-            | Self::MppInboundRequiresEgress
             | Self::MppInboundRequiresPath
             | Self::MppOutboundRequiresPath(_)
+            | Self::L4RoutingSectionRequired
+            | Self::L3RoutingSectionForbidden
+            | Self::L3AdmissionField(_)
+            | Self::TunL3OutboundPerformance(_)
             | Self::RoutingBalancerRequiresMembers(_)
             | Self::RoutingPolicy(_)
             | Self::RoutingValue(_)
@@ -3665,18 +3726,14 @@ impl std::error::Error for ConfigFileError {
             | Self::DnsPolicy(_)
             | Self::DnsValue(_)
             | Self::DirectBindFieldConflict
-            | Self::DestinationAclPolicy(_)
-            | Self::DestinationAclValue(_)
             | Self::RoutingRuleMissingInbound { .. }
             | Self::RoutingRuleMissingOutbound { .. }
             | Self::RoutingRuleMissingBalancer { .. }
-            | Self::RoutingRuleReferenceRequired { .. }
-            | Self::RoutingRuleReferenceConflict { .. }
-            | Self::RoutingRuleReferenceForbidden { .. }
             | Self::MissingOutboundEndpoint
             | Self::TunIpv4DisabledWithIpv4Options
             | Self::ManagedVpnValue(_)
             | Self::TunL3(_)
+            | Self::PeerDiagnostics(_)
             | Self::ProxyUsernameRequired
             | Self::ProxyPasswordRequired
             | Self::PortForward(_)

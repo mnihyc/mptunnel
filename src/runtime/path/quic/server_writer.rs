@@ -219,7 +219,13 @@ pub(super) async fn drain_server_udp_reliable_commands(
                     context
                         .reliable_streams
                         .detach_path(path_registration, stream_id)?;
-                    let _ = udp_path_finish_stream(send).await;
+                    // An unordered close before any response is the wire
+                    // representation used by a post-resolution policy drop.
+                    // Cancel that request without manufacturing HTTP 200;
+                    // an already-started response still finishes normally.
+                    if !send.cancel_pending_response() {
+                        let _ = udp_path_finish_stream(send).await;
+                    }
                     true
                 } else {
                     false

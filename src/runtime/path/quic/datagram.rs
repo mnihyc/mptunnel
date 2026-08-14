@@ -2,7 +2,8 @@
 
 use super::io::{
     UdpPathRecvStream, UdpPathSendStream, flush_udp_frame_batch, spawn_quic_path_reader,
-    udp_path_command_queue, udp_path_finish_stream, udp_path_write_frame,
+    udp_path_command_queue, udp_path_finish_stream, udp_path_retain_datagram_denial,
+    udp_path_write_datagram_refusal, udp_path_write_frame,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -20,8 +21,9 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
-    AcceptedServerDatagramFlow, ServerDatagramOpenRequest, ServerDatagramRequest,
-    ServerDatagramSendOutcome,
+    AcceptedServerDatagramFlow, ServerDatagramOpenFailure, ServerDatagramOpenRequest,
+    ServerDatagramRequest, ServerDatagramSendOutcome, ServerDatagramTombstone,
+    ServerDatagramTombstoneCache,
 };
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
@@ -31,6 +33,13 @@ pub(super) struct ServerUdpDatagramStreamContext {
     pub(super) principal_permit: PrincipalPermit,
     pub(super) flow_id: DatagramFlowId,
     pub(super) target: TargetAddr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerUdpDatagramOpenOutcome {
+    Opened,
+    Rejected,
+    Dropped,
 }
 
 pub(super) async fn handle_server_udp_datagram_stream(
@@ -50,18 +59,23 @@ pub(super) async fn handle_server_udp_datagram_stream(
         udp_path_command_queue(context.mux_limits, context.codec_limits),
     );
     let mut flows = Vec::<AcceptedServerDatagramFlow>::new();
+    let mut tombstones = ServerDatagramTombstoneCache::new(context.max_udp_flows_per_session);
     let mut pending_frames = Vec::<Frame>::new();
-    open_server_udp_datagram_flow(
-        &context,
-        &commands_tx,
-        &mut send,
-        &mut flows,
-        stream_context.session_id,
-        stream_context.principal_permit.clone(),
-        stream_context.flow_id,
-        stream_context.target,
-    )
-    .await?;
+    let mut saw_silent_drop = matches!(
+        open_server_udp_datagram_flow(
+            &context,
+            &commands_tx,
+            &mut send,
+            &mut flows,
+            &mut tombstones,
+            stream_context.session_id,
+            stream_context.principal_permit.clone(),
+            stream_context.flow_id,
+            stream_context.target,
+        )
+        .await?,
+        ServerUdpDatagramOpenOutcome::Dropped
+    );
     loop {
         let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
         tokio::select! {
@@ -69,21 +83,20 @@ pub(super) async fn handle_server_udp_datagram_stream(
             frame = carrier_frames.recv() => {
                 match frame {
                     Some(Ok(Frame::OpenDatagramFlow { flow_id, target, .. })) => {
-                        open_server_udp_datagram_flow(
+                        let outcome = open_server_udp_datagram_flow(
                             &context,
                             &commands_tx,
                             &mut send,
                             &mut flows,
+                            &mut tombstones,
                             stream_context.session_id,
                             stream_context.principal_permit.clone(),
                             flow_id,
                             target,
                         ).await?;
+                        saw_silent_drop |= matches!(outcome, ServerUdpDatagramOpenOutcome::Dropped);
                     }
                     Some(Ok(Frame::DatagramData { flow_id, datagram_id, ttl_ms, payload })) => {
-                        if ttl_ms == 0 {
-                            return Err(RuntimeError::Protocol("expired QUIC UDP path datagram received"));
-                        }
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "server_udp_datagram_request_received",
@@ -96,63 +109,63 @@ pub(super) async fn handle_server_udp_datagram_stream(
                                 ttl_ms,
                             ),
                         );
-                        let flow_index = flows
-                            .iter()
-                            .position(|flow| flow.flow_id() == flow_id)
-                            .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?;
-                        let flow = flows
-                            .get(flow_index)
-                            .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?;
-                        match flow
-                            .send(ServerDatagramRequest { datagram_id, ttl_ms, payload })
-                            .await?
-                        {
-                            ServerDatagramSendOutcome::Accepted => {
-                                let received = datagram_feedback_range(datagram_id)
-                                    .ok_or(RuntimeError::Protocol("datagram feedback range overflow"))?;
-                                udp_path_write_frame(
-                                    &mut send,
-                                    &Frame::DatagramFeedback {
-                                        flow_id,
-                                        received: vec![received],
-                                    },
-                                    context.codec_limits,
-                                ).await?;
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "server_udp_datagram_feedback_written",
-                                    format_args!(
-                                        "session_id={} flow_id={} datagram_id={}",
-                                        stream_context.session_id.0,
-                                        flow_id.0,
-                                        datagram_id.0,
-                                    ),
-                                );
+                        if let Some(flow) = flows.iter().find(|flow| flow.flow_id() == flow_id) {
+                            if ttl_ms == 0 {
+                                return Err(RuntimeError::Protocol("expired QUIC UDP path datagram received"));
                             }
-                            ServerDatagramSendOutcome::Full => {
-                                crate::observability::process_event!(
-                                    Warn,
-                                    "quic_datagram",
-                                    "worker_queue_full",
-                                    "QUIC UDP path datagram worker queue full; dropping request"
-                                );
-                            }
-                            ServerDatagramSendOutcome::Closed => {
-                                flows.retain(|flow| flow.flow_id() != flow_id);
-                                udp_path_write_frame(&mut send, &Frame::DatagramClose { flow_id }, context.codec_limits).await?;
+                            match flow
+                                .send(ServerDatagramRequest { datagram_id, ttl_ms, payload })
+                                .await?
+                            {
+                                ServerDatagramSendOutcome::Accepted => {
+                                    let received = datagram_feedback_range(datagram_id)
+                                        .ok_or(RuntimeError::Protocol("datagram feedback range overflow"))?;
+                                    udp_path_write_frame(
+                                        &mut send,
+                                        &Frame::DatagramFeedback {
+                                            flow_id,
+                                            received: vec![received],
+                                        },
+                                        context.codec_limits,
+                                    ).await?;
+                                    #[cfg(feature = "lab-diagnostics")]
+                                    lab_diagnostic(
+                                        "server_udp_datagram_feedback_written",
+                                        format_args!(
+                                            "session_id={} flow_id={} datagram_id={}",
+                                            stream_context.session_id.0,
+                                            flow_id.0,
+                                            datagram_id.0,
+                                        ),
+                                    );
+                                }
+                                ServerDatagramSendOutcome::Full => {
+                                    crate::observability::process_event!(
+                                        Warn,
+                                        "quic_datagram",
+                                        "worker_queue_full",
+                                        "QUIC UDP path datagram worker queue full; dropping request"
+                                    );
+                                }
+                                ServerDatagramSendOutcome::Closed => {
+                                    flows.retain(|flow| flow.flow_id() != flow_id);
+                                    udp_path_write_frame(&mut send, &Frame::DatagramClose { flow_id }, context.codec_limits).await?;
+                                }
                             }
                         }
                     }
                     Some(Ok(Frame::DatagramFeedback { flow_id, received })) => {
-                        let flow = flows
-                            .iter()
-                            .find(|flow| flow.flow_id() == flow_id)
-                            .ok_or(RuntimeError::Protocol("unknown QUIC datagram flow feedback"))?;
-                        flow.acknowledge_response(received);
+                        if let Some(flow) = flows.iter().find(|flow| flow.flow_id() == flow_id) {
+                            flow.acknowledge_response(received);
+                        }
                     }
                     Some(Ok(Frame::DatagramClose { flow_id })) => {
                         flows.retain(|flow| flow.flow_id() != flow_id);
-                        if flows.is_empty() {
+                        tombstones.remove(flow_id);
+                        if flows.is_empty() && tombstones.is_empty() {
+                            if saw_silent_drop && send.cancel_pending_response() {
+                                return Ok(());
+                            }
                             let _ = udp_path_finish_stream(&mut send).await;
                             return Ok(());
                         }
@@ -162,8 +175,18 @@ pub(super) async fn handle_server_udp_datagram_stream(
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(_)) => return Err(RuntimeError::Protocol("unexpected server QUIC UDP path datagram stream frame")),
-                    Some(Err(err)) if super::io::udp_path_input_finished(&err) => return Ok(()),
-                    Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => return Ok(()),
+                    Some(Err(err)) if super::io::udp_path_input_finished(&err) => {
+                        if saw_silent_drop {
+                            let _ = send.cancel_pending_response();
+                        }
+                        return Ok(());
+                    }
+                    Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => {
+                        if saw_silent_drop {
+                            let _ = send.cancel_pending_response();
+                        }
+                        return Ok(());
+                    }
                     Some(Err(err)) => return Err(err),
                 }
                 if let Some(command) = try_recv_reliable_path_command(&mut commands_rx) {
@@ -177,6 +200,9 @@ pub(super) async fn handle_server_udp_datagram_stream(
                     )
                     .await?;
                     if result {
+                        if saw_silent_drop {
+                            let _ = send.cancel_pending_response();
+                        }
                         return Ok(());
                     }
                 }
@@ -192,6 +218,9 @@ pub(super) async fn handle_server_udp_datagram_stream(
                         &mut pending_frames,
                     ).await;
                     if result? {
+                        if saw_silent_drop {
+                            let _ = send.cancel_pending_response();
+                        }
                         return Ok(());
                     }
                 }
@@ -418,27 +447,30 @@ async fn open_server_udp_datagram_flow(
     commands_tx: &ReliablePathCommandSender,
     send: &mut UdpPathSendStream,
     flows: &mut Vec<AcceptedServerDatagramFlow>,
+    tombstones: &mut ServerDatagramTombstoneCache,
     session_id: SessionId,
     principal_permit: PrincipalPermit,
     flow_id: DatagramFlowId,
     target: TargetAddr,
-) -> Result<(), RuntimeError> {
+) -> Result<ServerUdpDatagramOpenOutcome, RuntimeError> {
     if flows.iter().any(|flow| flow.flow_id() == flow_id) {
         return Err(RuntimeError::Protocol(
             "duplicate QUIC UDP path datagram flow",
         ));
     }
-    if flows.len() >= context.max_udp_flows_per_session {
-        udp_path_write_frame(
-            send,
-            &Frame::DatagramClose { flow_id },
-            context.codec_limits,
-        )
-        .await?;
-        return Ok(());
+    if let Some(tombstone) = tombstones.get(flow_id) {
+        return write_server_udp_datagram_tombstone(send, context, flow_id, tombstone, None).await;
     }
-    let flow = match context
-        .datagrams
+    if flows.len() >= context.max_udp_flows_per_session {
+        let tombstone = ServerDatagramTombstone::CapacityReject;
+        let evicted = tombstones.insert_with_eviction(flow_id, tombstone);
+        return write_server_udp_datagram_tombstone(send, context, flow_id, tombstone, evicted)
+            .await;
+    }
+    let datagrams = context.datagrams.as_ref().ok_or(RuntimeError::Protocol(
+        "L4 datagram service is unavailable for this MPP inbound",
+    ))?;
+    let flow = match datagrams
         .open(ServerDatagramOpenRequest {
             session_id,
             principal_permit,
@@ -449,8 +481,68 @@ async fn open_server_udp_datagram_flow(
         .await
     {
         Ok(flow) => flow,
-        Err(failure) => return Err(failure.into_error()),
+        Err(failure) => match failure.into_failure() {
+            ServerDatagramOpenFailure::Capacity => {
+                let tombstone = ServerDatagramTombstone::CapacityReject;
+                let evicted = tombstones.insert_with_eviction(flow_id, tombstone);
+                return write_server_udp_datagram_tombstone(
+                    send, context, flow_id, tombstone, evicted,
+                )
+                .await;
+            }
+            ServerDatagramOpenFailure::Runtime(RuntimeError::RouteRejected) => {
+                let tombstone = ServerDatagramTombstone::Reject;
+                let evicted = tombstones.insert_with_eviction(flow_id, tombstone);
+                return write_server_udp_datagram_tombstone(
+                    send, context, flow_id, tombstone, evicted,
+                )
+                .await;
+            }
+            // QUIC can multiplex several Product datagram flows on this
+            // request stream. A policy drop emits nothing and leaves every
+            // accepted sibling intact.
+            ServerDatagramOpenFailure::Runtime(RuntimeError::RouteDropped) => {
+                let tombstone = ServerDatagramTombstone::Drop;
+                let evicted = tombstones.insert_with_eviction(flow_id, tombstone);
+                return write_server_udp_datagram_tombstone(
+                    send, context, flow_id, tombstone, evicted,
+                )
+                .await;
+            }
+            ServerDatagramOpenFailure::Runtime(error) => return Err(error),
+        },
     };
     flows.push(flow);
-    Ok(())
+    Ok(ServerUdpDatagramOpenOutcome::Opened)
+}
+
+async fn write_server_udp_datagram_tombstone(
+    send: &mut UdpPathSendStream,
+    context: &ServerPathContext,
+    flow_id: DatagramFlowId,
+    tombstone: ServerDatagramTombstone,
+    evicted: Option<DatagramFlowId>,
+) -> Result<ServerUdpDatagramOpenOutcome, RuntimeError> {
+    match tombstone {
+        ServerDatagramTombstone::Reject | ServerDatagramTombstone::CapacityReject => {
+            udp_path_write_datagram_refusal(
+                send,
+                flow_id,
+                evicted,
+                context.max_udp_flows_per_session,
+                context.codec_limits,
+            )
+            .await?;
+            Ok(ServerUdpDatagramOpenOutcome::Rejected)
+        }
+        ServerDatagramTombstone::Drop => {
+            udp_path_retain_datagram_denial(
+                send,
+                flow_id,
+                evicted,
+                context.max_udp_flows_per_session,
+            )?;
+            Ok(ServerUdpDatagramOpenOutcome::Dropped)
+        }
+    }
 }

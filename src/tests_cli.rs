@@ -500,7 +500,6 @@ fn removed_record_cipher_cli_is_rejected() {
 fn service_supervisor_cli_is_parsed_and_validated() {
     let cli = parse_cli([
         "mptunnel",
-        "--service-mode",
         "--supervise",
         "--restart-backoff-ms",
         "500",
@@ -515,7 +514,6 @@ fn service_supervisor_cli_is_parsed_and_validated() {
     .expect("parse cli");
     let config = cli.into_config().expect("config");
 
-    assert!(config.service.service_mode);
     assert!(config.service.supervise);
     assert_eq!(config.service.restart_backoff, Duration::from_millis(500));
     assert_eq!(
@@ -541,6 +539,19 @@ fn service_supervisor_cli_is_parsed_and_validated() {
             crate::config::ConfigError::RestartMaxBackoffTooSmall
         ))
     ));
+}
+
+#[test]
+fn removed_service_mode_cli_is_rejected() {
+    let error = parse_cli([
+        "mptunnel",
+        "--service-mode",
+        "client",
+        "--path",
+        "tcp://127.0.0.1:443",
+    ])
+    .expect_err("service-mode was logging-only and must not survive v0.4");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[test]
@@ -577,7 +588,33 @@ fn operational_commands_are_typed_and_do_not_require_runtime_credentials() {
     let RouteCommand::Explain(route) = route.command;
     assert_eq!(route.target.authority(), "api.example:443");
     assert_eq!(route.network, RouteNetworkArg::Tcp);
+    assert_eq!(
+        route.source,
+        Some("198.51.100.8:41000".parse().expect("source"))
+    );
     assert_eq!(route.resolved_ip, Some("192.0.2.4".parse().expect("IP")));
+
+    let route = Cli::try_parse_from([
+        "mptunnel",
+        "--config",
+        "edge.toml",
+        "route",
+        "explain",
+        "--target",
+        "api.example:443",
+        "--network",
+        "tcp",
+        "--principal-id",
+        "peer",
+        "--inbound",
+        "mpp-server",
+    ])
+    .expect("MPP route explanation without a source");
+    let Command::Route(route) = route.command else {
+        panic!("expected route explain");
+    };
+    let RouteCommand::Explain(route) = route.command;
+    assert_eq!(route.source, None);
 
     for (flag, value) in [
         ("--interface", "eth0"),
@@ -838,7 +875,15 @@ fn server_outbound_dns_is_parsed() {
     let plan = dns.plan(&default).expect("default DNS plan");
     assert_eq!(plan.ip_strategy(), DnsIpStrategy::Ipv6ThenIpv4);
     assert_eq!(plan.limits().lookup_timeout, Duration::from_millis(1500));
-    assert_eq!(node.servers[0].dns_plan.as_ref(), Some(&default));
+    assert_eq!(
+        node.product_policy
+            .as_ref()
+            .expect("L4 routing policy")
+            .routes[0]
+            .action
+            .dns_plan(),
+        Some(&default)
+    );
 
     let cli = parse_cli([
         "mptunnel",

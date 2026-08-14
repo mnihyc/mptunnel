@@ -98,8 +98,8 @@ fn literal_dns_policy() -> DnsPolicyConfig {
             outbound_capabilities: Vec::new(),
             plans: vec![DnsPlanSpec::new(plan.clone(), vec![upstream])],
             rules: Vec::new(),
-            hosts: Vec::new(),
-            fake_dns: None,
+            override_records: Vec::new(),
+            synthetic_captures: Vec::new(),
             default_plan: plan,
         },
     }

@@ -1,11 +1,11 @@
 (function () {
   "use strict";
 
-  const HEALTH_ENDPOINT = "/api/v3/health";
-  const STATUS_ENDPOINT = "/api/v3/status";
-  const PEER_ENDPOINT = "/api/v3/diagnostics/peer";
-  const BALANCER_ACTION_ENDPOINT = "/api/v3/balancers/actions";
-  const EXPECTED_SCHEMA = "mptunnel.management.v3";
+  const HEALTH_ENDPOINT = "/api/v4/health";
+  const STATUS_ENDPOINT = "/api/v4/status";
+  const PEER_ENDPOINT = "/api/v4/diagnostics/peer";
+  const BALANCER_ACTION_ENDPOINT = "/api/v4/balancers/actions";
+  const EXPECTED_SCHEMA = "mptunnel.management.v4";
   const TOKEN_STORAGE_KEY = "mptunnel.dashboard.bearer";
   const NAVIGATION_STORAGE_KEY = "mptunnel.dashboard.navigation-collapsed";
   const REFRESH_STORAGE_KEY = "mptunnel.dashboard.refresh-interval-ms";
@@ -596,7 +596,7 @@
   }
 
   function validateHealth(payload) {
-    if (!payload || typeof payload !== "object" || payload.schema !== "mptunnel.health.v3") {
+    if (!payload || typeof payload !== "object" || payload.schema !== "mptunnel.health.v4") {
       throw new Error("Unsupported management health response");
     }
     return payload;

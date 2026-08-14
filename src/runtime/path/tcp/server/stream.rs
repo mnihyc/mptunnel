@@ -46,9 +46,6 @@ impl ServerTcpStreamState {
         target: TargetAddr,
         demand: StreamDemandHint,
     ) -> Result<Option<Frame>, RuntimeError> {
-        context
-            .reliable_streams
-            .validate_target(path_registration, &target)?;
         let response = match context
             .reliable_streams
             .open_or_attach(ServerStreamOpenRequest {
@@ -84,6 +81,9 @@ impl ServerTcpStreamState {
             ServerStreamOpenOutcome::DuplicateLiveIgnored | ServerStreamOpenOutcome::Rejected => {
                 Some(Frame::StreamDetach { stream_id })
             }
+            // Silent policy drop creates no registry entry and emits no MPP
+            // frame. The surrounding TCP carrier remains usable by siblings.
+            ServerStreamOpenOutcome::Dropped => None,
         };
         Ok(response)
     }

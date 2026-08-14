@@ -1,7 +1,7 @@
 # MPTUNNEL release package
 
-Each archive contains one MPTUNNEL command-line binary, two editable
-client/server examples, and this package guide. It is the same MPTUNNEL binary
+Each archive contains one MPTUNNEL command-line binary, three editable
+configuration examples, and this package guide. It is the same MPTUNNEL binary
 for client and server use. Windows archives additionally contain the signed,
 architecture-matched Wintun runtime and its required license.
 
@@ -74,11 +74,10 @@ certificate files, and validate before starting:
 ./mptunnel --config ./config.toml
 ```
 
-Configuration-relative certificate paths resolve beside the selected TOML
-file. The repository's
-[complete configuration reference](../examples/config.reference.toml)
-documents every TOML section, material source, DNS protocol, and carrier URI
-option; it is intentionally not duplicated in release archives. Run
+Relative material paths—including a relative path read from an environment
+variable—resolve beside the selected TOML file. The bundled
+[complete configuration reference](examples/config.reference.toml) documents
+every TOML section, material source, DNS protocol, and carrier URI option. Run
 `./mptunnel --help` for the simple CLI surface.
 
 ## Service helpers

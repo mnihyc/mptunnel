@@ -44,9 +44,9 @@ use crate::model::work::{
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::outbound::{OutboundTcpStream, ServerDestinationPolicy};
+use crate::outbound::OutboundTcpStream;
 use crate::performance::MppPerformanceConfig;
-use crate::product::DnsPlanId;
+use crate::product::InboundId;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 #[cfg(feature = "lab-diagnostics")]
@@ -56,10 +56,9 @@ use crate::protocol::frame::{
 };
 use crate::protocol::{Frame, OffsetRange, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
-use crate::runtime::outbound_registry::{
-    EgressSelection, OpenedTcpOutbound, RuntimeOutboundRegistry, finish_gateway_flow,
-};
+use crate::runtime::outbound_registry::{OpenedTcpOutbound, finish_gateway_flow};
 use crate::runtime::path::PathDeliveryStats;
+use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 use crate::runtime::sender::{
     RelaySendCause, ServerReinjectionOutputIdentity, ServerResponseSenderService,
     reliable_relay_sender_queue_limit,
@@ -82,10 +81,8 @@ use tokio::sync::mpsc;
 use tokio::task::{Id, JoinError, JoinSet};
 
 pub(in crate::runtime) struct ServerReliableRelayContext {
-    pub(in crate::runtime) outbound_registry: RuntimeOutboundRegistry,
-    pub(in crate::runtime) egress_selection: EgressSelection,
-    pub(in crate::runtime) dns_plan: Option<DnsPlanId>,
-    pub(in crate::runtime) destination_policy: Arc<ServerDestinationPolicy>,
+    pub(in crate::runtime) router: ClientIngressRouter,
+    pub(in crate::runtime) inbound: InboundId,
     pub(in crate::runtime) performance: MppPerformanceConfig,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) max_paths_per_session: usize,
@@ -207,21 +204,30 @@ async fn relay_accepted_stream(
     let session_id = accepted.session_id();
     let stream_id = accepted.stream().stream_id;
     let target = accepted.target().clone();
-    let principal_destination_policy = context
-        .destination_policy
-        .for_principal(accepted.principal_permit().principal().clone());
-    let outbound_stream = match context
-        .outbound_registry
-        .open_tcp(
-            &context.egress_selection,
-            &target,
-            context.dns_plan.as_ref(),
-            TrafficClass::Latency,
-            &principal_destination_policy,
-        )
-        .await
-    {
+    let outbound_stream = match context.router.route_mpp_tcp(
+        &target,
+        accepted.principal_permit().principal().clone(),
+        context.inbound.clone(),
+    ) {
+        Ok(ClientRoute::Open(plan)) => plan.open_tcp(&target).await,
+        Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject)) => Err(RuntimeError::RouteRejected),
+        Ok(ClientRoute::Deny(ClientPolicyDisposition::Drop)) => Err(RuntimeError::RouteDropped),
+        Err(error) => Err(error),
+    };
+    let outbound_stream = match outbound_stream {
         Ok(stream) => stream,
+        Err(RuntimeError::RouteDropped) => {
+            // Post-resolution policy can refine an initially admissible
+            // domain route. Retire only this logical stream and publish no
+            // refusal frame; sibling flows and their carriers remain live.
+            accepted.close().await;
+            return Ok(());
+        }
+        Err(RuntimeError::RouteRejected) => {
+            let lane = accepted.stream().current_lane();
+            accepted.reject(ResetReason::Refused, lane).await;
+            return Ok(());
+        }
         Err(err) => {
             let lane = accepted.stream().current_lane();
             accepted.reject(ResetReason::Refused, lane).await;

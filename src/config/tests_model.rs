@@ -186,6 +186,7 @@ fn udp_path_configuration_is_strict_and_requires_sni_identity() {
         }],
         path_probe_interval: DEFAULT_PATH_PROBE_INTERVAL,
         path_probe_timeout: DEFAULT_PATH_PROBE_TIMEOUT,
+        allow_peer_diagnostics: false,
         performance: MppPerformanceConfig::default(),
     };
     assert_eq!(
@@ -222,8 +223,6 @@ fn server_paths_reject_client_only_endpoint_options() {
     );
     let server = MppInboundConfig {
         name: "mpp-inbound".to_string(),
-        egress: EgressRef::Outbound(OutboundId::parse("direct").expect("outbound")),
-        dns_plan: None,
         paths: vec![NamedPathConfig {
             name: "path-1".to_string(),
             spec: "tcp://127.0.0.1:443?source-address=127.0.0.1"
@@ -232,8 +231,8 @@ fn server_paths_reject_client_only_endpoint_options() {
         }],
         security,
         tls: crate::transport::encrypted::test_server_tls_config(),
-        destination_acl: ServerDestinationAclConfig::default(),
         performance: MppPerformanceConfig::default(),
+        peer_diagnostics_principals: PeerDiagnosticsPrincipalPolicy::Deny,
         tun_l3: None,
     };
 

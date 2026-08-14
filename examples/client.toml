@@ -6,40 +6,10 @@
 # Transport protection uses a different raw 32-byte file shared by the two
 # endpoints: umask 077; openssl rand -out mpp-transport.key 32
 
-# L4 is the default. The separate experimental L3 profile is documented in
-# config.reference.toml.
-# forwarding_mode = "l4"
-
-[logging]
-level = "info"
-
 [[credentials]]
 credential_id = "home-client"
 principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
-
-[session]
-# Retain streams across outage and bound graceful TCP carrier retirement.
-retention_timeout_ms = 300000
-
-[dns]
-default = "system"
-
-[[dns.servers]]
-name = "system"
-protocol = "system"
-
-[[dns.policies]]
-name = "system"
-servers = ["system"]
-
-# The management API is optional, loopback-only, and requires a separate random
-# operator token when enabled.
-# [management]
-# listen = ["127.0.0.1:7600"]
-# token = { from = "file", path = "management-token.key" }
-# dashboard = true
-# allow_peer_diagnostics = false
 
 [[inbounds]]
 name = "local-mixed"
@@ -56,8 +26,11 @@ listen = ["127.0.0.1:1080"]
 [[outbounds]]
 name = "remote-mpp"
 protocol = "mpp"
+# Endpoint-specific incoming diagnostics permission. A `[management]` table
+# with `allow_peer_diagnostics = true` overrides this process-wide.
+# allow_peer_diagnostics = false
 # Replace server.example.com with the server's reachable name or address.
-# TCP and QUIC/UDP remain separate carriers under one MPP data-level session.
+# TCP and QUIC/UDP remain separate carriers under one logical MPP session.
 paths = [
   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
   { name = "path-2", endpoint = "quic://server.example.com:7443" },
@@ -77,5 +50,4 @@ transport_secret = { from = "file", path = "mpp-transport.key" }
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "remote-mpp"

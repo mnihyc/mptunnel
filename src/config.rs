@@ -24,6 +24,7 @@ pub use file::{
     ConfigFileError, DEFAULT_CONFIG_PATH, TomlConfigError, load_config_toml, load_config_toml_str,
 };
 pub(crate) use file::{load_certificates, load_private_key};
+pub(crate) use model::ActiveNodeGraph;
 pub use model::{
     AppConfig, ClientPathConfig, ClientSecurityConfig, CommandConfig, ConfigError,
     DEFAULT_AUTH_FRESHNESS_WINDOW, DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS,
@@ -36,7 +37,7 @@ pub use model::{
     DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, EgressRef, ForwardingMode,
     GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
     ManagementConfig, MppInboundConfig, MppOutboundConfig, NamedPathConfig, NamedTunL3Config,
-    NodeConfig, OutboundLeafConfig, ProductPolicyConfig, ServerDestinationAclConfig,
+    NodeConfig, OutboundLeafConfig, PeerDiagnosticsPrincipalPolicy, ProductPolicyConfig,
     ServerSecurityConfig, ServiceConfig, SessionConfig,
 };
 pub(crate) use secret::{

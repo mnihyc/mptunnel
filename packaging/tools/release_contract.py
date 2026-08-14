@@ -25,6 +25,7 @@ COMMON_ARCHIVE_FILES = frozenset(
     {
         "README.md",
         "examples/client.toml",
+        "examples/config.reference.toml",
         "examples/server.toml",
     }
 )

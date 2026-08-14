@@ -66,8 +66,8 @@ fn base_spec() -> DnsPolicySpec {
                 explanation: None,
             },
         ],
-        hosts: Vec::new(),
-        fake_dns: None,
+        override_records: Vec::new(),
+        synthetic_captures: Vec::new(),
         default_plan: plan_id("public"),
     }
 }
@@ -284,34 +284,32 @@ fn doq_is_an_encrypted_udp_transport_with_literal_identity() {
 }
 
 #[test]
-fn fake_dns_pools_lifetimes_and_bootstraps_fail_closed() {
+fn synthetic_capture_pools_lifetimes_and_bootstraps_fail_closed() {
     let mut valid = base_spec();
-    valid.fake_dns = Some(FakeDnsSpec {
+    let capture_id = DnsSyntheticCaptureId::parse("capture").expect("capture ID");
+    valid.synthetic_captures = vec![DnsSyntheticCaptureSpec {
+        id: capture_id.clone(),
         ipv4_pool: Some("198.18.0.0/16".parse().expect("IPv4 pool")),
         ipv6_pool: Some("fd00:4d50::/112".parse().expect("IPv6 pool")),
         max_entries: 4_096,
         answer_ttl: Duration::from_secs(30),
         recovery_ttl: Duration::from_secs(120),
-    });
+    }];
+    valid.plans[0].synthetic_capture = Some(capture_id);
     assert!(CompiledDnsPolicy::compile(1, valid.clone()).is_ok());
 
     let mut public = valid.clone();
-    public.fake_dns.as_mut().expect("FakeDNS").ipv4_pool =
-        Some("203.0.113.0/24".parse().expect("public pool"));
+    public.synthetic_captures[0].ipv4_pool = Some("203.0.113.0/24".parse().expect("public pool"));
     assert!(matches!(
         CompiledDnsPolicy::compile(1, public),
-        Err(DnsCompileError::InvalidFakeDnsIpv4Pool(_))
+        Err(DnsCompileError::InvalidSyntheticCaptureIpv4Pool(_))
     ));
 
     let mut short_recovery = valid.clone();
-    short_recovery
-        .fake_dns
-        .as_mut()
-        .expect("FakeDNS")
-        .recovery_ttl = Duration::from_secs(1);
+    short_recovery.synthetic_captures[0].recovery_ttl = Duration::from_secs(1);
     assert!(matches!(
         CompiledDnsPolicy::compile(1, short_recovery),
-        Err(DnsCompileError::InvalidFakeDnsLifetime { .. })
+        Err(DnsCompileError::InvalidSyntheticCaptureLifetime { .. })
     ));
 
     let mut overlap = valid;
@@ -320,7 +318,7 @@ fn fake_dns_pools_lifetimes_and_bootstraps_fail_closed() {
     };
     assert!(matches!(
         CompiledDnsPolicy::compile(1, overlap),
-        Err(DnsCompileError::FakeDnsContainsBootstrap { .. })
+        Err(DnsCompileError::SyntheticCaptureContainsBootstrap { .. })
     ));
 }
 
@@ -352,5 +350,85 @@ fn duplicate_ids_matches_and_references_fail_closed() {
     assert!(matches!(
         CompiledDnsPolicy::compile(1, missing),
         Err(DnsCompileError::UnknownUpstream { .. })
+    ));
+}
+
+#[test]
+fn named_override_records_are_isolated_by_policy_attachment() {
+    let record = DnsOverrideRecordId::parse("private-router").expect("record ID");
+    let mut spec = base_spec();
+    spec.override_records = vec![DnsOverrideRecordSpec {
+        id: record.clone(),
+        domain: domain("router.lan"),
+        addresses: vec!["192.0.2.10".parse().expect("address")],
+    }];
+    spec.plans[1].override_records = vec![record.clone()];
+    let compiled = CompiledDnsPolicy::compile(1, spec).expect("policy-scoped record");
+    assert!(
+        compiled
+            .override_record_for_plan(&plan_id("public"), &domain("router.lan"))
+            .is_none()
+    );
+    assert_eq!(
+        compiled
+            .override_record_for_plan(&plan_id("lan"), &domain("router.lan"))
+            .expect("attached record")
+            .id(),
+        &record
+    );
+}
+
+#[test]
+fn duplicate_domains_are_rejected_only_within_one_policy() {
+    let first = DnsOverrideRecordId::parse("first").expect("record ID");
+    let second = DnsOverrideRecordId::parse("second").expect("record ID");
+    let mut spec = base_spec();
+    spec.override_records = vec![
+        DnsOverrideRecordSpec {
+            id: first.clone(),
+            domain: domain("shared.example"),
+            addresses: vec!["192.0.2.1".parse().expect("address")],
+        },
+        DnsOverrideRecordSpec {
+            id: second.clone(),
+            domain: domain("shared.example"),
+            addresses: vec!["192.0.2.2".parse().expect("address")],
+        },
+    ];
+    spec.plans[0].override_records = vec![first.clone()];
+    spec.plans[1].override_records = vec![second.clone()];
+    assert!(CompiledDnsPolicy::compile(1, spec.clone()).is_ok());
+    spec.plans[0].override_records.push(second);
+    assert!(matches!(
+        CompiledDnsPolicy::compile(1, spec),
+        Err(DnsCompileError::DuplicatePlanOverrideDomain { .. })
+    ));
+}
+
+#[test]
+fn only_active_synthetic_capture_pools_must_be_disjoint() {
+    let first = DnsSyntheticCaptureId::parse("first").expect("capture ID");
+    let second = DnsSyntheticCaptureId::parse("second").expect("capture ID");
+    let capture = |id| DnsSyntheticCaptureSpec {
+        id,
+        ipv4_pool: Some("198.18.0.0/24".parse().expect("pool")),
+        ipv6_pool: None,
+        max_entries: 32,
+        answer_ttl: Duration::from_secs(30),
+        recovery_ttl: Duration::from_secs(120),
+    };
+    let mut spec = base_spec();
+    spec.synthetic_captures = vec![capture(first.clone()), capture(second.clone())];
+    spec.plans[0].synthetic_capture = Some(first);
+    let mut route_only = DnsPlanSpec::new(plan_id("route-only"), vec![upstream_id("private")]);
+    route_only.synthetic_capture = Some(second);
+    spec.plans.push(route_only);
+    // The route-only policy is valid but inactive, so its overlap is inert.
+    let compiled = CompiledDnsPolicy::compile(1, spec).expect("inactive overlap");
+    assert!(compiled.activate(std::iter::empty::<&DnsPlanId>()).is_ok());
+    let route_only = plan_id("route-only");
+    assert!(matches!(
+        compiled.activate([&route_only]),
+        Err(DnsCompileError::OverlappingSyntheticCapturePools { .. })
     ));
 }

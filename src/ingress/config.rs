@@ -567,6 +567,13 @@ impl ProxyAuthConfig {
         self.users.len()
     }
 
+    /// Principals that can authenticate on this local proxy inbound. An empty
+    /// iterator means authentication is disabled and the runtime uses the
+    /// fixed `anonymous` principal instead.
+    pub(crate) fn principals(&self) -> impl ExactSizeIterator<Item = &PrincipalId> {
+        self.users.iter().map(LocalProxyUser::principal)
+    }
+
     pub fn authenticate(&self, username: &str, password: &str) -> Option<PrincipalId> {
         let mut matched = None;
         for (index, user) in self.users.iter().enumerate() {

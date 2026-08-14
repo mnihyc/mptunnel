@@ -82,6 +82,10 @@ impl SendStream {
     pub async fn reject(&mut self) -> Result<(), QuicCarrierError> {
         self.stream.reject().await
     }
+
+    pub fn cancel_pending_response(&mut self) -> bool {
+        self.stream.cancel_pending_response()
+    }
 }
 
 pub(super) struct QuicWriteTransaction {
@@ -146,6 +150,8 @@ pub struct RecvStream {
 #[derive(Debug)]
 pub(super) struct DatagramFlowRegistry {
     active: HashSet<DatagramFlowId>,
+    refused: HashSet<DatagramFlowId>,
+    refused_lru: VecDeque<DatagramFlowId>,
     // Sorted inclusive ranges of every flow ID observed on this request. The
     // allocator is monotonic, so ordinary churn coalesces into one range.
     // Sparse history is bounded and compacted fail-closed.
@@ -158,6 +164,7 @@ pub(super) struct DatagramFlowRegistry {
 enum DatagramFlowState {
     Unknown,
     Active,
+    Refused,
     Closed,
 }
 
@@ -184,6 +191,8 @@ impl DatagramFlowRegistry {
     pub(super) fn new(max_flows: usize) -> Self {
         Self {
             active: HashSet::new(),
+            refused: HashSet::new(),
+            refused_lru: VecDeque::new(),
             seen_ranges: Vec::new(),
             max_flows: max_flows.max(1),
             max_seen_ranges: max_flows.max(1),
@@ -193,6 +202,8 @@ impl DatagramFlowRegistry {
     fn state(&self, flow_id: DatagramFlowId) -> DatagramFlowState {
         if self.active.contains(&flow_id) {
             DatagramFlowState::Active
+        } else if self.refused.contains(&flow_id) {
+            DatagramFlowState::Refused
         } else if self.flow_was_seen(flow_id) {
             DatagramFlowState::Closed
         } else {
@@ -234,6 +245,18 @@ impl DatagramFlowRegistry {
     }
 
     fn validate_transitions(&self, frames: &[Frame]) -> Result<(), QuicCarrierError> {
+        self.validate_transitions_with_overflow(frames, false)
+    }
+
+    fn validate_received_transitions(&self, frames: &[Frame]) -> Result<(), QuicCarrierError> {
+        self.validate_transitions_with_overflow(frames, true)
+    }
+
+    fn validate_transitions_with_overflow(
+        &self,
+        frames: &[Frame],
+        allow_receive_overflow: bool,
+    ) -> Result<(), QuicCarrierError> {
         let mut touched = HashMap::<DatagramFlowId, DatagramFlowState>::new();
         let mut active = self.active.len();
         for frame in frames {
@@ -247,19 +270,25 @@ impl DatagramFlowRegistry {
                 .or_insert_with(|| self.state(flow_id));
             let next = match (state, opening) {
                 (DatagramFlowState::Unknown, true) => {
-                    if active >= self.max_flows {
+                    if active >= self.max_flows && !allow_receive_overflow {
                         return Err(QuicCarrierError::NativeDatagramFlowsExhausted);
                     }
+                    // The bounded reader channel may provisionally hold more
+                    // OPENs than the accepted-flow limit. Runtime policy is
+                    // authoritative and converts excess/denied candidates to
+                    // bounded refusals before accepting Product traffic.
                     active = active.saturating_add(1);
                     DatagramFlowState::Active
                 }
                 (DatagramFlowState::Active, true) => DatagramFlowState::Active,
-                (DatagramFlowState::Closed, true) => {
-                    return Err(QuicCarrierError::InvalidNativeDatagram(
-                        "closed HTTP Datagram flow cannot be reopened on the same request",
-                    ));
-                }
-                (DatagramFlowState::Active, false) | (DatagramFlowState::Closed, false) => {
+                (DatagramFlowState::Refused, true) => DatagramFlowState::Refused,
+                // Closed IDs include denial-cache evictions. A later OPEN is
+                // terminal and ignored by the receive side, not a reason to
+                // tear down the shared request stream.
+                (DatagramFlowState::Closed, true) => DatagramFlowState::Closed,
+                (DatagramFlowState::Active, false)
+                | (DatagramFlowState::Refused, false)
+                | (DatagramFlowState::Closed, false) => {
                     if state == DatagramFlowState::Active {
                         active = active.saturating_sub(1);
                     }
@@ -278,19 +307,84 @@ impl DatagramFlowRegistry {
 
     fn apply_transitions(&mut self, frames: &[Frame]) -> Result<(), QuicCarrierError> {
         self.validate_transitions(frames)?;
+        self.apply_validated_transitions(frames, false);
+        Ok(())
+    }
+
+    fn apply_received_transitions(&mut self, frames: &[Frame]) -> Result<(), QuicCarrierError> {
+        self.validate_received_transitions(frames)?;
+        self.apply_validated_transitions(frames, true);
+        Ok(())
+    }
+
+    fn apply_validated_transitions(&mut self, frames: &[Frame], _allow_receive_overflow: bool) {
         for frame in frames {
             match frame {
-                Frame::OpenDatagramFlow { flow_id, .. } => {
-                    self.active.insert(*flow_id);
-                    self.record_seen(*flow_id);
-                }
+                Frame::OpenDatagramFlow { flow_id, .. } => match self.state(*flow_id) {
+                    DatagramFlowState::Unknown => {
+                        self.record_seen(*flow_id);
+                        self.active.insert(*flow_id);
+                    }
+                    DatagramFlowState::Refused => self.touch_refused(*flow_id),
+                    DatagramFlowState::Active | DatagramFlowState::Closed => {}
+                },
                 Frame::DatagramClose { flow_id } => {
                     self.active.remove(flow_id);
+                    self.refused.remove(flow_id);
+                    self.refused_lru.retain(|current| current != flow_id);
                 }
                 _ => {}
             }
         }
+    }
+
+    fn retain_refusal(
+        &mut self,
+        flow_id: DatagramFlowId,
+        evicted: Option<DatagramFlowId>,
+        max_refusals: usize,
+    ) -> Result<(), QuicCarrierError> {
+        match self.state(flow_id) {
+            DatagramFlowState::Active | DatagramFlowState::Refused => {
+                self.active.remove(&flow_id);
+                self.refused.insert(flow_id);
+                self.touch_refused(flow_id);
+            }
+            // A terminal denial-cache eviction is never resurrected. The
+            // caller may still repeat its wire-visible refusal if it retained
+            // a stale runtime decision, but DATA remains ineligible.
+            DatagramFlowState::Closed => {}
+            DatagramFlowState::Unknown => {
+                return Err(QuicCarrierError::InvalidNativeDatagram(
+                    "DATAGRAM_CLOSE refusal did not match an open flow",
+                ));
+            }
+        }
+        if let Some(evicted) = evicted {
+            self.terminalize_refusal(evicted);
+        }
+        let capacity = max_refusals.min(self.max_flows);
+        self.bound_refusals(capacity);
         Ok(())
+    }
+
+    fn bound_refusals(&mut self, capacity: usize) {
+        while self.refused.len() > capacity {
+            let Some(evicted) = self.refused_lru.pop_front() else {
+                break;
+            };
+            self.refused.remove(&evicted);
+        }
+    }
+
+    fn touch_refused(&mut self, flow_id: DatagramFlowId) {
+        self.refused_lru.retain(|current| *current != flow_id);
+        self.refused_lru.push_back(flow_id);
+    }
+
+    fn terminalize_refusal(&mut self, flow_id: DatagramFlowId) {
+        self.refused.remove(&flow_id);
+        self.refused_lru.retain(|current| *current != flow_id);
     }
 }
 
@@ -479,6 +573,62 @@ async fn write_reliable_frames(
             .expect("native IP tunnel lock")
             .validate_transitions(frames)?;
     }
+    write_reliable_frame_bytes(send, frames, limits).await?;
+    if frames.iter().any(|frame| {
+        matches!(
+            frame,
+            Frame::OpenDatagramFlow { .. } | Frame::DatagramClose { .. }
+        )
+    }) {
+        send.known_datagram_flows
+            .lock()
+            .expect("HTTP Datagram flow lock")
+            .apply_transitions(frames)?;
+    }
+    if frames.iter().any(|frame| {
+        matches!(
+            frame,
+            Frame::OpenIpTunnel { .. } | Frame::IpTunnelReady { .. } | Frame::IpTunnelClose { .. }
+        )
+    }) {
+        send.known_ip_tunnel
+            .lock()
+            .expect("native IP tunnel lock")
+            .apply_transitions(frames)?;
+    }
+    Ok(())
+}
+
+/// Writes a flow-local refusal while retaining enough request-stream state to
+/// accept an already-in-flight duplicate OPEN and repeat the refusal.
+pub async fn write_datagram_refusal(
+    send: &mut SendStream,
+    flow_id: DatagramFlowId,
+    evicted: Option<DatagramFlowId>,
+    max_refusals: usize,
+    limits: CodecLimits,
+) -> Result<(), QuicCarrierError> {
+    retain_datagram_denial(send, flow_id, evicted, max_refusals)?;
+    write_reliable_frame_bytes(send, &[Frame::DatagramClose { flow_id }], limits).await
+}
+
+pub fn retain_datagram_denial(
+    send: &mut SendStream,
+    flow_id: DatagramFlowId,
+    evicted: Option<DatagramFlowId>,
+    max_refusals: usize,
+) -> Result<(), QuicCarrierError> {
+    send.known_datagram_flows
+        .lock()
+        .expect("HTTP Datagram flow lock")
+        .retain_refusal(flow_id, evicted, max_refusals)
+}
+
+async fn write_reliable_frame_bytes(
+    send: &mut SendStream,
+    frames: &[Frame],
+    limits: CodecLimits,
+) -> Result<(), QuicCarrierError> {
     let delivery_evidence_bytes = frames.iter().fold(0_u64, |total, frame| {
         total.saturating_add(frame.delivery_evidence_bytes())
     });
@@ -516,28 +666,6 @@ async fn write_reliable_frames(
         return Err(err);
     }
     transaction.complete();
-    if frames.iter().any(|frame| {
-        matches!(
-            frame,
-            Frame::OpenDatagramFlow { .. } | Frame::DatagramClose { .. }
-        )
-    }) {
-        send.known_datagram_flows
-            .lock()
-            .expect("HTTP Datagram flow lock")
-            .apply_transitions(frames)?;
-    }
-    if frames.iter().any(|frame| {
-        matches!(
-            frame,
-            Frame::OpenIpTunnel { .. } | Frame::IpTunnelReady { .. } | Frame::IpTunnelClose { .. }
-        )
-    }) {
-        send.known_ip_tunnel
-            .lock()
-            .expect("native IP tunnel lock")
-            .apply_transitions(frames)?;
-    }
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.write_frames_wait",
@@ -663,7 +791,7 @@ impl RecvStream {
         let _ = self.read_buffer.split_to(FRAME_LEN_BYTES);
         let encoded = self.read_buffer.split_to(len).freeze();
         let frame = decode_frame_bytes(encoded, limits)?;
-        self.accept_reliable_frame(frame).map(Some)
+        self.accept_reliable_frame(frame)
     }
 
     fn pop_pending_h3_frame(
@@ -673,10 +801,27 @@ impl RecvStream {
         let Some(frame) = decode_ready_h3_frame(&mut self.pending_h3_data, limits)? else {
             return Ok(None);
         };
-        self.accept_reliable_frame(frame).map(Some)
+        self.accept_reliable_frame(frame)
     }
 
-    fn accept_reliable_frame(&mut self, frame: Frame) -> Result<Frame, QuicCarrierError> {
+    fn accept_reliable_frame(&mut self, frame: Frame) -> Result<Option<Frame>, QuicCarrierError> {
+        let suppress = match &frame {
+            Frame::OpenDatagramFlow { flow_id, .. } => {
+                self.known_datagram_flows
+                    .lock()
+                    .expect("HTTP Datagram flow lock")
+                    .state(*flow_id)
+                    == DatagramFlowState::Closed
+            }
+            Frame::DatagramFeedback { flow_id, .. } => {
+                self.known_datagram_flows
+                    .lock()
+                    .expect("HTTP Datagram flow lock")
+                    .state(*flow_id)
+                    != DatagramFlowState::Active
+            }
+            _ => false,
+        };
         if matches!(
             frame,
             Frame::OpenDatagramFlow { .. } | Frame::DatagramClose { .. }
@@ -684,7 +829,7 @@ impl RecvStream {
             self.known_datagram_flows
                 .lock()
                 .expect("HTTP Datagram flow lock")
-                .apply_transitions(std::slice::from_ref(&frame))?;
+                .apply_received_transitions(std::slice::from_ref(&frame))?;
         }
         if matches!(
             frame,
@@ -700,7 +845,7 @@ impl RecvStream {
             Frame::IpTunnelClose { tunnel_id, .. } => self.purge_deferred_ip_packets(*tunnel_id),
             _ => {}
         }
-        Ok(frame)
+        Ok((!suppress).then_some(frame))
     }
 
     fn pop_ready_native(&mut self) -> Option<Frame> {
@@ -734,7 +879,7 @@ impl RecvStream {
             {
                 DatagramFlowState::Active => NativeFrameState::Ready,
                 DatagramFlowState::Unknown => NativeFrameState::Pending,
-                DatagramFlowState::Closed => NativeFrameState::Closed,
+                DatagramFlowState::Refused | DatagramFlowState::Closed => NativeFrameState::Closed,
             },
             Frame::IpPacket { tunnel_id, .. } => match self
                 .known_ip_tunnel

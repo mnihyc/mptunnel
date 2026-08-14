@@ -190,6 +190,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             "packaging/README.md",
             "packaging/service/systemd/mptunnel.service",
             "examples/client.toml",
+            "examples/config.reference.toml",
             "examples/server.toml",
         )
         for relative in required_sources:

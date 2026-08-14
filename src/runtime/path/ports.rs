@@ -16,6 +16,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +80,94 @@ pub(in crate::runtime) enum ServerDatagramSendOutcome {
     Accepted,
     Full,
     Closed,
+}
+
+/// Stable result retained for a denied datagram flow ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ServerDatagramTombstone {
+    Reject,
+    Drop,
+    CapacityReject,
+}
+
+/// A carrier-local, independently bounded LRU of non-accepted datagram opens.
+///
+/// Tombstones never occupy accepted-flow slots. Remembering them makes a
+/// retransmitted OPEN deterministic while keeping attacker-controlled flow
+/// IDs bounded by the same configured per-session cardinality.
+pub(in crate::runtime) struct ServerDatagramTombstoneCache {
+    capacity: usize,
+    entries: HashMap<crate::protocol::DatagramFlowId, ServerDatagramTombstone>,
+    lru: VecDeque<crate::protocol::DatagramFlowId>,
+}
+
+impl ServerDatagramTombstoneCache {
+    pub(in crate::runtime) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    pub(in crate::runtime) fn get(
+        &mut self,
+        flow_id: crate::protocol::DatagramFlowId,
+    ) -> Option<ServerDatagramTombstone> {
+        let tombstone = self.entries.get(&flow_id).copied()?;
+        self.lru.retain(|current| *current != flow_id);
+        self.lru.push_back(flow_id);
+        Some(tombstone)
+    }
+
+    pub(in crate::runtime) fn insert(
+        &mut self,
+        flow_id: crate::protocol::DatagramFlowId,
+        tombstone: ServerDatagramTombstone,
+    ) {
+        let _ = self.insert_with_eviction(flow_id, tombstone);
+    }
+
+    pub(in crate::runtime) fn insert_with_eviction(
+        &mut self,
+        flow_id: crate::protocol::DatagramFlowId,
+        tombstone: ServerDatagramTombstone,
+    ) -> Option<crate::protocol::DatagramFlowId> {
+        if self.capacity == 0 {
+            return Some(flow_id);
+        }
+        if self.entries.insert(flow_id, tombstone).is_some() {
+            self.lru.retain(|current| *current != flow_id);
+            self.lru.push_back(flow_id);
+            return None;
+        }
+        self.lru.push_back(flow_id);
+        let mut evicted = None;
+        while self.entries.len() > self.capacity {
+            let Some(evicted_id) = self.lru.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&evicted_id).is_some() {
+                debug_assert!(evicted_id != flow_id);
+                evicted = Some(evicted_id);
+            }
+        }
+        evicted
+    }
+
+    pub(in crate::runtime) fn remove(&mut self, flow_id: crate::protocol::DatagramFlowId) {
+        self.entries.remove(&flow_id);
+        self.lru.retain(|current| *current != flow_id);
+    }
+
+    pub(in crate::runtime) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Accepted target worker plus the higher-layer accounting it keeps alive.
@@ -151,16 +240,29 @@ impl std::fmt::Debug for AcceptedServerDatagramFlow {
 
 /// Target-open failure plus any registered flow accounting awaiting close.
 pub(in crate::runtime) struct ServerDatagramOpenError {
-    error: RuntimeError,
+    failure: ServerDatagramOpenFailure,
+}
+
+pub(in crate::runtime) enum ServerDatagramOpenFailure {
+    Capacity,
+    Runtime(RuntimeError),
 }
 
 impl ServerDatagramOpenError {
     pub(in crate::runtime) fn new(error: RuntimeError) -> Self {
-        Self { error }
+        Self {
+            failure: ServerDatagramOpenFailure::Runtime(error),
+        }
     }
 
-    pub(in crate::runtime) fn into_error(self) -> RuntimeError {
-        self.error
+    pub(in crate::runtime) fn capacity() -> Self {
+        Self {
+            failure: ServerDatagramOpenFailure::Capacity,
+        }
+    }
+
+    pub(in crate::runtime) fn into_failure(self) -> ServerDatagramOpenFailure {
+        self.failure
     }
 }
 
@@ -168,7 +270,13 @@ impl std::fmt::Debug for ServerDatagramOpenError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServerDatagramOpenError")
-            .field("error", &self.error)
+            .field(
+                "kind",
+                &match &self.failure {
+                    ServerDatagramOpenFailure::Capacity => "capacity",
+                    ServerDatagramOpenFailure::Runtime(_) => "runtime",
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -428,6 +536,18 @@ pub(in crate::runtime) enum ServerStreamOpenOutcome {
     Existing(TrafficClass),
     DuplicateLiveIgnored,
     Rejected,
+    Dropped,
+}
+
+/// Policy result for one logical Product target.
+///
+/// Unlike a runtime or protocol error, rejection and silent drop are scoped
+/// to the requested flow and must never fail its shared carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ServerTargetAdmission {
+    Allow,
+    Reject,
+    Drop,
 }
 
 pub(in crate::runtime) enum ServerStreamFrameRoute {
@@ -528,8 +648,9 @@ pub(in crate::runtime) struct ServerStreamPort {
     target_admission: Arc<ServerStreamTargetAdmission>,
 }
 
-pub(in crate::runtime) type ServerStreamTargetAdmission =
-    dyn Fn(&PrincipalPermit, &TargetAddr) -> Result<(), RuntimeError> + Send + Sync;
+pub(in crate::runtime) type ServerStreamTargetAdmission = dyn Fn(&PrincipalPermit, &TargetAddr) -> Result<ServerTargetAdmission, RuntimeError>
+    + Send
+    + Sync;
 
 impl std::fmt::Debug for ServerStreamPort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -545,7 +666,7 @@ impl ServerStreamPort {
         Self {
             backend,
             owner_token,
-            target_admission: Arc::new(|_, _| Ok(())),
+            target_admission: Arc::new(|_, _| Ok(ServerTargetAdmission::Allow)),
         }
     }
 
@@ -562,7 +683,7 @@ impl ServerStreamPort {
         &self,
         path_registration: &ServerCarrierPathRegistration,
         target: &TargetAddr,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<ServerTargetAdmission, RuntimeError> {
         if !path_registration.belongs_to(self) {
             return Err(RuntimeError::Protocol(
                 "reliable path registration does not match stream service",
@@ -651,6 +772,11 @@ impl ServerStreamPort {
             return Err(RuntimeError::Protocol(
                 "reliable path registration does not match stream service or session",
             ));
+        }
+        match self.validate_target(&request.attachment.path_registration, &request.target)? {
+            ServerTargetAdmission::Allow => {}
+            ServerTargetAdmission::Reject => return Ok(ServerStreamOpenOutcome::Rejected),
+            ServerTargetAdmission::Drop => return Ok(ServerStreamOpenOutcome::Dropped),
         }
         self.backend
             .open_or_attach(request, new_stream_policy)

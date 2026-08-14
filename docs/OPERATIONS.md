@@ -58,14 +58,12 @@ egress socket classes on system behavior and are not valid for a catch-all
 embedded VPN. `run_with_all_host_providers` remains an advanced seam for hosts
 that deliberately own separate adapters.
 
-## Service mode
+## Runtime supervision
 
 ```bash
-mptunnel --service-mode --supervise ...
+mptunnel --supervise ...
 ```
 
-`--service-mode` declares process intent. It does not install or register a
-systemd unit, launchd job, Windows SCM service, or Android component.
 `--supervise` restarts failed runtime generations with bounded exponential
 backoff.
 
@@ -165,7 +163,7 @@ mptunnel --config ./config.toml --check-config
 mptunnel --config ./config.toml
 ```
 
-The graph contains explicitly named `[[inbounds]]`, `[[outbounds]]`, and
+The configuration contains explicitly named `[[inbounds]]`, `[[outbounds]]`, and
 optional `[[routing.balancers]]`. Every configured resource name is canonical
 lowercase ASCII. Configured-resource references use the selected resource noun:
 `inbounds`, `outbound`, `balancer`, or `dns_policy`. The `_id` suffix is
@@ -175,8 +173,9 @@ is an application or active-probe destination; a listen address accepts local
 traffic; and `endpoint` is a proxy connector or MPP carrier URI. A DNS server
 defines the protocol, literal connection address, TLS identity, HTTP path, and
 optional routed outbound. A DNS policy selects servers, address-family and
-security behavior, query limits, and cache behavior. A DNS record is an exact
-local answer. DNS override is synthetic captured-address recovery.
+security behavior, query limits, cache behavior, named static
+`override_records`, and at most one named `synthetic_capture`. Those
+attachments apply only when that policy is selected.
 MPP security and named carrier paths belong to each MPP inbound/outbound
 rather than to a global path role.
 
@@ -195,44 +194,117 @@ certificate. Shipped configurations set `transport_secret` to one exact
 32-byte endpoint-wide secret shared by the two peers; it is optional and is not
 an MPP client credential.
 
+Every L4 inbound, including an MPP listener, enters one ordered
+`[[routing.rules]]` table. The first matching rule wins. A normal rule names
+exactly one `outbound` or `balancer`, which implies ordinary allow; a final
+catch-all is optional because unmatched traffic rejects. Omitted `inbounds` or
+`principal_ids` means any, and scalar `"*"` is the equivalent explicit form.
+Concrete selector names must exist and be reachable from that rule.
+Unauthenticated local proxy, fixed-forward, and TUN-L4 flows use principal
+`anonymous`; authenticated proxy users and MPP peers use their configured
+principal IDs.
+
+A route-selected `dns_policy` is an instruction to resolve and authorize at
+this node, even when the chosen SOCKS5, HTTP CONNECT, HTTPS CONNECT, or MPP
+outbound could carry the domain unchanged. Such a selector must be available
+before resolution: omit `stages` or include `pre-resolution`; a
+post-resolution-only rule or a rule requiring destination-address evidence
+cannot select it. Without an IP-dependent match or route `dns_policy`, a
+domain-capable next hop owns resolution of a delegated domain.
+
+When MPTUNNEL has or resolves a literal address, ordinary allow does not
+authorize loopback, private, link-local, metadata, multicast, or unspecified
+destinations. A domain delegated unchanged is resolved at its next hop. To
+reach an internal network, put a narrow rule before the broader route, match
+the required inbound, principal, CIDR, port, and network, then set
+`decision = "allow-restricted"` and the intended egress. `decision = "reject"`
+returns the normal flow-local refusal;
+`drop` sends no proxy status or MPP frame (a QUIC request is transport-cancelled
+to release its stream). In both cases sibling flows and the shared carrier stay
+alive. MPP inbounds use this same table and may select only a non-MPP outbound
+or a balancer with no MPP member, so an inbound MPP flow cannot chain into
+another MPP outbound.
+
+When one domain returns several addresses, each address is checked against the
+same ordered rules. Public addresses selected by reject/drop rules are omitted
+when another allowed address remains. A private or special-use address selected
+by an ordinary allow rule fails the complete answer; it is never silently
+filtered into a weaker result. If nothing is allowed, drop takes precedence
+over reject.
+
 `tcp-forward`, `udp-forward`, and `mixed-forward` local inbounds require
 explicit non-zero listeners and one canonical `target`; `mixed-forward` binds
 both transports on every listed address. TCP overload is closed immediately at
 `max_connections`; UDP silently drops new sources at `max_associations`,
 expires source associations at `idle_timeout_ms`, and bounds each datagram by
-`datagram_ttl_ms`. All three use the ordinary route/DNS/ACL/outbound/balancer
+`datagram_ttl_ms`. All three use the ordinary route/DNS/outbound/balancer
 path; they do not dial around configured outbounds.
 
-`forwarding_mode` is a root setting for the complete runtime generation.
-Omitting it selects `l4`, which preserves SOCKS5, HTTP CONNECT, mixed proxy,
-fixed port forwarding, `protocol = "tun"`, and ordinary MPP server forwarding. L4 rejects
-all TUN-L3 configuration. Explicit `forwarding_mode = "l3"` is experimental;
-it requires at least one TUN-L3 client or server service, rejects every local
-L4 inbound, and requires each MPP server inbound to define its L3 address plan.
-A mode change is applied only by validated generation replacement, never as an
-in-place data-plane adjustment. Both TUN-L4 and TUN-L3 remain experimental.
+The inbound protocols determine the forwarding family. SOCKS5, HTTP CONNECT,
+mixed proxy, fixed port forwarding, `tun`, and `mpp` are L4. Experimental
+`tun-l3` and `mpp-l3` are L3. One document cannot mix the two families, and no
+separate mode switch is required. L4 requires an explicit `[routing]` section;
+L3 forbids it. Both TUN-L4 and TUN-L3 remain experimental.
 
-In L3 mode, `protocol = "tun-l3"` is the raw IP-tunnel ingress. It selects exactly one MPP
+`protocol = "tun-l3"` is the raw IP-tunnel ingress. It selects exactly one MPP
 outbound and receives its IPv4 and/or IPv6 host address from that MPP server's
 authenticated principal allocation. The server configures pools, its own TUN
-addresses, and explicit principal allocations under `[inbounds.tun_l3]`;
+addresses, and explicit principal allocations on a `protocol = "mpp-l3"`
+inbound under `[inbounds.tun_l3]`;
 `allowed_ips` adds externally routed prefixes owned by that principal. This
-packet plane does not use Product routing, DNS, destination ACLs, target
+packet plane does not use L4 routing, DNS, target
 outbounds, or the TUN-L4 userspace TCP/UDP stack. Carrier endpoint names still
 use normal carrier resolution; inner packet destinations do not. Operators
 remain responsible for host routes, IP forwarding, DNS, firewall rules, and
-NAT on both ends. TCP and QUIC carrier paths are both eligible.
+NAT on both ends. TCP and QUIC carrier paths are both eligible. A given MPP
+outbound may be selected by only one `tun-l3` inbound.
 
-The nested server address plan belongs only to L3 mode. Reliable-stream and
-application-datagram forwarding opens are rejected before they can enter the
-server's L4 egress services. L3 transport policy is isolated from the default
-L4 forwarding family.
+The nested server address plan belongs only to an `mpp-l3` inbound. Each
+configured family requires a pool and usable server address, and the plan
+requires at least one pool and allocation. Every allocation names an active
+accepted principal and supplies at least one usable, unique address in its
+pool. Addresses and `allowed_ips` cannot overlap ownership across principals or
+contain a server address. MTU defaults to 1500, with minimum 576 and 1280 when
+IPv6 is configured. L4 TCP/UDP opens are rejected before they can enter the
+server's egress services.
 
 One authenticated principal has one live logical IP tunnel per MPP inbound. A
 new session for the same principal supersedes the previous tunnel attachments;
 this provides locator-independent restart and roaming rather than deriving
 identity from a source address. See `examples/config.reference.toml` for the
 complete commented shape.
+
+### Migrating a 0.3 configuration
+
+Version 0.4 is a clean configuration break; removed fields are rejected rather
+than guessed. Apply these mechanical changes before validation:
+
+- Remove root `forwarding_mode`. L4 is inferred from ordinary inbound
+  protocols; an L3 server uses `protocol = "mpp-l3"` and an L3 client uses
+  `tun-l3`. Do not mix L3 and L4 inbounds.
+- Remove `[routing].generation`. Reload identity is runtime state, not an
+  operator setting.
+- Replace `action = "outbound"` or `"balancer"` with the corresponding
+  `outbound` or `balancer` field alone. Rename terminal `action = "reject"` or
+  `"drop"` to `decision`. A final catch-all is optional; unmatched traffic
+  rejects.
+- Delete both destination-ACL blocks. Move their match selectors into the one
+  ordered routing table. A private/special-use exception uses
+  `decision = "allow-restricted"` plus its outbound or balancer.
+- Remove `outbound`, `balancer`, and `dns_policy` from an MPP inbound. Central
+  routing now makes those choices for local and MPP L4 traffic alike.
+- Replace global `[[dns.records]]` and `[dns.override]` with named
+  `[[dns.override_records]]` and `[[dns.synthetic_capture]]` definitions, then
+  attach their names to each intended DNS policy. There is no global record or
+  capture fallback.
+- Use `peer_diagnostics_principal_ids` on an MPP inbound for per-principal
+  permission. The management-global switch remains an unconditional override.
+- Remove `[service].service_mode`; it only emitted intent and never installed
+  or changed a host service. Run MPTUNNEL under the platform supervisor instead.
+- Update management clients from `/api/v3/` to `/api/v4/`.
+
+Run `mptunnel --config ./config.toml --check-config` after migration. Unknown
+or mixed-version fields fail with a configuration error.
 
 Balancer strategies are `manual`, `ordered-failover`, `round-robin`, `random`,
 `weighted-random`, `least-latency`, and `least-load`. Members may start
@@ -242,6 +314,11 @@ capacity. Active probes require a literal IP TCP target and run under one
 process-wide concurrency bound. Least-latency uses only fresh end-to-end
 observations, while least-load uses active-flow leases. Neither
 strategy reads MPP carrier/path metrics.
+
+Any local L4 inbound may select a balancer. A route reachable from an MPP
+inbound may select a balancer only when none of its members is MPP. Balancers
+cannot nest and select one member outbound per new flow; separate MPP members
+retain independent sessions and carriers rather than merging them.
 
 Each selected local TCP or native UDP member receives its configured outbound
 connect timeout, and an MPP TCP member receives its MPP stream-open timeout. A
@@ -265,28 +342,43 @@ belong to the outbound that performs resolution and connection.
 
 DNS server protocols are `system`, `udp`, `tcp`, `udp-tcp`, `dot`, `doh`, and
 `doq`. A system server delegates to the operating system and accepts no other
-connection fields. Every network server uses `address = "<literal-IP>:<port>"`;
-this is the socket to contact, not a name that requires another DNS lookup.
+connection fields. Every network server uses a usable unicast
+`address = "<literal-IP>:<nonzero-port>"`; unspecified, multicast, and IPv4
+broadcast addresses are rejected. This is the socket to contact, not a name
+that requires another DNS lookup.
 DoT and DoQ also require `tls_name`; DoH requires both `tls_name` and `path`.
 The TLS name authenticates the DNS service and is also the HTTPS authority for
-DoH. An optional `outbound` routes supported DNS transports through a named
-outbound without changing the server's identity.
+DoH. A DoH path is 1..=256 visible-ASCII bytes, begins with one `/` (not `//`),
+and contains no `?`, `#`, or backslash. An optional `outbound` routes supported
+DNS transports through a named outbound without changing the server's identity;
+omission uses the built-in direct connection.
 
 A `[[dns.policies]]` entry names its ordered `servers`, address `family`,
 `security`, server-selection `strategy`, optional answer allowlist
 `answer_cidrs`, and grouped `query` and `cache` limits. `ordered` advances on a
 transport/server failure but treats a negative DNS response as authoritative.
-`race` requires `fallback_ms`; zero starts all servers immediately. Exact DNS
+`race` requires at least two servers and `fallback_ms`; zero starts all servers
+immediately, and the delay cannot exceed `query.timeout_ms`. `ipv4-only` and
+`ipv6-only` query and return only that family. A `*-then-*` policy queries its
+second family only when the preferred query returns no addresses and is not
+NXDOMAIN; a `*-and-*` policy queries both and returns the preferred family
+first. `query.timeout_ms` is the complete deadline for each A or AAAA lookup
+across that policy's servers. Exact DNS
 rules win before the longest suffix rule, and an unmatched query uses
 `[dns].default`. Omitting the entire `[dns]` section creates a system server and
 a policy named `default` with the documented defaults.
 
-`[[dns.records]]` supplies exact immutable domain-to-address answers.
-`[dns.override]` is separate: it allocates bounded synthetic A/AAAA answers only
-for captured DNS traffic and recovers the original domain when that synthetic
-address is opened. Ordinary dial-time resolution always asks the selected DNS
-policy for real addresses. See `examples/config.reference.toml` for every
-field, protocol form, limit, and default.
+`[[dns.override_records]]` defines named exact domain-to-address answers.
+`[[dns.synthetic_capture]]` defines named bounded pools for captured A/AAAA
+answers. Definitions have no effect until a named DNS policy lists their IDs in
+`override_records` or selects one `synthetic_capture`. An attached override
+wins before capture and applies to ordinary MPTUNNEL resolution and managed DNS
+listeners. Synthetic answers are produced only for queries received on managed
+`dns_listeners`; ordinary resolution never synthesizes. Every synthetic lease
+records its configuration generation, policy, and capture. A recovered flow
+keeps that policy when its route omits `dns_policy`; a route naming another
+policy is rejected. See `examples/config.reference.toml` for every field and
+protocol form, with operator-facing defaults and bounds.
 
 External/manual TUN uses `dns_redirects` (CLI `--tun-dns-redirect`) for explicit
 UDP port-53 destination sockets; the corresponding environment variable is
@@ -301,6 +393,15 @@ The simple server profile uses repeatable `--outbound-dns-server`,
 `--outbound-dns-protocol system|udp-tcp`, `--outbound-dns-family`, and
 `--outbound-dns-timeout-ms` (with the matching `MPTUNNEL_OUTBOUND_DNS_*`
 variables); use TOML for the complete seven-protocol model.
+
+External `dns_redirects` only forward UDP port 53 to the listed resolver
+sockets; they do not serve local override or synthetic answers. Managed mode
+requires every active DNS policy to be encrypted and non-system. Full mode also
+requires at least one `dns_listeners` address; at most one managed TUN inbound
+is allowed. Listener IPs must be usable, use a configured TUN address family,
+and remain outside `exclude_cidrs`. In managed mode `dns_ttl_ms` caps returned
+DNS TTLs; in external mode it bounds redirected UDP associations.
+`local_lan = true` bypasses directly connected LAN prefixes outside the tunnel.
 
 `[session].retention_timeout_ms` and
 `--session-retention-timeout-ms` set the absolute time an established logical
@@ -333,7 +434,8 @@ TCP carrier, proxy, DoT, and DoH endpoints receive only a bounded connect
 probe; application destinations are never probed. Domain endpoints never use
 host/system DNS during doctor: they are reported as skipped because configured
 runtime DNS and routing own resolution and connection setup. A configured
-routed or source-bound literal endpoint is not dialled outside its owner.
+routed or source-bound literal endpoint is not dialled because a doctor probe
+would bypass its selected outbound or source binding.
 A ranged outbound carrier endpoint is likewise reported as `INFO` and skipped:
 probing one concrete port cannot validate an externally published range, and
 runtime carrier selection remains authoritative.
@@ -373,12 +475,14 @@ mptunnel --config ./config.toml --principal-id local-user route explain \
 ```
 
 Omitting `--resolved-ip` evaluates the pre-resolution stage. Supplying it
-evaluates post-resolution policy. Route explanation accepts only attributes
-that every live ingress supplies: destination, resolved IP, network, source,
-principal, and inbound. Output separately identifies the pre-resolution rule
-and DNS policy that owned resolution, then the selected stage rule, action,
-outbound or balancer, initial demand, every rule's first mismatch, and the
-ID/publisher/revision/expiry/hash of each consulted signed rule set.
+evaluates post-resolution policy. Supply `--source` for a local inbound; omit
+it for an MPP inbound, where the peer has no meaningful local source socket.
+Source-constrained rules do not match when source is unavailable. Output
+identifies the DNS policy and exact/default/suffix/route selector that owned
+resolution, then the selected rule, decision, outbound or balancer, restricted
+address authorization, initial demand, every rule's first mismatch, and the
+ID/publisher/revision/expiry/hash of each consulted signed rule set. If no
+configured rule matches, it reports `rule: none` and `outcome: unmatched`.
 
 Runtime status and DNS operations use only the authenticated versioned API:
 
@@ -413,7 +517,10 @@ policy changes them. `initial-srtt-ms`, `initial-rttvar-ms`, and the
 replace; the initial rate defaults to unknown. `source-address` selects a TCP or
 QUIC client source IP; `max-datagram-payload-bytes` is QUIC-client-only;
 `max-tcp-carriers` is TCP-client-only; and `port-rotation-interval-ms` requires
-a ranged client endpoint. The reference
+a ranged client endpoint. MPP listener paths use one fixed port. They may use
+the `initial-*` and scheduling boolean options; TCP listeners may also use
+`allow-datagrams`. Source binding, datagram-payload limits, TCP carrier counts,
+port rotation, and port ranges are rejected on listeners. The reference
 configuration defines every range, default, and complete example.
 
 A configured path `name` is its stable endpoint-local path identity. The
@@ -449,68 +556,68 @@ example `token = { from = "file", path = "management-token.key" }` or
 file/environment flags. Inline values are plaintext-equivalent configuration
 content; they remain absent from diagnostics and management projections.
 
-All data and controls are authenticated under `/api/v3/`:
+All data and controls are authenticated under `/api/v4/`:
 
-- `GET /api/v3/` returns the endpoint index with
-  `mptunnel.management.v3`.
-- `GET /api/v3/health`, `GET /api/v3/health/live`, and
-  `GET /api/v3/health/ready` return `mptunnel.health.v3`. The latter two gate
+- `GET /api/v4/` returns the endpoint index with
+  `mptunnel.management.v4`.
+- `GET /api/v4/health`, `GET /api/v4/health/live`, and
+  `GET /api/v4/health/ready` return `mptunnel.health.v4`. The latter two gate
   terminal generation failure and serving readiness respectively.
-- `GET /api/v3/status` returns the complete cached
-  `mptunnel.management.v3` snapshot, including sanitized Product inbound and
+- `GET /api/v4/status` returns the complete cached
+  `mptunnel.management.v4` snapshot, including sanitized inbound and
   outbound inventory plus a separate TUN-L3 service inventory. Credentials,
   address pools, allocation contents and identities, and native proxy connector
   endpoints are absent; configured MPP carrier endpoints are present in the
   authenticated local path inventory.
-- `GET /api/v3/paths` returns configured named paths and live carrier
+- `GET /api/v4/paths` returns configured named paths and live carrier
   instances with their lifecycle state.
-- `GET /api/v3/traffic` returns monotonic forwarded totals, one-second rates,
+- `GET /api/v4/traffic` returns monotonic forwarded totals, one-second rates,
   and five minutes of one-second trend samples.
-- `GET /api/v3/sessions` returns authenticated MPP session ownership.
-- `GET /api/v3/flows` returns bounded active reliable/datagram logical-flow
+- `GET /api/v4/sessions` returns authenticated MPP session ownership.
+- `GET /api/v4/flows` returns bounded active reliable/datagram logical-flow
   detail, including the origin inbound, application target, selected outbound,
   and optional balancer.
-- `GET /api/v3/diagnostics` returns local diagnostic capability, peer session
+- `GET /api/v4/diagnostics` returns local diagnostic capability, peer session
   references, controls, and path state.
-- `GET /api/v3/config` returns `mptunnel.config.v3` with the canonical path,
+- `GET /api/v4/config` returns `mptunnel.config.v4` with the canonical path,
   desired, active, runtime, and pending revisions, mutation endpoints, and
   required precondition. It never returns TOML or resolved secrets.
-- `GET /api/v3/balancers` returns `mptunnel.balancer.v3` with named balancer
+- `GET /api/v4/balancers` returns `mptunnel.balancer.v4` with named balancer
   and outbound-member readiness, freshness, load, observations, probes,
   circuit state, and counters.
-- `GET /api/v3/dns/status` returns `mptunnel.dns.status.v3` with DNS
+- `GET /api/v4/dns/status` returns `mptunnel.dns.status.v4` with DNS
   generation, policy, cache, in-flight query, server, and override state.
-- `GET /api/v3/dns/explain?domain=<domain>` returns
-  `mptunnel.dns.explain.v3` without issuing a query.
-- `POST /api/v3/actions/path` accepts exactly
+- `GET /api/v4/dns/explain?domain=<domain>` returns
+  `mptunnel.dns.explain.v4` without issuing a query.
+- `POST /api/v4/actions/path` accepts exactly
   `{ "outbound": "...", "path": "...", "state": "..." }`; `state` is
   `enabled`, `suspect`, `failed`, or `disabled`.
-- `POST /api/v3/diagnostics/peer` accepts exactly
+- `POST /api/v4/diagnostics/peer` accepts exactly
   `{ "service": "mpp_outbound", "service_name": "...", "session_id": "..." }`
   or the corresponding `mpp_inbound` service.
-- `POST /api/v3/config/validate` accepts one bounded UTF-8
+- `POST /api/v4/config/validate` accepts one bounded UTF-8
   `application/toml` document, validates it and its referenced material, and
   returns its revision without writing or reloading.
-- `POST /api/v3/config/apply` accepts the same complete document and exactly
-  one `If-Match: sha256:...` revision from `GET /api/v3/config`. It persists
+- `POST /api/v4/config/apply` accepts the same complete document and exactly
+  one `If-Match: sha256:...` revision from `GET /api/v4/config`. It persists
   only when the desired revision still matches.
-- `POST /api/v3/balancers/actions` accepts exactly `balancer`, `action`, and,
+- `POST /api/v4/balancers/actions` accepts exactly `balancer`, `action`, and,
   except for `automatic`, `outbound`. Actions are `enable-member`,
   `drain-member`, `disable-member`, `pin-member`, and `automatic`; responses
-  use `mptunnel.balancer.v3`.
-- `POST /api/v3/dns/query` accepts exactly
+  use `mptunnel.balancer.v4`.
+- `POST /api/v4/dns/query` accepts exactly
   `{ "domain": "...", "type": "..." }` and returns
-  `mptunnel.dns.query.v3`.
-- `POST /api/v3/dns/cache/flush` accepts `{}` or
-  `{ "policy": "..." }` and returns `mptunnel.dns.flush.v3`.
+  `mptunnel.dns.query.v4`.
+- `POST /api/v4/dns/cache/flush` accepts `{}` or
+  `{ "policy": "..." }` and returns `mptunnel.dns.flush.v4`.
 
 Every `service_index` in a response is presentation-only. Mutations select
 stable configured names (`outbound`, `path`, `balancer`, and `service_name`)
 plus the protocol `session_id`; they never accept an index.
 
 Configuration mutation is deliberately full-document only: there is no
-`PATCH`, field update, history, or diff API. Process logging and inbound
-credential-authority changes may publish live when they are the complete
+`PATCH`, field update, history, or diff API. Process logging and changes to an
+inbound's accepted credentials may publish live when they are the complete
 change. A changed logging sink is prepared inside the serialized apply
 transaction after the document is staged; preparation failure rolls the
 document back before the active runtime is changed or a reload is requested.
@@ -530,7 +637,7 @@ process restart re-reads material at unchanged paths. Credential principal or
 secret rotation uses a new credential ID so overlap and retirement remain
 explicit.
 
-Persistence is activation-safe. A newly persisted document remains pending
+Configuration replacement is crash-recoverable. A newly persisted document remains pending
 while the prior active document is the durable last-good configuration. The
 candidate becomes last-good only after every required service in its
 generation reports ready. Failure before readiness rolls back the canonical
@@ -557,24 +664,29 @@ Tokens must contain 16-256 visible ASCII characters. The server rejects
 duplicate authorization/content-type headers, transfer encoding, ambiguous
 content lengths, pipelining, and non-origin request targets.
 
-Forwarded totals come from one generation-owned forwarding observer and are
-monotonic logical counters. `to_peer` counts bytes or datagrams accepted from
+Shared forwarding counters provide monotonic logical totals. `to_peer` counts
+bytes or datagrams accepted from
 the local source; `from_peer` counts bytes or datagrams delivered to the local
 destination. They do not grow from
 carrier retransmission, MPP reinjection, multipath copies, DNS connector work,
-or path probes. Native and MPP boundaries share the owner but never observe one
-flow twice. Path delivery rate, queue, and flight remain separate current
+or path probes. Native and MPP boundaries never count one flow twice. Path
+delivery rate, queue, and flight remain separate current
 carrier evidence. Numeric identifiers and monotonic byte totals are decimal
 strings so browser clients do not lose 64-bit precision.
 Per-flow detail is capped independently from forwarding capacity; aggregate
 counters remain exact. Diagnostics report both current and cumulative detail
 overflow, and per-session flow counts carry an explicit completeness flag.
 
-Set `allow_peer_diagnostics = true` or
-`--management-allow-peer-diagnostics` only on an endpoint that should answer an
-authenticated peer. The permission is independent of local HTTP and disabled
-by default. Either endpoint may initiate from its own management API; the
-remote endpoint's flag decides whether it returns data. Responses contain only
+Peer diagnostics have two endpoint controls. On an MPP outbound,
+`allow_peer_diagnostics = true` permits its authenticated peer. On an MPP
+inbound, `peer_diagnostics_principal_ids = ["..."]` permits only the listed
+authenticated principals, while the scalar `"*"` permits all of them; omission
+denies. The management-global `allow_peer_diagnostics = true` (or
+`--management-allow-peer-diagnostics`) unconditionally permits every
+authenticated peer on every MPP endpoint regardless of those endpoint
+controls. Permissions are independent of the local HTTP listener and default
+to deny. Either endpoint may initiate from its own management API; the remote
+endpoint's effective policy decides whether it returns data. Responses contain only
 per-session path state, usage, and metrics. They exclude endpoints,
 application targets, local resource names, credentials, and every other
 authenticated session. One
@@ -596,7 +708,7 @@ evidence restores it; management never manufactures an active observation.
 
 Balancer actions have the same evidence rule. Enabling a member permits new
 selection but does not invent a successful probe. `drain-member` immediately
-stops new selection while established flows finish on their existing leaf.
+stops new selection while established flows finish on their existing outbound.
 `pin-member` is an explicit manual override; `automatic` returns a non-manual
 strategy to configured ranking. A balancer configured with strategy `manual`
 must always retain a pin and therefore rejects `automatic`. These actions have
@@ -655,6 +767,12 @@ window/RTT ceiling and must be raised for line rate. Frame, payload, chunk, and
 sparse-range limits are separate safeguards and do not need to grow with BDP.
 
 Each proxy outbound has its own `connect_timeout_ms`; the default is 10,000 ms.
+Its required `endpoint` is `HOST:PORT`, with brackets around IPv6. When
+`[outbounds.auth]` is present, both username and password are required; the
+username is 1..=255 UTF-8 bytes with no colon or ASCII control characters.
+For HTTPS CONNECT, `tls_server_name` defaults to the endpoint host and optional
+`tls_ca_certificate` material adds private roots without disabling hostname
+verification.
 
 `[admission]` is the independent new-flow envelope used before DNS, target
 connects, or other flow-opening I/O. Defaults are finite:
@@ -671,11 +789,11 @@ connects, or other flow-opening I/O. Defaults are finite:
 | `max_dns_work` | 128 |
 
 SOCKS5, HTTP CONNECT, mixed proxy, fixed forwarding, TUN-L4, and authenticated
-MPP server opens share this one generation owner. Their listener/source/association
+MPP server opens share one L4 admission budget. Their listener/source/association
 limits still compose at their narrower boundary. Permits release exactly on
 close, error, cancellation, or generation retirement and never enter payload
 forwarding. TUN-L3 packet forwarding has its own bounded packet queues and does
-not consume Product flow admission. These fields do not derive from
+not consume L4 flow admission. These fields do not derive from
 `[resources]`; raising an MPP stream or queue budget never raises new-flow
 admission.
 
@@ -719,27 +837,29 @@ live-tail recovery may exceed the remaining allowance by one cause-specific
 event quantum so that budget exhaustion cannot deadlock recovery. Exact
 retained ranges, queue and flight limits, overlap/repeat suppression, and
 alternate-output requirements still apply. Exception bytes remain charged,
-reducing later optional authority. A continuous over-budget stream is therefore
-a defect, not expected failover overhead.
+reducing the remaining optional reinjection allowance. A continuous over-budget
+stream is therefore a defect, not expected failover overhead.
 
 The current timers are cause-specific. Exact path-instance failure permits an
 immediate bounded copy, preferring measured survivors but using any eligible
 live survivor when necessary. Complete Data ACKs establish missing ranges;
 positive partial ACK ranges may extend established state but cannot infer an
-omission. Fragmented request feedback waits one owner RTO/PTO from first
-authoritative gap observation. Response feedback may use a later-ACK TCP RACK
-5/4-SRTT or QUIC 9/8-SRTT time threshold; ACK silence waits owner RTO/PTO. A
+omission. Fragmented request feedback waits one original-carrier RTO/PTO from
+the first authoritative gap observation. Response feedback may use a later-ACK
+TCP RACK 5/4-SRTT or QUIC 9/8-SRTT time threshold; ACK silence waits that
+carrier's RTO/PTO. A
 contiguous live tail may send one bounded probe per recovery interval without
 progress. A request path becomes stale for new placement after four TCP RTOs
 or three QUIC PTOs without exact Data ACK progress when another attachment
 exists; this does not terminate native recovery.
 
-MPP datagram feedback confirms target-worker admission, not end-to-end target
-delivery. Before feedback, the runtime makes at most two product attempts. Both
-attempts retain the same session, flow, and datagram identity; the shared server
+MPP datagram feedback confirms that the server accepted a datagram for target
+forwarding, not end-to-end delivery. Before feedback, the runtime makes at most
+two carrier delivery attempts. Both retain the same session, flow, and datagram
+identity; the shared server
 flow forwards that identity to the target at most once and replays a bounded
 cached response to the retry carrier. A ranked alternative is tried after one
-modeled response timeout; the final or only attempt keeps three such timeouts,
+calculated response timeout; the final or only attempt keeps three such timeouts,
 capped by the absolute TTL. After feedback, the request is never replayed and
 its response may be awaited until that TTL. The guarantee is at-most-once target
 forwarding within retained MPP state, not end-to-end exactly-once UDP delivery.
@@ -752,22 +872,20 @@ without placing diagnostic work in an MPP data stream. Active
 failover additionally uses exact MPP progress, path-instance lifetime, PTO,
 and queue/flight evidence. A reconnect creates a new physical path instance;
 old flights and evidence cannot be inherited from its numeric path ID. A
-stream attachment incarnation is separate, so detach and reattach also cannot
-inherit ownership merely because the carrier stayed live.
+reattached stream receives a fresh binding, so it also cannot inherit an old
+scheduling decision merely because the carrier stayed live.
 
 When every carrier disappears, an established logical stream retains its MPP
 sequence, Data ACK, receive-window, FIN, and bounded repair/reorder state while
 the client rotates reconnect attempts across configured TCP and QUIC paths.
-Both endpoints stop reading their local product socket so ordinary TCP
+Both endpoints stop reading their local application socket so ordinary TCP
 backpressure bounds memory. Reattachment within the session-retention deadline
 continues the same stream; expiry closes both local sockets and registry state.
 
-The concrete fences differ by direction. Request scheduling uses the physical
-path instance plus `attachment_id`. Response new-data dispatch uses the physical
-path instance plus output incarnation and the response-model generation observed
-during planning; apply revalidates them while reserving queue credit and
-recording the logical path key and stream-unique output incarnation in the exact
-original flight.
+Immediately before queueing data, the runtime rechecks that the selected live
+carrier attachment and output are still valid. A reconnect or reattachment
+cannot inherit an old scheduling decision, queue reservation, or in-flight
+accounting merely because a numeric path identifier was reused.
 
 On the response sender, the output carrying the contiguous Data Sequence
 frontier remains governed by the shared MPP receive window and native carrier
@@ -793,13 +911,15 @@ TCP carriers may sample the exact authenticated socket through a host adapter:
 Every native field is optional and missing fields are unknown rather than zero.
 Passive native observations are scheduling evidence, not MPP Data ACKs.
 Native drain-based reinjection requires both exact bytes in flight and the
-unsent queue from one snapshot; otherwise it waits on exact MPP product flight.
+unsent queue from one snapshot; otherwise it waits on exact MPP application-data
+flight.
 
-TCP capacity transactions use receiver-confirmed receipts and may combine them
+TCP capacity estimates use receiver-confirmed receipts and may combine them
 with exact-socket telemetry. QUIC publishes fresh native packet-ACK-derived
 evidence with an explicit expiry and relies on its native congestion controller
-for send credit; it has no separate MPP calibration transaction. These proof
-states are not interchangeable. MPP Data ACK remains the carrier-neutral delivery authority;
+for send credit; it has no separate MPP calibration transaction. These evidence
+sources are not interchangeable. MPP Data ACK remains the authoritative
+carrier-neutral delivery signal;
 for response bulk admission, QUIC requires locally sourced ACK-derived carrier
 evidence, while durable unambiguous Data ACK progress may additionally establish
 a per-flow TCP MPP rate. While fresh, that exact rate may serve only as a
@@ -811,7 +931,7 @@ The adapter is optional. Older systems, unsupported kernels, restricted hosts,
 and compatibility layers that reject the socket query use the portable fallback
 and remain correct and eligible. Unproven paths retain one bounded startup
 flight; after durable original-data progress, shared MPP flow-control/reorder
-limits and the configured resource envelope govern product work while the
+limits and the configured resource envelope govern application data while the
 socket writer supplies native backpressure. Data ACK rate remains completion
 evidence, not a replacement TCP congestion window. The process prints one
 explicit warning that high-bandwidth, high-latency multipath may be slower
@@ -875,7 +995,9 @@ admission, request, DATA-record, and native-datagram contracts.
 Define named credentials globally and reference them from MPP inbounds and
 outbounds. Each key must be an exact textual UUID or at least 32 bytes of
 high-entropy material loaded from a configured source. Material sources do not
-trim whitespace or line endings. Overlap old and new
+trim whitespace or line endings. Relative material paths, including a relative
+path read from an environment variable, resolve beside the selected TOML.
+Overlap old and new
 credential IDs during rotation; a server may map both to the same principal.
 Session and path authentication bind the credential ID and check issue time
 against the configured freshness window, 300 seconds by default. Revocation

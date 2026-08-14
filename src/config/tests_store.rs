@@ -30,7 +30,6 @@ tls_pinned_certificate = { from = "file", path = "certificate.pem" }
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "edge"
 "#;
 
@@ -59,7 +58,6 @@ tls_pinned_certificate = { from = "file", path = "certificate.pem" }
 
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "edge"
 "#;
 

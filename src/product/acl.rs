@@ -1,368 +1,81 @@
 use crate::product::flow::{FlowContext, ProtocolTarget};
-use crate::product::routing::{
-    CompiledMatcher, RouteCompileError, RouteInput, RouteMatchSpec, RuleId,
-};
-use std::collections::HashSet;
+use crate::product::routing::{RouteAction, RouteDecision, RuleId};
 use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-const MAX_ACL_RULES: usize = 4_096;
-const MAX_RESOLUTION_ADDRESSES: usize = 64;
+pub(crate) const MAX_RESOLUTION_ADDRESSES: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AclEffect {
-    /// Explicitly deny a matching destination.
-    Deny,
-    /// Allow a matching public destination. This cannot override the built-in
-    /// restricted-address safety policy.
-    Allow,
-    /// Explicitly opt a matching destination into restricted address space.
-    AllowRestricted,
-}
-
+/// The immutable identity of the routing rule that authorized a flow.
+///
+/// A permit deliberately owns the complete terminal action and normalized
+/// flow. Consequently an address authorized by one rule, egress, principal,
+/// inbound, or policy generation cannot be replayed through another.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AclRuleSpec {
-    /// The operator-facing destination-ACL rule `name`, compiled to the same
-    /// typed rule identity used in explanations and audit output.
-    pub id: RuleId,
-    pub matcher: RouteMatchSpec,
-    pub effect: AclEffect,
-}
-
-impl AclRuleSpec {
-    pub const fn new(id: RuleId, matcher: RouteMatchSpec, effect: AclEffect) -> Self {
-        Self {
-            id,
-            matcher,
-            effect,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct CompiledAclRule {
-    id: RuleId,
-    matcher: CompiledMatcher,
-    effect: AclEffect,
-}
-
-/// Immutable shared client/server destination authorization generation.
-#[derive(Debug)]
-pub struct DestinationAcl {
+pub struct RoutePermit {
     generation: u64,
-    rules: Vec<CompiledAclRule>,
+    rule_id: RuleId,
+    action: RouteAction,
+    pub(crate) flow: Arc<FlowContext>,
 }
 
-impl DestinationAcl {
-    pub const fn safe_default(generation: u64) -> Self {
+impl RoutePermit {
+    pub(crate) fn from_decision(decision: RouteDecision<'_>, flow: Arc<FlowContext>) -> Self {
         Self {
-            generation,
-            rules: Vec::new(),
+            generation: decision.generation(),
+            rule_id: decision.rule_id().clone(),
+            action: decision.action().clone(),
+            flow,
         }
-    }
-
-    pub fn compile(generation: u64, rules: Vec<AclRuleSpec>) -> Result<Self, AclError> {
-        if rules.len() > MAX_ACL_RULES {
-            return Err(AclError::TooManyRules {
-                count: rules.len(),
-                maximum: MAX_ACL_RULES,
-            });
-        }
-        let final_index = rules.len().saturating_sub(1);
-        let mut ids = HashSet::with_capacity(rules.len());
-        let mut compiled = Vec::with_capacity(rules.len());
-        for (index, rule) in rules.into_iter().enumerate() {
-            if !ids.insert(rule.id.clone()) {
-                return Err(AclError::DuplicateRuleId(rule.id));
-            }
-            if rule.matcher.is_catch_all() && index != final_index {
-                return Err(AclError::ShadowingCatchAll(rule.id));
-            }
-            let matcher =
-                CompiledMatcher::compile(rule.matcher, &rule.id).map_err(AclError::Matcher)?;
-            compiled.push(CompiledAclRule {
-                id: rule.id,
-                matcher,
-                effect: rule.effect,
-            });
-        }
-        Ok(Self {
-            generation,
-            rules: compiled,
-        })
     }
 
     pub const fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// Return whether an explicit ACL rule can change the pre-resolution
-    /// verdict once a domain has address evidence.
-    ///
-    /// This is deliberately about configured first-match rules. The built-in
-    /// restricted-address guard is always applied when MPTUNNEL owns a native
-    /// connection or otherwise resolves a target. A configured proxy that
-    /// receives an unresolved domain is the resolution trust boundary, so it
-    /// does not trigger a query through the selected DNS policy by itself.
-    pub fn requires_post_resolution(&self, flow: &FlowContext) -> bool {
-        if let Some(address) = flow.target().ip() {
-            let pre_input = RouteInput::pre_resolution(flow);
-            let selected = self
-                .rules
-                .iter()
-                .position(|rule| rule.matcher.matches(pre_input));
-            let post_input = RouteInput::post_resolution(flow, address);
-            let post_selected = self
-                .rules
-                .iter()
-                .position(|rule| rule.matcher.matches(post_input));
-            return post_selected != selected;
-        }
-        self.pre_resolution_verdict_and_demand(flow).1
+    pub const fn rule_id(&self) -> &RuleId {
+        &self.rule_id
     }
 
-    /// Evaluate without allocating. This is suitable for route explanation and
-    /// dry-run tooling.
-    pub fn evaluate<'a>(&'a self, input: RouteInput<'_>) -> AclVerdict<'a> {
-        let matched = self.rules.iter().find(|rule| rule.matcher.matches(input));
-        if let Some(rule) = matched
-            && rule.effect == AclEffect::Deny
-        {
-            return AclVerdict::DeniedByRule { rule_id: &rule.id };
-        }
-
-        if let Some(address) = input.destination_ip()
-            && let Some(class) = restricted_ip_class(address)
-        {
-            if let Some(rule) = matched
-                && rule.effect == AclEffect::AllowRestricted
-            {
-                return AclVerdict::Allowed {
-                    rule_id: Some(&rule.id),
-                    restricted_override: true,
-                };
-            }
-            return AclVerdict::DeniedRestricted { address, class };
-        }
-
-        AclVerdict::Allowed {
-            rule_id: matched.map(|rule| &rule.id),
-            restricted_override: false,
-        }
-    }
-
-    /// Bind one immutable normalized flow to this ACL generation before DNS.
-    pub fn evaluate_pre_resolution(
-        &self,
-        flow: FlowContext,
-    ) -> Result<PreResolutionDecision, AclError> {
-        self.evaluate_pre_resolution_shared(Arc::new(flow))
-    }
-
-    pub(crate) fn evaluate_pre_resolution_shared(
-        &self,
-        flow: Arc<FlowContext>,
-    ) -> Result<PreResolutionDecision, AclError> {
-        let (verdict, requires_post_resolution) =
-            self.pre_resolution_verdict_and_demand(flow.as_ref());
-        if !requires_post_resolution {
-            verdict_to_result(verdict)?;
-        }
-        Ok(PreResolutionDecision {
-            acl_generation: self.generation,
-            flow,
-            requires_post_resolution,
-        })
-    }
-
-    /// Authorize every DNS answer. One disallowed answer fails the whole
-    /// resolution rather than being silently filtered into a policy-dependent
-    /// fallback.
-    pub fn authorize_resolution(
-        &self,
-        decision: PreResolutionDecision,
-        addresses: &[IpAddr],
-    ) -> Result<AuthorizedResolution, AclError> {
-        if decision.acl_generation != self.generation {
-            return Err(AclError::GenerationMismatch {
-                evaluated: decision.acl_generation,
-                current: self.generation,
-            });
-        }
-        if addresses.is_empty() {
-            return Err(AclError::EmptyResolution);
-        }
-        if addresses.len() > MAX_RESOLUTION_ADDRESSES {
-            return Err(AclError::TooManyResolutionAddresses {
-                count: addresses.len(),
-                maximum: MAX_RESOLUTION_ADDRESSES,
-            });
-        }
-
-        let literal = decision.flow.target().ip();
-        let mut canonical = Vec::with_capacity(addresses.len());
-        for address in addresses.iter().copied().map(canonical_ip) {
-            if literal.is_some_and(|literal| literal != address) {
-                return Err(AclError::TargetChanged);
-            }
-            verdict_to_result(self.evaluate(RouteInput::post_resolution(&decision.flow, address)))?;
-            if !canonical.contains(&address) {
-                canonical.push(address);
-            }
-        }
-
-        Ok(AuthorizedResolution {
-            acl_generation: self.generation,
-            flow: decision.flow,
-            addresses: canonical,
-        })
-    }
-
-    pub fn authorize_literal(
-        &self,
-        decision: PreResolutionDecision,
-    ) -> Result<AuthorizedResolution, AclError> {
-        let address = decision
-            .flow
-            .target()
-            .ip()
-            .ok_or(AclError::ExpectedLiteralIp)?;
-        self.authorize_resolution(decision, &[address])
-    }
-
-    /// Authorize delegation of the canonical domain to a configured
-    /// domain-capable outbound. Explicit post-resolution ACL dependencies must
-    /// be resolved through the selected DNS policy and therefore cannot produce
-    /// this proof.
-    pub fn authorize_domain(
-        &self,
-        decision: PreResolutionDecision,
-    ) -> Result<AuthorizedDomainTarget, AclError> {
-        if decision.acl_generation != self.generation {
-            return Err(AclError::GenerationMismatch {
-                evaluated: decision.acl_generation,
-                current: self.generation,
-            });
-        }
-        if decision.flow.target().domain().is_none() {
-            return Err(AclError::ExpectedDomain);
-        }
-        if decision.requires_post_resolution {
-            return Err(AclError::PostResolutionRequired);
-        }
-        Ok(AuthorizedDomainTarget { decision })
-    }
-
-    /// Promote a delegated-domain proof to exact address proofs when a later
-    /// IP-only leaf requires address evidence from the selected DNS policy.
-    pub fn authorize_domain_resolution(
-        &self,
-        domain: &AuthorizedDomainTarget,
-        addresses: &[IpAddr],
-    ) -> Result<AuthorizedResolution, AclError> {
-        self.authorize_resolution(domain.decision.clone(), addresses)
-    }
-
-    fn pre_resolution_verdict_and_demand<'a>(
-        &'a self,
-        flow: &FlowContext,
-    ) -> (AclVerdict<'a>, bool) {
-        if let Some(address) = flow.target().ip() {
-            let pre_input = RouteInput::pre_resolution(flow);
-            let post_input = RouteInput::post_resolution(flow, address);
-            let pre_selected = self
-                .rules
-                .iter()
-                .position(|rule| rule.matcher.matches(pre_input));
-            let post_selected = self
-                .rules
-                .iter()
-                .position(|rule| rule.matcher.matches(post_input));
-            return (self.evaluate(pre_input), pre_selected != post_selected);
-        }
-
-        let input = RouteInput::pre_resolution(flow);
-        let mut earlier_post_candidate = false;
-        for rule in &self.rules {
-            if rule.matcher.matches(input) {
-                let verdict = if rule.effect == AclEffect::Deny {
-                    AclVerdict::DeniedByRule { rule_id: &rule.id }
-                } else {
-                    AclVerdict::Allowed {
-                        rule_id: Some(&rule.id),
-                        restricted_override: false,
-                    }
-                };
-                return (
-                    verdict,
-                    earlier_post_candidate || !rule.matcher.could_match_post_resolution(flow),
-                );
-            }
-            earlier_post_candidate |= rule.matcher.could_match_post_resolution(flow);
-        }
-        (
-            AclVerdict::Allowed {
-                rule_id: None,
-                restricted_override: false,
-            },
-            earlier_post_candidate,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AclVerdict<'a> {
-    Allowed {
-        rule_id: Option<&'a RuleId>,
-        restricted_override: bool,
-    },
-    DeniedByRule {
-        rule_id: &'a RuleId,
-    },
-    DeniedRestricted {
-        address: IpAddr,
-        class: RestrictedIpClass,
-    },
-}
-
-/// Unforgeable pre-resolution policy decision for one immutable flow.
-///
-/// Stable denials are returned as errors. A decision may instead require
-/// post-resolution evidence before it can authorize either a domain or exact
-/// addresses.
-#[derive(Debug, Clone)]
-pub struct PreResolutionDecision {
-    acl_generation: u64,
-    flow: Arc<FlowContext>,
-    requires_post_resolution: bool,
-}
-
-/// Unforgeable proof that one normalized domain may cross a configured
-/// domain-capable outbound without target resolution at this node.
-#[derive(Debug, Clone)]
-pub struct AuthorizedDomainTarget {
-    decision: PreResolutionDecision,
-}
-
-impl AuthorizedDomainTarget {
-    pub const fn acl_generation(&self) -> u64 {
-        self.decision.acl_generation()
-    }
-
-    pub fn flow(&self) -> &FlowContext {
-        self.decision.flow()
-    }
-}
-
-impl PreResolutionDecision {
-    pub const fn acl_generation(&self) -> u64 {
-        self.acl_generation
+    pub const fn action(&self) -> &RouteAction {
+        &self.action
     }
 
     pub fn flow(&self) -> &FlowContext {
         self.flow.as_ref()
+    }
+}
+
+/// Pre-resolution routing result for one immutable normalized flow.
+#[derive(Debug, Clone)]
+pub struct PreResolutionDecision {
+    permit: RoutePermit,
+    requires_post_resolution: bool,
+}
+
+impl PreResolutionDecision {
+    pub(crate) const fn new(permit: RoutePermit, requires_post_resolution: bool) -> Self {
+        Self {
+            permit,
+            requires_post_resolution,
+        }
+    }
+
+    pub(crate) fn require_post_resolution(&mut self) {
+        self.requires_post_resolution = true;
+    }
+
+    pub const fn policy_generation(&self) -> u64 {
+        self.permit.generation()
+    }
+
+    pub const fn permit(&self) -> &RoutePermit {
+        &self.permit
+    }
+
+    pub fn flow(&self) -> &FlowContext {
+        self.permit.flow()
     }
 
     pub const fn requires_post_resolution(&self) -> bool {
@@ -370,64 +83,102 @@ impl PreResolutionDecision {
     }
 }
 
-/// Exact normalized addresses authorized for one immutable DNS result.
-#[derive(Debug)]
-pub struct AuthorizedResolution {
-    acl_generation: u64,
-    flow: Arc<FlowContext>,
-    addresses: Vec<IpAddr>,
+/// Proof that one normalized domain may cross a domain-capable outbound.
+#[derive(Debug, Clone)]
+pub struct AuthorizedDomainTarget {
+    permit: RoutePermit,
 }
 
-impl AuthorizedResolution {
-    pub const fn acl_generation(&self) -> u64 {
-        self.acl_generation
+impl AuthorizedDomainTarget {
+    pub(crate) const fn new(permit: RoutePermit) -> Self {
+        Self { permit }
+    }
+
+    pub const fn policy_generation(&self) -> u64 {
+        self.permit.generation()
+    }
+
+    pub const fn permit(&self) -> &RoutePermit {
+        &self.permit
     }
 
     pub fn flow(&self) -> &FlowContext {
-        self.flow.as_ref()
+        self.permit.flow()
+    }
+}
+
+/// Exact normalized addresses authorized from one immutable DNS answer set.
+#[derive(Debug)]
+pub struct AuthorizedResolution {
+    targets: Vec<AuthorizedTarget>,
+}
+
+impl AuthorizedResolution {
+    pub(crate) fn new(targets: Vec<AuthorizedTarget>) -> Self {
+        Self { targets }
     }
 
-    pub fn addresses(&self) -> &[IpAddr] {
-        &self.addresses
+    pub fn targets(&self) -> &[AuthorizedTarget] {
+        &self.targets
     }
 
-    /// Bind a connector to the original target and an exact authorized DNS
-    /// answer. A later re-resolution or target substitution is rejected.
+    pub fn into_targets(self) -> Vec<AuthorizedTarget> {
+        self.targets
+    }
+
+    /// Bind a connector to the original target and one address from the exact
+    /// answer set recorded by the permit.
     pub fn authorize_connect(
         &self,
         target: &ProtocolTarget,
         address: IpAddr,
-    ) -> Result<AuthorizedTarget, AclError> {
-        if target != self.flow.target() {
-            return Err(AclError::TargetChanged);
-        }
+    ) -> Result<AuthorizedTarget, RouteAuthorizationError> {
         let address = canonical_ip(address);
-        if !self.addresses.contains(&address) {
-            return Err(AclError::DnsRebinding { address });
+        let Some(first) = self.targets.first() else {
+            return Err(RouteAuthorizationError::EmptyResolution);
+        };
+        if target != first.flow().target() {
+            return Err(RouteAuthorizationError::TargetChanged);
         }
-        Ok(AuthorizedTarget {
-            acl_generation: self.acl_generation,
-            flow: self.flow.clone(),
-            address,
-        })
+        self.targets
+            .iter()
+            .find(|candidate| candidate.address == address)
+            .cloned()
+            .ok_or(RouteAuthorizationError::DnsRebinding { address })
     }
 }
 
-/// Immutable unforgeable Product proof passed to an outbound connector.
+/// Immutable, unforgeable Product proof passed to an outbound connector.
 #[derive(Debug, Clone)]
 pub struct AuthorizedTarget {
-    acl_generation: u64,
-    flow: Arc<FlowContext>,
+    permit: RoutePermit,
+    resolution: Arc<[IpAddr]>,
     address: IpAddr,
 }
 
 impl AuthorizedTarget {
-    pub const fn acl_generation(&self) -> u64 {
-        self.acl_generation
+    pub(crate) fn new(permit: RoutePermit, resolution: Arc<[IpAddr]>, address: IpAddr) -> Self {
+        Self {
+            permit,
+            resolution,
+            address,
+        }
+    }
+
+    pub const fn policy_generation(&self) -> u64 {
+        self.permit.generation()
+    }
+
+    pub const fn permit(&self) -> &RoutePermit {
+        &self.permit
     }
 
     pub fn flow(&self) -> &FlowContext {
-        self.flow.as_ref()
+        self.permit.flow()
+    }
+
+    pub fn resolution(&self) -> &[IpAddr] {
+        self.resolution.as_ref()
     }
 
     pub const fn address(&self) -> IpAddr {
@@ -445,6 +196,15 @@ pub enum RestrictedIpClass {
     Multicast,
 }
 
+impl RestrictedIpClass {
+    /// Classify the canonical destination safety class used by Product
+    /// authorization. Control-plane explanations call this same function so
+    /// they cannot drift from forwarding enforcement.
+    pub(crate) fn classify(address: IpAddr) -> Option<Self> {
+        restricted_ip_class(address)
+    }
+}
+
 impl fmt::Display for RestrictedIpClass {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -459,20 +219,17 @@ impl fmt::Display for RestrictedIpClass {
 }
 
 #[derive(Debug)]
-pub enum AclError {
-    DuplicateRuleId(RuleId),
-    ShadowingCatchAll(RuleId),
-    TooManyRules {
-        count: usize,
-        maximum: usize,
-    },
-    Matcher(RouteCompileError),
-    DeniedByRule {
-        rule_id: RuleId,
-    },
+pub enum RouteAuthorizationError {
     RestrictedAddress {
         address: IpAddr,
         class: RestrictedIpClass,
+        rule_id: RuleId,
+    },
+    Rejected {
+        rule_id: RuleId,
+    },
+    Dropped {
+        rule_id: RuleId,
     },
     EmptyResolution,
     TooManyResolutionAddresses {
@@ -490,33 +247,22 @@ pub enum AclError {
     ExpectedLiteralIp,
     ExpectedDomain,
     PostResolutionRequired,
+    NoUsableAddress,
 }
 
-impl fmt::Display for AclError {
+impl fmt::Display for RouteAuthorizationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicateRuleId(id) => {
-                write!(formatter, "duplicate destination ACL rule ID {id}")
-            }
-            Self::ShadowingCatchAll(id) => {
-                write!(
-                    formatter,
-                    "catch-all destination ACL rule {id} must be last"
-                )
-            }
-            Self::TooManyRules { count, maximum } => {
-                write!(
-                    formatter,
-                    "destination ACL has {count} rules; maximum is {maximum}"
-                )
-            }
-            Self::Matcher(error) => write!(formatter, "invalid destination ACL matcher: {error}"),
-            Self::DeniedByRule { rule_id } => {
-                write!(formatter, "destination denied by ACL rule {rule_id}")
-            }
-            Self::RestrictedAddress { address, class } => {
-                write!(formatter, "{address} is denied {class} address space")
-            }
+            Self::RestrictedAddress {
+                address,
+                class,
+                rule_id,
+            } => write!(
+                formatter,
+                "route {rule_id} does not authorize restricted {class} address {address}"
+            ),
+            Self::Rejected { rule_id } => write!(formatter, "route {rule_id} rejected destination"),
+            Self::Dropped { rule_id } => write!(formatter, "route {rule_id} dropped destination"),
             Self::EmptyResolution => formatter.write_str("DNS resolution returned no addresses"),
             Self::TooManyResolutionAddresses { count, maximum } => write!(
                 formatter,
@@ -524,17 +270,15 @@ impl fmt::Display for AclError {
             ),
             Self::GenerationMismatch { evaluated, current } => write!(
                 formatter,
-                "destination decision generation {evaluated} does not match ACL generation {current}"
+                "route decision generation {evaluated} does not match policy generation {current}"
             ),
             Self::TargetChanged => {
                 formatter.write_str("destination changed after the pre-resolution decision")
             }
-            Self::DnsRebinding { address } => {
-                write!(
-                    formatter,
-                    "connect address {address} was not in the authorized DNS result"
-                )
-            }
+            Self::DnsRebinding { address } => write!(
+                formatter,
+                "connect address {address} was not in the authorized DNS result"
+            ),
             Self::ExpectedLiteralIp => {
                 formatter.write_str("literal authorization requires an IP target")
             }
@@ -542,34 +286,44 @@ impl fmt::Display for AclError {
                 formatter.write_str("domain delegation authorization requires a domain target")
             }
             Self::PostResolutionRequired => {
-                formatter.write_str("destination ACL requires post-resolution authorization")
+                formatter.write_str("routing requires post-resolution authorization")
+            }
+            Self::NoUsableAddress => {
+                formatter.write_str("routing produced no eligible destination address")
             }
         }
     }
 }
 
-impl Error for AclError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Matcher(error) => Some(error),
-            _ => None,
+impl Error for RouteAuthorizationError {}
+
+pub(crate) fn canonical_resolution(
+    flow: &FlowContext,
+    addresses: &[IpAddr],
+) -> Result<Arc<[IpAddr]>, RouteAuthorizationError> {
+    if addresses.is_empty() {
+        return Err(RouteAuthorizationError::EmptyResolution);
+    }
+    if addresses.len() > MAX_RESOLUTION_ADDRESSES {
+        return Err(RouteAuthorizationError::TooManyResolutionAddresses {
+            count: addresses.len(),
+            maximum: MAX_RESOLUTION_ADDRESSES,
+        });
+    }
+    let literal = flow.target().ip();
+    let mut canonical = Vec::with_capacity(addresses.len());
+    for address in addresses.iter().copied().map(canonical_ip) {
+        if literal.is_some_and(|literal| literal != address) {
+            return Err(RouteAuthorizationError::TargetChanged);
+        }
+        if !canonical.contains(&address) {
+            canonical.push(address);
         }
     }
+    Ok(Arc::from(canonical))
 }
 
-fn verdict_to_result(verdict: AclVerdict<'_>) -> Result<(), AclError> {
-    match verdict {
-        AclVerdict::Allowed { .. } => Ok(()),
-        AclVerdict::DeniedByRule { rule_id } => Err(AclError::DeniedByRule {
-            rule_id: rule_id.clone(),
-        }),
-        AclVerdict::DeniedRestricted { address, class } => {
-            Err(AclError::RestrictedAddress { address, class })
-        }
-    }
-}
-
-fn restricted_ip_class(address: IpAddr) -> Option<RestrictedIpClass> {
+pub(crate) fn restricted_ip_class(address: IpAddr) -> Option<RestrictedIpClass> {
     let address = canonical_ip(address);
     if is_metadata(address) {
         return Some(RestrictedIpClass::Metadata);
@@ -602,7 +356,7 @@ fn is_metadata(address: IpAddr) -> bool {
     }
 }
 
-const fn canonical_ip(address: IpAddr) -> IpAddr {
+pub(crate) const fn canonical_ip(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V6(address) if address.is_unspecified() || address.is_loopback() => {
             IpAddr::V6(address)

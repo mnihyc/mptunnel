@@ -9,21 +9,22 @@ lifecycle stay below that boundary.
 
 ## Layer model
 
-One runtime generation selects one forwarding family. L4 is the default and
-retains the existing Product graph. Explicit experimental L3 mode selects the
-raw IP-packet graph and does not admit L4 streams or application datagrams.
-Carrier authentication and lifecycle remain shared; forwarding policy and
-performance changes stay inside the selected family.
+The configured inbound protocols select one forwarding family. SOCKS5, HTTP
+CONNECT, mixed proxy, port forwarding, TUN-L4, and MPP are L4. Experimental
+`tun-l3` and `mpp-l3` select the raw IP-packet plane and do not admit L4 streams
+or application datagrams. A document cannot mix the two families. Carrier
+authentication and lifecycle remain shared; forwarding policy and performance
+changes stay inside the selected family.
 
 ```text
-forwarding_mode = l4 (default)
-  SOCKS5 / HTTP CONNECT / mixed proxy / port forward / TUN-L4
+L4 inbound protocols
+  SOCKS5 / HTTP CONNECT / mixed proxy / port forward / TUN-L4 / MPP
     -> Product routing, DNS, admission, outbound selection
     -> MPP stream or application-datagram plane
        -> offsets, flow control, Data ACKs, bounded reinjection
 
-forwarding_mode = l3 (experimental)
-  TUN-L3 packet device
+L3 inbound protocols (experimental)
+  TUN-L3 packet device / MPP-L3 server
     -> authenticated static address ownership + packet-flow affinity
     -> complete IPv4/IPv6 packet plane
 

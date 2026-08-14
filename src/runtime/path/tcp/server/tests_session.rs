@@ -1,3 +1,4 @@
+use super::super::datagram::ServerTcpDatagramState;
 use super::super::evidence::ServerTcpEvidenceState;
 use super::super::writer::ServerTcpWriter;
 use super::{
@@ -16,15 +17,126 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{recv_reliable_path_command, reliable_path_command_channels};
-use crate::runtime::path::{PathProofObservation, ServerLocalPathProperties};
+use crate::runtime::path::{
+    AcceptedServerDatagramFlow, PathProofObservation, ServerDatagramOpenError,
+    ServerDatagramOpenRequest, ServerDatagramPort, ServerDatagramPortBackend,
+    ServerLocalPathProperties, ServerTargetAdmission,
+};
 use crate::runtime::peer_status::PeerStatusBroker;
 use crate::scheduler::TrafficClass;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+
+struct PolicyDenyDatagramBackend;
+
+impl ServerDatagramPortBackend for PolicyDenyDatagramBackend {
+    fn open<'a>(
+        &'a self,
+        request: ServerDatagramOpenRequest,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<AcceptedServerDatagramFlow, ServerDatagramOpenError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let error = match request.target.port() {
+                81 => return Err(ServerDatagramOpenError::new(RuntimeError::RouteRejected)),
+                82 => return Err(ServerDatagramOpenError::new(RuntimeError::RouteDropped)),
+                83 => return Err(ServerDatagramOpenError::capacity()),
+                _ => RuntimeError::Protocol("unexpected test datagram target"),
+            };
+            Err(ServerDatagramOpenError::new(error))
+        })
+    }
+}
+
+#[derive(Default)]
+struct ScriptedDatagramBackend {
+    opens: Mutex<HashMap<u16, usize>>,
+    feedback: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ScriptedDatagramBackend {
+    fn opens_for(&self, port: u16) -> usize {
+        self.opens
+            .lock()
+            .expect("scripted datagram opens")
+            .get(&port)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl ServerDatagramPortBackend for ScriptedDatagramBackend {
+    fn open<'a>(
+        &'a self,
+        request: ServerDatagramOpenRequest,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<AcceptedServerDatagramFlow, ServerDatagramOpenError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        *self
+            .opens
+            .lock()
+            .expect("scripted datagram opens")
+            .entry(request.target.port())
+            .or_default() += 1;
+        let feedback = self.feedback.clone();
+        Box::pin(async move {
+            match request.target.port() {
+                81 => Err(ServerDatagramOpenError::new(RuntimeError::RouteRejected)),
+                82 => Err(ServerDatagramOpenError::new(RuntimeError::RouteDropped)),
+                _ => {
+                    let (requests, mut receiver) = mpsc::channel(8);
+                    tokio::spawn(async move {
+                        while let Some(message) = receiver.recv().await {
+                            match message {
+                                crate::runtime::path::ServerDatagramWorkerMessage::Request {
+                                    admission,
+                                    ..
+                                } => {
+                                    let _ = admission.send(Ok(
+                                        crate::runtime::path::ServerDatagramSendOutcome::Accepted,
+                                    ));
+                                }
+                                crate::runtime::path::ServerDatagramWorkerMessage::ResponseFeedback { .. } => {
+                                    feedback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                crate::runtime::path::ServerDatagramWorkerMessage::Attach {
+                                    attached,
+                                    ..
+                                } => {
+                                    let _ = attached.send(());
+                                }
+                            }
+                        }
+                    });
+                    Ok(AcceptedServerDatagramFlow::holding(
+                        request.flow_id,
+                        requests,
+                        request.commands,
+                        Arc::new(()),
+                        (),
+                    ))
+                }
+            }
+        })
+    }
+}
 
 #[tokio::test]
 async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
@@ -147,6 +259,7 @@ async fn server_tcp_test_session_with_mode(
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
     );
+    let reliable_relay = reliable_relay.expect("L4 test server has a reliable relay");
     context.forwarding_mode = forwarding_mode;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -257,6 +370,389 @@ async fn server_tcp_l3_mode_rejects_l4_forwarding_opens() {
     assert_eq!(
         client.read_frame().await.expect("datagram rejection"),
         Frame::DatagramClose { flow_id }
+    );
+}
+
+#[tokio::test]
+async fn server_tcp_route_denials_are_flow_local_and_drop_is_silent() {
+    let session_id = SessionId(208);
+    let path_id = PathId(0);
+    let (mut session, mut client, commands, _path_frames, _relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    session.context.reliable_streams = session
+        .context
+        .reliable_streams
+        .clone()
+        .with_target_admission(Arc::new(|_, target| {
+            Ok(match target.port() {
+                81 => ServerTargetAdmission::Reject,
+                82 => ServerTargetAdmission::Drop,
+                _ => ServerTargetAdmission::Allow,
+            })
+        }));
+
+    let sibling_stream_id = StreamId(80);
+    session
+        .handle_frame(Frame::OpenStream {
+            stream_id: sibling_stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            demand: StreamDemandHint::Latency,
+        })
+        .await
+        .expect("open allowed sibling stream");
+
+    let rejected_stream_id = StreamId(81);
+    session
+        .handle_frame(Frame::OpenStream {
+            stream_id: rejected_stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+            demand: StreamDemandHint::Latency,
+        })
+        .await
+        .expect("reject one logical stream");
+    assert_eq!(
+        client.read_frame().await.expect("stream refusal"),
+        Frame::StreamDetach {
+            stream_id: rejected_stream_id,
+        }
+    );
+
+    let dropped_stream_id = StreamId(82);
+    session
+        .handle_frame(Frame::OpenStream {
+            stream_id: dropped_stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
+            demand: StreamDemandHint::Latency,
+        })
+        .await
+        .expect("silently drop one logical stream");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.read_frame())
+            .await
+            .is_err(),
+        "route drop must not emit an MPP response",
+    );
+    assert_eq!(
+        session
+            .context
+            .reliable_streams
+            .management_snapshot()
+            .active_streams,
+        1,
+        "denied opens must preserve the allowed sibling logical stream",
+    );
+
+    let sibling_frame = Frame::StreamMaxData {
+        stream_id: sibling_stream_id,
+        max_offset: 4096,
+    };
+    commands
+        .send_stream_ordered_frame(sibling_frame.clone(), TrafficClass::Latency)
+        .await
+        .expect("queue sibling output after route denials");
+    let command = recv_reliable_path_command(&mut session.commands_rx)
+        .await
+        .expect("dequeue sibling output");
+    assert!(matches!(
+        session
+            .drain_commands(command)
+            .await
+            .expect("write sibling output after route denials"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(
+        client.read_frame().await.expect("sibling output"),
+        sibling_frame,
+        "the shared TCP carrier must remain usable after both denial kinds",
+    );
+}
+
+#[tokio::test]
+async fn server_tcp_datagram_route_denials_are_flow_local_and_drop_is_silent() {
+    let session_id = SessionId(209);
+    let path_id = PathId(0);
+    let (mut session, mut client, _commands, _path_frames, _relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    session.context.datagrams = Some(ServerDatagramPort::new(Arc::new(PolicyDenyDatagramBackend)));
+
+    let rejected_flow_id = crate::protocol::DatagramFlowId(81);
+    session
+        .handle_frame(Frame::OpenDatagramFlow {
+            flow_id: rejected_flow_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+        })
+        .await
+        .expect("reject one TCP-carried datagram flow");
+    assert_eq!(
+        client.read_frame().await.expect("datagram refusal"),
+        Frame::DatagramClose {
+            flow_id: rejected_flow_id,
+        }
+    );
+
+    let dropped_flow_id = crate::protocol::DatagramFlowId(82);
+    session
+        .handle_frame(Frame::OpenDatagramFlow {
+            flow_id: dropped_flow_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
+        })
+        .await
+        .expect("silently drop one TCP-carried datagram flow");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.read_frame())
+            .await
+            .is_err(),
+        "datagram drop must not emit an MPP response",
+    );
+
+    let saturated_flow_id = crate::protocol::DatagramFlowId(83);
+    for _ in 0..2 {
+        session
+            .handle_frame(Frame::OpenDatagramFlow {
+                flow_id: saturated_flow_id,
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 83))),
+            })
+            .await
+            .expect("map shared registry saturation to a flow-local close");
+        assert_eq!(
+            client.read_frame().await.expect("registry capacity close"),
+            Frame::DatagramClose {
+                flow_id: saturated_flow_id,
+            },
+        );
+    }
+
+    session
+        .handle_frame(Frame::Ping { nonce: 209 })
+        .await
+        .expect("use shared TCP carrier after datagram denials");
+    assert_eq!(
+        client.read_frame().await.expect("carrier pong"),
+        Frame::Pong { nonce: 209 },
+        "a denied datagram flow must not tear down its shared TCP carrier",
+    );
+}
+
+#[tokio::test]
+async fn server_tcp_datagram_tombstones_are_deterministic_bounded_and_flow_local() {
+    let session_id = SessionId(210);
+    let path_id = PathId(0);
+    let (mut session, mut client, _commands, _path_frames, _relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    session.context.max_udp_flows_per_session = 2;
+    session.datagrams = ServerTcpDatagramState::new(2);
+    let backend = Arc::new(ScriptedDatagramBackend::default());
+    session.context.datagrams = Some(ServerDatagramPort::new(backend.clone()));
+
+    let reject_id = crate::protocol::DatagramFlowId(81);
+    let reject_open = Frame::OpenDatagramFlow {
+        flow_id: reject_id,
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+    };
+    session
+        .handle_frame(reject_open.clone())
+        .await
+        .expect("reject datagram open");
+    assert_eq!(
+        client.read_frame().await.expect("initial rejection"),
+        Frame::DatagramClose { flow_id: reject_id },
+    );
+    session
+        .handle_frame(Frame::DatagramData {
+            flow_id: reject_id,
+            datagram_id: crate::protocol::DatagramId(1),
+            ttl_ms: 0,
+            payload: Bytes::from_static(b"late-rejected"),
+        })
+        .await
+        .expect("ignore in-flight rejected data");
+    session
+        .handle_frame(Frame::DatagramFeedback {
+            flow_id: reject_id,
+            received: vec![crate::protocol::OffsetRange::new(0, 1).expect("feedback range")],
+        })
+        .await
+        .expect("ignore in-flight rejected feedback");
+    session
+        .handle_frame(reject_open.clone())
+        .await
+        .expect("repeat rejected open from tombstone");
+    assert_eq!(
+        client.read_frame().await.expect("repeated rejection"),
+        Frame::DatagramClose { flow_id: reject_id },
+    );
+    assert_eq!(
+        backend.opens_for(81),
+        1,
+        "reject tombstone must bypass policy"
+    );
+
+    let drop_id = crate::protocol::DatagramFlowId(82);
+    let drop_open = Frame::OpenDatagramFlow {
+        flow_id: drop_id,
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
+    };
+    session
+        .handle_frame(drop_open.clone())
+        .await
+        .expect("drop datagram open");
+    session
+        .handle_frame(Frame::DatagramData {
+            flow_id: drop_id,
+            datagram_id: crate::protocol::DatagramId(2),
+            ttl_ms: 0,
+            payload: Bytes::from_static(b"late-dropped"),
+        })
+        .await
+        .expect("ignore in-flight dropped data");
+    session
+        .handle_frame(Frame::DatagramFeedback {
+            flow_id: drop_id,
+            received: Vec::new(),
+        })
+        .await
+        .expect("ignore in-flight dropped feedback");
+    session
+        .handle_frame(drop_open)
+        .await
+        .expect("repeat silent drop from tombstone");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.read_frame())
+            .await
+            .is_err(),
+        "initial and repeated drop must stay silent",
+    );
+    assert_eq!(
+        backend.opens_for(82),
+        1,
+        "drop tombstone must bypass policy"
+    );
+    assert_eq!(session.datagrams.tombstone_count(), 2);
+
+    for (flow, port) in [(1, 90), (2, 91)] {
+        session
+            .handle_frame(Frame::OpenDatagramFlow {
+                flow_id: crate::protocol::DatagramFlowId(flow),
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], port))),
+            })
+            .await
+            .expect("open accepted sibling flow");
+    }
+    let accepted_id = crate::protocol::DatagramFlowId(1);
+    session
+        .handle_frame(Frame::DatagramData {
+            flow_id: accepted_id,
+            datagram_id: crate::protocol::DatagramId(3),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"accepted"),
+        })
+        .await
+        .expect("send accepted sibling data");
+    assert!(matches!(
+        client.read_frame().await.expect("accepted feedback"),
+        Frame::DatagramFeedback { flow_id, .. } if flow_id == accepted_id
+    ));
+    session
+        .handle_frame(Frame::DatagramFeedback {
+            flow_id: accepted_id,
+            received: Vec::new(),
+        })
+        .await
+        .expect("route accepted sibling feedback");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while backend.feedback.load(std::sync::atomic::Ordering::Relaxed) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted sibling feedback routing timeout");
+
+    let capacity_id = crate::protocol::DatagramFlowId(3);
+    let capacity_open = Frame::OpenDatagramFlow {
+        flow_id: capacity_id,
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 92))),
+    };
+    session
+        .handle_frame(capacity_open.clone())
+        .await
+        .expect("reject at accepted-flow capacity");
+    assert_eq!(
+        client.read_frame().await.expect("capacity rejection"),
+        Frame::DatagramClose {
+            flow_id: capacity_id,
+        },
+    );
+    assert_eq!(backend.opens_for(92), 0);
+    assert_eq!(
+        session.datagrams.tombstone_count(),
+        2,
+        "tombstones have an independent bound and do not consume accepted slots",
+    );
+
+    session
+        .handle_frame(Frame::DatagramClose {
+            flow_id: accepted_id,
+        })
+        .await
+        .expect("close one accepted flow");
+    session
+        .handle_frame(capacity_open)
+        .await
+        .expect("repeat capacity tombstone after capacity becomes available");
+    assert_eq!(
+        client
+            .read_frame()
+            .await
+            .expect("repeated capacity rejection"),
+        Frame::DatagramClose {
+            flow_id: capacity_id,
+        },
+    );
+    assert_eq!(backend.opens_for(92), 0);
+
+    session
+        .handle_frame(reject_open)
+        .await
+        .expect("re-evaluate LRU-evicted rejection");
+    assert_eq!(
+        client.read_frame().await.expect("re-evaluated rejection"),
+        Frame::DatagramClose { flow_id: reject_id },
+    );
+    assert_eq!(backend.opens_for(81), 2, "oldest tombstone must be evicted");
+    assert_eq!(session.datagrams.tombstone_count(), 2);
+
+    let unknown_id = crate::protocol::DatagramFlowId(999);
+    session
+        .handle_frame(Frame::DatagramData {
+            flow_id: unknown_id,
+            datagram_id: crate::protocol::DatagramId(4),
+            ttl_ms: 0,
+            payload: Bytes::from_static(b"unknown"),
+        })
+        .await
+        .expect("ignore unknown data");
+    session
+        .handle_frame(Frame::DatagramFeedback {
+            flow_id: unknown_id,
+            received: Vec::new(),
+        })
+        .await
+        .expect("ignore unknown feedback");
+    session
+        .handle_frame(Frame::DatagramClose {
+            flow_id: capacity_id,
+        })
+        .await
+        .expect("close capacity tombstone");
+    assert_eq!(session.datagrams.tombstone_count(), 1);
+
+    session
+        .handle_frame(Frame::Ping { nonce: 210 })
+        .await
+        .expect("use carrier after stale datagram frames");
+    assert_eq!(
+        client.read_frame().await.expect("carrier pong"),
+        Frame::Pong { nonce: 210 },
     );
 }
 

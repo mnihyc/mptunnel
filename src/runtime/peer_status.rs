@@ -52,7 +52,8 @@ pub(in crate::runtime) struct PeerStatusBroker {
 
 #[derive(Debug)]
 struct PeerStatusBrokerInner {
-    allow_incoming: bool,
+    allow_all_incoming: bool,
+    has_scoped_incoming: bool,
     request_timeout: Duration,
     state: Mutex<PeerStatusBrokerState>,
 }
@@ -66,6 +67,7 @@ struct PeerStatusBrokerState {
 
 #[derive(Debug, Default)]
 struct PeerStatusSession {
+    allow_incoming: bool,
     carriers: BTreeMap<u64, mpsc::Sender<u64>>,
     preferred_registration: Option<u64>,
     last_attempted_registration: Option<u64>,
@@ -128,18 +130,43 @@ impl std::fmt::Debug for PeerStatusCarrier {
 }
 
 impl PeerStatusBroker {
-    pub(in crate::runtime) fn new(allow_incoming: bool) -> Self {
-        Self::with_timeout(allow_incoming, PEER_STATUS_REQUEST_TIMEOUT)
+    pub(in crate::runtime) fn new(allow_all_incoming: bool) -> Self {
+        Self::with_policy_and_timeout(allow_all_incoming, false, PEER_STATUS_REQUEST_TIMEOUT)
+    }
+
+    /// Construct a broker whose endpoint may authorize only selected live
+    /// sessions. `allow_all_incoming` is the process-wide override;
+    /// `has_scoped_incoming` records whether the endpoint has any configured
+    /// principal authorization for management capability reporting.
+    pub(in crate::runtime) fn with_scoped_incoming(
+        allow_all_incoming: bool,
+        has_scoped_incoming: bool,
+    ) -> Self {
+        Self::with_policy_and_timeout(
+            allow_all_incoming,
+            has_scoped_incoming,
+            PEER_STATUS_REQUEST_TIMEOUT,
+        )
     }
 
     pub(in crate::runtime) fn allows_incoming(&self) -> bool {
-        self.inner.allow_incoming
+        self.inner.allow_all_incoming || self.inner.has_scoped_incoming
     }
 
-    fn with_timeout(allow_incoming: bool, request_timeout: Duration) -> Self {
+    #[cfg(test)]
+    fn with_timeout(allow_all_incoming: bool, request_timeout: Duration) -> Self {
+        Self::with_policy_and_timeout(allow_all_incoming, false, request_timeout)
+    }
+
+    fn with_policy_and_timeout(
+        allow_all_incoming: bool,
+        has_scoped_incoming: bool,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(PeerStatusBrokerInner {
-                allow_incoming,
+                allow_all_incoming,
+                has_scoped_incoming,
                 request_timeout,
                 state: Mutex::new(PeerStatusBrokerState {
                     next_registration_id: 1,
@@ -151,16 +178,21 @@ impl PeerStatusBroker {
     }
 
     pub(in crate::runtime) fn register(&self, session_id: SessionId) -> PeerStatusCarrier {
+        self.register_with_incoming(session_id, false)
+    }
+
+    pub(in crate::runtime) fn register_with_incoming(
+        &self,
+        session_id: SessionId,
+        allow_incoming: bool,
+    ) -> PeerStatusCarrier {
         let (requests, requests_rx) = mpsc::channel(PEER_STATUS_COMMAND_CAPACITY);
         let registration_id = {
             let mut state = self.inner.state.lock().expect("peer status broker lock");
             let registration_id = next_nonzero(&mut state.next_registration_id);
-            state
-                .sessions
-                .entry(session_id)
-                .or_default()
-                .carriers
-                .insert(registration_id, requests);
+            let session = state.sessions.entry(session_id).or_default();
+            session.allow_incoming |= allow_incoming;
+            session.carriers.insert(registration_id, requests);
             registration_id
         };
         PeerStatusCarrier {
@@ -278,6 +310,9 @@ impl PeerStatusBroker {
         let Some(session) = state.sessions.get_mut(&session_id) else {
             return false;
         };
+        if !self.inner.allow_all_incoming && !session.allow_incoming {
+            return false;
+        }
         if session.last_incoming_response_at.is_some_and(|previous| {
             now.saturating_duration_since(previous) < PEER_STATUS_INCOMING_MIN_INTERVAL
         }) {
@@ -285,6 +320,18 @@ impl PeerStatusBroker {
         }
         session.last_incoming_response_at = Some(now);
         true
+    }
+
+    fn incoming_enabled(&self, session_id: SessionId) -> bool {
+        self.inner.allow_all_incoming
+            || self
+                .inner
+                .state
+                .lock()
+                .expect("peer status broker lock")
+                .sessions
+                .get(&session_id)
+                .is_some_and(|session| session.allow_incoming)
     }
 
     fn unregister(&self, session_id: SessionId, registration_id: u64) {
@@ -325,7 +372,7 @@ impl PeerStatusCarrier {
         codec_limits: CodecLimits,
         paths: impl FnOnce() -> Option<Vec<PeerPathStatus>>,
     ) -> Frame {
-        if !self.broker.inner.allow_incoming {
+        if !self.broker.incoming_enabled(self.session_id) {
             return Frame::PeerStatusResponse {
                 request_id,
                 code: PeerStatusCode::Disabled,

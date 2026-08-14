@@ -30,7 +30,7 @@ fn local_proxy_auth() -> ProxyAuthConfig {
 fn auth_accepts_bearer_and_rejects_wrong_token() {
     let request = ManagementRequest {
         method: "GET".to_string(),
-        path: "/api/v3/status".to_string(),
+        path: "/api/v4/status".to_string(),
         headers: vec![(
             "authorization".to_string(),
             "Bearer correct-token".to_string(),
@@ -92,7 +92,7 @@ fn balancer_status_and_actions_share_the_generation_owned_balancer() {
 
     target.refresh_sample_snapshot();
     let initial = target.snapshot();
-    assert_eq!(initial.schema, "mptunnel.management.v3");
+    assert_eq!(initial.schema, "mptunnel.management.v4");
     assert_eq!(initial.services.balancers, 1);
     assert!(initial.controls.balancer.supported);
     assert_eq!(initial.balancers[0].ready_members, 2);
@@ -104,7 +104,7 @@ fn balancer_status_and_actions_share_the_generation_owned_balancer() {
         .expect("drain");
     assert_eq!(response["scope"], "runtime-generation");
     let drained = target.balancer_status_json().expect("balancer status");
-    assert_eq!(drained["schema"], "mptunnel.balancer.v3");
+    assert_eq!(drained["schema"], "mptunnel.balancer.v4");
     assert_eq!(
         drained["balancers"][0]["members"][1]["readiness"],
         "draining"
@@ -162,7 +162,7 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     };
 
     let initial = target.dns_status_json().expect("initial DNS status");
-    assert_eq!(initial["schema"], "mptunnel.dns.status.v3");
+    assert_eq!(initial["schema"], "mptunnel.dns.status.v4");
     assert_eq!(initial["generation"], 1);
     assert_eq!(initial["policies"][0]["name"], "test-default");
     assert_eq!(initial["policies"][0]["cache"]["entries"], 0);
@@ -172,19 +172,25 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     let explanation = target
         .dns_explain_json("managed.example")
         .expect("DNS explanation");
-    assert_eq!(explanation["schema"], "mptunnel.dns.explain.v3");
+    assert_eq!(explanation["schema"], "mptunnel.dns.explain.v4");
     assert_eq!(explanation["domain"], "managed.example");
     assert_eq!(explanation["policy"], "test-default");
-    assert_eq!(explanation["match"], "default");
+    assert_eq!(explanation["selector"], "default");
+    assert!(explanation["dns_rule"].is_null());
     assert_eq!(explanation["servers"][0]["name"], "test-static");
 
     let queried = target
         .dns_query_json(br#"{"domain":"managed.example","type":"A"}"#)
         .await
         .expect("typed DNS query");
-    assert_eq!(queried["schema"], "mptunnel.dns.query.v3");
+    assert_eq!(queried["schema"], "mptunnel.dns.query.v4");
     assert_eq!(queried["domain"], "managed.example");
     assert_eq!(queried["policy"], "test-default");
+    assert_eq!(queried["selector"], "default");
+    assert!(queried["dns_rule"].is_null());
+    assert!(queried["matched_domain"].is_null());
+    assert!(queried["override_record"].is_null());
+    assert!(queried["synthetic_capture"].is_null());
     assert_eq!(queried["rcode"], 0);
     assert_eq!(queried["rcode_name"], "NOERROR");
     assert_eq!(queried["answers"][0]["type"], "A");
@@ -197,7 +203,7 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     assert_eq!(observed["policies"][0]["servers"][0]["successes"], "1");
 
     let flushed = target.dns_flush_json(br#"{}"#).expect("flush all plans");
-    assert_eq!(flushed["schema"], "mptunnel.dns.flush.v3");
+    assert_eq!(flushed["schema"], "mptunnel.dns.flush.v4");
     assert_eq!(flushed["flushed_policies"], 1);
     assert_eq!(flushed["removed_entries"], 1);
     assert_eq!(

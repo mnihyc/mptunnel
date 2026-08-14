@@ -171,7 +171,8 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(context.mux_limits));
     let evidence =
         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);
-    let peer_status = context.peer_status.register(session_id);
+    let peer_status =
+        context.register_peer_status(session_id, path_registration.principal_permit().principal());
     let (commands_tx, commands_rx) =
         reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
     ServerTcpPathSession::new(ServerTcpPathAdmission {

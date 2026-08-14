@@ -4,9 +4,10 @@
 //! This module never loads system resolver configuration or the hosts file.
 
 use crate::product::{
-    CompiledDnsPlan, CompiledDnsPolicy, CompiledDnsUpstream, DnsEgressSpec, DnsIpStrategy,
-    DnsPlanId, DnsPlanLimits, DnsRuleId, DnsRuleMatchKind, DnsTransport, DnsUpstreamEndpoint,
-    DnsUpstreamId, DnsUpstreamStrategy, DomainName, FakeDnsSpec, OutboundId, ProductAdmission,
+    CompiledDnsPlan, CompiledDnsPolicy, CompiledDnsUpstream, DnsActivation, DnsEgressSpec,
+    DnsIpStrategy, DnsOverrideRecordId, DnsPlanId, DnsPlanLimits, DnsRuleId, DnsRuleMatchKind,
+    DnsSyntheticCaptureId, DnsSyntheticCaptureSpec, DnsTransport, DnsUpstreamEndpoint,
+    DnsUpstreamId, DnsUpstreamStrategy, DomainName, OutboundId, ProductAdmission,
     ProductAdmissionRejection, ProductDnsWork,
 };
 use crate::transport::{
@@ -326,7 +327,7 @@ impl DnsBackendFactory for DirectDnsBackendFactory {
 pub struct DnsGeneration {
     policy: Arc<CompiledDnsPolicy>,
     plans: Arc<BTreeMap<DnsPlanId, Arc<PlanRuntime>>>,
-    fake_dns: Option<Arc<FakeDnsRuntime>>,
+    synthetic_captures: Arc<BTreeMap<DnsSyntheticCaptureId, Arc<SyntheticCaptureRuntime>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,13 +354,14 @@ impl DnsRecordResolution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRuntimeSnapshot {
     pub generation: u64,
-    pub host_overrides: usize,
-    pub fake_dns: Option<FakeDnsRuntimeSnapshot>,
+    pub override_records: usize,
+    pub synthetic_captures: Vec<SyntheticCaptureRuntimeSnapshot>,
     pub plans: Vec<DnsPlanRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FakeDnsRuntimeSnapshot {
+pub struct SyntheticCaptureRuntimeSnapshot {
+    pub capture: DnsSyntheticCaptureId,
     pub ipv4_pool: Option<IpNet>,
     pub ipv6_pool: Option<IpNet>,
     pub max_entries: usize,
@@ -372,15 +374,20 @@ pub struct FakeDnsRuntimeSnapshot {
     pub capacity_failures: u64,
 }
 
-/// Classification of one TUN destination against the configured DNS override pools.
+/// Classification of one TUN destination against configured synthetic-capture pools.
 ///
 /// Unknown and expired synthetic addresses are separate from ordinary
 /// destinations so callers can fail closed instead of leaking them to an
 /// outbound as if they were real IPs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FakeDnsRecovery {
-    NotFake,
-    Recovered(DomainName),
+pub enum SyntheticCaptureRecovery {
+    NotSynthetic,
+    Recovered {
+        generation: u64,
+        plan: DnsPlanId,
+        capture: DnsSyntheticCaptureId,
+        domain: DomainName,
+    },
     Expired,
     Unknown,
 }
@@ -388,6 +395,8 @@ pub enum FakeDnsRecovery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsPlanRuntimeSnapshot {
     pub plan: DnsPlanId,
+    pub override_records: Vec<DnsOverrideRecordId>,
+    pub synthetic_capture: Option<DnsSyntheticCaptureId>,
     pub cache_entries: usize,
     pub fresh_cache_entries: usize,
     pub stale_cache_entries: usize,
@@ -400,7 +409,7 @@ pub struct DnsPlanRuntimeSnapshot {
     pub stale_answers: u64,
     pub cache_evictions: u64,
     pub cache_flushes: u64,
-    pub host_answers: u64,
+    pub override_record_answers: u64,
     pub upstream_strategy: DnsUpstreamStrategy,
     pub expected_cidrs: Vec<IpNet>,
     pub upstreams: Vec<DnsUpstreamRuntimeSnapshot>,
@@ -431,15 +440,17 @@ pub struct DnsQueryExplanation {
     pub match_kind: DnsRuleMatchKind,
     pub matched_domain: Option<DomainName>,
     pub explanation: Option<Arc<str>>,
-    pub host_addresses: Option<Arc<[IpAddr]>>,
-    pub fake_dns: Option<FakeDnsExplanation>,
+    pub override_record: Option<DnsOverrideRecordId>,
+    pub override_addresses: Option<Arc<[IpAddr]>>,
+    pub synthetic_capture: Option<SyntheticCaptureExplanation>,
     pub upstream_strategy: DnsUpstreamStrategy,
     pub expected_cidrs: Vec<IpNet>,
     pub upstreams: Vec<DnsUpstreamDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FakeDnsExplanation {
+pub struct SyntheticCaptureExplanation {
+    pub capture: DnsSyntheticCaptureId,
     pub ipv4_pool: Option<IpNet>,
     pub ipv6_pool: Option<IpNet>,
     pub answer_ttl: Duration,
@@ -471,9 +482,11 @@ impl std::fmt::Debug for DnsGeneration {
     }
 }
 
-struct FakeDnsRuntime {
-    spec: FakeDnsSpec,
-    state: Mutex<FakeDnsState>,
+struct SyntheticCaptureRuntime {
+    generation: u64,
+    id: DnsSyntheticCaptureId,
+    spec: DnsSyntheticCaptureSpec,
+    state: Mutex<SyntheticCaptureState>,
     answers: AtomicU64,
     recoveries: AtomicU64,
     expired_recoveries: AtomicU64,
@@ -482,31 +495,34 @@ struct FakeDnsRuntime {
 }
 
 #[derive(Default)]
-struct FakeDnsState {
-    domains: HashMap<DomainName, FakeDnsLease>,
-    addresses: HashMap<IpAddr, DomainName>,
+struct SyntheticCaptureState {
+    domains: HashMap<(DnsPlanId, DomainName), SyntheticCaptureLease>,
+    addresses: HashMap<IpAddr, (DnsPlanId, DomainName)>,
     next_ipv4: u128,
     next_ipv6: u128,
 }
 
-struct FakeDnsLease {
+struct SyntheticCaptureLease {
     ipv4: Option<Ipv4Addr>,
     ipv6: Option<Ipv6Addr>,
     recover_until: Instant,
 }
 
-enum FakeDnsWireAnswer {
+#[derive(Debug)]
+enum SyntheticCaptureWireAnswer {
     Disabled,
     Address(IpAddr, Duration),
     NoData,
     AtCapacity,
 }
 
-impl FakeDnsRuntime {
-    fn new(spec: FakeDnsSpec) -> Self {
+impl SyntheticCaptureRuntime {
+    fn new(generation: u64, spec: DnsSyntheticCaptureSpec) -> Self {
         Self {
+            generation,
+            id: spec.id.clone(),
             spec,
-            state: Mutex::new(FakeDnsState::default()),
+            state: Mutex::new(SyntheticCaptureState::default()),
             answers: AtomicU64::new(0),
             recoveries: AtomicU64::new(0),
             expired_recoveries: AtomicU64::new(0),
@@ -515,12 +531,17 @@ impl FakeDnsRuntime {
         }
     }
 
-    fn answer(&self, domain: &DomainName, record_type: RecordType) -> FakeDnsWireAnswer {
+    fn answer(
+        &self,
+        plan: &DnsPlanId,
+        domain: &DomainName,
+        record_type: RecordType,
+    ) -> SyntheticCaptureWireAnswer {
         let family = match record_type {
             RecordType::A if self.spec.ipv4_pool.is_some() => NetworkFamily::Ipv4,
             RecordType::AAAA if self.spec.ipv6_pool.is_some() => NetworkFamily::Ipv6,
-            RecordType::A | RecordType::AAAA => return FakeDnsWireAnswer::NoData,
-            _ => return FakeDnsWireAnswer::Disabled,
+            RecordType::A | RecordType::AAAA => return SyntheticCaptureWireAnswer::NoData,
+            _ => return SyntheticCaptureWireAnswer::Disabled,
         };
         let now = Instant::now();
         let recover_until = now
@@ -528,7 +549,8 @@ impl FakeDnsRuntime {
             .unwrap_or_else(|| now + Duration::from_secs(86_400));
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
 
-        if let Some(lease) = state.domains.get_mut(domain) {
+        let key = (plan.clone(), domain.clone());
+        if let Some(lease) = state.domains.get_mut(&key) {
             lease.recover_until = recover_until;
             let existing = match family {
                 NetworkFamily::Ipv4 => lease.ipv4.map(IpAddr::V4),
@@ -536,15 +558,15 @@ impl FakeDnsRuntime {
             };
             if let Some(address) = existing {
                 self.answers.fetch_add(1, Ordering::Relaxed);
-                return FakeDnsWireAnswer::Address(address, self.spec.answer_ttl);
+                return SyntheticCaptureWireAnswer::Address(address, self.spec.answer_ttl);
             }
         } else if state.domains.len() >= self.spec.max_entries {
             self.capacity_failures.fetch_add(1, Ordering::Relaxed);
-            return FakeDnsWireAnswer::AtCapacity;
+            return SyntheticCaptureWireAnswer::AtCapacity;
         } else {
             state.domains.insert(
-                domain.clone(),
-                FakeDnsLease {
+                key.clone(),
+                SyntheticCaptureLease {
                     ipv4: None,
                     ipv6: None,
                     recover_until,
@@ -553,51 +575,57 @@ impl FakeDnsRuntime {
         }
 
         let address = match family {
-            NetworkFamily::Ipv4 => allocate_fake_ipv4(&self.spec, &mut state),
-            NetworkFamily::Ipv6 => allocate_fake_ipv6(&self.spec, &mut state),
+            NetworkFamily::Ipv4 => allocate_synthetic_ipv4(&self.spec, &mut state),
+            NetworkFamily::Ipv6 => allocate_synthetic_ipv6(&self.spec, &mut state),
         };
         let Some(address) = address else {
             self.capacity_failures.fetch_add(1, Ordering::Relaxed);
-            return FakeDnsWireAnswer::AtCapacity;
+            return SyntheticCaptureWireAnswer::AtCapacity;
         };
-        state.addresses.insert(address, domain.clone());
+        state.addresses.insert(address, key.clone());
         let lease = state
             .domains
-            .get_mut(domain)
-            .expect("DNS override domain inserted before address allocation");
+            .get_mut(&key)
+            .expect("synthetic-capture domain inserted before address allocation");
         match address {
             IpAddr::V4(address) => lease.ipv4 = Some(address),
             IpAddr::V6(address) => lease.ipv6 = Some(address),
         }
         self.answers.fetch_add(1, Ordering::Relaxed);
-        FakeDnsWireAnswer::Address(address, self.spec.answer_ttl)
+        SyntheticCaptureWireAnswer::Address(address, self.spec.answer_ttl)
     }
 
-    fn recover(&self, address: IpAddr) -> FakeDnsRecovery {
-        if !fake_dns_contains(&self.spec, address) {
-            return FakeDnsRecovery::NotFake;
+    fn recover(&self, address: IpAddr) -> SyntheticCaptureRecovery {
+        if !synthetic_capture_contains(&self.spec, address) {
+            return SyntheticCaptureRecovery::NotSynthetic;
         }
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(domain) = state.addresses.get(&address) else {
+        let Some((plan, domain)) = state.addresses.get(&address) else {
             self.unknown_recoveries.fetch_add(1, Ordering::Relaxed);
-            return FakeDnsRecovery::Unknown;
+            return SyntheticCaptureRecovery::Unknown;
         };
-        let Some(lease) = state.domains.get(domain) else {
+        let Some(lease) = state.domains.get(&(plan.clone(), domain.clone())) else {
             self.unknown_recoveries.fetch_add(1, Ordering::Relaxed);
-            return FakeDnsRecovery::Unknown;
+            return SyntheticCaptureRecovery::Unknown;
         };
         if Instant::now() >= lease.recover_until {
             self.expired_recoveries.fetch_add(1, Ordering::Relaxed);
-            return FakeDnsRecovery::Expired;
+            return SyntheticCaptureRecovery::Expired;
         }
         self.recoveries.fetch_add(1, Ordering::Relaxed);
-        FakeDnsRecovery::Recovered(domain.clone())
+        SyntheticCaptureRecovery::Recovered {
+            generation: self.generation,
+            plan: plan.clone(),
+            capture: self.id.clone(),
+            domain: domain.clone(),
+        }
     }
 
-    fn snapshot(&self) -> FakeDnsRuntimeSnapshot {
+    fn snapshot(&self) -> SyntheticCaptureRuntimeSnapshot {
         let now = Instant::now();
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        FakeDnsRuntimeSnapshot {
+        SyntheticCaptureRuntimeSnapshot {
+            capture: self.id.clone(),
             ipv4_pool: self.spec.ipv4_pool.map(IpNet::V4),
             ipv6_pool: self.spec.ipv6_pool.map(IpNet::V6),
             max_entries: self.spec.max_entries,
@@ -622,7 +650,10 @@ enum NetworkFamily {
     Ipv6,
 }
 
-fn allocate_fake_ipv4(spec: &FakeDnsSpec, state: &mut FakeDnsState) -> Option<IpAddr> {
+fn allocate_synthetic_ipv4(
+    spec: &DnsSyntheticCaptureSpec,
+    state: &mut SyntheticCaptureState,
+) -> Option<IpAddr> {
     let pool = spec.ipv4_pool?;
     let base = u32::from(pool.network());
     let addresses = 1_u128 << u32::from(32 - pool.prefix_len());
@@ -636,7 +667,10 @@ fn allocate_fake_ipv4(spec: &FakeDnsSpec, state: &mut FakeDnsState) -> Option<Ip
     Some(IpAddr::V4(Ipv4Addr::from(address)))
 }
 
-fn allocate_fake_ipv6(spec: &FakeDnsSpec, state: &mut FakeDnsState) -> Option<IpAddr> {
+fn allocate_synthetic_ipv6(
+    spec: &DnsSyntheticCaptureSpec,
+    state: &mut SyntheticCaptureState,
+) -> Option<IpAddr> {
     let pool = spec.ipv6_pool?;
     let base = u128::from(pool.network());
     let host_bits = u32::from(128 - pool.prefix_len());
@@ -650,7 +684,7 @@ fn allocate_fake_ipv6(spec: &FakeDnsSpec, state: &mut FakeDnsState) -> Option<Ip
     Some(IpAddr::V6(Ipv6Addr::from(base.checked_add(offset)?)))
 }
 
-fn fake_dns_contains(spec: &FakeDnsSpec, address: IpAddr) -> bool {
+fn synthetic_capture_contains(spec: &DnsSyntheticCaptureSpec, address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => spec.ipv4_pool.is_some_and(|pool| pool.contains(&address)),
         IpAddr::V6(address) => spec.ipv6_pool.is_some_and(|pool| pool.contains(&address)),
@@ -676,21 +710,33 @@ impl DnsGeneration {
         policy: Arc<CompiledDnsPolicy>,
         factory: &dyn DnsBackendFactory,
     ) -> Result<Self, DnsRuntimeError> {
+        let selected = policy.dns_active_plans().cloned().collect::<BTreeSet<_>>();
         Self::compile_selected_with_factory(
             policy,
             factory,
             ProductAdmission::default(),
-            None,
+            Some(&selected),
             None,
         )
     }
 
-    pub(crate) fn compile_with_factory_and_admission(
+    /// Compile an explicit selector-reachable DNS closure. The caller supplies
+    /// the union of intrinsic DNS roots and route-selected policy roots.
+    pub(crate) fn compile_active_with_factory_and_admission(
         policy: Arc<CompiledDnsPolicy>,
         factory: &dyn DnsBackendFactory,
         admission: ProductAdmission,
+        activation: &DnsActivation,
     ) -> Result<Self, DnsRuntimeError> {
-        Self::compile_selected_with_factory(policy, factory, admission, None, None)
+        if activation.generation() != policy.generation() {
+            return Err(DnsRuntimeError::PolicyInvariant(format!(
+                "DNS activation generation {} does not match policy generation {}",
+                activation.generation(),
+                policy.generation()
+            )));
+        }
+        let active_plans = activation.plans().cloned().collect::<BTreeSet<_>>();
+        Self::compile_selected_with_factory(policy, factory, admission, Some(&active_plans), None)
     }
 
     /// Compile only the direct plans selected by endpoint names that must be
@@ -711,7 +757,7 @@ impl DnsGeneration {
         for domain in domains {
             let plan = policy.select(domain).plan().id().clone();
             selected.insert(plan.clone());
-            if policy.host(domain).is_none() {
+            if policy.override_record_for_plan(&plan, domain).is_none() {
                 network_plans.insert(plan);
             }
         }
@@ -758,22 +804,47 @@ impl DnsGeneration {
         selected: Option<&BTreeSet<DnsPlanId>>,
         plans_requiring_backends: Option<&BTreeSet<DnsPlanId>>,
     ) -> Result<Self, DnsRuntimeError> {
-        let fake_dns = policy
-            .fake_dns()
-            .cloned()
-            .map(FakeDnsRuntime::new)
-            .map(Arc::new);
-        let hosts = Arc::new(
-            policy
-                .hosts()
-                .map(|(domain, addresses)| (domain.clone(), addresses.clone()))
-                .collect::<BTreeMap<_, _>>(),
+        let selected_plans = selected.map_or_else(
+            || policy.dns_active_plans().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::clone,
         );
+        policy
+            .validate_active_plans(selected_plans.iter())
+            .map_err(|error| DnsRuntimeError::PolicyInvariant(error.to_string()))?;
+        let mut synthetic_captures = BTreeMap::new();
+        for capture_id in selected_plans.iter().filter_map(|plan_id| {
+            policy
+                .plan(plan_id)
+                .and_then(CompiledDnsPlan::synthetic_capture)
+        }) {
+            if synthetic_captures.contains_key(capture_id) {
+                continue;
+            }
+            let spec = policy.synthetic_capture(capture_id).ok_or_else(|| {
+                DnsRuntimeError::PolicyInvariant(format!(
+                    "active DNS synthetic capture {capture_id} disappeared"
+                ))
+            })?;
+            synthetic_captures.insert(
+                capture_id.clone(),
+                Arc::new(SyntheticCaptureRuntime::new(
+                    policy.generation(),
+                    spec.clone(),
+                )),
+            );
+        }
         let mut plans = BTreeMap::new();
         for plan in policy
             .plans()
-            .filter(|plan| selected.is_none_or(|selected| selected.contains(plan.id())))
+            .filter(|plan| selected_plans.contains(plan.id()))
         {
+            let hosts = Arc::new(
+                plan.override_records()
+                    .iter()
+                    .filter_map(|id| policy.override_record(id))
+                    .map(|record| (record.domain().clone(), record.addresses().clone()))
+                    .collect::<BTreeMap<_, _>>(),
+            );
             let mut backends = Vec::with_capacity(plan.upstreams().len());
             if plans_requiring_backends.is_none_or(|required| required.contains(plan.id())) {
                 for upstream_id in plan.upstreams() {
@@ -810,7 +881,7 @@ impl DnsGeneration {
         Ok(Self {
             policy,
             plans: Arc::new(plans),
-            fake_dns,
+            synthetic_captures: Arc::new(synthetic_captures),
         })
     }
 
@@ -844,10 +915,20 @@ impl DnsGeneration {
 
     pub fn runtime_snapshot(&self) -> DnsRuntimeSnapshot {
         let now = Instant::now();
+        let override_records = self
+            .plans
+            .values()
+            .flat_map(|runtime| runtime.override_records.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .len();
         DnsRuntimeSnapshot {
             generation: self.generation(),
-            host_overrides: self.policy.hosts().len(),
-            fake_dns: self.fake_dns.as_deref().map(FakeDnsRuntime::snapshot),
+            override_records,
+            synthetic_captures: self
+                .synthetic_captures
+                .values()
+                .map(|capture| capture.snapshot())
+                .collect(),
             plans: self
                 .plans
                 .values()
@@ -863,13 +944,21 @@ impl DnsGeneration {
             .plans
             .get(selection.plan().id())
             .expect("compiled DNS policy runtime");
-        let host_addresses = self.policy.host(domain).cloned();
-        let fake_dns = self.policy.fake_dns().map(|spec| FakeDnsExplanation {
-            ipv4_pool: spec.ipv4_pool.map(IpNet::V4),
-            ipv6_pool: spec.ipv6_pool.map(IpNet::V6),
-            answer_ttl: spec.answer_ttl,
-            recovery_ttl: spec.recovery_ttl,
-        });
+        let override_record = self
+            .policy
+            .override_record_for_plan(selection.plan().id(), domain);
+        let override_addresses = override_record.map(|record| record.addresses().clone());
+        let synthetic_capture = selection
+            .plan()
+            .synthetic_capture()
+            .and_then(|id| self.policy.synthetic_capture(id))
+            .map(|spec| SyntheticCaptureExplanation {
+                capture: spec.id.clone(),
+                ipv4_pool: spec.ipv4_pool.map(IpNet::V4),
+                ipv6_pool: spec.ipv6_pool.map(IpNet::V6),
+                answer_ttl: spec.answer_ttl,
+                recovery_ttl: spec.recovery_ttl,
+            });
         DnsQueryExplanation {
             generation: selection.generation(),
             domain: domain.clone(),
@@ -878,11 +967,12 @@ impl DnsGeneration {
             match_kind: selection.match_kind(),
             matched_domain: selection.matched_domain().cloned(),
             explanation: selection.explanation().map(Arc::from),
-            host_addresses: host_addresses.clone(),
-            fake_dns,
+            override_record: override_record.map(|record| record.id().clone()),
+            override_addresses: override_addresses.clone(),
+            synthetic_capture,
             upstream_strategy: selection.plan().upstream_strategy(),
             expected_cidrs: selection.plan().expected_cidrs().to_vec(),
-            upstreams: if host_addresses.is_some() {
+            upstreams: if override_addresses.is_some() {
                 Vec::new()
             } else {
                 runtime
@@ -935,12 +1025,14 @@ impl DnsGeneration {
         })
     }
 
-    pub fn recover_fake_dns(&self, address: IpAddr) -> FakeDnsRecovery {
-        self.fake_dns
-            .as_deref()
-            .map_or(FakeDnsRecovery::NotFake, |fake_dns| {
-                fake_dns.recover(address)
-            })
+    pub fn recover_synthetic_capture(&self, address: IpAddr) -> SyntheticCaptureRecovery {
+        for capture in self.synthetic_captures.values() {
+            let recovery = capture.recover(address);
+            if recovery != SyntheticCaptureRecovery::NotSynthetic {
+                return recovery;
+            }
+        }
+        SyntheticCaptureRecovery::NotSynthetic
     }
 
     /// Query one arbitrary IN-class record type through split-DNS selection.
@@ -1089,11 +1181,16 @@ impl DnsGeneration {
                 return encode_dns_wire_response(response, response_limit);
             }
         };
-        if self.policy.host(&domain).is_none()
-            && let Some(fake_dns) = self.fake_dns.as_deref()
+        let selection = self.policy.select(&domain);
+        if self
+            .policy
+            .override_record_for_plan(selection.plan().id(), &domain)
+            .is_none()
+            && let Some(capture_id) = selection.plan().synthetic_capture()
+            && let Some(capture) = self.synthetic_captures.get(capture_id)
         {
-            match fake_dns.answer(&domain, query.query_type()) {
-                FakeDnsWireAnswer::Address(address, fake_ttl) => {
+            match capture.answer(selection.plan().id(), &domain, query.query_type()) {
+                SyntheticCaptureWireAnswer::Address(address, fake_ttl) => {
                     let data = match address {
                         IpAddr::V4(address) => RData::A(A(address)),
                         IpAddr::V6(address) => RData::AAAA(AAAA(address)),
@@ -1105,22 +1202,18 @@ impl DnsGeneration {
                     ));
                     return encode_dns_wire_response(response, response_limit);
                 }
-                FakeDnsWireAnswer::NoData => {
+                SyntheticCaptureWireAnswer::NoData => {
                     return encode_dns_wire_response(response, response_limit);
                 }
-                FakeDnsWireAnswer::AtCapacity => {
+                SyntheticCaptureWireAnswer::AtCapacity => {
                     response.metadata.response_code = ResponseCode::ServFail;
                     return encode_dns_wire_response(response, response_limit);
                 }
-                FakeDnsWireAnswer::Disabled => {}
+                SyntheticCaptureWireAnswer::Disabled => {}
             }
         }
         match self
-            .query_record_in_plan(
-                self.policy.select(&domain).plan().id(),
-                &domain,
-                query.query_type(),
-            )
+            .query_record_in_plan(selection.plan().id(), &domain, query.query_type())
             .await
         {
             Ok(answer) => {
@@ -1156,8 +1249,8 @@ impl DnsGeneration {
                     outbound_capabilities: Vec::new(),
                     plans: vec![DnsPlanSpec::new(plan.clone(), vec![upstream.clone()])],
                     rules: Vec::new(),
-                    hosts: Vec::new(),
-                    fake_dns: None,
+                    override_records: Vec::new(),
+                    synthetic_captures: Vec::new(),
                     default_plan: plan,
                 },
             )
@@ -1352,6 +1445,8 @@ fn successful_upstream_result(
 
 struct PlanRuntime {
     id: DnsPlanId,
+    override_records: Arc<[DnsOverrideRecordId]>,
+    synthetic_capture: Option<DnsSyntheticCaptureId>,
     strategy: DnsIpStrategy,
     upstream_strategy: DnsUpstreamStrategy,
     expected_cidrs: Arc<[IpNet]>,
@@ -1373,6 +1468,8 @@ impl PlanRuntime {
     ) -> Self {
         Self {
             id: plan.id().clone(),
+            override_records: Arc::from(plan.override_records()),
+            synthetic_capture: plan.synthetic_capture().cloned(),
             strategy: plan.ip_strategy(),
             upstream_strategy: plan.upstream_strategy(),
             expected_cidrs: Arc::from(plan.expected_cidrs()),
@@ -1441,6 +1538,11 @@ impl PlanRuntime {
         self.telemetry.queries.fetch_add(1, Ordering::Relaxed);
         if let Some(addresses) = self.hosts.get(&question.domain) {
             self.telemetry.host_answers.fetch_add(1, Ordering::Relaxed);
+            let addresses = if dns_strategy_allows_record(self.strategy, question.record_type) {
+                addresses.as_ref()
+            } else {
+                &[]
+            };
             return Ok(ResolvedRecord::fresh(Arc::new(hosts_response(
                 &question,
                 addresses,
@@ -1850,6 +1952,8 @@ impl PlanRuntime {
         let (fresh_cache_entries, stale_cache_entries) = state.cache.counts(now);
         DnsPlanRuntimeSnapshot {
             plan: self.id.clone(),
+            override_records: self.override_records.to_vec(),
+            synthetic_capture: self.synthetic_capture.clone(),
             cache_entries: fresh_cache_entries + stale_cache_entries,
             fresh_cache_entries,
             stale_cache_entries,
@@ -1862,7 +1966,7 @@ impl PlanRuntime {
             stale_answers: self.telemetry.stale_answers.load(Ordering::Relaxed),
             cache_evictions: self.telemetry.cache_evictions.load(Ordering::Relaxed),
             cache_flushes: self.telemetry.cache_flushes.load(Ordering::Relaxed),
-            host_answers: self.telemetry.host_answers.load(Ordering::Relaxed),
+            override_record_answers: self.telemetry.host_answers.load(Ordering::Relaxed),
             upstream_strategy: self.upstream_strategy,
             expected_cidrs: self.expected_cidrs.to_vec(),
             upstreams: self
@@ -2180,6 +2284,14 @@ fn record_resolution_has_addresses(
             )
         })
     })
+}
+
+fn dns_strategy_allows_record(strategy: DnsIpStrategy, record_type: RecordType) -> bool {
+    match record_type {
+        RecordType::A => !matches!(strategy, DnsIpStrategy::Ipv6Only),
+        RecordType::AAAA => !matches!(strategy, DnsIpStrategy::Ipv4Only),
+        _ => true,
+    }
 }
 
 fn record_resolution_is_nx_domain(result: &Result<ResolvedRecord, DnsRuntimeError>) -> bool {

@@ -85,9 +85,6 @@ pub(super) async fn handle_server_udp_reliable_stream(
         target,
         initial_demand,
     } = stream_context;
-    context
-        .reliable_streams
-        .validate_target(&path_registration, &target)?;
     let duplicate_open_target = target.clone();
     let (commands_tx, commands_rx) = reliable_path_command_channels(udp_path_command_queue(
         context.mux_limits,
@@ -139,6 +136,13 @@ pub(super) async fn handle_server_udp_reliable_stream(
             )
             .await?;
             let _ = udp_path_finish_stream(&mut send).await;
+            return Ok(());
+        }
+        // Deliberately write no MPP response for a policy drop. Returning
+        // retires only this native QUIC request stream, not the connection or
+        // any sibling logical flow.
+        ServerStreamOpenOutcome::Dropped => {
+            let _ = send.cancel_pending_response();
             return Ok(());
         }
     };
@@ -444,6 +448,10 @@ async fn run_server_udp_reliable_stream_loop(
                                 )
                                 .await?;
                                 let _ = udp_path_finish_stream(&mut send).await;
+                                return Ok(());
+                            }
+                            ServerStreamOpenOutcome::Dropped => {
+                                let _ = send.cancel_pending_response();
                                 return Ok(());
                             }
                         }

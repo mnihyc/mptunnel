@@ -2,7 +2,8 @@
 
 use super::{client, server};
 use crate::config::{
-    ForwardingMode, ManagementConfig, NodeConfig, OutboundLeafConfig, SessionConfig,
+    ActiveNodeGraph, ForwardingMode, ManagementConfig, NodeConfig, OutboundLeafConfig,
+    SessionConfig,
 };
 use crate::performance::ResourceLimits;
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
@@ -52,16 +53,26 @@ pub(super) async fn run(
     } = environment;
     let runtime_carrier_network = carrier_network.provider.clone();
     let readiness = RuntimeReadinessBarrier::new(generation.clone());
+    let active = node
+        .compile_active_graph()
+        .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
     let NodeConfig {
         forwarding_mode,
-        outbounds,
-        gateway_balancers,
+        mut outbounds,
+        mut gateway_balancers,
         local_ingresses,
         tun_l3_ingresses,
         product_policy,
-        dns_policy,
+        dns_policy: _,
         servers,
     } = node;
+    outbounds.retain(|outbound| active.contains_outbound(outbound.id()));
+    gateway_balancers.retain(|balancer| active.contains_balancer(&balancer.id));
+    let ActiveNodeGraph {
+        dns_policy: compiled_dns,
+        dns_activation,
+        ..
+    } = active;
     let product_inventory = ProductRuntimeInventory::from_config(&local_ingresses, &outbounds);
     let tun_l3_inventory = match forwarding_mode {
         ForwardingMode::L4 => TunL3RuntimeInventory::default(),
@@ -95,7 +106,8 @@ pub(super) async fn run(
                         session_retention_timeout: session.retention_timeout,
                         path_group_ordinal: outbound_path_group_ordinal,
                         carrier_network: runtime_carrier_network.clone(),
-                        allow_peer_diagnostics: management.peer_diagnostics_enabled(),
+                        allow_peer_diagnostics: management.peer_diagnostics_enabled()
+                            || config.allow_peer_diagnostics,
                     },
                     product_telemetry.clone(),
                 )?;
@@ -137,14 +149,12 @@ pub(super) async fn run(
     let outbound_shell = RuntimeOutboundRegistryShell::compile(runtime_leaves, &gateway_balancers)?
         .with_product_admission(product_admission.clone())
         .with_product_telemetry(product_telemetry.clone());
-    let compiled_dns = dns_policy
-        .compile()
-        .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
     let dns_factory = outbound_shell.dns_backend_factory(native_sockets);
-    let dns = crate::dns::DnsGeneration::compile_with_factory_and_admission(
+    let dns = crate::dns::DnsGeneration::compile_active_with_factory_and_admission(
         Arc::new(compiled_dns),
         &dns_factory,
         product_admission,
+        &dns_activation,
     )
     .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
     carrier_network.install_product_dns(dns.clone())?;
@@ -155,24 +165,30 @@ pub(super) async fn run(
     };
     outbound_registry.spawn_gateway_probe_services(&mut services);
 
-    if !local_ingresses.is_empty() {
+    let has_l4_server = servers.iter().any(|server| server.tun_l3.is_none());
+    let router = if !local_ingresses.is_empty() || has_l4_server {
         let policy = product_policy.as_ref().ok_or(RuntimeError::Protocol(
-            "node local inbounds are missing routing policy",
+            "node L4 inbounds are missing routing policy",
         ))?;
-        let router = ClientIngressRouter::new(policy, outbound_registry.clone())?;
-        if let Err(error) = client::spawn_ingresses(
+        Some(ClientIngressRouter::new(policy, outbound_registry.clone())?)
+    } else {
+        None
+    };
+    if !local_ingresses.is_empty()
+        && let Err(error) = client::spawn_ingresses(
             local_ingresses,
             resources.into(),
-            router,
+            router
+                .clone()
+                .expect("local L4 inbounds require the shared router"),
             packet_devices.clone(),
             &readiness,
             &mut services,
         )
         .await
-        {
-            super::retire_runtime_services(&mut services).await;
-            return Err(error);
-        }
+    {
+        super::retire_runtime_services(&mut services).await;
+        return Err(error);
     }
 
     for ingress in tun_l3_ingresses {
@@ -194,31 +210,16 @@ pub(super) async fn run(
     let mut server_contexts = Vec::with_capacity(servers.len());
     for server_config in servers {
         let server_readiness = readiness.require("MPP server listeners");
-        let destination_acl = match server_config.destination_acl.compile() {
-            Ok(destination_acl) => destination_acl,
-            Err(error) => {
-                super::retire_runtime_services(&mut services).await;
-                return Err(RuntimeError::ProductPolicy(error.to_string()));
-            }
+        let server_router = if server_config.tun_l3.is_none() {
+            router.clone()
+        } else {
+            None
         };
-        let inbound_id = match crate::product::InboundId::parse(&server_config.name) {
-            Ok(inbound_id) => inbound_id,
-            Err(error) => {
-                super::retire_runtime_services(&mut services).await;
-                return Err(RuntimeError::ProductPolicy(error.to_string()));
-            }
-        };
-        let destination_policy = Arc::new(crate::outbound::ServerDestinationPolicy::for_inbound(
-            destination_acl,
-            inbound_id,
-        ));
         let runtime = match server::new_identity_runtime_with_metadata(
             server_config.name,
             server_config.paths,
             outbound_registry.clone(),
-            server_config.egress,
-            server_config.dns_plan,
-            destination_policy,
+            server_router,
             server_config.security,
             server_config.tls,
             server_config.performance,
@@ -226,6 +227,7 @@ pub(super) async fn run(
             product_telemetry.clone(),
             session.retention_timeout,
             management.peer_diagnostics_enabled(),
+            server_config.peer_diagnostics_principals,
             forwarding_mode,
             server_config.tun_l3,
         ) {
@@ -268,7 +270,9 @@ pub(super) async fn run(
                 device,
             ));
         }
-        services.spawn(reliable_relay.run());
+        if let Some(reliable_relay) = reliable_relay {
+            services.spawn(reliable_relay.run());
+        }
         server::spawn_listeners(bound, paths.clone(), &mut services);
         server_readiness.ready();
         server_contexts.push(paths);

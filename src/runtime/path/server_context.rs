@@ -1,6 +1,6 @@
 //! Shared server configuration and carrier-path registries.
 
-use crate::config::ServerSecurityConfig;
+use crate::config::{PeerDiagnosticsPrincipalPolicy, ServerSecurityConfig};
 use crate::model::path::PathPolicy;
 use crate::mux::MuxLimits;
 use crate::product::{
@@ -15,7 +15,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ProductCredentialAdmission;
 use crate::runtime::path::model::path_startup_metrics;
 use crate::runtime::path::{ServerDatagramPort, ServerStreamPort};
-use crate::runtime::peer_status::PeerStatusBroker;
+use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier};
 use crate::runtime::recent_ids::ExpiringReplayCache;
 use crate::runtime::telemetry::RuntimeTelemetry;
 use crate::runtime::tun_l3::{ServerIpTunnelDevice, ServerIpTunnelPort};
@@ -159,10 +159,13 @@ pub(in crate::runtime) struct ServerPathContext {
     pub(in crate::runtime) silent_rejections: Arc<Semaphore>,
     pub(in crate::runtime) tls: TcpServerTlsConfig,
     pub(in crate::runtime) reliable_streams: ServerStreamPort,
-    pub(in crate::runtime) datagrams: ServerDatagramPort,
+    /// Present only for L4 inbounds. L3 identities do not construct a
+    /// datagram service merely to reject L4 requests.
+    pub(in crate::runtime) datagrams: Option<ServerDatagramPort>,
     pub(in crate::runtime) ip_tunnels: Option<ServerIpTunnelPort>,
     pub(in crate::runtime) ip_tunnel_device: Arc<Mutex<Option<ServerIpTunnelDevice>>>,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
+    pub(in crate::runtime) peer_diagnostics_principals: PeerDiagnosticsPrincipalPolicy,
     #[allow(
         dead_code,
         reason = "standalone server composition hands the shared generation owner to management through this context"
@@ -174,6 +177,17 @@ pub(in crate::runtime) struct ServerPathContext {
 }
 
 impl ServerPathContext {
+    pub(in crate::runtime) fn register_peer_status(
+        &self,
+        session_id: SessionId,
+        principal: &crate::product::PrincipalId,
+    ) -> PeerStatusCarrier {
+        self.peer_status.register_with_incoming(
+            session_id,
+            self.peer_diagnostics_principals.allows(principal),
+        )
+    }
+
     pub(in crate::runtime) fn take_ip_tunnel_device(&self) -> Option<ServerIpTunnelDevice> {
         self.ip_tunnel_device
             .lock()

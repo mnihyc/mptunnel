@@ -15,12 +15,12 @@ forwarding, TUN, routing, DNS policy, outbound selection,
 balancing, persistent configuration, live management, and connection
 diagnostics.
 
-The global forwarding mode defaults to L4 for SOCKS5, HTTP CONNECT, mixed
-proxy, port forwarding, and TUN-L4. An explicit experimental L3 mode instead
-carries complete IP packets, with server-owned address pools and per-principal
-allocations. L3 can use TCP and QUIC together while host routes, DNS, firewall
-policy, forwarding, and NAT remain under operator control. Both TUN modes are
-experimental and cannot be mixed in one runtime generation.
+SOCKS5, HTTP CONNECT, mixed proxy, port forwarding, TUN, and MPP listeners use
+the ordinary L4 routing model. Experimental `tun-l3` and `mpp-l3` inbounds
+instead carry complete IP packets, with server-owned address pools and
+per-principal allocations. L3 can use TCP and QUIC together while host routes,
+DNS, firewall policy, forwarding, and NAT remain under operator control. A
+configuration cannot mix L4 and L3 inbound protocols.
 
 ## Contents
 
@@ -53,7 +53,6 @@ rank paths from live latency and delivery evidence, choose differently for
 upload and download, and move undelivered ranges to a surviving carrier.
 
 ```text
-forwarding_mode = l4 (default)
 SOCKS5 / HTTP CONNECT / mixed proxy / port forward / TUN-L4
                        |
              routing, DNS, outbounds
@@ -64,7 +63,6 @@ SOCKS5 / HTTP CONNECT / mixed proxy / port forward / TUN-L4
               /             |             \
         TCP path A      QUIC path B     TCP path C
 
-forwarding_mode = l3 (experimental)
 TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 ```
 
@@ -231,7 +229,7 @@ mptunnel --config ./config.toml
 
 ## Configuration and operation
 
-The same graph is available through TOML, the simple CLI surface, and supported
+The same configuration is available through TOML, the simple CLI surface, and supported
 authenticated runtime updates. Successful runtime updates are written
 atomically to `config.toml`; invalid or interrupted updates leave the active
 generation and last valid file unchanged.
@@ -246,6 +244,8 @@ is shorthand for the raw form.
 Inline encodings are not encryption and remain stored in the configuration.
 Material bytes are exact: file content, decoded inline content, and raw UTF-8
 are never trimmed. Consumer-specific size, UTF-8, or PEM validation follows.
+Relative material paths—including a relative path read from an environment
+variable—resolve beside the selected TOML document.
 
 Every configurable resource has a canonical `name`. References use the
 resource noun (`outbound`, `balancer`, `dns_policy`); `_id` fields identify
@@ -253,16 +253,40 @@ protocol credentials, principals, or signed artifacts. `target` means an
 application destination; a listen address accepts local traffic; an `endpoint`
 is a proxy connector or MPP carrier URI. A DNS server defines how and where to
 send DNS messages. A DNS policy selects servers, address families, security,
-limits, and cache behavior. DNS records are exact local answers; DNS override
-is the synthetic-address mode used only for captured DNS traffic.
+limits, cache behavior, named exact-name `override_records`, and at most one
+named `synthetic_capture`. Policy selection is explicit: a route-selected DNS
+policy wins, otherwise exact and longest-suffix DNS rules precede the default.
+Within that policy an attached override record wins, captured DNS may then use
+its attached synthetic capture, and only then are its servers queried. Ordinary
+dial-time resolution never synthesizes an address. A recovered synthetic
+address retains the policy and capture that issued it; a route may omit
+`dns_policy`, but cannot silently replace that policy with another.
 
 Fixed-target listeners use `tcp-forward`, `udp-forward`, or `mixed-forward`;
 the mixed form binds both transports on the same addresses and sends them to
 one target.
-Domain-capable SOCKS5/HTTP/MPP outbounds can receive a domain unchanged; DNS
-resolution is performed only when routing or the selected outbound requires an
-IP. Ranged carrier endpoints use syntax such as
+Domain-capable SOCKS5/HTTP/MPP outbounds can receive a domain unchanged, in
+which case that next hop owns name resolution. Selecting `dns_policy` on the
+route or using an IP-dependent rule instead forces resolution and address
+authorization at this MPTUNNEL node. Ranged carrier endpoints use syntax such as
 `quic://server.example:20000-40000`.
+
+All L4 inbounds, including local listeners and `protocol = "mpp"`, use one
+ordered, first-match `[[routing.rules]]` table. A normal rule names one
+`outbound` or `balancer`; no separate allow action is required. Explicit
+`decision = "allow-restricted"` authorizes a narrowly matched private or
+special-use destination, while `reject` and `drop` are terminal. Omitted
+`inbounds` or `principal_ids` means any; scalar `"*"` is the equivalent explicit
+spelling. If no rule matches, traffic is rejected—MPTUNNEL never silently uses
+the first outbound.
+
+`protocol = "mpp-l3"` is the distinct server-side packet service used with a
+`tun-l3` client. It does not enter L4 routing, application-target DNS, L4 flow
+admission, or target outbounds. Carrier endpoint DNS and `max_dns_work` remain
+available. Every definition is validated, but runtime starts only DNS policies
+reachable from `[dns].default`, DNS rules, or route `dns_policy`, and outbounds
+reachable from routes, active DNS servers, balancers, or a `tun-l3` inbound.
+Unused definitions make no network or system changes.
 
 Logging starts with the running version, configuration source, safe inbound and
 outbound inventory, bound listeners, runtime readiness, and shutdown. The
@@ -272,7 +296,8 @@ One bounded background HTTPS check reports the newest published GitHub release
 without delaying startup or forwarding; an available update includes its
 release-page URL.
 
-The opt-in loopback management endpoint provides live health, paths, sessions,
+The opt-in loopback management endpoint exposes only the authenticated v4 API
+under `/api/v4/` and provides live health, paths, sessions,
 connections, traffic, DNS, balancers, configuration state, and bounded
 controls. Its embedded dashboard stores a successfully authenticated token in
 same-origin `localStorage` until **Forget token** is selected or authentication

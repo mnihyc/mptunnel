@@ -14,8 +14,9 @@ use crate::platform::{
 };
 use crate::product::{
     DnsEgressSpec, DnsOutboundCapabilitySpec, DnsPlanId, DnsPlanSpec, DnsPolicySpec,
-    DnsSecurityPolicy, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, DomainName, NetworkSet,
-    OutboundId,
+    DnsSecurityPolicy, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, DomainName,
+    EgressAction, InitialDemand, Network, NetworkSet, OutboundId, RouteAction, RouteMatchSpec,
+    RouteRuleSpec, RuleId,
 };
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -235,8 +236,8 @@ fn encrypted_dns_policy_with_egress(egress: DnsEgressSpec) -> DnsPolicyConfig {
             outbound_capabilities,
             plans: vec![plan],
             rules: Vec::new(),
-            hosts: Vec::new(),
-            fake_dns: None,
+            override_records: Vec::new(),
+            synthetic_captures: Vec::new(),
             default_plan: plan_id,
         },
     }
@@ -257,8 +258,8 @@ fn plaintext_dns_policy() -> DnsPolicyConfig {
             outbound_capabilities: Vec::new(),
             plans: vec![DnsPlanSpec::new(plan_id.clone(), vec![upstream_id])],
             rules: Vec::new(),
-            hosts: Vec::new(),
-            fake_dns: None,
+            override_records: Vec::new(),
+            synthetic_captures: Vec::new(),
             default_plan: plan_id,
         },
     }
@@ -330,23 +331,65 @@ fn mpp_leaf(id: &str, paths: impl IntoIterator<Item = PathSpec>) -> OutboundLeaf
             paths,
             path_probe_interval: Duration::from_secs(10),
             path_probe_timeout: Duration::from_secs(2),
+            allow_peer_diagnostics: false,
             performance: MppPerformanceConfig::default(),
         }),
     }
 }
 
+fn product_policy_for_outbounds(outbounds: &[OutboundLeafConfig]) -> ProductPolicyConfig {
+    let mut routes = outbounds
+        .iter()
+        .enumerate()
+        .map(|(index, outbound)| {
+            let capabilities = outbound.networks();
+            let matcher = RouteMatchSpec {
+                domain_exact: vec![
+                    DomainName::parse(&format!("active-{index}.example"))
+                        .expect("active route domain"),
+                ],
+                networks: [Network::Tcp, Network::Udp]
+                    .into_iter()
+                    .filter(|network| capabilities.contains(*network))
+                    .collect(),
+                ..RouteMatchSpec::default()
+            };
+            RouteRuleSpec::new(
+                RuleId::parse(&format!("active-{index}")).expect("active route ID"),
+                matcher,
+                RouteAction::allow(
+                    EgressAction::Outbound(outbound.id().clone()),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    routes.push(RouteRuleSpec::new(
+        RuleId::parse("default-reject").expect("default route ID"),
+        RouteMatchSpec::default(),
+        RouteAction::reject(),
+    ));
+    ProductPolicyConfig {
+        generation: 1,
+        routes,
+    }
+}
+
+fn replace_outbounds(node: &mut NodeConfig, outbounds: Vec<OutboundLeafConfig>) {
+    node.product_policy = Some(product_policy_for_outbounds(&outbounds));
+    node.outbounds = outbounds;
+}
+
 fn node_with_vpn(outbounds: Vec<OutboundLeafConfig>) -> NodeConfig {
+    let product_policy = product_policy_for_outbounds(&outbounds);
     NodeConfig {
         forwarding_mode: crate::config::ForwardingMode::L4,
         outbounds,
         gateway_balancers: Vec::new(),
         local_ingresses: vec![managed_tun("vpn")],
         tun_l3_ingresses: Vec::new(),
-        product_policy: Some(ProductPolicyConfig {
-            generation: 1,
-            routes: Vec::new(),
-            destination_acl: Vec::new(),
-        }),
+        product_policy: Some(product_policy),
         dns_policy: encrypted_dns_policy(),
         servers: Vec::new(),
     }
@@ -523,10 +566,13 @@ fn compiler_rejects_impossible_mpp_inventory_before_resolution() {
         ) if outbound == "empty"
     ));
 
-    node.outbounds = vec![mpp_leaf(
-        "invalid",
-        ["quic://carrier.example:443".parse().expect("path")],
-    )];
+    replace_outbounds(
+        &mut node,
+        vec![mpp_leaf(
+            "invalid",
+            ["quic://carrier.example:443".parse().expect("path")],
+        )],
+    );
     let OutboundLeafConfig::Mpp { config, .. } = &mut node.outbounds[0] else {
         panic!("MPP");
     };
@@ -605,10 +651,13 @@ fn compiler_rejects_system_plaintext_invalid_and_precarrier_outbound_dns() {
     let dns_outbound = outbound_id("dns-proxy");
     node.dns_policy =
         encrypted_dns_policy_with_egress(DnsEgressSpec::Outbound(dns_outbound.clone()));
-    node.outbounds = vec![proxy_leaf(
-        dns_outbound.as_str(),
-        Endpoint::new("192.0.2.40", 1080).expect("literal DNS proxy"),
-    )];
+    replace_outbounds(
+        &mut node,
+        vec![proxy_leaf(
+            dns_outbound.as_str(),
+            Endpoint::new("192.0.2.40", 1080).expect("literal DNS proxy"),
+        )],
+    );
     let request = compile_node_linux_vpn_prepare_request(&node)
         .expect("literal-only routed DNS is bootstrap-safe")
         .expect("managed request");
@@ -618,10 +667,13 @@ fn compiler_rejects_system_plaintext_invalid_and_precarrier_outbound_dns() {
         "a routed DNS endpoint must not be leaked into the host bypass"
     );
 
-    node.outbounds = vec![proxy_leaf(
-        dns_outbound.as_str(),
-        Endpoint::new("dns-proxy.example", 1080).expect("named DNS proxy"),
-    )];
+    replace_outbounds(
+        &mut node,
+        vec![proxy_leaf(
+            dns_outbound.as_str(),
+            Endpoint::new("dns-proxy.example", 1080).expect("named DNS proxy"),
+        )],
+    );
     assert!(matches!(
         compile_node_linux_vpn_prepare_request(&node),
         Err(

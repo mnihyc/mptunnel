@@ -426,12 +426,20 @@ fn require_external_tun_host(config: &AppConfig) -> Result<(), RuntimeError> {
 
 fn require_protectable_vpn_dns(config: &AppConfig) -> Result<(), RuntimeError> {
     let CommandConfig::Node(node) = &config.command;
-    let dns_policy = node.dns_policy.compile().map_err(|error| {
-        RuntimeError::ProductPolicy(format!(
-            "invalid DNS policy for catch-all embedded VPN: {error}"
-        ))
-    })?;
-    if dns_policy.uses_system_resolution() {
+    let route_dns_plans = node
+        .product_policy
+        .iter()
+        .flat_map(|policy| &policy.routes)
+        .filter_map(|rule| rule.action.dns_plan());
+    let (dns_policy, dns_activation) =
+        node.dns_policy
+            .compile_active(route_dns_plans)
+            .map_err(|error| {
+                RuntimeError::ProductPolicy(format!(
+                    "invalid DNS policy for catch-all embedded VPN: {error}"
+                ))
+            })?;
+    if dns_policy.uses_system_resolution_for_activation(&dns_activation) {
         return Err(RuntimeError::ProductPolicy(
             VPN_HOST_SYSTEM_DNS_ERROR.to_string(),
         ));

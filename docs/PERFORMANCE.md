@@ -209,9 +209,9 @@ the aggregation opportunity measured above.
 
 ## TUN-L3 packet service
 
-These diagnostic candidate measurements selected experimental
-`forwarding_mode = "l3"`; they are a separate performance family from the
-default L4 proxy results above. They used two unprivileged network
+These diagnostic candidate measurements used experimental `tun-l3` and
+`mpp-l3` inbounds; they are a separate performance family from the L4 proxy
+results above. They used two unprivileged network
 namespaces and real kernel TUN interfaces rather than the containerized SOCKS
 or local-forwarding Product data plane. Their host load and container inventory
 were valid; the uncommitted source snapshot was the sole provenance failure, so

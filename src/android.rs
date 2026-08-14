@@ -1024,8 +1024,99 @@ fn insert_missing_transport_marker(document: &mut DocumentMut) -> Result<(), And
     Ok(())
 }
 
+fn migrate_v03_routing_actions(document: &mut DocumentMut) -> Result<(), AndroidBridgeError> {
+    let Some(rules) = document
+        .get_mut("routing")
+        .and_then(Item::as_table_mut)
+        .and_then(|routing| routing.get_mut("rules"))
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return Ok(());
+    };
+
+    for rule in rules.iter_mut() {
+        let Some(action) = rule.get("action") else {
+            continue;
+        };
+        if rule.contains_key("decision") {
+            return Err(bridge_error(
+                "editable routing rule cannot mix legacy action with decision",
+            ));
+        }
+        let action = action
+            .as_str()
+            .ok_or_else(|| bridge_error("legacy routing action must be a string"))?;
+        let outbound = routing_rule_string_reference(rule, "outbound")?;
+        let balancer = routing_rule_string_reference(rule, "balancer")?;
+        let decision = match action {
+            "outbound" if outbound && !balancer => "allow",
+            "balancer" if balancer && !outbound => "allow",
+            "reject"
+                if !outbound
+                    && !balancer
+                    && !rule.contains_key("dns_policy")
+                    && !rule.contains_key("initial_demand") =>
+            {
+                "reject"
+            }
+            "drop"
+                if !outbound
+                    && !balancer
+                    && !rule.contains_key("dns_policy")
+                    && !rule.contains_key("initial_demand") =>
+            {
+                "drop"
+            }
+            "outbound" => {
+                return Err(bridge_error(
+                    "legacy outbound routing action requires outbound and forbids balancer",
+                ));
+            }
+            "balancer" => {
+                return Err(bridge_error(
+                    "legacy balancer routing action requires balancer and forbids outbound",
+                ));
+            }
+            "reject" | "drop" => {
+                return Err(bridge_error(
+                    "legacy terminal routing action forbids outbound, balancer, dns_policy, and initial_demand",
+                ));
+            }
+            _ => return Err(bridge_error("legacy routing action is unsupported")),
+        };
+
+        let (action_key, action_item) = rule
+            .remove_entry("action")
+            .ok_or_else(|| bridge_error("legacy routing action became unavailable"))?;
+        let action_value = action_item
+            .as_value()
+            .ok_or_else(|| bridge_error("legacy routing action must be a value"))?;
+        let mut replacement = Value::from(decision);
+        *replacement.decor_mut() = action_value.decor().clone();
+        let decision_key = Key::new("decision")
+            .with_leaf_decor(action_key.leaf_decor().clone())
+            .with_dotted_decor(action_key.dotted_decor().clone());
+        rule.insert_formatted(&decision_key, Item::Value(replacement));
+    }
+    Ok(())
+}
+
+fn routing_rule_string_reference(
+    rule: &Table,
+    key: &'static str,
+) -> Result<bool, AndroidBridgeError> {
+    match rule.get(key) {
+        None => Ok(false),
+        Some(value) if value.as_str().is_some() => Ok(true),
+        Some(_) => Err(bridge_error(format!(
+            "legacy routing reference {key:?} must be a string"
+        ))),
+    }
+}
+
 fn migrate_editor(contents: &str) -> Result<String, AndroidBridgeError> {
     let mut document = parse_editor_document(contents)?;
+    migrate_v03_routing_actions(&mut document)?;
     migrate_legacy_materials_in_table(document.as_table_mut())?;
     if managed_source_count_in_table(document.as_table(), MANAGED_TRANSPORT_SECRET_ID) == 0 {
         insert_missing_transport_marker(&mut document)?;
@@ -2101,7 +2192,6 @@ protocol = "direct"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "direct"
 "#;
 
@@ -2135,7 +2225,6 @@ transport_secret = { from = "managed", id = "transport-secret" }
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "remote"
 "#;
 
@@ -2166,7 +2255,6 @@ tls_pinned_certificate_file = "@mptunnel-profile-certificate@"
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "remote"
 "#;
 
@@ -2193,7 +2281,6 @@ security = { credential_id = "profile", tls_server_name = "mptunnel.test", tls_p
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "remote"
 "#;
 
@@ -2218,7 +2305,6 @@ listen = ["127.0.0.1:@mptunnel-socks-port@"]
 [routing]
 [[routing.rules]]
 name = "default"
-action = "outbound"
 outbound = "remote"
 "#;
 
@@ -2282,6 +2368,146 @@ tls_pinned_certificate = {{ from = "base64", value = "{certificate}" }}
         runtime_editable_config()
             .replace(LOCAL_USER_DEFINITION_MARKER, &second_credential)
             .replace("[routing]", &second_outbound)
+    }
+
+    #[test]
+    fn v03_route_action_migration_is_strict_decor_preserving_and_idempotent() {
+        let legacy = r#"[routing]
+
+[[routing.rules]]
+name = "direct"
+action = "outbound" # preserve outbound decision comment
+outbound = "edge"
+custom = "keep"
+
+[[routing.rules]]
+name = "balanced"
+action = "balancer"
+balancer = "edges"
+
+[[routing.rules]]
+name = "rejected"
+action = "reject"
+
+[[routing.rules]]
+name = "dropped"
+action = "drop"
+"#;
+        let mut document = parse_editor_document(legacy).expect("legacy routing TOML");
+
+        migrate_v03_routing_actions(&mut document).expect("v0.3 routing migration");
+        let migrated = document.to_string();
+
+        assert!(!migrated.contains("action ="));
+        assert!(migrated.contains("decision = \"allow\" # preserve outbound decision comment"));
+        assert!(migrated.contains("custom = \"keep\""));
+        let rules = document["routing"]["rules"]
+            .as_array_of_tables()
+            .expect("routing rules");
+        let decisions = rules
+            .iter()
+            .map(|rule| rule["decision"].as_str().expect("route decision"))
+            .collect::<Vec<_>>();
+        assert_eq!(decisions, ["allow", "allow", "reject", "drop"]);
+
+        let mut second = parse_editor_document(&migrated).expect("migrated routing TOML");
+        migrate_v03_routing_actions(&mut second).expect("idempotent routing migration");
+        assert_eq!(second.to_string(), migrated);
+
+        let current = r#"[routing]
+[[routing.rules]]
+name = "current"
+decision = "allow"
+outbound = "edge"
+"#;
+        let mut current_document = parse_editor_document(current).expect("current routing TOML");
+        migrate_v03_routing_actions(&mut current_document).expect("current routing no-op");
+        assert_eq!(current_document.to_string(), current);
+    }
+
+    #[test]
+    fn v03_route_action_migration_rejects_dual_or_invalid_shapes() {
+        for invalid in [
+            r#"[routing]
+[[routing.rules]]
+name = "dual-dialect"
+action = "outbound"
+decision = "allow"
+outbound = "edge"
+"#,
+            r#"[routing]
+[[routing.rules]]
+name = "missing-outbound"
+action = "outbound"
+"#,
+            r#"[routing]
+[[routing.rules]]
+name = "mixed-egress"
+action = "balancer"
+outbound = "edge"
+balancer = "edges"
+"#,
+            r#"[routing]
+[[routing.rules]]
+name = "terminal-egress"
+action = "reject"
+outbound = "edge"
+"#,
+            r#"[routing]
+[[routing.rules]]
+name = "terminal-policy"
+action = "drop"
+dns_policy = "private"
+"#,
+            r#"[routing]
+[[routing.rules]]
+name = "unknown"
+action = "proxy"
+outbound = "edge"
+"#,
+            r#"[routing]
+[[routing.rules]]
+name = "wrong-type"
+action = 1
+outbound = "edge"
+"#,
+            r#"[routing]
+[[routing.rules]]
+name = "wrong-reference-type"
+action = "outbound"
+outbound = 1
+"#,
+        ] {
+            let mut document = parse_editor_document(invalid).expect("invalid-shape routing TOML");
+            assert!(
+                migrate_v03_routing_actions(&mut document).is_err(),
+                "legacy routing migration guessed at invalid input:\n{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn released_mpp4_style_editor_finalizes_and_compiles_without_manual_edit() {
+        let released = runtime_editable_config().replace(
+            "name = \"default\"\noutbound = \"remote\"",
+            "name = \"default\"\naction = \"outbound\"\noutbound = \"remote\"",
+        );
+        assert!(released.contains("action = \"outbound\""));
+
+        let migrated = migrate_editor(&released).expect("released editor migration");
+        assert!(!migrated.contains("action = \"outbound\""));
+        assert!(migrated.contains("decision = \"allow\""));
+        assert!(migrated.contains("# preserve this path comment"));
+        assert_eq!(
+            migrate_editor(&migrated).expect("idempotent released editor migration"),
+            migrated
+        );
+
+        let finalized = finalize_editor(&released, &test_bindings(false, false))
+            .expect("released mpp.4-style editor finalization");
+        assert!(!finalized.contains("action = \"outbound\""));
+        assert!(finalized.contains("decision = \"allow\""));
+        compile_inline_config(&finalized).expect("finalized v0.4 core config");
     }
 
     #[test]

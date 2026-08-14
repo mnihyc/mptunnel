@@ -1,8 +1,8 @@
 # Exhaustive configuration reference with one runnable common-client profile.
 # Active values expose local SOCKS5 and HTTP CONNECT through one TCP/QUIC MPP
 # peer. Commented blocks cover every other supported TOML shape without
-# opening extra listeners. Create the referenced credential file, replace the
-# example endpoint and TLS material, then run:
+# opening extra listeners. Create the referenced credential and transport-secret
+# files, replace the example endpoint and TLS material, then run:
 #
 #   mptunnel --config ./config.toml --check-config
 #
@@ -17,16 +17,14 @@
 # - path: one named TCP or QUIC carrier configuration in an MPP session;
 # - DNS server: one named DNS transport and its connection settings;
 # - DNS policy: server selection, address-family behavior, limits, and cache;
-# - DNS record: an exact static domain-to-address answer;
-# - DNS override: a synthetic captured address that can recover its domain;
+# - DNS override record: one named exact static domain-to-address answer;
+# - DNS synthetic capture: one named bounded address pool that can recover the
+#   original queried domain when a captured flow opens;
 # - outbound: a named connector used for application traffic or routed DNS.
 
 check_config = false
-
-# One forwarding family is selected for the complete runtime generation.
-# Omission selects L4. L3 is an explicit experimental alternative documented
-# in its dedicated section below; the two families cannot be mixed.
-# forwarding_mode = "l4"
+# Prefer the `--check-config` command-line flag for one-time validation. This
+# persistent field exists for service integrations that can only supply a file.
 
 # Process logging stays outside the forwarding data path. Relative file paths are
 # resolved beside this document; parent directories must already exist.
@@ -38,29 +36,36 @@ console = true          # standard error
 flow_events = false     # opt-in destination-bearing flow open/close records
 
 # Every secret, password, certificate, and key uses one byte-material source.
-# A source is resolved once when a configuration generation is compiled. No
-# source trims whitespace or line endings. Relative file paths resolve beside
-# this document. `env` reads the file whose path is stored in the named
-# environment variable; the variable never contains the material itself.
-# Hex is strict and must have an even number of digits. Base64 is strict,
-# padded RFC 4648 standard Base64. Raw values are TOML UTF-8 text; omitting
+# A source is resolved once when the configuration is loaded. No
+# source trims whitespace or line endings. Both `path` and a relative path read
+# from `var` resolve beside this document. `env` reads the file whose path is
+# stored in the named environment variable; the variable never contains the
+# material itself. `var` must contain only ASCII letters, digits, or underscore
+# and cannot be empty.
+# File and env-file contents are always literal bytes: a file containing hex
+# text is not decoded. Use `from = "hex"` when the pasted value is hexadecimal.
+# Hex accepts only `[0-9A-Fa-f]`, has no `0x` prefix or whitespace, and must
+# have an even number of digits. Base64 is strict padded RFC 4648 Base64 (`+/`,
+# not the URL alphabet) with no whitespace. Raw values are TOML UTF-8 text; omitting
 # `from` when `value` is present is identical to `from = "raw"`.
 # secret = { from = "file", path = "mpp-credential.key" }
 # secret = { from = "env", var = "MPTUNNEL_HOME_KEY_FILE" }
-# secret = { from = "hex", value = "001122aabbccddeeff" }
-# secret = { from = "base64", value = "ABEiM0RVZneImaq7zN3u/w==" }
-# secret = { from = "raw", value = "exact UTF-8 bytes" }
-# secret = { value = "exact UTF-8 bytes" }
+# secret = { from = "hex", value = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" }
+# secret = { from = "base64", value = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" }
+# password = { from = "raw", value = "exact UTF-8 plaintext" }
+# password = { value = "exact UTF-8 plaintext" }
 # Inline raw, hex, and Base64 values remain recoverable from this file; their
 # encoding is not encryption. Consumer requirements still apply:
 # - `credentials.secret`: an exact textual UUID or at least 32 bytes;
-# - `local_users.password` and `outbounds.auth.password`: valid UTF-8 accepted
-#   by the proxy protocol;
+# - `local_users.password` and `outbounds.auth.password`: 1..=255 UTF-8 bytes
+#   with no ASCII control characters;
 # - `management.token`: 16..=256 visible ASCII bytes;
 # - `transport_secret` and `ed25519_public_key`: exactly 32 bytes;
-# - certificate/CA fields: one or more complete PEM certificates; hex/Base64
-#   must decode to the complete PEM bytes, including PEM boundaries and lines;
-# - `tls_private_key`: exactly one complete supported PEM private key.
+# - `tls_pinned_certificate`: exactly one complete PEM certificate;
+# - `tls_certificate_chain` and `tls_ca_certificate`: one or more complete PEM
+#   certificates; hex/Base64 must decode to the complete PEM bytes, including
+#   PEM boundaries and line endings;
+# - `tls_private_key`: exactly one unencrypted PKCS#1, SEC1, or PKCS#8 PEM key.
 # Global credentials use protocol credential and principal identities. Each
 # MPP outbound uses `credential_id`; an MPP inbound accepts `credential_ids`.
 [[credentials]]
@@ -70,10 +75,14 @@ secret = { from = "file", path = "mpp-credential.key" }
 # expires_at_unix_secs = 1798761600
 # revoked = false
 # revocation_grace_seconds = 30
+# Expiration or revocation rejects new authentication. Revocation grace delays
+# retirement only for sessions already admitted by that credential; it never
+# permits new authentication.
 
 # Optional named users for local SOCKS5 and HTTP CONNECT authentication.
 # Login names and passwords are protocol credentials; `principal_id` is the
-# stable principal identity used by routing and admission. Inline values are
+# stable principal identity used by routing and admission. Usernames are
+# 1..=255 UTF-8 bytes without a colon or ASCII controls. Inline values are
 # stored in this document; Base64 is an encoding, not encryption.
 # [[local_users]]
 # name = "phone-login"
@@ -83,7 +92,6 @@ secret = { from = "file", path = "mpp-credential.key" }
 
 [service]
 # Supervision owns process generations, never MPP session state.
-service_mode = false
 supervise = false
 restart_backoff_ms = 1000
 restart_max_backoff_ms = 30000
@@ -99,11 +107,16 @@ retention_timeout_ms = 300000
 [management]
 # The API is disabled while listen is empty. To enable it, replace listen with
 # one or more loopback addresses and reference a separate 16..=256 byte
-# visible-ASCII operator-token file. Dashboard serving requires the API; peer
-# diagnosis is an independent, symmetric permission for authenticated MPP peers.
+# visible-ASCII operator-token file. Dashboard serving requires the API. The
+# public HTTP surface is API v4 only, rooted at `/api/v4/`; older API paths are
+# intentionally unsupported.
 listen = []
 # token = { from = "file", path = "management-token.key" }
 dashboard = false
+# Process-wide override for incoming peer diagnostics. `true` permits every
+# authenticated MPP peer on every MPP endpoint, even when the endpoint-specific
+# option or principal selector below denies it. It does not weaken MPP
+# authentication and is independent of whether the local HTTP API is enabled.
 allow_peer_diagnostics = false
 # With a nonempty listener and token, this file is also the operator profile:
 #   mptunnel --config ./config.toml status
@@ -139,8 +152,8 @@ tcp_path_heartbeat_timeout_ms = 30000
 quic_path_keep_alive_interval_ms = 10000
 quic_path_idle_timeout_ms = 30000
 
-# New-flow admission is a separate open/control-time owner. These limits do not
-# derive from, resize, or feed MPP path/session/stream/queue budgets.
+# New-flow admission is a separate limit applied while a flow opens. These
+# limits do not derive from, resize, or feed MPP path/session/stream/queue budgets.
 # Established permits do no per-byte or per-packet accounting.
 [admission]
 max_live_flows = 4096
@@ -152,18 +165,22 @@ max_live_flows_per_target = 256
 max_connects_per_target = 32
 max_dns_work = 128
 
-# DNS is one global catalog of named servers and policies. Routes and MPP
-# server inbounds may select a policy with `dns_policy`. A DNS rule's exact
-# domain wins over its longest matching suffix; `[dns].default` is used when no
-# rule matches. Omitting `[dns]` creates a `system` server and `default` policy
-# with the same defaults shown below.
+# DNS consists of named servers, policies, override records, and synthetic
+# captures. Records and captures have no effect until attached to a selected
+# policy. A route may explicitly select a policy with `dns_policy`.
+# Otherwise, a DNS rule's exact domain wins over its longest matching suffix;
+# `[dns].default` is used when no rule matches. Omitting `[dns]` creates a
+# `system` server and a `default` policy. The active example names that policy
+# `system` explicitly.
 [dns]
 default = "system"
 
 # `protocol = "system"` delegates to the operating-system resolver and accepts
 # no address, TLS name, HTTP path, or routed outbound. Every network protocol
-# requires `address` as a literal IP socket, avoiding recursive DNS. Bracket an
-# IPv6 address. The protocols are system, udp, tcp, udp-tcp, dot, doh, and doq.
+# requires `address` as a usable unicast literal IP with a nonzero port, avoiding
+# recursive DNS. Unspecified, multicast, and IPv4 broadcast addresses are
+# rejected. Bracket an IPv6 address. The protocols are system, udp, tcp,
+# udp-tcp, dot, doh, and doq.
 [[dns.servers]]
 name = "system"
 protocol = "system"
@@ -184,11 +201,15 @@ protocol = "system"
 # protocol = "udp-tcp"
 # address = "[2606:4700:4700::1111]:53"
 
-# Encrypted DNS server forms. `tls_name` is the authenticated DNS name; for
-# DoH it is also the HTTPS authority. `path` is required only by DoH and must
-# begin with `/`. `outbound` optionally routes TCP, DoT, or DoH through one
-# named direct, SOCKS5, HTTP CONNECT, HTTPS CONNECT, or MPP outbound. Plain UDP
-# and DoQ require native direct/source-bound egress when `outbound` is present.
+# Encrypted DNS server forms. `tls_name` is required by DoT, DoH, and DoQ and
+# is the authenticated TLS name; for DoH it is also the HTTPS authority. `path`
+# is required only by DoH. It is 1..=256 visible-ASCII bytes, begins with one
+# `/` (not `//`), and contains no `?`, `#`, or backslash. `outbound` is optional
+# on every network protocol; omission uses the built-in direct connection. A
+# selected outbound must have a literal-IP/DNS-independent
+# endpoint and support every required transport: TCP, DoT, and DoH can use a
+# direct, SOCKS5, HTTP CONNECT, HTTPS CONNECT, or MPP outbound; UDP, UDP-TCP,
+# and DoQ require a native direct/source-bound outbound.
 # [[dns.servers]]
 # name = "secure-dot"
 # protocol = "dot"
@@ -209,14 +230,61 @@ protocol = "system"
 # address = "[2606:4700:4700::1111]:853"
 # tls_name = "cloudflare-dns.com"
 
-# A policy lists DNS servers in order. `family` controls requested and returned
-# A/AAAA families: ipv4-only, ipv6-only, ipv4-then-ipv6, ipv6-then-ipv4,
-# ipv4-and-ipv6, or ipv6-and-ipv4. `security = "require-encrypted"` rejects any
+# Every definition is parsed and validated. Runtime starts only policies named
+# by `[dns].default`, `[[dns.rules]]`, or route `dns_policy`; the servers,
+# records, captures, and routed outbounds used by those policies; and egress
+# outbounds reached through routing, balancers, or a `tun-l3` inbound. Unused
+# definitions create no DNS workers, caches, sockets, host bypasses, or
+# synthetic-pool routes.
+
+# Named exact immutable records have no effect until attached to a policy by
+# name. An attached override applies to ordinary MPTUNNEL name resolution and
+# managed DNS listeners. A/AAAA queries return the eligible family; other types
+# and a missing eligible family return authoritative local NODATA without
+# leaking the name upstream. An override contains 1..=64 unique addresses; once
+# attached, its eligible addresses must fit `query.answers` and `answer_cidrs`.
+# [[dns.override_records]]
+# name = "router-home"
+# domain = "router.home.arpa"
+# addresses = ["192.168.1.1", "fd00::1"]
+
+# Named synthetic capture also has no effect until a policy attaches it. An
+# attached exact override wins before capture. Synthetic answers are produced
+# only for A/AAAA queries received on managed `dns_listeners`; ordinary name
+# resolution never synthesizes, and external `dns_redirects` only forward UDP
+# port 53 to the listed resolver sockets. Each lease records its configuration
+# generation, policy, and capture. A recovered flow keeps that policy when its
+# route omits `dns_policy`; a route naming a different policy is rejected.
+# Synthetic addresses are never reassigned to another domain while that
+# configuration is active, and expired or unknown recovery fails closed.
+# At least one pool is required. IPv4 pools must be in 198.18.0.0/15 and IPv6
+# pools in fc00::/7. Managed split-VPN includes must cover every active pool and
+# excludes cannot overlap one. Distinct active captures have disjoint pools;
+# pools cannot contain an active DNS-server or attached override address.
+# `capacity` is 1..=262144, `answer_ttl_seconds` is 1..=3600, and
+# `recovery_ttl_seconds` is at least the answer TTL and at most 86400. Every
+# configured pool must contain at least `capacity` usable addresses.
+# [[dns.synthetic_capture]]
+# name = "vpn-capture"
+# ipv4_pool = "198.18.0.0/16"
+# ipv6_pool = "fd00:4d50::/112"
+# capacity = 4096
+# answer_ttl_seconds = 30
+# recovery_ttl_seconds = 120
+
+# A policy lists 1..=16 unique DNS servers in order. `family` controls requested
+# and returned A/AAAA families: ipv4-only, ipv6-only, ipv4-then-ipv6,
+# ipv6-then-ipv4, ipv4-and-ipv6, or ipv6-and-ipv4. An `*-only` policy queries
+# and returns only that family. A `*-then-*` policy queries the second family
+# only when the preferred query returns no addresses and is not NXDOMAIN. An
+# `*-and-*` policy queries both and returns the preferred family first.
+# `security = "require-encrypted"` rejects any
 # server other than DoT, DoH, or DoQ. Ordered strategy advances only after a
 # transport/server failure; a DNS negative response is authoritative. Racing
-# requires `fallback_ms` and starts each later server after that delay; zero
-# starts all at once. A nonempty `answer_cidrs` accepts a response only when
-# every A/AAAA address is inside at least one listed network.
+# requires at least two servers and `fallback_ms`, which cannot exceed
+# `query.timeout_ms`; zero starts all at once. A nonempty `answer_cidrs` accepts
+# a response only when every A/AAAA address is inside at least one of at most
+# 256 unique listed networks.
 [[dns.policies]]
 name = "system"
 servers = ["system"]
@@ -224,11 +292,15 @@ family = "ipv4-and-ipv6"
 security = "allow-plaintext"
 strategy = "ordered"
 answer_cidrs = []
+override_records = []
+# synthetic_capture = "vpn-capture"
 query = { timeout_ms = 5000, inflight = 64, answers = 64 }
 cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, stale_ms = 30000, prefetch_ms = 30000 }
-# `query.timeout_ms` is the complete policy lookup deadline. `query.inflight`
-# and `query.answers` bound concurrent work and accepted answers. Cache TTLs are
-# caps in milliseconds; `stale_ms = 0` disables stale-on-error and
+# `query.timeout_ms` is the complete deadline for each A or AAAA lookup across
+# that policy's servers. Its range is 1..=60000 ms; `query.inflight` is
+# 1..=1024 and `query.answers` is 1..=64. `cache.entries` is 0..=65536.
+# Positive and negative TTL caps are 1..=86400000 ms; stale and prefetch caps
+# are 0..=86400000 ms. `stale_ms = 0` disables stale-on-error and
 # `prefetch_ms = 0` disables refresh-ahead.
 #
 # [[dns.policies]]
@@ -239,39 +311,24 @@ cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, sta
 # strategy = "race"
 # fallback_ms = 50
 # answer_cidrs = ["0.0.0.0/0", "::/0"]
+# override_records = ["router-home"]
+# synthetic_capture = "vpn-capture"
 # query = { timeout_ms = 5000, inflight = 64, answers = 64 }
 # cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, stale_ms = 30000, prefetch_ms = 30000 }
 #
-# DNS override applies only to captured A/AAAA wire queries. Dial-time
-# resolution still obtains real addresses from the selected policy. Synthetic addresses are
-# never reassigned to another domain in one generation; expired/unknown
-# recovery fails closed. IPv4 must be inside 198.18.0.0/15 and IPv6 inside
-# fc00::/7 so a synthetic pool cannot shadow public destinations. Managed split VPN
-# includes must cover every configured pool and excludes may not overlap one;
-# an external/manual TUN operator owns the equivalent routes.
-# [dns.override]
-# ipv4_pool = "198.18.0.0/16"
-# ipv6_pool = "fd00:4d50::/112"
-# max_entries = 4096
-# answer_ttl_ms = 30000
-# recovery_ttl_ms = 120000
-#
+# DNS selection rules name policies, not records or captures. Exact selection
+# wins over the longest suffix, then `[dns].default`; each named attachment is
+# therefore scoped to whichever selected policies reference it.
 # [[dns.rules]]
 # name = "private-host"
 # exact = "router.corp.example"
-# policy = "system"
-# explanation = "private host uses the system DNS server"
+# policy = "secure"
+# explanation = "private host uses the secure DNS policy"
 #
 # [[dns.rules]]
 # name = "private-zone"
 # suffix = "corp.example" # Exactly one of exact or suffix.
-# policy = "system"
-#
-# Exact immutable records answer locally and never send unmatched record types
-# to a DNS server.
-# [[dns.records]]
-# domain = "router.home.arpa"
-# addresses = ["192.168.1.1", "fd00::1"]
+# policy = "secure"
 
 # One listener may accept both proxy protocols by using `protocol = "mixed"`;
 # it shares the same `local_users` and admission policy and defaults to IPv4
@@ -309,7 +366,7 @@ listen = ["127.0.0.1:8080"]
 
 # Optional fixed-target local port forwards. Unlike proxy listeners, `listen`
 # and `target` are required and port zero is rejected. Each accepted flow uses
-# the normal routing, DNS, destination-ACL, outbound, and balancer pipeline.
+# the normal routing, DNS, outbound, and balancer pipeline.
 #
 # [[inbounds]]
 # name = "local-tcp-forward"
@@ -358,15 +415,22 @@ listen = ["127.0.0.1:8080"]
 # External/manual mode rewrites captured UDP port-53 destinations to a listed
 # `dns_redirects` socket, preferring an address of the original IP family.
 # dns_redirects = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
-# `dns_ttl_ms` bounds the external DNS datagram association.
+# `dns_ttl_ms` bounds external DNS datagram associations and caps TTLs returned
+# by the managed local DNS listener.
 # dns_ttl_ms = 5000
 #
 # To run IPv6-only, set disable_ipv4 = true and remove ipv4 and ipv4_gateway.
 # At least one IP family is required; IPv6 requires an MTU of at least 1280.
 #
+# The supported explicit spelling for external/manual mode is:
+# [inbounds.host]
+# mode = "external"
+#
 # On a supported host MPTUNNEL can instead own the interface, routes, endpoint
-# bypass, DNS publication, and cleanup transactionally. Full mode requires at
-# least one local DNS listener address and an encrypted, non-system DNS policy.
+# bypass, DNS publication, and cleanup transactionally. At most one managed TUN
+# inbound is allowed. Managed mode requires every active DNS policy to be
+# encrypted and non-system. Full mode additionally requires at least one local
+# DNS listener address.
 # `dns_redirects` and `ipv4_gateway` are external/manual fields and must remain
 # unset in this mode. Android `VpnService` lifecycle stays host-provided and
 # therefore uses external mode.
@@ -376,9 +440,13 @@ listen = ["127.0.0.1:8080"]
 # route_mode = "full" # Or "split" with nonempty include_cidrs.
 # include_cidrs = []
 # exclude_cidrs = []
+# `true` bypasses directly connected LAN prefixes outside the tunnel.
 # local_lan = true
 # Managed mode publishes these local addresses as system-facing DNS listeners;
 # queries captured there are answered through the selected `[dns]` policy.
+# Listener IPs must be usable, belong to a configured TUN address family, and
+# must not be covered by `exclude_cidrs`. In managed mode `dns_ttl_ms` also caps
+# TTLs returned by these listeners.
 # dns_listeners = ["10.88.0.53", "fd00:88::53"]
 #
 # Optional Linux-only RPDB tuning is nested below the portable VPN policy.
@@ -389,14 +457,18 @@ listen = ["127.0.0.1:8080"]
 # capture_rule_priority = 10000
 # socket_mark = 0x4d505455
 
-# Experimental L3 forwarding family (alternative profile)
+# Experimental L3 client (alternative profile)
 #
-# Set `forwarding_mode = "l3"` at the document root and remove every L4 local
-# inbound. Unlike `protocol = "tun"`, this mode does not enter L4 routing or
-# terminate inner TCP/UDP flows. The server assigns the interface address after
-# MPP authentication; this process opens only the packet device. Host routes,
-# DNS, firewall policy, forwarding, and NAT remain external. The selected
-# outbound must be MPP and may use both TCP and QUIC.
+# A document containing only `tun-l3`/`mpp-l3` inbounds is an L3 profile; no
+# separate mode switch is needed. L3 and L4 inbound protocols cannot be mixed.
+# Unlike `protocol = "tun"`, `tun-l3` does not enter L4 routing or terminate
+# inner TCP/UDP flows. The server assigns the interface address after MPP
+# authentication; this process opens only the packet device. Host routes, DNS,
+# firewall policy, forwarding, and NAT remain external. The selected outbound
+# must be MPP and may use both TCP and QUIC. A given MPP outbound may be selected
+# by only one `tun-l3` inbound. L3 profiles omit `[routing]`, omit that outbound's
+# `[outbounds.performance]`, and either omit `[admission]` or keep only
+# `max_dns_work`; every other admission limit belongs to L4 flows.
 # [[inbounds]]
 # name = "site-tunnel"
 # protocol = "tun-l3"
@@ -406,6 +478,9 @@ listen = ["127.0.0.1:8080"]
 [[outbounds]]
 name = "edge-mpp"
 protocol = "mpp"
+# Permit this client to answer a sanitized diagnostics request from its peer.
+# The default is false; the management-global override permits every endpoint.
+# allow_peer_diagnostics = false
 # TCP and QUIC/UDP remain independent carriers under one MPP session.
 paths = [
   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
@@ -451,6 +526,10 @@ paths = [
 #   (default false);
 # - allow-datagrams: permit application datagrams (default true); the key is
 #   accepted on TCP only because QUIC always permits datagrams.
+# MPP listener paths use one fixed port. They may use the `initial-*` and
+# scheduling boolean options; TCP listeners may also use `allow-datagrams`.
+# `source-address`, `max-datagram-payload-bytes`, `max-tcp-carriers`, port
+# rotation, and port ranges are client-only and are rejected on listeners.
 #
 # Complete examples:
 # tcp://192.0.2.10:7443?source-address=192.0.2.20&initial-srtt-ms=40&initial-rttvar-ms=5&initial-rate-mbps=100&max-tcp-carriers=3&backup=false&expensive=false&allow-bulk=true&control-only=false&allow-datagrams=true
@@ -458,9 +537,10 @@ paths = [
 path_probe_interval_ms = 10000
 path_probe_timeout_ms = 2000
 
-[outbounds.performance]
-# Optional repair traffic is evidence-gated and capped by this operator budget.
-extra_traffic_hint_percent = 5
+# Optional L4 MPP repair traffic is evidence-gated and capped by this operator
+# budget. Omit this table when the outbound is selected by `tun-l3`.
+# [outbounds.performance]
+# extra_traffic_hint_percent = 5
 
 [outbounds.security]
 credential_id = "home-client"
@@ -478,38 +558,34 @@ transport_secret = { from = "file", path = "mpp-transport.key" }
 auth_freshness_window_seconds = 300
 
 [routing]
-generation = 1
 
-# Destination policy is independent from route selection and runs before and,
-# when this node has or requires IP evidence, after resolution. Restricted
-# address space is denied unless an explicit matching rule uses
-# `allow-restricted`. Domain-capable outbounds otherwise delegate resolution to
-# the configured outbound's trust boundary.
-# [routing.destination_acl]
+# Routing is one ordered, first-match table shared by every L4 local and MPP
+# inbound. A normal rule selects exactly one `outbound` or `balancer`; its
+# ordinary allow decision is inferred. Use `decision = "allow-restricted"`
+# only to authorize a narrowly matched private or special-use destination.
+# Terminal `reject` and response-free `drop` rules select no egress. If no rule
+# matches, traffic is rejected. A final catch-all is useful for clarity but is
+# not required; MPTUNNEL never selects the first outbound implicitly.
 #
-# [[routing.destination_acl.rules]]
-# name = "allow-home-service"
-# effect = "allow-restricted" # deny, allow, or allow-restricted
-# domain_exact = ["router.home.arpa"]
-# domain_suffix = ["home.arpa"]
-# domain_keyword = ["router"]
-# domain_regex = ["^router[0-9]+\\.home\\.arpa$"]
-# destination_cidrs = ["192.168.1.0/24"]
-# destination_ports = [443]
-# networks = ["tcp"]
-# stages = ["pre-resolution", "post-resolution"]
-
-# Route fields are strict and match only attributes available on every live
-# ingress: domain exact/suffix/keyword/regex or signed domain sets,
+# Match fields are strict: domain exact/suffix/keyword/regex or signed sets,
 # destination/source CIDRs, destination/source ports, TCP/UDP, named inbound,
 # principal ID, and pre/post-resolution stage. Nonempty categories are ANDed;
 # values inside one category are ORed. Unknown fields fail configuration load.
+# Omitted `inbounds` or `principal_ids` means any; scalar `"*"` is an
+# equivalent explicit spelling. A concrete name must exist and be reachable.
+# An unauthenticated local proxy, fixed-forward, or TUN-L4 flow has principal
+# `anonymous`. An authenticated proxy uses its selected `local_users`
+# principal, and an MPP inbound uses the authenticated credential principal.
+# `stages` is an expert control; ordinary CIDR rules naturally wait for address
+# evidence without spelling a stage.
 #
-# Optional signed domain/GeoIP rule sets are loaded and verified as one atomic
-# routing generation. Publisher keys use the same byte-material source and
+# Optional signed domain/GeoIP rule sets are loaded and verified atomically.
+# Publisher keys use the same byte-material source and
 # must resolve to exactly 32 bytes.
 # Every set pins its signed ID, publisher, and minimum accepted revision so an
 # otherwise valid older artifact cannot be substituted during reload.
+# `file` is a normal file path, not a material-source table; a relative path
+# resolves beside this TOML. `minimum_revision` must be nonzero.
 #
 # [[routing.rule_set_publishers]]
 # publisher_id = "official"
@@ -540,20 +616,52 @@ generation = 1
 # inbounds = ["local-socks"]
 # principal_ids = ["family"]
 # stages = ["post-resolution"]
-# action = "outbound" # outbound, balancer, reject, or drop
+# decision = "allow" # Optional and redundant for an ordinary egress rule.
 # outbound = "edge-mpp"
-# balancer = "edge-balancer" # Alternative to outbound with action = "balancer".
-# dns_policy = "system"
+# balancer = "edge-balancer" # Alternative; never set both.
 # initial_demand = "throughput" # automatic (default) or throughput
 # explanation = "route signed domain and network policy through the edge"
 
+# A route-selected DNS policy must be known before resolution, so it belongs on
+# a domain/source/inbound/principal rule rather than one selected by a
+# destination CIDR or CIDR-bearing signed set. Such a rule must omit `stages` or
+# include `pre-resolution`; `stages = ["post-resolution"]` is invalid.
+# [[routing.rules]]
+# name = "secure-domain-resolution"
+# domain_suffix = ["corp.example"]
+# dns_policy = "secure"
+# outbound = "edge-mpp"
+
+# Terminal rules have no outbound, balancer, DNS policy, or demand hint.
+# [[routing.rules]]
+# name = "reject-example"
+# domain_suffix = ["blocked.example"]
+# decision = "reject" # Use "drop" when no application refusal should be sent.
+
 [[routing.rules]]
 name = "default"
-action = "outbound"
+inbounds = ["local-socks", "local-http"]
 outbound = "edge-mpp"
 explanation = "route local proxy traffic through the primary MPP outbound"
 
-# A second independent MPP leaf can join the edge-balancer routing example
+# When MPTUNNEL has or resolves a literal address, ordinary allow does not
+# authorize loopback, private, link-local, metadata, multicast, or unspecified
+# destinations. A domain delegated unchanged to a domain-capable outbound is
+# resolved at that next hop. Select `dns_policy` on the route or use an
+# IP-dependent/post-resolution rule when this node must enforce the resulting
+# address. Authorize an internal destination only with a narrow rule placed
+# before a broader one.
+# [[routing.rules]]
+# name = "allow-home-service"
+# inbounds = ["mpp-listener"]
+# principal_ids = ["home"]
+# destination_cidrs = ["192.168.1.0/24", "fd00::/8"]
+# destination_ports = [443]
+# networks = ["tcp"]
+# decision = "allow-restricted"
+# outbound = "direct-egress"
+
+# A second independent MPP outbound can join the edge-balancer routing example
 # below; it keeps its own session, carrier set, and performance policy.
 # [[credentials]]
 # credential_id = "secondary-client"
@@ -582,9 +690,10 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 
 # Optional server-side MPP inbound
 #
-# Uncomment this block and one egress below to run a symmetric node. An MPP
-# inbound selects one native egress leaf with `outbound`, or one native
-# `balancer`. It cannot select an MPP outbound or set both references.
+# Uncomment this block, the `mpp-direct-egress` route, and one non-MPP outbound
+# below to run a symmetric L4 node. The active edge route is deliberately
+# scoped to local inbounds; routes reached from an MPP inbound cannot chain
+# into another MPP outbound.
 # [[inbounds]]
 # name = "mpp-listener"
 # protocol = "mpp"
@@ -592,9 +701,10 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 #   { name = "path-1", endpoint = "tcp://0.0.0.0:7443" },
 #   { name = "path-2", endpoint = "quic://0.0.0.0:7443" },
 # ]
-# outbound = "direct-egress"
-# balancer = "egress-fallback" # Alternative: remove outbound before enabling.
-# dns_policy = "system"
+# Omission denies peer diagnostics. Use concrete accepted principal IDs or the
+# scalar `"*"` for every authenticated principal. The management-global option
+# above permits all regardless of this endpoint selector.
+# peer_diagnostics_principal_ids = ["home"]
 #
 # [inbounds.performance]
 # extra_traffic_hint_percent = 5
@@ -609,14 +719,40 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # Independently caps authentication work and silent Noise-rejection retention.
 # max_pending_authentications = 1024
 #
-# Experimental server-owned L3 address plan. It is valid only when the document
-# selects `forwarding_mode = "l3"`; reliable-stream and application-datagram
-# forwarding admission is then unavailable. Pools validate explicit stable
-# principal allocations; they are never learned from source IP addresses. One
+# [[routing.rules]]
+# name = "mpp-direct-egress"
+# inbounds = ["mpp-listener"]
+# outbound = "direct-egress"
+#
+# Experimental server-owned L3 address plan (alternative profile). Use an
+# `mpp-l3` inbound, keep only L3 inbounds, and omit `[routing]`.
+# L4 TCP/UDP forwarding is then unavailable. Each configured family requires a
+# pool and a usable server address. At least one pool and one allocation are
+# required. Every allocation names an active accepted principal and supplies at
+# least one usable, unique address in its pool. Addresses and `allowed_ips`
+# cannot overlap ownership across principals or contain a server address. MTU
+# defaults to 1500, with minimum 576 and 1280 when IPv6 is configured. Pools
+# validate explicit stable principal allocations; they are never learned from
+# source IP addresses. One
 # live logical tunnel per principal is retained, and a new authenticated session
 # supersedes its previous attachment set. Additional `allowed_ips` are routed to
 # that principal only when the host has independently installed the corresponding
 # route/forwarding policy.
+# [[inbounds]]
+# name = "mpp-l3-listener"
+# protocol = "mpp-l3"
+# paths = [
+#   { name = "path-1", endpoint = "tcp://0.0.0.0:7443" },
+#   { name = "path-2", endpoint = "quic://0.0.0.0:7443" },
+# ]
+# peer_diagnostics_principal_ids = ["home"]
+#
+# [inbounds.security]
+# credential_ids = ["home-client"]
+# tls_certificate_chain = { from = "file", path = "server-cert.pem" }
+# tls_private_key = { from = "file", path = "server-key.pem" }
+# transport_secret = { from = "file", path = "mpp-transport.key" }
+#
 # [inbounds.tun_l3]
 # interface_name = "mptun-l3-server"
 # ipv4_pool = "10.89.0.0/24"
@@ -631,42 +767,17 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # ipv6 = "fd89::2"
 # allowed_ips = ["192.168.50.0/24"]
 #
-# Server-side destination policy is scoped to this MPP inbound. Restricted
-# addresses are denied whenever this node has IP evidence. A domain delegated
-# unchanged to a proxy is resolved by that trusted next hop; add an applicable
-# IP or post-resolution rule when this node must enforce addresses first.
-# [inbounds.destination_acl]
-# generation = 1
+# Server egress outbounds
 #
-# [[inbounds.destination_acl.rules]]
-# name = "allow-private-service"
-# effect = "allow-restricted"
-# domain_exact = ["service.corp.example"]
-# domain_suffix = ["corp.example"]
-# domain_keyword = ["service"]
-# domain_regex = ["^service[0-9]+\\.corp\\.example$"]
-# destination_cidrs = ["10.0.0.0/8"]
-# destination_ports = [443, "8000-8999"]
-# networks = ["tcp", "udp"]
-# stages = ["pre-resolution", "post-resolution"]
-#
-# Force address evidence for otherwise unrestricted public targets:
-# [[inbounds.destination_acl.rules]]
-# name = "require-address-evidence"
-# effect = "allow"
-# stages = ["post-resolution"]
-
-# Server egress leaves
-#
-# Direct egress needs an IP target and obtains domain addresses through the DNS
-# policy selected by the route or accepting MPP inbound. That policy may use a
-# system, direct, or routed remote DNS server. Omit all bind fields to
-# let the OS select source addresses for both families. Legacy bind_ip selects
+# Direct egress resolves domain targets through the DNS policy selected by
+# routing or DNS domain rules. That policy may use a system, direct, or routed
+# remote DNS server. Omit all bind fields to let the OS select source addresses
+# for both families. Legacy bind_ip selects
 # one source address and makes this outbound eligible only for that address
 # family; it cannot be combined with bind_ipv4 or bind_ipv6. Prefer bind_ipv4,
 # bind_ipv6, or both for explicit family-specific sources. Once either new
-# field is present, only configured families are eligible and routing skips an
-# ineligible family before dialing. Source addresses are bound per connection:
+# field is present, only configured families are eligible; rules and balancers
+# skip an ineligible family before dialing. Source addresses are bound per connection:
 # a temporarily absent address fails that attempt without terminating the node,
 # and later attempts can succeed after the address or interface returns.
 # [[outbounds]]
@@ -679,10 +790,14 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # bind_ipv6 = "2001:db8::10"
 # connect_timeout_ms = 10000
 #
+# Proxy `endpoint` is required `HOST:PORT`; bracket IPv6. If `[outbounds.auth]`
+# is present, both username and password are required. Usernames are 1..=255
+# UTF-8 bytes with no colon or ASCII control characters.
+#
 # Relay through SOCKS5. TCP CONNECT and UDP ASSOCIATE are supported when the
 # proxy implements them. A canonical domain is normally carried to the proxy
-# for next-hop resolution. Routing or destination policy that needs IP
-# evidence first resolves through the selected DNS policy and carries the
+# for next-hop resolution. Routing that needs IP evidence first resolves
+# through the selected DNS policy and carries the
 # authorized literal instead.
 # [[outbounds]]
 # name = "socks5-egress"
@@ -695,16 +810,17 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # password = { from = "file", path = "proxy-password.key" }
 #
 # Plain HTTP CONNECT carries TCP targets and supports the same referenced
-# authentication table. It preserves a canonical domain unless routing or
-# destination policy requires authorized IP evidence.
+# authentication table. It preserves a canonical domain unless routing
+# requires authorized IP evidence.
 # [[outbounds]]
 # name = "http-egress"
 # protocol = "http-connect"
 # endpoint = "127.0.0.1:8080"
 # connect_timeout_ms = 10000
 #
-# HTTPS CONNECT authenticates the proxy with WebPKI. An optional CA
-# file adds private roots; it does not disable hostname verification.
+# HTTPS CONNECT authenticates the proxy with WebPKI. `tls_server_name` defaults
+# to the endpoint host. Optional `tls_ca_certificate` material adds private
+# roots; it does not disable hostname verification.
 # [[outbounds]]
 # name = "https-egress"
 # protocol = "https-connect"
@@ -719,13 +835,13 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 
 # Routing policies
 #
-# Local SOCKS5/HTTP/TUN rules may select an MPP balancer. An MPP inbound may
-# instead select a native-egress balancer. Balancers contain leaf outbounds
-# only and cannot be nested.
+# Any local L4 inbound may select a balancer. A rule reachable from an MPP
+# inbound may select only a non-MPP outbound or a balancer with no MPP member.
+# Balancers contain outbounds only and cannot be nested.
 # [routing]
 #
-# An MPP balancer chooses one independent MPP outbound once per new flow. It
-# never merges carrier paths from separate sessions. Selection uses only
+# A balancer chooses one member outbound once per new flow. MPP member sessions
+# and carriers remain independent and are never merged. Selection uses only
 # end-to-end probe/open/flow outcomes; it cannot inspect per-carrier MPP
 # scheduler state or carrier metrics.
 # [[routing.balancers]]

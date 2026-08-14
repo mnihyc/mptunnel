@@ -13,7 +13,7 @@ fn reference_documents_every_material_source_and_consumer() {
             "configuration reference omits material source {source}"
         );
     }
-    assert!(REFERENCE.contains("secret = { value = \"exact UTF-8 bytes\" }"));
+    assert!(REFERENCE.contains("password = { value = \"exact UTF-8 plaintext\" }"));
 
     for consumer in [
         "credentials.secret",
@@ -50,8 +50,10 @@ fn reference_documents_complete_dns_and_carrier_vocabularies() {
     }
     assert!(REFERENCE.contains("[[dns.servers]]"));
     assert!(REFERENCE.contains("[[dns.policies]]"));
-    assert!(REFERENCE.contains("[[dns.records]]"));
-    assert!(REFERENCE.contains("[dns.override]"));
+    assert!(REFERENCE.contains("[[dns.override_records]]"));
+    assert!(REFERENCE.contains("[[dns.synthetic_capture]]"));
+    assert!(REFERENCE.contains("override_records ="));
+    assert!(REFERENCE.contains("synthetic_capture ="));
     assert!(REFERENCE.contains("query = { timeout_ms"));
     assert!(REFERENCE.contains("cache = { entries"));
 }
@@ -96,12 +98,38 @@ fn current_documents_do_not_publish_superseded_configuration_names() {
             "published document contains superseded spelling {stale}"
         );
     }
+
+    let configuration_examples = [
+        REFERENCE,
+        include_str!("../examples/client.toml"),
+        include_str!("../examples/server.toml"),
+    ];
+    for stale in [
+        "[[dns.records]]",
+        "[dns.override]",
+        "forwarding_mode",
+        "generation =",
+        "[routing.destination_acl]",
+        "[inbounds.destination_acl]",
+        "effect =",
+        "action = \"outbound\"",
+        "action = \"balancer\"",
+        "action = \"reject\"",
+        "action = \"drop\"",
+    ] {
+        assert!(
+            configuration_examples
+                .iter()
+                .all(|document| !document.contains(stale)),
+            "published configuration contains superseded spelling {stale}"
+        );
+    }
 }
 
 #[test]
-fn release_package_links_but_does_not_bundle_the_exhaustive_reference() {
+fn release_package_links_and_bundles_the_exhaustive_reference() {
     let package_readme = include_str!("../packaging/README.md");
     let release_contract = include_str!("../packaging/tools/release_contract.py");
-    assert!(package_readme.contains("../examples/config.reference.toml"));
-    assert!(!release_contract.contains("config.reference.toml"));
+    assert!(package_readme.contains("examples/config.reference.toml"));
+    assert!(release_contract.contains("examples/config.reference.toml"));
 }

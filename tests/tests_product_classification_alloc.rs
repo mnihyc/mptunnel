@@ -2,12 +2,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ipnet::IpNet;
 use mptunnel::product::{
-    AclEffect, AclRuleSpec, CompiledRouteTable, DestinationAcl, DomainName, EgressAction,
-    FlowContext, GatewayBalancer, GatewayBalancerSpec, GatewayInstant, GatewayMemberSpec,
-    GatewayStickinessKey, GatewayStickinessPolicy, GatewayStrategy, InboundId, InitialDemand,
-    Network, NetworkSet, OutboundId, PortRange, PrincipalId, ProtocolTarget,
-    RULE_SET_SIGNATURE_CONTEXT, RouteAction, RouteInput, RouteMatchSpec, RouteRuleSpec, RuleId,
-    RuleSetPublisher, RuleSetPublisherCatalog, RuleSetPublisherId, SourceEndpoint, VerifiedRuleSet,
+    CompiledRouteTable, DomainName, EgressAction, FlowContext, GatewayBalancer,
+    GatewayBalancerSpec, GatewayInstant, GatewayMemberSpec, GatewayStickinessKey,
+    GatewayStickinessPolicy, GatewayStrategy, InboundId, InitialDemand, Network, NetworkSet,
+    OutboundId, PortRange, PrincipalId, ProtocolTarget, RULE_SET_SIGNATURE_CONTEXT, RouteAction,
+    RouteInput, RouteMatchSpec, RouteRuleSpec, RuleId, RuleSetPublisher, RuleSetPublisherCatalog,
+    RuleSetPublisherId, SourceEndpoint, VerifiedRuleSet,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::json;
@@ -155,15 +155,15 @@ fn matcher(rule_set: Arc<VerifiedRuleSet>) -> RouteMatchSpec {
 }
 
 #[test]
-fn warmed_route_and_acl_classification_allocate_nothing() {
+fn warmed_route_classification_allocates_nothing() {
     let rule_set = signed_rule_set();
     let table = CompiledRouteTable::compile(
         1,
         vec![
             RouteRuleSpec::new(
                 route_id("specific"),
-                matcher(rule_set.clone()),
-                RouteAction::new(
+                matcher(rule_set),
+                RouteAction::allow(
                     EgressAction::Outbound(OutboundId::parse("edge").expect("outbound")),
                     None,
                     InitialDemand::Automatic,
@@ -177,15 +177,6 @@ fn warmed_route_and_acl_classification_allocate_nothing() {
         ],
     )
     .expect("route table");
-    let acl = DestinationAcl::compile(
-        1,
-        vec![AclRuleSpec::new(
-            route_id("public-service"),
-            matcher(rule_set),
-            AclEffect::Allow,
-        )],
-    )
-    .expect("ACL");
     let flow = FlowContext::new(
         Network::Tcp,
         ProtocolTarget::from_host_port("api.service.example", 443).expect("target"),
@@ -218,7 +209,6 @@ fn warmed_route_and_acl_classification_allocate_nothing() {
 
     // Warm lazy regex automata before measuring.
     black_box(table.classify(input));
-    black_box(acl.evaluate(input));
     black_box(
         balancer
             .select(GatewayInstant::ZERO, Network::Tcp, None, &[], &mut entropy)
@@ -228,7 +218,6 @@ fn warmed_route_and_acl_classification_allocate_nothing() {
     begin_measurement();
     for _ in 0..10_000 {
         black_box(table.classify(input));
-        black_box(acl.evaluate(input));
         black_box(
             balancer
                 .select(GatewayInstant::ZERO, Network::Tcp, None, &[], &mut entropy)

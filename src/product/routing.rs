@@ -1,5 +1,5 @@
 use crate::product::flow::{
-    FlowContext, FlowError, InboundId, Network, PrincipalId, canonical_policy_id,
+    FlowContext, FlowError, InboundId, Network, PrincipalId, SourceEndpoint, canonical_policy_id,
 };
 use crate::product::rule_set::VerifiedRuleSet;
 use idna::domain_to_ascii_strict;
@@ -202,49 +202,101 @@ pub enum InitialDemand {
     Throughput,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EgressAction {
     Direct,
-    Reject,
-    Drop,
     Outbound(OutboundId),
     Balancer(BalancerId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteAction {
-    egress: EgressAction,
-    dns_plan: Option<DnsPlanId>,
-    initial_demand: InitialDemand,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteDisposition {
+    Allow,
+    AllowRestricted,
+    Reject,
+    Drop,
+}
+
+/// One terminal routing decision. Allow decisions necessarily select exactly
+/// one egress; reject/drop decisions cannot carry egress or DNS behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RouteAction {
+    Allow {
+        disposition: RouteDisposition,
+        egress: EgressAction,
+        dns_plan: Option<DnsPlanId>,
+        initial_demand: InitialDemand,
+    },
+    Reject,
+    Drop,
 }
 
 impl RouteAction {
-    pub const fn new(
+    pub const fn allow(
         egress: EgressAction,
         dns_plan: Option<DnsPlanId>,
         initial_demand: InitialDemand,
     ) -> Self {
-        Self {
+        Self::Allow {
+            disposition: RouteDisposition::Allow,
             egress,
             dns_plan,
             initial_demand,
         }
     }
 
-    pub const fn direct(initial_demand: InitialDemand) -> Self {
-        Self::new(EgressAction::Direct, None, initial_demand)
+    pub const fn allow_restricted(
+        egress: EgressAction,
+        dns_plan: Option<DnsPlanId>,
+        initial_demand: InitialDemand,
+    ) -> Self {
+        Self::Allow {
+            disposition: RouteDisposition::AllowRestricted,
+            egress,
+            dns_plan,
+            initial_demand,
+        }
     }
 
-    pub const fn egress(&self) -> &EgressAction {
-        &self.egress
+    pub const fn reject() -> Self {
+        Self::Reject
+    }
+
+    pub const fn drop() -> Self {
+        Self::Drop
+    }
+
+    pub const fn direct(initial_demand: InitialDemand) -> Self {
+        Self::allow(EgressAction::Direct, None, initial_demand)
+    }
+
+    pub const fn disposition(&self) -> RouteDisposition {
+        match self {
+            Self::Allow { disposition, .. } => *disposition,
+            Self::Reject => RouteDisposition::Reject,
+            Self::Drop => RouteDisposition::Drop,
+        }
+    }
+
+    pub const fn egress(&self) -> Option<&EgressAction> {
+        match self {
+            Self::Allow { egress, .. } => Some(egress),
+            Self::Reject | Self::Drop => None,
+        }
     }
 
     pub const fn dns_plan(&self) -> Option<&DnsPlanId> {
-        self.dns_plan.as_ref()
+        match self {
+            Self::Allow { dns_plan, .. } => dns_plan.as_ref(),
+            Self::Reject | Self::Drop => None,
+        }
     }
 
     pub const fn initial_demand(&self) -> InitialDemand {
-        self.initial_demand
+        match self {
+            Self::Allow { initial_demand, .. } => *initial_demand,
+            Self::Reject | Self::Drop => InitialDemand::Automatic,
+        }
     }
 }
 
@@ -276,6 +328,7 @@ struct CompiledRouteRule {
     matcher: CompiledMatcher,
     action: RouteAction,
     explanation: String,
+    implicit: bool,
 }
 
 /// One immutable routing generation. Compilation either returns the complete
@@ -288,9 +341,6 @@ pub struct CompiledRouteTable {
 
 impl CompiledRouteTable {
     pub fn compile(generation: u64, rules: Vec<RouteRuleSpec>) -> Result<Self, RouteCompileError> {
-        if rules.is_empty() {
-            return Err(RouteCompileError::MissingDefaultRule);
-        }
         if rules.len() > MAX_RULES {
             return Err(RouteCompileError::TooManyRules {
                 count: rules.len(),
@@ -299,27 +349,34 @@ impl CompiledRouteTable {
         }
 
         let mut ids = HashSet::with_capacity(rules.len());
-        let mut compiled = Vec::with_capacity(rules.len());
-        let final_index = rules.len() - 1;
+        // The fail-closed fallback is a runtime invariant, not configuration
+        // boilerplate. Keep it after the operator's ordered rules so a stated
+        // catch-all remains authoritative while an omitted one rejects.
+        let mut compiled = Vec::with_capacity(rules.len() + 1);
+        let final_index = rules.len().checked_sub(1);
         for (index, rule) in rules.into_iter().enumerate() {
             if !ids.insert(rule.id.clone()) {
                 return Err(RouteCompileError::DuplicateRuleId(rule.id));
             }
-            if rule.action.dns_plan().is_some()
-                && !rule.matcher.stages.is_empty()
+            let requires_destination_address = !rule.matcher.destination_cidrs.is_empty()
+                || rule
+                    .matcher
+                    .destination_rule_sets
+                    .iter()
+                    .any(|rule_set| !rule_set.destination_cidrs().is_empty());
+            let post_resolution_only = !rule.matcher.stages.is_empty()
                 && rule
                     .matcher
                     .stages
                     .iter()
-                    .all(|stage| *stage == RouteStage::PostResolution)
+                    .all(|stage| *stage == RouteStage::PostResolution);
+            if rule.action.dns_plan().is_some()
+                && (requires_destination_address || post_resolution_only)
             {
                 return Err(RouteCompileError::PostResolutionDnsPlan(rule.id));
             }
-            if rule.matcher.is_catch_all() && index != final_index {
+            if rule.matcher.is_catch_all() && Some(index) != final_index {
                 return Err(RouteCompileError::ShadowingDefaultRule(rule.id));
-            }
-            if index == final_index && !rule.matcher.is_catch_all() {
-                return Err(RouteCompileError::MissingDefaultRule);
             }
             let explanation = compile_explanation(rule.explanation, &rule.id)?;
             let matcher = CompiledMatcher::compile(rule.matcher, &rule.id)?;
@@ -328,8 +385,19 @@ impl CompiledRouteTable {
                 matcher,
                 action: rule.action,
                 explanation,
+                implicit: false,
             });
         }
+        let implicit_id = RuleId::parse("unmatched").expect("static fallback rule ID is valid");
+        let implicit_matcher = CompiledMatcher::compile(RouteMatchSpec::default(), &implicit_id)
+            .expect("static implicit-reject matcher is valid");
+        compiled.push(CompiledRouteRule {
+            id: implicit_id,
+            matcher: implicit_matcher,
+            action: RouteAction::reject(),
+            explanation: "unmatched traffic is rejected".to_string(),
+            implicit: true,
+        });
         Ok(Self {
             generation,
             rules: compiled,
@@ -341,24 +409,26 @@ impl CompiledRouteTable {
     }
 
     pub fn classify<'table>(&'table self, input: RouteInput<'_>) -> RouteDecision<'table> {
-        // A default rule is a compile-time invariant.
+        // A terminal fallback is a compile-time invariant; it may be the
+        // operator's catch-all or the internal fail-closed reject.
         let rule = self
             .rules
             .iter()
             .find(|rule| rule.matcher.matches(input))
-            .expect("compiled route table has a final catch-all rule");
+            .expect("compiled route table has a terminal fallback");
         RouteDecision {
             generation: self.generation,
             rule_id: &rule.id,
             action: &rule.action,
             explanation: &rule.explanation,
+            implicit: rule.implicit,
         }
     }
 
     /// Classify in declared order while allowing a runtime egress constraint
     /// to make an otherwise matching rule ineligible. Unlike `classify`, this
-    /// can return `None` because an explicit family constraint may also make
-    /// the final catch-all rule unusable for this destination address.
+    /// can return `None` because the caller may make every action, including
+    /// the fail-closed fallback, ineligible.
     pub fn classify_with_action_eligibility<'table>(
         &'table self,
         input: RouteInput<'_>,
@@ -372,6 +442,7 @@ impl CompiledRouteTable {
                 rule_id: &rule.id,
                 action: &rule.action,
                 explanation: &rule.explanation,
+                implicit: rule.implicit,
             })
     }
 
@@ -401,13 +472,60 @@ impl CompiledRouteTable {
                         rule_id: &rule.id,
                         action: &rule.action,
                         explanation: &rule.explanation,
+                        implicit: rule.implicit,
                     },
                     requires_post_resolution,
                 );
             }
             earlier_post_candidate |= rule.matcher.could_match_post_resolution(flow);
         }
-        unreachable!("compiled route table has a final catch-all rule")
+        unreachable!("compiled route table has a terminal fallback")
+    }
+
+    /// Pre-resolution classification with an ingress-specific egress
+    /// constraint. MPP inbounds use this to skip routes that would chain into
+    /// another MPP outbound while local inbounds admit every configured leaf.
+    pub fn classify_pre_resolution_with_action_eligibility<'table>(
+        &'table self,
+        flow: &FlowContext,
+        mut eligible: impl FnMut(&RouteAction) -> bool,
+    ) -> Option<(RouteDecision<'table>, bool)> {
+        if let Some(address) = flow.target().ip() {
+            let pre = self.classify_with_action_eligibility(
+                RouteInput::pre_resolution(flow),
+                &mut eligible,
+            )?;
+            let post = self.classify_with_action_eligibility(
+                RouteInput::post_resolution(flow, address),
+                &mut eligible,
+            )?;
+            let requires_post_resolution = pre.rule_id() != post.rule_id();
+            return Some((pre, requires_post_resolution));
+        }
+
+        let input = RouteInput::pre_resolution(flow);
+        let mut earlier_post_candidate = false;
+        for rule in &self.rules {
+            if !eligible(&rule.action) {
+                continue;
+            }
+            if rule.matcher.matches(input) {
+                let requires_post_resolution =
+                    earlier_post_candidate || !rule.matcher.could_match_post_resolution(flow);
+                return Some((
+                    RouteDecision {
+                        generation: self.generation,
+                        rule_id: &rule.id,
+                        action: &rule.action,
+                        explanation: &rule.explanation,
+                        implicit: rule.implicit,
+                    },
+                    requires_post_resolution,
+                ));
+            }
+            earlier_post_candidate |= rule.matcher.could_match_post_resolution(flow);
+        }
+        None
     }
 
     /// Return whether first-match routing for this flow can change once a
@@ -426,13 +544,13 @@ impl CompiledRouteTable {
                 .rules
                 .iter()
                 .position(|rule| rule.matcher.matches(pre_input))
-                .expect("compiled route table has a final catch-all rule");
+                .expect("compiled route table has a terminal fallback");
             let post_input = RouteInput::post_resolution(flow, address);
             let post_selected = self
                 .rules
                 .iter()
                 .position(|rule| rule.matcher.matches(post_input))
-                .expect("compiled route table has a final catch-all rule");
+                .expect("compiled route table has a terminal fallback");
             return post_selected != selected;
         }
         self.classify_pre_resolution(flow).1
@@ -442,10 +560,39 @@ impl CompiledRouteTable {
     /// semantics. Normal forwarding calls `classify` and allocates nothing;
     /// explicit route-explain/dry-run operations may allocate this trace.
     pub fn explain<'table>(&'table self, input: RouteInput<'_>) -> RouteExplanation<'table> {
+        self.explain_with_egress_eligibility(input, |_| true)
+    }
+
+    /// Produce the operator trace after applying the same per-egress
+    /// eligibility gate used by runtime routing. This keeps offline
+    /// post-resolution explanations honest when an outbound cannot carry the
+    /// selected destination IP family. Terminal reject/drop actions have no
+    /// egress and therefore always remain eligible.
+    pub fn explain_with_egress_eligibility<'table>(
+        &'table self,
+        input: RouteInput<'_>,
+        mut eligible: impl FnMut(&EgressAction) -> bool,
+    ) -> RouteExplanation<'table> {
+        self.explain_with_action_eligibility(input, |action| {
+            action
+                .egress()
+                .is_some_and(|egress| !eligible(egress))
+                .then_some(RouteMismatch::EgressIpFamily)
+        })
+    }
+
+    pub(crate) fn explain_with_action_eligibility<'table>(
+        &'table self,
+        input: RouteInput<'_>,
+        mut ineligible: impl FnMut(&RouteAction) -> Option<RouteMismatch>,
+    ) -> RouteExplanation<'table> {
         let mut selected = None;
         let mut rules = Vec::with_capacity(self.rules.len());
         for rule in &self.rules {
-            let first_mismatch = rule.matcher.first_mismatch(input);
+            let first_mismatch = rule
+                .matcher
+                .first_mismatch(input)
+                .or_else(|| ineligible(&rule.action));
             let is_selected = selected.is_none() && first_mismatch.is_none();
             if is_selected {
                 selected = Some(rule);
@@ -456,9 +603,10 @@ impl CompiledRouteTable {
                 first_mismatch,
                 domain_rule_sets: &rule.matcher.domain_rule_sets,
                 destination_rule_sets: &rule.matcher.destination_rule_sets,
+                implicit: rule.implicit,
             });
         }
-        let selected = selected.expect("compiled route table has a final matching catch-all rule");
+        let selected = selected.expect("compiled route table has a matching terminal fallback");
         RouteExplanation {
             generation: self.generation,
             selected: RouteDecision {
@@ -466,13 +614,14 @@ impl CompiledRouteTable {
                 rule_id: &selected.id,
                 action: &selected.action,
                 explanation: &selected.explanation,
+                implicit: selected.implicit,
             },
             rules,
         }
     }
 
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.rules.len().saturating_sub(1)
     }
 }
 
@@ -482,6 +631,7 @@ pub struct RouteDecision<'a> {
     rule_id: &'a RuleId,
     action: &'a RouteAction,
     explanation: &'a str,
+    implicit: bool,
 }
 
 impl<'a> RouteDecision<'a> {
@@ -500,6 +650,13 @@ impl<'a> RouteDecision<'a> {
     pub const fn explanation(self) -> &'a str {
         self.explanation
     }
+
+    /// True when no configured rule matched and the fail-closed fallback was
+    /// selected. The internal rule identity must not be presented as an
+    /// operator-configured name.
+    pub const fn is_implicit(self) -> bool {
+        self.implicit
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +672,8 @@ pub enum RouteMismatch {
     Inbound,
     Principal,
     Stage,
+    EgressIpFamily,
+    DnsPolicyProvenance,
 }
 
 impl fmt::Display for RouteMismatch {
@@ -531,6 +690,8 @@ impl fmt::Display for RouteMismatch {
             Self::Inbound => "inbound",
             Self::Principal => "principal",
             Self::Stage => "route stage",
+            Self::EgressIpFamily => "egress IP family",
+            Self::DnsPolicyProvenance => "DNS policy provenance",
         })
     }
 }
@@ -542,6 +703,7 @@ pub struct RouteRuleTrace<'a> {
     first_mismatch: Option<RouteMismatch>,
     domain_rule_sets: &'a [Arc<VerifiedRuleSet>],
     destination_rule_sets: &'a [Arc<VerifiedRuleSet>],
+    implicit: bool,
 }
 
 impl<'a> RouteRuleTrace<'a> {
@@ -555,6 +717,10 @@ impl<'a> RouteRuleTrace<'a> {
 
     pub const fn first_mismatch(self) -> Option<RouteMismatch> {
         self.first_mismatch
+    }
+
+    pub const fn is_implicit(self) -> bool {
+        self.implicit
     }
 
     /// Verified signed sets consulted by the rule's domain category. Control
@@ -756,7 +922,7 @@ impl CompiledMatcher {
     fn first_mismatch_after_destination(&self, input: RouteInput<'_>) -> Option<RouteMismatch> {
         if !matches_value(
             &self.source_cidrs,
-            Some(input.flow().source().address()),
+            input.flow().source().map(SourceEndpoint::address),
             |net, ip| net.contains(&ip),
         ) {
             return Some(RouteMismatch::SourceIp);
@@ -770,7 +936,7 @@ impl CompiledMatcher {
         }
         if !matches_value(
             &self.source_ports,
-            Some(input.flow().source().port()),
+            input.flow().source().map(SourceEndpoint::port),
             |range, port| range.contains(port),
         ) {
             return Some(RouteMismatch::SourcePort);
@@ -839,7 +1005,6 @@ impl CompiledMatcher {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteCompileError {
-    MissingDefaultRule,
     ShadowingDefaultRule(RuleId),
     DuplicateRuleId(RuleId),
     TooManyRules {
@@ -876,9 +1041,6 @@ pub enum RouteCompileError {
 impl fmt::Display for RouteCompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingDefaultRule => {
-                formatter.write_str("route table requires a final catch-all rule")
-            }
             Self::ShadowingDefaultRule(id) => {
                 write!(formatter, "catch-all route rule {id} must be last")
             }
@@ -923,7 +1085,7 @@ impl fmt::Display for RouteCompileError {
             ),
             Self::PostResolutionDnsPlan(rule_id) => write!(
                 formatter,
-                "post-resolution-only route rule {rule_id} cannot select a DNS policy"
+                "route rule {rule_id} cannot select a DNS policy because it is post-resolution-only or requires destination address evidence"
             ),
             Self::InvalidExplanation(rule_id) => {
                 write!(

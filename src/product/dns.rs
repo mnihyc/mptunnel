@@ -11,8 +11,9 @@ use std::time::Duration;
 pub const MAX_DNS_UPSTREAMS: usize = 128;
 pub const MAX_DNS_PLANS: usize = 128;
 pub const MAX_DNS_RULES: usize = 4_096;
-pub const MAX_DNS_HOSTS: usize = 4_096;
-pub const MAX_DNS_HOST_ADDRESSES: usize = 64;
+pub const MAX_DNS_OVERRIDE_RECORDS: usize = 4_096;
+pub const MAX_DNS_SYNTHETIC_CAPTURES: usize = 128;
+pub const MAX_DNS_OVERRIDE_ADDRESSES: usize = 64;
 pub const MAX_DNS_UPSTREAMS_PER_PLAN: usize = 16;
 pub const MAX_DNS_EXPECTED_CIDRS_PER_PLAN: usize = 256;
 pub const MAX_DNS_CACHE_ENTRIES_PER_PLAN: usize = 65_536;
@@ -20,14 +21,14 @@ pub const MAX_DNS_INFLIGHT_PER_PLAN: usize = 1_024;
 pub const MAX_DNS_ANSWERS: usize = 64;
 pub const MAX_DNS_TOTAL_CACHE_ENTRIES: usize = 262_144;
 pub const MAX_DNS_TOTAL_INFLIGHT: usize = 4_096;
-pub const MAX_FAKE_DNS_ENTRIES: usize = 262_144;
+pub const MAX_DNS_SYNTHETIC_ENTRIES: usize = 262_144;
 
 const MAX_DOH_PATH_BYTES: usize = 256;
 const MAX_DNS_EXPLANATION_BYTES: usize = 256;
 const MAX_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_DNS_TTL_CAP: Duration = Duration::from_secs(86_400);
-const MAX_FAKE_DNS_ANSWER_TTL: Duration = Duration::from_secs(3_600);
-const MAX_FAKE_DNS_RECOVERY_TTL: Duration = Duration::from_secs(86_400);
+const MAX_DNS_SYNTHETIC_ANSWER_TTL: Duration = Duration::from_secs(3_600);
+const MAX_DNS_SYNTHETIC_RECOVERY_TTL: Duration = Duration::from_secs(86_400);
 
 macro_rules! dns_id {
     ($name:ident) => {
@@ -71,6 +72,8 @@ macro_rules! dns_id {
 
 dns_id!(DnsUpstreamId);
 dns_id!(DnsRuleId);
+dns_id!(DnsOverrideRecordId);
+dns_id!(DnsSyntheticCaptureId);
 
 /// The wire protocol used to reach a named DNS server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -262,20 +265,22 @@ pub enum DnsUpstreamStrategy {
 /// including an absent address family, returns authoritative local NODATA and
 /// never leaks the private name to an upstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsHostSpec {
+pub struct DnsOverrideRecordSpec {
+    pub id: DnsOverrideRecordId,
     pub domain: DomainName,
     pub addresses: Vec<IpAddr>,
 }
 
 /// Bounded synthetic-address policy for local DNS capture.
 ///
-/// The synthetic DNS override is deliberately absent from ordinary dial-time resolution. A TUN
+/// Synthetic capture is deliberately absent from ordinary dial-time resolution. A TUN
 /// capture may publish a synthetic address and recover the original domain
 /// once when the application opens a flow; the selected outbound then resolves
 /// that domain normally. Pools are restricted to non-public ranges so enabling
 /// the override cannot silently shadow an Internet destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FakeDnsSpec {
+pub struct DnsSyntheticCaptureSpec {
+    pub id: DnsSyntheticCaptureId,
     pub ipv4_pool: Option<Ipv4Net>,
     pub ipv6_pool: Option<Ipv6Net>,
     pub max_entries: usize,
@@ -329,6 +334,10 @@ pub struct DnsPlanSpec {
     /// A/AAAA answer belongs to one of these networks. A rejected candidate
     /// advances to the next upstream.
     pub expected_cidrs: Vec<IpNet>,
+    /// Named exact-name records explicitly attached to this policy.
+    pub override_records: Vec<DnsOverrideRecordId>,
+    /// One optional synthetic capture explicitly attached to this policy.
+    pub synthetic_capture: Option<DnsSyntheticCaptureId>,
     pub limits: DnsPlanLimits,
 }
 
@@ -341,6 +350,8 @@ impl DnsPlanSpec {
             security: DnsSecurityPolicy::AllowPlaintext,
             upstream_strategy: DnsUpstreamStrategy::Ordered,
             expected_cidrs: Vec::new(),
+            override_records: Vec::new(),
+            synthetic_capture: None,
             limits: DnsPlanLimits::default(),
         }
     }
@@ -351,6 +362,22 @@ pub enum DnsRuleMatchKind {
     Exact,
     Suffix,
     Default,
+}
+
+impl DnsRuleMatchKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Suffix => "suffix",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl fmt::Display for DnsRuleMatchKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,8 +417,8 @@ pub struct DnsPolicySpec {
     pub outbound_capabilities: Vec<DnsOutboundCapabilitySpec>,
     pub plans: Vec<DnsPlanSpec>,
     pub rules: Vec<DnsRuleSpec>,
-    pub hosts: Vec<DnsHostSpec>,
-    pub fake_dns: Option<FakeDnsSpec>,
+    pub override_records: Vec<DnsOverrideRecordSpec>,
+    pub synthetic_captures: Vec<DnsSyntheticCaptureSpec>,
     pub default_plan: DnsPlanId,
 }
 
@@ -424,6 +451,8 @@ pub struct CompiledDnsPlan {
     security: DnsSecurityPolicy,
     upstream_strategy: DnsUpstreamStrategy,
     expected_cidrs: Vec<IpNet>,
+    override_records: Vec<DnsOverrideRecordId>,
+    synthetic_capture: Option<DnsSyntheticCaptureId>,
     limits: DnsPlanLimits,
 }
 
@@ -452,6 +481,14 @@ impl CompiledDnsPlan {
         &self.expected_cidrs
     }
 
+    pub fn override_records(&self) -> &[DnsOverrideRecordId] {
+        &self.override_records
+    }
+
+    pub const fn synthetic_capture(&self) -> Option<&DnsSyntheticCaptureId> {
+        self.synthetic_capture.as_ref()
+    }
+
     pub const fn limits(&self) -> DnsPlanLimits {
         self.limits
     }
@@ -474,35 +511,91 @@ pub struct CompiledDnsPolicy {
     rules: Vec<CompiledDnsRule>,
     exact_rules: BTreeMap<DomainName, usize>,
     suffix_rules: Vec<usize>,
-    hosts: BTreeMap<DomainName, std::sync::Arc<[IpAddr]>>,
-    fake_dns: Option<FakeDnsSpec>,
+    override_records: BTreeMap<DnsOverrideRecordId, CompiledDnsOverrideRecord>,
+    synthetic_captures: BTreeMap<DnsSyntheticCaptureId, DnsSyntheticCaptureSpec>,
+    dns_active_plans: BTreeSet<DnsPlanId>,
     default_plan: DnsPlanId,
+}
+
+/// Validated selector-reachable DNS policy roots for one generation.
+///
+/// Construction always includes the default policy and every split-DNS rule
+/// target; callers add route-selected policy IDs. Catalog entries outside this
+/// set remain parsed and validated but must not be instantiated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsActivation {
+    generation: u64,
+    plans: BTreeSet<DnsPlanId>,
+}
+
+impl DnsActivation {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn plans(&self) -> impl ExactSizeIterator<Item = &DnsPlanId> {
+        self.plans.iter()
+    }
+
+    pub fn contains(&self, plan: &DnsPlanId) -> bool {
+        self.plans.contains(plan)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledDnsOverrideRecord {
+    id: DnsOverrideRecordId,
+    domain: DomainName,
+    addresses: std::sync::Arc<[IpAddr]>,
+}
+
+impl CompiledDnsOverrideRecord {
+    pub const fn id(&self) -> &DnsOverrideRecordId {
+        &self.id
+    }
+
+    pub const fn domain(&self) -> &DomainName {
+        &self.domain
+    }
+
+    pub const fn addresses(&self) -> &std::sync::Arc<[IpAddr]> {
+        &self.addresses
+    }
 }
 
 impl CompiledDnsPolicy {
     pub fn compile(generation: u64, spec: DnsPolicySpec) -> Result<Self, DnsCompileError> {
         validate_collection_bounds(&spec)?;
-        validate_fake_dns(spec.fake_dns.as_ref(), &spec.upstreams)?;
+        let override_records = compile_override_records(spec.override_records)?;
+        let synthetic_captures = compile_synthetic_captures(spec.synthetic_captures)?;
         let capabilities = compile_capabilities(spec.outbound_capabilities)?;
         let upstreams = compile_upstreams(spec.upstreams, &capabilities)?;
-        let plans = compile_plans(spec.plans, &upstreams)?;
-        validate_generation_limits(&plans)?;
+        let plans = compile_plans(
+            spec.plans,
+            &upstreams,
+            &override_records,
+            &synthetic_captures,
+        )?;
         if !plans.contains_key(&spec.default_plan) {
             return Err(DnsCompileError::UnknownDefaultPlan(spec.default_plan));
         }
         let (rules, exact_rules, suffix_rules) = compile_rules(spec.rules, &plans)?;
-        let hosts = compile_hosts(spec.hosts)?;
-        Ok(Self {
+        let mut dns_active_plans = BTreeSet::from([spec.default_plan.clone()]);
+        dns_active_plans.extend(rules.iter().map(|rule| rule.plan.clone()));
+        let compiled = Self {
             generation,
             upstreams,
             plans,
             rules,
             exact_rules,
             suffix_rules,
-            hosts,
-            fake_dns: spec.fake_dns,
+            override_records,
+            synthetic_captures,
+            dns_active_plans,
             default_plan: spec.default_plan,
-        })
+        };
+        compiled.activate(std::iter::empty::<&DnsPlanId>())?;
+        Ok(compiled)
     }
 
     pub const fn generation(&self) -> u64 {
@@ -511,6 +604,12 @@ impl CompiledDnsPolicy {
 
     pub fn upstreams(&self) -> impl ExactSizeIterator<Item = &CompiledDnsUpstream> {
         self.upstreams.values()
+    }
+
+    /// DNS-policy roots selected by the default and split-DNS rules. Routing
+    /// may add explicit policy roots before runtime activation.
+    pub fn dns_active_plans(&self) -> impl ExactSizeIterator<Item = &DnsPlanId> {
+        self.dns_active_plans.iter()
     }
 
     pub fn upstream(&self, id: &DnsUpstreamId) -> Option<&CompiledDnsUpstream> {
@@ -523,8 +622,14 @@ impl CompiledDnsPolicy {
     /// inventory, while the DNS payload remains inside the selected outbound.
     /// System DNS has no explicit endpoint and is intentionally absent.
     pub fn bootstrap_endpoints(&self) -> impl Iterator<Item = SocketAddr> + '_ {
-        self.upstreams
-            .values()
+        self.bootstrap_endpoints_for_plans(self.dns_active_plans.iter())
+    }
+
+    pub fn bootstrap_endpoints_for_plans<'a>(
+        &'a self,
+        plans: impl IntoIterator<Item = &'a DnsPlanId> + 'a,
+    ) -> impl Iterator<Item = SocketAddr> + 'a {
+        self.active_upstreams(plans)
             .filter(|upstream| matches!(upstream.egress, DnsEgressSpec::Direct))
             .filter_map(|upstream| upstream.endpoint.bootstrap())
     }
@@ -532,16 +637,16 @@ impl CompiledDnsPolicy {
     /// True only when every configured plan is encrypted end to end. Platform
     /// full-VPN validation can use this without reinterpreting DNS internals.
     pub fn is_encrypted_only(&self) -> bool {
-        self.plans
-            .values()
+        self.dns_active_plans
+            .iter()
+            .filter_map(|id| self.plans.get(id))
             .all(|plan| plan.security == DnsSecurityPolicy::RequireEncrypted)
     }
 
     /// System resolution is deliberately explicit so managed VPN activation
     /// can reject it before changing host routes or resolver state.
     pub fn uses_system_resolution(&self) -> bool {
-        self.upstreams
-            .values()
+        self.active_upstreams(self.dns_active_plans.iter())
             .any(|upstream| matches!(upstream.endpoint, DnsUpstreamEndpoint::System))
     }
 
@@ -557,16 +662,215 @@ impl CompiledDnsPolicy {
         &self.default_plan
     }
 
-    pub fn hosts(&self) -> impl ExactSizeIterator<Item = (&DomainName, &std::sync::Arc<[IpAddr]>)> {
-        self.hosts.iter()
+    pub fn override_records(&self) -> impl ExactSizeIterator<Item = &CompiledDnsOverrideRecord> {
+        self.override_records.values()
     }
 
-    pub fn host(&self, domain: &DomainName) -> Option<&std::sync::Arc<[IpAddr]>> {
-        self.hosts.get(domain)
+    pub fn override_record(&self, id: &DnsOverrideRecordId) -> Option<&CompiledDnsOverrideRecord> {
+        self.override_records.get(id)
     }
 
-    pub const fn fake_dns(&self) -> Option<&FakeDnsSpec> {
-        self.fake_dns.as_ref()
+    pub fn override_record_for_plan(
+        &self,
+        plan: &DnsPlanId,
+        domain: &DomainName,
+    ) -> Option<&CompiledDnsOverrideRecord> {
+        self.plans
+            .get(plan)?
+            .override_records
+            .iter()
+            .find_map(|id| {
+                self.override_records
+                    .get(id)
+                    .filter(|record| record.domain == *domain)
+            })
+    }
+
+    pub fn synthetic_captures(&self) -> impl ExactSizeIterator<Item = &DnsSyntheticCaptureSpec> {
+        self.synthetic_captures.values()
+    }
+
+    pub fn synthetic_capture(
+        &self,
+        id: &DnsSyntheticCaptureId,
+    ) -> Option<&DnsSyntheticCaptureSpec> {
+        self.synthetic_captures.get(id)
+    }
+
+    pub fn synthetic_capture_for_plan(&self, plan: &DnsPlanId) -> Option<&DnsSyntheticCaptureSpec> {
+        let id = self.plans.get(plan)?.synthetic_capture.as_ref()?;
+        self.synthetic_captures.get(id)
+    }
+
+    /// Build the only activation set accepted by the normal runtime and
+    /// platform preflight paths. Intrinsic DNS roots cannot be omitted.
+    pub fn activate<'a>(
+        &self,
+        extra_plans: impl IntoIterator<Item = &'a DnsPlanId>,
+    ) -> Result<DnsActivation, DnsCompileError> {
+        let mut plans = self.dns_active_plans.clone();
+        plans.extend(extra_plans.into_iter().cloned());
+        self.validate_active_plans(plans.iter())?;
+        Ok(DnsActivation {
+            generation: self.generation,
+            plans,
+        })
+    }
+
+    pub fn bootstrap_endpoints_for_activation<'a>(
+        &'a self,
+        activation: &'a DnsActivation,
+    ) -> impl Iterator<Item = SocketAddr> + 'a {
+        debug_assert_eq!(activation.generation, self.generation);
+        self.bootstrap_endpoints_for_plans(activation.plans())
+    }
+
+    pub fn upstreams_for_activation<'a>(
+        &'a self,
+        activation: &'a DnsActivation,
+    ) -> impl Iterator<Item = &'a CompiledDnsUpstream> + 'a {
+        debug_assert_eq!(activation.generation, self.generation);
+        self.active_upstreams(activation.plans())
+    }
+
+    pub fn override_records_for_activation<'a>(
+        &'a self,
+        activation: &'a DnsActivation,
+    ) -> impl Iterator<Item = &'a CompiledDnsOverrideRecord> + 'a {
+        debug_assert_eq!(activation.generation, self.generation);
+        let ids = activation
+            .plans()
+            .flat_map(|plan| self.plans[plan].override_records.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        ids.into_iter()
+            .filter_map(|id| self.override_records.get(&id))
+    }
+
+    pub fn synthetic_captures_for_activation<'a>(
+        &'a self,
+        activation: &'a DnsActivation,
+    ) -> impl Iterator<Item = &'a DnsSyntheticCaptureSpec> + 'a {
+        debug_assert_eq!(activation.generation, self.generation);
+        let ids = activation
+            .plans()
+            .filter_map(|plan| self.plans[plan].synthetic_capture.clone())
+            .collect::<BTreeSet<_>>();
+        ids.into_iter()
+            .filter_map(|id| self.synthetic_captures.get(&id))
+    }
+
+    pub fn uses_system_resolution_for_activation(&self, activation: &DnsActivation) -> bool {
+        debug_assert_eq!(activation.generation, self.generation);
+        self.active_upstreams(activation.plans())
+            .any(|upstream| matches!(upstream.endpoint, DnsUpstreamEndpoint::System))
+    }
+
+    pub fn is_encrypted_only_for_activation(&self, activation: &DnsActivation) -> bool {
+        debug_assert_eq!(activation.generation, self.generation);
+        activation
+            .plans()
+            .filter_map(|id| self.plans.get(id))
+            .all(|plan| plan.security == DnsSecurityPolicy::RequireEncrypted)
+    }
+
+    /// Validate the complete set of policies that one runtime generation will
+    /// activate. Catalog definitions outside this closure remain inert.
+    pub fn validate_active_plans<'a>(
+        &self,
+        plans: impl IntoIterator<Item = &'a DnsPlanId>,
+    ) -> Result<(), DnsCompileError> {
+        let plans = plans.into_iter().cloned().collect::<BTreeSet<_>>();
+        for plan in &plans {
+            if !self.plans.contains_key(plan) {
+                return Err(DnsCompileError::UnknownActivePlan(plan.clone()));
+            }
+        }
+        let total_cache_entries = plans
+            .iter()
+            .map(|id| self.plans[id].limits.cache_capacity)
+            .try_fold(0_usize, usize::checked_add)
+            .ok_or(DnsCompileError::GenerationLimitsOverflow)?;
+        let total_inflight = plans
+            .iter()
+            .map(|id| self.plans[id].limits.max_inflight)
+            .try_fold(0_usize, usize::checked_add)
+            .ok_or(DnsCompileError::GenerationLimitsOverflow)?;
+        if total_cache_entries > MAX_DNS_TOTAL_CACHE_ENTRIES
+            || total_inflight > MAX_DNS_TOTAL_INFLIGHT
+        {
+            return Err(DnsCompileError::GenerationLimitsExceeded {
+                cache_entries: total_cache_entries,
+                maximum_cache_entries: MAX_DNS_TOTAL_CACHE_ENTRIES,
+                inflight: total_inflight,
+                maximum_inflight: MAX_DNS_TOTAL_INFLIGHT,
+            });
+        }
+        let captures = plans
+            .iter()
+            .filter_map(|plan| self.plans[plan].synthetic_capture.as_ref())
+            .collect::<BTreeSet<_>>();
+        for (index, left_id) in captures.iter().enumerate() {
+            let left = &self.synthetic_captures[*left_id];
+            for right_id in captures.iter().skip(index + 1) {
+                let right = &self.synthetic_captures[*right_id];
+                if capture_specs_overlap(left, right) {
+                    return Err(DnsCompileError::OverlappingSyntheticCapturePools {
+                        left: (*left_id).clone(),
+                        right: (*right_id).clone(),
+                    });
+                }
+            }
+        }
+        let upstream_ids = plans
+            .iter()
+            .flat_map(|plan| self.plans[plan].upstreams.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let record_ids = plans
+            .iter()
+            .flat_map(|plan| self.plans[plan].override_records.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for capture_id in captures {
+            let capture = &self.synthetic_captures[capture_id];
+            for upstream_id in &upstream_ids {
+                if let Some(bootstrap) = self.upstreams[upstream_id].endpoint.bootstrap()
+                    && synthetic_capture_contains(capture, bootstrap.ip())
+                {
+                    return Err(DnsCompileError::SyntheticCaptureContainsBootstrap {
+                        capture: capture_id.clone(),
+                        upstream: upstream_id.clone(),
+                        bootstrap,
+                    });
+                }
+            }
+            for record_id in &record_ids {
+                let record = &self.override_records[record_id];
+                if let Some(address) = record
+                    .addresses
+                    .iter()
+                    .copied()
+                    .find(|address| synthetic_capture_contains(capture, *address))
+                {
+                    return Err(DnsCompileError::SyntheticCaptureContainsOverrideAddress {
+                        capture: capture_id.clone(),
+                        record: record_id.clone(),
+                        address,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn active_upstreams<'a>(
+        &'a self,
+        plans: impl IntoIterator<Item = &'a DnsPlanId>,
+    ) -> impl Iterator<Item = &'a CompiledDnsUpstream> + 'a {
+        let ids = plans
+            .into_iter()
+            .filter_map(|id| self.plans.get(id))
+            .flat_map(|plan| plan.upstreams.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        ids.into_iter().filter_map(|id| self.upstreams.get(&id))
     }
 
     /// Select exact first, then the longest matching suffix, then default.
@@ -672,102 +976,118 @@ fn validate_collection_bounds(spec: &DnsPolicySpec) -> Result<(), DnsCompileErro
             maximum: MAX_DNS_RULES,
         });
     }
-    if spec.hosts.len() > MAX_DNS_HOSTS {
-        return Err(DnsCompileError::TooManyHosts {
-            count: spec.hosts.len(),
-            maximum: MAX_DNS_HOSTS,
+    if spec.override_records.len() > MAX_DNS_OVERRIDE_RECORDS {
+        return Err(DnsCompileError::TooManyOverrideRecords {
+            count: spec.override_records.len(),
+            maximum: MAX_DNS_OVERRIDE_RECORDS,
+        });
+    }
+    if spec.synthetic_captures.len() > MAX_DNS_SYNTHETIC_CAPTURES {
+        return Err(DnsCompileError::TooManySyntheticCaptures {
+            count: spec.synthetic_captures.len(),
+            maximum: MAX_DNS_SYNTHETIC_CAPTURES,
         });
     }
     Ok(())
 }
 
-fn validate_fake_dns(
-    fake_dns: Option<&FakeDnsSpec>,
-    upstreams: &[DnsUpstreamSpec],
-) -> Result<(), DnsCompileError> {
-    let Some(fake_dns) = fake_dns else {
-        return Ok(());
-    };
-    if fake_dns.ipv4_pool.is_none() && fake_dns.ipv6_pool.is_none() {
-        return Err(DnsCompileError::FakeDnsPoolRequired);
+fn validate_synthetic_capture(capture: &DnsSyntheticCaptureSpec) -> Result<(), DnsCompileError> {
+    if capture.ipv4_pool.is_none() && capture.ipv6_pool.is_none() {
+        return Err(DnsCompileError::SyntheticCapturePoolRequired);
     }
-    if !(1..=MAX_FAKE_DNS_ENTRIES).contains(&fake_dns.max_entries) {
-        return Err(DnsCompileError::InvalidFakeDnsCapacity {
-            capacity: fake_dns.max_entries,
-            maximum: MAX_FAKE_DNS_ENTRIES,
+    if !(1..=MAX_DNS_SYNTHETIC_ENTRIES).contains(&capture.max_entries) {
+        return Err(DnsCompileError::InvalidSyntheticCaptureCapacity {
+            capacity: capture.max_entries,
+            maximum: MAX_DNS_SYNTHETIC_ENTRIES,
         });
     }
-    if fake_dns.answer_ttl.is_zero()
-        || fake_dns.answer_ttl > MAX_FAKE_DNS_ANSWER_TTL
-        || fake_dns.recovery_ttl < fake_dns.answer_ttl
-        || fake_dns.recovery_ttl > MAX_FAKE_DNS_RECOVERY_TTL
+    if capture.answer_ttl.is_zero()
+        || capture.answer_ttl > MAX_DNS_SYNTHETIC_ANSWER_TTL
+        || capture.recovery_ttl < capture.answer_ttl
+        || capture.recovery_ttl > MAX_DNS_SYNTHETIC_RECOVERY_TTL
     {
-        return Err(DnsCompileError::InvalidFakeDnsLifetime {
-            answer_ttl: fake_dns.answer_ttl,
-            recovery_ttl: fake_dns.recovery_ttl,
+        return Err(DnsCompileError::InvalidSyntheticCaptureLifetime {
+            answer_ttl: capture.answer_ttl,
+            recovery_ttl: capture.recovery_ttl,
         });
     }
 
-    if let Some(pool) = fake_dns.ipv4_pool {
-        let reserved =
-            Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).expect("static DNS override IPv4 range");
+    if let Some(pool) = capture.ipv4_pool {
+        let reserved = Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15)
+            .expect("static DNS synthetic-capture IPv4 range");
         if pool.addr() != pool.network() || !reserved.contains(&pool.network()) {
-            return Err(DnsCompileError::InvalidFakeDnsIpv4Pool(pool));
+            return Err(DnsCompileError::InvalidSyntheticCaptureIpv4Pool(pool));
         }
         let addresses = 1_u128 << u32::from(32 - pool.prefix_len());
         let usable = addresses.saturating_sub(2);
-        if usable < fake_dns.max_entries as u128 {
-            return Err(DnsCompileError::FakeDnsPoolTooSmall {
+        if usable < capture.max_entries as u128 {
+            return Err(DnsCompileError::SyntheticCapturePoolTooSmall {
                 pool: IpNet::V4(pool),
                 capacity: usable,
-                required: fake_dns.max_entries,
+                required: capture.max_entries,
             });
         }
     }
-    if let Some(pool) = fake_dns.ipv6_pool {
+    if let Some(pool) = capture.ipv6_pool {
         let reserved = Ipv6Net::new(Ipv6Addr::from(0xfc00_u128 << 112), 7)
-            .expect("static DNS override IPv6 range");
+            .expect("static DNS synthetic-capture IPv6 range");
         if pool.addr() != pool.network() || !reserved.contains(&pool.network()) {
-            return Err(DnsCompileError::InvalidFakeDnsIpv6Pool(pool));
+            return Err(DnsCompileError::InvalidSyntheticCaptureIpv6Pool(pool));
         }
         let host_bits = u32::from(128 - pool.prefix_len());
         let usable = 1_u128
             .checked_shl(host_bits)
             .unwrap_or(u128::MAX)
             .saturating_sub(1);
-        if usable < fake_dns.max_entries as u128 {
-            return Err(DnsCompileError::FakeDnsPoolTooSmall {
+        if usable < capture.max_entries as u128 {
+            return Err(DnsCompileError::SyntheticCapturePoolTooSmall {
                 pool: IpNet::V6(pool),
                 capacity: usable,
-                required: fake_dns.max_entries,
+                required: capture.max_entries,
             });
         }
     }
 
-    for upstream in upstreams {
-        let Some(bootstrap) = upstream.endpoint.bootstrap() else {
-            continue;
-        };
-        let overlaps = match bootstrap.ip() {
-            IpAddr::V4(address) => fake_dns
-                .ipv4_pool
-                .is_some_and(|pool| pool.contains(&address)),
-            IpAddr::V6(address) => fake_dns
-                .ipv6_pool
-                .is_some_and(|pool| pool.contains(&address)),
-        };
-        if overlaps {
-            return Err(DnsCompileError::FakeDnsContainsBootstrap {
-                pool: match bootstrap.ip() {
-                    IpAddr::V4(_) => IpNet::V4(fake_dns.ipv4_pool.expect("matching IPv4 pool")),
-                    IpAddr::V6(_) => IpNet::V6(fake_dns.ipv6_pool.expect("matching IPv6 pool")),
-                },
-                upstream: upstream.id.clone(),
-                bootstrap,
-            });
+    Ok(())
+}
+
+fn compile_synthetic_captures(
+    captures: Vec<DnsSyntheticCaptureSpec>,
+) -> Result<BTreeMap<DnsSyntheticCaptureId, DnsSyntheticCaptureSpec>, DnsCompileError> {
+    let mut compiled = BTreeMap::new();
+    for capture in captures {
+        validate_synthetic_capture(&capture)?;
+        let duplicate = capture.id.clone();
+        if compiled.insert(capture.id.clone(), capture).is_some() {
+            return Err(DnsCompileError::DuplicateSyntheticCaptureId(duplicate));
         }
     }
-    Ok(())
+    Ok(compiled)
+}
+
+fn capture_specs_overlap(left: &DnsSyntheticCaptureSpec, right: &DnsSyntheticCaptureSpec) -> bool {
+    left.ipv4_pool
+        .zip(right.ipv4_pool)
+        .is_some_and(|(left, right)| {
+            left.contains(&right.network()) || right.contains(&left.network())
+        })
+        || left
+            .ipv6_pool
+            .zip(right.ipv6_pool)
+            .is_some_and(|(left, right)| {
+                left.contains(&right.network()) || right.contains(&left.network())
+            })
+}
+
+fn synthetic_capture_contains(capture: &DnsSyntheticCaptureSpec, address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => capture
+            .ipv4_pool
+            .is_some_and(|pool| pool.contains(&address)),
+        IpAddr::V6(address) => capture
+            .ipv6_pool
+            .is_some_and(|pool| pool.contains(&address)),
+    }
 }
 
 fn compile_capabilities(
@@ -862,10 +1182,12 @@ fn validate_upstream(
 fn compile_plans(
     plans: Vec<DnsPlanSpec>,
     upstreams: &BTreeMap<DnsUpstreamId, CompiledDnsUpstream>,
+    override_records: &BTreeMap<DnsOverrideRecordId, CompiledDnsOverrideRecord>,
+    synthetic_captures: &BTreeMap<DnsSyntheticCaptureId, DnsSyntheticCaptureSpec>,
 ) -> Result<BTreeMap<DnsPlanId, CompiledDnsPlan>, DnsCompileError> {
     let mut compiled = BTreeMap::new();
     for plan in plans {
-        validate_plan(&plan, upstreams)?;
+        validate_plan(&plan, upstreams, override_records, synthetic_captures)?;
         let duplicate = plan.id.clone();
         let value = CompiledDnsPlan {
             id: plan.id.clone(),
@@ -874,6 +1196,8 @@ fn compile_plans(
             security: plan.security,
             upstream_strategy: plan.upstream_strategy,
             expected_cidrs: plan.expected_cidrs,
+            override_records: plan.override_records,
+            synthetic_capture: plan.synthetic_capture,
             limits: plan.limits,
         };
         if compiled.insert(plan.id, value).is_some() {
@@ -886,6 +1210,8 @@ fn compile_plans(
 fn validate_plan(
     plan: &DnsPlanSpec,
     upstreams: &BTreeMap<DnsUpstreamId, CompiledDnsUpstream>,
+    override_records: &BTreeMap<DnsOverrideRecordId, CompiledDnsOverrideRecord>,
+    synthetic_captures: &BTreeMap<DnsSyntheticCaptureId, DnsSyntheticCaptureSpec>,
 ) -> Result<(), DnsCompileError> {
     if plan.upstreams.is_empty() {
         return Err(DnsCompileError::EmptyPlan(plan.id.clone()));
@@ -952,7 +1278,74 @@ fn validate_plan(
             });
         }
     }
+    let mut record_ids = BTreeSet::new();
+    let mut domains = BTreeMap::new();
+    for record_id in &plan.override_records {
+        if !record_ids.insert(record_id.clone()) {
+            return Err(DnsCompileError::DuplicatePlanOverrideRecord {
+                plan: plan.id.clone(),
+                record: record_id.clone(),
+            });
+        }
+        let record = override_records.get(record_id).ok_or_else(|| {
+            DnsCompileError::UnknownPlanOverrideRecord {
+                plan: plan.id.clone(),
+                record: record_id.clone(),
+            }
+        })?;
+        if let Some(previous) = domains.insert(record.domain.clone(), record_id.clone()) {
+            return Err(DnsCompileError::DuplicatePlanOverrideDomain {
+                plan: plan.id.clone(),
+                domain: record.domain.clone(),
+                first: previous,
+                second: record_id.clone(),
+            });
+        }
+        let eligible_addresses = record
+            .addresses
+            .iter()
+            .filter(|address| dns_strategy_allows_address(plan.ip_strategy, **address))
+            .count();
+        if eligible_addresses > plan.limits.max_answers {
+            return Err(DnsCompileError::PlanOverrideTooManyAddresses {
+                plan: plan.id.clone(),
+                record: record_id.clone(),
+                count: eligible_addresses,
+                maximum: plan.limits.max_answers,
+            });
+        }
+        if !plan.expected_cidrs.is_empty()
+            && let Some(address) = record.addresses.iter().copied().find(|address| {
+                dns_strategy_allows_address(plan.ip_strategy, *address)
+                    && !plan
+                        .expected_cidrs
+                        .iter()
+                        .any(|cidr| cidr.contains(address))
+            })
+        {
+            return Err(DnsCompileError::PlanOverrideOutsideExpectedCidrs {
+                plan: plan.id.clone(),
+                record: record_id.clone(),
+                address,
+            });
+        }
+    }
+    if let Some(capture) = &plan.synthetic_capture
+        && !synthetic_captures.contains_key(capture)
+    {
+        return Err(DnsCompileError::UnknownPlanSyntheticCapture {
+            plan: plan.id.clone(),
+            capture: capture.clone(),
+        });
+    }
     Ok(())
+}
+
+fn dns_strategy_allows_address(strategy: DnsIpStrategy, address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(_) => !matches!(strategy, DnsIpStrategy::Ipv6Only),
+        IpAddr::V6(_) => !matches!(strategy, DnsIpStrategy::Ipv4Only),
+    }
 }
 
 fn validate_limits(plan: &DnsPlanId, limits: DnsPlanLimits) -> Result<(), DnsCompileError> {
@@ -973,64 +1366,51 @@ fn validate_limits(plan: &DnsPlanId, limits: DnsPlanLimits) -> Result<(), DnsCom
     Ok(())
 }
 
-fn compile_hosts(
-    hosts: Vec<DnsHostSpec>,
-) -> Result<BTreeMap<DomainName, std::sync::Arc<[IpAddr]>>, DnsCompileError> {
+fn compile_override_records(
+    records: Vec<DnsOverrideRecordSpec>,
+) -> Result<BTreeMap<DnsOverrideRecordId, CompiledDnsOverrideRecord>, DnsCompileError> {
     let mut compiled = BTreeMap::new();
-    for host in hosts {
-        let DnsHostSpec { domain, addresses } = host;
+    for record in records {
+        let DnsOverrideRecordSpec {
+            id,
+            domain,
+            addresses,
+        } = record;
         if addresses.is_empty() {
-            return Err(DnsCompileError::EmptyHostAddresses(domain));
+            return Err(DnsCompileError::EmptyOverrideRecordAddresses(domain));
         }
-        if addresses.len() > MAX_DNS_HOST_ADDRESSES {
-            return Err(DnsCompileError::TooManyHostAddresses {
+        if addresses.len() > MAX_DNS_OVERRIDE_ADDRESSES {
+            return Err(DnsCompileError::TooManyOverrideRecordAddresses {
                 domain,
                 count: addresses.len(),
-                maximum: MAX_DNS_HOST_ADDRESSES,
+                maximum: MAX_DNS_OVERRIDE_ADDRESSES,
             });
         }
         let mut seen = BTreeSet::new();
         for address in &addresses {
             if !seen.insert(*address) {
-                return Err(DnsCompileError::DuplicateHostAddress {
+                return Err(DnsCompileError::DuplicateOverrideRecordAddress {
                     domain,
                     address: *address,
                 });
             }
         }
+        let duplicate = id.clone();
         if compiled
-            .insert(domain.clone(), std::sync::Arc::from(addresses))
+            .insert(
+                id.clone(),
+                CompiledDnsOverrideRecord {
+                    id,
+                    domain,
+                    addresses: std::sync::Arc::from(addresses),
+                },
+            )
             .is_some()
         {
-            return Err(DnsCompileError::DuplicateHostDomain(domain));
+            return Err(DnsCompileError::DuplicateOverrideRecordId(duplicate));
         }
     }
     Ok(compiled)
-}
-
-fn validate_generation_limits(
-    plans: &BTreeMap<DnsPlanId, CompiledDnsPlan>,
-) -> Result<(), DnsCompileError> {
-    let total_cache_entries = plans
-        .values()
-        .map(|plan| plan.limits.cache_capacity)
-        .try_fold(0_usize, usize::checked_add)
-        .ok_or(DnsCompileError::GenerationLimitsOverflow)?;
-    let total_inflight = plans
-        .values()
-        .map(|plan| plan.limits.max_inflight)
-        .try_fold(0_usize, usize::checked_add)
-        .ok_or(DnsCompileError::GenerationLimitsOverflow)?;
-    if total_cache_entries > MAX_DNS_TOTAL_CACHE_ENTRIES || total_inflight > MAX_DNS_TOTAL_INFLIGHT
-    {
-        return Err(DnsCompileError::GenerationLimitsExceeded {
-            cache_entries: total_cache_entries,
-            maximum_cache_entries: MAX_DNS_TOTAL_CACHE_ENTRIES,
-            inflight: total_inflight,
-            maximum_inflight: MAX_DNS_TOTAL_INFLIGHT,
-        });
-    }
-    Ok(())
 }
 
 type CompiledRules = (
@@ -1152,7 +1532,11 @@ pub enum DnsCompileError {
         count: usize,
         maximum: usize,
     },
-    TooManyHosts {
+    TooManyOverrideRecords {
+        count: usize,
+        maximum: usize,
+    },
+    TooManySyntheticCaptures {
         count: usize,
         maximum: usize,
     },
@@ -1235,37 +1619,77 @@ pub enum DnsCompileError {
         plan: DnsPlanId,
     },
     InvalidExplanation(DnsRuleId),
-    DuplicateHostDomain(DomainName),
-    EmptyHostAddresses(DomainName),
-    TooManyHostAddresses {
+    DuplicateOverrideRecordId(DnsOverrideRecordId),
+    EmptyOverrideRecordAddresses(DomainName),
+    TooManyOverrideRecordAddresses {
         domain: DomainName,
         count: usize,
         maximum: usize,
     },
-    DuplicateHostAddress {
+    DuplicateOverrideRecordAddress {
         domain: DomainName,
         address: IpAddr,
     },
-    FakeDnsPoolRequired,
-    InvalidFakeDnsCapacity {
+    DuplicateSyntheticCaptureId(DnsSyntheticCaptureId),
+    UnknownPlanOverrideRecord {
+        plan: DnsPlanId,
+        record: DnsOverrideRecordId,
+    },
+    DuplicatePlanOverrideRecord {
+        plan: DnsPlanId,
+        record: DnsOverrideRecordId,
+    },
+    DuplicatePlanOverrideDomain {
+        plan: DnsPlanId,
+        domain: DomainName,
+        first: DnsOverrideRecordId,
+        second: DnsOverrideRecordId,
+    },
+    PlanOverrideTooManyAddresses {
+        plan: DnsPlanId,
+        record: DnsOverrideRecordId,
+        count: usize,
+        maximum: usize,
+    },
+    PlanOverrideOutsideExpectedCidrs {
+        plan: DnsPlanId,
+        record: DnsOverrideRecordId,
+        address: IpAddr,
+    },
+    UnknownPlanSyntheticCapture {
+        plan: DnsPlanId,
+        capture: DnsSyntheticCaptureId,
+    },
+    UnknownActivePlan(DnsPlanId),
+    OverlappingSyntheticCapturePools {
+        left: DnsSyntheticCaptureId,
+        right: DnsSyntheticCaptureId,
+    },
+    SyntheticCaptureContainsBootstrap {
+        capture: DnsSyntheticCaptureId,
+        upstream: DnsUpstreamId,
+        bootstrap: SocketAddr,
+    },
+    SyntheticCaptureContainsOverrideAddress {
+        capture: DnsSyntheticCaptureId,
+        record: DnsOverrideRecordId,
+        address: IpAddr,
+    },
+    SyntheticCapturePoolRequired,
+    InvalidSyntheticCaptureCapacity {
         capacity: usize,
         maximum: usize,
     },
-    InvalidFakeDnsLifetime {
+    InvalidSyntheticCaptureLifetime {
         answer_ttl: Duration,
         recovery_ttl: Duration,
     },
-    InvalidFakeDnsIpv4Pool(Ipv4Net),
-    InvalidFakeDnsIpv6Pool(Ipv6Net),
-    FakeDnsPoolTooSmall {
+    InvalidSyntheticCaptureIpv4Pool(Ipv4Net),
+    InvalidSyntheticCaptureIpv6Pool(Ipv6Net),
+    SyntheticCapturePoolTooSmall {
         pool: IpNet,
         capacity: u128,
         required: usize,
-    },
-    FakeDnsContainsBootstrap {
-        pool: IpNet,
-        upstream: DnsUpstreamId,
-        bootstrap: SocketAddr,
     },
 }
 
@@ -1296,12 +1720,16 @@ impl fmt::Display for DnsCompileError {
                     "DNS configuration has {count} rules; maximum is {maximum}"
                 )
             }
-            Self::TooManyHosts { count, maximum } => {
+            Self::TooManyOverrideRecords { count, maximum } => {
                 write!(
                     formatter,
                     "DNS configuration has {count} records; maximum is {maximum}"
                 )
             }
+            Self::TooManySyntheticCaptures { count, maximum } => write!(
+                formatter,
+                "DNS configuration has {count} synthetic captures; maximum is {maximum}"
+            ),
             Self::DuplicateUpstreamId(id) => write!(formatter, "duplicate DNS server name {id}"),
             Self::DuplicateOutboundCapability(id) => {
                 write!(formatter, "duplicate DNS outbound capability for {id}")
@@ -1421,60 +1849,119 @@ impl fmt::Display for DnsCompileError {
             Self::InvalidExplanation(rule) => {
                 write!(formatter, "DNS rule {rule} has an invalid explanation")
             }
-            Self::DuplicateHostDomain(domain) => {
-                write!(formatter, "duplicate DNS record for {domain}")
+            Self::DuplicateOverrideRecordId(id) => {
+                write!(formatter, "duplicate DNS override-record name {id}")
             }
-            Self::EmptyHostAddresses(domain) => {
-                write!(formatter, "DNS record {domain} has no addresses")
+            Self::EmptyOverrideRecordAddresses(domain) => {
+                write!(formatter, "DNS override record {domain} has no addresses")
             }
-            Self::TooManyHostAddresses {
+            Self::TooManyOverrideRecordAddresses {
                 domain,
                 count,
                 maximum,
             } => write!(
                 formatter,
-                "DNS record {domain} has {count} addresses; maximum is {maximum}"
+                "DNS override record {domain} has {count} addresses; maximum is {maximum}"
             ),
-            Self::DuplicateHostAddress { domain, address } => {
-                write!(formatter, "DNS record {domain} repeats address {address}")
+            Self::DuplicateOverrideRecordAddress { domain, address } => {
+                write!(
+                    formatter,
+                    "DNS override record {domain} repeats address {address}"
+                )
             }
-            Self::FakeDnsPoolRequired => {
-                formatter.write_str("DNS override requires at least one IPv4 or IPv6 pool")
+            Self::DuplicateSyntheticCaptureId(id) => {
+                write!(formatter, "duplicate DNS synthetic-capture name {id}")
             }
-            Self::InvalidFakeDnsCapacity { capacity, maximum } => write!(
+            Self::UnknownPlanOverrideRecord { plan, record } => write!(
                 formatter,
-                "DNS override capacity {capacity} must be between 1 and {maximum}"
+                "DNS policy {plan} references unknown override record {record}"
             ),
-            Self::InvalidFakeDnsLifetime {
+            Self::DuplicatePlanOverrideRecord { plan, record } => write!(
+                formatter,
+                "DNS policy {plan} repeats override record {record}"
+            ),
+            Self::DuplicatePlanOverrideDomain {
+                plan,
+                domain,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "DNS policy {plan} attaches override records {first} and {second} for the same domain {domain}"
+            ),
+            Self::PlanOverrideTooManyAddresses {
+                plan,
+                record,
+                count,
+                maximum,
+            } => write!(
+                formatter,
+                "DNS policy {plan} override record {record} has {count} addresses; policy maximum is {maximum}"
+            ),
+            Self::PlanOverrideOutsideExpectedCidrs {
+                plan,
+                record,
+                address,
+            } => write!(
+                formatter,
+                "DNS policy {plan} override record {record} address {address} is outside its answer CIDRs"
+            ),
+            Self::UnknownPlanSyntheticCapture { plan, capture } => write!(
+                formatter,
+                "DNS policy {plan} references unknown synthetic capture {capture}"
+            ),
+            Self::UnknownActivePlan(plan) => {
+                write!(formatter, "active DNS policy {plan} does not exist")
+            }
+            Self::OverlappingSyntheticCapturePools { left, right } => write!(
+                formatter,
+                "active DNS synthetic captures {left} and {right} have overlapping pools"
+            ),
+            Self::SyntheticCaptureContainsBootstrap {
+                capture,
+                upstream,
+                bootstrap,
+            } => write!(
+                formatter,
+                "DNS synthetic capture {capture} contains address {bootstrap} for server {upstream}"
+            ),
+            Self::SyntheticCaptureContainsOverrideAddress {
+                capture,
+                record,
+                address,
+            } => write!(
+                formatter,
+                "DNS synthetic capture {capture} contains address {address} from override record {record}"
+            ),
+            Self::SyntheticCapturePoolRequired => {
+                formatter.write_str("DNS synthetic capture requires at least one IPv4 or IPv6 pool")
+            }
+            Self::InvalidSyntheticCaptureCapacity { capacity, maximum } => write!(
+                formatter,
+                "DNS synthetic-capture capacity {capacity} must be between 1 and {maximum}"
+            ),
+            Self::InvalidSyntheticCaptureLifetime {
                 answer_ttl,
                 recovery_ttl,
             } => write!(
                 formatter,
-                "DNS override answer TTL {answer_ttl:?} and recovery TTL {recovery_ttl:?} are invalid"
+                "DNS synthetic-capture answer TTL {answer_ttl:?} and recovery TTL {recovery_ttl:?} are invalid"
             ),
-            Self::InvalidFakeDnsIpv4Pool(pool) => write!(
+            Self::InvalidSyntheticCaptureIpv4Pool(pool) => write!(
                 formatter,
-                "DNS override IPv4 pool {pool} must be a canonical subnet of 198.18.0.0/15"
+                "DNS synthetic-capture IPv4 pool {pool} must be a canonical subnet of 198.18.0.0/15"
             ),
-            Self::InvalidFakeDnsIpv6Pool(pool) => write!(
+            Self::InvalidSyntheticCaptureIpv6Pool(pool) => write!(
                 formatter,
-                "DNS override IPv6 pool {pool} must be a canonical subnet of fc00::/7"
+                "DNS synthetic-capture IPv6 pool {pool} must be a canonical subnet of fc00::/7"
             ),
-            Self::FakeDnsPoolTooSmall {
+            Self::SyntheticCapturePoolTooSmall {
                 pool,
                 capacity,
                 required,
             } => write!(
                 formatter,
-                "DNS override pool {pool} has {capacity} usable addresses but capacity requires {required}"
-            ),
-            Self::FakeDnsContainsBootstrap {
-                pool,
-                upstream,
-                bootstrap,
-            } => write!(
-                formatter,
-                "DNS override pool {pool} contains address {bootstrap} for server {upstream}"
+                "DNS synthetic-capture pool {pool} has {capacity} usable addresses but capacity requires {required}"
             ),
         }
     }

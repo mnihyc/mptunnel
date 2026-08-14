@@ -5,8 +5,8 @@ uses native host facilities only where they improve lifecycle safety; Android
 and macOS keep VPN policy in their application host.
 
 Both TUN-L4 and TUN-L3 consume the same neutral packet-device interface, but a
-runtime generation selects only one global forwarding mode. TUN-L3 is
-external-host mode on every platform: it configures only the
+configuration cannot mix L4 and L3 inbound protocols. TUN-L3 is external-host
+mode on every platform: it configures only the
 configured server address or server-assigned client host address, plus MTU,
 when the provider supports those operations. It never changes routes, DNS,
 firewall policy, forwarding, or NAT. L4 and L3 services are rejected together

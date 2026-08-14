@@ -4,13 +4,15 @@
 //! native proxy bypasses, and pre-publication DNS rules cannot drift between
 //! platform adapters. No host inspection or mutation occurs here.
 
-use crate::config::{NodeConfig, OutboundLeafConfig};
+use crate::config::{ActiveNodeGraph, NodeConfig, OutboundLeafConfig};
 use crate::ingress::IngressConfig;
 use crate::ingress::tun::{
     DEFAULT_MANAGED_TUN_NAME, ManagedVpnCompileError, ManagedVpnPlatformConfig,
 };
 use crate::platform::{ManagedVpnConfig, RouteMode};
-use crate::product::{CompiledDnsPolicy, DnsCompileError, DnsEgressSpec, DomainName};
+use crate::product::{
+    CompiledDnsPolicy, DnsActivation, DnsCompileError, DnsEgressSpec, DomainName,
+};
 use crate::transport::{CarrierPathIdentity, Endpoint, PathSpec};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -45,6 +47,7 @@ pub(crate) struct ManagedVpnGenerationSpec {
     pub(crate) native_proxy_endpoints: Vec<Endpoint>,
     pub(crate) prepublication_domains: Vec<DomainName>,
     pub(crate) dns_policy: Arc<CompiledDnsPolicy>,
+    pub(crate) dns_activation: DnsActivation,
     pub(crate) resolution_timeout: Duration,
 }
 
@@ -93,9 +96,14 @@ pub(crate) fn compile_managed_vpn_generation_spec(
         .platform
         .clone();
 
+    let active = node
+        .compile_active_graph()
+        .map_err(ManagedVpnGenerationSpecError::DnsPolicy)?;
+
     let carrier_path_count = node
         .outbounds
         .iter()
+        .filter(|outbound| active.contains_outbound(outbound.id()))
         .filter_map(|outbound| match outbound {
             OutboundLeafConfig::Mpp {
                 id,
@@ -123,7 +131,11 @@ pub(crate) fn compile_managed_vpn_generation_spec(
     let mut carrier_paths = Vec::with_capacity(carrier_path_count);
     let mut prepublication_domains = BTreeSet::new();
     let mut group_ordinal = 0_usize;
-    for outbound in &node.outbounds {
+    for outbound in node
+        .outbounds
+        .iter()
+        .filter(|outbound| active.contains_outbound(outbound.id()))
+    {
         let OutboundLeafConfig::Mpp {
             id,
             config: outbound,
@@ -163,7 +175,11 @@ pub(crate) fn compile_managed_vpn_generation_spec(
     }
 
     let mut native_proxy_endpoints = Vec::new();
-    for outbound in &node.outbounds {
+    for outbound in node
+        .outbounds
+        .iter()
+        .filter(|outbound| active.contains_outbound(outbound.id()))
+    {
         let OutboundLeafConfig::Local { config, .. } = outbound else {
             continue;
         };
@@ -189,12 +205,13 @@ pub(crate) fn compile_managed_vpn_generation_spec(
         });
     }
 
-    let dns_policy = Arc::new(
-        node.dns_policy
-            .compile()
-            .map_err(ManagedVpnGenerationSpecError::DnsPolicy)?,
-    );
-    validate_managed_vpn_dns(&managed, &dns_policy)?;
+    let ActiveNodeGraph {
+        dns_policy,
+        dns_activation,
+        ..
+    } = active;
+    let dns_policy = Arc::new(dns_policy);
+    validate_managed_vpn_dns(&managed, &dns_policy, &dns_activation)?;
     for domain in &prepublication_domains {
         let selection = dns_policy.select(domain);
         for upstream_id in selection.plan().upstreams() {
@@ -228,6 +245,7 @@ pub(crate) fn compile_managed_vpn_generation_spec(
         native_proxy_endpoints,
         prepublication_domains: prepublication_domains.into_iter().collect(),
         dns_policy,
+        dns_activation,
         resolution_timeout: MANAGED_VPN_RESOLUTION_TIMEOUT,
     }))
 }
@@ -235,11 +253,12 @@ pub(crate) fn compile_managed_vpn_generation_spec(
 pub(crate) fn validate_managed_vpn_dns(
     managed: &ManagedVpnConfig,
     dns_policy: &CompiledDnsPolicy,
+    dns_activation: &DnsActivation,
 ) -> Result<(), ManagedVpnGenerationSpecError> {
-    if dns_policy.uses_system_resolution() {
+    if dns_policy.uses_system_resolution_for_activation(dns_activation) {
         return Err(ManagedVpnGenerationSpecError::SystemDnsUnsupported);
     }
-    if !dns_policy.is_encrypted_only() {
+    if !dns_policy.is_encrypted_only_for_activation(dns_activation) {
         return Err(ManagedVpnGenerationSpecError::EncryptedDnsRequired);
     }
     if managed.dns().is_none() && matches!(managed.route_mode(), RouteMode::Full) {

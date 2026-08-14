@@ -10,11 +10,11 @@ use crate::config::{
     DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
     DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS,
     DEFAULT_STREAM_WINDOW_BYTES, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
-    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig, EgressRef, LocalIngressConfig,
-    LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig, MppOutboundConfig,
+    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig, LocalIngressConfig, LogFormat,
+    LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig, MppOutboundConfig,
     MppPerformanceConfig, NamedPathConfig, NodeConfig, OutboundLeafConfig, ProductPolicyConfig,
-    ResourceLimits, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig, SessionConfig,
-    SharedSecret, normalize_secret_bytes, read_secret_environment, read_secret_file,
+    ResourceLimits, ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret,
+    normalize_secret_bytes, read_secret_environment, read_secret_file,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, ManagedVpnConfig, ManagedVpnPlatformConfig,
@@ -419,15 +419,6 @@ impl ManagementArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceArgs {
-    /// Declares service intent; does not register with a native service manager.
-    #[arg(
-        long,
-        global = true,
-        env = "MPTUNNEL_SERVICE_MODE",
-        default_value_t = false
-    )]
-    pub service_mode: bool,
-
     /// Restarts failed runtime generations inside the current process.
     #[arg(
         long,
@@ -460,7 +451,6 @@ pub struct ServiceArgs {
 impl ServiceArgs {
     fn into_config(self) -> ServiceConfig {
         ServiceConfig {
-            service_mode: self.service_mode,
             supervise: self.supervise,
             restart_backoff: Duration::from_millis(self.restart_backoff_ms),
             restart_max_backoff: Duration::from_millis(self.restart_max_backoff_ms),
@@ -727,9 +717,9 @@ pub struct RouteExplainArgs {
     #[arg(long, value_enum)]
     pub network: RouteNetworkArg,
 
-    /// Original source address and port.
+    /// Original source address and port. Omit for an MPP inbound flow.
     #[arg(long)]
-    pub source: SocketAddr,
+    pub source: Option<SocketAddr>,
 
     #[arg(long)]
     pub inbound: InboundId,
@@ -755,7 +745,7 @@ pub struct DnsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DnsCommand {
-    /// Print DNS cache, server, and synthetic-override status.
+    /// Print DNS cache, server, and synthetic-capture status.
     Status,
     /// Explain DNS policy selection without issuing a query.
     Explain(DnsExplainArgs),
@@ -1221,6 +1211,7 @@ impl ClientArgs {
             security,
             path_probe_interval: Duration::from_millis(self.path_probe_interval_ms),
             path_probe_timeout: Duration::from_millis(self.path_probe_timeout_ms),
+            allow_peer_diagnostics: false,
             performance: MppPerformanceConfig {
                 extra_traffic_hint_percent: self.extra_traffic_hint_percent,
             },
@@ -1231,13 +1222,12 @@ impl ClientArgs {
                 RuleId::parse("default")
                     .map_err(|error| CliConfigError::ProductPolicy(error.to_string()))?,
                 RouteMatchSpec::default(),
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Outbound(id.clone()),
                     None,
                     InitialDemand::Automatic,
                 ),
             )],
-            destination_acl: Vec::new(),
         };
         Ok(NodeConfig {
             forwarding_mode: crate::config::ForwardingMode::L4,
@@ -1538,8 +1528,6 @@ impl ServerArgs {
         )?;
         let server = MppInboundConfig {
             name: "cli-mpp-inbound".to_string(),
-            egress: EgressRef::Outbound(id.clone()),
-            dns_plan: Some(dns_plan),
             paths: self
                 .bind_paths
                 .into_iter()
@@ -1551,23 +1539,35 @@ impl ServerArgs {
                 .collect(),
             security,
             tls,
-            destination_acl: ServerDestinationAclConfig::default(),
             performance: MppPerformanceConfig {
                 extra_traffic_hint_percent: self.extra_traffic_hint_percent,
             },
+            peer_diagnostics_principals: crate::config::PeerDiagnosticsPrincipalPolicy::Deny,
             tun_l3: None,
         };
         Ok(NodeConfig {
             forwarding_mode: crate::config::ForwardingMode::L4,
             outbounds: vec![OutboundLeafConfig::Local {
-                id,
+                id: id.clone(),
                 config: outbound,
                 connect_timeout: Duration::from_millis(self.outbound_connect_timeout_ms),
             }],
             gateway_balancers: Vec::new(),
             local_ingresses: Vec::new(),
             tun_l3_ingresses: Vec::new(),
-            product_policy: None,
+            product_policy: Some(ProductPolicyConfig {
+                generation: 1,
+                routes: vec![RouteRuleSpec::new(
+                    RuleId::parse("default")
+                        .map_err(|error| CliConfigError::ProductPolicy(error.to_string()))?,
+                    RouteMatchSpec::default(),
+                    RouteAction::allow(
+                        EgressAction::Outbound(id.clone()),
+                        Some(dns_plan),
+                        InitialDemand::Automatic,
+                    ),
+                )],
+            }),
             dns_policy,
             servers: vec![server],
         })
@@ -1655,6 +1655,8 @@ fn simple_dns_policy(
         security: crate::product::DnsSecurityPolicy::AllowPlaintext,
         upstream_strategy: crate::product::DnsUpstreamStrategy::Ordered,
         expected_cidrs: Vec::new(),
+        override_records: Vec::new(),
+        synthetic_capture: None,
         limits,
     };
     let config = DnsPolicyConfig {
@@ -1664,8 +1666,8 @@ fn simple_dns_policy(
             outbound_capabilities: Vec::new(),
             plans: vec![plan],
             rules: Vec::new(),
-            hosts: Vec::new(),
-            fake_dns: None,
+            override_records: Vec::new(),
+            synthetic_captures: Vec::new(),
             default_plan: plan_id.clone(),
         },
     };
@@ -1704,11 +1706,13 @@ fn managed_dot_dns_policy(
                 security: DnsSecurityPolicy::RequireEncrypted,
                 upstream_strategy: crate::product::DnsUpstreamStrategy::Ordered,
                 expected_cidrs: Vec::new(),
+                override_records: Vec::new(),
+                synthetic_capture: None,
                 limits: DnsPlanLimits::default(),
             }],
             rules: Vec::new(),
-            hosts: Vec::new(),
-            fake_dns: None,
+            override_records: Vec::new(),
+            synthetic_captures: Vec::new(),
             default_plan: plan_id,
         },
     };

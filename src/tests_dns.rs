@@ -1,7 +1,8 @@
 use super::*;
 use crate::product::{
-    DnsHostSpec, DnsOutboundCapabilitySpec, DnsPlanSpec, DnsPolicySpec, DnsRuleMatch, DnsRuleSpec,
-    DnsSecurityPolicy, DnsUpstreamSpec, DnsUpstreamStrategy, FakeDnsSpec, NetworkSet,
+    DnsOutboundCapabilitySpec, DnsOverrideRecordId, DnsOverrideRecordSpec, DnsPlanSpec,
+    DnsPolicySpec, DnsRuleMatch, DnsRuleSpec, DnsSecurityPolicy, DnsSyntheticCaptureId,
+    DnsSyntheticCaptureSpec, DnsUpstreamSpec, DnsUpstreamStrategy, NetworkSet,
 };
 use hickory_proto::rr::rdata::{CNAME, TXT};
 use std::collections::VecDeque;
@@ -21,6 +22,14 @@ fn plan_id(value: &str) -> DnsPlanId {
 
 fn rule_id(value: &str) -> DnsRuleId {
     DnsRuleId::parse(value).expect("rule ID")
+}
+
+fn record_id(value: &str) -> DnsOverrideRecordId {
+    DnsOverrideRecordId::parse(value).expect("record ID")
+}
+
+fn capture_id(value: &str) -> DnsSyntheticCaptureId {
+    DnsSyntheticCaptureId::parse(value).expect("capture ID")
 }
 
 fn domain(value: &str) -> DomainName {
@@ -73,11 +82,18 @@ fn policy(
 fn policy_with_hosts(
     generation: u64,
     upstreams: Vec<DnsUpstreamSpec>,
-    plans: Vec<DnsPlanSpec>,
+    mut plans: Vec<DnsPlanSpec>,
     rules: Vec<DnsRuleSpec>,
-    hosts: Vec<DnsHostSpec>,
+    hosts: Vec<DnsOverrideRecordSpec>,
     default_plan: &str,
 ) -> Arc<CompiledDnsPolicy> {
+    let record_ids = hosts
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    for plan in &mut plans {
+        plan.override_records = record_ids.clone();
+    }
     Arc::new(
         CompiledDnsPolicy::compile(
             generation,
@@ -86,8 +102,8 @@ fn policy_with_hosts(
                 outbound_capabilities: Vec::new(),
                 plans,
                 rules,
-                hosts,
-                fake_dns: None,
+                override_records: hosts,
+                synthetic_captures: Vec::new(),
                 default_plan: plan_id(default_plan),
             },
         )
@@ -348,7 +364,8 @@ async fn split_selection_metadata_and_plan_caches_are_isolated() {
             plan: plan_id("private"),
             explanation: Some("private split zone".to_string()),
         }],
-        vec![DnsHostSpec {
+        vec![DnsOverrideRecordSpec {
+            id: record_id("router-home"),
             domain: domain("router.home.arpa"),
             addresses: vec![
                 "192.168.1.1".parse().expect("IPv4 host"),
@@ -454,15 +471,22 @@ async fn split_selection_metadata_and_plan_caches_are_isolated() {
         "unmatched host record types must not leak upstream"
     );
     let explanation = runtime.explain(&domain("router.home.arpa"));
-    assert!(explanation.host_addresses.is_some());
+    assert_eq!(
+        explanation
+            .override_record
+            .as_ref()
+            .map(DnsOverrideRecordId::as_str),
+        Some("router-home")
+    );
+    assert!(explanation.override_addresses.is_some());
     assert!(explanation.upstreams.is_empty());
     let snapshot = runtime.runtime_snapshot();
-    assert_eq!(snapshot.host_overrides, 1);
+    assert_eq!(snapshot.override_records, 1);
     assert_eq!(
         snapshot
             .plans
             .iter()
-            .map(|plan| plan.host_answers)
+            .map(|plan| plan.override_record_answers)
             .sum::<u64>(),
         3,
         "dual-stack address resolution plus TXT used the local host override"
@@ -650,12 +674,13 @@ async fn captured_dns_wire_answers_a_and_aaaa_without_cross_family_records() {
 }
 
 #[tokio::test]
-async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolution() {
+async fn synthetic_capture_recovers_domains_without_replacing_real_resolution() {
     let backend = MockBackend::new(MockResult::Positive(vec![
         "203.0.113.20".parse().expect("real address"),
     ]));
     let upstream = direct_udp("real", "192.0.2.53:53");
-    let plan = ipv4_plan("default", vec![upstream_id("real")]);
+    let mut plan = ipv4_plan("default", vec![upstream_id("real")]);
+    plan.synthetic_capture = Some(capture_id("capture"));
     let policy = Arc::new(
         CompiledDnsPolicy::compile(
             7,
@@ -664,18 +689,19 @@ async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolutio
                 outbound_capabilities: Vec::new(),
                 plans: vec![plan],
                 rules: Vec::new(),
-                hosts: Vec::new(),
-                fake_dns: Some(FakeDnsSpec {
+                override_records: Vec::new(),
+                synthetic_captures: vec![DnsSyntheticCaptureSpec {
+                    id: capture_id("capture"),
                     ipv4_pool: Some("198.18.0.0/24".parse().expect("IPv4 pool")),
                     ipv6_pool: Some("fd00:4d50::/120".parse().expect("IPv6 pool")),
                     max_entries: 32,
                     answer_ttl: Duration::from_millis(10),
                     recovery_ttl: Duration::from_millis(40),
-                }),
+                }],
                 default_plan: plan_id("default"),
             },
         )
-        .expect("FakeDNS policy"),
+        .expect("synthetic capture policy"),
     );
     let runtime = DnsGeneration::compile_with_factory(
         policy,
@@ -683,7 +709,7 @@ async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolutio
             backends: HashMap::from([(upstream_id("real"), test_backend(backend.clone()))]),
         },
     )
-    .expect("FakeDNS runtime");
+    .expect("synthetic capture runtime");
 
     let response = runtime
         .answer_wire_query(
@@ -692,14 +718,17 @@ async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolutio
             1_232,
         )
         .await
-        .expect("FakeDNS A response");
-    let response = Message::from_vec(&response).expect("decoded FakeDNS A response");
+        .expect("synthetic capture A response");
+    let response = Message::from_vec(&response).expect("decoded synthetic capture A response");
     let fake_ipv4 = match response.answers.as_slice() {
         [record] => match &record.data {
             RData::A(address) => IpAddr::V4(address.0),
-            other => panic!("unexpected FakeDNS A data {other:?}"),
+            other => panic!("unexpected synthetic capture A data {other:?}"),
         },
-        other => panic!("unexpected FakeDNS A answer count {}", other.len()),
+        other => panic!(
+            "unexpected synthetic capture A answer count {}",
+            other.len()
+        ),
     };
     assert!(
         "198.18.0.0/24"
@@ -710,11 +739,16 @@ async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolutio
     assert_eq!(
         backend.calls(),
         0,
-        "captured FakeDNS must not query upstream"
+        "captured synthetic capture must not query upstream"
     );
     assert_eq!(
-        runtime.recover_fake_dns(fake_ipv4),
-        FakeDnsRecovery::Recovered(domain("fake.example"))
+        runtime.recover_synthetic_capture(fake_ipv4),
+        SyntheticCaptureRecovery::Recovered {
+            generation: 7,
+            plan: plan_id("default"),
+            capture: capture_id("capture"),
+            domain: domain("fake.example"),
+        }
     );
 
     let response = runtime
@@ -724,14 +758,17 @@ async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolutio
             1_232,
         )
         .await
-        .expect("FakeDNS AAAA response");
-    let response = Message::from_vec(&response).expect("decoded FakeDNS AAAA response");
+        .expect("synthetic capture AAAA response");
+    let response = Message::from_vec(&response).expect("decoded synthetic capture AAAA response");
     let fake_ipv6 = match response.answers.as_slice() {
         [record] => match &record.data {
             RData::AAAA(address) => IpAddr::V6(address.0),
-            other => panic!("unexpected FakeDNS AAAA data {other:?}"),
+            other => panic!("unexpected synthetic capture AAAA data {other:?}"),
         },
-        other => panic!("unexpected FakeDNS AAAA answer count {}", other.len()),
+        other => panic!(
+            "unexpected synthetic capture AAAA answer count {}",
+            other.len()
+        ),
     };
     assert!(
         "fd00:4d50::/120"
@@ -752,19 +789,24 @@ async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolutio
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        runtime.recover_fake_dns(fake_ipv4),
-        FakeDnsRecovery::Expired,
+        runtime.recover_synthetic_capture(fake_ipv4),
+        SyntheticCaptureRecovery::Expired,
         "expired synthetic addresses must fail closed"
     );
     assert_eq!(
-        runtime.recover_fake_dns("198.18.0.200".parse().expect("unknown fake")),
-        FakeDnsRecovery::Unknown
+        runtime.recover_synthetic_capture("198.18.0.200".parse().expect("unknown fake")),
+        SyntheticCaptureRecovery::Unknown
     );
     assert_eq!(
-        runtime.recover_fake_dns("192.0.2.1".parse().expect("ordinary address")),
-        FakeDnsRecovery::NotFake
+        runtime.recover_synthetic_capture("192.0.2.1".parse().expect("ordinary address")),
+        SyntheticCaptureRecovery::NotSynthetic
     );
-    let snapshot = runtime.runtime_snapshot().fake_dns.expect("FakeDNS status");
+    let snapshot = runtime
+        .runtime_snapshot()
+        .synthetic_captures
+        .into_iter()
+        .next()
+        .expect("synthetic-capture status");
     assert_eq!(snapshot.owned_entries, 1);
     assert_eq!(snapshot.active_entries, 0);
     assert_eq!(snapshot.answers, 2);
@@ -774,28 +816,31 @@ async fn fake_dns_capture_recovers_domains_once_without_replacing_real_resolutio
 }
 
 #[tokio::test]
-async fn fake_dns_capacity_never_reassigns_an_owned_address() {
+async fn synthetic_capture_capacity_never_reassigns_an_owned_address() {
     let backend = MockBackend::new(MockResult::Failed);
+    let mut plan = ipv4_plan("default", vec![upstream_id("unused")]);
+    plan.synthetic_capture = Some(capture_id("bounded"));
     let policy = Arc::new(
         CompiledDnsPolicy::compile(
             8,
             DnsPolicySpec {
                 upstreams: vec![direct_udp("unused", "192.0.2.53:53")],
                 outbound_capabilities: Vec::new(),
-                plans: vec![ipv4_plan("default", vec![upstream_id("unused")])],
+                plans: vec![plan],
                 rules: Vec::new(),
-                hosts: Vec::new(),
-                fake_dns: Some(FakeDnsSpec {
+                override_records: Vec::new(),
+                synthetic_captures: vec![DnsSyntheticCaptureSpec {
+                    id: capture_id("bounded"),
                     ipv4_pool: Some("198.18.1.0/30".parse().expect("IPv4 pool")),
                     ipv6_pool: None,
                     max_entries: 1,
                     answer_ttl: Duration::from_millis(5),
                     recovery_ttl: Duration::from_millis(10),
-                }),
+                }],
                 default_plan: plan_id("default"),
             },
         )
-        .expect("bounded FakeDNS policy"),
+        .expect("bounded synthetic capture policy"),
     );
     let runtime = DnsGeneration::compile_with_factory(
         policy,
@@ -803,7 +848,7 @@ async fn fake_dns_capacity_never_reassigns_an_owned_address() {
             backends: HashMap::from([(upstream_id("unused"), test_backend(backend.clone()))]),
         },
     )
-    .expect("bounded FakeDNS runtime");
+    .expect("bounded synthetic capture runtime");
     let first = runtime
         .answer_wire_query(
             &wire_query(0x7101, "first.example.", RecordType::A),
@@ -811,11 +856,11 @@ async fn fake_dns_capacity_never_reassigns_an_owned_address() {
             1_232,
         )
         .await
-        .expect("first FakeDNS response");
+        .expect("first synthetic capture response");
     let first = Message::from_vec(&first).expect("decoded first response");
     let first_address = match &first.answers[0].data {
         RData::A(address) => IpAddr::V4(address.0),
-        other => panic!("unexpected first FakeDNS data {other:?}"),
+        other => panic!("unexpected first synthetic capture data {other:?}"),
     };
     tokio::time::sleep(Duration::from_millis(15)).await;
 
@@ -831,17 +876,97 @@ async fn fake_dns_capacity_never_reassigns_an_owned_address() {
     assert_eq!(second.metadata.response_code, ResponseCode::ServFail);
     assert!(second.answers.is_empty());
     assert_eq!(
-        runtime.recover_fake_dns(first_address),
-        FakeDnsRecovery::Expired
+        runtime.recover_synthetic_capture(first_address),
+        SyntheticCaptureRecovery::Expired
     );
     assert_eq!(backend.calls(), 0);
     assert_eq!(
         runtime
             .runtime_snapshot()
-            .fake_dns
-            .expect("FakeDNS status")
+            .synthetic_captures
+            .into_iter()
+            .next()
+            .expect("synthetic-capture status")
             .capacity_failures,
         1
+    );
+}
+
+#[tokio::test]
+async fn shared_capture_keeps_policy_and_domain_provenance_distinct() {
+    let capture = capture_id("shared");
+    let mut first = ipv4_plan("first", vec![upstream_id("unused")]);
+    first.synthetic_capture = Some(capture.clone());
+    let mut second = ipv4_plan("second", vec![upstream_id("unused")]);
+    second.synthetic_capture = Some(capture.clone());
+    let policy = Arc::new(
+        CompiledDnsPolicy::compile(
+            12,
+            DnsPolicySpec {
+                upstreams: vec![direct_udp("unused", "192.0.2.53:53")],
+                outbound_capabilities: Vec::new(),
+                plans: vec![first, second],
+                rules: vec![DnsRuleSpec {
+                    id: rule_id("second-root"),
+                    matcher: DnsRuleMatch::Suffix(domain("second.example")),
+                    plan: plan_id("second"),
+                    explanation: None,
+                }],
+                override_records: Vec::new(),
+                synthetic_captures: vec![DnsSyntheticCaptureSpec {
+                    id: capture.clone(),
+                    ipv4_pool: Some("198.18.2.0/24".parse().expect("pool")),
+                    ipv6_pool: None,
+                    max_entries: 32,
+                    answer_ttl: Duration::from_secs(30),
+                    recovery_ttl: Duration::from_secs(60),
+                }],
+                default_plan: plan_id("first"),
+            },
+        )
+        .expect("shared capture policy"),
+    );
+    let backend = MockBackend::new(MockResult::Failed);
+    let runtime = DnsGeneration::compile_with_factory(
+        policy,
+        &MapFactory {
+            backends: HashMap::from([(upstream_id("unused"), test_backend(backend))]),
+        },
+    )
+    .expect("shared capture runtime");
+    let capture_runtime = runtime
+        .synthetic_captures
+        .get(&capture)
+        .expect("active shared capture");
+    let shared_domain = domain("same.example");
+    let first_address =
+        match capture_runtime.answer(&plan_id("first"), &shared_domain, RecordType::A) {
+            SyntheticCaptureWireAnswer::Address(address, _) => address,
+            other => panic!("unexpected first synthetic answer: {other:?}"),
+        };
+    let second_address =
+        match capture_runtime.answer(&plan_id("second"), &shared_domain, RecordType::A) {
+            SyntheticCaptureWireAnswer::Address(address, _) => address,
+            other => panic!("unexpected second synthetic answer: {other:?}"),
+        };
+    assert_ne!(first_address, second_address);
+    assert_eq!(
+        runtime.recover_synthetic_capture(first_address),
+        SyntheticCaptureRecovery::Recovered {
+            generation: 12,
+            plan: plan_id("first"),
+            capture: capture.clone(),
+            domain: shared_domain.clone(),
+        }
+    );
+    assert_eq!(
+        runtime.recover_synthetic_capture(second_address),
+        SyntheticCaptureRecovery::Recovered {
+            generation: 12,
+            plan: plan_id("second"),
+            capture,
+            domain: shared_domain,
+        }
     );
 }
 
@@ -1414,14 +1539,16 @@ async fn direct_factory_never_bypasses_a_named_outbound() {
                     let mut plan =
                         DnsPlanSpec::new(plan_id("default"), vec![upstream_id("secure")]);
                     plan.security = DnsSecurityPolicy::RequireEncrypted;
+                    plan.override_records = vec![record_id("carrier-static")];
                     plan
                 }],
                 rules: Vec::new(),
-                hosts: vec![DnsHostSpec {
+                override_records: vec![DnsOverrideRecordSpec {
+                    id: record_id("carrier-static"),
                     domain: domain("carrier.example"),
                     addresses: vec!["198.51.100.10".parse().expect("carrier address")],
                 }],
-                fake_dns: None,
+                synthetic_captures: Vec::new(),
                 default_plan: plan_id("default"),
             },
         )

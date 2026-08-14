@@ -6,40 +6,10 @@
 # Transport protection uses a different raw 32-byte file shared by the two
 # endpoints: umask 077; openssl rand -out mpp-transport.key 32
 
-# L4 is the default. The separate experimental L3 profile is documented in
-# config.reference.toml.
-# forwarding_mode = "l4"
-
-[logging]
-level = "info"
-
 [[credentials]]
 credential_id = "home-client"
 principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
-
-[session]
-# Keep target sockets for reattachment and bound graceful TCP carrier retirement.
-retention_timeout_ms = 300000
-
-[dns]
-default = "system"
-
-[[dns.servers]]
-name = "system"
-protocol = "system"
-
-[[dns.policies]]
-name = "system"
-servers = ["system"]
-
-# The management API is optional, loopback-only, and requires a separate random
-# operator token when enabled.
-# [management]
-# listen = ["127.0.0.1:7600"]
-# token = { from = "file", path = "management-token.key" }
-# dashboard = true
-# allow_peer_diagnostics = false
 
 [[inbounds]]
 name = "mpp-listener"
@@ -48,8 +18,9 @@ paths = [
   { name = "path-1", endpoint = "tcp://0.0.0.0:7443" },
   { name = "path-2", endpoint = "quic://0.0.0.0:7443" },
 ]
-outbound = "direct-egress"
-dns_policy = "system"
+# Omission denies incoming peer diagnostics. Use a concrete list of accepted
+# principal IDs, or the scalar "*" for every authenticated principal.
+# peer_diagnostics_principal_ids = ["home"]
 
 [inbounds.security]
 credential_ids = ["home-client"]
@@ -73,7 +44,7 @@ protocol = "direct"
 # Replace the global `system` server with named UDP/TCP/DoT/DoH/DoQ servers
 # for explicit or encrypted resolution.
 
-# To relay through SOCKS5, change the MPP inbound reference above to
+# To relay through SOCKS5, change the routing rule below to
 # `outbound = "socks5-egress"`, then uncomment this complete block.
 # [[outbounds]]
 # name = "socks5-egress"
@@ -81,7 +52,7 @@ protocol = "direct"
 # endpoint = "127.0.0.1:1080"
 # connect_timeout_ms = 10000
 # Canonical target domains are carried to the SOCKS5 proxy unless an
-# IP-dependent destination ACL requires evidence from the selected DNS policy.
+# IP-dependent routing rule requires evidence from the selected DNS policy.
 
 # Plain HTTP CONNECT relays TCP. Use SOCKS5 when a proxy must relay
 # both TCP and UDP.
@@ -91,11 +62,26 @@ protocol = "direct"
 # endpoint = "127.0.0.1:8080"
 # connect_timeout_ms = 10000
 
+[routing]
+
+# To permit a private/internal destination, add a narrow rule before the
+# default. `allow-restricted` is the explicit authorization; a plain `allow`
+# still rejects restricted addresses when they become known.
+# [[routing.rules]]
+# name = "allow-home-network"
+# inbounds = ["mpp-listener"]
+# principal_ids = ["home"]
+# destination_cidrs = ["192.168.0.0/16", "fd00::/8"]
+# decision = "allow-restricted"
+# outbound = "direct-egress"
+
+[[routing.rules]]
+name = "default"
+outbound = "direct-egress"
+
 # For ordered direct-to-relay fallback, uncomment the SOCKS5 block, replace
-# `outbound = "direct-egress"` above with `balancer = "egress-fallback"`, and
-# uncomment this routing block. An inbound must not set both references.
-# [routing]
-#
+# the default rule's `outbound` with `balancer = "egress-fallback"`, and
+# uncomment this balancer block. A rule must not set both references.
 # [[routing.balancers]]
 # name = "egress-fallback"
 # strategy = "ordered-failover"

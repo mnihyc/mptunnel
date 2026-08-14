@@ -56,14 +56,14 @@ with open("/proc/net/dev", encoding="ascii") as handle:
 result = {"interfaces": interfaces}
 try:
     request = urllib.request.Request(
-        f"http://127.0.0.1:{int(sys.argv[1])}/api/v3/status",
+        f"http://127.0.0.1:{int(sys.argv[1])}/api/v4/status",
         headers={"Authorization": f"Bearer {sys.argv[2]}"},
     )
     with urllib.request.urlopen(request, timeout=2.0) as response:
         status = json.load(response)
     if not isinstance(status, dict):
         raise ValueError("management status is not a JSON object")
-    if status.get("schema") != "mptunnel.management.v3":
+    if status.get("schema") != "mptunnel.management.v4":
         raise ValueError(
             f"unexpected management status schema: {status.get('schema')!r}"
         )

@@ -155,7 +155,7 @@ pub(super) fn collect_snapshot(
     let controls = ManagementControls {
         path: ManagementControlStatus {
             supported: services.mpp_outbounds > 0,
-            operation: (services.mpp_outbounds > 0).then_some("POST /api/v3/actions/path"),
+            operation: (services.mpp_outbounds > 0).then_some("POST /api/v4/actions/path"),
             reason: (services.mpp_outbounds == 0)
                 .then_some("path control requires a local inbound service with an MPP outbound"),
         },
@@ -164,7 +164,7 @@ pub(super) fn collect_snapshot(
             operation: target
                 .gateway_control
                 .is_some()
-                .then_some("POST /api/v3/balancers/actions"),
+                .then_some("POST /api/v4/balancers/actions"),
             reason: target
                 .gateway_control
                 .is_none()
@@ -172,7 +172,7 @@ pub(super) fn collect_snapshot(
         },
         peer_diagnostics: ManagementControlStatus {
             supported: !peer_sessions.is_empty(),
-            operation: (!peer_sessions.is_empty()).then_some("POST /api/v3/diagnostics/peer"),
+            operation: (!peer_sessions.is_empty()).then_some("POST /api/v4/diagnostics/peer"),
             reason: peer_sessions
                 .is_empty()
                 .then_some("no authenticated peer control carrier is currently available"),

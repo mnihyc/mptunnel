@@ -1,11 +1,11 @@
 use super::*;
 use crate::dns::{DnsGeneration, DnsRuntimeError};
 use crate::ingress::socks5 as ingress_socks5;
-use crate::outbound::ServerDestinationPolicy;
 use crate::product::{
-    AclEffect, AclRuleSpec, CompiledDnsPolicy, DestinationAcl, DnsPlanId, DnsPlanSpec,
-    DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, DomainName, Network,
-    PortRange, RouteMatchSpec, RuleId,
+    CompiledDnsPolicy, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId,
+    DnsUpstreamSpec, DomainName, EgressAction, FlowContext, InboundId, InitialDemand, Network,
+    PortRange, PrincipalId, ProductPolicyGeneration, ProtocolTarget, RouteAction, RouteMatchSpec,
+    RouteRuleSpec, RuleId,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -102,8 +102,8 @@ fn blackhole_dns_runtime(upstream: SocketAddr, lookup_timeout: Duration) -> DnsG
             outbound_capabilities: Vec::new(),
             plans: vec![plan],
             rules: Vec::new(),
-            hosts: Vec::new(),
-            fake_dns: None,
+            override_records: Vec::new(),
+            synthetic_captures: Vec::new(),
             default_plan: plan_id,
         },
     )
@@ -111,30 +111,77 @@ fn blackhole_dns_runtime(upstream: SocketAddr, lookup_timeout: Duration) -> DnsG
     DnsGeneration::compile(Arc::new(policy)).expect("blackhole DNS generation")
 }
 
-fn safe_destination_policy() -> impl DestinationAuthorizer {
-    ServerDestinationPolicy::new(DestinationAcl::safe_default(1)).test_principal_policy()
+struct TestDestinationPolicy {
+    policy: ProductPolicyGeneration,
+    principal: PrincipalId,
+    inbound: InboundId,
 }
 
-fn scoped_loopback_policy(domain: &str, port: u16) -> impl DestinationAuthorizer {
+impl TestDestinationPolicy {
+    fn compile(routes: Vec<RouteRuleSpec>) -> Self {
+        Self {
+            policy: ProductPolicyGeneration::compile(9, routes).expect("test routing policy"),
+            principal: PrincipalId::parse("test-peer").expect("test principal"),
+            inbound: InboundId::parse("test-inbound").expect("test inbound"),
+        }
+    }
+}
+
+impl DestinationAuthorizer for TestDestinationPolicy {
+    fn product_policy(&self) -> &ProductPolicyGeneration {
+        &self.policy
+    }
+
+    fn flow(
+        &self,
+        network: Network,
+        target: &ProtocolTarget,
+    ) -> Result<Arc<FlowContext>, DestinationAuthorizationError> {
+        Ok(Arc::new(FlowContext::without_source(
+            network,
+            target.clone(),
+            self.principal.clone(),
+            self.inbound.clone(),
+        )))
+    }
+}
+
+fn safe_destination_policy() -> TestDestinationPolicy {
+    TestDestinationPolicy::compile(vec![RouteRuleSpec::new(
+        RuleId::parse("default").expect("test route ID"),
+        RouteMatchSpec::default(),
+        RouteAction::allow(EgressAction::Direct, None, InitialDemand::Automatic),
+    )])
+}
+
+fn allow_restricted_destination_policy() -> TestDestinationPolicy {
+    TestDestinationPolicy::compile(vec![RouteRuleSpec::new(
+        RuleId::parse("default").expect("test route ID"),
+        RouteMatchSpec::default(),
+        RouteAction::allow_restricted(EgressAction::Direct, None, InitialDemand::Automatic),
+    )])
+}
+
+fn scoped_loopback_policy(domain: &str, port: u16) -> TestDestinationPolicy {
     let matcher = RouteMatchSpec {
-        domain_exact: vec![DomainName::parse(domain).expect("test ACL domain")],
-        destination_cidrs: vec!["127.0.0.0/8".parse().expect("test ACL CIDR")],
+        domain_exact: vec![DomainName::parse(domain).expect("test route domain")],
+        destination_cidrs: vec!["127.0.0.0/8".parse().expect("test route CIDR")],
         destination_ports: vec![PortRange::single(port)],
         networks: vec![Network::Tcp, Network::Udp],
         ..RouteMatchSpec::default()
     };
-    ServerDestinationPolicy::new(
-        DestinationAcl::compile(
-            9,
-            vec![AclRuleSpec::new(
-                RuleId::parse("allow-scoped-loopback").expect("test ACL rule ID"),
-                matcher,
-                AclEffect::AllowRestricted,
-            )],
-        )
-        .expect("test destination ACL"),
-    )
-    .test_principal_policy()
+    TestDestinationPolicy::compile(vec![
+        RouteRuleSpec::new(
+            RuleId::parse("allow-scoped-loopback").expect("test route ID"),
+            matcher,
+            RouteAction::allow_restricted(EgressAction::Direct, None, InitialDemand::Automatic),
+        ),
+        RouteRuleSpec::new(
+            RuleId::parse("default-reject").expect("test route ID"),
+            RouteMatchSpec::default(),
+            RouteAction::reject(),
+        ),
+    ])
 }
 
 async fn connect_tcp(
@@ -143,15 +190,8 @@ async fn connect_tcp(
     target: &TargetAddr,
     timeout: Duration,
 ) -> Result<OutboundTcpStream, OutboundConnectError> {
-    super::connect_tcp(
-        config,
-        dns,
-        None,
-        &ServerDestinationPolicy::allow_restricted_for_test().test_principal_policy(),
-        target,
-        timeout,
-    )
-    .await
+    let policy = allow_restricted_destination_policy();
+    super::connect_tcp(config, dns, None, &policy, target, timeout).await
 }
 
 async fn connect_udp(
@@ -160,15 +200,8 @@ async fn connect_udp(
     target: &TargetAddr,
     timeout: Duration,
 ) -> Result<OutboundUdpSocket, OutboundConnectError> {
-    super::connect_udp(
-        config,
-        dns,
-        None,
-        &ServerDestinationPolicy::allow_restricted_for_test().test_principal_policy(),
-        target,
-        timeout,
-    )
-    .await
+    let policy = allow_restricted_destination_policy();
+    super::connect_udp(config, dns, None, &policy, target, timeout).await
 }
 
 #[test]
@@ -828,7 +861,9 @@ async fn safe_default_blocks_literal_pivot_before_tcp_or_udp_proxy_connector() {
         assert!(matches!(
             result,
             Err(OutboundConnectError::DestinationAuthorization(
-                DestinationAuthorizationError::Acl(_)
+                DestinationAuthorizationError::Policy(
+                    crate::product::RouteAuthorizationError::RestrictedAddress { .. }
+                )
             ))
         ));
     }
@@ -868,7 +903,9 @@ async fn mixed_public_and_loopback_dns_answer_fails_closed_before_any_dial() {
 
     assert!(matches!(
         error,
-        OutboundConnectError::DestinationAuthorization(DestinationAuthorizationError::Acl(_))
+        OutboundConnectError::DestinationAuthorization(DestinationAuthorizationError::Policy(
+            crate::product::RouteAuthorizationError::RestrictedAddress { .. }
+        ))
     ));
     assert!(
         tokio::time::timeout(Duration::from_millis(30), listener.accept())

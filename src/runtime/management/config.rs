@@ -26,15 +26,15 @@ impl ManagementTarget {
         let control = self.config_control().ok_or_else(config_unavailable)?;
         let store = control.store();
         Ok(json!({
-            "schema": "mptunnel.config.v3",
+            "schema": "mptunnel.config.v4",
             "path": store.path().display().to_string(),
             "desired_revision": store.revision().to_string(),
             "active_revision": store.active_revision().to_string(),
             "runtime_revision": control.runtime_revision().to_string(),
             "pending_revision": store.pending_revision().map(|revision| revision.to_string()),
             "mutation": {
-                "validate": "POST /api/v3/config/validate",
-                "apply": "POST /api/v3/config/apply",
+                "validate": "POST /api/v4/config/validate",
+                "apply": "POST /api/v4/config/apply",
                 "precondition": "If-Match"
             }
         }))
@@ -183,6 +183,28 @@ impl ManagementTarget {
             CommandConfig::Node(normalized_node),
             CommandConfig::Node(candidate_node),
         ) = (&active.command, &mut normalized.command, &candidate.command);
+        // File parsing assigns one fresh, internal identity to routing,
+        // balancers, and DNS so proofs cannot cross runtime generations. Those
+        // identities are deliberately absent from TOML and are not semantic
+        // configuration changes. Compare a live-update candidate using the
+        // active identities; every actual policy/spec difference remains in
+        // the surrounding values and still requires generation replacement.
+        normalized_node.dns_policy.generation = active_node.dns_policy.generation;
+        if let (Some(active_policy), Some(normalized_policy)) = (
+            active_node.product_policy.as_ref(),
+            normalized_node.product_policy.as_mut(),
+        ) {
+            normalized_policy.generation = active_policy.generation;
+        }
+        for normalized_balancer in &mut normalized_node.gateway_balancers {
+            if let Some(active_balancer) = active_node
+                .gateway_balancers
+                .iter()
+                .find(|active| active.id == normalized_balancer.id)
+            {
+                normalized_balancer.generation = active_balancer.generation;
+            }
+        }
         if active_node.servers.len() != normalized_node.servers.len()
             || self.servers.len() != normalized_node.servers.len()
         {

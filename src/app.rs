@@ -113,14 +113,6 @@ pub fn run_config_file(mut invocation: ConfigFileInvocation) -> Result<(), AppEr
     log_file_configuration(&config, config_control.store());
     let runtime = build_runtime()?;
     let update_check = crate::update::spawn(&runtime);
-    if config.service.service_mode {
-        crate::observability::process_event!(
-            Info,
-            "process",
-            "service_intent",
-            "service intent enabled; process registration remains host-owned"
-        );
-    }
     let shutdown = ProcessShutdown::new();
     let result = runtime.block_on(run_process_until_shutdown(
         run_config_file_generations(config, config_control, invocation, shutdown.clone()),
@@ -154,14 +146,6 @@ fn run_config(config: AppConfig) -> Result<(), AppError> {
     log_command_line_configuration(&config);
     let runtime = build_runtime()?;
     let update_check = crate::update::spawn(&runtime);
-    if config.service.service_mode {
-        crate::observability::process_event!(
-            Info,
-            "process",
-            "service_intent",
-            "service intent enabled; process registration remains host-owned"
-        );
-    }
     let shutdown = ProcessShutdown::new();
     let result = runtime.block_on(run_process_until_shutdown(
         run_standalone_generations(config, shutdown.clone()),

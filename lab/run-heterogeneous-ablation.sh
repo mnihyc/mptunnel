@@ -886,7 +886,6 @@ secret = { from = "file", path = ${credential_path_json} }
 name = "lab-mpp-in"
 protocol = "mpp"
 paths = ${paths}
-outbound = "lab-direct"
 
 [inbounds.security]
 credential_ids = ["lab"]
@@ -894,18 +893,20 @@ tls_certificate_chain = { from = "file", path = ${certificate_path_json} }
 tls_private_key = { from = "file", path = ${private_key_path_json} }
 ${transport_security}
 
-[inbounds.destination_acl]
-generation = 1
-
-[[inbounds.destination_acl.rules]]
-name = "allow-lab-private-targets"
-effect = "allow-restricted"
-destination_cidrs = ["172.31.0.0/16"]
-networks = ["tcp", "udp"]
-
 [[outbounds]]
 name = "lab-direct"
 protocol = "direct"
+
+[routing]
+
+[[routing.rules]]
+name = "allow-lab-private-targets"
+inbounds = ["lab-mpp-in"]
+principal_ids = ["lab"]
+destination_cidrs = ["172.31.0.0/16"]
+networks = ["tcp", "udp"]
+decision = "allow-restricted"
+outbound = "lab-direct"
 EOF
 }
 
@@ -958,17 +959,12 @@ ${transport_security}
 
 [routing]
 
-[routing.destination_acl]
-
-[[routing.destination_acl.rules]]
+[[routing.rules]]
 name = "allow-lab-private-targets"
-effect = "allow-restricted"
+inbounds = ["lab-socks"]
 destination_cidrs = ["172.31.0.0/16"]
 networks = ["tcp", "udp"]
-
-[[routing.rules]]
-name = "default"
-action = "outbound"
+decision = "allow-restricted"
 outbound = "lab-mpp-out"
 EOF
 }
@@ -1023,17 +1019,12 @@ ${transport_security}
 
 [routing]
 
-[routing.destination_acl]
-
-[[routing.destination_acl.rules]]
+[[routing.rules]]
 name = "allow-lab-private-targets"
-effect = "allow-restricted"
+inbounds = ["lab-tun"]
 destination_cidrs = ["172.31.0.0/16"]
 networks = ["tcp", "udp"]
-
-[[routing.rules]]
-name = "default"
-action = "outbound"
+decision = "allow-restricted"
 outbound = "lab-mpp-out"
 EOF
 }

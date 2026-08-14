@@ -4,7 +4,7 @@
 //! per Product flow. The returned concrete branch is then pinned for the flow
 //! lifetime and no routing or balancer decision enters payload forwarding.
 
-use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, EgressRef, GatewayBalancerConfig};
+use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, GatewayBalancerConfig};
 use crate::dns::{
     DirectDnsBackendFactory, DnsBackendError, DnsBackendFactory, DnsGeneration,
     DnsNativeSocketPolicy, DnsQueryBackend, DnsRuntimeError, DnsTcpConnectFuture, DnsTcpConnector,
@@ -578,13 +578,6 @@ impl RuntimeOutboundRegistry {
         deadline_after(timeout)
     }
 
-    pub(in crate::runtime) fn selection_for_egress(
-        &self,
-        egress: &EgressRef,
-    ) -> Result<EgressSelection, RuntimeError> {
-        self.shell.selection_for_egress(egress)
-    }
-
     pub(in crate::runtime) fn action_requires_family_resolution(
         &self,
         action: &EgressAction,
@@ -616,7 +609,7 @@ impl RuntimeOutboundRegistry {
                 }
                 Ok(false)
             }
-            EgressAction::Direct | EgressAction::Reject | EgressAction::Drop => Ok(false),
+            EgressAction::Direct => Ok(false),
         }
     }
 
@@ -639,7 +632,7 @@ impl RuntimeOutboundRegistry {
                         .is_some_and(|leaf| leaf.supports_ip_family(address))
                 })
             }),
-            EgressAction::Direct | EgressAction::Reject | EgressAction::Drop => true,
+            EgressAction::Direct => true,
         }
     }
 
@@ -655,6 +648,13 @@ impl RuntimeOutboundRegistry {
         self.shell.ensure_native_egress(selection)
     }
 
+    pub(in crate::runtime) fn action_is_native_egress(&self, action: &EgressAction) -> bool {
+        self.selection_for_action(action)
+            .and_then(|selection| self.ensure_native_egress(&selection))
+            .is_ok()
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) async fn open_tcp(
         &self,
         selection: &EgressSelection,
@@ -688,6 +688,7 @@ impl RuntimeOutboundRegistry {
         Ok(opened.with_product_flow(pending.commit(outbound)))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) async fn open_udp(
         &self,
         selection: &EgressSelection,
@@ -725,6 +726,15 @@ impl RuntimeOutboundRegistry {
         request: ProductOpenRequest<'_>,
     ) -> Result<(OpenedTcpOutbound, ProductOutboundFlow), RuntimeError> {
         self.open_product_tcp_for_origin(request, ProductFlowOriginKind::LocalInbound, true)
+            .await
+    }
+
+    pub(in crate::runtime) async fn open_product_tcp_from_mpp(
+        &self,
+        request: ProductOpenRequest<'_>,
+    ) -> Result<(OpenedTcpOutbound, ProductOutboundFlow), RuntimeError> {
+        self.ensure_native_egress(request.selection)?;
+        self.open_product_tcp_for_origin(request, ProductFlowOriginKind::MppInbound, false)
             .await
     }
 
@@ -903,6 +913,15 @@ impl RuntimeOutboundRegistry {
         request: ProductOpenRequest<'_>,
     ) -> Result<(OpenedUdpOutbound, ProductOutboundFlow), RuntimeError> {
         self.open_product_udp_for_origin(request, ProductFlowOriginKind::LocalInbound, true)
+            .await
+    }
+
+    pub(in crate::runtime) async fn open_product_udp_from_mpp(
+        &self,
+        request: ProductOpenRequest<'_>,
+    ) -> Result<(OpenedUdpOutbound, ProductOutboundFlow), RuntimeError> {
+        self.ensure_native_egress(request.selection)?;
+        self.open_product_udp_for_origin(request, ProductFlowOriginKind::MppInbound, false)
             .await
     }
 
@@ -1511,27 +1530,7 @@ impl RuntimeOutboundRegistryShell {
             EgressAction::Direct => Err(RuntimeError::ProductPolicy(
                 "direct route must select a configured direct outbound".to_string(),
             )),
-            EgressAction::Reject | EgressAction::Drop => Err(RuntimeError::ProductPolicy(
-                "terminal route cannot open an outbound".to_string(),
-            )),
         }
-    }
-
-    pub(in crate::runtime) fn selection_for_egress(
-        &self,
-        egress: &EgressRef,
-    ) -> Result<EgressSelection, RuntimeError> {
-        let selection = match egress {
-            EgressRef::Outbound(outbound) => EgressSelection::Outbound(outbound.clone()),
-            EgressRef::Balancer(balancer) => EgressSelection::Balancer(balancer.clone()),
-        };
-        let present = match &selection {
-            EgressSelection::Outbound(id) => self.leaves.contains_key(id),
-            EgressSelection::Balancer(id) => self.balancers.contains_key(id),
-        };
-        present.then_some(selection).ok_or_else(|| {
-            RuntimeError::ProductPolicy(format!("egress {} has no runtime binding", egress.name()))
-        })
     }
 
     /// Proves the server-side no-chaining invariant at runtime assembly.
@@ -1707,6 +1706,7 @@ impl DnsBackendFactory for RuntimeOutboundDnsBackendFactory {
     }
 }
 
+#[cfg(test)]
 async fn authorize_product_destination(
     dns: &DnsGeneration,
     dns_plan: Option<&DnsPlanId>,
@@ -1737,12 +1737,14 @@ fn authorized_flow(authorized: &[AuthorizedTarget]) -> Result<&FlowContext, Runt
     let first = authorized.first().ok_or_else(|| {
         RuntimeError::OutboundConnect(outbound::OutboundConnectError::NoAuthorizedAddresses)
     })?;
-    let generation = first.acl_generation();
+    let generation = first.policy_generation();
+    let permit = first.permit();
     let flow = first.flow();
-    if authorized
-        .iter()
-        .any(|target| target.acl_generation() != generation || target.flow() != flow)
-    {
+    if authorized.iter().any(|target| {
+        target.policy_generation() != generation
+            || target.flow() != flow
+            || target.permit() != permit
+    }) {
         return Err(RuntimeError::DestinationDenied(
             "authorized connector targets do not belong to one Product flow".to_string(),
         ));

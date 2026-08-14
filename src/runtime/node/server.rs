@@ -1,16 +1,19 @@
 //! Server listener composition; carrier loops remain under `runtime::path`.
 
-use crate::config::{EgressRef, ForwardingMode, NamedPathConfig, ServerSecurityConfig};
+use crate::config::{
+    ForwardingMode, NamedPathConfig, PeerDiagnosticsPrincipalPolicy, ServerSecurityConfig,
+};
 #[cfg(test)]
-use crate::config::{ManagementConfig, ServerDestinationAclConfig, SessionConfig};
+use crate::config::{ManagementConfig, ProductPolicyConfig, SessionConfig};
 use crate::outbound;
 #[cfg(test)]
 use crate::outbound::OutboundConfig;
-use crate::outbound::ServerDestinationPolicy;
 use crate::performance::{MppPerformanceConfig, ResourceLimits};
-use crate::product::Network;
+use crate::product::InboundId;
 #[cfg(test)]
-use crate::product::OutboundId;
+use crate::product::{
+    EgressAction, InitialDemand, OutboundId, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
+};
 use crate::protocol::UnderlayProtocol;
 #[cfg(test)]
 use crate::runtime::config_control::RuntimeConfigControl;
@@ -25,7 +28,10 @@ use crate::runtime::path::authentication::ProductCredentialAdmission;
 use crate::runtime::path::quic::io::UdpPathEndpoint;
 use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
 use crate::runtime::path::tcp::server::handle_server_path_with_authentication_slot;
-use crate::runtime::path::{CredentialRetirementControl, ServerLocalPath, ServerPathContext};
+use crate::runtime::path::{
+    CredentialRetirementControl, ServerLocalPath, ServerPathContext, ServerTargetAdmission,
+};
+use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 #[cfg(test)]
 use crate::runtime::readiness::RuntimeReadinessBarrier;
 use crate::runtime::recent_ids::{ExpiringReplayCache, path_join_replay_cache_capacity};
@@ -46,7 +52,7 @@ use tokio::sync::Semaphore;
 /// Per-identity server services and the carrier context they compose.
 pub(in crate::runtime) struct ServerIdentityRuntime {
     pub(in crate::runtime) paths: ServerPathContext,
-    pub(in crate::runtime) reliable_relay: ServerReliableRelayService,
+    pub(in crate::runtime) reliable_relay: Option<ServerReliableRelayService>,
 }
 
 #[cfg(test)]
@@ -55,7 +61,6 @@ pub(in crate::runtime) async fn run(
     path_specs: Vec<PathSpec>,
     outbound: OutboundConfig,
     outbound_connect_timeout: Duration,
-    destination_acl: ServerDestinationAclConfig,
     security: ServerSecurityConfig,
     tls: TcpServerTlsConfig,
     performance: MppPerformanceConfig,
@@ -77,11 +82,7 @@ pub(in crate::runtime) async fn run(
         crate::runtime::outbound_registry::test_dns_generation(),
     )?;
     let product_admission = registry.product_admission().clone();
-    let destination_policy = Arc::new(ServerDestinationPolicy::new(
-        destination_acl
-            .compile()
-            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?,
-    ));
+    let router = test_router(&registry, id.clone())?;
     let runtime = new_identity_runtime_with_metadata(
         "test-mpp-inbound".to_string(),
         path_specs
@@ -93,9 +94,7 @@ pub(in crate::runtime) async fn run(
             })
             .collect(),
         registry,
-        EgressRef::Outbound(id),
-        None,
-        destination_policy,
+        Some(router),
         security,
         tls,
         performance,
@@ -103,6 +102,7 @@ pub(in crate::runtime) async fn run(
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         session.retention_timeout,
         management.peer_diagnostics_enabled(),
+        PeerDiagnosticsPrincipalPolicy::Deny,
         ForwardingMode::L4,
         None,
     )?;
@@ -118,7 +118,9 @@ pub(in crate::runtime) async fn run(
         reliable_relay,
     } = runtime;
     let mut services = tokio::task::JoinSet::new();
-    services.spawn(reliable_relay.run());
+    if let Some(reliable_relay) = reliable_relay {
+        services.spawn(reliable_relay.run());
+    }
     spawn_listeners(bound, paths.clone(), &mut services);
     server_readiness.ready();
     if management.http_enabled() {
@@ -169,7 +171,6 @@ pub(in crate::runtime) fn new_identity_runtime(
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
 ) -> ServerIdentityRuntime {
-    let destination_policy = Arc::new(ServerDestinationPolicy::allow_restricted_for_test());
     let id = OutboundId::parse("test-server-egress").expect("static test outbound ID");
     let registry = RuntimeOutboundRegistry::compile(
         [RuntimeOutboundLeaf::Local {
@@ -182,6 +183,7 @@ pub(in crate::runtime) fn new_identity_runtime(
         crate::runtime::outbound_registry::test_dns_generation(),
     )
     .expect("test outbound registry");
+    let router = test_router(&registry, id).expect("test routing policy");
     new_identity_runtime_with_metadata(
         "test-mpp-inbound".to_string(),
         server_paths
@@ -193,9 +195,7 @@ pub(in crate::runtime) fn new_identity_runtime(
             })
             .collect(),
         registry,
-        EgressRef::Outbound(id),
-        None,
-        destination_policy,
+        Some(router),
         security,
         crate::transport::encrypted::test_server_tls_config(),
         performance,
@@ -203,6 +203,7 @@ pub(in crate::runtime) fn new_identity_runtime(
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         SessionConfig::default().retention_timeout,
         false,
+        PeerDiagnosticsPrincipalPolicy::Deny,
         ForwardingMode::L4,
         None,
     )
@@ -213,17 +214,16 @@ pub(in crate::runtime) fn new_identity_runtime(
 pub(super) fn new_identity_runtime_with_metadata(
     name: String,
     configured_paths: Vec<NamedPathConfig>,
-    outbound_registry: RuntimeOutboundRegistry,
-    egress: EgressRef,
-    dns_plan: Option<crate::product::DnsPlanId>,
-    destination_policy: Arc<ServerDestinationPolicy>,
+    _outbound_registry: RuntimeOutboundRegistry,
+    router: Option<ClientIngressRouter>,
     security: ServerSecurityConfig,
     tls: TcpServerTlsConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
     telemetry: RuntimeTelemetry,
     session_retention_timeout: Duration,
-    allow_peer_diagnostics: bool,
+    global_allow_peer_diagnostics: bool,
+    peer_diagnostics_principals: PeerDiagnosticsPrincipalPolicy,
     forwarding_mode: ForwardingMode,
     tun_l3: Option<crate::product::TunL3AddressPlan>,
 ) -> Result<ServerIdentityRuntime, RuntimeError> {
@@ -231,43 +231,75 @@ pub(super) fn new_identity_runtime_with_metadata(
         .into_iter()
         .map(|path| (path.name, path.spec))
         .unzip();
-    let egress_selection = outbound_registry.selection_for_egress(&egress)?;
-    outbound_registry.ensure_native_egress(&egress_selection)?;
     let mux_limits = resources.into();
-    let (reliable_streams, reliable_relay) =
-        ServerReliableRelayService::new(ServerReliableRelayContext {
-            outbound_registry: outbound_registry.clone(),
-            egress_selection: egress_selection.clone(),
-            dns_plan: dns_plan.clone(),
-            destination_policy: destination_policy.clone(),
-            performance,
-            mux_limits,
-            max_paths_per_session: resources.max_paths,
-            session_retention_timeout,
-            telemetry: telemetry.clone(),
-        });
-    let stream_destination_policy = destination_policy.clone();
-    let reliable_stream_port =
-        reliable_streams
-            .path_port()
-            .with_target_admission(Arc::new(move |permit, target| {
-                outbound::validate_target(target)?;
-                stream_destination_policy
-                    .for_principal(permit.principal().clone())
-                    .evaluate_pre(Network::Tcp, target)
-                    .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
-                Ok(())
-            }));
-    let datagram_port = ServerDatagramService::path_port(ServerDatagramServiceConfig {
-        outbound_registry,
-        egress_selection,
-        dns_plan,
-        destination_policy,
-        session_retention_timeout,
-        mux_limits,
-        reliable_streams: reliable_stream_port.clone(),
-        telemetry: telemetry.clone(),
-    });
+    let inbound =
+        InboundId::parse(&name).map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
+    let (reliable_stream_port, datagram_port, reliable_relay) = match (router, tun_l3.is_some()) {
+        (Some(router), false) => {
+            let (reliable_streams, reliable_relay) =
+                ServerReliableRelayService::new(ServerReliableRelayContext {
+                    router: router.clone(),
+                    inbound: inbound.clone(),
+                    performance,
+                    mux_limits,
+                    max_paths_per_session: resources.max_paths,
+                    session_retention_timeout,
+                    telemetry: telemetry.clone(),
+                });
+            let admission_router = router.clone();
+            let admission_inbound = inbound.clone();
+            let reliable_stream_port = reliable_streams.path_port().with_target_admission(
+                Arc::new(move |permit, target| {
+                    outbound::validate_target(target)?;
+                    match admission_router.route_mpp_tcp(
+                        target,
+                        permit.principal().clone(),
+                        admission_inbound.clone(),
+                    )? {
+                        ClientRoute::Open(_) => Ok(ServerTargetAdmission::Allow),
+                        ClientRoute::Deny(ClientPolicyDisposition::Reject) => {
+                            Ok(ServerTargetAdmission::Reject)
+                        }
+                        ClientRoute::Deny(ClientPolicyDisposition::Drop) => {
+                            Ok(ServerTargetAdmission::Drop)
+                        }
+                    }
+                }),
+            );
+            let datagram_port = ServerDatagramService::path_port(ServerDatagramServiceConfig {
+                router,
+                inbound,
+                session_retention_timeout,
+                mux_limits,
+                reliable_streams: reliable_stream_port.clone(),
+                telemetry: telemetry.clone(),
+            });
+            (
+                reliable_stream_port,
+                Some(datagram_port),
+                Some(reliable_relay),
+            )
+        }
+        (None, true) => {
+            let (reliable_streams, receiver) =
+                crate::runtime::stream::ServerReliableStreamRegistry::new_accepting_with_limits(
+                    mux_limits,
+                    resources.max_paths,
+                );
+            drop(receiver);
+            (reliable_streams.path_port(), None, None)
+        }
+        (None, false) => {
+            return Err(RuntimeError::Protocol(
+                "MPP L4 inbound is missing the shared routing policy",
+            ));
+        }
+        (Some(_), true) => {
+            return Err(RuntimeError::Protocol(
+                "MPP L3 inbound must not construct L4 routing services",
+            ));
+        }
+    };
     let (ip_tunnels, ip_tunnel_device) = tun_l3.map_or((None, None), |plan| {
         let (port, device) = ServerIpTunnelService::build(
             plan,
@@ -298,7 +330,11 @@ pub(super) fn new_identity_runtime_with_metadata(
         ip_tunnels,
         ip_tunnel_device: Arc::new(Mutex::new(ip_tunnel_device)),
         telemetry,
-        peer_status: crate::runtime::peer_status::PeerStatusBroker::new(allow_peer_diagnostics),
+        peer_status: crate::runtime::peer_status::PeerStatusBroker::with_scoped_incoming(
+            global_allow_peer_diagnostics,
+            peer_diagnostics_principals.has_authorized_principals(),
+        ),
+        peer_diagnostics_principals,
         path_join_replay: Arc::new(Mutex::new(ExpiringReplayCache::new(
             path_join_replay_cache_capacity(resources.max_streams),
         ))),
@@ -309,6 +345,86 @@ pub(super) fn new_identity_runtime_with_metadata(
         paths,
         reliable_relay,
     })
+}
+
+#[cfg(test)]
+fn test_router(
+    registry: &RuntimeOutboundRegistry,
+    id: OutboundId,
+) -> Result<ClientIngressRouter, RuntimeError> {
+    let policy = ProductPolicyConfig {
+        generation: 1,
+        routes: vec![RouteRuleSpec::new(
+            RuleId::parse("test-default")
+                .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?,
+            RouteMatchSpec::default(),
+            RouteAction::allow_restricted(
+                EgressAction::Outbound(id),
+                None,
+                InitialDemand::Automatic,
+            ),
+        )],
+    };
+    ClientIngressRouter::new(&policy, registry.clone())
+}
+
+#[cfg(test)]
+#[test]
+fn l3_identity_runtime_builds_packet_service_without_l4_relay() {
+    let security = ServerSecurityConfig::for_test(
+        crate::config::SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("test shared secret"),
+    );
+    let plan = crate::product::TunL3AddressPlan::compile(
+        crate::product::TunL3ServerSpec {
+            interface_name: Some("mptun-test".to_string()),
+            ipv4_pool: Some("10.88.0.0/24".parse().expect("IPv4 pool")),
+            ipv4: Some("10.88.0.1".parse().expect("server address")),
+            ipv6_pool: None,
+            ipv6: None,
+            mtu: 1_400,
+            allocations: vec![crate::product::TunL3AllocationSpec {
+                principal_id: crate::product::PrincipalId::parse("test-peer")
+                    .expect("test principal"),
+                ipv4: Some("10.88.0.2".parse().expect("peer address")),
+                ipv6: None,
+                allowed_ips: Vec::new(),
+            }],
+        },
+        &security.credential_authority,
+    )
+    .expect("TUN-L3 plan");
+    let registry = RuntimeOutboundRegistry::compile(
+        std::iter::empty::<RuntimeOutboundLeaf>(),
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("empty L3 outbound registry");
+    let resources = ResourceLimits::default();
+    let runtime = new_identity_runtime_with_metadata(
+        "packet-server".to_string(),
+        vec![NamedPathConfig {
+            name: "path-1".to_string(),
+            spec: "tcp://127.0.0.1:7443".parse().expect("server path"),
+        }],
+        registry,
+        None,
+        security,
+        crate::transport::encrypted::test_server_tls_config(),
+        MppPerformanceConfig::default(),
+        resources,
+        RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
+        SessionConfig::default().retention_timeout,
+        false,
+        PeerDiagnosticsPrincipalPolicy::Deny,
+        ForwardingMode::L3,
+        Some(plan),
+    )
+    .expect("L3 server runtime");
+
+    assert!(runtime.reliable_relay.is_none());
+    assert!(runtime.paths.datagrams.is_none());
+    assert!(runtime.paths.ip_tunnels.is_some());
 }
 
 pub(super) async fn bind_paths(

@@ -15,10 +15,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
-const DNS_STATUS_SCHEMA: &str = "mptunnel.dns.status.v3";
-const DNS_EXPLAIN_SCHEMA: &str = "mptunnel.dns.explain.v3";
-const DNS_QUERY_SCHEMA: &str = "mptunnel.dns.query.v3";
-const DNS_FLUSH_SCHEMA: &str = "mptunnel.dns.flush.v3";
+const DNS_STATUS_SCHEMA: &str = "mptunnel.dns.status.v4";
+const DNS_EXPLAIN_SCHEMA: &str = "mptunnel.dns.explain.v4";
+const DNS_QUERY_SCHEMA: &str = "mptunnel.dns.query.v4";
+const DNS_FLUSH_SCHEMA: &str = "mptunnel.dns.flush.v4";
 
 impl ManagementTarget {
     pub(super) fn dns_status_json(&self) -> Result<Value, ManagementHttpError> {
@@ -27,24 +27,25 @@ impl ManagementTarget {
         Ok(json!({
             "schema": DNS_STATUS_SCHEMA,
             "generation": snapshot.generation,
-            "records": snapshot.host_overrides,
-            "override": snapshot.fake_dns.map(|fake| json!({
-                "ipv4_pool": fake.ipv4_pool.map(|pool| pool.to_string()),
-                "ipv6_pool": fake.ipv6_pool.map(|pool| pool.to_string()),
-                "max_entries": fake.max_entries,
-                "owned_entries": fake.owned_entries,
-                "active_entries": fake.active_entries,
-                "answers": fake.answers.to_string(),
-                "recoveries": fake.recoveries.to_string(),
-                "expired_recoveries": fake.expired_recoveries.to_string(),
-                "unknown_recoveries": fake.unknown_recoveries.to_string(),
-                "capacity_failures": fake.capacity_failures.to_string(),
-            })),
+            "override_records": snapshot.override_records,
+            "synthetic_captures": snapshot.synthetic_captures.into_iter().map(|capture| json!({
+                "name": capture.capture.as_str(),
+                "ipv4_pool": capture.ipv4_pool.map(|pool| pool.to_string()),
+                "ipv6_pool": capture.ipv6_pool.map(|pool| pool.to_string()),
+                "capacity": capture.max_entries,
+                "owned_entries": capture.owned_entries,
+                "active_entries": capture.active_entries,
+                "answers": capture.answers.to_string(),
+                "recoveries": capture.recoveries.to_string(),
+                "expired_recoveries": capture.expired_recoveries.to_string(),
+                "unknown_recoveries": capture.unknown_recoveries.to_string(),
+                "capacity_failures": capture.capacity_failures.to_string(),
+            })).collect::<Vec<_>>(),
             "policies": snapshot.plans.into_iter().map(policy_status_json).collect::<Vec<_>>(),
             "operations": {
-                "explain": "GET /api/v3/dns/explain?domain=<domain>",
-                "query": "POST /api/v3/dns/query",
-                "flush": "POST /api/v3/dns/cache/flush"
+                "explain": "GET /api/v4/dns/explain?domain=<domain>",
+                "query": "POST /api/v4/dns/query",
+                "flush": "POST /api/v4/dns/cache/flush"
             }
         }))
     }
@@ -58,18 +59,21 @@ impl ManagementTarget {
             "generation": explanation.generation,
             "domain": explanation.domain.as_str(),
             "policy": explanation.plan.as_str(),
-            "rule": explanation.rule.as_ref().map(|rule| rule.as_str()),
-            "match": format!("{:?}", explanation.match_kind).to_ascii_lowercase(),
+            "selector": explanation.match_kind.as_str(),
+            "dns_rule": explanation.rule.as_ref().map(|rule| rule.as_str()),
             "matched_domain": explanation.matched_domain.as_ref().map(DomainName::as_str),
             "explanation": explanation.explanation.as_deref(),
-            "record_addresses": explanation.host_addresses.as_deref().map(|addresses| {
-                addresses.iter().map(ToString::to_string).collect::<Vec<_>>()
-            }),
-            "override": explanation.fake_dns.map(|fake| json!({
-                "ipv4_pool": fake.ipv4_pool.map(|pool| pool.to_string()),
-                "ipv6_pool": fake.ipv6_pool.map(|pool| pool.to_string()),
-                "answer_ttl_ms": fake.answer_ttl.as_millis().min(u64::MAX as u128) as u64,
-                "recovery_ttl_ms": fake.recovery_ttl.as_millis().min(u64::MAX as u128) as u64,
+            "override_record": explanation.override_record.map(|record| json!({
+                "name": record.as_str(),
+                "addresses": explanation.override_addresses.as_deref().unwrap_or_default()
+                    .iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })),
+            "synthetic_capture": explanation.synthetic_capture.map(|capture| json!({
+                "name": capture.capture.as_str(),
+                "ipv4_pool": capture.ipv4_pool.map(|pool| pool.to_string()),
+                "ipv6_pool": capture.ipv6_pool.map(|pool| pool.to_string()),
+                "answer_ttl_ms": capture.answer_ttl.as_millis().min(u64::MAX as u128) as u64,
+                "recovery_ttl_ms": capture.recovery_ttl.as_millis().min(u64::MAX as u128) as u64,
                 "capture_only": true,
             })),
             "strategy": server_strategy_name(explanation.upstream_strategy),
@@ -100,6 +104,7 @@ impl ManagementTarget {
             .query_record(&domain, record_type)
             .await
             .map_err(map_dns_runtime_error)?;
+        let explanation = dns.explain(&domain);
         let message = resolution.message();
         let response_code = message.metadata.response_code;
         Ok(json!({
@@ -108,8 +113,15 @@ impl ManagementTarget {
             "domain": domain.as_str(),
             "type": record_type.to_string(),
             "policy": resolution.metadata().plan().as_str(),
-            "rule": resolution.metadata().rule().map(|rule| rule.as_str()),
-            "match": format!("{:?}", resolution.metadata().match_kind()).to_ascii_lowercase(),
+            "selector": resolution.metadata().match_kind().as_str(),
+            "dns_rule": resolution.metadata().rule().map(|rule| rule.as_str()),
+            "matched_domain": resolution.metadata().matched_domain().map(DomainName::as_str),
+            "override_record": explanation.override_record.map(|record| json!({
+                "name": record.as_str(),
+                "addresses": explanation.override_addresses.as_deref().unwrap_or_default()
+                    .iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })),
+            "synthetic_capture": explanation.synthetic_capture.map(|capture| capture.capture.as_str().to_string()),
             "stale": resolution.is_stale(),
             "rcode": u16::from(response_code),
             "rcode_name": response_code_name(response_code),
@@ -167,6 +179,8 @@ fn parse_domain(value: &str) -> Result<DomainName, ManagementHttpError> {
 fn policy_status_json(plan: DnsPlanRuntimeSnapshot) -> Value {
     json!({
         "name": plan.plan.as_str(),
+        "override_records": plan.override_records.iter().map(|record| record.as_str()).collect::<Vec<_>>(),
+        "synthetic_capture": plan.synthetic_capture.as_ref().map(|capture| capture.as_str()),
         "strategy": server_strategy_name(plan.upstream_strategy),
         "fallback_ms": server_fallback_ms(plan.upstream_strategy),
         "answer_cidrs": plan.expected_cidrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -184,7 +198,7 @@ fn policy_status_json(plan: DnsPlanRuntimeSnapshot) -> Value {
         "coalesced_queries": plan.coalesced_queries.to_string(),
         "refreshes_started": plan.refreshes_started.to_string(),
         "stale_answers": plan.stale_answers.to_string(),
-        "record_answers": plan.host_answers.to_string(),
+        "override_record_answers": plan.override_record_answers.to_string(),
         "servers": plan.upstreams.into_iter().map(server_status_json).collect::<Vec<_>>(),
     })
 }

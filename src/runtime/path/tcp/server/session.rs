@@ -96,12 +96,13 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathSession {
 
 impl ServerTcpPathSession {
     pub(in crate::runtime::path::tcp) fn new(admission: ServerTcpPathAdmission) -> Self {
+        let max_udp_flows_per_session = admission.context.max_udp_flows_per_session;
         Self {
             session_id: admission.session_id,
             path_id: admission.path_id,
             state: ServerTcpCarrierState::Active,
             evidence: admission.evidence,
-            datagrams: ServerTcpDatagramState::new(),
+            datagrams: ServerTcpDatagramState::new(max_udp_flows_per_session),
             ip_tunnels: ServerTcpIpTunnelState::new(),
             streams: ServerTcpStreamState::new(),
             commands_rx: admission.commands_rx,

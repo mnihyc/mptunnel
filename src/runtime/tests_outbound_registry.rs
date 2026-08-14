@@ -1,10 +1,14 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
-use crate::outbound::{HttpsProxyConfig, ProxyConfig};
+use crate::outbound::{
+    DestinationAuthorizationError, DestinationAuthorizer, HttpsProxyConfig, ProxyConfig,
+};
 use crate::product::{
     CompiledDnsPolicy, DnsIpStrategy, DnsOutboundCapabilitySpec, DnsPlanId, DnsPlanSpec,
-    DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, GatewayBalancerSpec,
-    GatewayMemberSpec, GatewayStrategy, ProductAdmissionConfig, ProductAdmissionRejection,
+    DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, FlowContext,
+    GatewayBalancerSpec, GatewayMemberSpec, GatewayStrategy, InboundId, InitialDemand, PrincipalId,
+    ProductAdmissionConfig, ProductAdmissionRejection, ProductPolicyGeneration, ProtocolTarget,
+    RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -49,9 +53,50 @@ fn mpp_leaf(id: &str, context: ClientPathContext) -> RuntimeOutboundLeaf {
     }
 }
 
+struct TestDestinationPolicy {
+    policy: ProductPolicyGeneration,
+    principal: PrincipalId,
+    inbound: InboundId,
+}
+
+impl DestinationAuthorizer for TestDestinationPolicy {
+    fn product_policy(&self) -> &ProductPolicyGeneration {
+        &self.policy
+    }
+
+    fn flow(
+        &self,
+        network: Network,
+        target: &ProtocolTarget,
+    ) -> Result<Arc<FlowContext>, DestinationAuthorizationError> {
+        Ok(Arc::new(FlowContext::without_source(
+            network,
+            target.clone(),
+            self.principal.clone(),
+            self.inbound.clone(),
+        )))
+    }
+}
+
+fn allow_restricted_destination_policy() -> TestDestinationPolicy {
+    TestDestinationPolicy {
+        policy: ProductPolicyGeneration::compile(
+            1,
+            vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(EgressAction::Direct, None, InitialDemand::Automatic),
+            )],
+        )
+        .expect("test routing policy"),
+        principal: PrincipalId::parse("test-peer").expect("principal"),
+        inbound: InboundId::parse("test-inbound").expect("inbound"),
+    }
+}
+
 fn selection(registry: &RuntimeOutboundRegistry, id: &str) -> EgressSelection {
     registry
-        .selection_for_egress(&EgressRef::Outbound(
+        .selection_for_action(&EgressAction::Outbound(
             OutboundId::parse(id).expect("outbound ID"),
         ))
         .expect("outbound selection")
@@ -84,8 +129,7 @@ fn one_flow_admission() -> ProductAdmission {
 #[tokio::test]
 async fn new_flow_admission_distinguishes_initial_establishment_from_outage() {
     let target = TargetAddr::Ip("192.0.2.1:443".parse().expect("target"));
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
 
     let initial = mpp_context(7443);
     let initial_registry = RuntimeOutboundRegistry::compile(
@@ -157,8 +201,7 @@ async fn balancer_skips_offline_mpp_without_masking_native_availability() {
     .expect("mixed registry");
     let target = UdpSocket::bind("127.0.0.1:0").await.expect("UDP target");
     let target = TargetAddr::Ip(target.local_addr().expect("target address"));
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
     assert!(matches!(
         registry
             .open_udp(
@@ -204,8 +247,7 @@ async fn balancer_pre_excludes_member_without_matching_bind_family() {
     )
     .expect("family-aware registry");
     let target = TargetAddr::Ip("8.8.8.8:443".parse().expect("target address"));
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
     assert!(matches!(
         registry
             .open_udp(
@@ -345,8 +387,7 @@ async fn temporarily_unassigned_source_is_a_flow_error_and_runtime_remains_usabl
     )
     .expect("runtime registry");
     let target = TargetAddr::Ip("8.8.8.8:443".parse().expect("target address"));
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
 
     let unavailable = selection(&registry, "temporarily-down");
     assert!(matches!(
@@ -393,8 +434,7 @@ async fn all_offline_balancer_members_return_typed_unavailability() {
     )
     .expect("offline registry");
     let target = TargetAddr::Ip("192.0.2.1:443".parse().expect("target"));
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
     assert!(matches!(
         registry
             .open_udp(
@@ -424,8 +464,7 @@ async fn runtime_product_admission_precedes_target_io_and_recovers_after_close()
         admission.clone(),
     );
     let selection = selection(&registry, "direct");
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
 
     let first = registry
         .open_tcp(
@@ -498,8 +537,7 @@ async fn cancelled_outbound_open_releases_every_product_counter() {
         admission.clone(),
     );
     let selection = selection(&registry, "proxy");
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
     let opener = tokio::spawn(async move {
         registry
             .open_tcp(
@@ -558,8 +596,7 @@ async fn local_only_registry_opens_concrete_tcp_and_udp_without_mpp_context() {
             .with_product_telemetry(telemetry.clone())
             .with_dns(test_dns_generation());
     let selection = selection(&registry, "direct");
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
 
     let OpenedTcpOutbound::Local {
         stream: OutboundTcpStream::Plain(mut tcp),
@@ -682,8 +719,7 @@ async fn gateway_blackhole_failover_keeps_domain_resolution_lazy_and_irreversibl
         dns.clone(),
     )
     .expect("registry");
-    let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
-        .test_principal_policy();
+    let policy = allow_restricted_destination_policy();
     let started = tokio::time::Instant::now();
     let opened = registry
         .open_tcp(
@@ -1018,8 +1054,8 @@ fn named_dns_policy_for(
                 )],
                 plans: vec![plan_spec],
                 rules: Vec::new(),
-                hosts: Vec::new(),
-                fake_dns: None,
+                override_records: Vec::new(),
+                synthetic_captures: Vec::new(),
                 default_plan: plan,
             },
         )

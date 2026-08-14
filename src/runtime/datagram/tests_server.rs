@@ -1,12 +1,17 @@
 use super::*;
+use crate::config::ProductPolicyConfig;
 use crate::outbound::OutboundConfig;
+use crate::product::{
+    EgressAction, InboundId, InitialDemand, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
+};
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
     reliable_path_command_pending_bytes,
 };
 use crate::runtime::path::{
-    ServerDatagramOpenRequest, ServerDatagramRequest, ServerDatagramSendOutcome,
+    ServerDatagramOpenFailure, ServerDatagramOpenRequest, ServerDatagramRequest,
+    ServerDatagramSendOutcome,
 };
 use crate::runtime::stream::ServerReliableStreamRegistry;
 use crate::runtime::telemetry::RuntimeTelemetry;
@@ -54,6 +59,14 @@ fn test_server_datagram_port_with_retention(
     telemetry: RuntimeTelemetry,
     retention: Duration,
 ) -> TestServerDatagramPort {
+    test_server_datagram_port_with_limits(telemetry, retention, MuxLimits::default())
+}
+
+fn test_server_datagram_port_with_limits(
+    telemetry: RuntimeTelemetry,
+    retention: Duration,
+    mux_limits: MuxLimits,
+) -> TestServerDatagramPort {
     let outbound = OutboundConfig::Direct;
     let id = crate::product::OutboundId::parse("test-direct").expect("outbound");
     let outbound_registry = RuntimeOutboundRegistry::compile(
@@ -67,19 +80,28 @@ fn test_server_datagram_port_with_retention(
         crate::runtime::outbound_registry::test_dns_generation(),
     )
     .expect("registry");
-    let egress_selection = outbound_registry
-        .selection_for_egress(&crate::config::EgressRef::Outbound(id))
-        .expect("selection");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
+        outbound_registry,
+    )
+    .expect("router");
     let reliable_streams = Arc::new(ServerReliableStreamRegistry::new(8)).path_port();
     let inner = ServerDatagramService::path_port(ServerDatagramServiceConfig {
-        outbound_registry,
-        egress_selection,
-        dns_plan: None,
-        destination_policy: Arc::new(
-            crate::outbound::ServerDestinationPolicy::allow_restricted_for_test(),
-        ),
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         session_retention_timeout: retention,
-        mux_limits: MuxLimits::default(),
+        mux_limits,
         reliable_streams: reliable_streams.clone(),
         telemetry,
     });
@@ -88,6 +110,48 @@ fn test_server_datagram_port_with_retention(
         reliable_streams,
         carriers: Mutex::new(HashMap::new()),
     }
+}
+
+#[tokio::test]
+async fn shared_session_registry_saturation_is_an_explicit_capacity_failure() {
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port_with_limits(
+        telemetry,
+        Duration::from_secs(60),
+        MuxLimits {
+            max_streams: 1,
+            ..MuxLimits::default()
+        },
+    );
+    let session_id = SessionId(18);
+    let (carrier_a_commands, _carrier_a_rx) = reliable_path_command_channels(8);
+    let (carrier_b_commands, _carrier_b_rx) = reliable_path_command_channels(8);
+    let first = datagrams
+        .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
+            session_id,
+            flow_id: DatagramFlowId(1),
+            target: TargetAddr::Ip("127.0.0.1:9".parse().expect("first target")),
+            commands: carrier_a_commands,
+        })
+        .await
+        .expect("occupy the shared session registry from carrier A");
+
+    let failure = datagrams
+        .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
+            session_id,
+            flow_id: DatagramFlowId(2),
+            target: TargetAddr::Ip("127.0.0.1:10".parse().expect("second target")),
+            commands: carrier_b_commands,
+        })
+        .await
+        .expect_err("carrier B must observe the shared session limit");
+    assert!(matches!(
+        failure.into_failure(),
+        ServerDatagramOpenFailure::Capacity
+    ));
+    drop(first);
 }
 
 async fn await_test_signal(signal: oneshot::Receiver<()>, context: &str) {

@@ -1,16 +1,26 @@
 use super::*;
+use crate::config::ProductPolicyConfig;
 use crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::stream::validate_stream_ack;
 use crate::outbound::OutboundConfig;
+use crate::product::{
+    EgressAction, InboundId, InitialDemand, RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage,
+    RuleId,
+};
 use crate::protocol::frame::stream_ack_contiguous_frontier;
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics};
+use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamDemandHint, TargetAddr};
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::{
-    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
+    ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
+use crate::runtime::path::{
+    ServerLocalPathProperties, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPathAttachment,
+};
 use crate::runtime::relay::io::stream_ack_ranges_expose_authoritative_gap;
 use crate::runtime::stream::ReliablePathStreamOutput;
 use crate::runtime::stream::response::{
@@ -37,6 +47,154 @@ fn server_completion_waits_for_every_live_ack_publication() {
 
     publication.record_status(1, true, false);
     assert!(publication.current_generation_is_fully_published());
+}
+
+async fn assert_post_resolution_denial_is_logical_stream_local(
+    denial: RouteAction,
+    silently_dropped: bool,
+) {
+    let limits = MuxLimits::default();
+    let outbound_id = crate::product::OutboundId::parse("post-dns-direct").expect("outbound ID");
+    let dns = crate::dns::DnsGeneration::from_test_answers(HashMap::from([(
+        "denied.example".to_string(),
+        vec!["8.8.8.8".parse().expect("post-resolution address")],
+    )]));
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: outbound_id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        dns,
+    )
+    .expect("post-resolution registry");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![
+                RouteRuleSpec::new(
+                    RuleId::parse("resolved-denial").expect("route ID"),
+                    RouteMatchSpec {
+                        destination_cidrs: vec!["8.8.8.8/32".parse().expect("route CIDR")],
+                        stages: vec![RouteStage::PostResolution],
+                        ..RouteMatchSpec::default()
+                    },
+                    denial,
+                ),
+                RouteRuleSpec::new(
+                    RuleId::parse("provisional-direct").expect("route ID"),
+                    RouteMatchSpec::default(),
+                    RouteAction::allow(
+                        EgressAction::Outbound(outbound_id),
+                        None,
+                        InitialDemand::Automatic,
+                    ),
+                ),
+            ],
+        },
+        outbound_registry,
+    )
+    .expect("post-resolution router");
+    let context = Arc::new(ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
+        session_retention_timeout: Duration::from_secs(1),
+        telemetry: RuntimeTelemetry::new(4),
+    });
+    let (registry, mut accepted_rx) = ServerReliableStreamRegistry::new_accepting_with_limits(
+        limits,
+        crate::performance::ResourceLimits::default().max_paths,
+    );
+    let port = registry.path_port();
+    let session_id = SessionId(if silently_dropped { 722 } else { 721 });
+    let registration = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let (commands, mut command_rx) = reliable_path_command_channels(8);
+    let denied_stream_id = StreamId(1);
+    let sibling_stream_id = StreamId(2);
+    for (stream_id, target) in [
+        (
+            denied_stream_id,
+            TargetAddr::Domain {
+                host: "denied.example".to_string(),
+                port: 443,
+            },
+        ),
+        (
+            sibling_stream_id,
+            TargetAddr::Ip("1.1.1.1:443".parse().expect("sibling target")),
+        ),
+    ] {
+        assert!(matches!(
+            port.open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target,
+                initial_demand: StreamDemandHint::Latency,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: registration.clone(),
+                    commands: commands.clone(),
+                    max_frame_payload_bytes: limits.max_payload_bytes,
+                },
+                mux_limits: limits,
+            })
+            .await
+            .expect("open logical stream"),
+            ServerStreamOpenOutcome::New(_)
+        ));
+    }
+    let denied = accepted_rx.recv().await.expect("denied accepted stream");
+    let sibling = accepted_rx.recv().await.expect("sibling accepted stream");
+    assert_eq!(registry.management_snapshot().active_streams, 2);
+
+    relay_accepted_stream(context, denied)
+        .await
+        .expect("apply post-resolution denial");
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(1),
+        recv_reliable_path_command(&mut command_rx),
+    )
+    .await
+    .expect("logical denial command timeout")
+    .expect("logical denial command");
+    if silently_dropped {
+        assert!(
+            matches!(
+                terminal,
+                ReliablePathCommand::CloseStream(stream_id) if stream_id == denied_stream_id
+            ),
+            "drop must detach locally without a refusal frame"
+        );
+    } else {
+        assert!(matches!(
+            terminal,
+            ReliablePathCommand::ResetAndCloseStream {
+                stream_id,
+                reason: ResetReason::Refused,
+            } if stream_id == denied_stream_id
+        ));
+    }
+    assert_eq!(
+        registry.management_snapshot().active_streams,
+        1,
+        "post-resolution denial must retire only its logical stream",
+    );
+    assert_eq!(sibling.stream().stream_id, sibling_stream_id);
+}
+
+#[tokio::test]
+async fn post_resolution_reject_and_drop_preserve_sibling_logical_streams() {
+    assert_post_resolution_denial_is_logical_stream_local(RouteAction::reject(), false).await;
+    assert_post_resolution_denial_is_logical_stream_local(RouteAction::drop(), true).await;
 }
 
 #[tokio::test]
@@ -74,16 +232,25 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
         crate::runtime::outbound_registry::test_dns_generation(),
     )
     .expect("registry");
-    let egress_selection = outbound_registry
-        .selection_for_egress(&crate::config::EgressRef::Outbound(id))
-        .expect("selection");
-    let context = ServerReliableRelayContext {
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
         outbound_registry,
-        egress_selection,
-        dns_plan: None,
-        destination_policy: Arc::new(
-            crate::outbound::ServerDestinationPolicy::allow_restricted_for_test(),
-        ),
+    )
+    .expect("router");
+    let context = ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,

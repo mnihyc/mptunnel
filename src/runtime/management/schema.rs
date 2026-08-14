@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::gateway::ManagementBalancerStatus;
 
-pub(super) const SCHEMA: &str = "mptunnel.management.v3";
+pub(super) const SCHEMA: &str = "mptunnel.management.v4";
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementSnapshot {

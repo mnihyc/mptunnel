@@ -1205,31 +1205,59 @@ pub(crate) async fn resolve_authorization_before(
     authorization: DestinationAuthorization,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<AuthorizedTarget>, OutboundConnectError> {
-    let dns = DnsResolutionContext::Product {
-        generation: dns,
-        plan: dns_plan,
-    };
     let target = authorization.target();
-    let addresses = match target.ip() {
-        Some(address) => vec![address],
-        None => {
-            let host = target
-                .domain()
-                .expect("non-IP Product target has a domain")
-                .as_str();
-            operation_before(
-                deadline,
-                dns.resolve_socket_addrs(host, target.port().get()),
-            )
-            .await??
-            .into_iter()
-            .map(|address| address.ip())
-            .collect()
-        }
-    };
+    let addresses = resolve_target_addresses_before(dns, dns_plan, target, deadline).await?;
     destination_policy
         .authorize_addresses(authorization, &addresses)
         .map_err(Into::into)
+}
+
+pub(crate) async fn resolve_target_addresses_before(
+    dns: &DnsGeneration,
+    dns_plan: Option<&DnsPlanId>,
+    target: &crate::product::ProtocolTarget,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<IpAddr>, OutboundConnectError> {
+    resolve_target_addresses_with_plan_before(dns, dns_plan, target, deadline)
+        .await
+        .map(|resolved| resolved.addresses)
+}
+
+pub(crate) struct ResolvedTargetAddresses {
+    pub(crate) addresses: Vec<IpAddr>,
+    /// The exact policy that produced a domain answer. Literal targets have no
+    /// DNS provenance.
+    pub(crate) plan: Option<DnsPlanId>,
+}
+
+pub(crate) async fn resolve_target_addresses_with_plan_before(
+    dns: &DnsGeneration,
+    dns_plan: Option<&DnsPlanId>,
+    target: &crate::product::ProtocolTarget,
+    deadline: tokio::time::Instant,
+) -> Result<ResolvedTargetAddresses, OutboundConnectError> {
+    if let Some(address) = target.ip() {
+        return Ok(ResolvedTargetAddresses {
+            addresses: vec![address],
+            plan: None,
+        });
+    }
+    let domain = target.domain().expect("non-IP Product target has a domain");
+    let (addresses, plan) = match dns_plan {
+        Some(plan) => (
+            operation_before(deadline, dns.resolve_in_plan(plan, domain)).await??,
+            plan.clone(),
+        ),
+        None => {
+            let resolution = operation_before(deadline, dns.resolve(domain)).await??;
+            let plan = resolution.metadata().plan().clone();
+            (Arc::clone(resolution.addresses()), plan)
+        }
+    };
+    Ok(ResolvedTargetAddresses {
+        addresses: addresses.iter().copied().collect(),
+        plan: Some(plan),
+    })
 }
 
 pub(crate) async fn resolve_authorized_domain_before(
@@ -1267,7 +1295,8 @@ fn authorized_socket_addrs(
     let Some(first) = authorized.first() else {
         return Err(OutboundConnectError::NoAuthorizedAddresses);
     };
-    let generation = first.acl_generation();
+    let generation = first.policy_generation();
+    let permit = first.permit();
     let flow = first.flow();
     if flow.network() != network {
         return Err(DestinationAuthorizationError::TargetChanged.into());
@@ -1275,7 +1304,10 @@ fn authorized_socket_addrs(
     authorized
         .iter()
         .map(|target| {
-            if target.acl_generation() != generation || target.flow() != flow {
+            if target.policy_generation() != generation
+                || target.flow() != flow
+                || target.permit() != permit
+            {
                 return Err(DestinationAuthorizationError::TargetChanged.into());
             }
             Ok(SocketAddr::new(

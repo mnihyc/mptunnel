@@ -334,7 +334,7 @@ policy_id!(InboundId);
 pub struct FlowContext {
     network: Network,
     target: ProtocolTarget,
-    source: SourceEndpoint,
+    source: Option<SourceEndpoint>,
     principal: PrincipalId,
     inbound: InboundId,
 }
@@ -350,7 +350,25 @@ impl FlowContext {
         Self {
             network,
             target,
-            source,
+            source: Some(source),
+            principal,
+            inbound,
+        }
+    }
+
+    /// Construct a flow whose ingress protocol does not expose a transport
+    /// source endpoint. MPP L4 requests carry an authenticated principal and
+    /// target, but no trustworthy client socket address to route on.
+    pub fn without_source(
+        network: Network,
+        target: ProtocolTarget,
+        principal: PrincipalId,
+        inbound: InboundId,
+    ) -> Self {
+        Self {
+            network,
+            target,
+            source: None,
             principal,
             inbound,
         }
@@ -364,7 +382,7 @@ impl FlowContext {
         &self.target
     }
 
-    pub const fn source(&self) -> SourceEndpoint {
+    pub const fn source(&self) -> Option<SourceEndpoint> {
         self.source
     }
 

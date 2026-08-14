@@ -11,7 +11,10 @@ use crate::config::{
     AppConfig, CommandConfig, ConfigFileError, DEFAULT_CONFIG_PATH, ManagementConfig, NodeConfig,
     OutboundLeafConfig, load_config_toml,
 };
-use crate::product::{EgressAction, FlowContext, InitialDemand, RouteInput, SourceEndpoint};
+use crate::product::{
+    CompiledDnsPlan, CompiledDnsPolicy, EgressAction, FlowContext, InitialDemand,
+    RestrictedIpClass, RouteDecision, RouteDisposition, RouteInput, SourceEndpoint,
+};
 use crate::protocol::UnderlayProtocol;
 use crate::transport::Endpoint;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -55,7 +58,7 @@ fn run_status(
     output: &mut dyn Write,
 ) -> Result<(), OperationError> {
     let client = management_client(cli, args.address)?;
-    let value = client.get("/api/v3/status")?;
+    let value = client.get("/api/v4/status")?;
     write_json(output, &value, client.token())
 }
 
@@ -66,7 +69,7 @@ fn run_dns(
 ) -> Result<(), OperationError> {
     let client = management_client(cli, args.address)?;
     let value = match &args.command {
-        DnsCommand::Status => client.get("/api/v3/dns/status")?,
+        DnsCommand::Status => client.get("/api/v4/dns/status")?,
         DnsCommand::Explain(args) => dns_explain(&client, args)?,
         DnsCommand::Query(args) => dns_query(&client, args)?,
         DnsCommand::Flush(args) => dns_flush(&client, args)?,
@@ -76,7 +79,7 @@ fn run_dns(
 
 fn dns_explain(client: &ManagementClient, args: &DnsExplainArgs) -> Result<Value, OperationError> {
     let encoded = utf8_percent_encode(args.domain.as_str(), NON_ALPHANUMERIC);
-    client.get(&format!("/api/v3/dns/explain?domain={encoded}"))
+    client.get(&format!("/api/v4/dns/explain?domain={encoded}"))
 }
 
 fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, OperationError> {
@@ -90,7 +93,7 @@ fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, Op
         return Err(OperationError::InvalidDnsRecordType);
     }
     client.post(
-        "/api/v3/dns/query",
+        "/api/v4/dns/query",
         &json!({
             "domain": args.domain.as_str(),
             "type": args.record_type.to_ascii_uppercase(),
@@ -100,7 +103,7 @@ fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, Op
 
 fn dns_flush(client: &ManagementClient, args: &DnsFlushArgs) -> Result<Value, OperationError> {
     client.post(
-        "/api/v3/dns/cache/flush",
+        "/api/v4/dns/cache/flush",
         &json!({"policy": args.policy.as_ref().map(|policy| policy.as_str())}),
     )
 }
@@ -119,25 +122,99 @@ fn run_route_explain(
         .ok_or(OperationError::NoProductRouting)?
         .compile()
         .map_err(|error| OperationError::RoutePolicy(error.to_string()))?;
+    let dns_policy = node
+        .dns_policy
+        .compile()
+        .map_err(|error| OperationError::DnsPolicy(error.to_string()))?;
 
-    let flow = FlowContext::new(
-        args.network.into(),
-        args.target.clone(),
-        SourceEndpoint::from_socket_addr(args.source),
-        crate::product::PrincipalId::parse(&cli.principal_id)
-            .map_err(|error| OperationError::RouteInput(error.to_string()))?,
-        args.inbound.clone(),
-    );
+    let network = args.network.into();
+    let principal = crate::product::PrincipalId::parse(&cli.principal_id)
+        .map_err(|error| OperationError::RouteInput(error.to_string()))?;
+    let flow = match args.source {
+        Some(source) => FlowContext::new(
+            network,
+            args.target.clone(),
+            SourceEndpoint::from_socket_addr(source),
+            principal,
+            args.inbound.clone(),
+        ),
+        None => FlowContext::without_source(
+            network,
+            args.target.clone(),
+            principal,
+            args.inbound.clone(),
+        ),
+    };
     let input = args.resolved_ip.map_or_else(
         || RouteInput::pre_resolution(&flow),
         |address| RouteInput::post_resolution(&flow, address),
     );
-    let explanation = policy.routes().explain(input);
-    render_route_explanation(node, &policy, &flow, input, &explanation, output)
+    let pre_resolution = policy.routes().classify(RouteInput::pre_resolution(&flow));
+    let resolution_dns_plan = (args.resolved_ip.is_some() && flow.target().domain().is_some())
+        .then(|| {
+            pre_resolution
+                .action()
+                .dns_plan()
+                .cloned()
+                .unwrap_or_else(|| {
+                    dns_policy
+                        .select(flow.target().domain().expect("checked domain"))
+                        .plan()
+                        .id()
+                        .clone()
+                })
+        });
+    let explanation = policy
+        .routes()
+        .explain_with_action_eligibility(input, |action| {
+            if let (Some(selected), Some(resolved)) =
+                (action.dns_plan(), resolution_dns_plan.as_ref())
+                && selected != resolved
+            {
+                return Some(crate::product::RouteMismatch::DnsPolicyProvenance);
+            }
+            action.egress().and_then(|egress| {
+                input
+                    .resolved_ip()
+                    .is_some_and(|address| !egress_supports_ip_family(node, egress, address))
+                    .then_some(crate::product::RouteMismatch::EgressIpFamily)
+            })
+        });
+    render_route_explanation(&dns_policy, &policy, &flow, input, &explanation, output)
+}
+
+fn egress_supports_ip_family(node: &NodeConfig, egress: &EgressAction, address: IpAddr) -> bool {
+    match egress {
+        EgressAction::Direct => true,
+        EgressAction::Outbound(id) => node
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.id() == id)
+            .is_some_and(|outbound| outbound_supports_ip_family(outbound, address)),
+        EgressAction::Balancer(id) => node
+            .gateway_balancers
+            .iter()
+            .find(|balancer| &balancer.id == id)
+            .is_some_and(|balancer| {
+                balancer.spec.members.iter().any(|member| {
+                    node.outbounds
+                        .iter()
+                        .find(|outbound| outbound.id() == &member.id)
+                        .is_some_and(|outbound| outbound_supports_ip_family(outbound, address))
+                })
+            }),
+    }
+}
+
+fn outbound_supports_ip_family(outbound: &OutboundLeafConfig, address: IpAddr) -> bool {
+    match outbound {
+        OutboundLeafConfig::Mpp { .. } => true,
+        OutboundLeafConfig::Local { config, .. } => config.supports_ip_family(address),
+    }
 }
 
 fn render_route_explanation(
-    node: &NodeConfig,
+    dns_policy: &CompiledDnsPolicy,
     policy: &crate::product::ProductPolicyGeneration,
     flow: &FlowContext,
     input: RouteInput<'_>,
@@ -146,12 +223,8 @@ fn render_route_explanation(
 ) -> Result<(), OperationError> {
     let selected = explanation.selected();
     let action = selected.action();
-    let action_name = egress_action_name(action.egress());
+    let decision_name = route_decision_name(action.disposition());
     let resolution = policy.routes().classify(RouteInput::pre_resolution(flow));
-    let resolution_action = resolution.action();
-    let resolution_dns_policy = resolution_action
-        .dns_plan()
-        .unwrap_or(&node.dns_policy.spec.default_plan);
     writeln!(output, "route:")?;
     writeln!(output, "  generation: {}", explanation.generation())?;
     writeln!(
@@ -174,39 +247,73 @@ fn render_route_explanation(
     writeln!(
         output,
         "  source: {}",
-        SocketAddr::new(flow.source().address(), flow.source().port())
+        flow.source().map_or_else(
+            || "none".to_string(),
+            |source| SocketAddr::new(source.address(), source.port()).to_string(),
+        )
     )?;
     writeln!(output, "  principal: {}", flow.principal())?;
     writeln!(output, "  inbound: {}", flow.inbound())?;
-    writeln!(output, "resolution:")?;
-    writeln!(output, "  rule: {}", resolution.rule_id())?;
+    render_route_dns_selection(dns_policy, flow, resolution, output)?;
+    writeln!(output, "selected:")?;
     writeln!(
         output,
-        "  dns_policy: {}{}",
-        resolution_dns_policy,
-        if resolution_action.dns_plan().is_some() {
-            ""
+        "  rule: {}",
+        if selected.is_implicit() {
+            "none"
         } else {
-            " (policy default)"
+            selected.rule_id().as_str()
         }
     )?;
-    writeln!(output, "selected:")?;
-    writeln!(output, "  rule: {}", selected.rule_id())?;
-    writeln!(output, "  action: {action_name}")?;
-    match action.egress() {
-        EgressAction::Outbound(outbound) => writeln!(output, "  outbound: {outbound}")?,
-        EgressAction::Balancer(balancer) => writeln!(output, "  balancer: {balancer}")?,
-        EgressAction::Direct | EgressAction::Reject | EgressAction::Drop => {}
-    }
     writeln!(
         output,
-        "  initial_demand: {}",
-        initial_demand_name(action.initial_demand())
+        "  outcome: {}",
+        if selected.is_implicit() {
+            "unmatched"
+        } else {
+            "matched"
+        }
     )?;
+    writeln!(output, "  decision: {decision_name}")?;
+    match action.egress() {
+        Some(EgressAction::Direct) => writeln!(output, "  egress: direct")?,
+        Some(EgressAction::Outbound(outbound)) => {
+            writeln!(output, "  egress: outbound")?;
+            writeln!(output, "  outbound: {outbound}")?;
+        }
+        Some(EgressAction::Balancer(balancer)) => {
+            writeln!(output, "  egress: balancer")?;
+            writeln!(output, "  balancer: {balancer}")?;
+        }
+        None => {}
+    }
+    if action.egress().is_some() {
+        writeln!(
+            output,
+            "  initial_demand: {}",
+            initial_demand_name(action.initial_demand())
+        )?;
+    }
     writeln!(output, "  explanation: {}", selected.explanation())?;
+    render_restricted_authorization(input, selected, output)?;
     writeln!(output, "rules:")?;
     for trace in explanation.rules() {
-        writeln!(output, "  - id: {}", trace.rule_id())?;
+        if trace.is_implicit() && !trace.selected() {
+            continue;
+        }
+        writeln!(
+            output,
+            "  - id: {}",
+            if trace.is_implicit() {
+                "none"
+            } else {
+                trace.rule_id().as_str()
+            }
+        )?;
+        if trace.is_implicit() {
+            writeln!(output, "    result: unmatched (implicit reject)")?;
+            continue;
+        }
         if trace.selected() {
             writeln!(output, "    result: selected")?;
         } else if let Some(mismatch) = trace.first_mismatch() {
@@ -235,13 +342,128 @@ fn render_route_explanation(
     Ok(())
 }
 
-fn egress_action_name(action: &EgressAction) -> &'static str {
-    match action {
-        EgressAction::Direct => "direct",
-        EgressAction::Reject => "reject",
-        EgressAction::Drop => "drop",
-        EgressAction::Outbound(_) => "outbound",
-        EgressAction::Balancer(_) => "balancer",
+fn render_route_dns_selection(
+    dns_policy: &CompiledDnsPolicy,
+    flow: &FlowContext,
+    resolution: RouteDecision<'_>,
+    output: &mut dyn Write,
+) -> Result<(), OperationError> {
+    writeln!(output, "resolution:")?;
+    writeln!(
+        output,
+        "  route_rule: {}",
+        if resolution.is_implicit() {
+            "none"
+        } else {
+            resolution.rule_id().as_str()
+        }
+    )?;
+
+    if resolution.action().egress().is_none() {
+        return render_absent_dns_selection(output);
+    }
+
+    if let Some(plan_id) = resolution.action().dns_plan() {
+        let plan = dns_policy
+            .plan(plan_id)
+            .expect("validated route-selected DNS policy");
+        return render_dns_plan(output, plan, "route", None, None);
+    }
+
+    let Some(domain) = flow.target().domain() else {
+        return render_absent_dns_selection(output);
+    };
+    let selection = dns_policy.select(domain);
+    render_dns_plan(
+        output,
+        selection.plan(),
+        selection.match_kind().as_str(),
+        selection.rule_id().map(crate::product::DnsRuleId::as_str),
+        selection
+            .matched_domain()
+            .map(crate::product::DomainName::as_str),
+    )
+}
+
+fn render_absent_dns_selection(output: &mut dyn Write) -> Result<(), OperationError> {
+    writeln!(output, "  policy: none")?;
+    writeln!(output, "  selector: none")?;
+    writeln!(output, "  dns_rule: none")?;
+    writeln!(output, "  matched_domain: none")?;
+    writeln!(output, "  override_records: []")?;
+    writeln!(output, "  synthetic_capture: none")?;
+    Ok(())
+}
+
+fn render_dns_plan(
+    output: &mut dyn Write,
+    plan: &CompiledDnsPlan,
+    selector: &'static str,
+    rule: Option<&str>,
+    matched_domain: Option<&str>,
+) -> Result<(), OperationError> {
+    writeln!(output, "  policy: {}", plan.id())?;
+    writeln!(output, "  selector: {selector}")?;
+    writeln!(output, "  dns_rule: {}", rule.unwrap_or("none"))?;
+    writeln!(
+        output,
+        "  matched_domain: {}",
+        matched_domain.unwrap_or("none")
+    )?;
+    write!(output, "  override_records: [")?;
+    for (index, record) in plan.override_records().iter().enumerate() {
+        if index != 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{record}")?;
+    }
+    writeln!(output, "]")?;
+    writeln!(
+        output,
+        "  synthetic_capture: {}",
+        plan.synthetic_capture()
+            .map_or("none", crate::product::DnsSyntheticCaptureId::as_str)
+    )?;
+    Ok(())
+}
+
+fn render_restricted_authorization(
+    input: RouteInput<'_>,
+    selected: RouteDecision<'_>,
+    output: &mut dyn Write,
+) -> Result<(), OperationError> {
+    let destination = input.flow().target().ip().or(input.resolved_ip());
+    let restricted_class = destination.and_then(RestrictedIpClass::classify);
+    let restricted_authorized =
+        selected.action().disposition() == RouteDisposition::AllowRestricted;
+    let (class, outcome, rule) = match (destination, restricted_class) {
+        (None, _) => ("none".to_string(), "not-evaluated", None),
+        (Some(_), None) => ("public".to_string(), "not-required", None),
+        (Some(_), Some(class)) if restricted_authorized => (
+            class.to_string(),
+            "authorized",
+            (!selected.is_implicit()).then(|| selected.rule_id().as_str()),
+        ),
+        (Some(_), Some(class)) => (
+            class.to_string(),
+            "denied",
+            (!selected.is_implicit()).then(|| selected.rule_id().as_str()),
+        ),
+    };
+    writeln!(output, "authorization:")?;
+    writeln!(output, "  restricted_class: {class}")?;
+    writeln!(output, "  restricted_authorized: {restricted_authorized}")?;
+    writeln!(output, "  outcome: {outcome}")?;
+    writeln!(output, "  rule: {}", rule.unwrap_or("none"))?;
+    Ok(())
+}
+
+fn route_decision_name(decision: RouteDisposition) -> &'static str {
+    match decision {
+        RouteDisposition::Allow => "allow",
+        RouteDisposition::AllowRestricted => "allow-restricted",
+        RouteDisposition::Reject => "reject",
+        RouteDisposition::Drop => "drop",
     }
 }
 
@@ -361,7 +583,7 @@ fn doctor_management_checks(
     for address in addresses {
         let label = format!("management {address}");
         let result = ManagementClient::new(address, token.clone())
-            .and_then(|client| client.request("GET", "/api/v3/health", None, true));
+            .and_then(|client| client.request("GET", "/api/v4/health", None, true));
         match result {
             Ok(response) => {
                 let live = response.body.get("live").and_then(Value::as_bool);
@@ -385,10 +607,14 @@ fn doctor_management_checks(
                             report.warn(&label, detail);
                         }
                     }
-                    _ if explicit => {
-                        report.fail(&label, "health response did not match the v2 schema")
-                    }
-                    _ => report.warn(&label, "health response did not match the v2 schema"),
+                    _ if explicit => report.fail(
+                        &label,
+                        "health response did not match the mptunnel.health.v4 schema",
+                    ),
+                    _ => report.warn(
+                        &label,
+                        "health response did not match the mptunnel.health.v4 schema",
+                    ),
                 }
             }
             Err(error) if explicit => report.fail(&label, error.to_string()),
@@ -908,7 +1134,7 @@ struct ManagementResponse {
 fn validate_management_path(path: &str) -> Result<(), OperationError> {
     if path.is_empty()
         || path.len() > MANAGEMENT_PATH_LIMIT
-        || !path.starts_with("/api/v3/")
+        || !path.starts_with("/api/v4/")
         || !path.is_ascii()
         || path
             .bytes()
@@ -1054,6 +1280,7 @@ pub enum OperationError {
     CliConfig(crate::cli::CliConfigError),
     NoProductRouting,
     RoutePolicy(String),
+    DnsPolicy(String),
     RouteInput(String),
     InvalidDnsRecordType,
     ManagementTokenRequired,
@@ -1101,6 +1328,7 @@ impl std::fmt::Display for OperationError {
                 formatter.write_str("configuration has no local routing policy")
             }
             Self::RoutePolicy(error) => write!(formatter, "failed to compile routing: {error}"),
+            Self::DnsPolicy(error) => write!(formatter, "failed to compile DNS policy: {error}"),
             Self::RouteInput(error) => write!(formatter, "invalid route input: {error}"),
             Self::InvalidDnsRecordType => formatter.write_str(
                 "DNS record type must contain 1-16 ASCII letters or digits",

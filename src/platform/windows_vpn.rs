@@ -18,7 +18,7 @@ use crate::platform::{
     WindowsWintunConfig, WindowsWintunConfigError, WindowsWintunCreateError,
     WindowsWintunDeviceFactory, snapshot_process_vpn_environment,
 };
-use crate::product::{CompiledDnsPolicy, DomainName};
+use crate::product::{CompiledDnsPolicy, DnsActivation, DomainName};
 use crate::transport::{
     CarrierNetworkProvider, Endpoint, NativeSocketConfigurator, PreparedCarrierNetworkProvider,
     PreparedCarrierPath, ProtectedCarrierNetworkProvider, ProtectedNativeSocketConfigurator,
@@ -45,6 +45,7 @@ pub(crate) struct WindowsVpnPrepareRequest {
     native_proxy_endpoints: Vec<Endpoint>,
     prepublication_domains: Vec<DomainName>,
     dns_policy: Arc<CompiledDnsPolicy>,
+    dns_activation: DnsActivation,
     resolution_timeout: Duration,
 }
 
@@ -74,6 +75,7 @@ fn compile_node_windows_vpn_prepare_request(
         native_proxy_endpoints,
         prepublication_domains,
         dns_policy,
+        dns_activation,
         resolution_timeout,
     } = spec;
     // Portable configs may carry Linux tuning for use by the same file on a
@@ -94,6 +96,7 @@ fn compile_node_windows_vpn_prepare_request(
         native_proxy_endpoints,
         prepublication_domains,
         dns_policy,
+        dns_activation,
         resolution_timeout,
     }))
 }
@@ -283,7 +286,7 @@ pub(crate) async fn prepare_windows_vpn(
     .await?;
     let bootstrap_dns_addresses = request
         .dns_policy
-        .bootstrap_endpoints()
+        .bootstrap_endpoints_for_activation(&request.dns_activation)
         .map(|endpoint| endpoint.ip())
         .collect::<Vec<_>>();
 
@@ -359,10 +362,16 @@ fn validate_prepare_request(
             maximum: MAX_NATIVE_ENDPOINTS,
         });
     }
-    if request.dns_policy.uses_system_resolution() {
+    if request
+        .dns_policy
+        .uses_system_resolution_for_activation(&request.dns_activation)
+    {
         return Err(WindowsVpnPrepareError::SystemDnsUnsupported);
     }
-    if !request.dns_policy.is_encrypted_only() {
+    if !request
+        .dns_policy
+        .is_encrypted_only_for_activation(&request.dns_activation)
+    {
         return Err(WindowsVpnPrepareError::EncryptedDnsRequired);
     }
     if request.managed.dns().is_none()

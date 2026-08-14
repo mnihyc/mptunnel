@@ -144,7 +144,11 @@ fn domain_only_destination_set_cannot_create_address_routing_demand() {
                     destination_rule_sets: vec![domain_only],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
+                RouteAction::allow(
+                    EgressAction::Outbound(OutboundId::parse("proxy").expect("outbound")),
+                    Some("secure".parse().expect("DNS policy")),
+                    InitialDemand::Automatic,
+                ),
             ),
             RouteRuleSpec::new(
                 RuleId::parse("stable-domain").expect("rule"),
@@ -152,7 +156,7 @@ fn domain_only_destination_set_cannot_create_address_routing_demand() {
                     domain_exact: vec![DomainName::parse("service.example").expect("domain")],
                     ..RouteMatchSpec::default()
                 },
-                RouteAction::new(
+                RouteAction::allow(
                     EgressAction::Outbound(OutboundId::parse("proxy").expect("outbound")),
                     None,
                     InitialDemand::Automatic,
@@ -161,7 +165,7 @@ fn domain_only_destination_set_cannot_create_address_routing_demand() {
             RouteRuleSpec::new(
                 RuleId::parse("default").expect("rule"),
                 RouteMatchSpec::default(),
-                RouteAction::new(EgressAction::Reject, None, InitialDemand::Automatic),
+                RouteAction::reject(),
             ),
         ],
     )
@@ -177,4 +181,37 @@ fn domain_only_destination_set_cannot_create_address_routing_demand() {
     let (decision, requires_address_evidence) = table.classify_pre_resolution(&flow);
     assert_eq!(decision.rule_id().as_str(), "stable-domain");
     assert!(!requires_address_evidence);
+}
+
+#[test]
+fn cidr_bearing_destination_set_cannot_select_dns_policy() {
+    use crate::product::{
+        CompiledRouteTable, EgressAction, InitialDemand, OutboundId, RouteAction,
+        RouteCompileError, RouteMatchSpec, RouteRuleSpec, RuleId,
+    };
+
+    let (artifact, catalog) = signed_artifact(payload());
+    let address_set = Arc::new(
+        VerifiedRuleSet::verify_json(&artifact, &catalog, TEST_NOW).expect("verified set"),
+    );
+    let result = CompiledRouteTable::compile(
+        7,
+        vec![RouteRuleSpec::new(
+            RuleId::parse("address-set").expect("rule"),
+            RouteMatchSpec {
+                destination_rule_sets: vec![address_set],
+                ..RouteMatchSpec::default()
+            },
+            RouteAction::allow(
+                EgressAction::Outbound(OutboundId::parse("proxy").expect("outbound")),
+                Some("secure".parse().expect("DNS policy")),
+                InitialDemand::Automatic,
+            ),
+        )],
+    );
+
+    assert!(matches!(
+        result,
+        Err(RouteCompileError::PostResolutionDnsPlan(rule)) if rule.as_str() == "address-set"
+    ));
 }

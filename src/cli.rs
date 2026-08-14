@@ -1520,6 +1520,14 @@ impl ServerArgs {
         };
         let id = OutboundId::parse("cli-egress")
             .map_err(|error| CliConfigError::ProductPolicy(error.to_string()))?;
+        let route_matcher = if outbound.supports_udp_targets() {
+            RouteMatchSpec::default()
+        } else {
+            RouteMatchSpec {
+                networks: vec![crate::product::Network::Tcp],
+                ..RouteMatchSpec::default()
+            }
+        };
         let (dns_policy, dns_plan) = simple_dns_policy(
             self.outbound_dns_protocol,
             self.outbound_dns_servers,
@@ -1560,7 +1568,7 @@ impl ServerArgs {
                 routes: vec![RouteRuleSpec::new(
                     RuleId::parse("default")
                         .map_err(|error| CliConfigError::ProductPolicy(error.to_string()))?,
-                    RouteMatchSpec::default(),
+                    route_matcher,
                     RouteAction::allow(
                         EgressAction::Outbound(id.clone()),
                         Some(dns_plan),

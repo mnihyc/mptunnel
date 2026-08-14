@@ -355,7 +355,11 @@ async fn split_selection_metadata_and_plan_caches_are_isolated() {
             direct_udp("private-upstream", "10.0.0.53:53"),
         ],
         vec![
-            ipv4_plan("public", vec![upstream_id("public-upstream")]),
+            {
+                let mut plan = ipv4_plan("public", vec![upstream_id("public-upstream")]);
+                plan.ip_strategy = DnsIpStrategy::Ipv4ThenIpv6;
+                plan
+            },
             ipv4_plan("private", vec![upstream_id("private-upstream")]),
         ],
         vec![DnsRuleSpec {

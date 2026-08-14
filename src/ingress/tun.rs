@@ -86,7 +86,7 @@ impl TunL4Config {
     /// System-facing addresses handled by the managed local DNS listener.
     ///
     /// External/manual TUN forwarding intentionally returns an empty slice and
-    /// continues to use `dns_resolvers`.
+    /// continues to use the configured DNS redirects.
     pub fn managed_dns_capture_servers(&self) -> &[IpAddr] {
         self.managed_vpn()
             .map_or(&[], |config| config.dns_capture_servers.as_slice())
@@ -168,11 +168,10 @@ impl fmt::Display for ManagedVpnCompileError {
                 write!(formatter, "managed VPN IPv6 prefix {prefix} exceeds 128")
             }
             Self::FullDnsCaptureRequired => {
-                formatter.write_str("managed full VPN requires at least one DNS capture server")
+                formatter.write_str("managed full VPN requires at least one DNS listener")
             }
-            Self::ExternalDnsResolvers => formatter.write_str(
-                "managed VPN cannot set external TUN dns_resolvers; use DNS capture servers",
-            ),
+            Self::ExternalDnsResolvers => formatter
+                .write_str("managed VPN cannot set external TUN dns_redirects; use DNS listeners"),
             Self::ExternalIpv4Gateway => {
                 formatter.write_str("managed VPN cannot set the external/manual TUN IPv4 gateway")
             }

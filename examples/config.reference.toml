@@ -9,6 +9,17 @@
 # Minimal client and server profiles live in ./examples. Unknown TOML keys are
 # rejected. `mptunnel platform` reports host integration support; it is a
 # command, not a TOML setting.
+#
+# Vocabulary used throughout this reference:
+# - target: the application destination requested by a client;
+# - listen address: a local socket on which MPTUNNEL accepts traffic;
+# - endpoint: a proxy connector or MPP carrier URI;
+# - path: one named TCP or QUIC carrier configuration in an MPP session;
+# - DNS server: one named DNS transport and its connection settings;
+# - DNS policy: server selection, address-family behavior, limits, and cache;
+# - DNS record: an exact static domain-to-address answer;
+# - DNS override: a synthetic captured address that can recover its domain;
+# - outbound: a named connector used for application traffic or routed DNS.
 
 check_config = false
 
@@ -26,11 +37,32 @@ console = true          # standard error
 # file = "logs/mptunnel.log"
 flow_events = false     # opt-in destination-bearing flow open/close records
 
+# Every secret, password, certificate, and key uses one byte-material source.
+# A source is resolved once when a configuration generation is compiled. No
+# source trims whitespace or line endings. Relative file paths resolve beside
+# this document. `env` reads the file whose path is stored in the named
+# environment variable; the variable never contains the material itself.
+# Hex is strict and must have an even number of digits. Base64 is strict,
+# padded RFC 4648 standard Base64. Raw values are TOML UTF-8 text; omitting
+# `from` when `value` is present is identical to `from = "raw"`.
+# secret = { from = "file", path = "mpp-credential.key" }
+# secret = { from = "env", var = "MPTUNNEL_HOME_KEY_FILE" }
+# secret = { from = "hex", value = "001122aabbccddeeff" }
+# secret = { from = "base64", value = "ABEiM0RVZneImaq7zN3u/w==" }
+# secret = { from = "raw", value = "exact UTF-8 bytes" }
+# secret = { value = "exact UTF-8 bytes" }
+# Inline raw, hex, and Base64 values remain recoverable from this file; their
+# encoding is not encryption. Consumer requirements still apply:
+# - `credentials.secret`: an exact textual UUID or at least 32 bytes;
+# - `local_users.password` and `outbounds.auth.password`: valid UTF-8 accepted
+#   by the proxy protocol;
+# - `management.token`: 16..=256 visible ASCII bytes;
+# - `transport_secret` and `ed25519_public_key`: exactly 32 bytes;
+# - certificate/CA fields: one or more complete PEM certificates; hex/Base64
+#   must decode to the complete PEM bytes, including PEM boundaries and lines;
+# - `tls_private_key`: exactly one complete supported PEM private key.
 # Global credentials use protocol credential and principal identities. Each
 # MPP outbound uses `credential_id`; an MPP inbound accepts `credential_ids`.
-# File references are resolved relative to this TOML document. Environment
-# references use:
-# secret = { from = "environment", variable = "MPTUNNEL_HOME_KEY" }.
 [[credentials]]
 credential_id = "home-client"
 principal_id = "home"
@@ -41,8 +73,8 @@ secret = { from = "file", path = "mpp-credential.key" }
 
 # Optional named users for local SOCKS5 and HTTP CONNECT authentication.
 # Login names and passwords are protocol credentials; `principal_id` is the
-# stable principal identity used by routing and admission. Passwords are never
-# accepted inline.
+# stable principal identity used by routing and admission. Inline values are
+# stored in this document; Base64 is an encoding, not encryption.
 # [[local_users]]
 # name = "phone-login"
 # principal_id = "family"
@@ -120,69 +152,104 @@ max_live_flows_per_target = 256
 max_connects_per_target = 32
 max_dns_work = 128
 
-# DNS is one global named policy. Routes and MPP server inbounds may select a
-# DNS plan by name; exact rules win over the longest matching suffix, then
-# default.
+# DNS is one global catalog of named servers and policies. Routes and MPP
+# server inbounds may select a policy with `dns_policy`. A DNS rule's exact
+# domain wins over its longest matching suffix; `[dns].default` is used when no
+# rule matches. Omitting `[dns]` creates a `system` server and `default` policy
+# with the same defaults shown below.
 [dns]
-generation = 1
-default_dns_plan = "system"
-# There is never an implicit host-resolver escape path. Define a named
-# `transport = "system"` upstream explicitly when that behavior is wanted.
+default = "system"
 
-[[dns.upstreams]]
+# `protocol = "system"` delegates to the operating-system resolver and accepts
+# no address, TLS name, HTTP path, or routed outbound. Every network protocol
+# requires `address` as a literal IP socket, avoiding recursive DNS. Bracket an
+# IPv6 address. The protocols are system, udp, tcp, udp-tcp, dot, doh, and doq.
+[[dns.servers]]
 name = "system"
-transport = "system" # system, udp, tcp, udp-tcp, tls, https, or quic
+protocol = "system"
 
-[[dns.plans]]
-name = "system"
-upstreams = ["system"]
-ip_strategy = "ipv4-and-ipv6" # ipv4-only, ipv6-only, ipv4-then-ipv6,
-# ipv6-then-ipv4, ipv4-and-ipv6, or ipv6-and-ipv4
-security = "allow-plaintext"
-upstream_strategy = "ordered"
-# For plans with at least two upstreams, use `upstream_strategy = "race"` and
-# set `fallback_delay_ms` (zero races all upstreams immediately).
-# fallback_delay_ms = 50
-expected_cidrs = []
-lookup_timeout_ms = 5000
-cache_capacity = 4096
-max_inflight = 64
-max_answers = 64
-positive_ttl_cap_ms = 300000
-negative_ttl_cap_ms = 30000
-stale_if_error_ms = 30000
-prefetch_max_ms = 30000
+# Plain DNS server forms. `udp-tcp` retries a truncated UDP response over TCP.
+# [[dns.servers]]
+# name = "plain-udp"
+# protocol = "udp"
+# address = "1.1.1.1:53"
+#
+# [[dns.servers]]
+# name = "plain-tcp"
+# protocol = "tcp"
+# address = "1.1.1.1:53"
+#
+# [[dns.servers]]
+# name = "plain-udp-tcp"
+# protocol = "udp-tcp"
+# address = "[2606:4700:4700::1111]:53"
 
-# Encrypted upstream example. `bootstrap` is always a literal IP socket;
-# `server_name` authenticates TLS and is also the DoH authority. Custom DoH
-# ports are preserved. Use `transport = "tls"` for DoT or
-# `transport = "quic"` for DoQ (both without `path`). Direct and source-bound
-# leaves support DoQ; stream proxy/MPP DNS egress supports TCP/DoT/DoH.
-# [[dns.upstreams]]
-# name = "secure"
-# transport = "https"
-# bootstrap = "1.1.1.1:443"
-# server_name = "cloudflare-dns.com"
+# Encrypted DNS server forms. `tls_name` is the authenticated DNS name; for
+# DoH it is also the HTTPS authority. `path` is required only by DoH and must
+# begin with `/`. `outbound` optionally routes TCP, DoT, or DoH through one
+# named direct, SOCKS5, HTTP CONNECT, HTTPS CONNECT, or MPP outbound. Plain UDP
+# and DoQ require native direct/source-bound egress when `outbound` is present.
+# [[dns.servers]]
+# name = "secure-dot"
+# protocol = "dot"
+# address = "1.1.1.1:853"
+# tls_name = "cloudflare-dns.com"
+#
+# [[dns.servers]]
+# name = "secure-doh"
+# protocol = "doh"
+# address = "1.1.1.1:443"
+# tls_name = "cloudflare-dns.com"
 # path = "/dns-query"
 # outbound = "edge-mpp"
 #
-# `outbound` is optional. When present, DNS TCP/DoT/DoH uses that
-# named MPP, SOCKS5, HTTP CONNECT, HTTPS CONNECT, or direct leaf. DoQ and
-# plaintext UDP require a native direct/source-bound leaf.
+# [[dns.servers]]
+# name = "secure-doq"
+# protocol = "doq"
+# address = "[2606:4700:4700::1111]:853"
+# tls_name = "cloudflare-dns.com"
+
+# A policy lists DNS servers in order. `family` controls requested and returned
+# A/AAAA families: ipv4-only, ipv6-only, ipv4-then-ipv6, ipv6-then-ipv4,
+# ipv4-and-ipv6, or ipv6-and-ipv4. `security = "require-encrypted"` rejects any
+# server other than DoT, DoH, or DoQ. Ordered strategy advances only after a
+# transport/server failure; a DNS negative response is authoritative. Racing
+# requires `fallback_ms` and starts each later server after that delay; zero
+# starts all at once. A nonempty `answer_cidrs` accepts a response only when
+# every A/AAAA address is inside at least one listed network.
+[[dns.policies]]
+name = "system"
+servers = ["system"]
+family = "ipv4-and-ipv6"
+security = "allow-plaintext"
+strategy = "ordered"
+answer_cidrs = []
+query = { timeout_ms = 5000, inflight = 64, answers = 64 }
+cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, stale_ms = 30000, prefetch_ms = 30000 }
+# `query.timeout_ms` is the complete policy lookup deadline. `query.inflight`
+# and `query.answers` bound concurrent work and accepted answers. Cache TTLs are
+# caps in milliseconds; `stale_ms = 0` disables stale-on-error and
+# `prefetch_ms = 0` disables refresh-ahead.
 #
-# [[dns.plans]]
+# [[dns.policies]]
 # name = "secure"
-# upstreams = ["secure"]
+# servers = ["secure-doh", "secure-dot"]
+# family = "ipv4-and-ipv6"
 # security = "require-encrypted"
+# strategy = "race"
+# fallback_ms = 50
+# answer_cidrs = ["0.0.0.0/0", "::/0"]
+# query = { timeout_ms = 5000, inflight = 64, answers = 64 }
+# cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, stale_ms = 30000, prefetch_ms = 30000 }
 #
-# FakeDNS applies only to captured A/AAAA wire queries. Dial-time resolution
-# still obtains real addresses from the selected plan. Synthetic addresses are
+# DNS override applies only to captured A/AAAA wire queries. Dial-time
+# resolution still obtains real addresses from the selected policy. Synthetic addresses are
 # never reassigned to another domain in one generation; expired/unknown
 # recovery fails closed. IPv4 must be inside 198.18.0.0/15 and IPv6 inside
-# fc00::/7 so a fake pool cannot shadow public destinations. Managed split VPN
+# fc00::/7 so a synthetic pool cannot shadow public destinations. Managed split VPN
 # includes must cover every configured pool and excludes may not overlap one;
 # an external/manual TUN operator owns the equivalent routes.
-# [dns.fake_dns]
+# [dns.override]
 # ipv4_pool = "198.18.0.0/16"
 # ipv6_pool = "fd00:4d50::/112"
 # max_entries = 4096
@@ -192,16 +259,17 @@ prefetch_max_ms = 30000
 # [[dns.rules]]
 # name = "private-host"
 # exact = "router.corp.example"
-# dns_plan = "system"
-# explanation = "private host uses the host resolver"
+# policy = "system"
+# explanation = "private host uses the system DNS server"
 #
 # [[dns.rules]]
 # name = "private-zone"
 # suffix = "corp.example" # Exactly one of exact or suffix.
-# dns_plan = "system"
+# policy = "system"
 #
-# Exact immutable host overrides never leak unmatched record types upstream.
-# [[dns.hosts]]
+# Exact immutable records answer locally and never send unmatched record types
+# to a DNS server.
+# [[dns.records]]
 # domain = "router.home.arpa"
 # addresses = ["192.168.1.1", "fd00::1"]
 
@@ -287,7 +355,10 @@ listen = ["127.0.0.1:8080"]
 # ipv6_prefix = 64
 # mtu = 1500
 # disable_icmp = false
-# dns_resolvers = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
+# External/manual mode rewrites captured UDP port-53 destinations to a listed
+# `dns_redirects` socket, preferring an address of the original IP family.
+# dns_redirects = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
+# `dns_ttl_ms` bounds the external DNS datagram association.
 # dns_ttl_ms = 5000
 #
 # To run IPv6-only, set disable_ipv4 = true and remove ipv4 and ipv4_gateway.
@@ -295,8 +366,8 @@ listen = ["127.0.0.1:8080"]
 #
 # On a supported host MPTUNNEL can instead own the interface, routes, endpoint
 # bypass, DNS publication, and cleanup transactionally. Full mode requires at
-# least one local DNS capture address and an encrypted, non-system DNS plan.
-# `dns_resolvers` and `ipv4_gateway` are external/manual fields and must remain
+# least one local DNS listener address and an encrypted, non-system DNS policy.
+# `dns_redirects` and `ipv4_gateway` are external/manual fields and must remain
 # unset in this mode. Android `VpnService` lifecycle stays host-provided and
 # therefore uses external mode.
 #
@@ -306,7 +377,9 @@ listen = ["127.0.0.1:8080"]
 # include_cidrs = []
 # exclude_cidrs = []
 # local_lan = true
-# dns_capture_servers = ["10.88.0.53", "fd00:88::53"]
+# Managed mode publishes these local addresses as system-facing DNS listeners;
+# queries captured there are answered through the selected `[dns]` policy.
+# dns_listeners = ["10.88.0.53", "fd00:88::53"]
 #
 # Optional Linux-only RPDB tuning is nested below the portable VPN policy.
 # Omit this table for validated platform defaults.
@@ -336,38 +409,52 @@ protocol = "mpp"
 # TCP and QUIC/UDP remain independent carriers under one MPP session.
 paths = [
   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
-  { name = "path-2", endpoint = "udp://server.example.com:7443" },
+  { name = "path-2", endpoint = "quic://server.example.com:7443" },
 ]
-# IPv6 literals use brackets: tcp://[2001:db8::10]:7443.
-# Outbound carriers may use one inclusive nonzero ascending port interval:
-# tcp://server.example.com:7000-7999 or
-# udp://[2001:db8::10]:7000-7999. One concrete port is selected for each new
-# physical carrier and remains fixed across that establishment's DNS and
-# address-family attempts. Proxy, DNS, target, and management endpoints remain
-# single-port. Server MPP bind paths also require one fixed port; every
-# externally published range port must be redirected or forwarded to that
-# listener.
+# Grammar: `tcp://HOST:PORT[-END]` or `quic://HOST:PORT[-END]`, followed by an
+# optional `?KEY=VALUE&...` query. IPv6 literals require brackets, for example
+# `quic://[2001:db8::10]:7443`. Ports are canonical decimal 1..=65535 without
+# leading zeroes. A range is an inclusive, ascending pair with distinct ends.
+# Each query key may occur once; values are mandatory; unknown keys fail load.
 #
-# Ranged QUIC paths periodically move the same authenticated connection to
-# another port in the set. Ranged TCP paths use the same interval for ordered
-# replacement at an exact active-work quiescent boundary. The default is five
-# minutes; override it with
-# `port-hop-interval-ms=<u32>` (minimum 5000). TCP never migrates native state
-# or closes an active carrier to meet an interval.
+# Outbound paths may use a port range. One concrete port remains fixed across
+# all DNS/address-family attempts for one physical carrier establishment.
+# Ranged QUIC rotates the authenticated connection's socket; ranged TCP replaces
+# one carrier only at an active-work quiescent boundary. MPP inbound paths use
+# one fixed listen port; publish a range only through external redirection to
+# that listener. Other proxy, DNS, target, and management addresses are not
+# carrier URIs and always use one port.
 #
-# Carrier URI query reference (startup hints are replaced by live evidence;
-# policy flags remain operator constraints):
-#   source-ip=<IP>
-#   srtt-ms=<u32>
-#   jitter-ms=<u32>
-#   rate-bps|rate-kbps|rate-mbps=<u64>, or rate=unknown|unlimited
-#   datagram-payload-limit=512..65000
-#   tcp-carriers=MIN-MAX (tcp:// only; default 1-3; MIN is obsolete/ignored)
-#   port-hop-interval-ms=5000..4294967295 (ranged tcp:// or udp://)
-#   backup, expensive, bulk-allowed, probe-only, no-udp
-# Boolean flags may omit a value or use canonical true/false. Server bind
-# paths reject `source-ip`, `tcp-carriers`, and port ranges; udp:// paths cannot
-# set no-udp=true.
+# Startup hints are replaced by live evidence:
+# - source-address=<IP>: bind this TCP/QUIC client carrier to one literal source
+#   address; omission lets the operating system select it;
+# - initial-srtt-ms=<1..4294967295>: initial smoothed RTT in milliseconds;
+#   omission uses the 333 ms runtime startup model until live evidence exists;
+# - initial-rttvar-ms=<0..4294967295>: initial RTT variation in milliseconds;
+#   omission uses 0 ms until live evidence exists;
+# - exactly one initial-rate-bps|initial-rate-kbps|initial-rate-mbps=<nonzero-u64>,
+#   or initial-rate=unknown|unlimited; scaled values must fit in u64 bits/second;
+#   omission means unknown.
+#
+# Transport and carrier-group controls:
+# - max-datagram-payload-bytes=512..65000: QUIC client only; omission uses the
+#   smaller of `[resources].max_payload_bytes` and 65000;
+# - max-tcp-carriers=1..65535: TCP client only; omission defaults to 3;
+# - port-rotation-interval-ms=5000..4294967295: ranged TCP/QUIC client paths
+#   only; omission on a ranged path defaults to 300000 ms.
+#
+# Scheduling constraints are explicit `true` or `false`:
+# - backup: use only after schedulable regular paths (default false);
+# - expensive: add an evidence-scaled scheduling cost (default false);
+# - allow-bulk: permit throughput scheduling (default true);
+# - control-only: prohibit application data and retain control/probe work only
+#   (default false);
+# - allow-datagrams: permit application datagrams (default true); the key is
+#   accepted on TCP only because QUIC always permits datagrams.
+#
+# Complete examples:
+# tcp://192.0.2.10:7443?source-address=192.0.2.20&initial-srtt-ms=40&initial-rttvar-ms=5&initial-rate-mbps=100&max-tcp-carriers=3&backup=false&expensive=false&allow-bulk=true&control-only=false&allow-datagrams=true
+# quic://server.example.com:7000-7999?initial-rate=unknown&max-datagram-payload-bytes=1200&port-rotation-interval-ms=300000&backup=false&expensive=false&allow-bulk=true&control-only=false
 path_probe_interval_ms = 10000
 path_probe_timeout_ms = 2000
 
@@ -381,11 +468,13 @@ credential_id = "home-client"
 # the MPP credential. Its default is mptunnel.example; the carrier endpoint may
 # be a different DNS name or a literal IP address.
 # tls_server_name = "mptunnel.example"
-tls_pinned_certificate_file = "REPLACE_WITH_SERVER_CERT.pem"
+tls_pinned_certificate = { from = "file", path = "REPLACE_WITH_SERVER_CERT.pem" }
 # Endpoint-wide transport protection uses the same raw 32-byte file on both
 # peers. This key is separate from every MPP client credential. Omit the field
 # only when both peers use TLS 1.3 TCP and public QUIC Initials instead.
-transport_secret_file = "mpp-transport.key"
+transport_secret = { from = "file", path = "mpp-transport.key" }
+# Direct-paste alternative (`openssl rand -hex 32`); Base64/raw use the same schema:
+# transport_secret = { from = "hex", value = "REPLACE_WITH_64_HEX_DIGITS" }
 auth_freshness_window_seconds = 300
 
 [routing]
@@ -395,7 +484,7 @@ generation = 1
 # when this node has or requires IP evidence, after resolution. Restricted
 # address space is denied unless an explicit matching rule uses
 # `allow-restricted`. Domain-capable outbounds otherwise delegate resolution to
-# the configured upstream trust boundary.
+# the configured outbound's trust boundary.
 # [routing.destination_acl]
 #
 # [[routing.destination_acl.rules]]
@@ -417,13 +506,14 @@ generation = 1
 # values inside one category are ORed. Unknown fields fail configuration load.
 #
 # Optional signed domain/GeoIP rule sets are loaded and verified as one atomic
-# routing generation. Publisher keys are public Ed25519 keys encoded as base64.
+# routing generation. Publisher keys use the same byte-material source and
+# must resolve to exactly 32 bytes.
 # Every set pins its signed ID, publisher, and minimum accepted revision so an
 # otherwise valid older artifact cannot be substituted during reload.
 #
 # [[routing.rule_set_publishers]]
 # publisher_id = "official"
-# ed25519_public_key_base64 = "REPLACE_WITH_32_BYTE_ED25519_PUBLIC_KEY_BASE64"
+# ed25519_public_key = { from = "base64", value = "REPLACE_WITH_32_BYTE_ED25519_PUBLIC_KEY_BASE64" }
 #
 # [[routing.rule_sets]]
 # rule_set_id = "geo-public"
@@ -453,7 +543,7 @@ generation = 1
 # action = "outbound" # outbound, balancer, reject, or drop
 # outbound = "edge-mpp"
 # balancer = "edge-balancer" # Alternative to outbound with action = "balancer".
-# dns_plan = "system"
+# dns_policy = "system"
 # initial_demand = "throughput" # automatic (default) or throughput
 # explanation = "route signed domain and network policy through the edge"
 
@@ -475,7 +565,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # protocol = "mpp"
 # paths = [
 #   { name = "path-1", endpoint = "tcp://secondary.example.com:7443?backup=true&expensive=true" },
-#   { name = "path-2", endpoint = "udp://secondary.example.com:7443?backup=true&expensive=true" },
+#   { name = "path-2", endpoint = "quic://secondary.example.com:7443?backup=true&expensive=true" },
 # ]
 # path_probe_interval_ms = 10000
 # path_probe_timeout_ms = 2000
@@ -486,8 +576,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # [outbounds.security]
 # credential_id = "secondary-client"
 # tls_server_name = "secondary.example.com"
-# tls_pinned_certificate_file = "secondary-server-cert.pem"
-# transport_secret_file = "secondary-mpp-transport.key"
+# tls_pinned_certificate = { from = "file", path = "secondary-server-cert.pem" }
+# transport_secret = { from = "file", path = "secondary-mpp-transport.key" }
 # auth_freshness_window_seconds = 300
 
 # Optional server-side MPP inbound
@@ -500,20 +590,20 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # protocol = "mpp"
 # paths = [
 #   { name = "path-1", endpoint = "tcp://0.0.0.0:7443" },
-#   { name = "path-2", endpoint = "udp://0.0.0.0:7443" },
+#   { name = "path-2", endpoint = "quic://0.0.0.0:7443" },
 # ]
 # outbound = "direct-egress"
 # balancer = "egress-fallback" # Alternative: remove outbound before enabling.
-# dns_plan = "system"
+# dns_policy = "system"
 #
 # [inbounds.performance]
 # extra_traffic_hint_percent = 5
 #
 # [inbounds.security]
 # credential_ids = ["home-client"]
-# tls_certificate_chain_file = "server-cert.pem"
-# tls_private_key_file = "server-key.pem"
-# transport_secret_file = "mpp-transport.key"
+# tls_certificate_chain = { from = "file", path = "server-cert.pem" }
+# tls_private_key = { from = "file", path = "server-key.pem" }
+# transport_secret = { from = "file", path = "mpp-transport.key" }
 # auth_freshness_window_seconds = 300
 # authentication_timeout_ms = 5000
 # Independently caps authentication work and silent Noise-rejection retention.
@@ -543,7 +633,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 #
 # Server-side destination policy is scoped to this MPP inbound. Restricted
 # addresses are denied whenever this node has IP evidence. A domain delegated
-# unchanged to a proxy is resolved by that trusted upstream; add an applicable
+# unchanged to a proxy is resolved by that trusted next hop; add an applicable
 # IP or post-resolution rule when this node must enforce addresses first.
 # [inbounds.destination_acl]
 # generation = 1
@@ -569,8 +659,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # Server egress leaves
 #
 # Direct egress needs an IP target and obtains domain addresses through the DNS
-# plan selected by the route or accepting MPP inbound. That plan may use a
-# system, direct, or routed remote resolver upstream. Omit all bind fields to
+# policy selected by the route or accepting MPP inbound. That policy may use a
+# system, direct, or routed remote DNS server. Omit all bind fields to
 # let the OS select source addresses for both families. Legacy bind_ip selects
 # one source address and makes this outbound eligible only for that address
 # family; it cannot be combined with bind_ipv4 or bind_ipv6. Prefer bind_ipv4,
@@ -590,9 +680,9 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # connect_timeout_ms = 10000
 #
 # Relay through SOCKS5. TCP CONNECT and UDP ASSOCIATE are supported when the
-# upstream implements them. A canonical domain is normally carried to the
-# proxy for upstream resolution. Routing or destination policy that needs IP
-# evidence first resolves through the selected DNS plan and carries the
+# proxy implements them. A canonical domain is normally carried to the proxy
+# for next-hop resolution. Routing or destination policy that needs IP
+# evidence first resolves through the selected DNS policy and carries the
 # authorized literal instead.
 # [[outbounds]]
 # name = "socks5-egress"
@@ -601,8 +691,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # connect_timeout_ms = 10000
 #
 # [outbounds.auth]
-# username = "upstream-user"
-# password = { from = "file", path = "upstream-proxy-password.key" }
+# username = "proxy-user"
+# password = { from = "file", path = "proxy-password.key" }
 #
 # Plain HTTP CONNECT carries TCP targets and supports the same referenced
 # authentication table. It preserves a canonical domain unless routing or
@@ -613,19 +703,19 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # endpoint = "127.0.0.1:8080"
 # connect_timeout_ms = 10000
 #
-# HTTPS CONNECT authenticates the upstream proxy with WebPKI. An optional CA
+# HTTPS CONNECT authenticates the proxy with WebPKI. An optional CA
 # file adds private roots; it does not disable hostname verification.
 # [[outbounds]]
 # name = "https-egress"
 # protocol = "https-connect"
 # endpoint = "127.0.0.1:8443"
 # tls_server_name = "proxy.example.com"
-# tls_ca_certificate_file = "private-proxy-ca.pem"
+# tls_ca_certificate = { from = "file", path = "private-proxy-ca.pem" }
 # connect_timeout_ms = 10000
 #
 # [outbounds.auth]
-# username = "upstream-user"
-# password = { from = "file", path = "upstream-proxy-password.key" }
+# username = "proxy-user"
+# password = { from = "file", path = "proxy-password.key" }
 
 # Routing policies
 #
@@ -656,7 +746,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # `ordered-failover` tries enabled members in configured order. Retry occurs
 # only before flow commit. Each attempted TCP/native UDP member retains its own
 # outbound stage timeout. The first selected IP-only member may trigger one
-# flow-level lookup bounded by the selected DNS plan; failure skips later
+# flow-level lookup bounded by the selected DNS policy; failure skips later
 # IP-only members without re-querying, so one blackhole cannot consume a
 # successor's budget.
 # [[routing.balancers]]

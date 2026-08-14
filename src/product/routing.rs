@@ -923,7 +923,7 @@ impl fmt::Display for RouteCompileError {
             ),
             Self::PostResolutionDnsPlan(rule_id) => write!(
                 formatter,
-                "post-resolution-only route rule {rule_id} cannot select a DNS plan"
+                "post-resolution-only route rule {rule_id} cannot select a DNS policy"
             ),
             Self::InvalidExplanation(rule_id) => {
                 write!(

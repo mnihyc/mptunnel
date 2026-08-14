@@ -480,7 +480,7 @@ impl fmt::Display for VpnBypassAddressKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CarrierEndpoint => formatter.write_str("carrier endpoint"),
-            Self::BootstrapDns => formatter.write_str("bootstrap DNS"),
+            Self::BootstrapDns => formatter.write_str("pre-publication DNS"),
         }
     }
 }

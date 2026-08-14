@@ -755,13 +755,13 @@ pub struct DnsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DnsCommand {
-    /// Print DNS cache, upstream, and FakeDNS status.
+    /// Print DNS cache, server, and synthetic-override status.
     Status,
     /// Explain DNS policy selection without issuing a query.
     Explain(DnsExplainArgs),
     /// Issue one explicit typed DNS query through the configured runtime.
     Query(DnsQueryArgs),
-    /// Flush one plan cache or all DNS caches.
+    /// Flush one policy cache or all DNS caches.
     Flush(DnsFlushArgs),
 }
 
@@ -781,9 +781,9 @@ pub struct DnsQueryArgs {
 
 #[derive(Debug, Args)]
 pub struct DnsFlushArgs {
-    /// Flush only this DNS plan; omit to flush every DNS plan.
-    #[arg(long = "dns-plan")]
-    pub dns_plan: Option<DnsPlanId>,
+    /// Flush only this DNS policy; omit to flush every DNS policy.
+    #[arg(long = "policy")]
+    pub policy: Option<DnsPlanId>,
 }
 
 #[derive(Debug, Args)]
@@ -893,11 +893,11 @@ pub struct ClientArgs {
     pub tun_disable_icmp: bool,
 
     #[arg(
-        long = "tun-dns-resolver",
-        env = "MPTUNNEL_TUN_DNS_RESOLVERS",
+        long = "tun-dns-redirect",
+        env = "MPTUNNEL_TUN_DNS_REDIRECTS",
         value_delimiter = ','
     )]
-    pub tun_dns_resolvers: Vec<SocketAddr>,
+    pub tun_dns_redirects: Vec<SocketAddr>,
 
     #[arg(long, env = "MPTUNNEL_TUN_DNS_TTL_MS", default_value_t = DEFAULT_TUN_DNS_TTL_MS)]
     pub tun_dns_ttl_ms: u32,
@@ -938,32 +938,32 @@ pub struct ClientArgs {
 
     /// System-facing local DNS address captured by the managed VPN.
     #[arg(
-        long = "tun-dns-capture-server",
-        env = "MPTUNNEL_TUN_DNS_CAPTURE_SERVERS",
+        long = "tun-dns-listener",
+        env = "MPTUNNEL_TUN_DNS_LISTENERS",
         value_delimiter = ',',
         requires = "tun_vpn_mode"
     )]
-    pub tun_dns_capture_servers: Vec<IpAddr>,
+    pub tun_dns_listeners: Vec<IpAddr>,
 
-    /// Literal bootstrap endpoint for the managed VPN's DNS-over-TLS upstream.
+    /// Literal address for the managed VPN's DNS-over-TLS server.
     #[arg(
-        long = "tun-dns-dot-bootstrap",
-        env = "MPTUNNEL_TUN_DNS_DOT_BOOTSTRAP",
-        requires_all = ["tun_vpn_mode", "tun_dns_dot_server_name"],
-        conflicts_with = "tun_dns_resolvers"
+        long = "tun-dns-dot-address",
+        env = "MPTUNNEL_TUN_DNS_DOT_ADDRESS",
+        requires_all = ["tun_vpn_mode", "tun_dns_dot_tls_name"],
+        conflicts_with = "tun_dns_redirects"
     )]
-    pub tun_dns_dot_bootstrap: Option<SocketAddr>,
+    pub tun_dns_dot_address: Option<SocketAddr>,
 
-    /// Authenticated TLS name for the managed VPN's DNS-over-TLS upstream.
+    /// Authenticated TLS name for the managed VPN's DNS-over-TLS server.
     #[arg(
-        long = "tun-dns-dot-server-name",
-        env = "MPTUNNEL_TUN_DNS_DOT_SERVER_NAME",
-        requires_all = ["tun_vpn_mode", "tun_dns_dot_bootstrap"],
-        conflicts_with = "tun_dns_resolvers"
+        long = "tun-dns-dot-tls-name",
+        env = "MPTUNNEL_TUN_DNS_DOT_TLS_NAME",
+        requires_all = ["tun_vpn_mode", "tun_dns_dot_address"],
+        conflicts_with = "tun_dns_redirects"
     )]
-    pub tun_dns_dot_server_name: Option<String>,
+    pub tun_dns_dot_tls_name: Option<String>,
 
-    /// Outbound carrier endpoint: tcp://host:PORT[-END] or udp://host:PORT[-END].
+    /// Outbound carrier endpoint: tcp://host:PORT[-END] or quic://host:PORT[-END].
     #[arg(
         long = "path",
         env = "MPTUNNEL_PATHS",
@@ -1062,16 +1062,16 @@ impl ClientArgs {
             self.proxy_password_file.as_deref(),
             self.proxy_password_env.as_deref(),
         )?;
-        if self.tun_vpn_mode.is_some() && !self.tun_dns_resolvers.is_empty() {
+        if self.tun_vpn_mode.is_some() && !self.tun_dns_redirects.is_empty() {
             return Err(CliConfigError::ManagedVpn(
-                "--tun-dns-resolver is external/manual only and cannot be combined with --tun-vpn-mode"
+                "--tun-dns-redirect is external/manual only and cannot be combined with --tun-vpn-mode"
                     .to_string(),
             ));
         }
         let dns_policy = match (
             self.tun_vpn_mode,
-            self.tun_dns_dot_bootstrap,
-            self.tun_dns_dot_server_name.as_deref(),
+            self.tun_dns_dot_address,
+            self.tun_dns_dot_tls_name.as_deref(),
         ) {
             (Some(_), Some(bootstrap), Some(server_name)) => {
                 managed_dot_dns_policy(bootstrap, server_name)?
@@ -1083,10 +1083,10 @@ impl ClientArgs {
             (None, Some(_), _) | (None, _, Some(_)) => {
                 return Err(CliConfigError::ManagedDnsDotRequiresVpnMode);
             }
-            (None, None, None) if tun_enabled && !self.tun_dns_resolvers.is_empty() => {
+            (None, None, None) if tun_enabled && !self.tun_dns_redirects.is_empty() => {
                 simple_dns_policy(
-                    DnsModeArg::Servers,
-                    self.tun_dns_resolvers.clone(),
+                    DnsProtocolArg::UdpTcp,
+                    self.tun_dns_redirects.clone(),
                     DnsIpStrategy::Ipv4AndIpv6,
                     Duration::from_millis(DEFAULT_SIMPLE_DNS_TIMEOUT_MS),
                 )?
@@ -1175,7 +1175,7 @@ impl ClientArgs {
                         route_mode: RouteMode::Full,
                         excludes: self.tun_exclude_cidrs.clone(),
                         local_lan: self.tun_local_lan,
-                        dns_capture_servers: self.tun_dns_capture_servers.clone(),
+                        dns_capture_servers: self.tun_dns_listeners.clone(),
                         platform: ManagedVpnPlatformConfig::default(),
                     })
                 }
@@ -1183,7 +1183,7 @@ impl ClientArgs {
                     route_mode: RouteMode::Split(self.tun_include_cidrs.clone()),
                     excludes: self.tun_exclude_cidrs.clone(),
                     local_lan: self.tun_local_lan,
-                    dns_capture_servers: self.tun_dns_capture_servers.clone(),
+                    dns_capture_servers: self.tun_dns_listeners.clone(),
                     platform: ManagedVpnPlatformConfig::default(),
                 }),
             };
@@ -1198,7 +1198,7 @@ impl ClientArgs {
                     ipv6_prefix: self.tun_ipv6_prefix,
                     mtu: self.tun_mtu,
                     enable_icmp: !self.tun_disable_icmp,
-                    dns_resolvers: self.tun_dns_resolvers.clone(),
+                    dns_resolvers: self.tun_dns_redirects.clone(),
                     dns_ttl_ms: self.tun_dns_ttl_ms,
                     host,
                 }),
@@ -1317,15 +1317,15 @@ fn tun_requested(args: &ClientArgs) -> bool {
         || args.tun_ipv6_prefix != 64
         || args.tun_mtu != DEFAULT_TUN_MTU
         || args.tun_disable_icmp
-        || !args.tun_dns_resolvers.is_empty()
+        || !args.tun_dns_redirects.is_empty()
         || args.tun_dns_ttl_ms != DEFAULT_TUN_DNS_TTL_MS
         || args.tun_vpn_mode.is_some()
         || !args.tun_include_cidrs.is_empty()
         || !args.tun_exclude_cidrs.is_empty()
         || args.tun_local_lan
-        || !args.tun_dns_capture_servers.is_empty()
-        || args.tun_dns_dot_bootstrap.is_some()
-        || args.tun_dns_dot_server_name.is_some()
+        || !args.tun_dns_listeners.is_empty()
+        || args.tun_dns_dot_address.is_some()
+        || args.tun_dns_dot_tls_name.is_some()
 }
 
 #[derive(Debug, Args)]
@@ -1402,27 +1402,27 @@ pub struct ServerArgs {
     pub upstream_http_tls_server_name: Option<String>,
 
     #[arg(
-        long = "outbound-dns-resolver",
-        env = "MPTUNNEL_OUTBOUND_DNS_RESOLVERS",
+        long = "outbound-dns-server",
+        env = "MPTUNNEL_OUTBOUND_DNS_SERVERS",
         value_delimiter = ','
     )]
-    pub outbound_dns_resolvers: Vec<SocketAddr>,
+    pub outbound_dns_servers: Vec<SocketAddr>,
 
     #[arg(
-        long,
-        env = "MPTUNNEL_OUTBOUND_DNS_MODE",
+        long = "outbound-dns-protocol",
+        env = "MPTUNNEL_OUTBOUND_DNS_PROTOCOL",
         value_enum,
-        default_value_t = DnsModeArg::System
+        default_value_t = DnsProtocolArg::System
     )]
-    pub outbound_dns_mode: DnsModeArg,
+    pub outbound_dns_protocol: DnsProtocolArg,
 
     #[arg(
-        long,
-        env = "MPTUNNEL_OUTBOUND_DNS_STRATEGY",
+        long = "outbound-dns-family",
+        env = "MPTUNNEL_OUTBOUND_DNS_FAMILY",
         value_enum,
-        default_value_t = DnsStrategyArg::Ipv4AndIpv6
+        default_value_t = DnsFamilyArg::Ipv4AndIpv6
     )]
-    pub outbound_dns_strategy: DnsStrategyArg,
+    pub outbound_dns_family: DnsFamilyArg,
 
     #[arg(
         long,
@@ -1531,9 +1531,9 @@ impl ServerArgs {
         let id = OutboundId::parse("cli-egress")
             .map_err(|error| CliConfigError::ProductPolicy(error.to_string()))?;
         let (dns_policy, dns_plan) = simple_dns_policy(
-            self.outbound_dns_mode,
-            self.outbound_dns_resolvers,
-            self.outbound_dns_strategy.into(),
+            self.outbound_dns_protocol,
+            self.outbound_dns_servers,
+            self.outbound_dns_family.into(),
             Duration::from_millis(self.outbound_dns_timeout_ms),
         )?;
         let server = MppInboundConfig {
@@ -1575,13 +1575,13 @@ impl ServerArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum DnsModeArg {
+pub enum DnsProtocolArg {
     System,
-    Servers,
+    UdpTcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum DnsStrategyArg {
+pub enum DnsFamilyArg {
     Ipv4ThenIpv6,
     Ipv6ThenIpv4,
     Ipv4Only,
@@ -1590,51 +1590,51 @@ pub enum DnsStrategyArg {
     Ipv6AndIpv4,
 }
 
-impl From<DnsStrategyArg> for DnsIpStrategy {
-    fn from(value: DnsStrategyArg) -> Self {
+impl From<DnsFamilyArg> for DnsIpStrategy {
+    fn from(value: DnsFamilyArg) -> Self {
         match value {
-            DnsStrategyArg::Ipv4ThenIpv6 => Self::Ipv4ThenIpv6,
-            DnsStrategyArg::Ipv6ThenIpv4 => Self::Ipv6ThenIpv4,
-            DnsStrategyArg::Ipv4Only => Self::Ipv4Only,
-            DnsStrategyArg::Ipv6Only => Self::Ipv6Only,
-            DnsStrategyArg::Ipv4AndIpv6 => Self::Ipv4AndIpv6,
-            DnsStrategyArg::Ipv6AndIpv4 => Self::Ipv6AndIpv4,
+            DnsFamilyArg::Ipv4ThenIpv6 => Self::Ipv4ThenIpv6,
+            DnsFamilyArg::Ipv6ThenIpv4 => Self::Ipv6ThenIpv4,
+            DnsFamilyArg::Ipv4Only => Self::Ipv4Only,
+            DnsFamilyArg::Ipv6Only => Self::Ipv6Only,
+            DnsFamilyArg::Ipv4AndIpv6 => Self::Ipv4AndIpv6,
+            DnsFamilyArg::Ipv6AndIpv4 => Self::Ipv6AndIpv4,
         }
     }
 }
 
 fn simple_dns_policy(
-    mode: DnsModeArg,
-    resolvers: Vec<SocketAddr>,
+    protocol: DnsProtocolArg,
+    servers: Vec<SocketAddr>,
     strategy: DnsIpStrategy,
     timeout: Duration,
 ) -> Result<(DnsPolicyConfig, DnsPlanId), CliConfigError> {
     let plan_id =
         DnsPlanId::parse("default").map_err(|error| CliConfigError::Dns(error.to_string()))?;
-    let upstreams = match mode {
-        DnsModeArg::System if resolvers.is_empty() => vec![DnsUpstreamSpec::direct(
+    let upstreams = match protocol {
+        DnsProtocolArg::System if servers.is_empty() => vec![DnsUpstreamSpec::direct(
             DnsUpstreamId::parse("system")
                 .map_err(|error| CliConfigError::Dns(error.to_string()))?,
             DnsUpstreamEndpoint::System,
         )],
-        DnsModeArg::System => {
+        DnsProtocolArg::System => {
             return Err(CliConfigError::Dns(
-                "--outbound-dns-mode system cannot be combined with --outbound-dns-resolver"
+                "--outbound-dns-protocol system cannot be combined with --outbound-dns-server"
                     .to_string(),
             ));
         }
-        DnsModeArg::Servers if resolvers.is_empty() => {
+        DnsProtocolArg::UdpTcp if servers.is_empty() => {
             return Err(CliConfigError::Dns(
-                "--outbound-dns-mode servers requires at least one --outbound-dns-resolver"
+                "--outbound-dns-protocol udp-tcp requires at least one --outbound-dns-server"
                     .to_string(),
             ));
         }
-        DnsModeArg::Servers => resolvers
+        DnsProtocolArg::UdpTcp => servers
             .into_iter()
             .enumerate()
             .map(|(index, bootstrap)| {
                 Ok(DnsUpstreamSpec::direct(
-                    DnsUpstreamId::parse(&format!("resolver-{}", index + 1))
+                    DnsUpstreamId::parse(&format!("server-{}", index + 1))
                         .map_err(|error| CliConfigError::Dns(error.to_string()))?,
                     DnsUpstreamEndpoint::UdpTcp { bootstrap },
                 ))
@@ -1855,8 +1855,8 @@ impl From<crate::config::SecurityPolicyError> for CliConfigError {
     }
 }
 
-impl From<crate::config::SecretMaterialError> for CliConfigError {
-    fn from(value: crate::config::SecretMaterialError) -> Self {
+impl From<crate::config::MaterialSourceError> for CliConfigError {
+    fn from(value: crate::config::MaterialSourceError) -> Self {
         Self::SecretMaterial(value.to_string())
     }
 }
@@ -1921,11 +1921,11 @@ impl std::fmt::Display for CliConfigError {
             }
             Self::ManagedDnsDotRequired => write!(
                 f,
-                "--tun-vpn-mode requires --tun-dns-dot-bootstrap and --tun-dns-dot-server-name"
+                "--tun-vpn-mode requires --tun-dns-dot-address and --tun-dns-dot-tls-name"
             ),
             Self::ManagedDnsDotPairRequired => write!(
                 f,
-                "--tun-dns-dot-bootstrap and --tun-dns-dot-server-name must be set together"
+                "--tun-dns-dot-address and --tun-dns-dot-tls-name must be set together"
             ),
             Self::ManagedDnsDotRequiresVpnMode => {
                 write!(f, "managed DNS-over-TLS options require --tun-vpn-mode")

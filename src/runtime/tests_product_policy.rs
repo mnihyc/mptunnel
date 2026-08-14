@@ -28,7 +28,7 @@ fn security() -> ClientSecurityConfig {
 
 fn context(port: u16) -> ClientPathContext {
     ClientPathContext::new(
-        vec![format!("udp://127.0.0.1:{port}").parse().expect("path")],
+        vec![format!("quic://127.0.0.1:{port}").parse().expect("path")],
         security(),
         ResourceLimits::default(),
     )

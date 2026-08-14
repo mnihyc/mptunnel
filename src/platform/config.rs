@@ -606,17 +606,17 @@ impl fmt::Display for ManagedVpnConfigError {
                 "VPN route {route} has no configured TUN address of the same family"
             ),
             Self::DnsServerRequired => {
-                formatter.write_str("DNS capture requires at least one server address")
+                formatter.write_str("DNS capture requires at least one listener address")
             }
             Self::InvalidDnsServer(server) => {
                 write!(
                     formatter,
-                    "invalid system-facing DNS server address {server}"
+                    "invalid system-facing DNS listener address {server}"
                 )
             }
             Self::UnsupportedDnsFamily(server) => write!(
                 formatter,
-                "DNS server {server} has no configured TUN address of the same family"
+                "DNS listener {server} has no configured TUN address of the same family"
             ),
             Self::DnsServerExcluded(server) => {
                 write!(

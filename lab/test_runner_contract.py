@@ -200,8 +200,8 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('"unconstrained:unconstrained"', qos_dispatch)
         self.assertIn("range_3_3)", qos_case)
         self.assertIn("three_endpoints_1_1)", qos_case)
-        self.assertEqual(qos_case.count("?tcp-carriers=1-1"), 4)
-        self.assertNotIn("tcp-carriers", server_config)
+        self.assertEqual(qos_case.count("?max-tcp-carriers=1"), 4)
+        self.assertNotIn("max-tcp-carriers", server_config)
         self.assertIn("fixed", qos_case)
         self.assertIn("$tcp_carrier_qos_workers", qos_case)
         self.assertIn("$tcp_carrier_qos_duration_seconds", qos_case)
@@ -508,7 +508,7 @@ class RunnerContractTests(unittest.TestCase):
             SCRIPT,
         )
         self.assertIn(
-            '"--path \'tcp://172.31.10.20:${server_port}?tcp-carriers=1-1\'"',
+            '"--path \'tcp://172.31.10.20:${server_port}?max-tcp-carriers=1\'"',
             SCRIPT,
         )
 
@@ -524,7 +524,7 @@ class RunnerContractTests(unittest.TestCase):
             SCRIPT,
         )
         self.assertIn(
-            'tcp_carrier_hint_query="&tcp-carriers=1-${tcp_carrier_max}"',
+            'tcp_carrier_hint_query="&max-tcp-carriers=${tcp_carrier_max}"',
             SCRIPT,
         )
         self.assertIn(
@@ -562,12 +562,12 @@ class RunnerContractTests(unittest.TestCase):
         )[1].split("\n}", 1)[0]
 
         self.assertEqual(endpoints.count("--path 'tcp://"), 10)
-        self.assertEqual(endpoints.count("--path 'udp://"), 10)
+        self.assertEqual(endpoints.count("--path 'quic://"), 10)
         self.assertEqual(endpoints.count("${scale_tcp_carrier_query}"), 10)
         for prefix in range(41, 46):
             self.assertIn(f'"tcp://172.31.{prefix}.20:${{server_port}}"', server)
         for prefix in range(51, 61):
-            self.assertIn(f'"udp://172.31.{prefix}.20:${{server_port}}"', server)
+            self.assertIn(f'"quic://172.31.{prefix}.20:${{server_port}}"', server)
         self.assertIn("exec_netem client asymmetric-client", asymmetric)
         self.assertIn("exec_netem server asymmetric-server", asymmetric)
         self.assertIn("--small-batch-size \"$browser_batch_size\"", browser_batches)

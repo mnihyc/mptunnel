@@ -1,4 +1,4 @@
-use super::secret::{SecretMaterialError, SecretMaterialReference};
+use super::secret::{MaterialSource, MaterialSourceError};
 use super::{
     AppConfig, ClientPathConfig, ClientSecurityConfig, CommandConfig, ConfigError,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_AUTHENTICATION_TIMEOUT_MS,
@@ -46,8 +46,6 @@ use crate::product::{
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{EndpointParseError, PathSpecParseError};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -259,7 +257,7 @@ struct LocalUserFileConfig {
     name: String,
     principal_id: String,
     username: String,
-    password: SecretMaterialReference,
+    password: MaterialSource,
 }
 
 impl std::fmt::Debug for LocalUserFileConfig {
@@ -298,9 +296,9 @@ impl LocalUserCatalog {
             let password = value
                 .password
                 .resolve(material_base, "local proxy user password")
-                .map_err(ConfigFileError::SecretMaterial)?
+                .map_err(ConfigFileError::MaterialSource)?
                 .into_utf8("local proxy user password")
-                .map_err(ConfigFileError::SecretMaterial)?;
+                .map_err(ConfigFileError::MaterialSource)?;
             let user = LocalProxyUser::new(name.clone(), principal, value.username, password)
                 .map_err(ConfigFileError::ProxyAuth)?;
             if users.insert(name.clone(), user.clone()).is_some() {
@@ -467,7 +465,7 @@ impl ServiceFileConfig {
 struct ManagementFileConfig {
     #[serde(default)]
     listen: Vec<SocketAddr>,
-    token: Option<SecretMaterialReference>,
+    token: Option<MaterialSource>,
     #[serde(default)]
     dashboard: bool,
     #[serde(default)]
@@ -484,7 +482,7 @@ impl ManagementFileConfig {
                     reference
                         .resolve(material_base, "management token")
                         .and_then(|material| material.into_utf8("management token"))
-                        .map_err(ConfigFileError::SecretMaterial)
+                        .map_err(ConfigFileError::MaterialSource)
                 })
                 .transpose()?,
             dashboard: self.dashboard,
@@ -636,7 +634,7 @@ impl ResourceFileConfig {
 struct CredentialFileConfig {
     credential_id: String,
     principal_id: String,
-    secret: SecretMaterialReference,
+    secret: MaterialSource,
     expires_at_unix_secs: Option<u64>,
     #[serde(default)]
     revoked: bool,
@@ -672,7 +670,7 @@ fn parse_credential_catalog(
             let secret = value
                 .secret
                 .resolve(material_base, "credential")
-                .map_err(ConfigFileError::SecretMaterial)?
+                .map_err(ConfigFileError::MaterialSource)?
                 .into_bytes();
             CredentialRecord::new(
                 id,
@@ -699,10 +697,10 @@ struct SecurityFileConfig {
     authentication_timeout_ms: Option<u64>,
     max_pending_authentications: Option<usize>,
     tls_server_name: Option<String>,
-    tls_pinned_certificate_file: Option<PathBuf>,
-    tls_certificate_chain_file: Option<PathBuf>,
-    tls_private_key_file: Option<PathBuf>,
-    transport_secret_file: Option<PathBuf>,
+    tls_pinned_certificate: Option<MaterialSource>,
+    tls_certificate_chain: Option<MaterialSource>,
+    tls_private_key: Option<MaterialSource>,
+    transport_secret: Option<MaterialSource>,
 }
 
 impl SecurityFileConfig {
@@ -800,21 +798,21 @@ impl SecurityFileConfig {
     }
 
     fn client_tls(&self, material_base: &Path) -> Result<TcpClientTlsConfig, ConfigFileError> {
-        if self.tls_certificate_chain_file.is_some() || self.tls_private_key_file.is_some() {
+        if self.tls_certificate_chain.is_some() || self.tls_private_key.is_some() {
             return Err(ConfigFileError::MppTlsRoleMismatch(
                 "client MPP security cannot contain server-private transport material",
             ));
         }
-        let tls = match self.tls_pinned_certificate_file.as_deref() {
+        let tls = match self.tls_pinned_certificate.as_ref() {
             None => Err(ConfigFileError::MppTlsFieldRequired(
-                "tls_pinned_certificate_file",
+                "tls_pinned_certificate",
             )),
-            Some(path) => {
-                let certificates = load_certificates(material_base, path)?;
+            Some(source) => {
+                let certificates =
+                    load_certificates_from_source(material_base, source, "pinned TLS certificate")?;
                 let [pinned_leaf] = certificates.as_slice() else {
                     return Err(ConfigFileError::MppTlsMaterial(
-                        "tls_pinned_certificate_file must contain exactly one certificate"
-                            .to_string(),
+                        "tls_pinned_certificate must contain exactly one certificate".to_string(),
                     ));
                 };
                 TcpClientTlsConfig::new(
@@ -826,10 +824,14 @@ impl SecurityFileConfig {
                 .map_err(|error| ConfigFileError::MppTlsMaterial(error.to_string()))
             }
         }?;
-        match self.transport_secret_file.as_deref() {
+        match self.transport_secret.as_ref() {
             None => Ok(tls),
-            Some(path) => Ok(tls
-                .with_shared_transport_secret(load_shared_transport_secret(material_base, path)?)),
+            Some(source) => Ok(
+                tls.with_shared_transport_secret(load_shared_transport_secret(
+                    material_base,
+                    source,
+                )?),
+            ),
         }
     }
 
@@ -838,30 +840,35 @@ impl SecurityFileConfig {
         material_base: &Path,
         security: &ServerSecurityConfig,
     ) -> Result<TcpServerTlsConfig, ConfigFileError> {
-        if self.tls_server_name.is_some() || self.tls_pinned_certificate_file.is_some() {
+        if self.tls_server_name.is_some() || self.tls_pinned_certificate.is_some() {
             return Err(ConfigFileError::MppTlsRoleMismatch(
                 "server MPP security cannot contain client-side transport identity material",
             ));
         }
         let tls = match (
-            self.tls_certificate_chain_file.as_deref(),
-            self.tls_private_key_file.as_deref(),
+            self.tls_certificate_chain.as_ref(),
+            self.tls_private_key.as_ref(),
         ) {
             (None, _) => Err(ConfigFileError::MppTlsFieldRequired(
-                "tls_certificate_chain_file",
+                "tls_certificate_chain",
             )),
-            (_, None) => Err(ConfigFileError::MppTlsFieldRequired("tls_private_key_file")),
-            (Some(chain_path), Some(key_path)) => {
-                let certificate_chain = load_certificates(material_base, chain_path)?;
-                let private_key = load_private_key(material_base, key_path)?;
+            (_, None) => Err(ConfigFileError::MppTlsFieldRequired("tls_private_key")),
+            (Some(chain_source), Some(key_source)) => {
+                let certificate_chain = load_certificates_from_source(
+                    material_base,
+                    chain_source,
+                    "TLS certificate chain",
+                )?;
+                let private_key =
+                    load_private_key_from_source(material_base, key_source, "TLS private key")?;
                 TcpServerTlsConfig::new(certificate_chain, private_key)
                     .map_err(|error| ConfigFileError::MppTlsMaterial(error.to_string()))
             }
         }?;
-        match self.transport_secret_file.as_deref() {
+        match self.transport_secret.as_ref() {
             None => Ok(tls),
-            Some(path) => Ok(tls.with_shared_transport_secret(
-                load_shared_transport_secret(material_base, path)?,
+            Some(source) => Ok(tls.with_shared_transport_secret(
+                load_shared_transport_secret(material_base, source)?,
                 security.auth_freshness_window,
                 security.max_pending_authentications,
             )),
@@ -871,19 +878,15 @@ impl SecurityFileConfig {
 
 fn load_shared_transport_secret(
     base: &Path,
-    configured: &Path,
+    source: &MaterialSource,
 ) -> Result<SharedTransportSecret, ConfigFileError> {
-    let path = material_path(base, configured);
-    let bytes = std::fs::read(&path).map_err(|error| {
-        ConfigFileError::MppTransportSecret(format!(
-            "failed to read shared transport secret {}: {error}",
-            configured.display()
-        ))
-    })?;
+    let bytes = source
+        .resolve(base, "shared transport secret")
+        .map_err(ConfigFileError::MaterialSource)?
+        .into_bytes();
     let bytes = bytes.try_into().map_err(|bytes: Vec<u8>| {
         ConfigFileError::MppTransportSecret(format!(
-            "shared transport secret {} must contain exactly 32 raw bytes, found {}",
-            configured.display(),
+            "shared transport secret must contain exactly 32 bytes, found {}",
             bytes.len()
         ))
     })?;
@@ -909,18 +912,33 @@ pub(crate) fn load_certificates(
             configured.display()
         ))
     })?;
-    let certificates = CertificateDer::pem_slice_iter(&bytes)
+    parse_certificates(&bytes, "TLS certificate file")
+}
+
+fn load_certificates_from_source(
+    base: &Path,
+    source: &MaterialSource,
+    purpose: &'static str,
+) -> Result<Vec<CertificateDer<'static>>, ConfigFileError> {
+    let bytes = source
+        .resolve(base, purpose)
+        .map_err(ConfigFileError::MaterialSource)?
+        .into_bytes();
+    parse_certificates(&bytes, purpose)
+}
+
+fn parse_certificates(
+    bytes: &[u8],
+    purpose: &'static str,
+) -> Result<Vec<CertificateDer<'static>>, ConfigFileError> {
+    let certificates = CertificateDer::pem_slice_iter(bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
-            ConfigFileError::MppTlsMaterial(format!(
-                "failed to parse TLS certificate file {}: {error}",
-                configured.display()
-            ))
+            ConfigFileError::MppTlsMaterial(format!("failed to parse {purpose}: {error}"))
         })?;
     if certificates.is_empty() {
         return Err(ConfigFileError::MppTlsMaterial(format!(
-            "TLS certificate file {} contains no certificates",
-            configured.display()
+            "{purpose} contains no certificates"
         )));
     }
     Ok(certificates)
@@ -937,25 +955,37 @@ pub(crate) fn load_private_key(
             configured.display()
         ))
     })?;
-    let mut keys = PrivateKeyDer::pem_slice_iter(&bytes)
+    parse_private_key(&bytes, "TLS private-key file")
+}
+
+fn load_private_key_from_source(
+    base: &Path,
+    source: &MaterialSource,
+    purpose: &'static str,
+) -> Result<PrivateKeyDer<'static>, ConfigFileError> {
+    let bytes = source
+        .resolve(base, purpose)
+        .map_err(ConfigFileError::MaterialSource)?
+        .into_bytes();
+    parse_private_key(&bytes, purpose)
+}
+
+fn parse_private_key(
+    bytes: &[u8],
+    purpose: &'static str,
+) -> Result<PrivateKeyDer<'static>, ConfigFileError> {
+    let mut keys = PrivateKeyDer::pem_slice_iter(bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
-            ConfigFileError::MppTlsMaterial(format!(
-                "failed to parse TLS private-key file {}: {error}",
-                configured.display()
-            ))
+            ConfigFileError::MppTlsMaterial(format!("failed to parse {purpose}: {error}"))
         })?
         .into_iter();
     let key = keys.next().ok_or_else(|| {
-        ConfigFileError::MppTlsMaterial(format!(
-            "TLS private-key file {} contains no private key",
-            configured.display()
-        ))
+        ConfigFileError::MppTlsMaterial(format!("{purpose} contains no private key"))
     })?;
     if keys.next().is_some() {
         return Err(ConfigFileError::MppTlsMaterial(format!(
-            "TLS private-key file {} must contain exactly one private key",
-            configured.display()
+            "{purpose} must contain exactly one private key"
         )));
     }
     Ok(key)
@@ -1044,7 +1074,7 @@ enum InboundFileConfig {
         #[serde(default)]
         disable_icmp: bool,
         #[serde(default)]
-        dns_resolvers: Vec<SocketAddr>,
+        dns_redirects: Vec<SocketAddr>,
         dns_ttl_ms: Option<u32>,
         #[serde(default)]
         host: TunHostFileConfig,
@@ -1065,7 +1095,7 @@ enum InboundFileConfig {
         paths: Vec<MppPathFileConfig>,
         outbound: Option<String>,
         balancer: Option<String>,
-        dns_plan: Option<String>,
+        dns_policy: Option<String>,
         tun_l3: Option<TunL3ServerFileConfig>,
     },
 }
@@ -1184,7 +1214,7 @@ impl LocalIngressAdmissionFileConfig {
 #[serde(deny_unknown_fields)]
 struct OutboundProxyAuthFileConfig {
     username: Option<String>,
-    password: Option<SecretMaterialReference>,
+    password: Option<MaterialSource>,
 }
 
 impl std::fmt::Debug for OutboundProxyAuthFileConfig {
@@ -1208,9 +1238,9 @@ impl OutboundProxyAuthFileConfig {
             .password
             .ok_or(ConfigFileError::ProxyPasswordRequired)?
             .resolve(material_base, "upstream proxy password")
-            .map_err(ConfigFileError::SecretMaterial)?
+            .map_err(ConfigFileError::MaterialSource)?
             .into_utf8("upstream proxy password")
-            .map_err(ConfigFileError::SecretMaterial)?;
+            .map_err(ConfigFileError::MaterialSource)?;
         ProxyCredentials::new(username, password).map_err(ConfigFileError::Outbound)
     }
 }
@@ -1230,7 +1260,7 @@ struct TunFileConfig {
     #[serde(default)]
     disable_icmp: bool,
     #[serde(default)]
-    dns_resolvers: Vec<SocketAddr>,
+    dns_redirects: Vec<SocketAddr>,
     dns_ttl_ms: Option<u32>,
     #[serde(default)]
     host: TunHostFileConfig,
@@ -1255,7 +1285,7 @@ impl TunFileConfig {
             ipv6_prefix: self.ipv6_prefix.unwrap_or(64),
             mtu: self.mtu.unwrap_or(DEFAULT_TUN_MTU),
             enable_icmp: !self.disable_icmp,
-            dns_resolvers: self.dns_resolvers,
+            dns_resolvers: self.dns_redirects,
             dns_ttl_ms: self.dns_ttl_ms.unwrap_or(DEFAULT_TUN_DNS_TTL_MS),
             host: self.host.into_config()?,
         })
@@ -1277,7 +1307,7 @@ enum TunHostFileConfig {
         #[serde(default)]
         local_lan: bool,
         #[serde(default)]
-        dns_capture_servers: Vec<IpAddr>,
+        dns_listeners: Vec<IpAddr>,
         linux: Option<ManagedVpnLinuxFileConfig>,
     },
 }
@@ -1289,7 +1319,7 @@ impl TunHostFileConfig {
             include_cidrs,
             exclude_cidrs,
             local_lan,
-            dns_capture_servers,
+            dns_listeners,
             linux,
         } = self
         else {
@@ -1313,7 +1343,7 @@ impl TunHostFileConfig {
             route_mode,
             excludes,
             local_lan,
-            dns_capture_servers,
+            dns_capture_servers: dns_listeners,
             platform: ManagedVpnPlatformConfig { linux },
         }))
     }
@@ -1435,7 +1465,7 @@ enum OutboundFileConfig {
         endpoint: Option<String>,
         auth: Option<OutboundProxyAuthFileConfig>,
         tls_server_name: Option<String>,
-        tls_ca_certificate_file: Option<PathBuf>,
+        tls_ca_certificate: Option<MaterialSource>,
         connect_timeout_ms: Option<u64>,
     },
 }
@@ -1461,7 +1491,7 @@ struct RoutingFileConfig {
 #[serde(deny_unknown_fields)]
 struct RoutingRuleSetPublisherFileConfig {
     publisher_id: String,
-    ed25519_public_key_base64: String,
+    ed25519_public_key: MaterialSource,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1631,7 +1661,7 @@ struct RoutingRuleFileConfig {
     action: RoutingActionFileValue,
     outbound: Option<String>,
     balancer: Option<String>,
-    dns_plan: Option<String>,
+    dns_policy: Option<String>,
     #[serde(default)]
     initial_demand: RoutingInitialDemandFileValue,
     explanation: Option<String>,
@@ -1949,7 +1979,7 @@ fn parse_outbounds(
                 endpoint,
                 auth,
                 tls_server_name,
-                tls_ca_certificate_file,
+                tls_ca_certificate,
                 connect_timeout_ms,
             } => {
                 let name = canonical_config_name(&name)?;
@@ -1962,9 +1992,15 @@ fn parse_outbounds(
                     auth.map(|auth| auth.into_outbound_credentials(material_base))
                         .transpose()?,
                 );
-                let root_certificates = tls_ca_certificate_file
-                    .as_deref()
-                    .map(|path| load_certificates(material_base, path))
+                let root_certificates = tls_ca_certificate
+                    .as_ref()
+                    .map(|source| {
+                        load_certificates_from_source(
+                            material_base,
+                            source,
+                            "HTTPS proxy CA certificate",
+                        )
+                    })
                     .transpose()?
                     .unwrap_or_default();
                 let id = OutboundId::parse(&name)
@@ -2135,24 +2171,17 @@ fn compile_rule_set_registry(
         .map(|publisher| {
             let id = RuleSetPublisherId::parse(&publisher.publisher_id)
                 .map_err(|error| ConfigFileError::RuleSet(error.to_string()))?;
-            if publisher.ed25519_public_key_base64.trim() != publisher.ed25519_public_key_base64 {
-                return Err(ConfigFileError::RuleSet(format!(
-                    "publisher {id} Ed25519 public key must not contain surrounding whitespace"
-                )));
-            }
-            let decoded = BASE64
-                .decode(publisher.ed25519_public_key_base64.as_bytes())
-                .map_err(|_| {
-                    ConfigFileError::RuleSet(format!(
-                        "publisher {id} Ed25519 public key is not valid base64"
-                    ))
-                })?;
-            let public_key: [u8; 32] = decoded.try_into().map_err(|_| {
+            let public_key = publisher
+                .ed25519_public_key
+                .resolve(material_base, "Ed25519 rule-set publisher public key")
+                .map_err(ConfigFileError::MaterialSource)?
+                .into_bytes();
+            let public_key: [u8; 32] = public_key.try_into().map_err(|_| {
                 ConfigFileError::RuleSet(format!(
-                    "publisher {id} Ed25519 public key must decode to exactly 32 bytes"
+                    "publisher {id} Ed25519 public key must contain exactly 32 bytes"
                 ))
             })?;
-            Ok(RuleSetPublisher::new(id, public_key))
+            Ok::<_, ConfigFileError>(RuleSetPublisher::new(id, public_key))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let publishers = RuleSetPublisherCatalog::compile(publishers)
@@ -2327,7 +2356,7 @@ fn compile_product_route_rule(
             .collect(),
     };
     let dns_plan = rule
-        .dns_plan
+        .dns_policy
         .map(|plan| {
             let plan = canonical_config_name(&plan)?;
             crate::product::DnsPlanId::parse(&plan)
@@ -2701,7 +2730,7 @@ fn build_node_services(
                 ipv6_prefix,
                 mtu,
                 disable_icmp,
-                dns_resolvers,
+                dns_redirects,
                 dns_ttl_ms,
                 host,
             } => {
@@ -2720,7 +2749,7 @@ fn build_node_services(
                             ipv6_prefix,
                             mtu,
                             disable_icmp,
-                            dns_resolvers,
+                            dns_redirects,
                             dns_ttl_ms,
                             host,
                         }
@@ -2754,7 +2783,7 @@ fn build_node_services(
                 paths,
                 outbound,
                 balancer,
-                dns_plan,
+                dns_policy,
                 tun_l3,
             } => {
                 let name = canonical_config_name(&name)?;
@@ -2772,7 +2801,7 @@ fn build_node_services(
                 servers.push(MppInboundConfig {
                     name,
                     egress,
-                    dns_plan: dns_plan
+                    dns_plan: dns_policy
                         .map(|plan| {
                             let plan = canonical_config_name(&plan)?;
                             crate::product::DnsPlanId::parse(&plan)
@@ -2877,66 +2906,72 @@ fn outbound_connect_timeout(value: Option<u64>) -> Duration {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsFileConfig {
-    #[serde(default = "default_product_policy_generation")]
-    generation: u64,
-    upstreams: Vec<DnsUpstreamFileConfig>,
-    plans: Vec<DnsPlanFileConfig>,
+    #[serde(default = "default_dns_servers")]
+    servers: Vec<DnsServerFileConfig>,
+    #[serde(default = "default_dns_policies")]
+    policies: Vec<DnsPolicyFileConfig>,
     #[serde(default)]
     rules: Vec<DnsRuleFileConfig>,
     #[serde(default)]
-    hosts: Vec<DnsHostFileConfig>,
-    fake_dns: Option<FakeDnsFileConfig>,
-    default_dns_plan: String,
+    records: Vec<DnsRecordFileConfig>,
+    r#override: Option<DnsOverrideFileConfig>,
+    #[serde(default = "default_dns_policy_name")]
+    default: String,
 }
 
 impl Default for DnsFileConfig {
     fn default() -> Self {
         Self {
-            generation: default_product_policy_generation(),
-            upstreams: vec![DnsUpstreamFileConfig {
-                name: "system".to_string(),
-                transport: DnsTransportFileValue::System,
-                bootstrap: None,
-                server_name: None,
-                path: None,
-                outbound: None,
-            }],
-            plans: vec![DnsPlanFileConfig {
-                name: "default".to_string(),
-                upstreams: vec!["system".to_string()],
-                ip_strategy: DnsStrategyFileValue::default(),
-                security: DnsSecurityFileValue::default(),
-                upstream_strategy: DnsUpstreamStrategyFileValue::default(),
-                fallback_delay_ms: None,
-                expected_cidrs: Vec::new(),
-                lookup_timeout_ms: None,
-                cache_capacity: None,
-                max_inflight: None,
-                max_answers: None,
-                positive_ttl_cap_ms: None,
-                negative_ttl_cap_ms: None,
-                stale_if_error_ms: None,
-                prefetch_max_ms: None,
-            }],
+            servers: default_dns_servers(),
+            policies: default_dns_policies(),
             rules: Vec::new(),
-            hosts: Vec::new(),
-            fake_dns: None,
-            default_dns_plan: "default".to_string(),
+            records: Vec::new(),
+            r#override: None,
+            default: default_dns_policy_name(),
         }
     }
+}
+
+fn default_dns_policy_name() -> String {
+    "default".to_string()
+}
+
+fn default_dns_servers() -> Vec<DnsServerFileConfig> {
+    vec![DnsServerFileConfig {
+        name: "system".to_string(),
+        protocol: DnsProtocolFileValue::System,
+        address: None,
+        tls_name: None,
+        path: None,
+        outbound: None,
+    }]
+}
+
+fn default_dns_policies() -> Vec<DnsPolicyFileConfig> {
+    vec![DnsPolicyFileConfig {
+        name: default_dns_policy_name(),
+        servers: vec!["system".to_string()],
+        family: DnsFamilyFileValue::default(),
+        security: DnsSecurityFileValue::default(),
+        strategy: DnsServerStrategyFileValue::default(),
+        fallback_ms: None,
+        answer_cidrs: Vec::new(),
+        query: DnsQueryFileConfig::default(),
+        cache: DnsCacheFileConfig::default(),
+    }]
 }
 
 impl DnsFileConfig {
     fn into_config(self, outbounds: &ParsedOutbounds) -> Result<DnsPolicyConfig, ConfigFileError> {
         let upstreams = self
-            .upstreams
+            .servers
             .into_iter()
-            .map(DnsUpstreamFileConfig::into_spec)
+            .map(DnsServerFileConfig::into_spec)
             .collect::<Result<Vec<_>, _>>()?;
         let plans = self
-            .plans
+            .policies
             .into_iter()
-            .map(DnsPlanFileConfig::into_spec)
+            .map(DnsPolicyFileConfig::into_spec)
             .collect::<Result<Vec<_>, _>>()?;
         let rules = self
             .rules
@@ -2944,11 +2979,11 @@ impl DnsFileConfig {
             .map(DnsRuleFileConfig::into_spec)
             .collect::<Result<Vec<_>, _>>()?;
         let hosts = self
-            .hosts
+            .records
             .into_iter()
-            .map(DnsHostFileConfig::into_spec)
+            .map(DnsRecordFileConfig::into_spec)
             .collect::<Result<Vec<_>, _>>()?;
-        let fake_dns = self.fake_dns.map(FakeDnsFileConfig::into_spec);
+        let fake_dns = self.r#override.map(DnsOverrideFileConfig::into_spec);
         let mut outbound_capabilities = outbounds
             .leaves
             .values()
@@ -2998,13 +3033,13 @@ impl DnsFileConfig {
             hosts,
             fake_dns,
             default_plan: {
-                let name = canonical_config_name(&self.default_dns_plan)?;
+                let name = canonical_config_name(&self.default)?;
                 crate::product::DnsPlanId::parse(&name)
                     .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?
             },
         };
         let config = DnsPolicyConfig {
-            generation: self.generation,
+            generation: default_product_policy_generation(),
             spec,
         };
         config
@@ -3016,7 +3051,7 @@ impl DnsFileConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FakeDnsFileConfig {
+struct DnsOverrideFileConfig {
     ipv4_pool: Option<ipnet::Ipv4Net>,
     ipv6_pool: Option<ipnet::Ipv6Net>,
     max_entries: usize,
@@ -3024,7 +3059,7 @@ struct FakeDnsFileConfig {
     recovery_ttl_ms: u64,
 }
 
-impl FakeDnsFileConfig {
+impl DnsOverrideFileConfig {
     fn into_spec(self) -> FakeDnsSpec {
         FakeDnsSpec {
             ipv4_pool: self.ipv4_pool,
@@ -3038,22 +3073,22 @@ impl FakeDnsFileConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DnsUpstreamFileConfig {
+struct DnsServerFileConfig {
     name: String,
-    transport: DnsTransportFileValue,
-    bootstrap: Option<SocketAddr>,
-    server_name: Option<String>,
+    protocol: DnsProtocolFileValue,
+    address: Option<SocketAddr>,
+    tls_name: Option<String>,
     path: Option<String>,
     outbound: Option<String>,
 }
 
-impl DnsUpstreamFileConfig {
+impl DnsServerFileConfig {
     fn into_spec(self) -> Result<DnsUpstreamSpec, ConfigFileError> {
         let Self {
             name,
-            transport,
-            bootstrap,
-            server_name,
+            protocol,
+            address,
+            tls_name,
             path,
             outbound,
         } = self;
@@ -3061,64 +3096,58 @@ impl DnsUpstreamFileConfig {
         let id = DnsUpstreamId::parse(&name)
             .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?;
         if matches!(
-            transport,
-            DnsTransportFileValue::Udp | DnsTransportFileValue::Tcp | DnsTransportFileValue::UdpTcp
-        ) && (server_name.is_some() || path.is_some())
+            protocol,
+            DnsProtocolFileValue::Udp | DnsProtocolFileValue::Tcp | DnsProtocolFileValue::UdpTcp
+        ) && (tls_name.is_some() || path.is_some())
         {
             return Err(ConfigFileError::DnsValue(format!(
-                "DNS upstream {} transport does not accept TLS identity or HTTP path",
+                "DNS server {} protocol does not accept a TLS name or HTTP path",
                 id.as_str()
             )));
         }
         if matches!(
-            transport,
-            DnsTransportFileValue::Tls | DnsTransportFileValue::Quic
+            protocol,
+            DnsProtocolFileValue::Dot | DnsProtocolFileValue::Doq
         ) && path.is_some()
         {
             return Err(ConfigFileError::DnsValue(format!(
-                "DNS encrypted non-HTTP upstream {} does not accept an HTTP path",
+                "DNS server {} protocol does not accept an HTTP path",
                 id.as_str()
             )));
         }
-        let endpoint = match transport {
-            DnsTransportFileValue::System => {
-                if bootstrap.is_some()
-                    || server_name.is_some()
-                    || path.is_some()
-                    || outbound.is_some()
-                {
+        let endpoint = match protocol {
+            DnsProtocolFileValue::System => {
+                if address.is_some() || tls_name.is_some() || path.is_some() || outbound.is_some() {
                     return Err(ConfigFileError::DnsValue(
-                        "system DNS upstream cannot set bootstrap, TLS identity, path, or outbound egress".to_string(),
+                        "system DNS server cannot set address, tls_name, path, or outbound"
+                            .to_string(),
                     ));
                 }
                 DnsUpstreamEndpoint::System
             }
-            DnsTransportFileValue::Udp => DnsUpstreamEndpoint::Udp {
-                bootstrap: required_dns_bootstrap(bootstrap, &id)?,
+            DnsProtocolFileValue::Udp => DnsUpstreamEndpoint::Udp {
+                bootstrap: required_dns_server_address(address, &id)?,
             },
-            DnsTransportFileValue::Tcp => DnsUpstreamEndpoint::Tcp {
-                bootstrap: required_dns_bootstrap(bootstrap, &id)?,
+            DnsProtocolFileValue::Tcp => DnsUpstreamEndpoint::Tcp {
+                bootstrap: required_dns_server_address(address, &id)?,
             },
-            DnsTransportFileValue::UdpTcp => DnsUpstreamEndpoint::UdpTcp {
-                bootstrap: required_dns_bootstrap(bootstrap, &id)?,
+            DnsProtocolFileValue::UdpTcp => DnsUpstreamEndpoint::UdpTcp {
+                bootstrap: required_dns_server_address(address, &id)?,
             },
-            DnsTransportFileValue::Tls => DnsUpstreamEndpoint::Tls {
-                bootstrap: required_dns_bootstrap(bootstrap, &id)?,
-                server_name: required_dns_server_name(server_name, &id)?,
+            DnsProtocolFileValue::Dot => DnsUpstreamEndpoint::Tls {
+                bootstrap: required_dns_server_address(address, &id)?,
+                server_name: required_dns_tls_name(tls_name, &id)?,
             },
-            DnsTransportFileValue::Https => DnsUpstreamEndpoint::Https {
-                bootstrap: required_dns_bootstrap(bootstrap, &id)?,
-                server_name: required_dns_server_name(server_name, &id)?,
+            DnsProtocolFileValue::Doh => DnsUpstreamEndpoint::Https {
+                bootstrap: required_dns_server_address(address, &id)?,
+                server_name: required_dns_tls_name(tls_name, &id)?,
                 path: path.ok_or_else(|| {
-                    ConfigFileError::DnsValue(format!(
-                        "DNS HTTPS upstream {} requires path",
-                        id.as_str()
-                    ))
+                    ConfigFileError::DnsValue(format!("DoH server {} requires path", id.as_str()))
                 })?,
             },
-            DnsTransportFileValue::Quic => DnsUpstreamEndpoint::Quic {
-                bootstrap: required_dns_bootstrap(bootstrap, &id)?,
-                server_name: required_dns_server_name(server_name, &id)?,
+            DnsProtocolFileValue::Doq => DnsUpstreamEndpoint::Quic {
+                bootstrap: required_dns_server_address(address, &id)?,
+                server_name: required_dns_tls_name(tls_name, &id)?,
             },
         };
         let egress = outbound
@@ -3138,87 +3167,101 @@ impl DnsUpstreamFileConfig {
     }
 }
 
-fn required_dns_bootstrap(
-    bootstrap: Option<SocketAddr>,
+fn required_dns_server_address(
+    address: Option<SocketAddr>,
     id: &DnsUpstreamId,
 ) -> Result<SocketAddr, ConfigFileError> {
-    bootstrap.ok_or_else(|| {
+    address.ok_or_else(|| {
         ConfigFileError::DnsValue(format!(
-            "DNS upstream {} requires a literal bootstrap SocketAddr",
+            "DNS server {} requires a literal IP socket address",
             id.as_str()
         ))
     })
 }
 
-fn required_dns_server_name(
-    server_name: Option<String>,
+fn required_dns_tls_name(
+    tls_name: Option<String>,
     id: &DnsUpstreamId,
 ) -> Result<DomainName, ConfigFileError> {
-    let server_name = server_name.ok_or_else(|| {
+    let tls_name = tls_name.ok_or_else(|| {
         ConfigFileError::DnsValue(format!(
-            "DNS encrypted upstream {} requires server_name",
+            "encrypted DNS server {} requires tls_name",
             id.as_str()
         ))
     })?;
-    DomainName::parse(&server_name).map_err(|error| ConfigFileError::DnsValue(error.to_string()))
+    DomainName::parse(&tls_name).map_err(|error| ConfigFileError::DnsValue(error.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum DnsTransportFileValue {
+enum DnsProtocolFileValue {
     System,
     Udp,
     Tcp,
     UdpTcp,
-    Tls,
-    Https,
-    Quic,
+    Dot,
+    Doh,
+    Doq,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DnsPlanFileConfig {
+struct DnsPolicyFileConfig {
     name: String,
-    upstreams: Vec<String>,
+    servers: Vec<String>,
     #[serde(default)]
-    ip_strategy: DnsStrategyFileValue,
+    family: DnsFamilyFileValue,
     #[serde(default)]
     security: DnsSecurityFileValue,
     #[serde(default)]
-    upstream_strategy: DnsUpstreamStrategyFileValue,
-    fallback_delay_ms: Option<u64>,
+    strategy: DnsServerStrategyFileValue,
+    fallback_ms: Option<u64>,
     #[serde(default)]
-    expected_cidrs: Vec<String>,
-    lookup_timeout_ms: Option<u64>,
-    cache_capacity: Option<usize>,
-    max_inflight: Option<usize>,
-    max_answers: Option<usize>,
-    positive_ttl_cap_ms: Option<u64>,
-    negative_ttl_cap_ms: Option<u64>,
-    stale_if_error_ms: Option<u64>,
-    prefetch_max_ms: Option<u64>,
+    answer_cidrs: Vec<String>,
+    #[serde(default)]
+    query: DnsQueryFileConfig,
+    #[serde(default)]
+    cache: DnsCacheFileConfig,
 }
 
-impl DnsPlanFileConfig {
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsQueryFileConfig {
+    timeout_ms: Option<u64>,
+    inflight: Option<usize>,
+    answers: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsCacheFileConfig {
+    entries: Option<usize>,
+    positive_ttl_ms: Option<u64>,
+    negative_ttl_ms: Option<u64>,
+    stale_ms: Option<u64>,
+    prefetch_ms: Option<u64>,
+}
+
+impl DnsPolicyFileConfig {
     fn into_spec(self) -> Result<DnsPlanSpec, ConfigFileError> {
         let name = canonical_config_name(&self.name)?;
         let id = crate::product::DnsPlanId::parse(&name)
             .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?;
         let defaults = DnsPlanLimits::default();
-        let upstream_strategy = match (self.upstream_strategy, self.fallback_delay_ms) {
-            (DnsUpstreamStrategyFileValue::Ordered, None) => DnsUpstreamStrategy::Ordered,
-            (DnsUpstreamStrategyFileValue::Ordered, Some(_)) => {
+        let upstream_strategy = match (self.strategy, self.fallback_ms) {
+            (DnsServerStrategyFileValue::Ordered, None) => DnsUpstreamStrategy::Ordered,
+            (DnsServerStrategyFileValue::Ordered, Some(_)) => {
                 return Err(ConfigFileError::DnsValue(format!(
-                    "ordered DNS plan {} cannot set fallback_delay_ms",
+                    "ordered DNS policy {} cannot set fallback_ms",
                     id.as_str()
                 )));
             }
-            (DnsUpstreamStrategyFileValue::Race, Some(delay_ms)) => DnsUpstreamStrategy::Race {
+            (DnsServerStrategyFileValue::Race, Some(delay_ms)) => DnsUpstreamStrategy::Race {
                 fallback_delay: Duration::from_millis(delay_ms),
             },
-            (DnsUpstreamStrategyFileValue::Race, None) => {
+            (DnsServerStrategyFileValue::Race, None) => {
                 return Err(ConfigFileError::DnsValue(format!(
-                    "racing DNS plan {} requires fallback_delay_ms",
+                    "racing DNS policy {} requires fallback_ms",
                     id.as_str()
                 )));
             }
@@ -3226,7 +3269,7 @@ impl DnsPlanFileConfig {
         Ok(DnsPlanSpec {
             id: id.clone(),
             upstreams: self
-                .upstreams
+                .servers
                 .into_iter()
                 .map(|value| {
                     let value = canonical_config_name(&value)?;
@@ -3234,16 +3277,16 @@ impl DnsPlanFileConfig {
                         .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            ip_strategy: self.ip_strategy.into(),
+            ip_strategy: self.family.into(),
             security: self.security.into(),
             upstream_strategy,
             expected_cidrs: self
-                .expected_cidrs
+                .answer_cidrs
                 .into_iter()
                 .map(|value| {
                     value.parse::<ipnet::IpNet>().map_err(|error| {
                         ConfigFileError::DnsValue(format!(
-                            "DNS plan {} expected CIDR {value:?} is invalid: {error}",
+                            "DNS policy {} answer CIDR {value:?} is invalid: {error}",
                             id.as_str()
                         ))
                     })
@@ -3251,26 +3294,31 @@ impl DnsPlanFileConfig {
                 .collect::<Result<Vec<_>, _>>()?,
             limits: DnsPlanLimits {
                 lookup_timeout: Duration::from_millis(
-                    self.lookup_timeout_ms
+                    self.query
+                        .timeout_ms
                         .unwrap_or(defaults.lookup_timeout.as_millis() as u64),
                 ),
-                cache_capacity: self.cache_capacity.unwrap_or(defaults.cache_capacity),
-                max_inflight: self.max_inflight.unwrap_or(defaults.max_inflight),
-                max_answers: self.max_answers.unwrap_or(defaults.max_answers),
+                cache_capacity: self.cache.entries.unwrap_or(defaults.cache_capacity),
+                max_inflight: self.query.inflight.unwrap_or(defaults.max_inflight),
+                max_answers: self.query.answers.unwrap_or(defaults.max_answers),
                 positive_ttl_cap: Duration::from_millis(
-                    self.positive_ttl_cap_ms
+                    self.cache
+                        .positive_ttl_ms
                         .unwrap_or(defaults.positive_ttl_cap.as_millis() as u64),
                 ),
                 negative_ttl_cap: Duration::from_millis(
-                    self.negative_ttl_cap_ms
+                    self.cache
+                        .negative_ttl_ms
                         .unwrap_or(defaults.negative_ttl_cap.as_millis() as u64),
                 ),
                 stale_if_error: Duration::from_millis(
-                    self.stale_if_error_ms
+                    self.cache
+                        .stale_ms
                         .unwrap_or(defaults.stale_if_error.as_millis() as u64),
                 ),
                 prefetch_max: Duration::from_millis(
-                    self.prefetch_max_ms
+                    self.cache
+                        .prefetch_ms
                         .unwrap_or(defaults.prefetch_max.as_millis() as u64),
                 ),
             },
@@ -3280,7 +3328,7 @@ impl DnsPlanFileConfig {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum DnsUpstreamStrategyFileValue {
+enum DnsServerStrategyFileValue {
     #[default]
     Ordered,
     Race,
@@ -3288,12 +3336,12 @@ enum DnsUpstreamStrategyFileValue {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DnsHostFileConfig {
+struct DnsRecordFileConfig {
     domain: String,
     addresses: Vec<IpAddr>,
 }
 
-impl DnsHostFileConfig {
+impl DnsRecordFileConfig {
     fn into_spec(self) -> Result<DnsHostSpec, ConfigFileError> {
         Ok(DnsHostSpec {
             domain: DomainName::parse(&self.domain)
@@ -3309,14 +3357,14 @@ struct DnsRuleFileConfig {
     name: String,
     exact: Option<String>,
     suffix: Option<String>,
-    dns_plan: String,
+    policy: String,
     explanation: Option<String>,
 }
 
 impl DnsRuleFileConfig {
     fn into_spec(self) -> Result<DnsRuleSpec, ConfigFileError> {
         let name = canonical_config_name(&self.name)?;
-        let dns_plan = canonical_config_name(&self.dns_plan)?;
+        let dns_policy = canonical_config_name(&self.policy)?;
         let matcher = match (self.exact, self.suffix) {
             (Some(exact), None) => DnsRuleMatch::Exact(
                 DomainName::parse(&exact)
@@ -3336,7 +3384,7 @@ impl DnsRuleFileConfig {
             id: DnsRuleId::parse(&name)
                 .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             matcher,
-            plan: crate::product::DnsPlanId::parse(&dns_plan)
+            plan: crate::product::DnsPlanId::parse(&dns_policy)
                 .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             explanation: self.explanation,
         })
@@ -3345,7 +3393,7 @@ impl DnsRuleFileConfig {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum DnsStrategyFileValue {
+enum DnsFamilyFileValue {
     Ipv4ThenIpv6,
     Ipv6ThenIpv4,
     Ipv4Only,
@@ -3355,15 +3403,15 @@ enum DnsStrategyFileValue {
     Ipv6AndIpv4,
 }
 
-impl From<DnsStrategyFileValue> for DnsIpStrategy {
-    fn from(value: DnsStrategyFileValue) -> Self {
+impl From<DnsFamilyFileValue> for DnsIpStrategy {
+    fn from(value: DnsFamilyFileValue) -> Self {
         match value {
-            DnsStrategyFileValue::Ipv4ThenIpv6 => Self::Ipv4ThenIpv6,
-            DnsStrategyFileValue::Ipv6ThenIpv4 => Self::Ipv6ThenIpv4,
-            DnsStrategyFileValue::Ipv4Only => Self::Ipv4Only,
-            DnsStrategyFileValue::Ipv6Only => Self::Ipv6Only,
-            DnsStrategyFileValue::Ipv4AndIpv6 => Self::Ipv4AndIpv6,
-            DnsStrategyFileValue::Ipv6AndIpv4 => Self::Ipv6AndIpv4,
+            DnsFamilyFileValue::Ipv4ThenIpv6 => Self::Ipv4ThenIpv6,
+            DnsFamilyFileValue::Ipv6ThenIpv4 => Self::Ipv6ThenIpv4,
+            DnsFamilyFileValue::Ipv4Only => Self::Ipv4Only,
+            DnsFamilyFileValue::Ipv6Only => Self::Ipv6Only,
+            DnsFamilyFileValue::Ipv4AndIpv6 => Self::Ipv4AndIpv6,
+            DnsFamilyFileValue::Ipv6AndIpv4 => Self::Ipv6AndIpv4,
         }
     }
 }
@@ -3395,7 +3443,7 @@ pub enum ConfigFileError {
     LocalUser(String),
     ProxyAuth(ProxyAuthConfigError),
     LocalAdmission(LocalIngressAdmissionConfigError),
-    SecretMaterial(SecretMaterialError),
+    MaterialSource(MaterialSourceError),
     Endpoint(EndpointParseError),
     Outbound(OutboundError),
     PathSpec(PathSpecParseError),
@@ -3464,7 +3512,7 @@ impl std::fmt::Display for ConfigFileError {
             Self::LocalUser(error) => write!(f, "invalid local user catalog: {error}"),
             Self::ProxyAuth(error) => write!(f, "invalid local proxy authentication: {error}"),
             Self::LocalAdmission(error) => write!(f, "invalid local proxy admission: {error}"),
-            Self::SecretMaterial(error) => write!(f, "{error}"),
+            Self::MaterialSource(error) => write!(f, "{error}"),
             Self::Endpoint(err) => write!(f, "{err}"),
             Self::Outbound(err) => write!(f, "{err}"),
             Self::PathSpec(err) => write!(f, "{err}"),
@@ -3592,7 +3640,7 @@ impl std::error::Error for ConfigFileError {
             Self::Credential(_) | Self::LocalUser(_) => None,
             Self::ProxyAuth(error) => Some(error),
             Self::LocalAdmission(error) => Some(error),
-            Self::SecretMaterial(error) => Some(error),
+            Self::MaterialSource(error) => Some(error),
             Self::Endpoint(err) => Some(err),
             Self::Outbound(err) => Some(err),
             Self::PathSpec(err) => Some(err),

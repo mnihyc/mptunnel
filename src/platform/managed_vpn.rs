@@ -201,7 +201,7 @@ pub(crate) fn compile_managed_vpn_generation_spec(
             let upstream = dns_policy.upstream(upstream_id).ok_or_else(|| {
                 ManagedVpnGenerationSpecError::DnsPolicyInvariant {
                     message: format!(
-                        "pre-publication plan {} lost upstream {upstream_id}",
+                        "pre-publication DNS policy {} lost server {upstream_id}",
                         selection.plan().id()
                     ),
                 }
@@ -337,13 +337,13 @@ impl fmt::Display for ManagedVpnGenerationSpecError {
             }
             Self::PreCarrierDnsEgressUnsupported { upstream, outbound } => write!(
                 formatter,
-                "managed VPN DNS upstream {upstream} selects outbound {outbound}, which is unavailable before carrier bootstrap"
+                "managed VPN DNS server {upstream} selects outbound {outbound}, which is unavailable before carrier bootstrap"
             ),
             Self::SystemDnsUnsupported => formatter.write_str(
                 "managed VPN cannot use system DNS because it creates a recursive tunnel dependency",
             ),
             Self::EncryptedDnsRequired => {
-                formatter.write_str("managed VPN requires encrypted-only DNS plans")
+                formatter.write_str("managed VPN requires encrypted-only DNS policies")
             }
             Self::FullTunnelDnsCaptureRequired => {
                 formatter.write_str("full managed VPN requires host DNS capture")

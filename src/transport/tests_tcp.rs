@@ -40,7 +40,7 @@ async fn tcp_path_connects_to_bound_listener_and_frames_work() {
 
 #[tokio::test]
 async fn tcp_path_rejects_udp_underlay() {
-    let path = "udp://127.0.0.1:1234".parse::<PathSpec>().expect("path");
+    let path = "quic://127.0.0.1:1234".parse::<PathSpec>().expect("path");
     let err = connect_path(&path, TcpConnectOptions::default())
         .await
         .expect_err("wrong underlay");

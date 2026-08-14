@@ -44,7 +44,7 @@ fn tcp_carrier_groups_publish_every_bounded_pool_member() {
         vec![
             ClientPathConfig {
                 name: "primary".to_string(),
-                spec: "tcp://127.0.0.1:12700?tcp-carriers=1-3"
+                spec: "tcp://127.0.0.1:12700?max-tcp-carriers=3"
                     .parse()
                     .expect("primary path"),
                 security: primary_security.clone(),
@@ -52,7 +52,7 @@ fn tcp_carrier_groups_publish_every_bounded_pool_member() {
             },
             ClientPathConfig {
                 name: "secondary".to_string(),
-                spec: "tcp://127.0.0.1:12701?tcp-carriers=2-2"
+                spec: "tcp://127.0.0.1:12701?max-tcp-carriers=2"
                     .parse()
                     .expect("secondary path"),
                 security: secondary_security.clone(),
@@ -163,7 +163,7 @@ fn tcp_carrier_groups_publish_every_bounded_pool_member() {
     assert!(matches!(
         ClientPathContext::new(
             vec![
-                "tcp://127.0.0.1:12702?tcp-carriers=1-3"
+                "tcp://127.0.0.1:12702?max-tcp-carriers=3"
                     .parse()
                     .expect("bounded path")
             ],
@@ -321,7 +321,7 @@ fn session_product_ownership_fences_tcp_replacement_across_attachment_changes() 
         "tcp://127.0.0.1:12720"
             .parse::<PathSpec>()
             .expect("TCP path"),
-        "udp://127.0.0.1:12721"
+        "quic://127.0.0.1:12721"
             .parse::<PathSpec>()
             .expect("QUIC path"),
     ];
@@ -392,7 +392,7 @@ fn peer_path_usage_is_directional_and_sequence_ordered_per_underlay() {
         "tcp://127.0.0.1:12710"
             .parse::<PathSpec>()
             .expect("TCP path"),
-        "udp://127.0.0.1:12711"
+        "quic://127.0.0.1:12711"
             .parse::<PathSpec>()
             .expect("QUIC path"),
     ];

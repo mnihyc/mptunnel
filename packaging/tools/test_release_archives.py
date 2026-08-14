@@ -315,8 +315,14 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.assertNotIn("i686-linux-android", package_script)
         self.assertEqual(
             package_script.count("Java_com_v2ray_ang_mpp_MptunnelNative_"),
-            7,
+            11,
         )
+        self.assertIn("if ! diff -u", package_script)
+        self.assertIn(
+            "awk '/^Java_com_v2ray_ang_mpp_MptunnelNative_/ { print }'",
+            package_script,
+        )
+        self.assertNotIn("for symbol in \"${jni_exports[@]}\"", package_script)
         self.assertIn("llvm-strip", package_script)
         self.assertIn("llvm-nm", package_script)
         self.assertIn("0x4000", package_script)

@@ -23,7 +23,7 @@ and a server TLS identity. Securely copy `mpp-credential.key`,
 
 ```text
 umask 077
-openssl rand -hex 32 > mpp-credential.key
+openssl rand -out mpp-credential.key 32
 openssl rand -out mpp-transport.key 32
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -subj "/CN=mptunnel.example" \
@@ -43,7 +43,7 @@ Start the server:
   --tls-certificate-chain ./server-cert.pem \
   --tls-private-key ./server-key.pem \
   --bind-path tcp://0.0.0.0:7443 \
-  --bind-path udp://0.0.0.0:7443 \
+  --bind-path quic://0.0.0.0:7443 \
   --outbound-protocol direct
 ```
 
@@ -57,7 +57,7 @@ Start the client:
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
   --path tcp://server.example.com:7443 \
-  --path udp://server.example.com:7443
+  --path quic://server.example.com:7443
 ```
 
 The certificate name defaults to `mptunnel.example`. The commands use the
@@ -75,7 +75,11 @@ certificate files, and validate before starting:
 ```
 
 Configuration-relative certificate paths resolve beside the selected TOML
-file. Run `./mptunnel --help` for the simple CLI surface.
+file. The repository's
+[complete configuration reference](../examples/config.reference.toml)
+documents every TOML section, material source, DNS protocol, and carrier URI
+option; it is intentionally not duplicated in release archives. Run
+`./mptunnel --help` for the simple CLI surface.
 
 ## Service helpers
 
@@ -129,6 +133,7 @@ Every release uses versioned bundle names:
 - `mptunnel-<version>-macos-amd64.zip`
 - `mptunnel-<version>-macos-arm64.zip`
 - `mptunnel-<version>-android-arm64.tar.gz`
+- `mptunnel-<version>-android-x86_64.tar.gz`
 
 The release's `version.json` records its schema, product, version, tag, source
 commit, and the exact name and tag-specific GitHub download URL of every

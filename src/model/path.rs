@@ -13,13 +13,29 @@ static NEXT_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// These values never cross the wire: each endpoint applies the policy attached
 /// to its own path configuration and publishes only resulting observations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathPolicy {
     pub backup: bool,
     pub expensive: bool,
     pub bulk_allowed: bool,
     pub probe_only: bool,
     pub no_udp: bool,
+}
+
+impl serde::Serialize for PathPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        let mut state = serializer.serialize_struct("PathPolicy", 5)?;
+        state.serialize_field("backup", &self.backup)?;
+        state.serialize_field("expensive", &self.expensive)?;
+        state.serialize_field("allow_bulk", &self.bulk_allowed)?;
+        state.serialize_field("control_only", &self.probe_only)?;
+        state.serialize_field("allow_datagrams", &!self.no_udp)?;
+        state.end()
+    }
 }
 
 impl Default for PathPolicy {

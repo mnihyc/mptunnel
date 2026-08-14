@@ -14,7 +14,7 @@ use crate::runtime::outbound_registry::{GatewayRuntimeControl, NamedGatewayRunti
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub(super) const BALANCER_SCHEMA: &str = "mptunnel.balancer.v1";
+pub(super) const BALANCER_SCHEMA: &str = "mptunnel.balancer.v3";
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementBalancerStatus {

@@ -218,20 +218,26 @@ if [[ "$target_os" == "android" ]]; then
       "$android_library" | awk '{print $1}'
   )"
   jni_exports=(
-    Java_com_v2ray_ang_mpp_MptunnelNative_nativeDeleteProfile
+    Java_com_v2ray_ang_mpp_MptunnelNative_nativeFinalizeEditor
     Java_com_v2ray_ang_mpp_MptunnelNative_nativeIsRunning
+    Java_com_v2ray_ang_mpp_MptunnelNative_nativeMigrateEditor
+    Java_com_v2ray_ang_mpp_MptunnelNative_nativePatchEditor
+    Java_com_v2ray_ang_mpp_MptunnelNative_nativeProjectEditor
     Java_com_v2ray_ang_mpp_MptunnelNative_nativeStart
     Java_com_v2ray_ang_mpp_MptunnelNative_nativeState
     Java_com_v2ray_ang_mpp_MptunnelNative_nativeStatsJson
     Java_com_v2ray_ang_mpp_MptunnelNative_nativeStop
     Java_com_v2ray_ang_mpp_MptunnelNative_nativeVersion
   )
-  for symbol in "${jni_exports[@]}"; do
-    if [[ "$(grep -Fxc "$symbol" <<<"$dynamic_symbols")" -ne 1 ]]; then
-      echo "$android_library does not export exactly one $symbol" >&2
-      exit 1
-    fi
-  done
+  if ! diff -u \
+    <(printf '%s\n' "${jni_exports[@]}" | LC_ALL=C sort) \
+    <(
+      awk '/^Java_com_v2ray_ang_mpp_MptunnelNative_/ { print }' \
+        <<<"$dynamic_symbols" | LC_ALL=C sort
+    ); then
+    echo "$android_library does not expose the exact Android JNI contract" >&2
+    exit 1
+  fi
 
   mapfile -t load_alignments < <(
     "${android_toolchain}/llvm-readelf" -W -l "$android_library" |

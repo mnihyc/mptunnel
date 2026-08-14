@@ -1,11 +1,11 @@
 (function () {
   "use strict";
 
-  const HEALTH_ENDPOINT = "/api/v2/health";
-  const STATUS_ENDPOINT = "/api/v2/status";
-  const PEER_ENDPOINT = "/api/v2/diagnostics/peer";
-  const BALANCER_ACTION_ENDPOINT = "/api/v2/balancers/actions";
-  const EXPECTED_SCHEMA = "mptunnel.management.v6";
+  const HEALTH_ENDPOINT = "/api/v3/health";
+  const STATUS_ENDPOINT = "/api/v3/status";
+  const PEER_ENDPOINT = "/api/v3/diagnostics/peer";
+  const BALANCER_ACTION_ENDPOINT = "/api/v3/balancers/actions";
+  const EXPECTED_SCHEMA = "mptunnel.management.v3";
   const TOKEN_STORAGE_KEY = "mptunnel.dashboard.bearer";
   const NAVIGATION_STORAGE_KEY = "mptunnel.dashboard.navigation-collapsed";
   const REFRESH_STORAGE_KEY = "mptunnel.dashboard.refresh-interval-ms";
@@ -596,7 +596,7 @@
   }
 
   function validateHealth(payload) {
-    if (!payload || typeof payload !== "object" || payload.schema !== "mptunnel.health.v2") {
+    if (!payload || typeof payload !== "object" || payload.schema !== "mptunnel.health.v3") {
       throw new Error("Unsupported management health response");
     }
     return payload;
@@ -953,7 +953,7 @@
       "DNS",
       health.dns === null || health.dns === undefined
         ? "Not configured"
-        : formatCount(healthDns.plans) + " plans / " + formatCount(healthDns.failed_plans) + " failed"
+        : formatCount(healthDns.policies) + " policies / " + formatCount(healthDns.failed_policies) + " failed"
     );
     if (health.desired_revision || health.active_revision || health.runtime_revision) {
       const revisions = [health.desired_revision, health.active_revision, health.runtime_revision]
@@ -1404,9 +1404,9 @@
     const restrictions = [];
     if (policy.backup) restrictions.push("backup");
     if (policy.expensive) restrictions.push("expensive");
-    if (policy.bulk_allowed === false) restrictions.push("no-bulk");
-    if (policy.probe_only) restrictions.push("probe");
-    if (policy.no_udp) restrictions.push("no-udp");
+    if (policy.allow_bulk === false) restrictions.push("allow-bulk=false");
+    if (policy.control_only) restrictions.push("control-only=true");
+    if (policy.allow_datagrams === false) restrictions.push("allow-datagrams=false");
     return restrictions.join(", ") || "default";
   }
 
@@ -1437,7 +1437,7 @@
         "span",
         "cell-secondary",
         formatIdentifier(path.tcp_carrier_ordinal) + " / " +
-          formatIdentifier(path.tcp_carriers_max)
+          formatIdentifier(path.max_tcp_carriers)
       ));
     } else {
       carrier.append(createElement("span", "cell-secondary", "--"));

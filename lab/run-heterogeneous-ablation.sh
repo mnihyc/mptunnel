@@ -827,7 +827,7 @@ management_config_toml() {
 shared_transport_secret_toml() {
   local path="$1"
   if flag_enabled "$shared_transport_secret"; then
-    printf 'transport_secret_file = %s\n' "$(toml_string "$path")"
+    printf 'transport_secret = { from = "file", path = %s }\n' "$(toml_string "$path")"
   fi
 }
 
@@ -850,21 +850,21 @@ server_config_toml() {
     "tcp://172.31.43.20:${server_port}" \
     "tcp://172.31.44.20:${server_port}" \
     "tcp://172.31.45.20:${server_port}" \
-    "udp://172.31.10.20:${server_port}" \
-    "udp://172.31.15.20:${server_port}" \
-    "udp://172.31.16.20:${server_port}" \
-    "udp://172.31.20.20:${server_port}" \
-    "udp://172.31.30.20:${server_port}" \
-    "udp://172.31.51.20:${server_port}" \
-    "udp://172.31.52.20:${server_port}" \
-    "udp://172.31.53.20:${server_port}" \
-    "udp://172.31.54.20:${server_port}" \
-    "udp://172.31.55.20:${server_port}" \
-    "udp://172.31.56.20:${server_port}" \
-    "udp://172.31.57.20:${server_port}" \
-    "udp://172.31.58.20:${server_port}" \
-    "udp://172.31.59.20:${server_port}" \
-    "udp://172.31.60.20:${server_port}")"
+    "quic://172.31.10.20:${server_port}" \
+    "quic://172.31.15.20:${server_port}" \
+    "quic://172.31.16.20:${server_port}" \
+    "quic://172.31.20.20:${server_port}" \
+    "quic://172.31.30.20:${server_port}" \
+    "quic://172.31.51.20:${server_port}" \
+    "quic://172.31.52.20:${server_port}" \
+    "quic://172.31.53.20:${server_port}" \
+    "quic://172.31.54.20:${server_port}" \
+    "quic://172.31.55.20:${server_port}" \
+    "quic://172.31.56.20:${server_port}" \
+    "quic://172.31.57.20:${server_port}" \
+    "quic://172.31.58.20:${server_port}" \
+    "quic://172.31.59.20:${server_port}" \
+    "quic://172.31.60.20:${server_port}")"
   resources="$(resource_config_toml)"
   management="$(management_config_toml "$server_management_token_path")"
   if [[ -n "$resources" ]]; then
@@ -890,8 +890,8 @@ outbound = "lab-direct"
 
 [inbounds.security]
 credential_ids = ["lab"]
-tls_certificate_chain_file = ${certificate_path_json}
-tls_private_key_file = ${private_key_path_json}
+tls_certificate_chain = { from = "file", path = ${certificate_path_json} }
+tls_private_key = { from = "file", path = ${private_key_path_json} }
 ${transport_security}
 
 [inbounds.destination_acl]
@@ -953,7 +953,7 @@ ${probe}
 [outbounds.security]
 credential_id = "lab"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = ${certificate_path_json}
+tls_pinned_certificate = { from = "file", path = ${certificate_path_json} }
 ${transport_security}
 
 [routing]
@@ -1018,7 +1018,7 @@ ${probe}
 [outbounds.security]
 credential_id = "lab"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = ${certificate_path_json}
+tls_pinned_certificate = { from = "file", path = ${certificate_path_json} }
 ${transport_security}
 
 [routing]
@@ -3536,16 +3536,16 @@ run_tcp_carrier_qos_case() {
   local endpoint
   case "$topology" in
     range_1_1)
-      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1'"
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?max-tcp-carriers=1'"
       ;;
     range_1_3)
-      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-3'"
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?max-tcp-carriers=3'"
       ;;
     range_3_3)
-      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=3-3'"
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?max-tcp-carriers=3'"
       ;;
     three_endpoints_1_1)
-      endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1' --path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1' --path 'tcp://172.31.20.20:${server_port}?tcp-carriers=1-1'"
+      endpoint="--path 'tcp://172.31.20.20:${server_port}?max-tcp-carriers=1' --path 'tcp://172.31.20.20:${server_port}?max-tcp-carriers=1' --path 'tcp://172.31.20.20:${server_port}?max-tcp-carriers=1'"
       ;;
     *)
       echo "unknown TCP carrier QoS topology: $topology" >&2
@@ -3603,7 +3603,7 @@ finish_quic_port_hop_case() {
 
 run_quic_port_hop_download_case() {
   local case_name="mptunnel_udp_stream_single_unconstrained_port_hopping"
-  local endpoint="--path 'udp://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-hop-interval-ms=5000'"
+  local endpoint="--path 'quic://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-rotation-interval-ms=5000'"
   start_quic_port_hop_client "$case_name" "$endpoint"
   run_tcp_download_probe_case "$case_name"
   finish_quic_port_hop_case
@@ -3611,7 +3611,7 @@ run_quic_port_hop_download_case() {
 
 run_quic_port_hop_upload_case() {
   local case_name="mptunnel_udp_stream_single_unconstrained_port_hopping_upload"
-  local endpoint="--path 'udp://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-hop-interval-ms=5000'"
+  local endpoint="--path 'quic://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-rotation-interval-ms=5000'"
   start_quic_port_hop_client "$case_name" "$endpoint"
   run_tcp_upload_probe_case "$case_name"
   finish_quic_port_hop_case
@@ -3873,8 +3873,8 @@ if [[ -n "$tcp_carrier_max" ]]; then
     echo "MPTUNNEL_LAB_TCP_CARRIER_MAX must be a positive integer" >&2
     exit 2
   fi
-  tcp_carrier_query="?tcp-carriers=1-${tcp_carrier_max}"
-  tcp_carrier_hint_query="&tcp-carriers=1-${tcp_carrier_max}"
+  tcp_carrier_query="?max-tcp-carriers=${tcp_carrier_max}"
+  tcp_carrier_hint_query="&max-tcp-carriers=${tcp_carrier_max}"
 fi
 
 tcp_endpoint_lowlat="--path 'tcp://172.31.10.20:${server_port}${tcp_carrier_query}'"
@@ -3882,34 +3882,34 @@ tcp_endpoint_balanced="--path 'tcp://172.31.15.20:${server_port}${tcp_carrier_qu
 tcp_endpoint_mildloss="--path 'tcp://172.31.16.20:${server_port}${tcp_carrier_query}'"
 tcp_endpoint_fat="--path 'tcp://172.31.20.20:${server_port}${tcp_carrier_query}'"
 tcp_endpoint_poor="--path 'tcp://172.31.30.20:${server_port}${tcp_carrier_query}'"
-udp_endpoint_lowlat="--path 'udp://172.31.10.20:${server_port}'"
-udp_endpoint_balanced="--path 'udp://172.31.15.20:${server_port}'"
-udp_endpoint_mildloss="--path 'udp://172.31.16.20:${server_port}'"
-udp_endpoint_fat="--path 'udp://172.31.20.20:${server_port}'"
-udp_endpoint_poor="--path 'udp://172.31.30.20:${server_port}'"
+udp_endpoint_lowlat="--path 'quic://172.31.10.20:${server_port}'"
+udp_endpoint_balanced="--path 'quic://172.31.15.20:${server_port}'"
+udp_endpoint_mildloss="--path 'quic://172.31.16.20:${server_port}'"
+udp_endpoint_fat="--path 'quic://172.31.20.20:${server_port}'"
+udp_endpoint_poor="--path 'quic://172.31.30.20:${server_port}'"
 
 if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]]; then
-  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80${tcp_carrier_hint_query}'"
-  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200${tcp_carrier_hint_query}'"
-  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}?srtt-ms=160&rate-mbps=100${tcp_carrier_hint_query}'"
-  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500${tcp_carrier_hint_query}'"
-  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true${tcp_carrier_hint_query}'"
-  udp_lowlat="--path 'udp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80'"
-  udp_balanced="--path 'udp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
-  udp_mildloss="--path 'udp://172.31.16.20:${server_port}?srtt-ms=160&rate-mbps=100'"
-  udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500'"
-  udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true'"
+  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?initial-srtt-ms=20&initial-rate-mbps=80${tcp_carrier_hint_query}'"
+  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?initial-srtt-ms=80&initial-rate-mbps=200${tcp_carrier_hint_query}'"
+  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}?initial-srtt-ms=160&initial-rate-mbps=100${tcp_carrier_hint_query}'"
+  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?initial-srtt-ms=180&initial-rate-mbps=500${tcp_carrier_hint_query}'"
+  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?initial-srtt-ms=420&initial-rttvar-ms=120&initial-rate-mbps=50&expensive=true${tcp_carrier_hint_query}'"
+  udp_lowlat="--path 'quic://172.31.10.20:${server_port}?initial-srtt-ms=20&initial-rate-mbps=80'"
+  udp_balanced="--path 'quic://172.31.15.20:${server_port}?initial-srtt-ms=80&initial-rate-mbps=200'"
+  udp_mildloss="--path 'quic://172.31.16.20:${server_port}?initial-srtt-ms=160&initial-rate-mbps=100'"
+  udp_fat="--path 'quic://172.31.20.20:${server_port}?initial-srtt-ms=180&initial-rate-mbps=500'"
+  udp_poor="--path 'quic://172.31.30.20:${server_port}?initial-srtt-ms=420&initial-rttvar-ms=120&initial-rate-mbps=50&expensive=true'"
 else
   tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}${tcp_carrier_query}'"
   tcp_balanced="--path 'tcp://172.31.15.20:${server_port}${tcp_carrier_query}'"
   tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}${tcp_carrier_query}'"
   tcp_fat="--path 'tcp://172.31.20.20:${server_port}${tcp_carrier_query}'"
   tcp_poor="--path 'tcp://172.31.30.20:${server_port}${tcp_carrier_query}'"
-  udp_lowlat="--path 'udp://172.31.10.20:${server_port}'"
-  udp_balanced="--path 'udp://172.31.15.20:${server_port}'"
-  udp_mildloss="--path 'udp://172.31.16.20:${server_port}'"
-  udp_fat="--path 'udp://172.31.20.20:${server_port}'"
-  udp_poor="--path 'udp://172.31.30.20:${server_port}'"
+  udp_lowlat="--path 'quic://172.31.10.20:${server_port}'"
+  udp_balanced="--path 'quic://172.31.15.20:${server_port}'"
+  udp_mildloss="--path 'quic://172.31.16.20:${server_port}'"
+  udp_fat="--path 'quic://172.31.20.20:${server_port}'"
+  udp_poor="--path 'quic://172.31.30.20:${server_port}'"
 fi
 tcp_all="${tcp_lowlat} ${tcp_balanced} ${tcp_mildloss} ${tcp_fat} ${tcp_poor}"
 udp_all="${udp_lowlat} ${udp_balanced} ${udp_mildloss} ${udp_fat} ${udp_poor}"
@@ -3923,7 +3923,7 @@ if [[ -n "$scale_tcp_carrier_max" ]]; then
     echo "MPTUNNEL_LAB_SCALE_TCP_CARRIER_MAX must be a positive integer" >&2
     exit 2
   fi
-  scale_tcp_carrier_query="?tcp-carriers=1-${scale_tcp_carrier_max}"
+  scale_tcp_carrier_query="?max-tcp-carriers=${scale_tcp_carrier_max}"
 fi
 tcp_scale_all="--path 'tcp://172.31.10.20:${server_port}${scale_tcp_carrier_query}' \
 --path 'tcp://172.31.15.20:${server_port}${scale_tcp_carrier_query}' \
@@ -3935,16 +3935,16 @@ tcp_scale_all="--path 'tcp://172.31.10.20:${server_port}${scale_tcp_carrier_quer
 --path 'tcp://172.31.43.20:${server_port}${scale_tcp_carrier_query}' \
 --path 'tcp://172.31.44.20:${server_port}${scale_tcp_carrier_query}' \
 --path 'tcp://172.31.45.20:${server_port}${scale_tcp_carrier_query}'"
-udp_scale_all="--path 'udp://172.31.51.20:${server_port}' \
---path 'udp://172.31.52.20:${server_port}' \
---path 'udp://172.31.53.20:${server_port}' \
---path 'udp://172.31.54.20:${server_port}' \
---path 'udp://172.31.55.20:${server_port}' \
---path 'udp://172.31.56.20:${server_port}' \
---path 'udp://172.31.57.20:${server_port}' \
---path 'udp://172.31.58.20:${server_port}' \
---path 'udp://172.31.59.20:${server_port}' \
---path 'udp://172.31.60.20:${server_port}'"
+udp_scale_all="--path 'quic://172.31.51.20:${server_port}' \
+--path 'quic://172.31.52.20:${server_port}' \
+--path 'quic://172.31.53.20:${server_port}' \
+--path 'quic://172.31.54.20:${server_port}' \
+--path 'quic://172.31.55.20:${server_port}' \
+--path 'quic://172.31.56.20:${server_port}' \
+--path 'quic://172.31.57.20:${server_port}' \
+--path 'quic://172.31.58.20:${server_port}' \
+--path 'quic://172.31.59.20:${server_port}' \
+--path 'quic://172.31.60.20:${server_port}'"
 mixed_scale_all="${tcp_scale_all} ${udp_scale_all}"
 
 if should_run_case "direct_low_latency"; then
@@ -4149,7 +4149,7 @@ if should_run_case "mptunnel_tcp_single_unconstrained_range_1_1"; then
   run_reliable_ideal_download_case \
     "mptunnel_tcp_single_unconstrained_range_1_1" \
     "unconstrained" \
-    "--path 'tcp://172.31.10.20:${server_port}?tcp-carriers=1-1'"
+    "--path 'tcp://172.31.10.20:${server_port}?max-tcp-carriers=1'"
 fi
 
 if should_run_case "mptunnel_tcp_multipath_all"; then
@@ -4274,13 +4274,13 @@ if should_run_case "mptunnel_tcp_single_unconstrained_range_1_1_upload"; then
   run_reliable_ideal_upload_case \
     "mptunnel_tcp_single_unconstrained_range_1_1_upload" \
     "unconstrained" \
-    "--path 'tcp://172.31.10.20:${server_port}?tcp-carriers=1-1'"
+    "--path 'tcp://172.31.10.20:${server_port}?max-tcp-carriers=1'"
 fi
 if should_run_case "mptunnel_tcp_single_unconstrained_range_1_3_upload"; then
   run_reliable_ideal_upload_case \
     "mptunnel_tcp_single_unconstrained_range_1_3_upload" \
     "unconstrained" \
-    "--path 'tcp://172.31.10.20:${server_port}?tcp-carriers=1-3'"
+    "--path 'tcp://172.31.10.20:${server_port}?max-tcp-carriers=3'"
 fi
 
 if should_run_case "mptunnel_tcp_multipath_all_upload"; then

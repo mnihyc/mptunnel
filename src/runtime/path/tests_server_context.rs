@@ -34,7 +34,7 @@ fn authority(records: Vec<CredentialRecord>, ids: &[&str]) -> CredentialAuthorit
 
 #[test]
 fn local_listener_configuration_is_independent_of_peer_path_id() {
-    let spec = "udp://127.0.0.1:12900?srtt-ms=73&rate-mbps=420&backup=true&bulk-allowed=false"
+    let spec = "quic://127.0.0.1:12900?initial-srtt-ms=73&initial-rate-mbps=420&backup=true&allow-bulk=false"
         .parse::<PathSpec>()
         .expect("server UDP path");
     let local = ServerLocalPath::new(7, spec);

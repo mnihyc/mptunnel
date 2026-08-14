@@ -27,7 +27,7 @@ async fn mixed_remote_set() -> (
     RelayPathInstance,
 ) {
     let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "udp://127.0.0.1:10252"]);
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(17);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes =
@@ -53,7 +53,7 @@ async fn mixed_remote_set() -> (
 #[tokio::test]
 async fn bounded_ack_gap_uses_an_active_unmeasured_alternate() {
     let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "udp://127.0.0.1:10252"]);
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(17);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes =
@@ -106,9 +106,9 @@ async fn bounded_ack_gap_uses_an_active_unmeasured_alternate() {
 #[tokio::test]
 async fn retained_tail_uses_only_a_measured_earlier_completion() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10253?srtt-ms=20",
-        "udp://127.0.0.1:10254?srtt-ms=20",
-        "udp://127.0.0.1:10255?srtt-ms=20",
+        "tcp://127.0.0.1:10253?initial-srtt-ms=20",
+        "quic://127.0.0.1:10254?initial-srtt-ms=20",
+        "quic://127.0.0.1:10255?initial-srtt-ms=20",
     ]);
     let stream_id = StreamId(18);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
@@ -222,8 +222,9 @@ async fn retained_tail_uses_only_a_measured_earlier_completion() {
 
 #[tokio::test]
 async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
-    let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10251?srtt-ms=20&rate-mbps=200"]);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
+    ]);
     let stream_id = StreamId(32);
     let (old_commands, _old_receivers) = reliable_path_command_channels(8);
     let mut remotes =
@@ -266,9 +267,9 @@ async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
 #[tokio::test]
 async fn ack_gap_repair_history_does_not_exhaust_non_original_outputs() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10251?srtt-ms=20&rate-mbps=200",
-        "udp://127.0.0.1:10252?srtt-ms=15&rate-mbps=250",
-        "udp://127.0.0.1:10253?srtt-ms=10&rate-mbps=300",
+        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
+        "quic://127.0.0.1:10252?initial-srtt-ms=15&initial-rate-mbps=250",
+        "quic://127.0.0.1:10253?initial-srtt-ms=10&initial-rate-mbps=300",
     ]);
     let stream_id = StreamId(33);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -369,8 +370,8 @@ async fn ack_gap_repair_history_does_not_exhaust_non_original_outputs() {
 #[tokio::test]
 async fn portable_quic_repair_waits_for_exact_stream_flight_but_failure_recovery_does_not() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10251?srtt-ms=20&rate-mbps=200",
-        "udp://127.0.0.1:10252?srtt-ms=10&rate-mbps=300",
+        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
+        "quic://127.0.0.1:10252?initial-srtt-ms=10&initial-rate-mbps=300",
     ]);
     let stream_id = StreamId(35);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -442,8 +443,8 @@ async fn portable_quic_repair_waits_for_exact_stream_flight_but_failure_recovery
 #[tokio::test]
 async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10251?srtt-ms=20&rate-mbps=200",
-        "udp://127.0.0.1:10252?srtt-ms=10&rate-mbps=300",
+        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
+        "quic://127.0.0.1:10252?initial-srtt-ms=10&initial-rate-mbps=300",
     ]);
     let stream_id = StreamId(36);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -505,9 +506,9 @@ async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
 #[tokio::test]
 async fn unbound_reinjection_requires_idle_but_measured_recovery_may_use_busy() {
     let context = client_test_context_with_paths(&[
-        "udp://127.0.0.1:10251?srtt-ms=20&rate-mbps=200",
-        "tcp://127.0.0.1:10252?srtt-ms=2&rate-mbps=1000",
-        "tcp://127.0.0.1:10253?srtt-ms=30&rate-mbps=100",
+        "quic://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
+        "tcp://127.0.0.1:10252?initial-srtt-ms=2&initial-rate-mbps=1000",
+        "tcp://127.0.0.1:10253?initial-srtt-ms=30&initial-rate-mbps=100",
     ]);
     let stream_id = StreamId(34);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -775,7 +776,7 @@ async fn product_ack_returns_the_exact_path_that_made_progress() {
 #[tokio::test]
 async fn stale_path_is_not_selected_for_new_request_data() {
     let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "udp://127.0.0.1:10252"]);
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(19);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes =
@@ -899,7 +900,7 @@ async fn stale_path_is_not_selected_for_new_request_data() {
 #[tokio::test]
 async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
     let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "udp://127.0.0.1:10252"]);
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(20);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes =
@@ -976,7 +977,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
 async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
     let stream_id = StreamId(21);
     let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "udp://127.0.0.1:10252"]);
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);

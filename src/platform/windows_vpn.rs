@@ -411,7 +411,7 @@ async fn resolve_carrier_paths(
                     let dns = dns.ok_or_else(|| WindowsVpnPrepareError::DnsResolution {
                         endpoint: authority.clone(),
                         source: DnsRuntimeError::PolicyInvariant(
-                            "pre-publication endpoint requires an unavailable direct DNS plan"
+                            "pre-publication endpoint requires an unavailable direct DNS policy"
                                 .to_string(),
                         ),
                     })?;
@@ -469,7 +469,7 @@ async fn resolve_native_endpoints(
                     let dns = dns.ok_or_else(|| WindowsVpnPrepareError::DnsResolution {
                         endpoint: authority.clone(),
                         source: DnsRuntimeError::PolicyInvariant(
-                            "pre-publication endpoint requires an unavailable direct DNS plan"
+                            "pre-publication endpoint requires an unavailable direct DNS policy"
                                 .to_string(),
                         ),
                     })?;
@@ -601,7 +601,7 @@ impl fmt::Display for WindowsVpnPrepareError {
                 "managed VPN cannot use system DNS because it creates a recursive tunnel dependency",
             ),
             Self::EncryptedDnsRequired => {
-                formatter.write_str("managed VPN requires encrypted-only DNS plans")
+                formatter.write_str("managed VPN requires encrypted-only DNS policies")
             }
             Self::FullTunnelDnsCaptureRequired => {
                 formatter.write_str("full managed VPN requires host DNS capture")

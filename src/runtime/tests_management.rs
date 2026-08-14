@@ -30,7 +30,7 @@ fn local_proxy_auth() -> ProxyAuthConfig {
 fn auth_accepts_bearer_and_rejects_wrong_token() {
     let request = ManagementRequest {
         method: "GET".to_string(),
-        path: "/api/v2/status".to_string(),
+        path: "/api/v3/status".to_string(),
         headers: vec![(
             "authorization".to_string(),
             "Bearer correct-token".to_string(),
@@ -92,7 +92,7 @@ fn balancer_status_and_actions_share_the_generation_owned_balancer() {
 
     target.refresh_sample_snapshot();
     let initial = target.snapshot();
-    assert_eq!(initial.schema, "mptunnel.management.v6");
+    assert_eq!(initial.schema, "mptunnel.management.v3");
     assert_eq!(initial.services.balancers, 1);
     assert!(initial.controls.balancer.supported);
     assert_eq!(initial.balancers[0].ready_members, 2);
@@ -104,7 +104,7 @@ fn balancer_status_and_actions_share_the_generation_owned_balancer() {
         .expect("drain");
     assert_eq!(response["scope"], "runtime-generation");
     let drained = target.balancer_status_json().expect("balancer status");
-    assert_eq!(drained["schema"], "mptunnel.balancer.v1");
+    assert_eq!(drained["schema"], "mptunnel.balancer.v3");
     assert_eq!(
         drained["balancers"][0]["members"][1]["readiness"],
         "draining"
@@ -162,27 +162,29 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     };
 
     let initial = target.dns_status_json().expect("initial DNS status");
-    assert_eq!(initial["schema"], "mptunnel.dns.status.v2");
+    assert_eq!(initial["schema"], "mptunnel.dns.status.v3");
     assert_eq!(initial["generation"], 1);
-    assert_eq!(initial["plans"][0]["name"], "test-default");
-    assert_eq!(initial["plans"][0]["cache"]["entries"], 0);
+    assert_eq!(initial["policies"][0]["name"], "test-default");
+    assert_eq!(initial["policies"][0]["cache"]["entries"], 0);
+    assert_eq!(initial["policies"][0]["servers"][0]["protocol"], "system");
+    assert!(initial["policies"][0]["servers"][0]["address"].is_null());
 
     let explanation = target
         .dns_explain_json("managed.example")
         .expect("DNS explanation");
-    assert_eq!(explanation["schema"], "mptunnel.dns.explain.v2");
+    assert_eq!(explanation["schema"], "mptunnel.dns.explain.v3");
     assert_eq!(explanation["domain"], "managed.example");
-    assert_eq!(explanation["dns_plan"], "test-default");
+    assert_eq!(explanation["policy"], "test-default");
     assert_eq!(explanation["match"], "default");
-    assert_eq!(explanation["upstreams"][0]["name"], "test-static");
+    assert_eq!(explanation["servers"][0]["name"], "test-static");
 
     let queried = target
         .dns_query_json(br#"{"domain":"managed.example","type":"A"}"#)
         .await
         .expect("typed DNS query");
-    assert_eq!(queried["schema"], "mptunnel.dns.query.v2");
+    assert_eq!(queried["schema"], "mptunnel.dns.query.v3");
     assert_eq!(queried["domain"], "managed.example");
-    assert_eq!(queried["dns_plan"], "test-default");
+    assert_eq!(queried["policy"], "test-default");
     assert_eq!(queried["rcode"], 0);
     assert_eq!(queried["rcode_name"], "NOERROR");
     assert_eq!(queried["answers"][0]["type"], "A");
@@ -190,16 +192,16 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     assert_eq!(queried["answers"][0]["data"], "192.0.2.53");
 
     let observed = target.dns_status_json().expect("observed DNS status");
-    assert_eq!(observed["plans"][0]["cache"]["entries"], 1);
-    assert_eq!(observed["plans"][0]["upstreams"][0]["attempts"], "1");
-    assert_eq!(observed["plans"][0]["upstreams"][0]["successes"], "1");
+    assert_eq!(observed["policies"][0]["cache"]["entries"], 1);
+    assert_eq!(observed["policies"][0]["servers"][0]["attempts"], "1");
+    assert_eq!(observed["policies"][0]["servers"][0]["successes"], "1");
 
     let flushed = target.dns_flush_json(br#"{}"#).expect("flush all plans");
-    assert_eq!(flushed["schema"], "mptunnel.dns.flush.v2");
-    assert_eq!(flushed["flushed_dns_plan_count"], 1);
+    assert_eq!(flushed["schema"], "mptunnel.dns.flush.v3");
+    assert_eq!(flushed["flushed_policies"], 1);
     assert_eq!(flushed["removed_entries"], 1);
     assert_eq!(
-        target.dns_status_json().expect("flushed DNS status")["plans"][0]["cache"]["entries"],
+        target.dns_status_json().expect("flushed DNS status")["policies"][0]["cache"]["entries"],
         0
     );
 
@@ -213,10 +215,17 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     );
     assert_eq!(
         target
-            .dns_flush_json(br#"{"dns_plan":"missing"}"#)
-            .expect_err("unknown plan")
+            .dns_flush_json(br#"{"policy":"missing"}"#)
+            .expect_err("unknown policy")
             .status,
         404
+    );
+    assert_eq!(
+        target
+            .dns_flush_json(br#"{"dns_plan":"test-default"}"#)
+            .expect_err("removed DNS JSON names must fail closed")
+            .status,
+        400
     );
 }
 
@@ -229,7 +238,7 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
         vec![ClientPathConfig {
             name: "primary".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443?tcp-carriers=2-3"
+            spec: "tcp://127.0.0.1:443?max-tcp-carriers=3"
                 .parse()
                 .expect("path"),
             security,
@@ -292,7 +301,7 @@ fn node_path_control_can_select_client_by_outbound_name() {
         vec![ClientPathConfig {
             name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443?tcp-carriers=1-1"
+            spec: "tcp://127.0.0.1:443?max-tcp-carriers=1"
                 .parse()
                 .expect("path"),
             security,
@@ -371,7 +380,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
         vec![ClientPathConfig {
             name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443?tcp-carriers=1-1"
+            spec: "tcp://127.0.0.1:443?max-tcp-carriers=1"
                 .parse()
                 .expect("path"),
             security,
@@ -459,7 +468,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert_eq!(status.paths.len(), 1);
     assert_eq!(status.paths[0].path, "path-1");
     assert_eq!(status.paths[0].tcp_carrier_ordinal, Some(1));
-    assert_eq!(status.paths[0].tcp_carriers_max, Some(1));
+    assert_eq!(status.paths[0].max_tcp_carriers, Some(1));
     assert_eq!(status.outbounds[0].name, "daily-direct");
     assert_eq!(status.outbounds[0].protocol, "direct");
     assert_eq!(status.outbounds[0].networks, ["tcp", "udp"]);
@@ -467,6 +476,14 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert_eq!(status.admission.tracked_principals, 1);
     assert_eq!(status.admission.tracked_targets, 1);
     let encoded = serde_json::to_string(&*status).expect("serialize snapshot");
+    assert!(encoded.contains("\"max_tcp_carriers\":1"));
+    assert!(!encoded.contains("tcp_carriers_max"));
+    assert!(encoded.contains("\"allow_bulk\":true"));
+    assert!(encoded.contains("\"control_only\":false"));
+    assert!(encoded.contains("\"allow_datagrams\":true"));
+    assert!(!encoded.contains("bulk_allowed"));
+    assert!(!encoded.contains("probe_only"));
+    assert!(!encoded.contains("no_udp"));
     assert!(!encoded.contains("operator"));
     assert!(!encoded.contains("secret"));
     assert!(!encoded.contains("private-principal"));
@@ -482,7 +499,7 @@ fn status_projects_the_bounded_tcp_carrier_pool() {
         vec![ClientPathConfig {
             name: "primary".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443?tcp-carriers=1-3"
+            spec: "tcp://127.0.0.1:443?max-tcp-carriers=3"
                 .parse()
                 .expect("path"),
             security,
@@ -513,7 +530,7 @@ fn status_projects_the_bounded_tcp_carrier_pool() {
     assert_eq!(status.paths.len(), 3);
     assert_eq!(status.paths[1].path, "primary");
     assert_eq!(status.paths[1].tcp_carrier_ordinal, Some(2));
-    assert_eq!(status.paths[1].tcp_carriers_max, Some(3));
+    assert_eq!(status.paths[1].max_tcp_carriers, Some(3));
     assert_eq!(status.paths[2].tcp_carrier_ordinal, Some(3));
 }
 
@@ -526,7 +543,7 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
         vec![ClientPathConfig {
             name: "primary".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443?tcp-carriers=1-1"
+            spec: "tcp://127.0.0.1:443?max-tcp-carriers=1"
                 .parse()
                 .expect("path"),
             security,

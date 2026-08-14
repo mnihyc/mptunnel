@@ -230,8 +230,8 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
     let context = ClientPathContext::new(
         [
             "tcp://127.0.0.1:11171",
-            "udp://127.0.0.1:11172?srtt-ms=180&rate-mbps=500",
-            "tcp://127.0.0.1:11173?srtt-ms=40&rate-mbps=500",
+            "quic://127.0.0.1:11172?initial-srtt-ms=180&initial-rate-mbps=500",
+            "tcp://127.0.0.1:11173?initial-srtt-ms=40&initial-rate-mbps=500",
         ]
         .into_iter()
         .map(|path| path.parse::<PathSpec>().expect("test path"))

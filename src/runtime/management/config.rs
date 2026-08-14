@@ -26,15 +26,15 @@ impl ManagementTarget {
         let control = self.config_control().ok_or_else(config_unavailable)?;
         let store = control.store();
         Ok(json!({
-            "schema": "mptunnel.config.v2",
+            "schema": "mptunnel.config.v3",
             "path": store.path().display().to_string(),
             "desired_revision": store.revision().to_string(),
             "active_revision": store.active_revision().to_string(),
             "runtime_revision": control.runtime_revision().to_string(),
             "pending_revision": store.pending_revision().map(|revision| revision.to_string()),
             "mutation": {
-                "validate": "POST /api/v2/config/validate",
-                "apply": "POST /api/v2/config/apply",
+                "validate": "POST /api/v3/config/validate",
+                "apply": "POST /api/v3/config/apply",
                 "precondition": "If-Match"
             }
         }))

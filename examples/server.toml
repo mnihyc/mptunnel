@@ -1,7 +1,7 @@
 # Generate one random credential into ./mpp-credential.key and transfer that
 # file securely to both endpoints. Keep it outside source control.
 #
-# Linux/macOS: umask 077; openssl rand -hex 32 > mpp-credential.key
+# Linux/macOS: umask 077; openssl rand -out mpp-credential.key 32
 # PowerShell:   (New-Guid).Guid | Set-Content -NoNewline mpp-credential.key
 # Transport protection uses a different raw 32-byte file shared by the two
 # endpoints: umask 077; openssl rand -out mpp-transport.key 32
@@ -23,15 +23,15 @@ secret = { from = "file", path = "mpp-credential.key" }
 retention_timeout_ms = 300000
 
 [dns]
-default_dns_plan = "system"
+default = "system"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "system"
-transport = "system"
+protocol = "system"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "system"
-upstreams = ["system"]
+servers = ["system"]
 
 # The management API is optional, loopback-only, and requires a separate random
 # operator token when enabled.
@@ -46,17 +46,19 @@ name = "mpp-listener"
 protocol = "mpp"
 paths = [
   { name = "path-1", endpoint = "tcp://0.0.0.0:7443" },
-  { name = "path-2", endpoint = "udp://0.0.0.0:7443" },
+  { name = "path-2", endpoint = "quic://0.0.0.0:7443" },
 ]
 outbound = "direct-egress"
-dns_plan = "system"
+dns_policy = "system"
 
 [inbounds.security]
 credential_ids = ["home-client"]
-tls_certificate_chain_file = "server-cert.pem"
-tls_private_key_file = "server-key.pem"
+tls_certificate_chain = { from = "file", path = "server-cert.pem" }
+tls_private_key = { from = "file", path = "server-key.pem" }
 # This endpoint-wide secret is not an MPP client credential.
-transport_secret_file = "mpp-transport.key"
+transport_secret = { from = "file", path = "mpp-transport.key" }
+# Direct-paste alternative (`openssl rand -hex 32`); use the same value on both peers:
+# transport_secret = { from = "hex", value = "REPLACE_WITH_64_HEX_DIGITS" }
 
 [[outbounds]]
 name = "direct-egress"
@@ -68,7 +70,7 @@ protocol = "direct"
 # eligible. A temporarily absent address fails a dial, not the node process.
 # bind_ipv4 = "192.0.2.10"
 # bind_ipv6 = "2001:db8::10"
-# Replace the global `system` upstream with named UDP/TCP/DoT/DoH/DoQ upstreams
+# Replace the global `system` server with named UDP/TCP/DoT/DoH/DoQ servers
 # for explicit or encrypted resolution.
 
 # To relay through SOCKS5, change the MPP inbound reference above to
@@ -78,10 +80,10 @@ protocol = "direct"
 # protocol = "socks5"
 # endpoint = "127.0.0.1:1080"
 # connect_timeout_ms = 10000
-# Canonical target domains are carried to the upstream SOCKS5 proxy unless an
-# IP-dependent destination ACL requires evidence from the selected DNS plan.
+# Canonical target domains are carried to the SOCKS5 proxy unless an
+# IP-dependent destination ACL requires evidence from the selected DNS policy.
 
-# Plain HTTP CONNECT relays TCP. Use SOCKS5 when an upstream proxy must relay
+# Plain HTTP CONNECT relays TCP. Use SOCKS5 when a proxy must relay
 # both TCP and UDP.
 # [[outbounds]]
 # name = "http-egress"

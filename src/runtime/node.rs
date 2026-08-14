@@ -369,7 +369,7 @@ pub async fn run_with_all_host_providers(
 }
 
 const PUBLIC_RUNTIME_MANAGED_VPN_ERROR: &str = "low-level runtime entry points accept only external TUN host ownership; process-managed VPN must use the application lifecycle, while Android/macOS VPN hosts must own OS route/DNS publication";
-const VPN_HOST_SYSTEM_DNS_ERROR: &str = "catch-all embedded VPN cannot use operating-system DNS because its resolver sockets cannot be passed to HostSocketProtector; configure literal-bootstrap or outbound-backed DNS";
+const VPN_HOST_SYSTEM_DNS_ERROR: &str = "catch-all embedded VPN cannot use operating-system DNS because its resolver sockets cannot be passed to HostSocketProtector; configure a literal DNS server address or an outbound-routed DNS server";
 
 async fn run_public_generation(
     config: AppConfig,

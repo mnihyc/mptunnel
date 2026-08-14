@@ -1,6 +1,6 @@
 //! Generation-scoped split DNS runtime.
 //!
-//! Explicit upstreams are always dialed through their literal bootstrap IP.
+//! Explicit servers are always dialed through their literal configured IP.
 //! This module never loads system resolver configuration or the hosts file.
 
 use crate::product::{
@@ -118,7 +118,7 @@ impl DnsBackendResponse {
 pub type DnsRecordBackendFuture =
     Pin<Box<dyn Future<Output = Result<DnsBackendResponse, DnsBackendError>> + Send + 'static>>;
 
-/// One already-bound upstream query implementation.
+/// One already-bound DNS server query implementation.
 ///
 /// Routed backends implement this trait using a pinned Product leaf. Returning
 /// a backend from the factory is the explicit proof that the named egress was
@@ -372,7 +372,7 @@ pub struct FakeDnsRuntimeSnapshot {
     pub capacity_failures: u64,
 }
 
-/// Classification of one TUN destination against the configured FakeDNS pools.
+/// Classification of one TUN destination against the configured DNS override pools.
 ///
 /// Unknown and expired synthetic addresses are separate from ordinary
 /// destinations so callers can fail closed instead of leaking them to an
@@ -466,7 +466,7 @@ impl std::fmt::Debug for DnsGeneration {
         formatter
             .debug_struct("DnsGeneration")
             .field("generation", &self.policy.generation())
-            .field("plans", &self.plans.len())
+            .field("policies", &self.plans.len())
             .finish()
     }
 }
@@ -564,7 +564,7 @@ impl FakeDnsRuntime {
         let lease = state
             .domains
             .get_mut(domain)
-            .expect("FakeDNS domain inserted before address allocation");
+            .expect("DNS override domain inserted before address allocation");
         match address {
             IpAddr::V4(address) => lease.ipv4 = Some(address),
             IpAddr::V6(address) => lease.ipv6 = Some(address),
@@ -718,13 +718,13 @@ impl DnsGeneration {
         for plan_id in &network_plans {
             let plan = policy.plan(plan_id).ok_or_else(|| {
                 DnsRuntimeError::PolicyInvariant(format!(
-                    "pre-publication DNS lost selected plan {plan_id}"
+                    "pre-publication DNS lost selected policy {plan_id}"
                 ))
             })?;
             for upstream_id in plan.upstreams() {
                 let upstream = policy.upstream(upstream_id).ok_or_else(|| {
                     DnsRuntimeError::PolicyInvariant(format!(
-                        "pre-publication plan {plan_id} lost upstream {upstream_id}"
+                        "pre-publication policy {plan_id} lost server {upstream_id}"
                     ))
                 })?;
                 if matches!(upstream.endpoint(), DnsUpstreamEndpoint::System) {
@@ -779,7 +779,7 @@ impl DnsGeneration {
                 for upstream_id in plan.upstreams() {
                     let upstream = policy.upstream(upstream_id).ok_or_else(|| {
                         DnsRuntimeError::PolicyInvariant(format!(
-                            "plan {} lost upstream {}",
+                            "policy {} lost server {}",
                             plan.id(),
                             upstream_id
                         ))
@@ -802,7 +802,7 @@ impl DnsGeneration {
             ));
             if plans.insert(plan.id().clone(), runtime).is_some() {
                 return Err(DnsRuntimeError::PolicyInvariant(format!(
-                    "duplicate compiled plan {}",
+                    "duplicate compiled policy {}",
                     plan.id()
                 )));
             }
@@ -862,7 +862,7 @@ impl DnsGeneration {
         let runtime = self
             .plans
             .get(selection.plan().id())
-            .expect("compiled DNS plan runtime");
+            .expect("compiled DNS policy runtime");
         let host_addresses = self.policy.host(domain).cloned();
         let fake_dns = self.policy.fake_dns().map(|spec| FakeDnsExplanation {
             ipv4_pool: spec.ipv4_pool.map(IpNet::V4),
@@ -1449,7 +1449,7 @@ impl PlanRuntime {
         }
         let mut launch = None;
         let disposition = {
-            let mut state = self.state.lock().expect("DNS plan state lock");
+            let mut state = self.state.lock().expect("DNS policy state lock");
             let now = Instant::now();
             match state.cache.lookup(&question, now) {
                 Some(hit) if !hit.stale => {
@@ -1564,7 +1564,7 @@ impl PlanRuntime {
             result = Ok(stale.stale_resolved());
         }
         let now = Instant::now();
-        let mut state = self.state.lock().expect("DNS plan state lock");
+        let mut state = self.state.lock().expect("DNS policy state lock");
         if state.cache_epoch == cache_epoch
             && let Some((answer, ttl)) = cached
         {
@@ -1726,7 +1726,7 @@ impl PlanRuntime {
                 upstream.telemetry.timeouts.fetch_add(1, Ordering::Relaxed);
                 UpstreamAttempt::Failed {
                     upstream: upstream.upstream.clone(),
-                    message: "upstream query timed out".to_string(),
+                    message: "server query timed out".to_string(),
                 }
             }
             Ok(Err(DnsBackendError::Failed(message))) => {
@@ -1830,8 +1830,8 @@ impl PlanRuntime {
     ) -> UpstreamQueryResult {
         let (upstream, message) = last_failure.unwrap_or_else(|| {
             (
-                DnsUpstreamId::parse("unavailable").expect("static DNS upstream ID"),
-                "DNS plan has no usable backend".to_string(),
+                DnsUpstreamId::parse("unavailable").expect("static DNS server ID"),
+                "DNS policy has no usable server backend".to_string(),
             )
         });
         (
@@ -1846,7 +1846,7 @@ impl PlanRuntime {
     }
 
     fn snapshot(&self, now: Instant) -> DnsPlanRuntimeSnapshot {
-        let mut state = self.state.lock().expect("DNS plan state lock");
+        let mut state = self.state.lock().expect("DNS policy state lock");
         let (fresh_cache_entries, stale_cache_entries) = state.cache.counts(now);
         DnsPlanRuntimeSnapshot {
             plan: self.id.clone(),
@@ -1874,7 +1874,7 @@ impl PlanRuntime {
     }
 
     fn flush_cache(&self) -> usize {
-        let mut state = self.state.lock().expect("DNS plan state lock");
+        let mut state = self.state.lock().expect("DNS policy state lock");
         state.cache_epoch = state.cache_epoch.wrapping_add(1);
         let removed = state.cache.clear();
         self.telemetry.cache_flushes.fetch_add(1, Ordering::Relaxed);
@@ -2239,8 +2239,7 @@ fn merge_address_record_results(
             return Err(DnsRuntimeError::AllUpstreamsFailed {
                 plan: plan.clone(),
                 domain: domain.clone(),
-                last_upstream: DnsUpstreamId::parse("inconsistent")
-                    .expect("static DNS upstream ID"),
+                last_upstream: DnsUpstreamId::parse("inconsistent").expect("static DNS server ID"),
                 message: "DNS server returned inconsistent NXDOMAIN and positive address answers"
                     .to_string(),
             });
@@ -2322,14 +2321,14 @@ fn validate_expected_addresses(
         })
         .collect::<Vec<_>>();
     if addresses.is_empty() {
-        return Err("DNS answer did not contain an address required by expected_cidrs".to_string());
+        return Err("DNS answer did not contain an address required by answer_cidrs".to_string());
     }
     if let Some(address) = addresses
         .iter()
         .find(|address| !expected.iter().any(|cidr| cidr.contains(*address)))
     {
         return Err(format!(
-            "DNS answer address {address} is outside the plan's expected_cidrs"
+            "DNS answer address {address} is outside the policy's answer_cidrs"
         ));
     }
     Ok(())
@@ -2544,7 +2543,7 @@ impl RoutedTcpDnsBackend {
             } => (*bootstrap, Some(server_name.to_string())),
             _ => {
                 return Err(DnsRuntimeError::PolicyInvariant(format!(
-                    "non-TCP/DoT upstream {} reached the routed TCP DNS backend",
+                    "non-TCP/DoT server {} reached the routed TCP DNS backend",
                     upstream.id()
                 )));
             }
@@ -2721,7 +2720,7 @@ impl DohDnsBackend {
         } = upstream.endpoint()
         else {
             return Err(DnsRuntimeError::PolicyInvariant(format!(
-                "non-DoH upstream {} reached the DoH backend",
+                "non-DoH server {} reached the DoH backend",
                 upstream.id()
             )));
         };
@@ -2745,8 +2744,9 @@ impl DohDnsBackend {
         {
             return Err(DnsRuntimeError::Build {
                 upstream: upstream.id().clone(),
-                message: "DoH identity, authority, bootstrap port, or path changed during parsing"
-                    .to_string(),
+                message:
+                    "DoH identity, authority, server-address port, or path changed during parsing"
+                        .to_string(),
             });
         }
         ServerName::try_from(server_name.as_str()).map_err(|error| DnsRuntimeError::Build {
@@ -2981,7 +2981,7 @@ impl DnsBackendFactory for StaticTestBackendFactory {
     ) -> Result<Arc<dyn DnsQueryBackend>, DnsRuntimeError> {
         if upstream.id() != &self.upstream {
             return Err(DnsRuntimeError::PolicyInvariant(
-                "static test DNS factory received an unknown upstream".to_string(),
+                "static test DNS factory received an unknown server".to_string(),
             ));
         }
         Ok(Arc::new(StaticTestBackend {
@@ -3060,7 +3060,7 @@ impl RuntimeProvider for ConfiguredDnsRuntimeProvider {
             if bind_addr.is_some() && socket_policy.has_explicit_binding() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "DNS runtime and upstream both requested a source bind",
+                    "DNS runtime and server both requested a source bind",
                 ));
             }
             let socket = configured_tcp_socket(server_addr, &socket_policy)?;
@@ -3157,7 +3157,7 @@ fn ensure_source_family(source: Option<IpAddr>, remote: IpAddr) -> io::Result<()
     if source.is_some_and(|source| source.is_ipv4() != remote.is_ipv4()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "DNS source and bootstrap IP families differ",
+            "DNS source and server-address IP families differ",
         ));
     }
     Ok(())
@@ -3166,7 +3166,7 @@ fn ensure_source_family(source: Option<IpAddr>, remote: IpAddr) -> io::Result<()
 fn incompatible_dns_source_family() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "DNS source and bootstrap IP families differ",
+        "DNS source and server-address IP families differ",
     )
 }
 
@@ -3182,7 +3182,7 @@ impl HickoryDnsBackend {
     ) -> Result<Self, DnsRuntimeError> {
         let name_server = name_server_config(upstream.endpoint()).ok_or_else(|| {
             DnsRuntimeError::PolicyInvariant(format!(
-                "upstream {} reached the wrong direct backend",
+                "server {} reached the wrong direct backend",
                 upstream.id()
             ))
         })?;
@@ -3396,11 +3396,11 @@ impl std::fmt::Display for DnsRuntimeError {
         match self {
             Self::MissingEgressConnector { upstream, outbound } => write!(
                 formatter,
-                "DNS upstream {upstream} requires outbound {outbound}, but no matching DNS egress connector was injected"
+                "DNS server {upstream} requires outbound {outbound}, but no matching DNS egress connector was injected"
             ),
             Self::RecursiveEgressConnector { upstream, outbound } => write!(
                 formatter,
-                "DNS upstream {upstream} cannot use outbound {outbound}: its control endpoint depends on DNS"
+                "DNS server {upstream} cannot use outbound {outbound}: its control endpoint depends on DNS"
             ),
             Self::PrepublicationDnsRequiresDirect {
                 plan,
@@ -3408,27 +3408,27 @@ impl std::fmt::Display for DnsRuntimeError {
                 outbound,
             } => write!(
                 formatter,
-                "pre-publication DNS plan {plan} cannot use upstream {upstream} through outbound {outbound}"
+                "pre-publication DNS policy {plan} cannot use server {upstream} through outbound {outbound}"
             ),
             Self::PrepublicationSystemDns { plan, upstream } => write!(
                 formatter,
-                "pre-publication DNS plan {plan} cannot use system upstream {upstream}"
+                "pre-publication DNS policy {plan} cannot use system server {upstream}"
             ),
             Self::UnsupportedEgressTransport { upstream, outbound } => write!(
                 formatter,
-                "DNS upstream {upstream} cannot use outbound {outbound}: routed DNS currently requires TCP, DoT, or DoH"
+                "DNS server {upstream} cannot use outbound {outbound}: routed DNS currently requires TCP, DoT, or DoH"
             ),
             Self::Build { upstream, message } => {
                 write!(
                     formatter,
-                    "failed to build DNS upstream {upstream}: {message}"
+                    "failed to build DNS server {upstream}: {message}"
                 )
             }
             Self::PolicyInvariant(message) => {
                 write!(formatter, "compiled DNS policy invariant failed: {message}")
             }
             Self::UnknownPlan(plan) => {
-                write!(formatter, "DNS plan {plan} is not in this generation")
+                write!(formatter, "DNS policy {plan} is not in this generation")
             }
             Self::InvalidDomain { domain, message } => {
                 write!(formatter, "invalid DNS domain {domain:?}: {message}")
@@ -3437,19 +3437,19 @@ impl std::fmt::Display for DnsRuntimeError {
             Self::AtCapacity { plan, limit } => {
                 write!(
                     formatter,
-                    "DNS plan {plan} reached its {limit}-query in-flight limit"
+                    "DNS policy {plan} reached its {limit}-query in-flight limit"
                 )
             }
             Self::ProductAtCapacity { rejection } => {
                 write!(formatter, "DNS work admission rejected: {rejection}")
             }
             Self::Timeout { plan, domain } => {
-                write!(formatter, "DNS plan {plan} timed out resolving {domain}")
+                write!(formatter, "DNS policy {plan} timed out resolving {domain}")
             }
             Self::NoRecords { plan, domain } => {
                 write!(
                     formatter,
-                    "DNS plan {plan} found no address records for {domain}"
+                    "DNS policy {plan} found no address records for {domain}"
                 )
             }
             Self::TooManyAnswers {
@@ -3459,7 +3459,7 @@ impl std::fmt::Display for DnsRuntimeError {
                 maximum,
             } => write!(
                 formatter,
-                "DNS plan {plan} returned {count} addresses for {domain}; maximum is {maximum}"
+                "DNS policy {plan} returned {count} addresses for {domain}; maximum is {maximum}"
             ),
             Self::AllUpstreamsFailed {
                 plan,
@@ -3468,7 +3468,7 @@ impl std::fmt::Display for DnsRuntimeError {
                 message,
             } => write!(
                 formatter,
-                "all DNS upstreams in plan {plan} failed for {domain}; last failure from {last_upstream}: {message}"
+                "all DNS servers in policy {plan} failed for {domain}; last failure from {last_upstream}: {message}"
             ),
         }
     }

@@ -221,7 +221,7 @@ fn tun_tcp_accept_tasks_share_the_configured_core_stream_ceiling() {
 
 async fn reserve_tcp_path() -> PathSpec {
     let port = reserve_process_unique_tcp_port().await;
-    format!("tcp://127.0.0.1:{port}?tcp-carriers=1-1")
+    format!("tcp://127.0.0.1:{port}?max-tcp-carriers=1")
         .parse()
         .expect("path")
 }
@@ -594,7 +594,7 @@ async fn spawn_notified_server_path(
 
 async fn reserve_udp_path() -> PathSpec {
     let port = reserve_process_unique_udp_port().await;
-    format!("udp://127.0.0.1:{port}").parse().expect("path")
+    format!("quic://127.0.0.1:{port}").parse().expect("path")
 }
 
 async fn spawn_udp_server_path(
@@ -754,7 +754,7 @@ async fn server_udp_listener_accepts_probe_after_noise() {
         .await
         .expect("send noise");
 
-    let path = format!("udp://{server_addr}")
+    let path = format!("quic://{server_addr}")
         .parse::<PathSpec>()
         .expect("client path");
     let resources = ResourceLimits::default();
@@ -1148,7 +1148,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
 
 #[test]
 fn client_snapshot_separates_product_progress_from_native_carrier_evidence() {
-    let path: PathSpec = "udp://127.0.0.1:1".parse().expect("UDP path");
+    let path: PathSpec = "quic://127.0.0.1:1".parse().expect("UDP path");
     let sample_floor =
         (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64);
     let mut observation = ClientPathObservation {
@@ -1195,7 +1195,7 @@ fn client_snapshot_separates_product_progress_from_native_carrier_evidence() {
 
 #[test]
 fn data_plane_failure_invalidates_durable_product_and_native_window_authority() {
-    let path: PathSpec = "udp://127.0.0.1:2".parse().expect("UDP path");
+    let path: PathSpec = "quic://127.0.0.1:2".parse().expect("UDP path");
     let sample_floor = 7 * 1024 * 1024_u64;
     let mut health = ClientPathHealthRecord::default();
     health.carrier_inflight_limit_bytes = sample_floor;
@@ -3118,10 +3118,10 @@ fn observed_udp_datagram_loss_prefers_alternative_for_next_realtime_packet() {
     let resources = ResourceLimits::default();
     let context = ClientPathContext::new(
         vec![
-            "udp://127.0.0.1:10000?srtt-ms=20&rate-mbps=200"
+            "quic://127.0.0.1:10000?initial-srtt-ms=20&initial-rate-mbps=200"
                 .parse()
                 .expect("path"),
-            "udp://127.0.0.1:10001?srtt-ms=30&rate-mbps=200"
+            "quic://127.0.0.1:10001?initial-srtt-ms=30&initial-rate-mbps=200"
                 .parse()
                 .expect("path"),
         ],
@@ -3259,7 +3259,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         ResourceLimits::default().max_streams,
     ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let path = "tcp://127.0.0.1:10000?srtt-ms=20&rate-mbps=500"
+    let path = "tcp://127.0.0.1:10000?initial-srtt-ms=20&initial-rate-mbps=500"
         .parse::<PathSpec>()
         .expect("path spec");
     let initial_metrics =

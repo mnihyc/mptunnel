@@ -164,7 +164,7 @@ fn status_authenticates_and_redacts_token_from_debug_and_output() {
 
     let request = server.requests.lock().expect("requests");
     let request = String::from_utf8_lossy(&request[0]);
-    assert!(request.starts_with("GET /api/v2/status HTTP/1.1\r\n"));
+    assert!(request.starts_with("GET /api/v3/status HTTP/1.1\r\n"));
     assert!(request.contains(&format!("Authorization: Bearer {TOKEN}\r\n")));
     let output = String::from_utf8(output).expect("status output");
     assert!(!output.contains(TOKEN));
@@ -237,11 +237,11 @@ fn management_client_rejects_oversized_and_ambiguous_responses() {
     let client = ManagementClient::new(server.address, TOKEN.to_string()).expect("client");
 
     assert!(matches!(
-        client.get("/api/v2/status"),
+        client.get("/api/v3/status"),
         Err(OperationError::ManagementResponseBodyTooLarge)
     ));
     assert!(matches!(
-        client.get("/api/v2/status"),
+        client.get("/api/v3/status"),
         Err(OperationError::AmbiguousManagementResponse)
     ));
     server.handle.join().expect("bounded response server");
@@ -258,7 +258,7 @@ fn dns_commands_use_only_the_versioned_authenticated_contract() {
         vec!["dns", "status"],
         vec!["dns", "explain", "WWW.Example."],
         vec!["dns", "query", "www.example", "--type", "AAAA"],
-        vec!["dns", "flush", "--dns-plan", "default"],
+        vec!["dns", "flush", "--policy", "default"],
     ] {
         let cli = operation_cli(&directory, server.address, &command);
         execute(&cli, &mut Vec::new()).expect("DNS operation");
@@ -270,12 +270,12 @@ fn dns_commands_use_only_the_versioned_authenticated_contract() {
         .iter()
         .map(|request| String::from_utf8_lossy(request).into_owned())
         .collect::<Vec<_>>();
-    assert!(rendered[0].starts_with("GET /api/v2/dns/status HTTP/1.1\r\n"));
-    assert!(rendered[1].starts_with("GET /api/v2/dns/explain?domain=www%2Eexample HTTP/1.1\r\n"));
-    assert!(rendered[2].starts_with("POST /api/v2/dns/query HTTP/1.1\r\n"));
+    assert!(rendered[0].starts_with("GET /api/v3/dns/status HTTP/1.1\r\n"));
+    assert!(rendered[1].starts_with("GET /api/v3/dns/explain?domain=www%2Eexample HTTP/1.1\r\n"));
+    assert!(rendered[2].starts_with("POST /api/v3/dns/query HTTP/1.1\r\n"));
     assert!(rendered[2].ends_with(r#"{"domain":"www.example","type":"AAAA"}"#));
-    assert!(rendered[3].starts_with("POST /api/v2/dns/cache/flush HTTP/1.1\r\n"));
-    assert!(rendered[3].ends_with(r#"{"dns_plan":"default"}"#));
+    assert!(rendered[3].starts_with("POST /api/v3/dns/cache/flush HTTP/1.1\r\n"));
+    assert!(rendered[3].ends_with(r#"{"policy":"default"}"#));
     assert!(
         rendered
             .iter()
@@ -326,7 +326,7 @@ fn route_explain_uses_the_canonical_pre_and_post_resolution_policy() {
     assert!(post.contains("rule: resolved-private"));
     assert!(post.contains("initial_demand: throughput"));
     assert!(post.contains("action: outbound\n  outbound: direct"));
-    assert!(post.contains("resolution:\n  rule: default\n  dns_plan: default (policy default)"));
+    assert!(post.contains("resolution:\n  rule: default\n  dns_policy: default (policy default)"));
 }
 
 #[test]

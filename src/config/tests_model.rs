@@ -90,7 +90,7 @@ fn managed_full_tun_requires_local_dns_capture() {
     assert!(matches!(
         validate_tun_l4(&tun),
         Err(ConfigError::ManagedVpn(message))
-            if message.contains("full VPN requires at least one DNS capture server")
+            if message.contains("full VPN requires at least one DNS listener")
     ));
 }
 
@@ -101,7 +101,7 @@ fn managed_tun_rejects_external_dns_and_gateway_fields() {
     assert!(matches!(
         validate_tun_l4(&tun),
         Err(ConfigError::ManagedVpn(message))
-            if message.contains("cannot set external TUN dns_resolvers")
+            if message.contains("cannot set external TUN dns_redirects")
     ));
 
     tun.dns_resolvers.clear();
@@ -153,7 +153,7 @@ fn extra_traffic_hint_default_is_five_percent() {
 
 #[test]
 fn udp_path_configuration_is_strict_and_requires_sni_identity() {
-    let default_path = "udp://127.0.0.1:443-445"
+    let default_path = "quic://127.0.0.1:443-445"
         .parse::<PathSpec>()
         .expect("default udp path parses");
 
@@ -162,12 +162,12 @@ fn udp_path_configuration_is_strict_and_requires_sni_identity() {
         crate::protocol::UnderlayProtocol::Udp
     );
     assert!(
-        "udp://127.0.0.1:443?unsupported=true"
+        "quic://127.0.0.1:443?unsupported=true"
             .parse::<PathSpec>()
             .is_err()
     );
     assert!(
-        "udp://127.0.0.1:443?profile=experimental"
+        "quic://127.0.0.1:443?profile=experimental"
             .parse::<PathSpec>()
             .is_err()
     );
@@ -208,7 +208,7 @@ fn udp_path_configuration_is_strict_and_requires_sni_identity() {
             limit: 2
         })
     );
-    outbound.paths[0].spec = "tcp://127.0.0.1:443?tcp-carriers=1-2"
+    outbound.paths[0].spec = "tcp://127.0.0.1:443?max-tcp-carriers=2"
         .parse()
         .expect("bounded TCP carrier range");
     assert_eq!(validate_mpp_outbound(&outbound, resources), Ok(()));
@@ -226,7 +226,7 @@ fn server_paths_reject_client_only_endpoint_options() {
         dns_plan: None,
         paths: vec![NamedPathConfig {
             name: "path-1".to_string(),
-            spec: "tcp://127.0.0.1:443?source-ip=127.0.0.1"
+            spec: "tcp://127.0.0.1:443?source-address=127.0.0.1"
                 .parse()
                 .expect("server path"),
         }],
@@ -243,14 +243,30 @@ fn server_paths_reject_client_only_endpoint_options() {
     );
 
     let mut server = server;
-    for ranged in ["tcp://127.0.0.1:443-445", "udp://127.0.0.1:443-445"] {
+    server.paths[0].spec = "quic://127.0.0.1:443?max-datagram-payload-bytes=1400"
+        .parse()
+        .expect("client datagram payload policy");
+    assert_eq!(
+        validate_mpp_inbound(&server, ResourceLimits::default()),
+        Err(ConfigError::ServerPathMaxDatagramPayload)
+    );
+
+    server.paths[0].spec = "tcp://127.0.0.1:443-445?port-rotation-interval-ms=5000"
+        .parse()
+        .expect("client port rotation policy");
+    assert_eq!(
+        validate_mpp_inbound(&server, ResourceLimits::default()),
+        Err(ConfigError::ServerPathPortRotation)
+    );
+
+    for ranged in ["tcp://127.0.0.1:443-445", "quic://127.0.0.1:443-445"] {
         server.paths[0].spec = ranged.parse().expect("ranged server path");
         assert_eq!(
             validate_mpp_inbound(&server, ResourceLimits::default()),
             Err(ConfigError::ServerPathPortRange)
         );
     }
-    server.paths[0].spec = "tcp://127.0.0.1:443?tcp-carriers=1-3"
+    server.paths[0].spec = "tcp://127.0.0.1:443?max-tcp-carriers=3"
         .parse()
         .expect("client carrier policy");
     assert_eq!(

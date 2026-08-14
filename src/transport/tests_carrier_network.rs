@@ -50,7 +50,7 @@ fn unified_host_callback_protects_tcp_and_udp_carriers_once() {
         protector.clone(),
     );
     let tcp_path = path("tcp://192.0.2.1:443");
-    let udp_path = path("udp://192.0.2.2:443");
+    let udp_path = path("quic://192.0.2.2:443");
     let tcp_identity = CarrierPathIdentity {
         group_ordinal: 3,
         path_ordinal: 4,
@@ -155,7 +155,7 @@ async fn carrier_protection_rejection_prevents_tcp_connect() {
 
 #[test]
 fn system_udp_socket_is_bound_for_quic_handoff() {
-    let path = path("udp://192.0.2.1:443");
+    let path = path("quic://192.0.2.1:443");
     let carrier = CarrierSocket::system(CarrierSocketRequest {
         path: &path,
         identity: CarrierPathIdentity {
@@ -174,7 +174,7 @@ fn system_udp_socket_is_bound_for_quic_handoff() {
 
 #[test]
 fn system_socket_defers_source_family_check_until_resolution() {
-    let path = path("tcp://example.test:443?source-ip=192.0.2.10");
+    let path = path("tcp://example.test:443?source-address=192.0.2.10");
     let error = CarrierSocket::system(CarrierSocketRequest {
         path: &path,
         identity: CarrierPathIdentity {
@@ -190,7 +190,7 @@ fn system_socket_defers_source_family_check_until_resolution() {
 
 #[test]
 fn carrier_conversion_rejects_the_wrong_transport() {
-    let path = path("udp://192.0.2.1:443");
+    let path = path("quic://192.0.2.1:443");
     let carrier = CarrierSocket::system(CarrierSocketRequest {
         path: &path,
         identity: CarrierPathIdentity {
@@ -295,7 +295,7 @@ async fn prepared_provider_never_falls_back_to_runtime_dns() {
 
 #[test]
 fn prepared_provider_rejects_identity_aliases_and_incompatible_answers() {
-    let configured = path("udp://carrier.invalid:443?source-ip=192.0.2.5");
+    let configured = path("quic://carrier.invalid:443?source-address=192.0.2.5");
     let identity = CarrierPathIdentity {
         group_ordinal: 0,
         path_ordinal: 0,

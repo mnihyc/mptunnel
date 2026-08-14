@@ -372,7 +372,7 @@ impl ClientIngressRouter {
             .await
     }
 
-    /// Recover a captured FakeDNS address exactly once while establishing a TUN
+    /// Recover a captured DNS override address exactly once while establishing a TUN
     /// flow. Established payload paths retain the resulting domain target and
     /// never call back into DNS per packet.
     pub(in crate::runtime) fn recover_tun_target(
@@ -386,10 +386,10 @@ impl ClientIngressRouter {
                 port: remote.port(),
             }),
             FakeDnsRecovery::Expired => Err(RuntimeError::DestinationDenied(
-                "expired FakeDNS address rejected before routing".to_string(),
+                "expired DNS override address rejected before routing".to_string(),
             )),
             FakeDnsRecovery::Unknown => Err(RuntimeError::DestinationDenied(
-                "unknown FakeDNS address rejected before routing".to_string(),
+                "unknown DNS override address rejected before routing".to_string(),
             )),
         }
     }

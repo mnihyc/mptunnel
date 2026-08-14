@@ -56,7 +56,7 @@ those durable instances. TCP and QUIC keep their own handshake and liveness
 mechanics, while the path layer records only authenticated exchange timing as
 path RTT, not connection setup time.
 
-Carrier bootstrap may select one concrete destination port from a configured
+Carrier establishment may select one concrete destination port from a configured
 inclusive set before resolution. Every address-family attempt for that
 establishment uses the same selected port; a later physical carrier
 establishment selects independently. Managed-VPN preparation therefore stores

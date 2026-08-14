@@ -517,7 +517,7 @@ async fn quic_destination_port_migration_preserves_connection_and_streams() {
 
     let first = first_port.port().min(second_port.port());
     let last = first_port.port().max(second_port.port());
-    let path: PathSpec = format!("udp://127.0.0.1:{first}-{last}")
+    let path: PathSpec = format!("quic://127.0.0.1:{first}-{last}")
         .parse()
         .expect("ranged UDP path");
     let carrier = CarrierSocket::system(CarrierSocketRequest {

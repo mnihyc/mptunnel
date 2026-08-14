@@ -40,7 +40,7 @@ pub use model::{
     ServerSecurityConfig, ServiceConfig, SessionConfig,
 };
 pub(crate) use secret::{
-    SecretMaterialError, normalize_secret_bytes, read_secret_environment, read_secret_file,
+    MaterialSourceError, normalize_secret_bytes, read_secret_environment, read_secret_file,
 };
 pub use store::{
     CanonicalConfigStore, CommittedConfig, ConfigRecoveryConflict, ConfigRevision,

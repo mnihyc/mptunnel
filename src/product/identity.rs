@@ -40,7 +40,7 @@ impl SharedSecret {
 }
 
 fn parse_uuid_secret(value: &[u8]) -> Option<[u8; 16]> {
-    let text = std::str::from_utf8(value).ok()?.trim();
+    let text = std::str::from_utf8(value).ok()?;
     let uuid = Uuid::parse_str(text).ok()?;
     Some(*uuid.as_bytes())
 }

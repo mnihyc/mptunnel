@@ -87,19 +87,18 @@ dashboard = false
 allow_peer_diagnostics = false
 
 [dns]
-generation = 1
-default_dns_plan = "local"
+default = "local"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "system"
-transport = "system"
+protocol = "system"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "local"
-upstreams = ["system"]
-ip_strategy = "ipv4-only"
+servers = ["system"]
+family = "ipv4-only"
 
-[[dns.hosts]]
+[[dns.records]]
 domain = "{LOCAL_DNS_TARGET}"
 addresses = ["127.0.0.1"]
 
@@ -326,7 +325,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         "pre-reload SOCKS5 listener",
     );
 
-    let unauthorized_health = http_request(management, "GET", "/api/v2/health", None, &[], &[])
+    let unauthorized_health = http_request(management, "GET", "/api/v3/health", None, &[], &[])
         .expect("unauthenticated health response");
     assert_eq!(unauthorized_health.status, 401);
     let removed_legacy_health = http_request(
@@ -342,7 +341,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let health = http_request(
         management,
         "GET",
-        "/api/v2/health/ready",
+        "/api/v3/health/ready",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -351,14 +350,14 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     assert_eq!(health.status, 200);
     assert_eq!(health.json()["ready"], true);
 
-    let unauthorized = http_request(management, "GET", "/api/v2/config", None, &[], &[])
+    let unauthorized = http_request(management, "GET", "/api/v3/config", None, &[], &[])
         .expect("unauthenticated config status");
     assert_eq!(unauthorized.status, 401);
 
     let status = http_request(
         management,
         "GET",
-        "/api/v2/config",
+        "/api/v3/config",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -378,7 +377,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let invalid = http_request(
         management,
         "POST",
-        "/api/v2/config/validate",
+        "/api/v3/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         invalid_candidate.as_bytes(),
@@ -405,7 +404,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         let collision = http_request(
             management,
             "POST",
-            "/api/v2/config/validate",
+            "/api/v3/config/validate",
             Some(OPERATOR_TOKEN),
             &[("Content-Type", "application/toml")],
             store_collision.as_bytes(),
@@ -421,7 +420,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let validated = http_request(
         management,
         "POST",
-        "/api/v2/config/validate",
+        "/api/v3/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         candidate.as_bytes(),
@@ -436,7 +435,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let missing_precondition = http_request(
         management,
         "POST",
-        "/api/v2/config/apply",
+        "/api/v3/config/apply",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         candidate.as_bytes(),
@@ -447,7 +446,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let stale = http_request(
         management,
         "POST",
-        "/api/v2/config/apply",
+        "/api/v3/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -468,7 +467,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v2/config/apply",
+        "/api/v3/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -496,7 +495,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         if let Ok(response) = http_request(
             management,
             "GET",
-            "/api/v2/config",
+            "/api/v3/config",
             Some(OPERATOR_TOKEN),
             &[],
             &[],
@@ -574,7 +573,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let validated = http_request(
         management,
         "POST",
-        "/api/v2/config/validate",
+        "/api/v3/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         unusable_logging_candidate.as_bytes(),
@@ -587,7 +586,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v2/config/apply",
+        "/api/v3/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -607,7 +606,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let status = http_request(
         management,
         "GET",
-        "/api/v2/config",
+        "/api/v3/config",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -623,7 +622,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let validated = http_request(
         management,
         "POST",
-        "/api/v2/config/validate",
+        "/api/v3/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         live_logging_candidate.as_bytes(),
@@ -637,7 +636,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v2/config/apply",
+        "/api/v3/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -678,7 +677,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let validated = http_request(
         management,
         "POST",
-        "/api/v2/config/validate",
+        "/api/v3/config/validate",
         Some(OPERATOR_TOKEN),
         &[("Content-Type", "application/toml")],
         non_logging_candidate.as_bytes(),
@@ -692,7 +691,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let applied = http_request(
         management,
         "POST",
-        "/api/v2/config/apply",
+        "/api/v3/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -710,7 +709,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         if let Ok(response) = http_request(
             management,
             "GET",
-            "/api/v2/config",
+            "/api/v3/config",
             Some(OPERATOR_TOKEN),
             &[],
             &[],
@@ -938,8 +937,8 @@ outbound = "direct-egress"
 
 [inbounds.security]
 credential_ids = ["daily-use"]
-tls_certificate_chain_file = "{certificate}"
-tls_private_key_file = "{private_key}"
+tls_certificate_chain = {{ from = "file", path = "{certificate}" }}
+tls_private_key = {{ from = "file", path = "{private_key}" }}
 
 [inbounds.destination_acl]
 generation = 1
@@ -1013,7 +1012,7 @@ path_probe_timeout_ms = 1000
 [outbounds.security]
 credential_id = "daily-use"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "{certificate}"
+tls_pinned_certificate = {{ from = "file", path = "{certificate}" }}
 
 [[outbounds]]
 name = "direct-default"
@@ -1081,7 +1080,7 @@ fn wait_for_mpp_outbound_availability(
         if let Ok(response) = http_request(
             management,
             "GET",
-            "/api/v2/sessions",
+            "/api/v3/sessions",
             Some(OPERATOR_TOKEN),
             &[],
             &[],
@@ -1328,7 +1327,7 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     let status = http_request(
         management,
         "GET",
-        "/api/v2/config",
+        "/api/v3/config",
         Some(OPERATOR_TOKEN),
         &[],
         &[],
@@ -1346,7 +1345,7 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     let applied = http_request(
         management,
         "POST",
-        "/api/v2/config/apply",
+        "/api/v3/config/apply",
         Some(OPERATOR_TOKEN),
         &[
             ("Content-Type", "application/toml"),
@@ -1530,39 +1529,38 @@ fn split_dot_config() -> &'static str {
 level = "error"
 
 [dns]
-generation = 17
-default_dns_plan = "public"
+default = "public"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "corp-dot"
-transport = "tls"
-bootstrap = "9.9.9.9:853"
-server_name = "dns.quad9.net"
+protocol = "dot"
+address = "9.9.9.9:853"
+tls_name = "dns.quad9.net"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "public-dot"
-transport = "tls"
-bootstrap = "1.1.1.1:853"
-server_name = "cloudflare-dns.com"
+protocol = "dot"
+address = "1.1.1.1:853"
+tls_name = "cloudflare-dns.com"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "corp"
-upstreams = ["corp-dot"]
-ip_strategy = "ipv4-only"
+servers = ["corp-dot"]
+family = "ipv4-only"
 security = "require-encrypted"
-lookup_timeout_ms = 750
+query = { timeout_ms = 750 }
 
-[[dns.plans]]
+[[dns.policies]]
 name = "public"
-upstreams = ["public-dot"]
-ip_strategy = "ipv4-only"
+servers = ["public-dot"]
+family = "ipv4-only"
 security = "require-encrypted"
-lookup_timeout_ms = 750
+query = { timeout_ms = 750 }
 
 [[dns.rules]]
 name = "corp-split"
 suffix = "corp.example"
-dns_plan = "corp"
+policy = "corp"
 explanation = "private daily-use namespace"
 
 [[inbounds]]
@@ -1693,7 +1691,7 @@ async fn strict_toml_drives_split_dot_selection_and_local_dns_capture_boundary()
         corp.addresses().as_ref(),
         &["10.42.0.53".parse::<IpAddr>().expect("corp answer")]
     );
-    assert_eq!(corp.metadata().generation(), 17);
+    assert_eq!(corp.metadata().generation(), 1);
     assert_eq!(corp.metadata().plan().as_str(), "corp");
     assert_eq!(
         corp.metadata().rule().map(|rule| rule.as_str()),

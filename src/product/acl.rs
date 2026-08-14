@@ -105,7 +105,7 @@ impl DestinationAcl {
     /// restricted-address guard is always applied when MPTUNNEL owns a native
     /// connection or otherwise resolves a target. A configured proxy that
     /// receives an unresolved domain is the resolution trust boundary, so it
-    /// does not trigger a query through the selected DNS plan by itself.
+    /// does not trigger a query through the selected DNS policy by itself.
     pub fn requires_post_resolution(&self, flow: &FlowContext) -> bool {
         if let Some(address) = flow.target().ip() {
             let pre_input = RouteInput::pre_resolution(flow);
@@ -234,7 +234,7 @@ impl DestinationAcl {
 
     /// Authorize delegation of the canonical domain to a configured
     /// domain-capable outbound. Explicit post-resolution ACL dependencies must
-    /// be resolved through the selected DNS plan and therefore cannot produce
+    /// be resolved through the selected DNS policy and therefore cannot produce
     /// this proof.
     pub fn authorize_domain(
         &self,
@@ -256,7 +256,7 @@ impl DestinationAcl {
     }
 
     /// Promote a delegated-domain proof to exact address proofs when a later
-    /// IP-only leaf requires address evidence from the selected DNS plan.
+    /// IP-only leaf requires address evidence from the selected DNS policy.
     pub fn authorize_domain_resolution(
         &self,
         domain: &AuthorizedDomainTarget,

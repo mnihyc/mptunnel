@@ -210,7 +210,7 @@ impl OutboundConfig {
     /// Native target sockets need an IP target. Proxy protocols can carry a
     /// domain in their own request and delegate target resolution upstream.
     ///
-    /// Resolution for an IP-only leaf uses the selected Product DNS plan; its
+    /// Resolution for an IP-only leaf uses the selected Product DNS policy; its
     /// upstream transport may be system, direct, or routed.
     pub const fn requires_ip_target(&self) -> bool {
         matches!(

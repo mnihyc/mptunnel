@@ -147,9 +147,9 @@ fn request_dispatch_rejects_switchable_response_output() {
 async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output() {
     let stream_id = StreamId(90);
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10260?srtt-ms=500&rate-mbps=400",
-        "udp://127.0.0.1:10261?srtt-ms=40&rate-mbps=200",
-        "udp://127.0.0.1:10262?srtt-ms=5&rate-mbps=500",
+        "tcp://127.0.0.1:10260?initial-srtt-ms=500&initial-rate-mbps=400",
+        "quic://127.0.0.1:10261?initial-srtt-ms=40&initial-rate-mbps=200",
+        "quic://127.0.0.1:10262?initial-srtt-ms=5&initial-rate-mbps=500",
     ]);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(1);
@@ -363,7 +363,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
 async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
     let stream_id = StreamId(126);
     let context =
-        client_test_context_with_paths(&["tcp://127.0.0.1:10341", "udp://127.0.0.1:10342"]);
+        client_test_context_with_paths(&["tcp://127.0.0.1:10341", "quic://127.0.0.1:10342"]);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, tcp_commands),
@@ -913,8 +913,8 @@ async fn client_path_failure_releases_path_load_before_cleanup_waits() {
 async fn client_path_failure_releases_optional_load_before_cleanup_waits() {
     let stream_id = StreamId(125);
     let context = Arc::new(client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10331?srtt-ms=20&rate-mbps=500",
-        "tcp://127.0.0.1:10332?srtt-ms=20&rate-mbps=500",
+        "tcp://127.0.0.1:10331?initial-srtt-ms=20&initial-rate-mbps=500",
+        "tcp://127.0.0.1:10332?initial-srtt-ms=20&initial-rate-mbps=500",
     ]));
     let (service_commands, _service_rx) = reliable_path_command_channels(1);
     let mut remotes =

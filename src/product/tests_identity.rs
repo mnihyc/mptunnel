@@ -36,14 +36,17 @@ fn shared_secret_is_redacted_and_minimum_sized() {
 
 #[test]
 fn shared_secret_accepts_uuid_and_derives_master_material() {
-    let uuid_secret =
-        SharedSecret::new(b"6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_vec()).expect("uuid secret");
+    let uuid = b"6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    let uuid_secret = SharedSecret::new(uuid.to_vec()).expect("uuid secret");
+    let uuid_with_newline =
+        SharedSecret::new([uuid.as_slice(), b"\n"].concat()).expect("raw UUID bytes");
     let raw_secret =
         SharedSecret::new(b"raw-secret-material-with-at-least-32-bytes".to_vec()).expect("raw");
 
     assert_eq!(uuid_secret.as_bytes().len(), SharedSecret::DERIVED_BYTES);
     assert_eq!(raw_secret.as_bytes().len(), SharedSecret::DERIVED_BYTES);
     assert_ne!(uuid_secret.as_bytes(), raw_secret.as_bytes());
+    assert_ne!(uuid_secret.as_bytes(), uuid_with_newline.as_bytes());
 }
 
 #[test]

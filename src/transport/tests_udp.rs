@@ -5,7 +5,7 @@ async fn udp_path_connects_to_bound_socket_and_datagrams_work() {
     let bind_path = reserve_udp_path().await;
     let socket = bind_socket(&bind_path).await.expect("bind socket");
     let local_addr = socket.local_addr().expect("local addr");
-    let client_path = format!("udp://{local_addr}")
+    let client_path = format!("quic://{local_addr}")
         .parse::<PathSpec>()
         .expect("client path");
 
@@ -53,7 +53,7 @@ async fn reserve_udp_path() -> PathSpec {
     let probe = UdpSocket::bind("127.0.0.1:0").await.expect("reserve port");
     let port = probe.local_addr().expect("reserved addr").port();
     drop(probe);
-    format!("udp://127.0.0.1:{port}")
+    format!("quic://127.0.0.1:{port}")
         .parse()
         .expect("bind path")
 }

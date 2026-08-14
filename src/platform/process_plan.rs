@@ -296,7 +296,7 @@ pub enum ProcessHostOperation {
     },
 }
 
-/// Fully validated two-phase desktop route/DNS plan.
+/// Fully validated two-phase desktop route/DNS transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessVpnPlan {
     prepare_operations: Vec<ProcessHostOperation>,

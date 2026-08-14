@@ -28,7 +28,11 @@ fn local_leaf(id: &str, config: OutboundConfig) -> RuntimeOutboundLeaf {
 
 fn mpp_context(port: u16) -> ClientPathContext {
     ClientPathContext::new(
-        vec![format!("udp://127.0.0.1:{port}").parse().expect("MPP path")],
+        vec![
+            format!("quic://127.0.0.1:{port}")
+                .parse()
+                .expect("MPP path"),
+        ],
         ClientSecurityConfig::for_test(
             SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("test secret"),
         ),
@@ -966,7 +970,7 @@ async fn gateway_blackhole_failover_keeps_domain_resolution_lazy_and_irreversibl
 #[test]
 fn server_native_selector_rejects_mpp_chaining_at_runtime_assembly() {
     let context = ClientPathContext::new(
-        vec!["udp://127.0.0.1:7443".parse().expect("path")],
+        vec!["quic://127.0.0.1:7443".parse().expect("path")],
         ClientSecurityConfig::for_test(
             SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
         ),
@@ -1166,7 +1170,7 @@ fn routed_dns_rejects_proxy_and_mpp_control_hostnames_at_runtime_assembly() {
     let mpp_id = OutboundId::parse("named-mpp").expect("outbound ID");
     let context = ClientPathContext::new(
         vec![
-            "udp://carrier.example:7443"
+            "quic://carrier.example:7443"
                 .parse()
                 .expect("MPP path endpoint"),
         ],
@@ -1202,7 +1206,7 @@ fn routed_dns_rejects_proxy_and_mpp_control_hostnames_at_runtime_assembly() {
     let literal_id = OutboundId::parse("literal-mpp").expect("outbound ID");
     let context = ClientPathContext::new(
         vec![
-            "udp://127.0.0.1:7443"
+            "quic://127.0.0.1:7443"
                 .parse()
                 .expect("literal MPP path endpoint"),
         ],

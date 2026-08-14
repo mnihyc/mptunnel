@@ -142,9 +142,10 @@ async fn packet_service_enforces_ownership_and_preserves_packets() {
         4,
         16 * 1_500,
     );
-    let local_path: crate::transport::PathSpec = "tcp://127.0.0.1:9000?srtt-ms=20&rate-mbps=500"
-        .parse()
-        .expect("path");
+    let local_path: crate::transport::PathSpec =
+        "tcp://127.0.0.1:9000?initial-srtt-ms=20&initial-rate-mbps=500"
+            .parse()
+            .expect("path");
     let local = ServerLocalPath::new(0, local_path);
     let registration = context.reliable_streams.register_test_carrier_path(
         SessionId(1),
@@ -251,9 +252,10 @@ async fn packet_service_enforces_ownership_and_preserves_packets() {
 
 #[test]
 fn server_packet_ranking_requires_delivered_capacity_evidence() {
-    let path: crate::transport::PathSpec = "udp://127.0.0.1:9000?srtt-ms=20&rate-mbps=100"
-        .parse()
-        .expect("path");
+    let path: crate::transport::PathSpec =
+        "quic://127.0.0.1:9000?initial-srtt-ms=20&initial-rate-mbps=100"
+            .parse()
+            .expect("path");
     let local = ServerLocalPath::new(0, path);
     let startup = local.startup_metrics(PathId(0));
     let mut live = crate::protocol::PathMetrics {

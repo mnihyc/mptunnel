@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::gateway::ManagementBalancerStatus;
 
-pub(super) const SCHEMA: &str = "mptunnel.management.v6";
+pub(super) const SCHEMA: &str = "mptunnel.management.v3";
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementSnapshot {
@@ -250,7 +250,7 @@ pub(super) struct ManagementPathStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tcp_carrier_ordinal: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) tcp_carriers_max: Option<u16>,
+    pub(super) max_tcp_carriers: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) path_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

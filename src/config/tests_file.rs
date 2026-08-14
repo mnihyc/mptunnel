@@ -17,6 +17,7 @@ const TEST_MANAGEMENT_TOKEN_FILE: &str = "management-token.key";
 const TEST_PROXY_PASSWORD_FILE: &str = "proxy-password.key";
 const TEST_TRANSPORT_SECRET_FILE: &str = "mptunnel-transport-secret.key";
 const TEST_SHORT_TRANSPORT_SECRET_FILE: &str = "mptunnel-short-transport-secret.key";
+const TEST_HEX_TEXT_TRANSPORT_SECRET_FILE: &str = "mptunnel-hex-text-transport-secret.key";
 const TEST_CREDENTIAL_CATALOG: &str = r#"
 [[credentials]]
 credential_id = "test-default"
@@ -90,6 +91,10 @@ impl TestTlsDirectory {
                 b"transport-secret-32-bytes-value!",
             ),
             (TEST_SHORT_TRANSPORT_SECRET_FILE, b"too-short"),
+            (
+                TEST_HEX_TEXT_TRANSPORT_SECRET_FILE,
+                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
         ] {
             std::fs::write(path.join(file), secret).expect("write config-test credential");
         }
@@ -271,11 +276,11 @@ protocol = "socks5"
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{{ name = "path-1", endpoint = "udp://127.0.0.1:443" }}]
+paths = [{{ name = "path-1", endpoint = "quic://127.0.0.1:443" }}]
 
 [outbounds.security]
 credential_id = "test-default"
-tls_pinned_certificate_file = "{TEST_CERTIFICATE_FILE}"
+tls_pinned_certificate = {{ from = "file", path = "{TEST_CERTIFICATE_FILE}" }}
 {extra_security}
 
 [routing]
@@ -298,8 +303,8 @@ outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
-tls_certificate_chain_file = "{TEST_CERTIFICATE_FILE}"
-tls_private_key_file = "{TEST_PRIVATE_KEY_FILE}"
+tls_certificate_chain = {{ from = "file", path = "{TEST_CERTIFICATE_FILE}" }}
+tls_private_key = {{ from = "file", path = "{TEST_PRIVATE_KEY_FILE}" }}
 {extra_security}
 
 [[outbounds]]
@@ -337,7 +342,7 @@ fn shared_transport_secret_is_optional_distinct_and_strict() {
     );
 
     let protected = load_config_toml_str(&mpp_outbound_security_document(&format!(
-        "transport_secret_file = {TEST_TRANSPORT_SECRET_FILE:?}"
+        "transport_secret = {{ from = \"file\", path = {TEST_TRANSPORT_SECRET_FILE:?} }}"
     )))
     .expect("client shared transport secret");
     let CommandConfig::Node(protected) = protected.command;
@@ -357,7 +362,7 @@ fn shared_transport_secret_is_optional_distinct_and_strict() {
     );
 
     let server = load_config_toml_str(&mpp_inbound_security_document(&format!(
-        "transport_secret_file = {TEST_TRANSPORT_SECRET_FILE:?}"
+        "transport_secret = {{ from = \"file\", path = {TEST_TRANSPORT_SECRET_FILE:?} }}"
     )))
     .expect("server shared transport secret");
     let CommandConfig::Node(server) = server.command;
@@ -366,10 +371,11 @@ fn shared_transport_secret_is_optional_distinct_and_strict() {
 
     for file in [
         TEST_SHORT_TRANSPORT_SECRET_FILE,
+        TEST_HEX_TEXT_TRANSPORT_SECRET_FILE,
         "missing-transport-secret.key",
     ] {
         let error = load_config_toml_str(&mpp_outbound_security_document(&format!(
-            "transport_secret_file = {file:?}"
+            "transport_secret = {{ from = \"file\", path = {file:?} }}"
         )))
         .expect_err("invalid shared transport secret");
         assert!(error.to_string().contains("shared transport secret"));
@@ -382,6 +388,213 @@ fn shared_transport_secret_is_optional_distinct_and_strict() {
             ))),
             Err(ConfigFileError::Toml(_))
         ));
+    }
+}
+
+#[test]
+fn inline_material_sources_build_client_and_server_security() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let directory = TestTlsDirectory::new();
+    let certificate = BASE64.encode(
+        std::fs::read(directory.path.join(TEST_CERTIFICATE_FILE)).expect("read test certificate"),
+    );
+    let private_key = BASE64.encode(
+        std::fs::read(directory.path.join(TEST_PRIVATE_KEY_FILE)).expect("read test private key"),
+    );
+    let transport = std::fs::read(directory.path.join(TEST_TRANSPORT_SECRET_FILE))
+        .expect("read test transport secret");
+    let transport_hex = transport
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let transport_base64 = BASE64.encode(&transport);
+
+    let client = format!(
+        r#"
+[[credentials]]
+credential_id = "inline"
+principal_id = "inline"
+secret = {{ from = "hex", value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
+
+[[local_users]]
+name = "local-user"
+principal_id = "local-user"
+username = "alice"
+password = {{ value = "inline-password" }}
+
+[management]
+listen = ["127.0.0.1:7600"]
+token = {{ from = "raw", value = "inline-token-123" }}
+
+[[inbounds]]
+name = "local"
+protocol = "mixed"
+local_users = ["local-user"]
+
+[[outbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }}]
+
+[outbounds.security]
+credential_id = "inline"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate = {{ from = "base64", value = "{certificate}" }}
+transport_secret = {{ from = "hex", value = "{transport_hex}" }}
+
+[routing]
+[[routing.rules]]
+name = "default"
+action = "outbound"
+outbound = "edge"
+"#,
+    );
+    let client = super::load_config_toml_str_at(&client, &directory.path)
+        .expect("inline client material sources");
+    let CommandConfig::Node(client) = client.command;
+    assert!(
+        mpp_outbounds(&client)[0].paths[0]
+            .tls
+            .shared_transport_secret_configured()
+    );
+
+    let server = format!(
+        r#"
+[[credentials]]
+credential_id = "inline"
+principal_id = "inline"
+secret = {{ from = "base64", value = "{credential}" }}
+
+[[inbounds]]
+name = "edge"
+protocol = "mpp"
+paths = [{{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }}]
+outbound = "direct"
+
+[inbounds.security]
+credential_ids = ["inline"]
+tls_certificate_chain = {{ from = "base64", value = "{certificate}" }}
+tls_private_key = {{ from = "base64", value = "{private_key}" }}
+transport_secret = {{ from = "base64", value = "{transport_base64}" }}
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+"#,
+        credential = BASE64.encode([0xaa; 32]),
+    );
+    let server = super::load_config_toml_str_at(&server, &directory.path)
+        .expect("inline server material sources");
+    let CommandConfig::Node(server) = server.command;
+    assert!(server.servers[0].tls.shared_transport_secret_configured());
+    assert_eq!(
+        mpp_outbounds(&client)[0].security.credential.secret(),
+        server.servers[0]
+            .security
+            .credential_authority
+            .credentials()[0]
+            .secret(),
+        "hex and base64 sources must resolve to the same credential bytes"
+    );
+}
+
+#[test]
+fn material_sources_preserve_trailing_control_bytes_and_reject_removed_schema() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let exact_credential = BASE64.encode([vec![b'x'; 31], vec![b'\n']].concat());
+    let accepted = format!(
+        r#"
+[[credentials]]
+credential_id = "exact"
+principal_id = "exact"
+secret = {{ from = "base64", value = "{exact_credential}" }}
+
+[[inbounds]]
+name = "local"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+action = "outbound"
+outbound = "direct"
+"#,
+    );
+    load_config_toml_str(&accepted).expect("32 exact credential bytes including newline");
+
+    let token_with_newline = BASE64.encode(b"operator-token-123\n");
+    let rejected = format!(
+        r#"
+[management]
+listen = ["127.0.0.1:7600"]
+token = {{ from = "base64", value = "{token_with_newline}" }}
+
+[[inbounds]]
+name = "local"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+action = "outbound"
+outbound = "direct"
+"#,
+    );
+    assert!(
+        load_config_toml_str(&rejected).is_err(),
+        "material resolution must not trim the trailing newline"
+    );
+
+    for removed in [
+        r#"secret = { from = "environment", variable = "OLD_SECRET" }"#,
+        r#"tls_pinned_certificate_file = "old.pem""#,
+        r#"transport_secret_file = "old.key""#,
+    ] {
+        let document = if removed.starts_with("secret") {
+            format!(
+                r#"
+[[credentials]]
+credential_id = "old"
+principal_id = "old"
+{removed}
+
+[[inbounds]]
+name = "local"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+action = "outbound"
+outbound = "direct"
+"#,
+            )
+        } else {
+            mpp_outbound_security_document(removed)
+        };
+        assert!(
+            matches!(
+                load_config_toml_str(&document),
+                Err(ConfigFileError::Toml(_))
+            ),
+            "removed material schema was accepted: {removed}"
+        );
     }
 }
 
@@ -506,12 +719,12 @@ ipv6_prefix = 64
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{{ name = "path-1", endpoint = "udp://127.0.0.1:443" }}]
+paths = [{{ name = "path-1", endpoint = "quic://127.0.0.1:443" }}]
 
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = {{ from = "file", path = "mptunnel-test-certificate.pem" }}
 
 [routing]
 
@@ -527,23 +740,23 @@ fn managed_fake_dns_document(host: &str) -> String {
     format!(
         r#"
 [dns]
-default_dns_plan = "secure"
+default = "secure"
 
-[dns.fake_dns]
+[dns.override]
 ipv4_pool = "198.18.0.0/16"
 max_entries = 4096
 answer_ttl_ms = 30000
 recovery_ttl_ms = 120000
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "dot"
-transport = "tls"
-bootstrap = "1.1.1.1:853"
-server_name = "cloudflare-dns.com"
+protocol = "dot"
+address = "1.1.1.1:853"
+tls_name = "cloudflare-dns.com"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "secure"
-upstreams = ["dot"]
+servers = ["dot"]
 security = "require-encrypted"
 
 {}
@@ -587,7 +800,7 @@ mode = "managed"
 route_mode = "full"
 exclude_cidrs = ["192.168.0.9/16"]
 local_lan = true
-dns_capture_servers = ["10.88.0.53", "fd00:88::53"]
+dns_listeners = ["10.88.0.53", "fd00:88::53"]
 
 [inbounds.host.linux]
 route_table = 51821
@@ -699,7 +912,7 @@ include_cidrs = ["10.0.0.0/8"]
     assert!(matches!(
         missing,
         ConfigFileError::Config(ConfigError::DnsPolicy(message))
-            if message.contains("does not capture FakeDNS pool")
+            if message.contains("does not capture DNS override pool")
     ));
 
     let excluded = load_config_toml_str(&managed_fake_dns_document(
@@ -725,7 +938,7 @@ fn toml_managed_vpn_rejects_unknown_fields_and_invalid_policy() {
         r#"
 mode = "managed"
 route_mode = "full"
-dns_capture_servers = ["10.88.0.53"]
+dns_listeners = ["10.88.0.53"]
 auto_route = true
 "#,
     );
@@ -735,7 +948,7 @@ auto_route = true
         r#"
 mode = "managed"
 route_mode = "full"
-dns_capture_servers = ["10.88.0.53"]
+dns_listeners = ["10.88.0.53"]
 
 [linux]
 socket_mark = 0
@@ -755,7 +968,7 @@ fn toml_managed_vpn_rejects_legacy_mode_and_flat_linux_tuning() {
             r#"
 mode = "{unsupported_mode}"
 route_mode = "full"
-dns_capture_servers = ["10.88.0.53"]
+dns_listeners = ["10.88.0.53"]
 "#
         );
         assert!(
@@ -768,7 +981,7 @@ dns_capture_servers = ["10.88.0.53"]
         r#"
 mode = "managed"
 route_mode = "full"
-dns_capture_servers = ["10.88.0.53"]
+dns_listeners = ["10.88.0.53"]
 route_table = 51821
 "#,
     );
@@ -785,7 +998,7 @@ fn toml_managed_full_vpn_rejects_split_only_includes() {
 mode = "managed"
 route_mode = "full"
 include_cidrs = ["10.0.0.0/8"]
-dns_capture_servers = ["10.88.0.53"]
+dns_listeners = ["10.88.0.53"]
 "#,
     )
     .expect("file shape");
@@ -801,35 +1014,29 @@ dns_capture_servers = ["10.88.0.53"]
 fn dns_file_config_exposes_tagged_transport_bounds_and_ttl_caps() {
     let file: DnsFileConfig = toml::from_str(
         r#"
-generation = 7
-default_dns_plan = "default"
+default = "default"
 
-[[upstreams]]
+[[servers]]
 name = "v4"
-transport = "udp-tcp"
-bootstrap = "1.1.1.1:53"
+protocol = "udp-tcp"
+address = "1.1.1.1:53"
 
-[[upstreams]]
+[[servers]]
 name = "v6"
-transport = "udp-tcp"
-bootstrap = "[2606:4700:4700::1111]:53"
+protocol = "udp-tcp"
+address = "[2606:4700:4700::1111]:53"
 
-[[plans]]
+[[policies]]
 name = "default"
-upstreams = ["v4", "v6"]
-ip_strategy = "ipv6-and-ipv4"
-upstream_strategy = "race"
-fallback_delay_ms = 50
-expected_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
-lookup_timeout_ms = 1500
-cache_capacity = 2048
-max_inflight = 32
-positive_ttl_cap_ms = 120000
-negative_ttl_cap_ms = 15000
-stale_if_error_ms = 45000
-prefetch_max_ms = 12000
+servers = ["v4", "v6"]
+family = "ipv6-and-ipv4"
+strategy = "race"
+fallback_ms = 50
+answer_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
+query = { timeout_ms = 1500, inflight = 32, answers = 24 }
+cache = { entries = 2048, positive_ttl_ms = 120000, negative_ttl_ms = 15000, stale_ms = 45000, prefetch_ms = 12000 }
 
-[[hosts]]
+[[records]]
 domain = "router.home.arpa"
 addresses = ["192.0.2.1", "2001:db8::1"]
 "#,
@@ -846,7 +1053,7 @@ addresses = ["192.0.2.1", "2001:db8::1"]
     let default = crate::product::DnsPlanId::parse("default").expect("plan ID");
     let plan = compiled.plan(&default).expect("default plan");
 
-    assert_eq!(config.generation, 7);
+    assert_eq!(config.generation, 1);
     assert_eq!(compiled.bootstrap_endpoints().count(), 2);
     assert_eq!(plan.ip_strategy(), DnsIpStrategy::Ipv6AndIpv4);
     assert_eq!(
@@ -865,6 +1072,7 @@ addresses = ["192.0.2.1", "2001:db8::1"]
     assert_eq!(plan.limits().lookup_timeout, Duration::from_millis(1_500));
     assert_eq!(plan.limits().cache_capacity, 2_048);
     assert_eq!(plan.limits().max_inflight, 32);
+    assert_eq!(plan.limits().max_answers, 24);
     assert_eq!(
         plan.limits().positive_ttl_cap,
         Duration::from_millis(120_000)
@@ -888,27 +1096,183 @@ addresses = ["192.0.2.1", "2001:db8::1"]
 }
 
 #[test]
+fn dns_file_schema_accepts_every_canonical_server_protocol() {
+    let file: DnsFileConfig = toml::from_str(
+        r#"
+default = "all"
+
+[[servers]]
+name = "system"
+protocol = "system"
+
+[[servers]]
+name = "udp"
+protocol = "udp"
+address = "1.1.1.1:53"
+
+[[servers]]
+name = "tcp"
+protocol = "tcp"
+address = "1.0.0.1:53"
+
+[[servers]]
+name = "udp-tcp"
+protocol = "udp-tcp"
+address = "9.9.9.9:53"
+
+[[servers]]
+name = "dot"
+protocol = "dot"
+address = "9.9.9.9:853"
+tls_name = "dns.quad9.net"
+
+[[servers]]
+name = "doh"
+protocol = "doh"
+address = "1.1.1.1:443"
+tls_name = "cloudflare-dns.com"
+path = "/dns-query"
+
+[[servers]]
+name = "doq"
+protocol = "doq"
+address = "1.1.1.1:853"
+tls_name = "cloudflare-dns.com"
+
+[[policies]]
+name = "all"
+servers = ["system", "udp", "tcp", "udp-tcp", "dot", "doh", "doq"]
+"#,
+    )
+    .expect("canonical DNS schema");
+    let compiled = file
+        .into_config(&ParsedOutbounds {
+            leaves: HashMap::new(),
+            balancers: HashMap::new(),
+            order: Vec::new(),
+            balancer_order: Vec::new(),
+        })
+        .expect("canonical DNS config")
+        .compile()
+        .expect("compiled canonical DNS config");
+    let protocols = compiled
+        .upstreams()
+        .map(|server| server.endpoint().transport())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        protocols,
+        HashSet::from([
+            crate::product::DnsTransport::System,
+            crate::product::DnsTransport::Udp,
+            crate::product::DnsTransport::Tcp,
+            crate::product::DnsTransport::UdpTcp,
+            crate::product::DnsTransport::Tls,
+            crate::product::DnsTransport::Https,
+            crate::product::DnsTransport::Quic,
+        ])
+    );
+}
+
+#[test]
+fn dns_file_schema_rejects_removed_names_and_invalid_field_applicability() {
+    for removed in [
+        r#"generation = 7"#,
+        r#"default_dns_plan = "default""#,
+        r#"upstreams = []"#,
+        r#"plans = []"#,
+        r#"hosts = []"#,
+        r#"fake_dns = {}"#,
+        r#"servers = [{ name = "old", transport = "udp", bootstrap = "1.1.1.1:53" }]"#,
+        r#"policies = [{ name = "default", servers = ["system"], lookup_timeout_ms = 5000 }]"#,
+        r#"rules = [{ name = "old", exact = "example.test", dns_plan = "default" }]"#,
+    ] {
+        assert!(
+            toml::from_str::<DnsFileConfig>(removed).is_err(),
+            "removed DNS field unexpectedly parsed: {removed}"
+        );
+    }
+
+    for invalid in [
+        r#"
+default = "default"
+[[servers]]
+name = "system"
+protocol = "system"
+address = "1.1.1.1:53"
+[[policies]]
+name = "default"
+servers = ["system"]
+"#,
+        r#"
+default = "default"
+[[servers]]
+name = "udp"
+protocol = "udp"
+address = "1.1.1.1:53"
+tls_name = "cloudflare-dns.com"
+[[policies]]
+name = "default"
+servers = ["udp"]
+"#,
+        r#"
+default = "default"
+[[servers]]
+name = "doh"
+protocol = "doh"
+address = "1.1.1.1:443"
+tls_name = "cloudflare-dns.com"
+[[policies]]
+name = "default"
+servers = ["doh"]
+"#,
+        r#"
+default = "default"
+[[servers]]
+name = "system"
+protocol = "system"
+[[policies]]
+name = "default"
+servers = ["system"]
+strategy = "race"
+"#,
+    ] {
+        let parsed = toml::from_str::<DnsFileConfig>(invalid).expect("valid TOML shape");
+        assert!(
+            parsed
+                .into_config(&ParsedOutbounds {
+                    leaves: HashMap::new(),
+                    balancers: HashMap::new(),
+                    order: Vec::new(),
+                    balancer_order: Vec::new(),
+                })
+                .is_err(),
+            "invalid DNS field combination unexpectedly compiled: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn dns_file_config_strictly_compiles_doq_and_fake_dns() {
     let file: DnsFileConfig = toml::from_str(
         r#"
-default_dns_plan = "secure"
+default = "secure"
 
-[fake_dns]
+[override]
 ipv4_pool = "198.18.0.0/16"
 ipv6_pool = "fd00:4d50::/112"
 max_entries = 4096
 answer_ttl_ms = 30000
 recovery_ttl_ms = 120000
 
-[[upstreams]]
+[[servers]]
 name = "doq"
-transport = "quic"
-bootstrap = "1.1.1.1:853"
-server_name = "cloudflare-dns.com"
+protocol = "doq"
+address = "1.1.1.1:853"
+tls_name = "cloudflare-dns.com"
 
-[[plans]]
+[[policies]]
 name = "secure"
-upstreams = ["doq"]
+servers = ["doq"]
 security = "require-encrypted"
 "#,
     )
@@ -936,18 +1300,18 @@ security = "require-encrypted"
 
     let invalid_pool = toml::from_str::<DnsFileConfig>(
         r#"
-default_dns_plan = "default"
-[fake_dns]
+default = "default"
+[override]
 ipv4_pool = "203.0.113.0/24"
 max_entries = 32
 answer_ttl_ms = 30000
 recovery_ttl_ms = 120000
-[[upstreams]]
+[[servers]]
 name = "system"
-transport = "system"
-[[plans]]
+protocol = "system"
+[[policies]]
 name = "default"
-upstreams = ["system"]
+servers = ["system"]
 "#,
     )
     .expect("file shape")
@@ -966,16 +1330,16 @@ upstreams = ["system"]
 
     let invalid_doq_path = toml::from_str::<DnsFileConfig>(
         r#"
-default_dns_plan = "default"
-[[upstreams]]
+default = "default"
+[[servers]]
 name = "doq"
-transport = "quic"
-bootstrap = "1.1.1.1:853"
-server_name = "cloudflare-dns.com"
+protocol = "doq"
+address = "1.1.1.1:853"
+tls_name = "cloudflare-dns.com"
 path = "/dns-query"
-[[plans]]
+[[policies]]
 name = "default"
-upstreams = ["doq"]
+servers = ["doq"]
 "#,
     )
     .expect("file shape")
@@ -997,18 +1361,18 @@ fn routed_dot_accepts_only_a_literal_proxy_control_endpoint() {
     let literal = load_config_toml_str(
         r#"
 [dns]
-default_dns_plan = "secure"
+default = "secure"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "dot"
-transport = "tls"
-bootstrap = "1.1.1.1:853"
-server_name = "cloudflare-dns.com"
+protocol = "dot"
+address = "1.1.1.1:853"
+tls_name = "cloudflare-dns.com"
 outbound = "proxy"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "secure"
-upstreams = ["dot"]
+servers = ["dot"]
 security = "require-encrypted"
 
 [[inbounds]]
@@ -1035,18 +1399,18 @@ outbound = "proxy"
     let named = load_config_toml_str(
         r#"
 [dns]
-default_dns_plan = "secure"
+default = "secure"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "dot"
-transport = "tls"
-bootstrap = "1.1.1.1:853"
-server_name = "cloudflare-dns.com"
+protocol = "dot"
+address = "1.1.1.1:853"
+tls_name = "cloudflare-dns.com"
 outbound = "proxy"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "secure"
-upstreams = ["dot"]
+servers = ["dot"]
 security = "require-encrypted"
 
 [[inbounds]]
@@ -1077,17 +1441,17 @@ fn routed_dns_capabilities_do_not_overstate_udp_support() {
     let error = load_config_toml_str(
         r#"
 [dns]
-default_dns_plan = "plain"
+default = "plain"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "udp"
-transport = "udp"
-bootstrap = "1.1.1.1:53"
+protocol = "udp"
+address = "1.1.1.1:53"
 outbound = "proxy"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "plain"
-upstreams = ["udp"]
+servers = ["udp"]
 
 [[inbounds]]
 name = "local"
@@ -1118,19 +1482,19 @@ fn routed_doh_accepts_a_literal_mpp_carrier_inventory() {
     let config = load_config_toml_str(
         r#"
 [dns]
-default_dns_plan = "secure"
+default = "secure"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "doh"
-transport = "https"
-bootstrap = "1.1.1.1:443"
-server_name = "cloudflare-dns.com"
+protocol = "doh"
+address = "1.1.1.1:443"
+tls_name = "cloudflare-dns.com"
 path = "/dns-query"
 outbound = "edge"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "secure"
-upstreams = ["doh"]
+servers = ["doh"]
 security = "require-encrypted"
 
 [[inbounds]]
@@ -1140,12 +1504,12 @@ protocol = "socks5"
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 [[routing.rules]]
@@ -1162,16 +1526,15 @@ outbound = "edge"
 
 #[test]
 fn proxy_auth_file_debug_redacts_password() {
-    let auth = OutboundProxyAuthFileConfig {
-        username: Some("alice".to_string()),
-        password: Some(SecretMaterialReference::File {
-            path: "do-not-print-secret.key".into(),
-        }),
-    };
+    let auth: OutboundProxyAuthFileConfig = toml::from_str(
+        r#"username = "alice"
+password = { from = "raw", value = "do-not-print-secret" }"#,
+    )
+    .expect("proxy auth material source");
 
     let debug = format!("{auth:?}");
     assert!(debug.contains("alice"));
-    assert!(!debug.contains("proxy-password"));
+    assert!(!debug.contains("do-not-print-secret"));
 }
 
 #[test]
@@ -1198,12 +1561,12 @@ handshake_timeout_ms = 5000
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 [[routing.rules]]
@@ -1298,8 +1661,8 @@ outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
-tls_certificate_chain_file = "mptunnel-test-certificate.pem"
-tls_private_key_file = "mptunnel-test-private-key.pem"
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [inbounds.tun_l3]
 interface_name = "mptun-server"
@@ -1320,7 +1683,7 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [[outbounds]]
 name = "direct"
@@ -1370,7 +1733,7 @@ fn l4_forwarding_mode_rejects_client_and_server_tun_l3() {
 [inbounds.host]
 mode = "managed"
 route_mode = "full"
-dns_capture_servers = ["10.88.0.53"]
+dns_listeners = ["10.88.0.53"]
 "#;
     let client = format!(
         "{}\n{}",
@@ -1399,8 +1762,8 @@ outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
-tls_certificate_chain_file = "mptunnel-test-certificate.pem"
-tls_private_key_file = "mptunnel-test-private-key.pem"
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [inbounds.tun_l3]
 ipv4_pool = "10.89.0.0/24"
@@ -1463,8 +1826,8 @@ outbound = "direct"
 
 [inbounds.security]
 credential_ids = ["test-default"]
-tls_certificate_chain_file = "mptunnel-test-certificate.pem"
-tls_private_key_file = "mptunnel-test-private-key.pem"
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [inbounds.tun_l3]
 interface_name = "mptun0"
@@ -1483,7 +1846,7 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [[outbounds]]
 name = "direct"
@@ -1522,12 +1885,12 @@ protocol = "socks5"
 [[outbounds]]
 name = "mpp"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "udp://127.0.0.1:443" }]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "quic://127.0.0.1:443" }]
 
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 
@@ -1627,7 +1990,7 @@ protocol = "socks5"
 [[outbounds]]
 name = "mpp-main"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "udp://127.0.0.1:8443-8450" }]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "quic://127.0.0.1:8443-8450" }]
 
 [outbounds.performance]
 extra_traffic_hint_percent = 25
@@ -1635,7 +1998,7 @@ extra_traffic_hint_percent = 25
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 
@@ -1756,7 +2119,7 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 
@@ -1819,7 +2182,7 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 
@@ -1891,7 +2254,7 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-default"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 "#,
     )
     .expect_err("duplicate inbound name should fail");
@@ -1907,28 +2270,24 @@ fn node_config_toml_covers_forwarding_chaining_and_outbound_dns() {
     let config = load_config_toml_str(
         r#"
 [dns]
-generation = 3
-default_dns_plan = "egress"
+default = "egress"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "v4"
-transport = "udp-tcp"
-bootstrap = "1.1.1.1:53"
+protocol = "udp-tcp"
+address = "1.1.1.1:53"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "v6"
-transport = "udp-tcp"
-bootstrap = "[2606:4700:4700::1111]:53"
+protocol = "udp-tcp"
+address = "[2606:4700:4700::1111]:53"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "egress"
-upstreams = ["v4", "v6"]
-ip_strategy = "ipv4-and-ipv6"
-lookup_timeout_ms = 1500
-cache_capacity = 2048
-max_inflight = 32
-positive_ttl_cap_ms = 120000
-negative_ttl_cap_ms = 15000
+servers = ["v4", "v6"]
+family = "ipv4-and-ipv6"
+query = { timeout_ms = 1500, inflight = 32 }
+cache = { entries = 2048, positive_ttl_ms = 120000, negative_ttl_ms = 15000 }
 
 [[inbounds]]
 name = "local-http"
@@ -1938,14 +2297,14 @@ listen = ["127.0.0.1:8081"]
 [[inbounds]]
 name = "edge-mpp"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "tcp://0.0.0.0:8443" }, { name = "path-2", endpoint = "udp://0.0.0.0:8443" }]
+paths = [{ name = "path-1", endpoint = "tcp://0.0.0.0:8443" }, { name = "path-2", endpoint = "quic://0.0.0.0:8443" }]
 outbound = "proxy-egress"
-dns_plan = "egress"
+dns_policy = "egress"
 
 [inbounds.security]
 credential_ids = ["test-default"]
-tls_certificate_chain_file = "mptunnel-test-certificate.pem"
-tls_private_key_file = "mptunnel-test-private-key.pem"
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [inbounds.performance]
 extra_traffic_hint_percent = 200
@@ -1958,7 +2317,7 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-fed"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [[outbounds]]
 name = "proxy-egress"
@@ -2038,7 +2397,7 @@ name = "secure-proxy"
 protocol = "https-connect"
 endpoint = "127.0.0.1:4443"
 tls_server_name = "mptunnel.test"
-tls_ca_certificate_file = "mptunnel-test-certificate.pem"
+tls_ca_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [outbounds.auth]
 username = "alice"
@@ -2078,8 +2437,8 @@ outbound = "proxy"
 
 [inbounds.security]
 credential_ids = ["test-default"]
-tls_certificate_chain_file = "mptunnel-test-certificate.pem"
-tls_private_key_file = "mptunnel-test-private-key.pem"
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [[outbounds]]
 name = "proxy"
@@ -2112,8 +2471,8 @@ outbound = "direct-a"
 
 [inbounds.security]
 credential_ids = ["test-a"]
-tls_certificate_chain_file = "mptunnel-test-certificate.pem"
-tls_private_key_file = "mptunnel-test-private-key.pem"
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [[outbounds]]
 name = "mpp-a"
@@ -2123,17 +2482,17 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-b"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [[outbounds]]
 name = "mpp-b"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:443" }]
 
 [outbounds.security]
 credential_id = "test-c"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [[outbounds]]
 name = "direct-a"
@@ -2263,17 +2622,17 @@ paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 [outbounds.security]
 credential_id = "test-b"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [[outbounds]]
 name = "mpp-b"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:443" }]
 
 [outbounds.security]
 credential_id = "test-c"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 
@@ -2314,8 +2673,8 @@ balancer = "outer"
 
 [inbounds.security]
 credential_ids = ["test-a"]
-tls_certificate_chain_file = "mptunnel-test-certificate.pem"
-tls_private_key_file = "mptunnel-test-private-key.pem"
+tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" }
+tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [[outbounds]]
 name = "direct-a"
@@ -2358,20 +2717,20 @@ protocol = "http-connect"
 [[outbounds]]
 name = "edge-a"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 [outbounds.security]
 credential_id = "test-a"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [[outbounds]]
 name = "edge-b"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:8443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:8443" }]
 [outbounds.security]
 credential_id = "test-b"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 generation = 42
@@ -2502,17 +2861,17 @@ protocol = "socks5"
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }}]
+paths = [{{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }}]
 [outbounds.security]
 credential_id = "test-a"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = {{ from = "file", path = "mptunnel-test-certificate.pem" }}
 
 [routing]
 
 [[routing.rule_set_publishers]]
 publisher_id = "official"
-ed25519_public_key_base64 = "{public_key}"
+ed25519_public_key = {{ from = "base64", value = "{public_key}" }}
 
 [[routing.rule_sets]]
 rule_set_id = "geo-public"
@@ -2620,11 +2979,11 @@ protocol = "socks5"
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 [outbounds.security]
 credential_id = "test-a"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 [[routing.rules]]
@@ -2649,11 +3008,11 @@ protocol = "socks5"
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 [outbounds.security]
 credential_id = "test-a"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 [[routing.rules]]
@@ -2719,11 +3078,11 @@ protocol = "socks5"
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 [outbounds.security]
 credential_id = "test-a"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
 [[routing.rules]]

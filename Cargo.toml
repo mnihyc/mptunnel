@@ -1,6 +1,6 @@
 [package]
 name = "mptunnel"
-version = "0.2.7"
+version = "0.3.0"
 authors = ["mnihyc"]
 edition = "2024"
 description = "Encrypted multipath proxy and tunnel"
@@ -73,9 +73,11 @@ route_manager = "0.2.13"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.22.4"
+toml_edit = "0.22.27"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 jni = "0.22.4"
+toml_edit = "0.22.27"
 
 [dev-dependencies]
 rcgen = "0.14.8"

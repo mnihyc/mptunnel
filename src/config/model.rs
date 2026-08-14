@@ -201,7 +201,7 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
             && dns_policy.plan(plan).is_none()
         {
             return Err(ConfigError::DnsPolicy(format!(
-                "MPP inbound references missing DNS plan {}",
+                "MPP inbound references missing DNS policy {}",
                 plan.as_str()
             )));
         }
@@ -250,7 +250,7 @@ fn validate_fake_dns_tun_routes(
                 .any(|excluded| ip_nets_overlap(*excluded, pool))
             {
                 return Err(ConfigError::DnsPolicy(format!(
-                    "FakeDNS pool {pool} overlaps a managed VPN exclude"
+                    "DNS override pool {pool} overlaps a managed VPN exclude"
                 )));
             }
             if let crate::platform::RouteMode::Split(includes) = &managed.route_mode
@@ -259,7 +259,7 @@ fn validate_fake_dns_tun_routes(
                     .any(|included| ip_net_contains(*included, pool))
             {
                 return Err(ConfigError::DnsPolicy(format!(
-                    "managed split VPN does not capture FakeDNS pool {pool}"
+                    "managed split VPN does not capture DNS override pool {pool}"
                 )));
             }
         }
@@ -287,7 +287,7 @@ fn validate_product_policy_dns_plans(
             && dns_policy.plan(plan).is_none()
         {
             return Err(ConfigError::ProductPolicy(format!(
-                "route {} references missing DNS plan {}",
+                "route {} references missing DNS policy {}",
                 rule.id.as_str(),
                 plan.as_str()
             )));
@@ -726,8 +726,8 @@ impl DnsPolicyConfig {
     /// Managed full-VPN validation rejects this policy before publishing host
     /// routes, so the convenience default cannot become an implicit DNS leak.
     pub fn system_default() -> Self {
-        let upstream = DnsUpstreamId::parse("system").expect("static DNS upstream ID");
-        let plan = DnsPlanId::parse("default").expect("static DNS plan ID");
+        let upstream = DnsUpstreamId::parse("system").expect("static DNS server ID");
+        let plan = DnsPlanId::parse("default").expect("static DNS policy ID");
         Self {
             generation: 1,
             spec: DnsPolicySpec {
@@ -886,7 +886,7 @@ pub struct MppInboundConfig {
     pub name: String,
     /// Egress outbound or egress balancer selected for accepted MPP flows.
     pub egress: EgressRef,
-    /// Optional DNS plan for target resolution before native egress.
+    /// Optional DNS policy for target resolution before native egress.
     pub dns_plan: Option<crate::product::DnsPlanId>,
     /// Named carrier listen/bind paths owned by this MPP inbound.
     pub paths: Vec<NamedPathConfig>,
@@ -1093,9 +1093,9 @@ fn validate_mpp_inbound(
     if server
         .paths
         .iter()
-        .any(|path| !path.spec.endpoint.ports().is_single())
+        .any(|path| path.spec.metadata.max_datagram_payload_bytes.is_some())
     {
-        return Err(ConfigError::ServerPathPortRange);
+        return Err(ConfigError::ServerPathMaxDatagramPayload);
     }
     if server
         .paths
@@ -1103,6 +1103,20 @@ fn validate_mpp_inbound(
         .any(|path| path.spec.metadata.tcp_carriers.is_some())
     {
         return Err(ConfigError::ServerTcpCarrierRange);
+    }
+    if server
+        .paths
+        .iter()
+        .any(|path| path.spec.metadata.port_hop_interval_ms.is_some())
+    {
+        return Err(ConfigError::ServerPathPortRotation);
+    }
+    if server
+        .paths
+        .iter()
+        .any(|path| !path.spec.endpoint.ports().is_single())
+    {
+        return Err(ConfigError::ServerPathPortRange);
     }
     validate_server_security_config(&server.security)?;
     server
@@ -1257,6 +1271,8 @@ pub enum ConfigError {
     PathProbeTimeoutZero,
     QuicTlsServerNameRequiresDns,
     ServerPathSourceBinding,
+    ServerPathMaxDatagramPayload,
+    ServerPathPortRotation,
     ServerPathPortRange,
     ServerTcpCarrierRange,
     TunAddressRequired,
@@ -1502,15 +1518,23 @@ impl std::fmt::Display for ConfigError {
                 "QUIC paths require a DNS TLS server name because HTTP/3 authority is bound to SNI; carrier endpoints may still use IP addresses"
             ),
             Self::ServerPathSourceBinding => {
-                write!(f, "source-ip is valid only for client carrier paths")
+                write!(f, "source-address is valid only for client carrier paths")
             }
+            Self::ServerPathMaxDatagramPayload => write!(
+                f,
+                "max-datagram-payload-bytes is valid only for client QUIC carrier paths"
+            ),
+            Self::ServerPathPortRotation => write!(
+                f,
+                "port-rotation-interval-ms is valid only for client carrier paths"
+            ),
             Self::ServerPathPortRange => write!(
                 f,
                 "server carrier paths require one listener port; forward any advertised port range to that listener"
             ),
             Self::ServerTcpCarrierRange => write!(
                 f,
-                "tcp-carriers is client endpoint policy and cannot configure a server listener"
+                "max-tcp-carriers is client endpoint policy and cannot configure a server listener"
             ),
             Self::TunAddressRequired => write!(f, "TUN L4 ingress requires IPv4 or IPv6 address"),
             Self::TunIpv4PrefixInvalid => write!(f, "TUN IPv4 prefix must be in 0..=32"),
@@ -1518,7 +1542,7 @@ impl std::fmt::Display for ConfigError {
             Self::TunMtuTooSmall => write!(f, "TUN MTU must be at least 576 bytes"),
             Self::TunIpv6MtuTooSmall => write!(f, "TUN IPv6 MTU must be at least 1280 bytes"),
             Self::TunDnsTtlZero => write!(f, "TUN DNS TTL must be greater than zero"),
-            Self::TunDnsResolverPortZero => write!(f, "TUN DNS resolver port must be nonzero"),
+            Self::TunDnsResolverPortZero => write!(f, "TUN DNS redirect port must be nonzero"),
             Self::ManagedVpn(error) => {
                 write!(f, "invalid managed VPN configuration: {error}")
             }

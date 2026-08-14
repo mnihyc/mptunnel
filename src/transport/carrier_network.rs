@@ -458,7 +458,7 @@ fn validated_source_ip(
     if source_ip.is_ipv4() != remote_addr.is_ipv4() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "source-ip and resolved remote address use different IP families",
+            "source-address and resolved remote address use different IP families",
         ));
     }
     Ok(Some(source_ip))

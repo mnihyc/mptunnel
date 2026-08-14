@@ -136,7 +136,7 @@ async fn queued_path_proof_keeps_identity_until_generation_changes() {
 #[tokio::test]
 async fn duplicate_attachment_releases_pending_stream_and_load() {
     let stream_id = StreamId(94);
-    let context = context(&["udp://127.0.0.1:11094"]);
+    let context = context(&["quic://127.0.0.1:11094"]);
     let (first, _first_receivers, _first_frames) =
         opened_stream(stream_id, UnderlayProtocol::Udp, 0);
     let mut remotes = ReliableRelayRemoteSet::new(first, 4);
@@ -506,9 +506,9 @@ fn inflight_open_claim_remains_excluded_from_last_resort_recovery() {
 #[tokio::test]
 async fn additional_paths_are_ranked_by_metrics_across_carriers() {
     let context = context(&[
-        "udp://127.0.0.1:10179?srtt-ms=100&rate-mbps=20",
-        "tcp://127.0.0.1:10180?srtt-ms=10&rate-mbps=500",
-        "udp://127.0.0.1:10181?srtt-ms=20&rate-mbps=200",
+        "quic://127.0.0.1:10179?initial-srtt-ms=100&initial-rate-mbps=20",
+        "tcp://127.0.0.1:10180?initial-srtt-ms=10&initial-rate-mbps=500",
+        "quic://127.0.0.1:10181?initial-srtt-ms=20&initial-rate-mbps=200",
     ]);
     let (slow, _receivers, _frames) = opened_stream(StreamId(160), UnderlayProtocol::Udp, 0);
     let remotes = ReliableRelayRemoteSet::new(slow, 4);
@@ -532,9 +532,9 @@ async fn additional_paths_are_ranked_by_metrics_across_carriers() {
 #[tokio::test]
 async fn available_path_precedes_faster_locally_configured_backup() {
     let context = context(&[
-        "tcp://127.0.0.1:10182?srtt-ms=80&rate-mbps=100",
-        "tcp://127.0.0.1:10183?srtt-ms=5&rate-mbps=1000&backup=true",
-        "udp://127.0.0.1:10184?srtt-ms=100&rate-mbps=20",
+        "tcp://127.0.0.1:10182?initial-srtt-ms=80&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10183?initial-srtt-ms=5&initial-rate-mbps=1000&backup=true",
+        "quic://127.0.0.1:10184?initial-srtt-ms=100&initial-rate-mbps=20",
     ]);
     let (attached, _receivers, _frames) = opened_stream(StreamId(161), UnderlayProtocol::Udp, 0);
     let remotes = ReliableRelayRemoteSet::new(attached, 4);
@@ -557,8 +557,8 @@ async fn available_path_precedes_faster_locally_configured_backup() {
 #[tokio::test]
 async fn reinjection_candidate_uses_distinct_metric_ranked_carrier() {
     let context = context(&[
-        "tcp://127.0.0.1:11168?srtt-ms=20&rate-mbps=500",
-        "udp://127.0.0.1:11169?srtt-ms=180&rate-mbps=40",
+        "tcp://127.0.0.1:11168?initial-srtt-ms=20&initial-rate-mbps=500",
+        "quic://127.0.0.1:11169?initial-srtt-ms=180&initial-rate-mbps=40",
     ]);
     let (slow, _receivers, _frames) = opened_stream(StreamId(151), UnderlayProtocol::Udp, 0);
     let remotes = ReliableRelayRemoteSet::new(slow, 4);

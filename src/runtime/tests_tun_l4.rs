@@ -15,7 +15,7 @@ use std::net::IpAddr;
 
 fn context() -> ClientPathContext {
     ClientPathContext::new(
-        vec!["udp://127.0.0.1:7443".parse().expect("path")],
+        vec!["quic://127.0.0.1:7443".parse().expect("path")],
         ClientSecurityConfig::for_test(
             SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
         ),

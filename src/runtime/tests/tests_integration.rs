@@ -636,11 +636,14 @@ impl RangedTcpCarrierServer {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id() {
-    let tcp_path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=100&tcp-carriers=1-1").await;
+    let tcp_path =
+        reserve_tcp_path_with_query("initial-srtt-ms=20&initial-rate-mbps=100&max-tcp-carriers=1")
+            .await;
     let udp_port = reserve_process_unique_udp_port().await;
-    let udp_path = format!("udp://127.0.0.1:{udp_port}?srtt-ms=90&rate-mbps=400&backup=true")
-        .parse::<PathSpec>()
-        .expect("UDP backup path");
+    let udp_path =
+        format!("quic://127.0.0.1:{udp_port}?initial-srtt-ms=90&initial-rate-mbps=400&backup=true")
+            .parse::<PathSpec>()
+            .expect("UDP backup path");
     let server = tokio::spawn(run_server(
         vec![tcp_path.clone(), udp_path.clone()],
         OutboundConfig::Direct,
@@ -710,7 +713,7 @@ async fn session_owner_reconciles_bounded_target_and_retires_disabled_group() {
         Abort(usize),
     }
 
-    let path = reserve_tcp_path_with_query("tcp-carriers=2-3").await;
+    let path = reserve_tcp_path_with_query("max-tcp-carriers=3").await;
     let listener = bind_listener(&path).await.expect("bind carrier listener");
     let local_path = ServerLocalPath::new(0, path.clone());
     let ServerIdentityRuntime {
@@ -1019,7 +1022,7 @@ async fn session_owner_reconciles_bounded_target_and_retires_disabled_group() {
 async fn fenced_tcp_data_plane_instance_is_replaced_by_pool_reconciliation() {
     let carrier_server = RangedTcpCarrierServer::spawn().await;
     let client_path = format!(
-        "tcp://127.0.0.1:{}?tcp-carriers=1-1",
+        "tcp://127.0.0.1:{}?max-tcp-carriers=1",
         carrier_server.first_port
     )
     .parse::<PathSpec>()
@@ -1094,7 +1097,7 @@ async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescen
     let first_port = carrier_server.first_port;
     let second_port = first_port + 1;
     let client_path = format!(
-        "tcp://127.0.0.1:{first_port}-{second_port}?tcp-carriers=1-3&port-hop-interval-ms=5000"
+        "tcp://127.0.0.1:{first_port}-{second_port}?max-tcp-carriers=3&port-rotation-interval-ms=5000"
     )
     .parse::<PathSpec>()
     .expect("ranged client TCP path");
@@ -1324,7 +1327,7 @@ async fn ranged_tcp_maximum_one_reconnects_only_after_product_quiescence() {
     let first_port = carrier_server.first_port;
     let second_port = first_port + 1;
     let client_path = format!(
-        "tcp://127.0.0.1:{first_port}-{second_port}?tcp-carriers=1-1&port-hop-interval-ms=5000"
+        "tcp://127.0.0.1:{first_port}-{second_port}?max-tcp-carriers=1&port-rotation-interval-ms=5000"
     )
     .parse::<PathSpec>()
     .expect("maximum-one ranged client TCP path");
@@ -1883,9 +1886,11 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     });
 
     let low_latency_path =
-        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=20&tcp-carriers=1-1").await;
+        reserve_tcp_path_with_query("initial-srtt-ms=10&initial-rate-mbps=20&max-tcp-carriers=1")
+            .await;
     let high_bandwidth_path =
-        reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=300&tcp-carriers=1-1").await;
+        reserve_tcp_path_with_query("initial-srtt-ms=120&initial-rate-mbps=300&max-tcp-carriers=1")
+            .await;
     let low_latency_listener = bind_listener(&low_latency_path)
         .await
         .expect("low-latency bind");
@@ -2244,9 +2249,11 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
         stream.shutdown().await.expect("target shutdown");
     });
 
-    let tcp_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=100&tcp-carriers=1-1").await;
+    let tcp_path =
+        reserve_tcp_path_with_query("initial-srtt-ms=10&initial-rate-mbps=100&max-tcp-carriers=1")
+            .await;
     let udp_port = reserve_process_unique_udp_port().await;
-    let udp_path = format!("udp://127.0.0.1:{udp_port}?srtt-ms=120&rate-mbps=100")
+    let udp_path = format!("quic://127.0.0.1:{udp_port}?initial-srtt-ms=120&initial-rate-mbps=100")
         .parse::<PathSpec>()
         .expect("QUIC recovery path");
     let tcp_listener = bind_listener(&tcp_path).await.expect("TCP path bind");
@@ -2499,10 +2506,13 @@ fn tcp_path_activity_does_not_extend_pending_heartbeat_deadline() {
 #[tokio::test]
 async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     let (target_addr, target) = spawn_echo_target().await;
-    let high_latency_path =
-        reserve_tcp_path_with_query("srtt-ms=200&rate-mbps=1000&tcp-carriers=1-1").await;
+    let high_latency_path = reserve_tcp_path_with_query(
+        "initial-srtt-ms=200&initial-rate-mbps=1000&max-tcp-carriers=1",
+    )
+    .await;
     let low_latency_path =
-        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=50&tcp-carriers=1-1").await;
+        reserve_tcp_path_with_query("initial-srtt-ms=10&initial-rate-mbps=50&max-tcp-carriers=1")
+            .await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let high_latency_server = spawn_notified_server_path(
         high_latency_path.clone(),
@@ -2605,11 +2615,12 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
 async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let (target_addr, target) = spawn_echo_target().await;
     let no_bulk_low_latency_path = reserve_tcp_path_with_query(
-        "srtt-ms=10&rate-mbps=1000&bulk-allowed=false&tcp-carriers=1-1",
+        "initial-srtt-ms=10&initial-rate-mbps=1000&allow-bulk=false&max-tcp-carriers=1",
     )
     .await;
     let bulk_allowed_path =
-        reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=100&tcp-carriers=1-1").await;
+        reserve_tcp_path_with_query("initial-srtt-ms=120&initial-rate-mbps=100&max-tcp-carriers=1")
+            .await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let low_latency_server = spawn_notified_server_path(
         no_bulk_low_latency_path.clone(),

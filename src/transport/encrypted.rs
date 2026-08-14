@@ -72,13 +72,13 @@ pub(crate) const fn carrier_security_description(
     shared_transport_secret: bool,
 ) -> &'static str {
     match (underlay, shared_transport_secret) {
-        (UnderlayProtocol::Tcp, true) => "TCP with Noise (transport_secret_file configured)",
-        (UnderlayProtocol::Tcp, false) => "TCP with TLS 1.3 (transport_secret_file not configured)",
+        (UnderlayProtocol::Tcp, true) => "TCP with Noise (transport_secret configured)",
+        (UnderlayProtocol::Tcp, false) => "TCP with TLS 1.3 (transport_secret not configured)",
         (UnderlayProtocol::Udp, true) => {
-            "QUIC with TLS 1.3 and private Initial keys (transport_secret_file configured)"
+            "QUIC with TLS 1.3 and private Initial keys (transport_secret configured)"
         }
         (UnderlayProtocol::Udp, false) => {
-            "QUIC with TLS 1.3 and standard public Initial keys (transport_secret_file not configured)"
+            "QUIC with TLS 1.3 and standard public Initial keys (transport_secret not configured)"
         }
     }
 }

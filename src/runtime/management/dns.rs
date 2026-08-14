@@ -8,17 +8,17 @@ use super::http::ManagementHttpError;
 use crate::dns::{
     DnsPlanRuntimeSnapshot, DnsRuntimeError, DnsUpstreamDescriptor, DnsUpstreamRuntimeSnapshot,
 };
-use crate::product::{DnsEgressSpec, DnsPlanId, DnsUpstreamStrategy, DomainName};
+use crate::product::{DnsEgressSpec, DnsPlanId, DnsTransport, DnsUpstreamStrategy, DomainName};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{Record, RecordType};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
-const DNS_STATUS_SCHEMA: &str = "mptunnel.dns.status.v2";
-const DNS_EXPLAIN_SCHEMA: &str = "mptunnel.dns.explain.v2";
-const DNS_QUERY_SCHEMA: &str = "mptunnel.dns.query.v2";
-const DNS_FLUSH_SCHEMA: &str = "mptunnel.dns.flush.v2";
+const DNS_STATUS_SCHEMA: &str = "mptunnel.dns.status.v3";
+const DNS_EXPLAIN_SCHEMA: &str = "mptunnel.dns.explain.v3";
+const DNS_QUERY_SCHEMA: &str = "mptunnel.dns.query.v3";
+const DNS_FLUSH_SCHEMA: &str = "mptunnel.dns.flush.v3";
 
 impl ManagementTarget {
     pub(super) fn dns_status_json(&self) -> Result<Value, ManagementHttpError> {
@@ -27,8 +27,8 @@ impl ManagementTarget {
         Ok(json!({
             "schema": DNS_STATUS_SCHEMA,
             "generation": snapshot.generation,
-            "host_overrides": snapshot.host_overrides,
-            "fake_dns": snapshot.fake_dns.map(|fake| json!({
+            "records": snapshot.host_overrides,
+            "override": snapshot.fake_dns.map(|fake| json!({
                 "ipv4_pool": fake.ipv4_pool.map(|pool| pool.to_string()),
                 "ipv6_pool": fake.ipv6_pool.map(|pool| pool.to_string()),
                 "max_entries": fake.max_entries,
@@ -40,11 +40,11 @@ impl ManagementTarget {
                 "unknown_recoveries": fake.unknown_recoveries.to_string(),
                 "capacity_failures": fake.capacity_failures.to_string(),
             })),
-            "plans": snapshot.plans.into_iter().map(plan_status_json).collect::<Vec<_>>(),
+            "policies": snapshot.plans.into_iter().map(policy_status_json).collect::<Vec<_>>(),
             "operations": {
-                "explain": "GET /api/v2/dns/explain?domain=<domain>",
-                "query": "POST /api/v2/dns/query",
-                "flush": "POST /api/v2/dns/cache/flush"
+                "explain": "GET /api/v3/dns/explain?domain=<domain>",
+                "query": "POST /api/v3/dns/query",
+                "flush": "POST /api/v3/dns/cache/flush"
             }
         }))
     }
@@ -57,24 +57,25 @@ impl ManagementTarget {
             "schema": DNS_EXPLAIN_SCHEMA,
             "generation": explanation.generation,
             "domain": explanation.domain.as_str(),
-            "dns_plan": explanation.plan.as_str(),
+            "policy": explanation.plan.as_str(),
             "rule": explanation.rule.as_ref().map(|rule| rule.as_str()),
             "match": format!("{:?}", explanation.match_kind).to_ascii_lowercase(),
             "matched_domain": explanation.matched_domain.as_ref().map(DomainName::as_str),
             "explanation": explanation.explanation.as_deref(),
-            "host_addresses": explanation.host_addresses.as_deref().map(|addresses| {
+            "record_addresses": explanation.host_addresses.as_deref().map(|addresses| {
                 addresses.iter().map(ToString::to_string).collect::<Vec<_>>()
             }),
-            "fake_dns": explanation.fake_dns.map(|fake| json!({
+            "override": explanation.fake_dns.map(|fake| json!({
                 "ipv4_pool": fake.ipv4_pool.map(|pool| pool.to_string()),
                 "ipv6_pool": fake.ipv6_pool.map(|pool| pool.to_string()),
                 "answer_ttl_ms": fake.answer_ttl.as_millis().min(u64::MAX as u128) as u64,
                 "recovery_ttl_ms": fake.recovery_ttl.as_millis().min(u64::MAX as u128) as u64,
                 "capture_only": true,
             })),
-            "upstream_strategy": upstream_strategy_json(explanation.upstream_strategy),
-            "expected_cidrs": explanation.expected_cidrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "upstreams": explanation.upstreams.iter().map(upstream_descriptor_json).collect::<Vec<_>>(),
+            "strategy": server_strategy_name(explanation.upstream_strategy),
+            "fallback_ms": server_fallback_ms(explanation.upstream_strategy),
+            "answer_cidrs": explanation.expected_cidrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "servers": explanation.upstreams.iter().map(server_descriptor_json).collect::<Vec<_>>(),
         }))
     }
 
@@ -106,7 +107,7 @@ impl ManagementTarget {
             "generation": resolution.metadata().generation(),
             "domain": domain.as_str(),
             "type": record_type.to_string(),
-            "dns_plan": resolution.metadata().plan().as_str(),
+            "policy": resolution.metadata().plan().as_str(),
             "rule": resolution.metadata().rule().map(|rule| rule.as_str()),
             "match": format!("{:?}", resolution.metadata().match_kind()).to_ascii_lowercase(),
             "stale": resolution.is_stale(),
@@ -125,19 +126,19 @@ impl ManagementTarget {
         let request = serde_json::from_slice::<DnsFlushRequest>(body).map_err(|_| {
             ManagementHttpError::new(400, "Bad Request", "invalid DNS cache-flush JSON body")
         })?;
-        let plan = request
-            .dns_plan
+        let policy = request
+            .policy
             .as_deref()
             .map(DnsPlanId::parse)
             .transpose()
-            .map_err(|_| ManagementHttpError::new(400, "Bad Request", "invalid DNS plan name"))?;
+            .map_err(|_| ManagementHttpError::new(400, "Bad Request", "invalid DNS policy name"))?;
         let flushed = dns
-            .flush_cache(plan.as_ref())
+            .flush_cache(policy.as_ref())
             .map_err(map_dns_runtime_error)?;
         Ok(json!({
             "schema": DNS_FLUSH_SCHEMA,
             "generation": flushed.generation,
-            "flushed_dns_plan_count": flushed.plans,
+            "flushed_policies": flushed.plans,
             "removed_entries": flushed.removed_entries,
         }))
     }
@@ -155,7 +156,7 @@ struct DnsQueryRequest {
 #[serde(deny_unknown_fields)]
 struct DnsFlushRequest {
     #[serde(default)]
-    dns_plan: Option<String>,
+    policy: Option<String>,
 }
 
 fn parse_domain(value: &str) -> Result<DomainName, ManagementHttpError> {
@@ -163,11 +164,12 @@ fn parse_domain(value: &str) -> Result<DomainName, ManagementHttpError> {
         .map_err(|error| ManagementHttpError::new(400, "Bad Request", error.to_string()))
 }
 
-fn plan_status_json(plan: DnsPlanRuntimeSnapshot) -> Value {
+fn policy_status_json(plan: DnsPlanRuntimeSnapshot) -> Value {
     json!({
         "name": plan.plan.as_str(),
-        "upstream_strategy": upstream_strategy_json(plan.upstream_strategy),
-        "expected_cidrs": plan.expected_cidrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "strategy": server_strategy_name(plan.upstream_strategy),
+        "fallback_ms": server_fallback_ms(plan.upstream_strategy),
+        "answer_cidrs": plan.expected_cidrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "cache": {
             "entries": plan.cache_entries,
             "fresh": plan.fresh_cache_entries,
@@ -182,19 +184,19 @@ fn plan_status_json(plan: DnsPlanRuntimeSnapshot) -> Value {
         "coalesced_queries": plan.coalesced_queries.to_string(),
         "refreshes_started": plan.refreshes_started.to_string(),
         "stale_answers": plan.stale_answers.to_string(),
-        "host_answers": plan.host_answers.to_string(),
-        "upstreams": plan.upstreams.into_iter().map(upstream_status_json).collect::<Vec<_>>(),
+        "record_answers": plan.host_answers.to_string(),
+        "servers": plan.upstreams.into_iter().map(server_status_json).collect::<Vec<_>>(),
     })
 }
 
-fn upstream_status_json(upstream: DnsUpstreamRuntimeSnapshot) -> Value {
+fn server_status_json(upstream: DnsUpstreamRuntimeSnapshot) -> Value {
     let average_latency_micros =
         (upstream.successes > 0).then(|| upstream.total_latency_micros / upstream.successes);
     json!({
         "name": upstream.upstream.as_str(),
-        "transport": format!("{:?}", upstream.transport).to_ascii_lowercase(),
-        "bootstrap": upstream.bootstrap.map(|address| address.to_string()),
-        "egress": egress_json(&upstream.egress),
+        "protocol": dns_protocol_name(upstream.transport),
+        "address": upstream.bootstrap.map(|address| address.to_string()),
+        "outbound": outbound_name(&upstream.egress),
         "attempts": upstream.attempts.to_string(),
         "successes": upstream.successes.to_string(),
         "negative_answers": upstream.negative_answers.to_string(),
@@ -207,31 +209,47 @@ fn upstream_status_json(upstream: DnsUpstreamRuntimeSnapshot) -> Value {
     })
 }
 
-fn upstream_descriptor_json(upstream: &DnsUpstreamDescriptor) -> Value {
+fn server_descriptor_json(upstream: &DnsUpstreamDescriptor) -> Value {
     json!({
         "name": upstream.upstream.as_str(),
-        "transport": format!("{:?}", upstream.transport).to_ascii_lowercase(),
-        "bootstrap": upstream.bootstrap.map(|address| address.to_string()),
-        "egress": egress_json(&upstream.egress),
+        "protocol": dns_protocol_name(upstream.transport),
+        "address": upstream.bootstrap.map(|address| address.to_string()),
+        "outbound": outbound_name(&upstream.egress),
     })
 }
 
-fn upstream_strategy_json(strategy: DnsUpstreamStrategy) -> Value {
+const fn server_strategy_name(strategy: DnsUpstreamStrategy) -> &'static str {
     match strategy {
-        DnsUpstreamStrategy::Ordered => json!({"kind": "ordered"}),
-        DnsUpstreamStrategy::Race { fallback_delay } => json!({
-            "kind": "race",
-            "fallback_delay_ms": fallback_delay.as_millis().min(u64::MAX as u128) as u64,
-        }),
+        DnsUpstreamStrategy::Ordered => "ordered",
+        DnsUpstreamStrategy::Race { .. } => "race",
     }
 }
 
-fn egress_json(egress: &DnsEgressSpec) -> Value {
-    match egress {
-        DnsEgressSpec::Direct => json!({"kind": "direct"}),
-        DnsEgressSpec::Outbound(outbound) => {
-            json!({"kind": "outbound", "outbound": outbound.as_str()})
+fn server_fallback_ms(strategy: DnsUpstreamStrategy) -> Option<u64> {
+    match strategy {
+        DnsUpstreamStrategy::Ordered => None,
+        DnsUpstreamStrategy::Race { fallback_delay } => {
+            Some(fallback_delay.as_millis().min(u64::MAX as u128) as u64)
         }
+    }
+}
+
+const fn dns_protocol_name(protocol: DnsTransport) -> &'static str {
+    match protocol {
+        DnsTransport::System => "system",
+        DnsTransport::Udp => "udp",
+        DnsTransport::Tcp => "tcp",
+        DnsTransport::UdpTcp => "udp-tcp",
+        DnsTransport::Tls => "dot",
+        DnsTransport::Https => "doh",
+        DnsTransport::Quic => "doq",
+    }
+}
+
+fn outbound_name(egress: &DnsEgressSpec) -> Option<&str> {
+    match egress {
+        DnsEgressSpec::Direct => None,
+        DnsEgressSpec::Outbound(outbound) => Some(outbound.as_str()),
     }
 }
 

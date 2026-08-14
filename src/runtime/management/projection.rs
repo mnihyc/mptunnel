@@ -155,7 +155,7 @@ pub(super) fn collect_snapshot(
     let controls = ManagementControls {
         path: ManagementControlStatus {
             supported: services.mpp_outbounds > 0,
-            operation: (services.mpp_outbounds > 0).then_some("POST /api/v2/actions/path"),
+            operation: (services.mpp_outbounds > 0).then_some("POST /api/v3/actions/path"),
             reason: (services.mpp_outbounds == 0)
                 .then_some("path control requires a local inbound service with an MPP outbound"),
         },
@@ -164,7 +164,7 @@ pub(super) fn collect_snapshot(
             operation: target
                 .gateway_control
                 .is_some()
-                .then_some("POST /api/v2/balancers/actions"),
+                .then_some("POST /api/v3/balancers/actions"),
             reason: target
                 .gateway_control
                 .is_none()
@@ -172,7 +172,7 @@ pub(super) fn collect_snapshot(
         },
         peer_diagnostics: ManagementControlStatus {
             supported: !peer_sessions.is_empty(),
-            operation: (!peer_sessions.is_empty()).then_some("POST /api/v2/diagnostics/peer"),
+            operation: (!peer_sessions.is_empty()).then_some("POST /api/v3/diagnostics/peer"),
             reason: peer_sessions
                 .is_empty()
                 .then_some("no authenticated peer control carrier is currently available"),
@@ -639,7 +639,7 @@ fn client_path_status(
         tcp_carrier_ordinal: tcp_context
             .and_then(|context| context.tcp_member_ordinal(index))
             .map(|ordinal| ordinal.saturating_add(1)),
-        tcp_carriers_max: tcp_endpoint.map(|endpoint| endpoint.range.max()),
+        max_tcp_carriers: tcp_endpoint.map(|endpoint| endpoint.range.max()),
         path_id: Some(snapshot.id.0.to_string()),
         path_instance_id: record
             .path_instance_id()
@@ -711,7 +711,7 @@ fn collect_server(
             path,
             underlay: underlay_name(spec.underlay),
             tcp_carrier_ordinal: None,
-            tcp_carriers_max: None,
+            max_tcp_carriers: None,
             path_id: None,
             path_instance_id: None,
             endpoint: Some(path_endpoint(spec)),
@@ -780,7 +780,7 @@ fn collect_server(
             path: configured_path,
             underlay: underlay_name(path.underlay),
             tcp_carrier_ordinal: None,
-            tcp_carriers_max: None,
+            max_tcp_carriers: None,
             path_id: Some(path.path_id.0.to_string()),
             path_instance_id: Some(path.path_instance_id.as_u64().to_string()),
             endpoint: None,

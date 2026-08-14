@@ -1,7 +1,7 @@
 # Generate one random credential into ./mpp-credential.key and transfer that
 # file securely to both endpoints. Keep it outside source control.
 #
-# Linux/macOS: umask 077; openssl rand -hex 32 > mpp-credential.key
+# Linux/macOS: umask 077; openssl rand -out mpp-credential.key 32
 # PowerShell:   (New-Guid).Guid | Set-Content -NoNewline mpp-credential.key
 # Transport protection uses a different raw 32-byte file shared by the two
 # endpoints: umask 077; openssl rand -out mpp-transport.key 32
@@ -23,15 +23,15 @@ secret = { from = "file", path = "mpp-credential.key" }
 retention_timeout_ms = 300000
 
 [dns]
-default_dns_plan = "system"
+default = "system"
 
-[[dns.upstreams]]
+[[dns.servers]]
 name = "system"
-transport = "system"
+protocol = "system"
 
-[[dns.plans]]
+[[dns.policies]]
 name = "system"
-upstreams = ["system"]
+servers = ["system"]
 
 # The management API is optional, loopback-only, and requires a separate random
 # operator token when enabled.
@@ -60,16 +60,18 @@ protocol = "mpp"
 # TCP and QUIC/UDP remain separate carriers under one MPP data-level session.
 paths = [
   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
-  { name = "path-2", endpoint = "udp://server.example.com:7443" },
+  { name = "path-2", endpoint = "quic://server.example.com:7443" },
 ]
 
 [outbounds.security]
 credential_id = "home-client"
 # The pinned certificate uses mptunnel.example unless this is overridden.
 # tls_server_name = "mptunnel.example"
-tls_pinned_certificate_file = "server-cert.pem"
+tls_pinned_certificate = { from = "file", path = "server-cert.pem" }
 # This endpoint-wide secret is not the MPP client credential above.
-transport_secret_file = "mpp-transport.key"
+transport_secret = { from = "file", path = "mpp-transport.key" }
+# Direct-paste alternative (`openssl rand -hex 32`); use the same value on both peers:
+# transport_secret = { from = "hex", value = "REPLACE_WITH_64_HEX_DIGITS" }
 
 [routing]
 

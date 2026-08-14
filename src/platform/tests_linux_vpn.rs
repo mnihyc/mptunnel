@@ -424,14 +424,14 @@ fn compiler_matches_combined_runtime_ordinals_and_collects_all_native_proxies() 
             "first-mpp",
             [
                 "tcp://carrier-a.example:443".parse().expect("TCP path"),
-                "udp://carrier-b.example:443".parse().expect("QUIC path"),
+                "quic://carrier-b.example:443".parse().expect("QUIC path"),
             ],
         ),
         proxy_leaf("socks", proxy_a.clone()),
         local_leaf("https", OutboundConfig::HttpsConnect(Box::new(https))),
         mpp_leaf(
             "second-mpp",
-            ["udp://carrier-c.example:8443"
+            ["quic://carrier-c.example:8443"
                 .parse()
                 .expect("second QUIC path")],
         ),
@@ -525,7 +525,7 @@ fn compiler_rejects_impossible_mpp_inventory_before_resolution() {
 
     node.outbounds = vec![mpp_leaf(
         "invalid",
-        ["udp://carrier.example:443".parse().expect("path")],
+        ["quic://carrier.example:443".parse().expect("path")],
     )];
     let OutboundLeafConfig::Mpp { config, .. } = &mut node.outbounds[0] else {
         panic!("MPP");
@@ -543,7 +543,7 @@ fn compiler_rejects_impossible_mpp_inventory_before_resolution() {
 
 #[test]
 fn compiler_enforces_generation_inventory_bounds() {
-    let path = "udp://carrier.example:443"
+    let path = "quic://carrier.example:443"
         .parse::<PathSpec>()
         .expect("path");
     let node = node_with_vpn(vec![mpp_leaf(
@@ -667,7 +667,7 @@ async fn prepublication_resolution_uses_injected_dns_and_literal_fast_path() {
             group_ordinal: 2,
             path_ordinal: 3,
         },
-        path: "udp://carrier.example:443".parse().expect("carrier path"),
+        path: "quic://carrier.example:443".parse().expect("carrier path"),
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 

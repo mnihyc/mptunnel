@@ -68,7 +68,7 @@ fn seed_native_packet_evidence(
 
 #[test]
 fn authenticated_output_uses_startup_prior_before_exact_measurement() {
-    let path = "udp://127.0.0.1:12700"
+    let path = "quic://127.0.0.1:12700"
         .parse::<PathSpec>()
         .expect("test UDP path");
     let security = ClientSecurityConfig::for_test(
@@ -109,7 +109,7 @@ fn authenticated_output_uses_startup_prior_before_exact_measurement() {
 
 #[test]
 fn packet_candidates_require_the_current_instance_and_do_not_consume_product_state() {
-    let context = packet_path_context(&["udp://127.0.0.1:12720?rate-mbps=80"]);
+    let context = packet_path_context(&["quic://127.0.0.1:12720?initial-rate-mbps=80"]);
     let key = RelayPathKey {
         underlay: UnderlayProtocol::Udp,
         index: 0,
@@ -176,10 +176,10 @@ fn packet_candidates_require_the_current_instance_and_do_not_consume_product_sta
 #[test]
 fn packet_candidates_use_native_evidence_with_regular_before_backup() {
     let context = packet_path_context(&[
-        "udp://127.0.0.1:12730",
-        "udp://127.0.0.1:12731",
-        "udp://127.0.0.1:12732?backup=true",
-        "udp://127.0.0.1:12733?probe-only=true",
+        "quic://127.0.0.1:12730",
+        "quic://127.0.0.1:12731",
+        "quic://127.0.0.1:12732?backup=true",
+        "quic://127.0.0.1:12733?control-only=true",
     ]);
     let attachments = (0..4)
         .map(|index| {
@@ -210,7 +210,7 @@ fn packet_candidates_use_native_evidence_with_regular_before_backup() {
     assert_eq!(
         candidates.len(),
         3,
-        "probe-only paths are not packet outputs"
+        "control-only paths are not packet outputs"
     );
     assert_eq!(candidates[0].attachment, attachments[1]);
     assert_eq!(candidates[1].attachment, attachments[0]);
@@ -226,8 +226,8 @@ fn packet_candidates_use_native_evidence_with_regular_before_backup() {
 #[test]
 fn packet_candidates_balance_equal_paths_with_packet_plane_load() {
     let context = packet_path_context(&[
-        "udp://127.0.0.1:12740?rate-mbps=500",
-        "udp://127.0.0.1:12741?rate-mbps=500",
+        "quic://127.0.0.1:12740?initial-rate-mbps=500",
+        "quic://127.0.0.1:12741?initial-rate-mbps=500",
     ]);
     let attachments = (0..2)
         .map(|index| {

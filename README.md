@@ -176,7 +176,7 @@ one shared transport key, and a separate TLS identity:
 
 ```bash
 umask 077
-openssl rand -hex 32 > mpp-credential.key
+openssl rand -out mpp-credential.key 32
 openssl rand -out mpp-transport.key 32
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -subj "/CN=mptunnel.example" \
@@ -196,7 +196,7 @@ mptunnel --credential-secret-file ./mpp-credential.key \
   --tls-certificate-chain ./server-cert.pem \
   --tls-private-key ./server-key.pem \
   --bind-path tcp://0.0.0.0:7443 \
-  --bind-path udp://0.0.0.0:7443 \
+  --bind-path quic://0.0.0.0:7443 \
   --outbound-protocol direct
 ```
 
@@ -210,7 +210,7 @@ mptunnel --credential-secret-file ./mpp-credential.key \
   --socks5-listen 127.0.0.1:1080 \
   --http-listen 127.0.0.1:8080 \
   --path tcp://server.example.com:7443 \
-  --path udp://server.example.com:7443
+  --path quic://server.example.com:7443
 ```
 
 The shared transport key replaces the TCP TLS handshake with PSK-gated Noise
@@ -236,10 +236,25 @@ authenticated runtime updates. Successful runtime updates are written
 atomically to `config.toml`; invalid or interrupted updates leave the active
 generation and last valid file unchanged.
 
+Every TOML secret, certificate, and key uses one byte-material table:
+`{ from = "file", path = "..." }` reads exact file bytes;
+`{ from = "env", var = "MPTUNNEL_NAME_FILE" }` reads the file whose path is in
+that environment variable; `{ from = "hex", value = "..." }` and
+`{ from = "base64", value = "..." }` decode strict inline encodings; and
+`{ from = "raw", value = "..." }` supplies UTF-8 bytes. `{ value = "..." }`
+is shorthand for the raw form.
+Inline encodings are not encryption and remain stored in the configuration.
+Material bytes are exact: file content, decoded inline content, and raw UTF-8
+are never trimmed. Consumer-specific size, UTF-8, or PEM validation follows.
+
 Every configurable resource has a canonical `name`. References use the
-resource noun (`outbound`, `balancer`, `dns_plan`); `_id` fields identify
+resource noun (`outbound`, `balancer`, `dns_policy`); `_id` fields identify
 protocol credentials, principals, or signed artifacts. `target` means an
-application destination, while `endpoint` means a listener or connector.
+application destination; a listen address accepts local traffic; an `endpoint`
+is a proxy connector or MPP carrier URI. A DNS server defines how and where to
+send DNS messages. A DNS policy selects servers, address families, security,
+limits, and cache behavior. DNS records are exact local answers; DNS override
+is the synthetic-address mode used only for captured DNS traffic.
 
 Fixed-target listeners use `tcp-forward`, `udp-forward`, or `mixed-forward`;
 the mixed form binds both transports on the same addresses and sends them to
@@ -247,7 +262,7 @@ one target.
 Domain-capable SOCKS5/HTTP/MPP outbounds can receive a domain unchanged; DNS
 resolution is performed only when routing or the selected outbound requires an
 IP. Ranged carrier endpoints use syntax such as
-`udp://server.example:20000-40000`.
+`quic://server.example:20000-40000`.
 
 Logging starts with the running version, configuration source, safe inbound and
 outbound inventory, bound listeners, runtime readiness, and shutdown. The

@@ -32,12 +32,12 @@ listen = ["127.0.0.1:1080"]
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 
 [outbounds.security]
 credential_id = "edge-client"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "edge-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "edge-certificate.pem" }
 
 [routing]
 
@@ -61,12 +61,12 @@ listen = ["127.0.0.1:1081"]
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 
 [outbounds.security]
 credential_id = "edge-client"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "edge-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "edge-certificate.pem" }
 
 [routing]
 
@@ -94,12 +94,12 @@ listen = ["127.0.0.1:1081"]
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 
 [outbounds.security]
 credential_id = "edge-client"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "edge-certificate.pem"
+tls_pinned_certificate = { from = "file", path = "edge-certificate.pem" }
 
 [routing]
 
@@ -170,7 +170,7 @@ fn target_from_document(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
     let context = ClientPathContext::new(
-        vec!["udp://127.0.0.1:7443".parse().expect("path")],
+        vec!["quic://127.0.0.1:7443".parse().expect("path")],
         security,
         ResourceLimits::default(),
     )

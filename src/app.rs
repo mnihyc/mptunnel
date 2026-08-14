@@ -234,7 +234,11 @@ fn log_configuration_inventory(config: &AppConfig) {
             plural_noun(node.gateway_balancers.len(), "balancer", "balancers"),
             plural_noun(route_count, "route", "routes"),
             node.dns_policy.spec.plans.len(),
-            plural_noun(node.dns_policy.spec.plans.len(), "DNS plan", "DNS plans"),
+            plural_noun(
+                node.dns_policy.spec.plans.len(),
+                "DNS policy",
+                "DNS policies",
+            ),
         ),
     );
 

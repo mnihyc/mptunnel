@@ -19,12 +19,12 @@ listen = ["127.0.0.1:1080"]
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 
 [outbounds.security]
 credential_id = "home"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "certificate.pem"
+tls_pinned_certificate = { from = "file", path = "certificate.pem" }
 
 [routing]
 
@@ -48,12 +48,12 @@ listen = ["127.0.0.1:1081"]
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "quic://127.0.0.1:7443" }]
 
 [outbounds.security]
 credential_id = "home"
 tls_server_name = "mptunnel.test"
-tls_pinned_certificate_file = "certificate.pem"
+tls_pinned_certificate = { from = "file", path = "certificate.pem" }
 
 [routing]
 

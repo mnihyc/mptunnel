@@ -20,12 +20,12 @@ async fn parse(raw: &[u8]) -> Result<ManagementRequest, ManagementHttpError> {
 #[tokio::test]
 async fn parser_accepts_one_complete_origin_form_request() {
     let request = parse(
-        b"POST /api/v2/diagnostics/peer?fresh=true HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        b"POST /api/v3/diagnostics/peer?fresh=true HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
     )
     .await
     .expect("request");
     assert_eq!(request.method, "POST");
-    assert_eq!(request.path_without_query(), "/api/v2/diagnostics/peer");
+    assert_eq!(request.path_without_query(), "/api/v3/diagnostics/peer");
     assert_eq!(request.body, b"{}");
 }
 
@@ -40,18 +40,18 @@ fn dns_explain_accepts_exactly_one_nonempty_utf8_domain_parameter() {
 
     assert_eq!(
         required_single_query_parameter(
-            &request("/api/v2/dns/explain?domain=www%2Eexample%2Ecom"),
+            &request("/api/v3/dns/explain?domain=www%2Eexample%2Ecom"),
             "domain"
         )
         .expect("one encoded domain"),
         "www.example.com"
     );
     for path in [
-        "/api/v2/dns/explain",
-        "/api/v2/dns/explain?domain=",
-        "/api/v2/dns/explain?domain=a.example&domain=b.example",
-        "/api/v2/dns/explain?domain=a.example&plan=default",
-        "/api/v2/dns/explain?domain=%ff",
+        "/api/v3/dns/explain",
+        "/api/v3/dns/explain?domain=",
+        "/api/v3/dns/explain?domain=a.example&domain=b.example",
+        "/api/v3/dns/explain?domain=a.example&plan=default",
+        "/api/v3/dns/explain?domain=%ff",
     ] {
         assert!(
             required_single_query_parameter(&request(path), "domain").is_err(),
@@ -79,21 +79,21 @@ fn health_target(generation: RuntimeGenerationControl) -> ManagementTarget {
 #[test]
 fn management_api_is_one_authenticated_versioned_surface() {
     for path in [
-        "/api/v2/",
-        "/api/v2/health",
-        "/api/v2/health/live",
-        "/api/v2/health/ready",
-        "/api/v2/status",
-        "/api/v2/paths",
-        "/api/v2/traffic",
-        "/api/v2/sessions",
-        "/api/v2/flows",
-        "/api/v2/diagnostics",
-        "/api/v2/actions/path",
-        "/api/v2/diagnostics/peer",
-        "/api/v2/config",
-        "/api/v2/balancers",
-        "/api/v2/dns/status",
+        "/api/v3/",
+        "/api/v3/health",
+        "/api/v3/health/live",
+        "/api/v3/health/ready",
+        "/api/v3/status",
+        "/api/v3/paths",
+        "/api/v3/traffic",
+        "/api/v3/sessions",
+        "/api/v3/flows",
+        "/api/v3/diagnostics",
+        "/api/v3/actions/path",
+        "/api/v3/diagnostics/peer",
+        "/api/v3/config",
+        "/api/v3/balancers",
+        "/api/v3/dns/status",
     ] {
         assert!(known_path(path, false), "{path} must be registered");
         assert!(!public_path(path, true), "{path} must require bearer auth");
@@ -110,6 +110,8 @@ fn management_api_is_one_authenticated_versioned_surface() {
         "/api/control/path",
         "/api/diagnostics/peer",
         "/api/v1/status",
+        "/api/v2/status",
+        "/api/v2/dns/status",
     ] {
         assert!(
             !known_path(legacy, true),
@@ -175,7 +177,7 @@ fn failed_health_is_structured_and_never_ready() {
     let (status, reason, response) = health_response(&health_target(generation.clone()));
 
     assert_eq!((status, reason), (503, "Service Unavailable"));
-    assert_eq!(response["schema"], "mptunnel.health.v2");
+    assert_eq!(response["schema"], "mptunnel.health.v3");
     assert_eq!(response["live"], false);
     assert_eq!(response["ready"], false);
     assert_eq!(response["phase"], "failed");
@@ -215,10 +217,10 @@ async fn management_bind_failure_fails_the_startup_barrier() {
 #[tokio::test]
 async fn parser_rejects_ambiguous_security_headers() {
     for raw in [
-        b"GET /api/v2/status HTTP/1.1\r\nAuthorization: Bearer first\r\nAuthorization: Bearer second\r\n\r\n".as_slice(),
-        b"POST /api/v2/actions/path HTTP/1.1\r\nContent-Type: application/json\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n".as_slice(),
-        b"POST /api/v2/actions/path HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n".as_slice(),
-        b"POST /api/v2/config/apply HTTP/1.1\r\nIf-Match: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nIf-Match: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\nContent-Length: 0\r\n\r\n".as_slice(),
+        b"GET /api/v3/status HTTP/1.1\r\nAuthorization: Bearer first\r\nAuthorization: Bearer second\r\n\r\n".as_slice(),
+        b"POST /api/v3/actions/path HTTP/1.1\r\nContent-Type: application/json\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n".as_slice(),
+        b"POST /api/v3/actions/path HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n".as_slice(),
+        b"POST /api/v3/config/apply HTTP/1.1\r\nIf-Match: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nIf-Match: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\nContent-Length: 0\r\n\r\n".as_slice(),
     ] {
         assert_eq!(parse(raw).await.expect_err("ambiguous request").status, 400);
     }
@@ -229,7 +231,7 @@ fn config_apply_requires_toml_and_one_valid_revision() {
     let revision = ConfigRevision::from_bytes(b"config");
     let quoted = ManagementRequest {
         method: "POST".to_string(),
-        path: "/api/v2/config/apply".to_string(),
+        path: "/api/v3/config/apply".to_string(),
         headers: vec![
             ("content-type".to_string(), "application/toml".to_string()),
             ("if-match".to_string(), format!("\"{revision}\"")),
@@ -254,13 +256,13 @@ fn config_apply_requires_toml_and_one_valid_revision() {
 
 #[tokio::test]
 async fn parser_rejects_absolute_targets_and_pipelining() {
-    let absolute = parse(b"GET http://localhost/api/v2/status HTTP/1.1\r\n\r\n")
+    let absolute = parse(b"GET http://localhost/api/v3/status HTTP/1.1\r\n\r\n")
         .await
         .expect_err("absolute target");
     assert_eq!(absolute.status, 400);
 
     let pipelined =
-        parse(b"GET /api/v2/status HTTP/1.1\r\n\r\nGET /api/v2/status HTTP/1.1\r\n\r\n")
+        parse(b"GET /api/v3/status HTTP/1.1\r\n\r\nGET /api/v3/status HTTP/1.1\r\n\r\n")
             .await
             .expect_err("pipelined request");
     assert_eq!(pipelined.status, 400);
@@ -269,7 +271,7 @@ async fn parser_rejects_absolute_targets_and_pipelining() {
 #[tokio::test]
 async fn parser_enforces_the_body_limit_independently_of_header_size() {
     let request = format!(
-        "POST /api/v2/config/validate HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        "POST /api/v3/config/validate HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
         BODY_LIMIT + 1
     );
     let error = parse(request.as_bytes())
@@ -297,7 +299,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         assert!(DASHBOARD_HTML.contains(option), "missing {option}");
     }
     assert!(DASHBOARD_JS.contains("const REFRESH_INTERVALS_MS = [0, 1000, 5000, 30000];"));
-    assert!(DASHBOARD_JS.contains(r#"const HEALTH_ENDPOINT = "/api/v2/health";"#));
+    assert!(DASHBOARD_JS.contains(r#"const HEALTH_ENDPOINT = "/api/v3/health";"#));
     assert!(DASHBOARD_JS.contains("state.health && !state.health.ready"));
     assert!(DASHBOARD_JS.contains("state.health && state.health.degraded"));
     assert!(DASHBOARD_JS.contains("await refreshDashboard(\"poll\");"));

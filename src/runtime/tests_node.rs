@@ -169,7 +169,7 @@ async fn product_dns_carrier_resolution_is_generation_scoped_and_literal_safe() 
     let domain_path = "tcp://carrier.product.test:440-450"
         .parse::<PathSpec>()
         .expect("domain carrier");
-    let literal_path = "udp://192.0.2.10:8440-8450"
+    let literal_path = "quic://192.0.2.10:8440-8450"
         .parse::<PathSpec>()
         .expect("literal carrier");
     let identity = CarrierPathIdentity {

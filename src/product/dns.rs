@@ -72,7 +72,7 @@ macro_rules! dns_id {
 dns_id!(DnsUpstreamId);
 dns_id!(DnsRuleId);
 
-/// The wire transport used to reach a tagged DNS upstream.
+/// The wire protocol used to reach a named DNS server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsTransport {
     System,
@@ -100,7 +100,7 @@ impl DnsTransport {
     }
 }
 
-/// A DNS endpoint. Every explicit network endpoint has a literal bootstrap IP;
+/// A DNS endpoint. Every explicit network endpoint has a literal server IP;
 /// `System` is a separate opt-in for non-VPN/simple-client use.
 ///
 /// The tagged variants make it impossible to construct DoT or DoH without an
@@ -189,7 +189,7 @@ pub enum DnsEgressSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsUpstreamSpec {
-    /// The operator-facing `[[dns.upstreams]].name`, compiled to a typed
+    /// The operator-facing `[[dns.servers]].name`, compiled to a typed
     /// reference and never serialized as an MPP protocol identifier.
     pub id: DnsUpstreamId,
     pub endpoint: DnsUpstreamEndpoint,
@@ -206,7 +206,7 @@ impl DnsUpstreamSpec {
     }
 }
 
-/// Product facts needed to prove that a DNS upstream cannot recurse through
+/// Product facts needed to prove that a DNS server cannot recurse through
 /// the resolver it is helping to implement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsOutboundCapabilitySpec {
@@ -269,11 +269,11 @@ pub struct DnsHostSpec {
 
 /// Bounded synthetic-address policy for local DNS capture.
 ///
-/// FakeDNS is deliberately absent from ordinary dial-time resolution. A TUN
+/// The synthetic DNS override is deliberately absent from ordinary dial-time resolution. A TUN
 /// capture may publish a synthetic address and recover the original domain
 /// once when the application opens a flow; the selected outbound then resolves
 /// that domain normally. Pools are restricted to non-public ranges so enabling
-/// FakeDNS cannot silently shadow an Internet destination.
+/// the override cannot silently shadow an Internet destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeDnsSpec {
     pub ipv4_pool: Option<Ipv4Net>,
@@ -316,8 +316,8 @@ impl Default for DnsPlanLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsPlanSpec {
-    /// The operator-facing `[[dns.plans]].name`, compiled to the type used by
-    /// routing rules and DNS plan references.
+    /// The operator-facing `[[dns.policies]].name`, compiled to the type used by
+    /// routing rules and DNS policy references.
     pub id: DnsPlanId,
     /// Ordered failover list. A negative DNS result is authoritative and does
     /// not fall through; transport and server failures do.
@@ -587,7 +587,7 @@ impl CompiledDnsPolicy {
             plan: self
                 .plans
                 .get(&self.default_plan)
-                .expect("compiled DNS default plan"),
+                .expect("compiled default DNS policy"),
             rule_id: None,
             match_kind: DnsRuleMatchKind::Default,
             matched_domain: None,
@@ -599,7 +599,10 @@ impl CompiledDnsPolicy {
         let rule = &self.rules[index];
         DnsSelection {
             generation: self.generation,
-            plan: self.plans.get(&rule.plan).expect("compiled DNS rule plan"),
+            plan: self
+                .plans
+                .get(&rule.plan)
+                .expect("compiled DNS rule policy"),
             rule_id: Some(&rule.id),
             match_kind: rule.matcher.kind(),
             matched_domain: Some(rule.matcher.domain()),
@@ -707,7 +710,7 @@ fn validate_fake_dns(
 
     if let Some(pool) = fake_dns.ipv4_pool {
         let reserved =
-            Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).expect("static FakeDNS IPv4 range");
+            Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).expect("static DNS override IPv4 range");
         if pool.addr() != pool.network() || !reserved.contains(&pool.network()) {
             return Err(DnsCompileError::InvalidFakeDnsIpv4Pool(pool));
         }
@@ -722,8 +725,8 @@ fn validate_fake_dns(
         }
     }
     if let Some(pool) = fake_dns.ipv6_pool {
-        let reserved =
-            Ipv6Net::new(Ipv6Addr::from(0xfc00_u128 << 112), 7).expect("static FakeDNS IPv6 range");
+        let reserved = Ipv6Net::new(Ipv6Addr::from(0xfc00_u128 << 112), 7)
+            .expect("static DNS override IPv6 range");
         if pool.addr() != pool.network() || !reserved.contains(&pool.network()) {
             return Err(DnsCompileError::InvalidFakeDnsIpv6Pool(pool));
         }
@@ -1270,38 +1273,40 @@ impl fmt::Display for DnsCompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoUpstreams => {
-                formatter.write_str("DNS policy must define at least one upstream")
+                formatter.write_str("DNS configuration must define at least one server")
             }
             Self::TooManyUpstreams { count, maximum } => {
                 write!(
                     formatter,
-                    "DNS policy has {count} upstreams; maximum is {maximum}"
+                    "DNS configuration has {count} servers; maximum is {maximum}"
                 )
             }
-            Self::NoPlans => formatter.write_str("DNS policy must define at least one plan"),
+            Self::NoPlans => {
+                formatter.write_str("DNS configuration must define at least one policy")
+            }
             Self::TooManyPlans { count, maximum } => {
                 write!(
                     formatter,
-                    "DNS policy has {count} plans; maximum is {maximum}"
+                    "DNS configuration has {count} policies; maximum is {maximum}"
                 )
             }
             Self::TooManyRules { count, maximum } => {
                 write!(
                     formatter,
-                    "DNS policy has {count} rules; maximum is {maximum}"
+                    "DNS configuration has {count} rules; maximum is {maximum}"
                 )
             }
             Self::TooManyHosts { count, maximum } => {
                 write!(
                     formatter,
-                    "DNS policy has {count} host overrides; maximum is {maximum}"
+                    "DNS configuration has {count} records; maximum is {maximum}"
                 )
             }
-            Self::DuplicateUpstreamId(id) => write!(formatter, "duplicate DNS upstream ID {id}"),
+            Self::DuplicateUpstreamId(id) => write!(formatter, "duplicate DNS server name {id}"),
             Self::DuplicateOutboundCapability(id) => {
                 write!(formatter, "duplicate DNS outbound capability for {id}")
             }
-            Self::DuplicatePlanId(id) => write!(formatter, "duplicate DNS plan ID {id}"),
+            Self::DuplicatePlanId(id) => write!(formatter, "duplicate DNS policy name {id}"),
             Self::DuplicateRuleId(id) => write!(formatter, "duplicate DNS rule ID {id}"),
             Self::DuplicateRuleMatch { kind, domain } => {
                 write!(formatter, "duplicate DNS {kind:?} rule match for {domain}")
@@ -1311,25 +1316,25 @@ impl fmt::Display for DnsCompileError {
                 bootstrap,
             } => write!(
                 formatter,
-                "DNS upstream {upstream} has unusable literal bootstrap address {bootstrap}"
+                "DNS server {upstream} has unusable address {bootstrap}"
             ),
             Self::InvalidDohPath { upstream } => {
                 write!(
                     formatter,
-                    "DoH upstream {upstream} has an invalid absolute path"
+                    "DoH server {upstream} has an invalid absolute path"
                 )
             }
             Self::SystemUpstreamWithOutbound { upstream, outbound } => write!(
                 formatter,
-                "system DNS upstream {upstream} cannot use named outbound {outbound}"
+                "system DNS server {upstream} cannot use outbound {outbound}"
             ),
             Self::UnknownOutbound { upstream, outbound } => write!(
                 formatter,
-                "DNS upstream {upstream} references unknown outbound {outbound}"
+                "DNS server {upstream} references unknown outbound {outbound}"
             ),
             Self::RecursiveOutbound { upstream, outbound } => write!(
                 formatter,
-                "DNS upstream {upstream} uses DNS-dependent outbound {outbound}"
+                "DNS server {upstream} uses DNS-dependent outbound {outbound}"
             ),
             Self::UnsupportedOutboundNetwork {
                 upstream,
@@ -1337,34 +1342,34 @@ impl fmt::Display for DnsCompileError {
                 network,
             } => write!(
                 formatter,
-                "DNS upstream {upstream} requires {network}, which outbound {outbound} does not support"
+                "DNS server {upstream} requires {network}, which outbound {outbound} does not support"
             ),
-            Self::EmptyPlan(plan) => write!(formatter, "DNS plan {plan} has no upstreams"),
+            Self::EmptyPlan(plan) => write!(formatter, "DNS policy {plan} has no servers"),
             Self::TooManyPlanUpstreams {
                 plan,
                 count,
                 maximum,
             } => write!(
                 formatter,
-                "DNS plan {plan} has {count} upstreams; maximum is {maximum}"
+                "DNS policy {plan} has {count} servers; maximum is {maximum}"
             ),
             Self::DuplicatePlanUpstream { plan, upstream } => {
-                write!(formatter, "DNS plan {plan} repeats upstream {upstream}")
+                write!(formatter, "DNS policy {plan} repeats server {upstream}")
             }
             Self::UnknownUpstream { plan, upstream } => {
                 write!(
                     formatter,
-                    "DNS plan {plan} references unknown upstream {upstream}"
+                    "DNS policy {plan} references unknown server {upstream}"
                 )
             }
             Self::PlaintextUpstreamInEncryptedPlan { plan, upstream } => write!(
                 formatter,
-                "encrypted DNS plan {plan} contains plaintext upstream {upstream}"
+                "encrypted DNS policy {plan} contains plaintext server {upstream}"
             ),
             Self::RacingPlanRequiresFallback(plan) => {
                 write!(
                     formatter,
-                    "racing DNS plan {plan} requires at least two upstreams"
+                    "racing DNS policy {plan} requires at least two servers"
                 )
             }
             Self::InvalidRaceDelay {
@@ -1373,7 +1378,7 @@ impl fmt::Display for DnsCompileError {
                 lookup_timeout,
             } => write!(
                 formatter,
-                "DNS plan {plan} fallback race delay {fallback_delay:?} exceeds its lookup timeout {lookup_timeout:?}"
+                "DNS policy {plan} fallback delay {fallback_delay:?} exceeds its query timeout {lookup_timeout:?}"
             ),
             Self::TooManyExpectedCidrs {
                 plan,
@@ -1381,15 +1386,15 @@ impl fmt::Display for DnsCompileError {
                 maximum,
             } => write!(
                 formatter,
-                "DNS plan {plan} has {count} expected CIDRs; maximum is {maximum}"
+                "DNS policy {plan} has {count} answer CIDRs; maximum is {maximum}"
             ),
             Self::DuplicateExpectedCidr { plan, cidr } => {
-                write!(formatter, "DNS plan {plan} repeats expected CIDR {cidr}")
+                write!(formatter, "DNS policy {plan} repeats answer CIDR {cidr}")
             }
             Self::InvalidPlanLimits(plan) => {
                 write!(
                     formatter,
-                    "DNS plan {plan} has invalid or unbounded runtime limits"
+                    "DNS policy {plan} has invalid or unbounded runtime limits"
                 )
             }
             Self::GenerationLimitsOverflow => {
@@ -1405,19 +1410,22 @@ impl fmt::Display for DnsCompileError {
                 "DNS generation requests {cache_entries} cache entries and {inflight} in-flight queries; maxima are {maximum_cache_entries} and {maximum_inflight}"
             ),
             Self::UnknownDefaultPlan(plan) => {
-                write!(formatter, "DNS default plan {plan} does not exist")
+                write!(formatter, "default DNS policy {plan} does not exist")
             }
             Self::UnknownRulePlan { rule, plan } => {
-                write!(formatter, "DNS rule {rule} references unknown plan {plan}")
+                write!(
+                    formatter,
+                    "DNS rule {rule} references unknown policy {plan}"
+                )
             }
             Self::InvalidExplanation(rule) => {
                 write!(formatter, "DNS rule {rule} has an invalid explanation")
             }
             Self::DuplicateHostDomain(domain) => {
-                write!(formatter, "duplicate DNS host override for {domain}")
+                write!(formatter, "duplicate DNS record for {domain}")
             }
             Self::EmptyHostAddresses(domain) => {
-                write!(formatter, "DNS host override {domain} has no addresses")
+                write!(formatter, "DNS record {domain} has no addresses")
             }
             Self::TooManyHostAddresses {
                 domain,
@@ -1425,35 +1433,32 @@ impl fmt::Display for DnsCompileError {
                 maximum,
             } => write!(
                 formatter,
-                "DNS host override {domain} has {count} addresses; maximum is {maximum}"
+                "DNS record {domain} has {count} addresses; maximum is {maximum}"
             ),
             Self::DuplicateHostAddress { domain, address } => {
-                write!(
-                    formatter,
-                    "DNS host override {domain} repeats address {address}"
-                )
+                write!(formatter, "DNS record {domain} repeats address {address}")
             }
             Self::FakeDnsPoolRequired => {
-                formatter.write_str("FakeDNS requires at least one IPv4 or IPv6 pool")
+                formatter.write_str("DNS override requires at least one IPv4 or IPv6 pool")
             }
             Self::InvalidFakeDnsCapacity { capacity, maximum } => write!(
                 formatter,
-                "FakeDNS capacity {capacity} must be between 1 and {maximum}"
+                "DNS override capacity {capacity} must be between 1 and {maximum}"
             ),
             Self::InvalidFakeDnsLifetime {
                 answer_ttl,
                 recovery_ttl,
             } => write!(
                 formatter,
-                "FakeDNS answer TTL {answer_ttl:?} and recovery TTL {recovery_ttl:?} are invalid"
+                "DNS override answer TTL {answer_ttl:?} and recovery TTL {recovery_ttl:?} are invalid"
             ),
             Self::InvalidFakeDnsIpv4Pool(pool) => write!(
                 formatter,
-                "FakeDNS IPv4 pool {pool} must be a canonical subnet of 198.18.0.0/15"
+                "DNS override IPv4 pool {pool} must be a canonical subnet of 198.18.0.0/15"
             ),
             Self::InvalidFakeDnsIpv6Pool(pool) => write!(
                 formatter,
-                "FakeDNS IPv6 pool {pool} must be a canonical subnet of fc00::/7"
+                "DNS override IPv6 pool {pool} must be a canonical subnet of fc00::/7"
             ),
             Self::FakeDnsPoolTooSmall {
                 pool,
@@ -1461,7 +1466,7 @@ impl fmt::Display for DnsCompileError {
                 required,
             } => write!(
                 formatter,
-                "FakeDNS pool {pool} has {capacity} usable addresses but capacity requires {required}"
+                "DNS override pool {pool} has {capacity} usable addresses but capacity requires {required}"
             ),
             Self::FakeDnsContainsBootstrap {
                 pool,
@@ -1469,7 +1474,7 @@ impl fmt::Display for DnsCompileError {
                 bootstrap,
             } => write!(
                 formatter,
-                "FakeDNS pool {pool} contains bootstrap {bootstrap} for upstream {upstream}"
+                "DNS override pool {pool} contains address {bootstrap} for server {upstream}"
             ),
         }
     }

@@ -144,7 +144,7 @@ fn client_cli_builds_default_socks_config() {
         "--path",
         "tcp://127.0.0.1:443-445",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     let config = cli.into_config().expect("config");
@@ -235,7 +235,7 @@ fn client_cli_exposes_sparse_node_limits() {
         "103",
         "client",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI sparse-node limits");
     let config = cli.into_config().expect("valid sparse-node limits");
@@ -677,7 +677,7 @@ fn management_token_value_has_no_raw_cli_argument() {
 
 #[test]
 fn secret_is_required() {
-    let cli = Cli::try_parse_from(["mptunnel", "client", "--path", "udp://127.0.0.1:443"])
+    let cli = Cli::try_parse_from(["mptunnel", "client", "--path", "quic://127.0.0.1:443"])
         .expect("parse cli");
 
     assert!(matches!(
@@ -697,7 +697,7 @@ fn raw_secret_argument_is_not_part_of_the_clean_cli() {
             "0123456789abcdef0123456789abcdef",
             "client",
             "--path",
-            "udp://127.0.0.1:443",
+            "quic://127.0.0.1:443",
         ])
         .is_err()
     );
@@ -724,7 +724,7 @@ fn server_outbound_requires_matching_parameters() {
         "mptunnel",
         "server",
         "--bind-path",
-        "udp://0.0.0.0:443",
+        "quic://0.0.0.0:443",
         "--outbound-protocol",
         "http-connect",
     ])
@@ -752,7 +752,7 @@ fn server_https_connect_outbound_and_proxy_auth_are_parsed() {
         OsString::from("mptunnel"),
         OsString::from("server"),
         OsString::from("--bind-path"),
-        OsString::from("udp://0.0.0.0:443"),
+        OsString::from("quic://0.0.0.0:443"),
         OsString::from("--outbound-protocol"),
         OsString::from("https-connect"),
         OsString::from("--upstream-http"),
@@ -785,7 +785,7 @@ fn server_upstream_proxy_auth_requires_both_fields() {
         "mptunnel",
         "server",
         "--bind-path",
-        "udp://0.0.0.0:443",
+        "quic://0.0.0.0:443",
         "--outbound-protocol",
         "socks5",
         "--upstream-socks5",
@@ -808,13 +808,13 @@ fn server_outbound_dns_is_parsed() {
         "server",
         "--bind-path",
         "tcp://0.0.0.0:443",
-        "--outbound-dns-resolver",
+        "--outbound-dns-server",
         "1.1.1.1:53",
-        "--outbound-dns-resolver",
+        "--outbound-dns-server",
         "[2606:4700:4700::1111]:53",
-        "--outbound-dns-mode",
-        "servers",
-        "--outbound-dns-strategy",
+        "--outbound-dns-protocol",
+        "udp-tcp",
+        "--outbound-dns-family",
         "ipv6-then-ipv4",
         "--outbound-dns-timeout-ms",
         "1500",
@@ -845,13 +845,45 @@ fn server_outbound_dns_is_parsed() {
         "server",
         "--bind-path",
         "tcp://0.0.0.0:443",
-        "--outbound-dns-resolver",
+        "--outbound-dns-server",
         "1.1.1.1:0",
-        "--outbound-dns-mode",
-        "servers",
+        "--outbound-dns-protocol",
+        "udp-tcp",
     ])
     .expect("parse cli");
     assert!(matches!(cli.into_config(), Err(CliConfigError::Dns(_))));
+}
+
+#[test]
+fn removed_dns_cli_names_are_not_accepted_as_aliases() {
+    for arguments in [
+        vec![
+            "mptunnel",
+            "server",
+            "--bind-path",
+            "tcp://0.0.0.0:443",
+            "--outbound-dns-resolver",
+            "1.1.1.1:53",
+        ],
+        vec![
+            "mptunnel",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+            "--tun-dns-resolver",
+            "1.1.1.1:53",
+        ],
+        vec![
+            "mptunnel",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+            "--tun-dns-dot-bootstrap",
+            "1.1.1.1:853",
+        ],
+    ] {
+        assert!(parse_cli(arguments).is_err());
+    }
 }
 
 #[test]
@@ -863,14 +895,14 @@ fn tun_l4_cli_parses_dual_stack_and_dns() {
         "mptun0",
         "--tun-ipv6",
         "fd00::1",
-        "--tun-dns-resolver",
+        "--tun-dns-redirect",
         "1.1.1.1:53",
-        "--tun-dns-resolver",
+        "--tun-dns-redirect",
         "[2606:4700:4700::1111]:53",
         "--path",
         "tcp://127.0.0.1:443",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     let config = cli.into_config().expect("config");
@@ -927,7 +959,7 @@ fn tun_l4_cli_supports_ipv6_only() {
         "--path",
         "tcp://127.0.0.1:443",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     let config = cli.into_config().expect("config");
@@ -960,7 +992,7 @@ fn tun_l4_validation_accepts_single_underlay_and_rejects_ipv4_flags() {
         "--path",
         "tcp://127.0.0.1:443",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     assert!(matches!(
@@ -983,7 +1015,7 @@ fn tun_l4_validation_accepts_single_underlay_and_rejects_ipv4_flags() {
         "client",
         "--tun",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     cli.into_config().expect("UDP-only TUN config");
@@ -992,12 +1024,12 @@ fn tun_l4_validation_accepts_single_underlay_and_rejects_ipv4_flags() {
         "mptunnel",
         "client",
         "--tun",
-        "--tun-dns-resolver",
+        "--tun-dns-redirect",
         "1.1.1.1:0",
         "--path",
         "tcp://127.0.0.1:443",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     assert!(matches!(cli.into_config(), Err(CliConfigError::Dns(_))));
@@ -1015,14 +1047,14 @@ fn managed_full_vpn_cli_builds_explicit_host_policy() {
         "--tun-exclude-cidr",
         "192.168.4.7/16",
         "--tun-local-lan",
-        "--tun-dns-capture-server",
+        "--tun-dns-listener",
         "10.88.0.53",
-        "--tun-dns-dot-bootstrap",
+        "--tun-dns-dot-address",
         "1.1.1.1:853",
-        "--tun-dns-dot-server-name",
+        "--tun-dns-dot-tls-name",
         "cloudflare-dns.com",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     let config = cli.into_config().expect("managed full config");
@@ -1080,12 +1112,12 @@ fn managed_split_vpn_cli_builds_bounded_include_policy() {
         "10.1.2.3/8",
         "--tun-exclude-cidr",
         "10.20.30.40/16",
-        "--tun-dns-dot-bootstrap",
+        "--tun-dns-dot-address",
         "9.9.9.9:853",
-        "--tun-dns-dot-server-name",
+        "--tun-dns-dot-tls-name",
         "dns.quad9.net",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     let config = cli.into_config().expect("managed split config");
@@ -1123,7 +1155,7 @@ fn managed_vpn_cli_requires_explicit_mode_and_valid_mode_fields() {
             "client",
             "--tun-local-lan",
             "--path",
-            "udp://127.0.0.1:443",
+            "quic://127.0.0.1:443",
         ])
         .is_err(),
         "managed-only flags must not silently change an external TUN"
@@ -1136,14 +1168,14 @@ fn managed_vpn_cli_requires_explicit_mode_and_valid_mode_fields() {
         "full",
         "--tun-include-cidr",
         "10.0.0.0/8",
-        "--tun-dns-capture-server",
+        "--tun-dns-listener",
         "10.88.0.53",
-        "--tun-dns-dot-bootstrap",
+        "--tun-dns-dot-address",
         "1.1.1.1:853",
-        "--tun-dns-dot-server-name",
+        "--tun-dns-dot-tls-name",
         "cloudflare-dns.com",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     assert!(matches!(
@@ -1160,19 +1192,19 @@ fn managed_full_vpn_cli_requires_capture_and_rejects_external_dns() {
         "client",
         "--tun-vpn-mode",
         "full",
-        "--tun-dns-dot-bootstrap",
+        "--tun-dns-dot-address",
         "1.1.1.1:853",
-        "--tun-dns-dot-server-name",
+        "--tun-dns-dot-tls-name",
         "cloudflare-dns.com",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     assert!(matches!(
         without_capture.into_config(),
         Err(CliConfigError::Config(
             crate::config::ConfigError::ManagedVpn(message)
-        )) if message.contains("requires at least one DNS capture server")
+        )) if message.contains("requires at least one DNS listener")
     ));
 
     let managed_without_dot = parse_cli([
@@ -1180,10 +1212,10 @@ fn managed_full_vpn_cli_requires_capture_and_rejects_external_dns() {
         "client",
         "--tun-vpn-mode",
         "full",
-        "--tun-dns-capture-server",
+        "--tun-dns-listener",
         "10.88.0.53",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     assert!(matches!(
@@ -1196,12 +1228,12 @@ fn managed_full_vpn_cli_requires_capture_and_rejects_external_dns() {
         "client",
         "--tun-vpn-mode",
         "full",
-        "--tun-dns-capture-server",
+        "--tun-dns-listener",
         "10.88.0.53",
-        "--tun-dns-resolver",
+        "--tun-dns-redirect",
         "1.1.1.1:53",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     assert!(matches!(
@@ -1214,18 +1246,18 @@ fn managed_full_vpn_cli_requires_capture_and_rejects_external_dns() {
 #[test]
 fn managed_vpn_cli_requires_a_complete_dot_identity() {
     for incomplete in [
-        vec!["--tun-dns-dot-bootstrap", "1.1.1.1:853"],
-        vec!["--tun-dns-dot-server-name", "cloudflare-dns.com"],
+        vec!["--tun-dns-dot-address", "1.1.1.1:853"],
+        vec!["--tun-dns-dot-tls-name", "cloudflare-dns.com"],
     ] {
         let mut args = vec![
             "mptunnel",
             "client",
             "--tun-vpn-mode",
             "full",
-            "--tun-dns-capture-server",
+            "--tun-dns-listener",
             "10.88.0.53",
             "--path",
-            "udp://127.0.0.1:443",
+            "quic://127.0.0.1:443",
         ];
         args.extend(incomplete);
         assert!(
@@ -1239,14 +1271,14 @@ fn managed_vpn_cli_requires_a_complete_dot_identity() {
         "client",
         "--tun-vpn-mode",
         "full",
-        "--tun-dns-capture-server",
+        "--tun-dns-listener",
         "10.88.0.53",
-        "--tun-dns-dot-bootstrap",
+        "--tun-dns-dot-address",
         "1.1.1.1:853",
-        "--tun-dns-dot-server-name",
+        "--tun-dns-dot-tls-name",
         "not a dns name",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     assert!(matches!(
@@ -1259,14 +1291,14 @@ fn managed_vpn_cli_requires_a_complete_dot_identity() {
         "client",
         "--tun-vpn-mode",
         "full",
-        "--tun-dns-capture-server",
+        "--tun-dns-listener",
         "10.88.0.53",
-        "--tun-dns-dot-bootstrap",
+        "--tun-dns-dot-address",
         "1.1.1.1:0",
-        "--tun-dns-dot-server-name",
+        "--tun-dns-dot-tls-name",
         "cloudflare-dns.com",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse CLI");
     assert!(matches!(
@@ -1469,7 +1501,7 @@ fn logical_session_retention_and_quic_liveness_are_independently_configurable() 
         "12000",
         "client",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     let config = cli.into_config().expect("config");
@@ -1503,7 +1535,7 @@ fn logical_session_and_quic_liveness_timing_is_validated() {
     ] {
         let mut command = vec!["mptunnel"];
         command.extend(args);
-        command.extend(["client", "--path", "udp://127.0.0.1:443"]);
+        command.extend(["client", "--path", "quic://127.0.0.1:443"]);
         let cli = parse_cli(command).expect("parse cli");
         assert!(matches!(
             cli.into_config(),
@@ -1519,7 +1551,7 @@ fn logical_session_and_quic_liveness_timing_is_validated() {
         "10000",
         "client",
         "--path",
-        "udp://127.0.0.1:443",
+        "quic://127.0.0.1:443",
     ])
     .expect("parse cli");
     assert!(matches!(

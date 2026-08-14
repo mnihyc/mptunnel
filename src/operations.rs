@@ -55,7 +55,7 @@ fn run_status(
     output: &mut dyn Write,
 ) -> Result<(), OperationError> {
     let client = management_client(cli, args.address)?;
-    let value = client.get("/api/v2/status")?;
+    let value = client.get("/api/v3/status")?;
     write_json(output, &value, client.token())
 }
 
@@ -66,7 +66,7 @@ fn run_dns(
 ) -> Result<(), OperationError> {
     let client = management_client(cli, args.address)?;
     let value = match &args.command {
-        DnsCommand::Status => client.get("/api/v2/dns/status")?,
+        DnsCommand::Status => client.get("/api/v3/dns/status")?,
         DnsCommand::Explain(args) => dns_explain(&client, args)?,
         DnsCommand::Query(args) => dns_query(&client, args)?,
         DnsCommand::Flush(args) => dns_flush(&client, args)?,
@@ -76,7 +76,7 @@ fn run_dns(
 
 fn dns_explain(client: &ManagementClient, args: &DnsExplainArgs) -> Result<Value, OperationError> {
     let encoded = utf8_percent_encode(args.domain.as_str(), NON_ALPHANUMERIC);
-    client.get(&format!("/api/v2/dns/explain?domain={encoded}"))
+    client.get(&format!("/api/v3/dns/explain?domain={encoded}"))
 }
 
 fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, OperationError> {
@@ -90,7 +90,7 @@ fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, Op
         return Err(OperationError::InvalidDnsRecordType);
     }
     client.post(
-        "/api/v2/dns/query",
+        "/api/v3/dns/query",
         &json!({
             "domain": args.domain.as_str(),
             "type": args.record_type.to_ascii_uppercase(),
@@ -100,8 +100,8 @@ fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, Op
 
 fn dns_flush(client: &ManagementClient, args: &DnsFlushArgs) -> Result<Value, OperationError> {
     client.post(
-        "/api/v2/dns/cache/flush",
-        &json!({"dns_plan": args.dns_plan.as_ref().map(|plan| plan.as_str())}),
+        "/api/v3/dns/cache/flush",
+        &json!({"policy": args.policy.as_ref().map(|policy| policy.as_str())}),
     )
 }
 
@@ -149,7 +149,7 @@ fn render_route_explanation(
     let action_name = egress_action_name(action.egress());
     let resolution = policy.routes().classify(RouteInput::pre_resolution(flow));
     let resolution_action = resolution.action();
-    let resolution_dns_plan = resolution_action
+    let resolution_dns_policy = resolution_action
         .dns_plan()
         .unwrap_or(&node.dns_policy.spec.default_plan);
     writeln!(output, "route:")?;
@@ -182,8 +182,8 @@ fn render_route_explanation(
     writeln!(output, "  rule: {}", resolution.rule_id())?;
     writeln!(
         output,
-        "  dns_plan: {}{}",
-        resolution_dns_plan,
+        "  dns_policy: {}{}",
+        resolution_dns_policy,
         if resolution_action.dns_plan().is_some() {
             ""
         } else {
@@ -361,7 +361,7 @@ fn doctor_management_checks(
     for address in addresses {
         let label = format!("management {address}");
         let result = ManagementClient::new(address, token.clone())
-            .and_then(|client| client.request("GET", "/api/v2/health", None, true));
+            .and_then(|client| client.request("GET", "/api/v3/health", None, true));
         match result {
             Ok(response) => {
                 let live = response.body.get("live").and_then(Value::as_bool);
@@ -465,7 +465,7 @@ fn configured_probe_endpoints(config: &AppConfig, report: &mut DoctorReport) -> 
             &mut probes,
             &mut seen,
             ProbeEndpoint {
-                label: format!("DNS upstream {}", upstream.id),
+                label: format!("DNS server {}", upstream.id),
                 authority: endpoint.authority(),
                 endpoint,
                 connect,
@@ -908,7 +908,7 @@ struct ManagementResponse {
 fn validate_management_path(path: &str) -> Result<(), OperationError> {
     if path.is_empty()
         || path.len() > MANAGEMENT_PATH_LIMIT
-        || !path.starts_with("/api/v2/")
+        || !path.starts_with("/api/v3/")
         || !path.is_ascii()
         || path
             .bytes()

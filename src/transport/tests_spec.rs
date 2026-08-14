@@ -1,51 +1,80 @@
 use super::*;
 
 #[test]
-fn path_specs_parse_tcp_and_udp() {
-    let tcp =
-        "tcp://example.com:443?source-ip=192.0.2.10&srtt-ms=20&rate-mbps=30&bulk-allowed=false"
-            .parse::<PathSpec>()
-            .expect("tcp");
-    let udp = "udp://[2001:db8::1]:8443?jitter-ms=5&rate-bps=100000000&datagram-payload-limit=1400"
-        .parse::<PathSpec>()
-        .expect("udp");
+fn canonical_path_specs_parse_tcp_and_quic() {
+    let tcp = concat!(
+        "tcp://example.com:5000-5010?",
+        "source-address=192.0.2.10&",
+        "initial-srtt-ms=20&",
+        "initial-rttvar-ms=5&",
+        "initial-rate-mbps=30&",
+        "max-tcp-carriers=5&",
+        "port-rotation-interval-ms=45000&",
+        "backup=true&",
+        "expensive=false&",
+        "allow-bulk=false&",
+        "control-only=true&",
+        "allow-datagrams=false"
+    )
+    .parse::<PathSpec>()
+    .expect("canonical TCP path");
 
     assert_eq!(tcp.underlay, UnderlayProtocol::Tcp);
     assert_eq!(tcp.endpoint.host, "example.com");
-    assert_eq!(
-        tcp.endpoint.ports(),
-        CarrierPortSet::single(443).expect("port")
-    );
+    assert_eq!(tcp.endpoint.ports().first(), 5000);
+    assert_eq!(tcp.endpoint.ports().last(), 5010);
     assert_eq!(
         tcp.binding.source_ip,
-        Some("192.0.2.10".parse().expect("source IP"))
+        Some("192.0.2.10".parse().expect("source address"))
     );
     assert_eq!(tcp.metadata.initial_srtt_ms, Some(20));
+    assert_eq!(tcp.metadata.initial_jitter_ms, Some(5));
     assert_eq!(
         tcp.metadata.initial_rate,
         RateHint::BitsPerSecond(30_000_000)
     );
-    assert!(!tcp.metadata.policy.bulk_allowed);
-    assert_eq!(udp.underlay, UnderlayProtocol::Udp);
-    assert_eq!(udp.endpoint.host, "2001:db8::1");
     assert_eq!(
-        udp.endpoint.ports(),
-        CarrierPortSet::single(8443).expect("port")
+        tcp.tcp_carrier_range(),
+        Some(TcpCarrierRange::new(5).expect("carrier limit"))
     );
-    assert_eq!(udp.binding, PathBinding::default());
-    assert_eq!(udp.metadata.initial_jitter_ms, Some(5));
     assert_eq!(
-        udp.metadata.initial_rate,
+        tcp.port_hop_interval(),
+        Some(std::time::Duration::from_millis(45_000))
+    );
+    assert!(tcp.metadata.policy.backup);
+    assert!(!tcp.metadata.policy.expensive);
+    assert!(!tcp.metadata.policy.bulk_allowed);
+    assert!(tcp.metadata.policy.probe_only);
+    assert!(tcp.metadata.policy.no_udp);
+
+    let quic = concat!(
+        "quic://[2001:db8::1]:8443?",
+        "initial-rttvar-ms=0&",
+        "initial-rate-bps=100000000&",
+        "max-datagram-payload-bytes=1400"
+    )
+    .parse::<PathSpec>()
+    .expect("canonical QUIC path");
+    assert_eq!(quic.underlay, UnderlayProtocol::Udp);
+    assert_eq!(quic.endpoint.host, "2001:db8::1");
+    assert_eq!(quic.endpoint.ports().first(), 8443);
+    assert_eq!(quic.metadata.initial_jitter_ms, Some(0));
+    assert_eq!(
+        quic.metadata.initial_rate,
         RateHint::BitsPerSecond(100_000_000)
     );
-    assert_eq!(udp.metadata.max_datagram_payload_bytes, Some(1400));
+    assert_eq!(quic.metadata.max_datagram_payload_bytes, Some(1400));
+}
 
+#[test]
+fn carrier_endpoints_parse_canonical_fixed_and_ranged_ports() {
     let ranged_tcp = "tcp://example.com:111-222"
         .parse::<PathSpec>()
         .expect("ranged TCP carrier");
-    let ranged_udp = "udp://[2001:db8::2]:5000-5010"
+    let ranged_quic = "quic://[2001:db8::2]:5000-5010"
         .parse::<PathSpec>()
-        .expect("ranged UDP carrier");
+        .expect("ranged QUIC carrier");
+
     assert_eq!(ranged_tcp.endpoint.ports().first(), 111);
     assert_eq!(ranged_tcp.endpoint.ports().last(), 222);
     assert!(
@@ -71,119 +100,187 @@ fn path_specs_parse_tcp_and_udp() {
         assert_ne!(selected, current);
     }
     assert_eq!(ranged_tcp.endpoint.authority(), "example.com:111-222");
-    assert_eq!(ranged_udp.endpoint.ports().first(), 5000);
-    assert_eq!(ranged_udp.endpoint.ports().last(), 5010);
-    assert_eq!(ranged_udp.endpoint.authority(), "[2001:db8::2]:5000-5010");
+    assert_eq!(ranged_quic.endpoint.authority(), "[2001:db8::2]:5000-5010");
     assert_eq!(
-        ranged_udp.port_hop_interval(),
-        Some(std::time::Duration::from_millis(
-            DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS.into()
-        ))
-    );
-    assert_eq!(
-        ranged_tcp.port_hop_interval(),
+        ranged_quic.port_hop_interval(),
         Some(std::time::Duration::from_millis(
             DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS.into()
         ))
     );
     assert_eq!(
         ranged_tcp.tcp_carrier_range(),
-        Some(TcpCarrierRange::new(1, 3).expect("default range"))
-    );
-    assert_eq!(
-        TcpCarrierRange::new(1, 3).expect("obsolete minimum"),
-        TcpCarrierRange::new(3, 3).expect("same maximum"),
-        "obsolete MIN has no runtime meaning"
-    );
-
-    let ranged_udp_with_interval = "udp://example.com:5000-5010?port-hop-interval-ms=45000"
-        .parse::<PathSpec>()
-        .expect("ranged UDP carrier with migration interval");
-    assert_eq!(
-        ranged_udp_with_interval.port_hop_interval(),
-        Some(std::time::Duration::from_millis(45_000))
-    );
-
-    let ranged_tcp_with_policy =
-        "tcp://example.com:5000-5010?tcp-carriers=2-5&port-hop-interval-ms=45000"
-            .parse::<PathSpec>()
-            .expect("ranged TCP carrier policy");
-    assert_eq!(
-        ranged_tcp_with_policy.tcp_carrier_range(),
-        Some(TcpCarrierRange::new(2, 5).expect("configured range"))
-    );
-    assert_eq!(
-        ranged_tcp_with_policy.port_hop_interval(),
-        Some(std::time::Duration::from_millis(45_000))
+        Some(TcpCarrierRange::new(DEFAULT_TCP_CARRIER_MAX).expect("default limit"))
     );
 }
 
 #[test]
-fn path_specs_reject_ambiguous_values() {
-    assert!("example.com:443".parse::<PathSpec>().is_err());
-    assert!("tcp://example.com".parse::<PathSpec>().is_err());
-    assert!("udp://example.com:0".parse::<PathSpec>().is_err());
+fn canonical_initial_rate_forms_are_exact_and_mutually_exclusive() {
+    for (query, expected) in [
+        ("initial-rate-bps=7", RateHint::BitsPerSecond(7)),
+        ("initial-rate-kbps=7", RateHint::BitsPerSecond(7_000)),
+        ("initial-rate-mbps=7", RateHint::BitsPerSecond(7_000_000)),
+        ("initial-rate=unknown", RateHint::Unknown),
+        ("initial-rate=unlimited", RateHint::Unlimited),
+    ] {
+        let path = format!("tcp://example.com:443?{query}")
+            .parse::<PathSpec>()
+            .expect("canonical rate form");
+        assert_eq!(path.metadata.initial_rate, expected, "{query}");
+    }
+
     for invalid in [
+        "initial-rate-bps=0",
+        "initial-rate-kbps=0",
+        "initial-rate-mbps=0",
+        "initial-rate=7",
+        "initial-rate-mbps=18446744073710",
+        "initial-rate-bps=1&initial-rate=unlimited",
+        "initial-rate-kbps=1&initial-rate-mbps=1",
+    ] {
+        assert!(
+            format!("tcp://example.com:443?{invalid}")
+                .parse::<PathSpec>()
+                .is_err(),
+            "invalid rate must be rejected: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn path_specs_reject_noncanonical_schemes_hosts_and_ports() {
+    for invalid in [
+        "example.com:443",
+        "udp://example.com:443",
+        "UDP://example.com:443",
+        "tcp://example.com",
+        "quic://example.com:0",
+        "tcp://example.com:0443",
+        "tcp://example.com:+443",
         "tcp://example.com:0-10",
         "tcp://example.com:222-111",
         "tcp://example.com:443-443",
         "tcp://example.com:443-",
         "tcp://example.com:-444",
+        "tcp://example.com:443-0444",
         "tcp://example.com:443-444-445",
-        "udp://2001:db8::1:443-444",
-        "tcp://example.com:443?port-hop-interval-ms=300000",
-        "udp://example.com:443?port-hop-interval-ms=300000",
-        "udp://example.com:443-444?port-hop-interval-ms=4999",
-        "udp://example.com:443-444?port-hop-interval-ms=5000&port-hop-interval-ms=6000",
-        "udp://example.com:443-444?tcp-carriers=1-3",
-        "tcp://example.com:443?tcp-carriers=0-3",
-        "tcp://example.com:443?tcp-carriers=4-3",
-        "tcp://example.com:443?tcp-carriers=1",
-        "tcp://example.com:443?tcp-carriers=1-3-5",
-        "tcp://example.com:443?tcp-carriers=1-3&tcp-carriers=1-3",
+        "quic://2001:db8::1:443-444",
+        "quic://[example.com]:443",
+        "quic://[2001:db8::1:443",
+        "quic://2001:db8::1]:443",
+        " tcp://example.com:443",
+        "tcp://example.com:443 ",
     ] {
         assert!(
             invalid.parse::<PathSpec>().is_err(),
-            "ambiguous carrier endpoint must be rejected: {invalid}"
+            "noncanonical carrier endpoint must be rejected: {invalid}"
         );
     }
     assert!("example.com:443-444".parse::<Endpoint>().is_err());
-    assert!("tcp://example.com:443?".parse::<PathSpec>().is_err());
-    assert!(
-        "tcp://example.com:443?unknown=true"
-            .parse::<PathSpec>()
-            .is_err()
-    );
-    assert!(
-        "tcp://example.com:443?source-ip=not-an-ip"
-            .parse::<PathSpec>()
-            .is_err()
-    );
-    assert!(
-        "tcp://example.com:443?source-ip=192.0.2.1&source-ip=192.0.2.2"
-            .parse::<PathSpec>()
-            .is_err()
-    );
-    assert!(
-        "udp://example.com:443?no-udp=true"
-            .parse::<PathSpec>()
-            .is_err()
-    );
-    assert!(
-        "udp://example.com:443?datagram-payload-limit=100"
-            .parse::<PathSpec>()
-            .is_err()
-    );
+}
+
+#[test]
+fn path_options_reject_missing_invalid_duplicate_and_inapplicable_values() {
+    for invalid in [
+        "tcp://example.com:443?",
+        "tcp://example.com:443?&backup=true",
+        "tcp://example.com:443?unknown=true",
+        "tcp://example.com:443?source-address=not-an-ip",
+        "tcp://example.com:443?initial-srtt-ms=0",
+        "tcp://example.com:443?max-tcp-carriers=0",
+        "tcp://example.com:443?max-tcp-carriers=65536",
+        "tcp://example.com:443?max-tcp-carriers=1-3",
+        "tcp://example.com:443?max-datagram-payload-bytes=1400",
+        "quic://example.com:443?max-tcp-carriers=3",
+        "quic://example.com:443?allow-datagrams=true",
+        "quic://example.com:443?allow-datagrams=false",
+        "quic://example.com:443?max-datagram-payload-bytes=511",
+        "quic://example.com:443?max-datagram-payload-bytes=65001",
+        "tcp://example.com:443?port-rotation-interval-ms=300000",
+        "quic://example.com:443?port-rotation-interval-ms=300000",
+        "quic://example.com:443-444?port-rotation-interval-ms=4999",
+    ] {
+        assert!(
+            invalid.parse::<PathSpec>().is_err(),
+            "invalid or ineffective option must be rejected: {invalid}"
+        );
+    }
+
+    for boolean in [
+        "backup",
+        "expensive",
+        "allow-bulk",
+        "control-only",
+        "allow-datagrams",
+    ] {
+        assert!(
+            format!("tcp://example.com:443?{boolean}")
+                .parse::<PathSpec>()
+                .is_err(),
+            "Boolean values must be explicit: {boolean}"
+        );
+        assert!(
+            format!("tcp://example.com:443?{boolean}=yes")
+                .parse::<PathSpec>()
+                .is_err(),
+            "Boolean values must be true or false: {boolean}"
+        );
+        assert!(
+            format!("tcp://example.com:443?{boolean}=true&{boolean}=false")
+                .parse::<PathSpec>()
+                .is_err(),
+            "duplicate Boolean option must be rejected: {boolean}"
+        );
+    }
+
+    for duplicate in [
+        "source-address=192.0.2.1&source-address=192.0.2.2",
+        "initial-srtt-ms=1&initial-srtt-ms=2",
+        "initial-rttvar-ms=1&initial-rttvar-ms=2",
+        "max-datagram-payload-bytes=1200&max-datagram-payload-bytes=1300",
+        "max-tcp-carriers=1&max-tcp-carriers=2",
+        "port-rotation-interval-ms=5000&port-rotation-interval-ms=6000",
+    ] {
+        let scheme = if duplicate.starts_with("max-datagram") {
+            "quic"
+        } else {
+            "tcp"
+        };
+        let endpoint = if duplicate.starts_with("port-rotation") {
+            "example.com:443-444"
+        } else {
+            "example.com:443"
+        };
+        assert!(
+            format!("{scheme}://{endpoint}?{duplicate}")
+                .parse::<PathSpec>()
+                .is_err(),
+            "duplicate option must be rejected: {duplicate}"
+        );
+    }
+}
+
+#[test]
+fn legacy_path_grammar_is_rejected() {
     for legacy in [
+        "source-ip=192.0.2.1",
+        "srtt-ms=20",
+        "jitter-ms=5",
+        "rate-bps=1000",
+        "rate-kbps=1000",
+        "rate-mbps=100",
+        "rate=unknown",
+        "datagram-payload-limit=1400",
+        "tcp-carriers=1-3",
+        "port-hop-interval-ms=5000",
+        "bulk-allowed=false",
+        "probe-only=true",
+        "no-udp=true",
         "rtt-ms=20",
         "mtu=1400",
         "mtu-bytes=1400",
         "payload-mtu=1400",
         "bulk=true",
         "no-bulk=true",
-        "backup=1",
-        "backup=yes",
-        "backup=on",
     ] {
         assert!(
             format!("tcp://example.com:443?{legacy}")
@@ -192,19 +289,4 @@ fn path_specs_reject_ambiguous_values() {
             "legacy carrier option must be rejected: {legacy}"
         );
     }
-    assert!(
-        "tcp://example.com:443?unsupported=true"
-            .parse::<PathSpec>()
-            .is_err()
-    );
-    assert!(
-        "udp://example.com:443?unsupported=true"
-            .parse::<PathSpec>()
-            .is_err()
-    );
-    assert!(
-        "udp://example.com:443?profile=experimental"
-            .parse::<PathSpec>()
-            .is_err()
-    );
 }

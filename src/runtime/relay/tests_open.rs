@@ -67,7 +67,7 @@ fn attachment_refusal_does_not_classify_the_carrier_as_failed() {
 
 #[test]
 fn cold_quic_attachment_budget_covers_serialized_setup_exchanges() {
-    let path = "udp://127.0.0.1:11095"
+    let path = "quic://127.0.0.1:11095"
         .parse::<PathSpec>()
         .expect("UDP path");
     let context =
@@ -150,7 +150,7 @@ fn dropping_initial_open_attempt_rolls_back_scheduler_load() {
 
 #[test]
 fn dropping_pending_attachment_releases_load_before_stream_cleanup() {
-    let path = "udp://127.0.0.1:11097"
+    let path = "quic://127.0.0.1:11097"
         .parse::<PathSpec>()
         .expect("udp path");
     let context =
@@ -181,10 +181,10 @@ fn dropping_pending_attachment_releases_load_before_stream_cleanup() {
 fn initial_open_retry_uses_fresh_stream_id() {
     let context = ClientPathContext::new(
         vec![
-            "tcp://127.0.0.1:10132?srtt-ms=20&rate-mbps=100"
+            "tcp://127.0.0.1:10132?initial-srtt-ms=20&initial-rate-mbps=100"
                 .parse()
                 .expect("first path"),
-            "tcp://127.0.0.1:10133?srtt-ms=80&rate-mbps=200"
+            "tcp://127.0.0.1:10133?initial-srtt-ms=80&initial-rate-mbps=200"
                 .parse()
                 .expect("second path"),
         ],

@@ -39,10 +39,10 @@ fn automatic_bulk_use_honors_every_operator_policy() {
     for query in [
         "expensive=true",
         "backup=true",
-        "probe-only=true",
-        "bulk-allowed=false",
+        "control-only=true",
+        "allow-bulk=false",
     ] {
-        let path = format!("udp://127.0.0.1:10002?{query}")
+        let path = format!("quic://127.0.0.1:10002?{query}")
             .parse::<PathSpec>()
             .expect("policy path");
         assert!(
@@ -66,7 +66,7 @@ fn automatic_bulk_use_honors_every_operator_policy() {
 
 #[test]
 fn path_snapshot_preserves_rate_provenance() {
-    let tcp = "tcp://127.0.0.1:10000?rate-mbps=400"
+    let tcp = "tcp://127.0.0.1:10000?initial-rate-mbps=400"
         .parse::<PathSpec>()
         .expect("TCP path");
     let product = ClientPathObservation {
@@ -117,7 +117,7 @@ fn path_snapshot_preserves_rate_provenance() {
 
 #[test]
 fn path_snapshot_preserves_app_limited_provenance_with_active_flight() {
-    let udp = "udp://127.0.0.1:10000"
+    let udp = "quic://127.0.0.1:10000"
         .parse::<PathSpec>()
         .expect("UDP path");
     let snapshot = path_snapshot(
@@ -140,7 +140,7 @@ fn path_snapshot_preserves_app_limited_provenance_with_active_flight() {
 
 #[test]
 fn native_carrier_evidence_is_post_attachment_fresh_and_ack_derived() {
-    let udp = "udp://127.0.0.1:10000"
+    let udp = "quic://127.0.0.1:10000"
         .parse::<PathSpec>()
         .expect("UDP path");
     let now = Instant::now();

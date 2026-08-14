@@ -50,7 +50,7 @@ fn socks_udp_classifies_once_per_cached_target() {
     };
     let context = |port: u16| {
         ClientPathContext::new(
-            vec![format!("udp://127.0.0.1:{port}").parse().expect("path")],
+            vec![format!("quic://127.0.0.1:{port}").parse().expect("path")],
             security(),
             ResourceLimits::default(),
         )

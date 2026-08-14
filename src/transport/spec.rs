@@ -5,6 +5,7 @@
 
 pub use crate::model::path::PathPolicy;
 use crate::protocol::UnderlayProtocol;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 use std::str::FromStr;
@@ -14,20 +15,37 @@ pub const DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 pub const MIN_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 1_000;
 pub const DEFAULT_TCP_CARRIER_MAX: u16 = 3;
 
+/// Complete public query-key vocabulary accepted by carrier path URIs.
+pub const CARRIER_PATH_QUERY_KEYS: &[&str] = &[
+    "source-address",
+    "initial-srtt-ms",
+    "initial-rttvar-ms",
+    "initial-rate-bps",
+    "initial-rate-kbps",
+    "initial-rate-mbps",
+    "initial-rate",
+    "max-datagram-payload-bytes",
+    "max-tcp-carriers",
+    "port-rotation-interval-ms",
+    "backup",
+    "expensive",
+    "allow-bulk",
+    "control-only",
+    "allow-datagrams",
+];
+
 /// Local concurrency target for one configured TCP endpoint.
 ///
-/// The accepted `MIN-MAX` syntax retains the obsolete `MIN` value only as a
-/// validated grammar position. It has no runtime or protocol semantics. Each
-/// of the `MAX` members is an independently authenticated carrier; Section 7.2
-/// of `RFC.md` defines its directional usage.
+/// Each member is an independently authenticated carrier; Section 7.2 of
+/// `RFC.md` defines its directional usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCarrierRange {
     max: u16,
 }
 
 impl TcpCarrierRange {
-    pub fn new(obsolete_min: u16, max: u16) -> Result<Self, TcpCarrierRangeError> {
-        if obsolete_min == 0 || obsolete_min > max {
+    pub fn new(max: u16) -> Result<Self, TcpCarrierRangeError> {
+        if max == 0 {
             return Err(TcpCarrierRangeError);
         }
         Ok(Self { max })
@@ -51,9 +69,7 @@ pub struct TcpCarrierRangeError;
 
 impl std::fmt::Display for TcpCarrierRangeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(
-            "TCP carrier range must satisfy 1 <= MIN <= MAX <= 65535; MIN is obsolete and ignored",
-        )
+        formatter.write_str("maximum TCP carriers must be in 1..=65535")
     }
 }
 
@@ -255,15 +271,20 @@ impl FromStr for CarrierEndpoint {
     type Err = CarrierEndpointParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.trim();
         if value.is_empty() {
             return Err(CarrierEndpointParseError::Empty);
+        }
+        if value.trim() != value {
+            return Err(CarrierEndpointParseError::InvalidHost);
         }
 
         if let Some(rest) = value.strip_prefix('[') {
             let Some((host, tail)) = rest.split_once(']') else {
                 return Err(CarrierEndpointParseError::InvalidIpv6);
             };
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(CarrierEndpointParseError::InvalidIpv6);
+            }
             let Some(ports) = tail.strip_prefix(':') else {
                 return Err(CarrierEndpointParseError::MissingPort);
             };
@@ -275,6 +296,9 @@ impl FromStr for CarrierEndpoint {
         };
         if host.contains(':') {
             return Err(CarrierEndpointParseError::InvalidIpv6);
+        }
+        if host.contains(['[', ']']) || host.chars().any(char::is_whitespace) {
+            return Err(CarrierEndpointParseError::InvalidHost);
         }
         Self::new(host, parse_carrier_ports(ports)?)
     }
@@ -362,25 +386,32 @@ impl FromStr for PathSpec {
         };
         let underlay = match scheme {
             "tcp" => UnderlayProtocol::Tcp,
-            "udp" => UnderlayProtocol::Udp,
+            "quic" => UnderlayProtocol::Udp,
             _ => return Err(PathSpecParseError::UnknownScheme(scheme.to_string())),
         };
         let (endpoint, query) = path
             .split_once('?')
             .map_or((path, None), |(endpoint, query)| (endpoint, Some(query)));
         let endpoint: CarrierEndpoint = endpoint.parse()?;
-        let (binding, metadata) = match query {
+        let (binding, metadata, options) = match query {
             Some(query) => parse_path_options(query)?,
-            None => (PathBinding::default(), PathMetadata::default()),
+            None => (
+                PathBinding::default(),
+                PathMetadata::default(),
+                PathOptionPresence::default(),
+            ),
         };
-        if underlay == UnderlayProtocol::Udp && metadata.policy.no_udp {
-            return Err(PathSpecParseError::NoUdpOnUdpPath);
+        if underlay == UnderlayProtocol::Udp && options.allow_datagrams {
+            return Err(PathSpecParseError::AllowDatagramsRequiresTcpPath);
         }
         if underlay != UnderlayProtocol::Tcp && metadata.tcp_carriers.is_some() {
-            return Err(PathSpecParseError::TcpCarriersRequireTcpPath);
+            return Err(PathSpecParseError::MaxTcpCarriersRequiresTcpPath);
+        }
+        if underlay != UnderlayProtocol::Udp && metadata.max_datagram_payload_bytes.is_some() {
+            return Err(PathSpecParseError::MaxDatagramPayloadRequiresQuicPath);
         }
         if metadata.port_hop_interval_ms.is_some() && endpoint.ports().is_single() {
-            return Err(PathSpecParseError::PortHopIntervalRequiresRangedPath);
+            return Err(PathSpecParseError::PortRotationIntervalRequiresRangedPath);
         }
         Ok(Self {
             underlay,
@@ -391,19 +422,22 @@ impl FromStr for PathSpec {
     }
 }
 
-fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSpecParseError> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PathOptionPresence {
+    allow_datagrams: bool,
+}
+
+fn parse_path_options(
+    query: &str,
+) -> Result<(PathBinding, PathMetadata, PathOptionPresence), PathSpecParseError> {
     if query.is_empty() {
         return Err(PathSpecParseError::EmptyQuery);
     }
     let mut binding = PathBinding::default();
     let mut metadata = PathMetadata::default();
-    let mut source_ip_set = false;
-    let mut srtt_set = false;
-    let mut jitter_set = false;
+    let mut options = PathOptionPresence::default();
+    let mut seen = HashSet::new();
     let mut rate_set = false;
-    let mut datagram_payload_limit_set = false;
-    let mut tcp_carriers_set = false;
-    let mut port_hop_interval_set = false;
     for part in query.split('&') {
         if part.is_empty() {
             return Err(PathSpecParseError::EmptyQueryParam);
@@ -411,46 +445,42 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
         let (key, value) = part
             .split_once('=')
             .map_or((part, None), |(key, value)| (key, Some(value)));
+        reject_duplicate(!seen.insert(key), key)?;
         match key {
-            "source-ip" => {
-                reject_duplicate(source_ip_set, key)?;
-                source_ip_set = true;
+            "source-address" => {
                 binding.source_ip = Some(parse_ip_param(key, value)?);
             }
-            "srtt-ms" => {
-                reject_duplicate(srtt_set, key)?;
-                srtt_set = true;
-                metadata.initial_srtt_ms = Some(parse_u32_param(key, value)?);
+            "initial-srtt-ms" => {
+                metadata.initial_srtt_ms = Some(parse_nonzero_u32_param(key, value)?);
             }
-            "jitter-ms" => {
-                reject_duplicate(jitter_set, key)?;
-                jitter_set = true;
+            "initial-rttvar-ms" => {
                 metadata.initial_jitter_ms = Some(parse_u32_param(key, value)?);
             }
-            "rate-bps" => {
+            "initial-rate-bps" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
-                metadata.initial_rate = RateHint::BitsPerSecond(parse_u64_param(key, value)?);
+                metadata.initial_rate =
+                    RateHint::BitsPerSecond(parse_nonzero_u64_param(key, value)?);
             }
-            "rate-kbps" => {
+            "initial-rate-kbps" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
                 metadata.initial_rate = RateHint::BitsPerSecond(
-                    parse_u64_param(key, value)?
+                    parse_nonzero_u64_param(key, value)?
                         .checked_mul(1_000)
                         .ok_or(PathSpecParseError::QueryParamOverflow(key.to_string()))?,
                 );
             }
-            "rate-mbps" => {
+            "initial-rate-mbps" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
                 metadata.initial_rate = RateHint::BitsPerSecond(
-                    parse_u64_param(key, value)?
+                    parse_nonzero_u64_param(key, value)?
                         .checked_mul(1_000_000)
                         .ok_or(PathSpecParseError::QueryParamOverflow(key.to_string()))?,
                 );
             }
-            "rate" => {
+            "initial-rate" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
                 metadata.initial_rate = match value
@@ -466,31 +496,28 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
                     }
                 };
             }
-            "datagram-payload-limit" => {
-                reject_duplicate(datagram_payload_limit_set, key)?;
-                datagram_payload_limit_set = true;
+            "max-datagram-payload-bytes" => {
                 metadata.max_datagram_payload_bytes =
                     Some(parse_datagram_payload_limit(key, value)?);
             }
-            "tcp-carriers" => {
-                reject_duplicate(tcp_carriers_set, key)?;
-                tcp_carriers_set = true;
-                metadata.tcp_carriers = Some(parse_tcp_carrier_range(key, value)?);
+            "max-tcp-carriers" => {
+                metadata.tcp_carriers = Some(parse_tcp_carrier_limit(key, value)?);
             }
-            "port-hop-interval-ms" => {
-                reject_duplicate(port_hop_interval_set, key)?;
-                port_hop_interval_set = true;
+            "port-rotation-interval-ms" => {
                 metadata.port_hop_interval_ms = Some(parse_port_hop_interval(key, value)?);
             }
             "backup" => metadata.policy.backup = parse_bool_param(key, value)?,
             "expensive" => metadata.policy.expensive = parse_bool_param(key, value)?,
-            "bulk-allowed" => metadata.policy.bulk_allowed = parse_bool_param(key, value)?,
-            "probe-only" => metadata.policy.probe_only = parse_bool_param(key, value)?,
-            "no-udp" => metadata.policy.no_udp = parse_bool_param(key, value)?,
+            "allow-bulk" => metadata.policy.bulk_allowed = parse_bool_param(key, value)?,
+            "control-only" => metadata.policy.probe_only = parse_bool_param(key, value)?,
+            "allow-datagrams" => {
+                options.allow_datagrams = true;
+                metadata.policy.no_udp = !parse_bool_param(key, value)?;
+            }
             _ => return Err(PathSpecParseError::UnknownQueryParam(key.to_string())),
         }
     }
-    Ok((binding, metadata))
+    Ok((binding, metadata, options))
 }
 
 fn reject_duplicate(seen: bool, key: &str) -> Result<(), PathSpecParseError> {
@@ -520,6 +547,28 @@ fn parse_u64_param(key: &str, value: Option<&str>) -> Result<u64, PathSpecParseE
     value
         .parse::<u64>()
         .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
+}
+
+fn parse_nonzero_u32_param(key: &str, value: Option<&str>) -> Result<u32, PathSpecParseError> {
+    let parsed = parse_u32_param(key, value)?;
+    if parsed == 0 {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            parsed.to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_nonzero_u64_param(key: &str, value: Option<&str>) -> Result<u64, PathSpecParseError> {
+    let parsed = parse_u64_param(key, value)?;
+    if parsed == 0 {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            parsed.to_string(),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_datagram_payload_limit(
@@ -552,35 +601,20 @@ fn parse_port_hop_interval(key: &str, value: Option<&str>) -> Result<u32, PathSp
     Ok(interval)
 }
 
-fn parse_tcp_carrier_range(
+fn parse_tcp_carrier_limit(
     key: &str,
     value: Option<&str>,
 ) -> Result<TcpCarrierRange, PathSpecParseError> {
     let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
-    let Some((obsolete_min, max)) = value.split_once('-') else {
-        return Err(PathSpecParseError::InvalidQueryParamValue(
-            key.to_string(),
-            value.to_string(),
-        ));
-    };
-    if obsolete_min.is_empty() || max.is_empty() || max.contains('-') {
-        return Err(PathSpecParseError::InvalidQueryParamValue(
-            key.to_string(),
-            value.to_string(),
-        ));
-    }
-    let obsolete_min = obsolete_min.parse::<u16>().map_err(|_| {
+    let max = value.parse::<u16>().map_err(|_| {
         PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
     })?;
-    let max = max.parse::<u16>().map_err(|_| {
-        PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
-    })?;
-    TcpCarrierRange::new(obsolete_min, max)
+    TcpCarrierRange::new(max)
         .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
 }
 
 fn parse_bool_param(key: &str, value: Option<&str>) -> Result<bool, PathSpecParseError> {
-    match value.unwrap_or("true") {
+    match value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))? {
         "true" => Ok(true),
         "false" => Ok(false),
         value => Err(PathSpecParseError::InvalidQueryParamValue(
@@ -616,6 +650,12 @@ fn parse_carrier_ports(value: &str) -> Result<CarrierPortSet, CarrierEndpointPar
 }
 
 fn parse_carrier_port(value: &str) -> Result<u16, CarrierEndpointParseError> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(CarrierEndpointParseError::InvalidPort);
+    }
     let port = value
         .parse::<u16>()
         .map_err(|_| CarrierEndpointParseError::InvalidPort)?;
@@ -654,6 +694,7 @@ pub enum CarrierEndpointParseError {
     EmptyHost,
     MissingPort,
     InvalidIpv6,
+    InvalidHost,
     InvalidPort,
     InvalidPortRange,
     NonCanonicalPortRange,
@@ -668,6 +709,7 @@ impl std::fmt::Display for CarrierEndpointParseError {
             Self::InvalidIpv6 => {
                 formatter.write_str("IPv6 carrier endpoint must use [addr]:port syntax")
             }
+            Self::InvalidHost => formatter.write_str("carrier endpoint host is invalid"),
             Self::InvalidPort => formatter.write_str("carrier endpoint port must be in 1..=65535"),
             Self::InvalidPortRange => formatter.write_str(
                 "carrier endpoint port range must be an ascending START-END in 1..=65535",
@@ -693,9 +735,10 @@ pub enum PathSpecParseError {
     InvalidQueryParamValue(String, String),
     DuplicateQueryParam(String),
     QueryParamOverflow(String),
-    NoUdpOnUdpPath,
-    TcpCarriersRequireTcpPath,
-    PortHopIntervalRequiresRangedPath,
+    AllowDatagramsRequiresTcpPath,
+    MaxDatagramPayloadRequiresQuicPath,
+    MaxTcpCarriersRequiresTcpPath,
+    PortRotationIntervalRequiresRangedPath,
 }
 
 impl From<CarrierEndpointParseError> for PathSpecParseError {
@@ -709,7 +752,7 @@ impl std::fmt::Display for PathSpecParseError {
         match self {
             Self::MissingScheme => write!(
                 f,
-                "path must use tcp://host:PORT[-END] or udp://host:PORT[-END]"
+                "path must use tcp://host:PORT[-END] or quic://host:PORT[-END]"
             ),
             Self::UnknownScheme(scheme) => write!(f, "unknown path scheme {scheme:?}"),
             Self::Endpoint(err) => write!(f, "{err}"),
@@ -731,12 +774,27 @@ impl std::fmt::Display for PathSpecParseError {
             Self::QueryParamOverflow(key) => {
                 write!(f, "path query parameter {key:?} is too large")
             }
-            Self::NoUdpOnUdpPath => write!(f, "udp:// paths cannot set no-udp=true"),
-            Self::TcpCarriersRequireTcpPath => {
-                write!(f, "tcp-carriers requires a tcp:// carrier endpoint")
+            Self::AllowDatagramsRequiresTcpPath => {
+                write!(
+                    f,
+                    "allow-datagrams is valid only for tcp:// carrier endpoints"
+                )
             }
-            Self::PortHopIntervalRequiresRangedPath => {
-                write!(f, "port-hop-interval-ms requires a ranged carrier endpoint")
+            Self::MaxDatagramPayloadRequiresQuicPath => write!(
+                f,
+                "max-datagram-payload-bytes is valid only for quic:// carrier endpoints"
+            ),
+            Self::MaxTcpCarriersRequiresTcpPath => {
+                write!(
+                    f,
+                    "max-tcp-carriers is valid only for tcp:// carrier endpoints"
+                )
+            }
+            Self::PortRotationIntervalRequiresRangedPath => {
+                write!(
+                    f,
+                    "port-rotation-interval-ms requires a ranged carrier endpoint"
+                )
             }
         }
     }

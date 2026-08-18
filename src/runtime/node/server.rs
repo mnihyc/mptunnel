@@ -251,7 +251,7 @@ pub(super) fn new_identity_runtime_with_metadata(
             let reliable_stream_port = reliable_streams.path_port().with_target_admission(
                 Arc::new(move |permit, target| {
                     outbound::validate_target(target)?;
-                    match admission_router.route_mpp_tcp(
+                    match admission_router.preflight_mpp_tcp(
                         target,
                         permit.principal().clone(),
                         admission_inbound.clone(),

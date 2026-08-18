@@ -292,6 +292,10 @@ Logging starts with the running version, configuration source, safe inbound and
 outbound inventory, bound listeners, runtime readiness, and shutdown. The
 default UTC text format is readable at a terminal; newline-delimited JSON,
 append-only files, and sanitized opt-in flow summaries are also supported.
+Set `level = "debug"` to see one correlated, scope-separated trace showing what
+each L4 inbound accepted, which route and optional balancer were selected, and
+each configured outbound attempt and result. UDP is traced per logical
+association; packets and physical MPP carrier internals are not logged.
 One bounded background HTTPS check reports the newest published GitHub release
 without delaying startup or forwarding; an available update includes its
 release-page URL.

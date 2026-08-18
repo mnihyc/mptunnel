@@ -80,6 +80,11 @@ variable—resolve beside the selected TOML file. The bundled
 every TOML section, material source, DNS protocol, and carrier URI option. Run
 `./mptunnel --help` for the simple CLI surface.
 
+For an immediate connection trace, set `level = "debug"` in `[logging]` or use
+`--log-level debug`. The correlated records show inbound acceptance, routing,
+optional balancing, and configured outbound results without logging
+packets or physical MPP carrier internals.
+
 ## Service helpers
 
 Linux archives include `service/systemd/mptunnel.service`. It expects:
@@ -120,6 +125,13 @@ must establish the TUN descriptor, bind carrier sockets to the selected
 network, protect every carrier, target, proxy, and DNS socket before I/O, and
 use external TUN host mode. Low-level host-provider APIs reject process-managed
 TUN mode because they do not own OS route/DNS publication.
+
+The JNI start contract is `nativeStart(String, SocketProtector,
+MptunnelLogSink, long): boolean`. `MptunnelLogSink.log(String level, String
+message)` receives each already-filtered, redacted, bounded, and rendered
+record once; the callback replaces stderr delivery in the embedded runtime.
+Hosts should expose `[logging].level` with its ordinary `info` default and the
+supported `off`, `error`, `warn`, `info`, and `debug` values.
 
 ## Downloads
 

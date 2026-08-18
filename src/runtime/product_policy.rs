@@ -5,8 +5,8 @@ use crate::outbound::{
 };
 use crate::product::{
     DnsPlanId, DnsSyntheticCaptureId, EgressAction, FlowContext, InboundId, InitialDemand, Network,
-    PrincipalId, ProductPolicyGeneration, ProtocolTarget, RouteAuthorizationError, RoutePermit,
-    SourceEndpoint,
+    PrincipalId, ProductPolicyGeneration, ProtocolTarget, RouteAuthorizationError,
+    RouteDisposition, RoutePermit, RuleId, SourceEndpoint,
 };
 use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
@@ -51,6 +51,7 @@ pub(in crate::runtime) struct ClientOutboundPlan {
     authorizer: ProductFlowDestinationAuthorizer,
     authorization: DestinationAuthorization,
     recovered_dns: Option<SyntheticCaptureRoute>,
+    debug_connection_id: Option<crate::observability::DebugConnectionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,9 @@ impl RecoveredTunTarget {
 }
 
 struct DestinationRouteGroup {
+    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    rule_id: RuleId,
+    disposition: RouteDisposition,
     selection: EgressSelection,
     destination: ProductDestination,
     dns_plan: Option<DnsPlanId>,
@@ -100,6 +104,7 @@ impl ClientOutboundPlan {
         let groups = self.destination_route_groups(Network::Tcp).await?;
         let mut last_error = None;
         for group in groups {
+            self.emit_routing_selected(&group);
             let request = ProductOpenRequest {
                 pending: &pending,
                 selection: &group.selection,
@@ -107,6 +112,7 @@ impl ClientOutboundPlan {
                 authorizer: &self.authorizer,
                 dns_plan: group.dns_plan.as_ref(),
                 traffic_class: group.traffic_class,
+                debug_connection_id: group.debug_connection_id,
             };
             let opened = match self.origin {
                 RouteOrigin::Local => self.registry.open_product_tcp(request).await,
@@ -114,6 +120,7 @@ impl ClientOutboundPlan {
             };
             match opened {
                 Ok((opened, outbound)) => {
+                    self.emit_inbound_established();
                     return Ok(opened.with_product_flow(pending.commit(outbound)));
                 }
                 Err(error) => last_error = Some(error),
@@ -138,6 +145,7 @@ impl ClientOutboundPlan {
         let groups = self.destination_route_groups(Network::Udp).await?;
         let mut last_error = None;
         for group in groups {
+            self.emit_routing_selected(&group);
             let request = ProductOpenRequest {
                 pending: &pending,
                 selection: &group.selection,
@@ -145,6 +153,7 @@ impl ClientOutboundPlan {
                 authorizer: &self.authorizer,
                 dns_plan: group.dns_plan.as_ref(),
                 traffic_class: group.traffic_class,
+                debug_connection_id: group.debug_connection_id,
             };
             let opened = match self.origin {
                 RouteOrigin::Local => self.registry.open_product_udp(request).await,
@@ -152,6 +161,7 @@ impl ClientOutboundPlan {
             };
             match opened {
                 Ok((opened, outbound)) => {
+                    self.emit_inbound_established();
                     return Ok(opened.with_product_flow(pending.commit(outbound)));
                 }
                 Err(error) => last_error = Some(error),
@@ -188,6 +198,9 @@ impl ClientOutboundPlan {
                 .authorize_domain(self.authorization.clone())
                 .map_err(map_destination_authorization_error)?;
             return Ok(vec![DestinationRouteGroup {
+                debug_connection_id: self.debug_connection_id,
+                rule_id: permit.rule_id().clone(),
+                disposition: permit.action().disposition(),
                 selection,
                 destination: ProductDestination::domain(domain),
                 dns_plan,
@@ -210,28 +223,29 @@ impl ClientOutboundPlan {
         .map_err(RuntimeError::OutboundConnect)?;
         let resolution_dns_plan = resolved.plan;
         let origin = self.origin;
-        let authorized = self
-            .authorizer
-            .policy
-            .authorize_resolution(
-                self.authorization.decision.clone(),
-                &resolved.addresses,
-                |action, address| {
-                    if let (Some(selected), Some(resolved)) =
-                        (action.dns_plan(), resolution_dns_plan.as_ref())
-                        && selected != resolved
-                    {
-                        return false;
-                    }
-                    let Some(egress) = action.egress() else {
-                        return true;
-                    };
-                    (origin != RouteOrigin::Mpp || self.registry.action_is_native_egress(egress))
-                        && self.registry.action_supports_ip_family(egress, address)
-                },
-            )
-            .map_err(map_route_authorization_error)?
-            .into_targets();
+        let authorized = match self.authorizer.policy.authorize_resolution(
+            self.authorization.decision.clone(),
+            &resolved.addresses,
+            |action, address| {
+                if let (Some(selected), Some(resolved)) =
+                    (action.dns_plan(), resolution_dns_plan.as_ref())
+                    && selected != resolved
+                {
+                    return false;
+                }
+                let Some(egress) = action.egress() else {
+                    return true;
+                };
+                (origin != RouteOrigin::Mpp || self.registry.action_is_native_egress(egress))
+                    && self.registry.action_supports_ip_family(egress, address)
+            },
+        ) {
+            Ok(authorized) => authorized.into_targets(),
+            Err(error) => {
+                self.emit_routing_terminal_error(&error);
+                return Err(map_route_authorization_error(error));
+            }
+        };
 
         let mut groups: Vec<PendingRouteGroup> = Vec::new();
         for target in authorized {
@@ -254,6 +268,9 @@ impl ClientOutboundPlan {
             .into_iter()
             .map(|group| {
                 Ok(DestinationRouteGroup {
+                    debug_connection_id: self.debug_connection_id,
+                    rule_id: group.permit.rule_id().clone(),
+                    disposition: group.permit.action().disposition(),
                     selection: group.selection,
                     destination: ProductDestination::resolved(group.authorized)?,
                     dns_plan: group.dns_plan,
@@ -327,6 +344,87 @@ impl ClientOutboundPlan {
             )));
         }
         Ok(Some(recovered.plan.clone()))
+    }
+
+    fn emit_inbound_established(&self) {
+        emit_inbound_debug_for_flow(
+            self.debug_connection_id,
+            crate::observability::InboundDebugEvent::Established,
+            self.authorizer.flow.as_ref(),
+        );
+    }
+
+    fn emit_routing_selected(&self, group: &DestinationRouteGroup) {
+        if group.debug_connection_id.is_none() {
+            return;
+        }
+        let egress = match &group.selection {
+            EgressSelection::Outbound(outbound) => format!("outbound:{}", outbound.as_str()),
+            EgressSelection::Balancer(balancer) => format!("balancer:{}", balancer.as_str()),
+        };
+        let decision = match group.disposition {
+            RouteDisposition::Allow => "allow",
+            RouteDisposition::AllowRestricted => "allow-restricted",
+            RouteDisposition::Reject => "reject",
+            RouteDisposition::Drop => "drop",
+        };
+        debug_assert!(matches!(
+            group.disposition,
+            RouteDisposition::Allow | RouteDisposition::AllowRestricted
+        ));
+        let flow = self.authorizer.flow.as_ref();
+        let destination = flow.target().authority();
+        crate::observability::emit_routing_debug(
+            group.debug_connection_id,
+            crate::observability::RoutingDebugEvent::Selected,
+            debug_network_label(flow.network()),
+            Some(group.rule_id.as_str()),
+            decision,
+            Some(&egress),
+            &destination,
+        );
+    }
+
+    fn emit_routing_terminal_error(&self, error: &RouteAuthorizationError) {
+        emit_product_routing_terminal_debug(
+            self.debug_connection_id,
+            self.authorizer.flow.as_ref(),
+            error,
+        );
+    }
+}
+
+pub(super) fn emit_product_routing_terminal_debug(
+    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    flow: &FlowContext,
+    error: &RouteAuthorizationError,
+) {
+    let Some((event, rule, decision)) = routing_terminal_debug_fields(error) else {
+        return;
+    };
+    emit_routing_terminal_debug(debug_connection_id, event, flow, rule, decision);
+}
+
+fn routing_terminal_debug_fields(
+    error: &RouteAuthorizationError,
+) -> Option<(crate::observability::RoutingDebugEvent, &str, &'static str)> {
+    match error {
+        RouteAuthorizationError::RestrictedAddress { rule_id, .. } => Some((
+            crate::observability::RoutingDebugEvent::Rejected,
+            rule_id.as_str(),
+            "restricted-address",
+        )),
+        RouteAuthorizationError::Rejected { rule_id } => Some((
+            crate::observability::RoutingDebugEvent::Rejected,
+            rule_id.as_str(),
+            "reject",
+        )),
+        RouteAuthorizationError::Dropped { rule_id } => Some((
+            crate::observability::RoutingDebugEvent::Dropped,
+            rule_id.as_str(),
+            "drop",
+        )),
+        _ => None,
     }
 }
 
@@ -538,6 +636,96 @@ impl ClientIngressRouter {
         )
     }
 
+    /// Performs the server opening-path policy check silently. An allowed
+    /// logical stream is traced later by its relay actor; a terminal decision
+    /// is repeated once with a trace identity because no relay will follow.
+    pub(in crate::runtime) fn preflight_mpp_tcp(
+        &self,
+        target: &TargetAddr,
+        principal: PrincipalId,
+        inbound: InboundId,
+    ) -> Result<ClientRoute, RuntimeError> {
+        self.preflight_mpp_tcp_with_terminal_debug_connection(
+            target,
+            principal,
+            inbound,
+            crate::observability::next_debug_connection_id,
+        )
+    }
+
+    fn preflight_mpp_tcp_with_terminal_debug_connection(
+        &self,
+        target: &TargetAddr,
+        principal: PrincipalId,
+        inbound: InboundId,
+        terminal_debug_connection: impl FnOnce() -> Option<crate::observability::DebugConnectionId>,
+    ) -> Result<ClientRoute, RuntimeError> {
+        let traced_principal = principal.clone();
+        let traced_inbound = inbound.clone();
+        let preflight = self.preflight_mpp_tcp_once(target, principal, inbound, None);
+        match preflight {
+            Ok(allowed @ ClientRoute::Open(_)) => Ok(allowed),
+            Ok(ClientRoute::Deny(_)) | Err(_) => self.preflight_mpp_tcp_once(
+                target,
+                traced_principal,
+                traced_inbound,
+                terminal_debug_connection(),
+            ),
+        }
+    }
+
+    fn preflight_mpp_tcp_once(
+        &self,
+        target: &TargetAddr,
+        principal: PrincipalId,
+        inbound: InboundId,
+        debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    ) -> Result<ClientRoute, RuntimeError> {
+        let route = self.route_with_debug_connection(
+            Network::Tcp,
+            target,
+            None,
+            principal,
+            inbound,
+            RouteOrigin::Mpp,
+            None,
+            debug_connection_id,
+        )?;
+        let ClientRoute::Open(plan) = route else {
+            return Ok(route);
+        };
+        let Some(address) = plan.authorizer.flow.target().ip() else {
+            return Ok(ClientRoute::Open(plan));
+        };
+        let authorization = plan.authorizer.policy.authorize_resolution(
+            plan.authorization.decision.clone(),
+            &[address],
+            |action, address| {
+                let Some(egress) = action.egress() else {
+                    return true;
+                };
+                plan.registry.action_is_native_egress(egress)
+                    && plan.registry.action_supports_ip_family(egress, address)
+            },
+        );
+        match authorization {
+            Ok(_) => Ok(ClientRoute::Open(plan)),
+            Err(error) => {
+                plan.emit_routing_terminal_error(&error);
+                match error {
+                    RouteAuthorizationError::Rejected { .. }
+                    | RouteAuthorizationError::RestrictedAddress { .. } => {
+                        Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject))
+                    }
+                    RouteAuthorizationError::Dropped { .. } => {
+                        Ok(ClientRoute::Deny(ClientPolicyDisposition::Drop))
+                    }
+                    error => Err(map_route_authorization_error(error)),
+                }
+            }
+        }
+    }
+
     pub(in crate::runtime) fn route_mpp_udp(
         &self,
         target: &TargetAddr,
@@ -569,6 +757,34 @@ impl ClientIngressRouter {
         origin: RouteOrigin,
         recovered_dns: Option<SyntheticCaptureRoute>,
     ) -> Result<ClientRoute, RuntimeError> {
+        let debug_connection_id = crate::observability::next_debug_connection_id();
+        self.route_with_debug_connection(
+            network,
+            target,
+            source,
+            principal,
+            inbound,
+            origin,
+            recovered_dns,
+            debug_connection_id,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared policy path also receives its optional connection-trace identity so server preflight can remain deliberately unlogged"
+    )]
+    fn route_with_debug_connection(
+        &self,
+        network: Network,
+        target: &TargetAddr,
+        source: Option<SourceEndpoint>,
+        principal: PrincipalId,
+        inbound: InboundId,
+        origin: RouteOrigin,
+        recovered_dns: Option<SyntheticCaptureRoute>,
+        debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    ) -> Result<ClientRoute, RuntimeError> {
         let normalized_target = protocol_target(target)?;
         let flow = Arc::new(match source {
             Some(source) => {
@@ -576,6 +792,11 @@ impl ClientIngressRouter {
             }
             None => FlowContext::without_source(network, normalized_target, principal, inbound),
         });
+        emit_inbound_debug_for_flow(
+            debug_connection_id,
+            crate::observability::InboundDebugEvent::Accepted,
+            flow.as_ref(),
+        );
         let decision =
             self.policy
                 .evaluate_pre_resolution_shared_with_eligibility(flow.clone(), |action| {
@@ -587,13 +808,18 @@ impl ClientIngressRouter {
                 });
         let mut decision = match decision {
             Ok(decision) => decision,
-            Err(RouteAuthorizationError::Rejected { .. }) => {
-                return Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject));
+            Err(error) => {
+                emit_product_routing_terminal_debug(debug_connection_id, flow.as_ref(), &error);
+                return match error {
+                    RouteAuthorizationError::Rejected { .. } => {
+                        Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject))
+                    }
+                    RouteAuthorizationError::Dropped { .. } => {
+                        Ok(ClientRoute::Deny(ClientPolicyDisposition::Drop))
+                    }
+                    error => Err(map_route_authorization_error(error)),
+                };
             }
-            Err(RouteAuthorizationError::Dropped { .. }) => {
-                return Ok(ClientRoute::Deny(ClientPolicyDisposition::Drop));
-            }
-            Err(error) => return Err(map_route_authorization_error(error)),
         };
         if let Some(recovered) = &recovered_dns {
             if recovered.generation != self.registry.dns().generation() {
@@ -649,8 +875,64 @@ impl ClientIngressRouter {
             authorizer,
             authorization: DestinationAuthorization { decision },
             recovered_dns,
+            debug_connection_id,
         }))
     }
+}
+
+const fn debug_network_label(network: Network) -> &'static str {
+    match network {
+        Network::Tcp => "tcp",
+        Network::Udp => "udp",
+    }
+}
+
+fn emit_inbound_debug_for_flow(
+    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    event: crate::observability::InboundDebugEvent,
+    flow: &FlowContext,
+) {
+    if debug_connection_id.is_none() {
+        return;
+    }
+    let (source, destination) = match event {
+        crate::observability::InboundDebugEvent::Accepted => (
+            flow.source()
+                .map(|source| SocketAddr::new(source.address(), source.port()).to_string()),
+            Some(flow.target().authority()),
+        ),
+        crate::observability::InboundDebugEvent::Established => (None, None),
+    };
+    crate::observability::emit_inbound_debug(
+        debug_connection_id,
+        event,
+        debug_network_label(flow.network()),
+        flow.inbound().as_str(),
+        source.as_deref(),
+        destination.as_deref(),
+    );
+}
+
+fn emit_routing_terminal_debug(
+    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    event: crate::observability::RoutingDebugEvent,
+    flow: &FlowContext,
+    rule: &str,
+    decision: &str,
+) {
+    if debug_connection_id.is_none() {
+        return;
+    }
+    let destination = flow.target().authority();
+    crate::observability::emit_routing_debug(
+        debug_connection_id,
+        event,
+        debug_network_label(flow.network()),
+        Some(rule),
+        decision,
+        None,
+        &destination,
+    );
 }
 
 fn map_destination_authorization_error(error: DestinationAuthorizationError) -> RuntimeError {

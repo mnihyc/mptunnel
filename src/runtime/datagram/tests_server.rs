@@ -620,6 +620,10 @@ async fn same_client_datagram_across_attachments_is_forwarded_once() {
     let snapshot = telemetry.snapshot();
     assert_eq!(snapshot.datagram.io.from_peer_packets, 1);
     assert_eq!(snapshot.datagram.io.to_peer_packets, 1);
+    assert_eq!(
+        snapshot.datagram.flows.opened, 1,
+        "carrier reattachment must reuse one logical Product UDP flow",
+    );
 }
 
 #[tokio::test]

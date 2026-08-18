@@ -125,6 +125,7 @@ fn logging_schema_is_typed_strict_and_config_relative() {
         ("error", LogLevel::Error),
         ("warn", LogLevel::Warn),
         ("info", LogLevel::Info),
+        ("debug", LogLevel::Debug),
     ] {
         let document = format!(
             "[logging]\nlevel = {level:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
@@ -139,7 +140,7 @@ fn logging_schema_is_typed_strict_and_config_relative() {
         );
     }
 
-    for level in ["warning", "INFO", "debug", "trace", "verbose", ""] {
+    for level in ["warning", "INFO", "trace", "verbose", ""] {
         let document = format!(
             "[logging]\nlevel = {level:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
             managed_tun_document("")

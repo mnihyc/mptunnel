@@ -6,7 +6,8 @@
 //! listener-readiness barrier, and synchronous `VpnService.protect(int)`
 //! callback.
 
-use crate::config::load_config_toml_str;
+use crate::config::{LogLevel, load_config_toml_str};
+use crate::observability::{HostLogSink, HostLogSinkRegistration};
 use crate::platform::SystemPacketDeviceProvider;
 use crate::runtime::{
     RuntimeHostControl, RuntimeHostPhase, RuntimeHostStats, run_with_vpn_host_providers_and_control,
@@ -24,7 +25,7 @@ use jni::{Env, EnvUnowned, JValue, JavaVM, jni_mangle, jni_sig, jni_str};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Key, Table, Value};
@@ -47,6 +48,8 @@ const ANDROID_LOCAL_USER_ID: &str = "v2rayng-local";
 #[serde(deny_unknown_fields)]
 struct EditorProjection {
     schema_version: u8,
+    #[serde(default = "default_editor_log_level")]
+    log_level: String,
     paths: Vec<EditorPath>,
     advanced: Option<EditorAdvanced>,
     credential_id: String,
@@ -195,6 +198,7 @@ impl SharedStatus {
 struct ActiveRuntime {
     control: RuntimeHostControl,
     status: Arc<SharedStatus>,
+    log_sink_registration: HostLogSinkRegistration,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -214,6 +218,30 @@ fn bridge() -> &'static Mutex<AndroidBridge> {
 #[derive(Debug)]
 struct AndroidSocketProtector {
     callback: Global<JObject<'static>>,
+}
+
+#[derive(Debug)]
+struct AndroidLogSink {
+    callback: Global<JObject<'static>>,
+}
+
+impl HostLogSink for AndroidLogSink {
+    fn log(&self, level: LogLevel, rendered_record: &str) {
+        let Ok(vm) = JavaVM::singleton() else {
+            return;
+        };
+        let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
+            let level = env.new_string(level.as_str())?;
+            let rendered_record = env.new_string(rendered_record)?;
+            env.call_method(
+                self.callback.as_obj(),
+                jni_str!("log"),
+                jni_sig!((level: JString, message: JString) -> void),
+                &[JValue::Object(&level), JValue::Object(&rendered_record)],
+            )?;
+            Ok(())
+        });
+    }
 }
 
 impl HostSocketProtector for AndroidSocketProtector {
@@ -463,6 +491,7 @@ fn credential_table_mut(
 
 fn project_editor(contents: &str) -> Result<EditorProjection, AndroidBridgeError> {
     let document = parse_editor_document(contents)?;
+    let log_level = project_log_level(&document)?;
     let outbound_index = guided_mpp_outbound_index(&document)?;
     let outbound = mpp_outbound(&document, outbound_index)?;
     let security = child_table(outbound, "security")?;
@@ -483,12 +512,44 @@ fn project_editor(contents: &str) -> Result<EditorProjection, AndroidBridgeError
     let advanced = project_advanced(&document, outbound, security)?;
     Ok(EditorProjection {
         schema_version: 1,
+        log_level,
         paths,
         advanced,
         credential_id,
         principal_id,
         tls_server_name,
     })
+}
+
+fn default_editor_log_level() -> String {
+    LogLevel::Info.as_str().to_string()
+}
+
+fn validate_editor_log_level(level: &str) -> Result<(), AndroidBridgeError> {
+    if matches!(level, "off" | "error" | "warn" | "info" | "debug") {
+        Ok(())
+    } else {
+        Err(bridge_error(
+            "log_level must be one of off, error, warn, info, or debug",
+        ))
+    }
+}
+
+fn project_log_level(document: &DocumentMut) -> Result<String, AndroidBridgeError> {
+    let Some(logging) = document.get("logging") else {
+        return Ok(default_editor_log_level());
+    };
+    let logging = logging
+        .as_table()
+        .ok_or_else(|| bridge_error("editable field \"logging\" must be a table"))?;
+    let level = match logging.get("level") {
+        Some(level) => level
+            .as_str()
+            .ok_or_else(|| bridge_error("editable field \"level\" must be a string"))?,
+        None => LogLevel::Info.as_str(),
+    };
+    validate_editor_log_level(level)?;
+    Ok(level.to_string())
 }
 
 fn required_string<'a>(table: &'a Table, key: &str) -> Result<&'a str, AndroidBridgeError> {
@@ -619,6 +680,7 @@ fn parse_projection_json(contents: &str) -> Result<EditorProjection, AndroidBrid
     if projection.schema_version != 1 {
         return Err(bridge_error("unsupported editor projection schema version"));
     }
+    validate_editor_log_level(&projection.log_level)?;
     Ok(projection)
 }
 
@@ -1334,6 +1396,8 @@ fn patch_editor(contents: &str, projection_json: &str) -> Result<String, Android
         );
     }
     patch_advanced(&mut document, outbound_index, projection.advanced.as_ref())?;
+    let logging = ensure_child_table(document.as_table_mut(), "logging")?;
+    set_table_value(logging, "level", Value::from(projection.log_level.as_str()));
     Ok(document.to_string())
 }
 
@@ -1779,10 +1843,15 @@ fn duration_from_java(value: jlong, name: &str) -> Result<Duration, AndroidBridg
 fn start_runtime(
     config: crate::config::AppConfig,
     protector: AndroidSocketProtector,
+    log_sink: AndroidLogSink,
     ready_timeout: Duration,
 ) -> Result<bool, AndroidBridgeError> {
+    crate::observability::configure_for_host_sink(&config.logging)
+        .map_err(|error| bridge_error(error.to_string()))?;
     let control = RuntimeHostControl::for_config(&config);
     let status = Arc::new(SharedStatus::starting());
+    let log_sink_registration = crate::observability::register_host_sink(Arc::new(log_sink));
+    let launch = Arc::new(Barrier::new(2));
 
     {
         let mut global = bridge()
@@ -1790,18 +1859,28 @@ fn start_runtime(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !global.start_reserved || global.active.is_some() {
             global.start_reserved = false;
+            crate::observability::clear_host_sink(log_sink_registration);
             return Err(bridge_error("MPTUNNEL start reservation was lost"));
         }
         let worker_control = control.clone();
         let worker_status = status.clone();
+        let worker_launch = launch.clone();
         let worker = match std::thread::Builder::new()
             .name("mptunnel-android".to_string())
             .spawn(move || {
-                run_runtime_thread(config, protector, worker_control, worker_status);
+                worker_launch.wait();
+                run_runtime_thread(
+                    config,
+                    protector,
+                    worker_control,
+                    worker_status,
+                    log_sink_registration,
+                );
             }) {
             Ok(worker) => worker,
             Err(error) => {
                 global.start_reserved = false;
+                crate::observability::clear_host_sink(log_sink_registration);
                 return Err(bridge_error(format!(
                     "failed to spawn runtime thread: {error}"
                 )));
@@ -1810,11 +1889,14 @@ fn start_runtime(
         global.active = Some(ActiveRuntime {
             control: control.clone(),
             status: status.clone(),
+            log_sink_registration,
             worker: Some(worker),
         });
         global.start_reserved = false;
         global.last_error = None;
     }
+    // The worker cannot emit until the bridge mutex above has been released.
+    launch.wait();
 
     let deadline = Instant::now() + ready_timeout;
     let mut snapshot = status
@@ -1825,6 +1907,7 @@ fn start_runtime(
         match snapshot.phase {
             AndroidRuntimePhase::Ready => return Ok(true),
             AndroidRuntimePhase::Failed | AndroidRuntimePhase::Stopped => {
+                crate::observability::clear_host_sink(log_sink_registration);
                 return Err(bridge_error(snapshot.error.clone().unwrap_or_else(|| {
                     "runtime stopped before listener readiness".to_string()
                 })));
@@ -1836,6 +1919,7 @@ fn start_runtime(
             drop(snapshot);
             control.request_shutdown();
             status.transition_to_stopping();
+            crate::observability::clear_host_sink(log_sink_registration);
             return Err(bridge_error("runtime listener readiness timed out"));
         }
         let (next, _) = status
@@ -1851,6 +1935,7 @@ fn run_runtime_thread(
     protector: AndroidSocketProtector,
     control: RuntimeHostControl,
     status: Arc<SharedStatus>,
+    log_sink_registration: HostLogSinkRegistration,
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1885,6 +1970,7 @@ fn run_runtime_thread(
         Err(error) => Err(crate::runtime::RuntimeError::Io(error)),
     };
 
+    crate::observability::clear_host_sink(log_sink_registration);
     match result {
         Ok(()) => status.set(AndroidRuntimePhase::Stopped, None),
         Err(error) => status.set(AndroidRuntimePhase::Failed, Some(error.to_string())),
@@ -1903,6 +1989,7 @@ fn reap_finished_runtime(global: &mut AndroidBridge) {
     let Some(mut active) = global.active.take() else {
         return;
     };
+    crate::observability::clear_host_sink(active.log_sink_registration);
     global.last_stats = active.control.stats();
     let snapshot = active.status.snapshot();
     global.last_error = snapshot.error;
@@ -1912,7 +1999,7 @@ fn reap_finished_runtime(global: &mut AndroidBridge) {
 }
 
 fn stop_runtime(timeout: Duration) -> bool {
-    let (control, status) = {
+    let (control, status, log_sink_registration) = {
         let mut global = bridge()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1922,7 +2009,11 @@ fn stop_runtime(timeout: Duration) -> bool {
         };
         active.status.transition_to_stopping();
         active.control.request_shutdown();
-        (active.control.clone(), active.status.clone())
+        (
+            active.control.clone(),
+            active.status.clone(),
+            active.log_sink_registration,
+        )
     };
 
     let deadline = Instant::now() + timeout;
@@ -1936,6 +2027,7 @@ fn stop_runtime(timeout: Duration) -> bool {
     ) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            crate::observability::clear_host_sink(log_sink_registration);
             return false;
         }
         let (next, wait) = status
@@ -1949,6 +2041,7 @@ fn stop_runtime(timeout: Duration) -> bool {
                 AndroidRuntimePhase::Stopped | AndroidRuntimePhase::Failed
             )
         {
+            crate::observability::clear_host_sink(log_sink_registration);
             return false;
         }
     }
@@ -1959,6 +2052,7 @@ fn stop_runtime(timeout: Duration) -> bool {
     let Some(mut active) = global.active.take() else {
         return true;
     };
+    crate::observability::clear_host_sink(active.log_sink_registration);
     global.last_stats = control.stats();
     global.last_error = active.status.snapshot().error;
     active
@@ -2075,6 +2169,7 @@ pub fn native_start<'caller>(
     _class: JClass<'caller>,
     config_toml: JString<'caller>,
     protector: JObject<'caller>,
+    log_sink: JObject<'caller>,
     ready_timeout_ms: jlong,
 ) -> jboolean {
     unowned_env
@@ -2082,15 +2177,25 @@ pub fn native_start<'caller>(
             if protector.is_null() {
                 return Err(bridge_error("socket protector must not be null"));
             }
+            if log_sink.is_null() {
+                return Err(bridge_error("log sink must not be null"));
+            }
             let config_toml = jstring(env, &config_toml, "configuration document")?;
+            let ready_timeout = duration_from_java(ready_timeout_ms, "ready timeout")?;
             reserve_start()?;
             let result = (|| {
                 let config = compile_inline_config(&config_toml)?;
-                let callback = env.new_global_ref(&protector)?;
+                let protector_callback = env.new_global_ref(&protector)?;
+                let log_callback = env.new_global_ref(&log_sink)?;
                 start_runtime(
                     config,
-                    AndroidSocketProtector { callback },
-                    duration_from_java(ready_timeout_ms, "ready timeout")?,
+                    AndroidSocketProtector {
+                        callback: protector_callback,
+                    },
+                    AndroidLogSink {
+                        callback: log_callback,
+                    },
+                    ready_timeout,
                 )
             })();
             if result.is_err() {
@@ -2622,6 +2727,7 @@ name = "remote""#,
     #[test]
     fn projection_fills_partial_advanced_defaults_and_accepts_transient_values() {
         let projection = project_editor(EDITABLE_CONFIG).expect("editor projection");
+        assert_eq!(projection.log_level, "info");
         let advanced = projection.advanced.expect("partial advanced projection");
         assert_eq!(advanced.path_probe_interval_ms, 1234);
         assert_eq!(
@@ -2632,6 +2738,7 @@ name = "remote""#,
 
         let transient = EditorProjection {
             schema_version: 1,
+            log_level: "debug".to_string(),
             paths: vec![
                 EditorPath {
                     name: String::new(),
@@ -2664,6 +2771,57 @@ name = "remote""#,
         .expect("transient structural patch");
         let projected = project_editor(&patched).expect("reproject transient document");
         assert_eq!(projected, transient);
+    }
+
+    #[test]
+    fn editor_log_level_is_backward_compatible_and_patches_only_logging_level() {
+        let configured = format!(
+            "[logging]\nlevel = \"debug\"\nformat = \"json\"\nconsole = false\ncustom = \"keep\"\n\n{EDITABLE_CONFIG}"
+        );
+        let mut projection = project_editor(&configured).expect("logging projection");
+        assert_eq!(projection.log_level, "debug");
+        projection.log_level = "warn".to_string();
+
+        let patched = patch_editor(
+            &configured,
+            &serde_json::to_string(&projection).expect("projection JSON"),
+        )
+        .expect("logging patch");
+        let document = parse_editor_document(&patched).expect("patched logging TOML");
+        let logging = document
+            .get("logging")
+            .and_then(Item::as_table)
+            .expect("logging table");
+        assert_eq!(logging.get("level").and_then(Item::as_str), Some("warn"));
+        assert_eq!(logging.get("format").and_then(Item::as_str), Some("json"));
+        assert_eq!(logging.get("console").and_then(Item::as_bool), Some(false));
+        assert_eq!(logging.get("custom").and_then(Item::as_str), Some("keep"));
+        assert_eq!(
+            project_editor(&patched).expect("reproject logging"),
+            projection
+        );
+
+        let mut legacy_projection =
+            serde_json::to_value(&projection).expect("legacy projection value");
+        legacy_projection
+            .as_object_mut()
+            .expect("projection object")
+            .remove("log_level");
+        assert_eq!(
+            parse_projection_json(&legacy_projection.to_string())
+                .expect("schema-1 projection without additive field")
+                .log_level,
+            "info"
+        );
+
+        projection.log_level = "trace".to_string();
+        let error = patch_editor(
+            EDITABLE_CONFIG,
+            &serde_json::to_string(&projection).expect("invalid projection JSON"),
+        )
+        .expect_err("unsupported log level")
+        .to_string();
+        assert!(error.contains("off, error, warn, info, or debug"));
     }
 
     #[test]

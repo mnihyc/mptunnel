@@ -75,7 +75,7 @@ lifecycle callbacks remain owned by the embedding application.
 
 ```toml
 [logging]
-level = "info"          # off, error, warn, or info
+level = "info"          # off, error, warn, info, or debug
 format = "text"         # text or json
 console = true          # standard error
 # file = "logs/mptunnel.log"
@@ -126,15 +126,49 @@ The matching environment variables are `MPTUNNEL_LOG_LEVEL`,
 `MPTUNNEL_LOG_FLOW_EVENTS`.
 
 When logging is enabled, at least the console or file sink must be enabled.
-Flow events require `info`, because they are information records. `error` means
+Flow events require at least `info`, because they are information records. `error` means
 the process or a configured sink cannot continue; `warn` means the service is
 still running but degraded, retrying, saturated, or recovering; `info` covers
-configuration and service lifecycle transitions.
+configuration and service lifecycle transitions. `debug` includes those levels
+and adds an immediate per-connection trace for routed L4 traffic.
+
+Each debug trace uses one process-local, monotonically increasing `id`. Records
+are deliberately separated by ownership so the first glance reads in order:
+
+```text
+2026-08-06T02:15:10.100Z DEBUG inbound.accepted: id=17 network=tcp inbound="local-socks" source="127.0.0.1:52144" destination="example.com:443"
+2026-08-06T02:15:10.101Z DEBUG routing.selected: id=17 network=tcp destination="example.com:443" rule="default" decision="allow" egress="balancer:internet"
+2026-08-06T02:15:10.102Z DEBUG balancer.selected: id=17 network=tcp balancer="internet" outbound="direct" attempt=1
+2026-08-06T02:15:10.102Z DEBUG outbound.connecting: id=17 network=tcp outbound="direct" destination="example.com:443" attempt=1
+2026-08-06T02:15:10.118Z DEBUG outbound.connected: id=17 network=tcp outbound="direct" destination="example.com:443" attempt=1
+2026-08-06T02:15:10.118Z DEBUG inbound.established: id=17 network=tcp inbound="local-socks"
+```
+
+The trace begins after an L4 inbound has authenticated (when applicable),
+parsed a target, and accepted the logical request; it is not a raw-socket or
+pre-authentication access log. The inbound scope reports only what that inbound
+accepted and established.
+Routing reports its rule and configured egress. A balancer reports each member
+choice, and the outbound scope reports each configured outbound attempt,
+success, or failure before failover. Direct routes simply omit the balancer
+record. For UDP, one trace represents the logical association becoming ready,
+not every packet. A configured outbound may internally try multiple resolved
+addresses; those connector details remain one outbound attempt in this view.
+Rejected and dropped requests stop at the routing record.
+MPP L3 packets, internal DNS and probe traffic, and physical MPP carrier/path
+state are intentionally outside this connection trace; use the management path
+and session views for current carrier state.
 
 All records are length-bounded and remove terminal control characters. Repeated
 saturation and fault records are rate-limited per call site and report the
 suppressed count on the next record. Authorization, cookies, tokens, passwords,
 credential secrets, and private-key forms are redacted as a final defense.
+Debug connection records are not rate-limited, so all attempts are visible
+while `debug` remains enabled and the sink remains writable. They include source
+and destination addresses and are therefore privacy-sensitive. They never add
+principals, credentials, secrets, payloads, or fields owned by another scope.
+All dynamic fields remain bounded, control-sanitized, and secret-redacted.
+
 `flow_events = true` additionally emits one sanitized
 open and close record for each observable flow, including its inbound,
 destination, selected concrete outbound, duration, outcome, and byte/packet

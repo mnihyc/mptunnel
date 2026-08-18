@@ -16,6 +16,7 @@ use crate::runtime::ingress_runtime::{
 };
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use crate::runtime::path::ClientPathContext;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -97,6 +98,61 @@ fn inbound() -> InboundId {
 
 fn anonymous() -> PrincipalId {
     PrincipalId::parse("anonymous").expect("principal")
+}
+
+#[test]
+fn restricted_address_is_a_named_routing_rejection_debug_decision() {
+    let rule = RuleId::parse("public-only").expect("rule");
+    let error = RouteAuthorizationError::RestrictedAddress {
+        address: "127.0.0.1".parse().expect("loopback address"),
+        class: crate::product::RestrictedIpClass::Loopback,
+        rule_id: rule.clone(),
+    };
+    let (event, selected_rule, decision) =
+        routing_terminal_debug_fields(&error).expect("routing debug decision");
+    assert_eq!(event, crate::observability::RoutingDebugEvent::Rejected);
+    assert_eq!(selected_rule, rule.as_str());
+    assert_eq!(decision, "restricted-address");
+}
+
+#[tokio::test]
+async fn final_route_group_preserves_debug_connection_rule_and_allow_restricted_identity() {
+    let edge = context(7443);
+    let edge_id = OutboundId::parse("edge").expect("outbound");
+    let selected_rule = RuleId::parse("private-destination").expect("rule");
+    let config = policy(vec![RouteRuleSpec::new(
+        selected_rule.clone(),
+        RouteMatchSpec::default(),
+        RouteAction::allow_restricted(
+            EgressAction::Outbound(edge_id.clone()),
+            None,
+            InitialDemand::Automatic,
+        ),
+    )]);
+    let router = ClientIngressRouter::new(&config, registry([("edge", edge)], &[]))
+        .expect("debug route router");
+    let target = TargetAddr::Domain {
+        host: "private.example".to_string(),
+        port: 443,
+    };
+    let ClientRoute::Open(mut plan) = router
+        .route_udp(&target, source(), anonymous(), inbound())
+        .expect("debug route")
+    else {
+        panic!("expected open route");
+    };
+    let connection_id = crate::observability::DebugConnectionId::for_test(41);
+    plan.debug_connection_id = Some(connection_id);
+
+    let groups = plan
+        .destination_route_groups(Network::Udp)
+        .await
+        .expect("final route groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].debug_connection_id, Some(connection_id));
+    assert_eq!(groups[0].rule_id, selected_rule);
+    assert_eq!(groups[0].disposition, RouteDisposition::AllowRestricted);
+    assert_eq!(groups[0].selection, EgressSelection::Outbound(edge_id),);
 }
 
 #[tokio::test]
@@ -828,7 +884,82 @@ fn deny_actions_finish_before_target_lookup_or_destination_open_authority() {
                 .expect("UDP deny route"),
             ClientRoute::Deny(actual) if actual == expected
         ));
+        let terminal_trace_allocations = Cell::<usize>::new(0);
+        assert!(matches!(
+            router
+                .preflight_mpp_tcp_with_terminal_debug_connection(
+                    &target,
+                    anonymous(),
+                    inbound(),
+                    || {
+                        terminal_trace_allocations
+                            .set(terminal_trace_allocations.get().saturating_add(1));
+                        Some(crate::observability::DebugConnectionId::for_test(73))
+                    },
+                )
+                .expect("MPP TCP preflight deny route"),
+            ClientRoute::Deny(actual) if actual == expected
+        ));
+        assert_eq!(terminal_trace_allocations.get(), 1);
     }
+}
+
+#[test]
+fn mpp_tcp_preflight_preserves_allow_without_a_trace_identity() {
+    let outbound = OutboundId::parse("native-direct").expect("outbound");
+    let config = policy(vec![rule(
+        "default",
+        RouteMatchSpec::default(),
+        EgressAction::Outbound(outbound.clone()),
+    )]);
+    let registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: outbound,
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_millis(100),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("native outbound registry");
+    let router = ClientIngressRouter::new(&config, registry).expect("preflight router");
+    let target = TargetAddr::Domain {
+        host: "example.com".to_string(),
+        port: 443,
+    };
+
+    let terminal_trace_allocations = Cell::<usize>::new(0);
+    let ClientRoute::Open(plan) = router
+        .preflight_mpp_tcp_with_terminal_debug_connection(&target, anonymous(), inbound(), || {
+            terminal_trace_allocations.set(terminal_trace_allocations.get().saturating_add(1));
+            Some(crate::observability::DebugConnectionId::for_test(74))
+        })
+        .expect("allowed MPP TCP preflight")
+    else {
+        panic!("expected allowed preflight plan");
+    };
+    assert_eq!(plan.debug_connection_id, None);
+    assert_eq!(terminal_trace_allocations.get(), 0);
+
+    let loopback = TargetAddr::Ip("127.0.0.1:443".parse().expect("loopback target"));
+    let terminal_trace_allocations = Cell::<usize>::new(0);
+    assert!(matches!(
+        router
+            .preflight_mpp_tcp_with_terminal_debug_connection(
+                &loopback,
+                anonymous(),
+                inbound(),
+                || {
+                    terminal_trace_allocations
+                        .set(terminal_trace_allocations.get().saturating_add(1));
+                    Some(crate::observability::DebugConnectionId::for_test(75))
+                },
+            )
+            .expect("restricted MPP TCP preflight"),
+        ClientRoute::Deny(ClientPolicyDisposition::Reject)
+    ));
+    assert_eq!(terminal_trace_allocations.get(), 1);
 }
 
 #[tokio::test]

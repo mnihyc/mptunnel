@@ -29,11 +29,15 @@ check_config = false
 # Process logging stays outside the forwarding data path. Relative file paths are
 # resolved beside this document; parent directories must already exist.
 [logging]
-level = "info"          # off, error, warn, or info
+level = "info"          # off, error, warn, info, or debug
 format = "text"         # text or newline-delimited json
 console = true          # standard error
 # file = "logs/mptunnel.log"
 flow_events = false     # opt-in destination-bearing flow open/close records
+# `debug` adds a concise, correlated trace for each routed L4 connection or UDP
+# association: inbound acceptance/establishment, route selection, optional
+# balancer choice, and each configured outbound attempt. It does not
+# log packets, DNS/probe work, or physical MPP carrier internals.
 
 # Every secret, password, certificate, and key uses one byte-material source.
 # A source is resolved once when the configuration is loaded. No

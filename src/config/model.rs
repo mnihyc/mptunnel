@@ -53,6 +53,7 @@ pub enum LogLevel {
     Error = 1,
     Warn = 2,
     Info = 3,
+    Debug = 4,
 }
 
 impl LogLevel {
@@ -62,6 +63,7 @@ impl LogLevel {
             Self::Error => "error",
             Self::Warn => "warn",
             Self::Info => "info",
+            Self::Debug => "debug",
         }
     }
 }
@@ -1654,7 +1656,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "enabled logging requires the console or file sink")
             }
             Self::FlowEventsRequireInfo => {
-                write!(f, "flow-event logging requires log level info")
+                write!(f, "flow-event logging requires at least log level info")
             }
             Self::AuthFreshnessWindowZero => {
                 write!(f, "auth freshness window must be greater than zero")

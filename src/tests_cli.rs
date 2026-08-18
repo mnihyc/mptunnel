@@ -180,7 +180,7 @@ fn client_cli_builds_default_socks_config() {
 
 #[test]
 fn client_cli_rejects_unsupported_log_levels() {
-    for level in ["warning", "debug", "trace"] {
+    for level in ["warning", "trace"] {
         let error = parse_cli([
             "mptunnel",
             "--log-level",
@@ -199,7 +199,7 @@ fn simple_cli_maps_the_complete_logging_surface() {
     let config = parse_cli([
         "mptunnel",
         "--log-level",
-        "info",
+        "debug",
         "--log-format",
         "json",
         "--log-file",
@@ -213,7 +213,7 @@ fn simple_cli_maps_the_complete_logging_surface() {
     .expect("parse logging CLI")
     .into_config()
     .expect("compile logging CLI");
-    assert_eq!(config.logging.level, crate::config::LogLevel::Info);
+    assert_eq!(config.logging.level, crate::config::LogLevel::Debug);
     assert_eq!(config.logging.format, crate::config::LogFormat::Json);
     assert_eq!(
         config.logging.file,

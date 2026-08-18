@@ -1,11 +1,12 @@
 //! Process-event logger for lifecycle, control, fault, and optional Product
 //! flow boundaries.
 //!
-//! The data plane does not enqueue log records. Each call site has a fixed
-//! burst limiter, messages are truncated before allocation can grow beyond the
-//! record bound, and disabled records stop at one relaxed atomic read.
-//! Sanitized flow lifecycle records are separately opt-in and never enter a
-//! payload, packet, carrier, scheduler, or congestion-control path.
+//! The data plane never logs payload, packet, scheduling, or congestion loops.
+//! Process-fault call sites have fixed burst limiters, while explicit debug
+//! connection boundaries are unthrottled so one accepted connection has a
+//! reproducible state trail. Every dynamic field is sanitized and bounded;
+//! disabled records stop at one relaxed atomic read. Sanitized flow lifecycle
+//! records remain separately opt-in.
 
 use crate::config::{CanonicalConfigStore, LogFormat, LogLevel, LoggingConfig};
 use serde::Serialize;
@@ -22,13 +23,17 @@ use time::OffsetDateTime;
 const DEFAULT_WINDOW_MS: u64 = 10_000;
 const DEFAULT_BURST: u32 = 4;
 const MESSAGE_LIMIT: usize = 2_048;
+const CONNECTION_FIELD_LIMIT: usize = 512;
 
 static LEVEL_FILTER: AtomicU8 = AtomicU8::new(LogLevel::Info as u8);
 static FLOW_EVENTS: AtomicBool = AtomicBool::new(false);
+static NEXT_DEBUG_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 struct Logger {
     output: RwLock<Arc<Output>>,
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    host_sink: RwLock<HostSinkState>,
     emission: Mutex<()>,
 }
 
@@ -41,6 +46,34 @@ struct Output {
 struct FileSink {
     path: PathBuf,
     file: File,
+}
+
+/// Embedding-host destination for records already filtered, redacted, bounded,
+/// and rendered by MPTUNNEL.
+///
+/// Implementations must not call back into the logger. Delivery failures are
+/// deliberately private to the host sink so a broken callback cannot recurse
+/// through the logging path or stop the runtime.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub(crate) trait HostLogSink: Send + Sync + 'static {
+    fn log(&self, level: LogLevel, rendered_record: &str);
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostLogSinkRegistration(u64);
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+#[derive(Default)]
+struct HostSinkState {
+    next_registration: u64,
+    active: Option<RegisteredHostSink>,
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+struct RegisteredHostSink {
+    registration: HostLogSinkRegistration,
+    sink: Arc<dyn HostLogSink>,
 }
 
 pub(crate) struct PreparedLogger {
@@ -105,6 +138,8 @@ impl Logger {
                 console: true,
                 file: Mutex::new(None),
             })),
+            #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+            host_sink: RwLock::new(HostSinkState::default()),
             emission: Mutex::new(()),
         }
     }
@@ -125,6 +160,53 @@ impl Logger {
         LEVEL_FILTER.store(prepared.level as u8, Ordering::Relaxed);
         FLOW_EVENTS.store(prepared.flow_events, Ordering::Relaxed);
         previous.flush();
+    }
+
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    fn register_host_sink(&self, sink: Arc<dyn HostLogSink>) -> HostLogSinkRegistration {
+        let mut state = self.host_sink.write().expect("host log sink lock poisoned");
+        state.next_registration = state.next_registration.wrapping_add(1).max(1);
+        let registration = HostLogSinkRegistration(state.next_registration);
+        state.active = Some(RegisteredHostSink { registration, sink });
+        registration
+    }
+
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    fn clear_host_sink(&self, registration: HostLogSinkRegistration) {
+        let mut state = self.host_sink.write().expect("host log sink lock poisoned");
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.registration == registration)
+        {
+            state.active = None;
+        }
+    }
+
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    fn host_sink(&self) -> Option<Arc<dyn HostLogSink>> {
+        self.host_sink
+            .read()
+            .expect("host log sink lock poisoned")
+            .active
+            .as_ref()
+            .map(|active| active.sink.clone())
+    }
+
+    fn write_to_sinks(&self, level: LogLevel, output: &Output, line: &[u8]) {
+        output.write(line);
+        #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+        {
+            let Some(sink) = self.host_sink() else {
+                return;
+            };
+            let Ok(rendered) = std::str::from_utf8(line) else {
+                return;
+            };
+            sink.log(level, rendered.strip_suffix('\n').unwrap_or(rendered));
+        }
+        #[cfg(not(any(target_os = "android", all(test, target_os = "linux"))))]
+        let _ = level;
     }
 }
 
@@ -299,10 +381,39 @@ pub(crate) fn install(prepared: PreparedLogger) {
     logger().install(prepared);
 }
 
+/// Installs one process-local embedding callback and returns an identity that
+/// can clear only that exact registration. This prevents a late worker from
+/// removing a newer runtime's callback.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub(crate) fn register_host_sink(sink: Arc<dyn HostLogSink>) -> HostLogSinkRegistration {
+    logger().register_host_sink(sink)
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub(crate) fn clear_host_sink(registration: HostLogSinkRegistration) {
+    logger().clear_host_sink(registration);
+}
+
 pub(crate) fn configure(config: &LoggingConfig) -> Result<(), ConfigureError> {
     let prepared = prepare(config)?;
     install(prepared);
     Ok(())
+}
+
+/// Installs an embedding-host logger where the callback replaces stderr as the
+/// console destination. The configured level, format, flow policy, and optional
+/// file remain unchanged, so one rendered record reaches the host exactly once.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub(crate) fn configure_for_host_sink(config: &LoggingConfig) -> Result<(), ConfigureError> {
+    install(prepare_for_host_sink(config)?);
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn prepare_for_host_sink(config: &LoggingConfig) -> Result<PreparedLogger, ConfigureError> {
+    let mut config = config.clone();
+    config.console = false;
+    prepare(&config)
 }
 
 pub(crate) fn configure_for_store(
@@ -315,7 +426,11 @@ pub(crate) fn configure_for_store(
 }
 
 pub(crate) fn enabled(level: LogLevel) -> bool {
-    level as u8 <= LEVEL_FILTER.load(Ordering::Relaxed)
+    level_enabled(level, LEVEL_FILTER.load(Ordering::Relaxed))
+}
+
+const fn level_enabled(level: LogLevel, filter: u8) -> bool {
+    level as u8 <= filter
 }
 
 pub(crate) fn flow_events_enabled() -> bool {
@@ -450,7 +565,7 @@ fn emit_record(
     let output = logger.snapshot();
     let mut line = Vec::with_capacity(message.len().saturating_add(192));
     write_record(&mut line, output.format, &record);
-    output.write(&line);
+    logger.write_to_sinks(level, &output, &line);
 }
 
 #[derive(Serialize)]
@@ -509,6 +624,7 @@ fn text_level(level: &str) -> &str {
         "error" => "ERROR",
         "warn" => "WARN",
         "info" => "INFO",
+        "debug" => "DEBUG",
         _ => "UNKNOWN",
     }
 }
@@ -519,6 +635,353 @@ fn write_suppressed(output: &mut Vec<u8>, suppressed: u64) {
     }
     let noun = if suppressed == 1 { "event" } else { "events" };
     let _ = write!(output, " ({suppressed} similar {noun} suppressed)");
+}
+
+/// Process-local correlation identity for one debug-logged connection.
+///
+/// The value is deliberately opaque to callers: it exists only to correlate
+/// scope-owned connection records and is never a protocol flow ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DebugConnectionId(u64);
+
+#[cfg(test)]
+impl DebugConnectionId {
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for DebugConnectionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Allocates a monotonically increasing connection-log identity when debug
+/// logging is active. Disabled debug logging performs only the level check.
+pub(crate) fn next_debug_connection_id() -> Option<DebugConnectionId> {
+    if !enabled(LogLevel::Debug) {
+        return None;
+    }
+    NEXT_DEBUG_CONNECTION_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .map(DebugConnectionId)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundDebugEvent {
+    Accepted,
+    Established,
+}
+
+impl InboundDebugEvent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Established => "established",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboundDebugEvent {
+    Connecting,
+    Connected,
+    Failed,
+}
+
+impl OutboundDebugEvent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutingDebugEvent {
+    Selected,
+    Rejected,
+    Dropped,
+}
+
+impl RoutingDebugEvent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::Rejected => "rejected",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ConnectionDebugRecord<'a> {
+    timestamp_unix_ms: u64,
+    level: &'static str,
+    component: &'static str,
+    event: &'static str,
+    connection_id: String,
+    network: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inbound: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    egress: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    balancer: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outbound: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+impl<'a> ConnectionDebugRecord<'a> {
+    fn new(
+        timestamp_unix_ms: u64,
+        component: &'static str,
+        event: &'static str,
+        id: DebugConnectionId,
+        network: &'a str,
+    ) -> Self {
+        Self {
+            timestamp_unix_ms,
+            level: LogLevel::Debug.as_str(),
+            component,
+            event,
+            connection_id: id.to_string(),
+            network,
+            inbound: None,
+            source: None,
+            rule: None,
+            decision: None,
+            egress: None,
+            balancer: None,
+            outbound: None,
+            destination: None,
+            attempt: None,
+            error: None,
+        }
+    }
+}
+
+/// Emits one inbound-owned connection state without outbound or routing data.
+pub(crate) fn emit_inbound_debug(
+    id: Option<DebugConnectionId>,
+    event: InboundDebugEvent,
+    network: &str,
+    inbound: &str,
+    source: Option<&str>,
+    destination: Option<&str>,
+) {
+    if !enabled(LogLevel::Debug) {
+        return;
+    }
+    let Some(id) = id else {
+        return;
+    };
+    let network = sanitize_connection_field(network);
+    let inbound = sanitize_connection_field(inbound);
+    let source = source.map(sanitize_connection_field);
+    let destination = destination.map(sanitize_connection_field);
+    let mut record =
+        ConnectionDebugRecord::new(unix_millis(), "inbound", event.as_str(), id, &network);
+    record.inbound = Some(&inbound);
+    record.source = source.as_deref();
+    record.destination = destination.as_deref();
+    emit_connection_debug_record(&record);
+}
+
+/// Emits one routing-owned decision without inbound, balancer, or connector
+/// state. `decision` is the routing verdict; `egress` names an allowed target
+/// as `outbound:<id>` or `balancer:<id>`.
+pub(crate) fn emit_routing_debug(
+    id: Option<DebugConnectionId>,
+    event: RoutingDebugEvent,
+    network: &str,
+    rule: Option<&str>,
+    decision: &str,
+    egress: Option<&str>,
+    destination: &str,
+) {
+    if !enabled(LogLevel::Debug) {
+        return;
+    }
+    let Some(id) = id else {
+        return;
+    };
+    let network = sanitize_connection_field(network);
+    let rule = rule.map(sanitize_connection_field);
+    let decision = sanitize_connection_field(decision);
+    let egress = egress.map(sanitize_connection_field);
+    let destination = sanitize_connection_field(destination);
+    let mut record =
+        ConnectionDebugRecord::new(unix_millis(), "routing", event.as_str(), id, &network);
+    record.rule = rule.as_deref();
+    record.decision = Some(&decision);
+    record.egress = egress.as_deref();
+    record.destination = Some(&destination);
+    emit_connection_debug_record(&record);
+}
+
+/// Emits a concrete member selection owned only by the named balancer.
+pub(crate) fn emit_balancer_debug(
+    id: Option<DebugConnectionId>,
+    network: &str,
+    balancer: &str,
+    outbound: &str,
+    attempt: usize,
+) {
+    if !enabled(LogLevel::Debug) {
+        return;
+    }
+    let Some(id) = id else {
+        return;
+    };
+    let network = sanitize_connection_field(network);
+    let balancer = sanitize_connection_field(balancer);
+    let outbound = sanitize_connection_field(outbound);
+    let mut record =
+        ConnectionDebugRecord::new(unix_millis(), "balancer", "selected", id, &network);
+    record.balancer = Some(&balancer);
+    record.outbound = Some(&outbound);
+    record.attempt = Some(attempt);
+    emit_connection_debug_record(&record);
+}
+
+/// Emits one connector-owned connection state without inbound, routing, or
+/// balancer data.
+pub(crate) fn emit_outbound_debug(
+    id: Option<DebugConnectionId>,
+    event: OutboundDebugEvent,
+    network: &str,
+    outbound: &str,
+    destination: &str,
+    attempt: usize,
+    error: Option<&str>,
+) {
+    if !enabled(LogLevel::Debug) {
+        return;
+    }
+    let Some(id) = id else {
+        return;
+    };
+    let network = sanitize_connection_field(network);
+    let outbound = sanitize_connection_field(outbound);
+    let destination = sanitize_connection_field(destination);
+    let error = error.map(sanitize_connection_field);
+    let mut record =
+        ConnectionDebugRecord::new(unix_millis(), "outbound", event.as_str(), id, &network);
+    record.outbound = Some(&outbound);
+    record.destination = Some(&destination);
+    record.attempt = Some(attempt);
+    record.error = error.as_deref();
+    emit_connection_debug_record(&record);
+}
+
+fn sanitize_connection_field(value: &str) -> String {
+    bound_message(redact_message(value), CONNECTION_FIELD_LIMIT)
+}
+
+fn emit_connection_debug_record(record: &ConnectionDebugRecord<'_>) {
+    let logger = logger();
+    let _emission = logger
+        .emission
+        .lock()
+        .expect("logger emission lock poisoned");
+    if !enabled(LogLevel::Debug) {
+        return;
+    }
+    let output = logger.snapshot();
+    let mut line = Vec::with_capacity(768);
+    write_connection_debug_record(&mut line, output.format, record);
+    logger.write_to_sinks(LogLevel::Debug, &output, &line);
+}
+
+fn write_connection_debug_record(
+    output: &mut Vec<u8>,
+    format: LogFormat,
+    record: &ConnectionDebugRecord<'_>,
+) {
+    if format == LogFormat::Json {
+        let _ = serde_json::to_writer(&mut *output, record);
+        output.push(b'\n');
+        return;
+    }
+    write_text_header(
+        output,
+        record.timestamp_unix_ms,
+        record.level,
+        record.component,
+        record.event,
+    );
+    let _ = write!(
+        output,
+        "id={} network={}",
+        record.connection_id, record.network
+    );
+    match record.component {
+        "inbound" => {
+            debug_assert!(record.inbound.is_some());
+            write_debug_text_field(output, "inbound", record.inbound);
+            write_debug_text_field(output, "source", record.source);
+            write_debug_text_field(output, "destination", record.destination);
+        }
+        "routing" => {
+            debug_assert!(record.destination.is_some() && record.decision.is_some());
+            write_debug_text_field(output, "destination", record.destination);
+            write_debug_text_field(output, "rule", record.rule);
+            write_debug_text_field(output, "decision", record.decision);
+            write_debug_text_field(output, "egress", record.egress);
+        }
+        "balancer" => {
+            debug_assert!(
+                record.balancer.is_some() && record.outbound.is_some() && record.attempt.is_some()
+            );
+            write_debug_text_field(output, "balancer", record.balancer);
+            write_debug_text_field(output, "outbound", record.outbound);
+            write_debug_text_attempt(output, record.attempt);
+        }
+        "outbound" => {
+            debug_assert!(
+                record.outbound.is_some()
+                    && record.destination.is_some()
+                    && record.attempt.is_some()
+            );
+            write_debug_text_field(output, "outbound", record.outbound);
+            write_debug_text_field(output, "destination", record.destination);
+            write_debug_text_attempt(output, record.attempt);
+            write_debug_text_field(output, "error", record.error);
+        }
+        _ => debug_assert!(false, "unknown connection debug component"),
+    }
+    output.push(b'\n');
+}
+
+fn write_debug_text_field(output: &mut Vec<u8>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        let _ = write!(output, " {key}={}", quote_text_field(value));
+    }
+}
+
+fn write_debug_text_attempt(output: &mut Vec<u8>, attempt: Option<usize>) {
+    if let Some(attempt) = attempt {
+        let _ = write!(output, " attempt={attempt}");
+    }
 }
 
 #[derive(Serialize)]
@@ -622,7 +1085,7 @@ pub(crate) fn emit_flow_open(
             );
         }
     }
-    output.write(&line);
+    logger.write_to_sinks(LogLevel::Info, &output, &line);
     Some(FlowLogToken { output })
 }
 
@@ -689,7 +1152,7 @@ pub(crate) fn emit_flow_close(
             );
         }
     }
-    output.write(&line);
+    logger.write_to_sinks(LogLevel::Info, output, &line);
 }
 
 fn quote_text_field(value: &str) -> String {

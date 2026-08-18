@@ -970,7 +970,7 @@ fn routing_client_config(
     format!(
         r#"
 [logging]
-level = "info"
+level = "debug"
 format = "json"
 console = false
 file = "product-flows.jsonl"
@@ -1507,6 +1507,68 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
         fs::read_to_string(&flow_log_path).expect("read original Product flow log"),
         fs::read_to_string(&next_flow_log_path).expect("read updated Product flow log")
     );
+    let debug_records = parse_json_log(&flow_log)
+        .into_iter()
+        .filter(|record| record["level"] == "debug")
+        .collect::<Vec<_>>();
+    let proxy_connection_id = debug_records
+        .iter()
+        .find(|record| {
+            record["component"] == "balancer"
+                && record["event"] == "selected"
+                && record["outbound"] == "failed-proxy"
+                && record["attempt"] == 1
+        })
+        .and_then(|record| record["connection_id"].as_str())
+        .expect("first proxy-balancer debug attempt");
+    let proxy_events = debug_records
+        .iter()
+        .filter(|record| record["connection_id"] == proxy_connection_id)
+        .map(|record| {
+            (
+                record["component"].as_str().expect("debug component"),
+                record["event"].as_str().expect("debug event"),
+                record.get("outbound").and_then(serde_json::Value::as_str),
+                record.get("attempt").and_then(serde_json::Value::as_u64),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        proxy_events,
+        [
+            ("inbound", "accepted", None, None),
+            ("routing", "selected", None, None),
+            ("balancer", "selected", Some("failed-proxy"), Some(1)),
+            ("outbound", "connecting", Some("failed-proxy"), Some(1)),
+            ("outbound", "failed", Some("failed-proxy"), Some(1)),
+            ("balancer", "selected", Some("working-proxy"), Some(2)),
+            ("outbound", "connecting", Some("working-proxy"), Some(2)),
+            ("outbound", "connected", Some("working-proxy"), Some(2)),
+            ("inbound", "established", None, None),
+        ],
+        "one stable connection ID must expose ordered inbound, routing, balancer-failover, and outbound states"
+    );
+    let mpp_connection_id = debug_records
+        .iter()
+        .find(|record| {
+            record["component"] == "outbound"
+                && record["event"] == "connected"
+                && record["outbound"] == "edge-mpp"
+                && record["network"] == "tcp"
+                && record["attempt"] == 1
+        })
+        .and_then(|record| record["connection_id"].as_str())
+        .expect("MPP outbound debug connection");
+    for event in ["accepted", "established"] {
+        assert!(
+            debug_records.iter().any(|record| {
+                record["connection_id"] == mpp_connection_id
+                    && record["component"] == "inbound"
+                    && record["event"] == event
+            }),
+            "MPP outbound state must correlate with inbound.{event}"
+        );
+    }
     assert!(
         !flow_log.contains("0123456789abcdef0123456789abcdef"),
         "Product flow log leaked credential material"

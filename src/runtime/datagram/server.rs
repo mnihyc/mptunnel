@@ -173,29 +173,24 @@ impl ServerDatagramPortBackend for ServerDatagramService {
             } = request;
             outbound::validate_target(&target)
                 .map_err(|error| ServerDatagramOpenError::new(error.into()))?;
-            let route = self
-                .router
-                .route_mpp_udp(
-                    &target,
-                    principal_permit.principal().clone(),
-                    self.inbound.clone(),
-                )
-                .map_err(ServerDatagramOpenError::new)?;
-            let plan = match route {
-                ClientRoute::Open(plan) => plan,
-                ClientRoute::Deny(ClientPolicyDisposition::Reject) => {
-                    return Err(ServerDatagramOpenError::new(RuntimeError::RouteRejected));
-                }
-                ClientRoute::Deny(ClientPolicyDisposition::Drop) => {
-                    return Err(ServerDatagramOpenError::new(RuntimeError::RouteDropped));
-                }
-            };
-
             let key = (session_id, flow_id);
             let slot = self.flow_slot(key, target.clone())?;
+            let principal = principal_permit.principal().clone();
             let worker = slot
                 .worker
                 .get_or_try_init(|| async {
+                    let route =
+                        self.router
+                            .route_mpp_udp(&target, principal, self.inbound.clone())?;
+                    let plan = match route {
+                        ClientRoute::Open(plan) => plan,
+                        ClientRoute::Deny(ClientPolicyDisposition::Reject) => {
+                            return Err(RuntimeError::RouteRejected);
+                        }
+                        ClientRoute::Deny(ClientPolicyDisposition::Drop) => {
+                            return Err(RuntimeError::RouteDropped);
+                        }
+                    };
                     let opened = plan.open_udp(&target).await?;
                     let crate::runtime::outbound_registry::OpenedUdpOutbound::Local {
                         socket: outbound_socket,

@@ -11,7 +11,8 @@ use crate::dns::{
     DnsTcpStream, DohDnsBackend, RoutedTcpDnsBackend,
 };
 use crate::outbound::{
-    self, DestinationAuthorizer, OutboundConfig, OutboundTcpStream, OutboundUdpSocket,
+    self, DestinationAuthorizationError, DestinationAuthorizer, OutboundConfig, OutboundTcpStream,
+    OutboundUdpSocket,
 };
 use crate::performance::MppPerformanceConfig;
 use crate::product::{
@@ -246,6 +247,90 @@ pub(in crate::runtime) enum EgressSelection {
     Balancer(BalancerId),
 }
 
+fn product_network_label(network: Network) -> &'static str {
+    match network {
+        Network::Tcp => "tcp",
+        Network::Udp => "udp",
+    }
+}
+
+fn emit_balancer_selection(
+    connection_id: Option<crate::observability::DebugConnectionId>,
+    network: Network,
+    balancer: &BalancerId,
+    outbound: &OutboundId,
+    attempt: usize,
+) {
+    crate::observability::emit_balancer_debug(
+        connection_id,
+        product_network_label(network),
+        balancer.as_str(),
+        outbound.as_str(),
+        attempt,
+    );
+}
+
+struct OutboundDebugAttempt<'a> {
+    connection_id: Option<crate::observability::DebugConnectionId>,
+    network: Network,
+    outbound: &'a OutboundId,
+    destination: &'a str,
+    attempt: usize,
+}
+
+impl<'a> OutboundDebugAttempt<'a> {
+    fn begin(
+        connection_id: Option<crate::observability::DebugConnectionId>,
+        network: Network,
+        outbound: &'a OutboundId,
+        destination: &'a str,
+        attempt: usize,
+    ) -> Self {
+        let state = Self {
+            connection_id,
+            network,
+            outbound,
+            destination,
+            attempt,
+        };
+        state.emit(crate::observability::OutboundDebugEvent::Connecting, None);
+        state
+    }
+
+    fn result<T>(&self, result: Result<T, RuntimeError>) -> Result<T, RuntimeError> {
+        result.inspect_err(|error| self.failed(error))
+    }
+
+    fn connected(&self) {
+        self.emit(crate::observability::OutboundDebugEvent::Connected, None);
+    }
+
+    fn failed(&self, error: &RuntimeError) {
+        if self.connection_id.is_none()
+            || !crate::observability::enabled(crate::config::LogLevel::Debug)
+        {
+            return;
+        }
+        let error = error.to_string();
+        self.emit(
+            crate::observability::OutboundDebugEvent::Failed,
+            Some(&error),
+        );
+    }
+
+    fn emit(&self, event: crate::observability::OutboundDebugEvent, error: Option<&str>) {
+        crate::observability::emit_outbound_debug(
+            self.connection_id,
+            event,
+            product_network_label(self.network),
+            self.outbound.as_str(),
+            self.destination,
+            self.attempt,
+            error,
+        );
+    }
+}
+
 // This is the one-time handoff into a concrete relay branch. Boxing the MPP
 // side would add one heap allocation to every selected MPP flow.
 #[allow(clippy::large_enum_variant)]
@@ -298,6 +383,7 @@ pub(in crate::runtime) struct ProductOpenRequest<'a> {
     pub(in crate::runtime) authorizer: &'a dyn DestinationAuthorizer,
     pub(in crate::runtime) dns_plan: Option<&'a DnsPlanId>,
     pub(in crate::runtime) traffic_class: TrafficClass,
+    pub(in crate::runtime) debug_connection_id: Option<crate::observability::DebugConnectionId>,
 }
 
 pub(in crate::runtime) enum ProductDestination {
@@ -680,6 +766,7 @@ impl RuntimeOutboundRegistry {
                     authorizer,
                     dns_plan,
                     traffic_class,
+                    debug_connection_id: None,
                 },
                 ProductFlowOriginKind::MppInbound,
                 false,
@@ -713,6 +800,7 @@ impl RuntimeOutboundRegistry {
                     authorizer,
                     dns_plan,
                     traffic_class: TrafficClass::RealtimeDatagram,
+                    debug_connection_id: None,
                 },
                 ProductFlowOriginKind::MppInbound,
                 false,
@@ -777,28 +865,51 @@ impl RuntimeOutboundRegistry {
             authorizer,
             dns_plan,
             traffic_class,
+            debug_connection_id,
         } = request;
         ensure_destination_network(&destination, Network::Tcp)?;
         ensure_product_open_identity(&destination, pending)?;
         let protocol_target = pending.target();
         let principal = pending.principal();
+        let debug_destination = debug_connection_id
+            .map(|_| protocol_target.authority())
+            .unwrap_or_default();
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Tcp)?;
-                leaf.ensure_new_product_flow_available()?;
                 if leaf.requires_ip_target() {
-                    self.resolve_destination(&mut destination, dns_plan, authorizer)
-                        .await?;
+                    self.resolve_destination(
+                        &mut destination,
+                        dns_plan,
+                        authorizer,
+                        debug_connection_id,
+                    )
+                    .await?;
                 }
+                let attempt = OutboundDebugAttempt::begin(
+                    debug_connection_id,
+                    Network::Tcp,
+                    id,
+                    &debug_destination,
+                    1,
+                );
+                attempt.result(leaf.ensure_new_product_flow_available())?;
                 if !leaf.supports_destination_family(&destination) {
-                    return Err(leaf.destination_family_error());
+                    return attempt.result(Err(leaf.destination_family_error()));
                 }
-                let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
-                let connect = pending
-                    .try_begin_connect(leaf.id().clone())
-                    .map_err(RuntimeError::ProductAdmission)?;
-                let opened = self
-                    .open_product_tcp_leaf(
+                let scope = attempt.result(product_flow_scope(
+                    &destination,
+                    origin_kind,
+                    leaf.id(),
+                    None,
+                ))?;
+                let connect = attempt.result(
+                    pending
+                        .try_begin_connect(leaf.id().clone())
+                        .map_err(RuntimeError::ProductAdmission),
+                )?;
+                let opened = attempt.result(
+                    self.open_product_tcp_leaf(
                         leaf,
                         ProductLeafOpen {
                             destination: &mut destination,
@@ -809,7 +920,9 @@ impl RuntimeOutboundRegistry {
                             observe_native,
                         },
                     )
-                    .await?;
+                    .await,
+                )?;
+                attempt.connected();
                 Ok((opened, connect.connected()))
             }
             EgressSelection::Balancer(id) => {
@@ -819,7 +932,7 @@ impl RuntimeOutboundRegistry {
                 let mut last_error = None;
                 let mut resolution_unavailable = false;
                 self.exclude_ineligible_balancer_members(runtime, &destination, &mut excluded)?;
-                for _ in 0..attempt_limit {
+                for attempt_number in 1..=attempt_limit {
                     let binding = match runtime.select_for_principal(
                         Network::Tcp,
                         protocol_target,
@@ -830,23 +943,27 @@ impl RuntimeOutboundRegistry {
                         Err(error) => return Err(last_error.unwrap_or(error)),
                     };
                     let handle = binding.handle;
-                    let leaf = self
-                        .shell
-                        .require_leaf(runtime.member_id(handle)?, Network::Tcp)?;
-                    if let Err(error) = leaf.ensure_new_product_flow_available() {
-                        excluded.push(handle);
-                        if last_error.is_none() {
-                            last_error = Some(error);
-                        }
-                        continue;
-                    }
+                    let member = runtime.member_id(handle)?;
+                    emit_balancer_selection(
+                        debug_connection_id,
+                        Network::Tcp,
+                        id,
+                        member,
+                        attempt_number,
+                    );
+                    let leaf = self.shell.require_leaf(member, Network::Tcp)?;
                     if leaf.requires_ip_target() {
                         if resolution_unavailable {
                             excluded.push(handle);
                             continue;
                         }
                         if let Err(error) = self
-                            .resolve_destination(&mut destination, dns_plan, authorizer)
+                            .resolve_destination(
+                                &mut destination,
+                                dns_plan,
+                                authorizer,
+                                debug_connection_id,
+                            )
                             .await
                         {
                             if matches!(error, RuntimeError::DestinationDenied(_)) {
@@ -858,9 +975,25 @@ impl RuntimeOutboundRegistry {
                             continue;
                         }
                     }
-                    if !leaf.supports_destination_family(&destination) {
+                    let attempt = OutboundDebugAttempt::begin(
+                        debug_connection_id,
+                        Network::Tcp,
+                        member,
+                        &debug_destination,
+                        attempt_number,
+                    );
+                    if let Err(error) = attempt.result(leaf.ensure_new_product_flow_available()) {
                         excluded.push(handle);
-                        last_error.get_or_insert_with(|| leaf.destination_family_error());
+                        if last_error.is_none() {
+                            last_error = Some(error);
+                        }
+                        continue;
+                    }
+                    if !leaf.supports_destination_family(&destination) {
+                        let error = leaf.destination_family_error();
+                        attempt.failed(&error);
+                        excluded.push(handle);
+                        last_error.get_or_insert(error);
                         self.exclude_ineligible_balancer_members(
                             runtime,
                             &destination,
@@ -868,17 +1001,26 @@ impl RuntimeOutboundRegistry {
                         )?;
                         continue;
                     }
-                    let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
-                    let connect = match pending.try_begin_connect(leaf.id().clone()) {
+                    let scope = attempt.result(product_flow_scope(
+                        &destination,
+                        origin_kind,
+                        leaf.id(),
+                        Some(id),
+                    ))?;
+                    let connect = match attempt.result(
+                        pending
+                            .try_begin_connect(leaf.id().clone())
+                            .map_err(RuntimeError::ProductAdmission),
+                    ) {
                         Ok(connect) => connect,
                         Err(error) => {
                             excluded.push(handle);
-                            last_error = Some(RuntimeError::ProductAdmission(error));
+                            last_error = Some(error);
                             continue;
                         }
                     };
-                    match self
-                        .open_product_tcp_leaf(
+                    match attempt.result(
+                        self.open_product_tcp_leaf(
                             leaf,
                             ProductLeafOpen {
                                 destination: &mut destination,
@@ -889,9 +1031,12 @@ impl RuntimeOutboundRegistry {
                                 observe_native,
                             },
                         )
-                        .await
-                    {
-                        Ok(opened) => return Ok((opened, connect.connected())),
+                        .await,
+                    ) {
+                        Ok(opened) => {
+                            attempt.connected();
+                            return Ok((opened, connect.connected()));
+                        }
                         Err(error @ RuntimeError::DestinationDenied(_)) => return Err(error),
                         Err(error) => {
                             excluded.push(handle);
@@ -938,28 +1083,51 @@ impl RuntimeOutboundRegistry {
             authorizer,
             dns_plan,
             traffic_class,
+            debug_connection_id,
         } = request;
         ensure_destination_network(&destination, Network::Udp)?;
         ensure_product_open_identity(&destination, pending)?;
         let protocol_target = pending.target();
         let principal = pending.principal();
+        let debug_destination = debug_connection_id
+            .map(|_| protocol_target.authority())
+            .unwrap_or_default();
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Udp)?;
-                leaf.ensure_new_product_flow_available()?;
                 if leaf.requires_ip_target() {
-                    self.resolve_destination(&mut destination, dns_plan, authorizer)
-                        .await?;
+                    self.resolve_destination(
+                        &mut destination,
+                        dns_plan,
+                        authorizer,
+                        debug_connection_id,
+                    )
+                    .await?;
                 }
+                let attempt = OutboundDebugAttempt::begin(
+                    debug_connection_id,
+                    Network::Udp,
+                    id,
+                    &debug_destination,
+                    1,
+                );
+                attempt.result(leaf.ensure_new_product_flow_available())?;
                 if !leaf.supports_destination_family(&destination) {
-                    return Err(leaf.destination_family_error());
+                    return attempt.result(Err(leaf.destination_family_error()));
                 }
-                let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
-                let connect = pending
-                    .try_begin_connect(leaf.id().clone())
-                    .map_err(RuntimeError::ProductAdmission)?;
-                let opened = self
-                    .open_product_udp_leaf(
+                let scope = attempt.result(product_flow_scope(
+                    &destination,
+                    origin_kind,
+                    leaf.id(),
+                    None,
+                ))?;
+                let connect = attempt.result(
+                    pending
+                        .try_begin_connect(leaf.id().clone())
+                        .map_err(RuntimeError::ProductAdmission),
+                )?;
+                let opened = attempt.result(
+                    self.open_product_udp_leaf(
                         leaf,
                         ProductLeafOpen {
                             destination: &mut destination,
@@ -970,7 +1138,9 @@ impl RuntimeOutboundRegistry {
                             observe_native,
                         },
                     )
-                    .await?;
+                    .await,
+                )?;
+                attempt.connected();
                 Ok((opened, connect.connected()))
             }
             EgressSelection::Balancer(id) => {
@@ -980,7 +1150,7 @@ impl RuntimeOutboundRegistry {
                 let mut last_error = None;
                 let mut resolution_unavailable = false;
                 self.exclude_ineligible_balancer_members(runtime, &destination, &mut excluded)?;
-                for _ in 0..attempt_limit {
+                for attempt_number in 1..=attempt_limit {
                     let binding = match runtime.select_for_principal(
                         Network::Udp,
                         protocol_target,
@@ -991,23 +1161,27 @@ impl RuntimeOutboundRegistry {
                         Err(error) => return Err(last_error.unwrap_or(error)),
                     };
                     let handle = binding.handle;
-                    let leaf = self
-                        .shell
-                        .require_leaf(runtime.member_id(handle)?, Network::Udp)?;
-                    if let Err(error) = leaf.ensure_new_product_flow_available() {
-                        excluded.push(handle);
-                        if last_error.is_none() {
-                            last_error = Some(error);
-                        }
-                        continue;
-                    }
+                    let member = runtime.member_id(handle)?;
+                    emit_balancer_selection(
+                        debug_connection_id,
+                        Network::Udp,
+                        id,
+                        member,
+                        attempt_number,
+                    );
+                    let leaf = self.shell.require_leaf(member, Network::Udp)?;
                     if leaf.requires_ip_target() {
                         if resolution_unavailable {
                             excluded.push(handle);
                             continue;
                         }
                         if let Err(error) = self
-                            .resolve_destination(&mut destination, dns_plan, authorizer)
+                            .resolve_destination(
+                                &mut destination,
+                                dns_plan,
+                                authorizer,
+                                debug_connection_id,
+                            )
                             .await
                         {
                             if matches!(error, RuntimeError::DestinationDenied(_)) {
@@ -1019,9 +1193,25 @@ impl RuntimeOutboundRegistry {
                             continue;
                         }
                     }
-                    if !leaf.supports_destination_family(&destination) {
+                    let attempt = OutboundDebugAttempt::begin(
+                        debug_connection_id,
+                        Network::Udp,
+                        member,
+                        &debug_destination,
+                        attempt_number,
+                    );
+                    if let Err(error) = attempt.result(leaf.ensure_new_product_flow_available()) {
                         excluded.push(handle);
-                        last_error.get_or_insert_with(|| leaf.destination_family_error());
+                        if last_error.is_none() {
+                            last_error = Some(error);
+                        }
+                        continue;
+                    }
+                    if !leaf.supports_destination_family(&destination) {
+                        let error = leaf.destination_family_error();
+                        attempt.failed(&error);
+                        excluded.push(handle);
+                        last_error.get_or_insert(error);
                         self.exclude_ineligible_balancer_members(
                             runtime,
                             &destination,
@@ -1029,17 +1219,26 @@ impl RuntimeOutboundRegistry {
                         )?;
                         continue;
                     }
-                    let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
-                    let connect = match pending.try_begin_connect(leaf.id().clone()) {
+                    let scope = attempt.result(product_flow_scope(
+                        &destination,
+                        origin_kind,
+                        leaf.id(),
+                        Some(id),
+                    ))?;
+                    let connect = match attempt.result(
+                        pending
+                            .try_begin_connect(leaf.id().clone())
+                            .map_err(RuntimeError::ProductAdmission),
+                    ) {
                         Ok(connect) => connect,
                         Err(error) => {
                             excluded.push(handle);
-                            last_error = Some(RuntimeError::ProductAdmission(error));
+                            last_error = Some(error);
                             continue;
                         }
                     };
-                    match self
-                        .open_product_udp_leaf(
+                    match attempt.result(
+                        self.open_product_udp_leaf(
                             leaf,
                             ProductLeafOpen {
                                 destination: &mut destination,
@@ -1050,9 +1249,12 @@ impl RuntimeOutboundRegistry {
                                 observe_native,
                             },
                         )
-                        .await
-                    {
-                        Ok(opened) => return Ok((opened, connect.connected())),
+                        .await,
+                    ) {
+                        Ok(opened) => {
+                            attempt.connected();
+                            return Ok((opened, connect.connected()));
+                        }
                         Err(error @ RuntimeError::DestinationDenied(_)) => return Err(error),
                         Err(error) => {
                             excluded.push(handle);
@@ -1248,15 +1450,31 @@ impl RuntimeOutboundRegistry {
         destination: &'a mut ProductDestination,
         dns_plan: Option<&DnsPlanId>,
         authorizer: &dyn DestinationAuthorizer,
+        debug_connection_id: Option<crate::observability::DebugConnectionId>,
     ) -> Result<&'a [AuthorizedTarget], RuntimeError> {
         if let ProductDestination::Domain(domain) = destination {
             let deadline =
                 self.destination_resolution_deadline(dns_plan, domain.flow().target())?;
-            let authorized = outbound::resolve_authorized_domain_before(
+            let authorized = match outbound::resolve_authorized_domain_before(
                 &self.dns, dns_plan, authorizer, domain, deadline,
             )
             .await
-            .map_err(map_destination_resolution_error)?;
+            {
+                Ok(authorized) => authorized,
+                Err(error) => {
+                    if let outbound::OutboundConnectError::DestinationAuthorization(
+                        DestinationAuthorizationError::Policy(error),
+                    ) = &error
+                    {
+                        crate::runtime::product_policy::emit_product_routing_terminal_debug(
+                            debug_connection_id,
+                            domain.flow(),
+                            error,
+                        );
+                    }
+                    return Err(map_destination_resolution_error(error));
+                }
+            };
             *destination = ProductDestination::resolved(authorized)?;
         }
         match destination {

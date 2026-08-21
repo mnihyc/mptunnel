@@ -50,6 +50,15 @@ struct EditorProjection {
     schema_version: u8,
     #[serde(default = "default_editor_log_level")]
     log_level: String,
+    /// Three-state patch field: a missing JSON member preserves the TOML, an
+    /// explicit JSON null removes the compatibility-optional key, and a
+    /// string sets one of the supported modes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_defined_optional_string"
+    )]
+    target_resolution: Option<Option<String>>,
     paths: Vec<EditorPath>,
     advanced: Option<EditorAdvanced>,
     credential_id: String,
@@ -364,6 +373,14 @@ fn parse_editor_document(contents: &str) -> Result<DocumentMut, AndroidBridgeErr
         .map_err(|_| bridge_error("editable configuration document is invalid"))
 }
 
+/// Raw/advanced editor save gate. This deliberately validates only the TOML
+/// document boundary (including its size limit); operator-selected schema and
+/// runtime semantics are validated when that document is actually finalized
+/// and started.
+fn validate_editor_syntax(contents: &str) -> Result<(), AndroidBridgeError> {
+    parse_editor_document(contents).map(drop)
+}
+
 fn normalize_legacy_marker_lines(contents: &str) -> String {
     let legacy_definition = LOCAL_USER_DEFINITION_MARKER.trim_start_matches("# ");
     let legacy_binding = LOCAL_USER_BINDING_MARKER.trim_start_matches("# ");
@@ -492,6 +509,7 @@ fn credential_table_mut(
 fn project_editor(contents: &str) -> Result<EditorProjection, AndroidBridgeError> {
     let document = parse_editor_document(contents)?;
     let log_level = project_log_level(&document)?;
+    let target_resolution = project_target_resolution(&document)?;
     let outbound_index = guided_mpp_outbound_index(&document)?;
     let outbound = mpp_outbound(&document, outbound_index)?;
     let security = child_table(outbound, "security")?;
@@ -513,6 +531,7 @@ fn project_editor(contents: &str) -> Result<EditorProjection, AndroidBridgeError
     Ok(EditorProjection {
         schema_version: 1,
         log_level,
+        target_resolution: Some(target_resolution),
         paths,
         advanced,
         credential_id,
@@ -525,6 +544,15 @@ fn default_editor_log_level() -> String {
     LogLevel::Info.as_str().to_string()
 }
 
+fn deserialize_defined_optional_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 fn validate_editor_log_level(level: &str) -> Result<(), AndroidBridgeError> {
     if matches!(level, "off" | "error" | "warn" | "info" | "debug") {
         Ok(())
@@ -533,6 +561,33 @@ fn validate_editor_log_level(level: &str) -> Result<(), AndroidBridgeError> {
             "log_level must be one of off, error, warn, info, or debug",
         ))
     }
+}
+
+fn validate_editor_target_resolution(mode: &str) -> Result<(), AndroidBridgeError> {
+    if matches!(mode, "as-is" | "route-only" | "full-resolve") {
+        Ok(())
+    } else {
+        Err(bridge_error(
+            "target_resolution must be one of as-is, route-only, or full-resolve",
+        ))
+    }
+}
+
+fn project_target_resolution(document: &DocumentMut) -> Result<Option<String>, AndroidBridgeError> {
+    let Some(routing) = document.get("routing") else {
+        return Ok(None);
+    };
+    let routing = routing
+        .as_table()
+        .ok_or_else(|| bridge_error("editable field \"routing\" must be a table"))?;
+    let Some(mode) = routing.get("target_resolution") else {
+        return Ok(None);
+    };
+    let mode = mode
+        .as_str()
+        .ok_or_else(|| bridge_error("editable field \"target_resolution\" must be a string"))?;
+    validate_editor_target_resolution(mode)?;
+    Ok(Some(mode.to_string()))
 }
 
 fn project_log_level(document: &DocumentMut) -> Result<String, AndroidBridgeError> {
@@ -681,6 +736,9 @@ fn parse_projection_json(contents: &str) -> Result<EditorProjection, AndroidBrid
         return Err(bridge_error("unsupported editor projection schema version"));
     }
     validate_editor_log_level(&projection.log_level)?;
+    if let Some(Some(mode)) = projection.target_resolution.as_ref() {
+        validate_editor_target_resolution(mode)?;
+    }
     Ok(projection)
 }
 
@@ -1396,9 +1454,35 @@ fn patch_editor(contents: &str, projection_json: &str) -> Result<String, Android
         );
     }
     patch_advanced(&mut document, outbound_index, projection.advanced.as_ref())?;
+    patch_target_resolution(&mut document, &projection.target_resolution)?;
     let logging = ensure_child_table(document.as_table_mut(), "logging")?;
     set_table_value(logging, "level", Value::from(projection.log_level.as_str()));
     Ok(document.to_string())
+}
+
+fn patch_target_resolution(
+    document: &mut DocumentMut,
+    projected: &Option<Option<String>>,
+) -> Result<(), AndroidBridgeError> {
+    match projected {
+        None => Ok(()),
+        Some(None) => {
+            let Some(routing) = document.get_mut("routing") else {
+                return Ok(());
+            };
+            routing
+                .as_table_mut()
+                .ok_or_else(|| bridge_error("editable field \"routing\" must be a table"))?
+                .remove("target_resolution");
+            Ok(())
+        }
+        Some(Some(mode)) => {
+            validate_editor_target_resolution(mode)?;
+            let routing = ensure_child_table(document.as_table_mut(), "routing")?;
+            set_table_value(routing, "target_resolution", Value::from(mode.as_str()));
+            Ok(())
+        }
+    }
 }
 
 fn parse_finalize_bindings(contents: &str) -> Result<FinalizeBindings, AndroidBridgeError> {
@@ -2147,6 +2231,21 @@ pub fn native_migrate_editor<'caller>(
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
+#[jni_mangle("com.v2ray.ang.mpp.MptunnelNative", "nativeValidateEditorSyntax")]
+pub fn native_validate_editor_syntax<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    config_toml: JString<'caller>,
+) -> jboolean {
+    unowned_env
+        .with_env(|env| -> Result<jboolean, AndroidBridgeError> {
+            let config_toml = jstring(env, &config_toml, "editable configuration document")?;
+            validate_editor_syntax(&config_toml)?;
+            Ok(jboolean::from(true))
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 #[jni_mangle("com.v2ray.ang.mpp.MptunnelNative", "nativeFinalizeEditor")]
 pub fn native_finalize_editor<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
@@ -2739,6 +2838,7 @@ name = "remote""#,
         let transient = EditorProjection {
             schema_version: 1,
             log_level: "debug".to_string(),
+            target_resolution: Some(None),
             paths: vec![
                 EditorPath {
                     name: String::new(),
@@ -2825,6 +2925,106 @@ name = "remote""#,
     }
 
     #[test]
+    fn editor_target_resolution_projects_sets_removes_and_preserves_legacy_payloads() {
+        let omitted = project_editor(EDITABLE_CONFIG).expect("omitted mode projection");
+        assert_eq!(omitted.target_resolution, Some(None));
+        assert_eq!(
+            serde_json::to_value(&omitted).expect("projection JSON")["target_resolution"],
+            serde_json::Value::Null
+        );
+
+        for mode in ["as-is", "route-only", "full-resolve"] {
+            let configured = EDITABLE_CONFIG.replacen(
+                "[routing]\n",
+                &format!(
+                    "[routing]\ntarget_resolution = \"{mode}\" # preserve target decoration\ncustom_routing = \"keep\" # preserve custom routing field\n"
+                ),
+                1,
+            );
+            let projection = project_editor(&configured).expect("explicit mode projection");
+            assert_eq!(
+                projection
+                    .target_resolution
+                    .as_ref()
+                    .and_then(|value| value.as_deref()),
+                Some(mode)
+            );
+
+            let mut legacy_json =
+                serde_json::to_value(&projection).expect("legacy projection value");
+            legacy_json
+                .as_object_mut()
+                .expect("projection object")
+                .remove("target_resolution");
+            let legacy_projection = parse_projection_json(&legacy_json.to_string())
+                .expect("schema-1 projection without additive field");
+            assert_eq!(legacy_projection.target_resolution, None);
+            let legacy_patched = patch_editor(&configured, &legacy_json.to_string())
+                .expect("legacy projection patch");
+            assert_eq!(
+                project_target_resolution(
+                    &parse_editor_document(&legacy_patched).expect("legacy patched TOML")
+                )
+                .expect("legacy patched mode"),
+                Some(mode.to_string())
+            );
+            assert!(legacy_patched.contains("custom_routing = \"keep\""));
+        }
+
+        let mut projection = omitted;
+        projection.target_resolution = Some(Some("route-only".to_string()));
+        let inserted = patch_editor(
+            EDITABLE_CONFIG,
+            &serde_json::to_string(&projection).expect("set projection JSON"),
+        )
+        .expect("set target resolution");
+        assert!(inserted.contains("target_resolution = \"route-only\""));
+        assert_eq!(
+            project_editor(&inserted).expect("reproject set mode"),
+            projection
+        );
+
+        projection.target_resolution = Some(None);
+        let removed = patch_editor(
+            &inserted,
+            &serde_json::to_string(&projection).expect("remove projection JSON"),
+        )
+        .expect("remove target resolution");
+        assert!(!removed.contains("target_resolution"));
+        assert_eq!(
+            project_editor(&removed).expect("reproject removed mode"),
+            projection
+        );
+
+        projection.target_resolution = Some(Some("auto".to_string()));
+        let error = patch_editor(
+            EDITABLE_CONFIG,
+            &serde_json::to_string(&projection).expect("invalid projection JSON"),
+        )
+        .expect_err("unsupported target resolution")
+        .to_string();
+        assert!(error.contains("as-is, route-only, or full-resolve"));
+    }
+
+    #[test]
+    fn raw_editor_save_gate_checks_toml_syntax_without_enforcing_runtime_intent() {
+        let operator_document = r#"[dns]
+default = "system"
+operator_extension = "preserve-for-future-core"
+"#;
+        validate_editor_syntax(operator_document).expect("syntactically valid advanced document");
+        assert!(
+            compile_inline_config(operator_document).is_err(),
+            "the syntax-only save gate must remain distinct from runtime compilation"
+        );
+
+        let error = validate_editor_syntax("[dns\ndefault = \"system\"")
+            .expect_err("broken TOML syntax")
+            .to_string();
+        assert!(error.contains("invalid"));
+    }
+
+    #[test]
     fn guided_patch_preserves_unknowns_and_makes_material_bindings_authoritative() {
         let mut projection = project_editor(EDITABLE_CONFIG).expect("editor projection");
         projection.credential_id = "edited-credential".to_string();
@@ -2906,6 +3106,21 @@ name = "remote""#,
         let parsed = inline_document(&finalized);
         validate_inline_document(&parsed).expect("finalized Android confinement");
         compile_inline_config(&finalized).expect("finalized core config");
+    }
+
+    #[test]
+    fn finalizer_preserves_and_compiles_explicit_target_resolution_modes() {
+        for mode in ["as-is", "route-only", "full-resolve"] {
+            let editable = runtime_editable_config().replacen(
+                "[routing]\n",
+                &format!("[routing]\ntarget_resolution = \"{mode}\"\n"),
+                1,
+            );
+            let finalized = finalize_editor(&editable, &test_bindings(false, false))
+                .expect("target resolution finalization");
+            assert!(finalized.contains(&format!("target_resolution = \"{mode}\"")));
+            compile_inline_config(&finalized).expect("target resolution finalized config");
+        }
     }
 
     #[test]

@@ -202,6 +202,40 @@ pub enum InitialDemand {
     Throughput,
 }
 
+/// Controls whether a domain target is resolved while making a Product
+/// routing decision and which representation is handed to the selected
+/// outbound.
+///
+/// `Auto` preserves the compatibility/default behavior used by hand-built
+/// policies. File configurations can opt into one of the three explicit
+/// modes. `RouteOnly` may resolve a domain to classify
+/// address-dependent rules, but retains the original hostname for a
+/// domain-capable outbound (such as MPP). `AsIs` never performs a routing DNS
+/// lookup; address-dependent rules simply cannot match a hostname and the
+/// selected domain-capable outbound receives the original target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TargetResolutionMode {
+    /// Preserve the pre-existing demand-driven behavior for documents that do
+    /// not declare a strategy. This is intentionally not advertised as one
+    /// of the three V2Ray-style choices.
+    #[default]
+    Auto,
+    AsIs,
+    RouteOnly,
+    FullResolve,
+}
+
+impl TargetResolutionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::AsIs => "as-is",
+            Self::RouteOnly => "route-only",
+            Self::FullResolve => "full-resolve",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EgressAction {
     Direct,
@@ -226,9 +260,14 @@ pub enum RouteAction {
         egress: EgressAction,
         dns_plan: Option<DnsPlanId>,
         initial_demand: InitialDemand,
+        target_resolution: TargetResolutionMode,
     },
-    Reject,
-    Drop,
+    Reject {
+        target_resolution: TargetResolutionMode,
+    },
+    Drop {
+        target_resolution: TargetResolutionMode,
+    },
 }
 
 impl RouteAction {
@@ -242,6 +281,7 @@ impl RouteAction {
             egress,
             dns_plan,
             initial_demand,
+            target_resolution: TargetResolutionMode::Auto,
         }
     }
 
@@ -255,15 +295,20 @@ impl RouteAction {
             egress,
             dns_plan,
             initial_demand,
+            target_resolution: TargetResolutionMode::Auto,
         }
     }
 
     pub const fn reject() -> Self {
-        Self::Reject
+        Self::Reject {
+            target_resolution: TargetResolutionMode::Auto,
+        }
     }
 
     pub const fn drop() -> Self {
-        Self::Drop
+        Self::Drop {
+            target_resolution: TargetResolutionMode::Auto,
+        }
     }
 
     pub const fn direct(initial_demand: InitialDemand) -> Self {
@@ -273,29 +318,60 @@ impl RouteAction {
     pub const fn disposition(&self) -> RouteDisposition {
         match self {
             Self::Allow { disposition, .. } => *disposition,
-            Self::Reject => RouteDisposition::Reject,
-            Self::Drop => RouteDisposition::Drop,
+            Self::Reject { .. } => RouteDisposition::Reject,
+            Self::Drop { .. } => RouteDisposition::Drop,
         }
     }
 
     pub const fn egress(&self) -> Option<&EgressAction> {
         match self {
             Self::Allow { egress, .. } => Some(egress),
-            Self::Reject | Self::Drop => None,
+            Self::Reject { .. } | Self::Drop { .. } => None,
         }
     }
 
     pub const fn dns_plan(&self) -> Option<&DnsPlanId> {
         match self {
             Self::Allow { dns_plan, .. } => dns_plan.as_ref(),
-            Self::Reject | Self::Drop => None,
+            Self::Reject { .. } | Self::Drop { .. } => None,
         }
     }
 
     pub const fn initial_demand(&self) -> InitialDemand {
         match self {
             Self::Allow { initial_demand, .. } => *initial_demand,
-            Self::Reject | Self::Drop => InitialDemand::Automatic,
+            Self::Reject { .. } | Self::Drop { .. } => InitialDemand::Automatic,
+        }
+    }
+
+    pub const fn target_resolution(&self) -> TargetResolutionMode {
+        match self {
+            Self::Allow {
+                target_resolution, ..
+            } => *target_resolution,
+            Self::Reject { target_resolution } | Self::Drop { target_resolution } => {
+                *target_resolution
+            }
+        }
+    }
+
+    pub fn with_target_resolution(self, target_resolution: TargetResolutionMode) -> Self {
+        match self {
+            Self::Allow {
+                disposition,
+                egress,
+                dns_plan,
+                initial_demand,
+                ..
+            } => Self::Allow {
+                disposition,
+                egress,
+                dns_plan,
+                initial_demand,
+                target_resolution,
+            },
+            Self::Reject { .. } => Self::Reject { target_resolution },
+            Self::Drop { .. } => Self::Drop { target_resolution },
         }
     }
 }
@@ -348,6 +424,21 @@ impl CompiledRouteTable {
             });
         }
 
+        // File configuration exposes one routing-wide mode and applies it to
+        // every declared action. Preserve that mode on the compiler-owned
+        // fail-closed rule as well; otherwise an omitted catch-all could
+        // unexpectedly resolve under AsIs. Hand-built mixed-mode tables fall
+        // back to compatibility behavior for their implicit rule.
+        let implicit_target_resolution = rules
+            .first()
+            .map(|rule| rule.action.target_resolution())
+            .filter(|mode| {
+                rules
+                    .iter()
+                    .all(|rule| rule.action.target_resolution() == *mode)
+            })
+            .unwrap_or(TargetResolutionMode::Auto);
+
         let mut ids = HashSet::with_capacity(rules.len());
         // The fail-closed fallback is a runtime invariant, not configuration
         // boilerplate. Keep it after the operator's ordered rules so a stated
@@ -394,7 +485,7 @@ impl CompiledRouteTable {
         compiled.push(CompiledRouteRule {
             id: implicit_id,
             matcher: implicit_matcher,
-            action: RouteAction::reject(),
+            action: RouteAction::reject().with_target_resolution(implicit_target_resolution),
             explanation: "unmatched traffic is rejected".to_string(),
             implicit: true,
         });

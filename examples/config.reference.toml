@@ -563,6 +563,20 @@ auth_freshness_window_seconds = 300
 
 [routing]
 
+# Hostname representation is one node-wide routing choice, shared by local
+# and MPP inbounds:
+#   as-is       - routing never performs DNS; domain-capable outbounds receive
+#                 the original hostname and IP-dependent rules cannot match it
+#   route-only  - resolve only for an IP-dependent routing decision, then keep
+#                 the original hostname for a domain-capable outbound
+#   full-resolve - resolve every hostname and pass authorized literal IPs
+# Omission retains the historical demand-driven compatibility behavior.
+# Resolution mode never changes literal-IP authorization. Private literals
+# require a narrow allow-restricted rule independently on each node that
+# handles them; as-is hostnames bypass CIDR matching only because no local DNS
+# answer exists to match.
+# target_resolution = "route-only"
+
 # Routing is one ordered, first-match table shared by every L4 local and MPP
 # inbound. A normal rule selects exactly one `outbound` or `balancer`; its
 # ordinary allow decision is inferred. Use `decision = "allow-restricted"`

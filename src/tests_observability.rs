@@ -170,6 +170,7 @@ fn connection_debug_records_are_stable_sanitized_and_scope_owned() {
         "tcp",
     );
     inbound.inbound = Some("local-socks");
+    inbound.principal = Some("alice");
     inbound.source = Some("127.0.0.1:51000");
     let mut json = Vec::new();
     write_connection_debug_record(&mut json, LogFormat::Json, &inbound);
@@ -178,6 +179,7 @@ fn connection_debug_records_are_stable_sanitized_and_scope_owned() {
     assert_eq!(parsed["event"], "accepted");
     assert_eq!(parsed["connection_id"], "17");
     assert_eq!(parsed["inbound"], "local-socks");
+    assert_eq!(parsed["principal"], "alice");
     assert!(parsed.get("destination").is_none());
     for foreign in ["rule", "decision", "egress", "balancer", "outbound"] {
         assert!(parsed.get(foreign).is_none(), "inbound leaked {foreign}");
@@ -186,7 +188,7 @@ fn connection_debug_records_are_stable_sanitized_and_scope_owned() {
     write_connection_debug_record(&mut text, LogFormat::Text, &inbound);
     assert_eq!(
         String::from_utf8(text).expect("inbound text record"),
-        "1970-01-01T00:00:00.009Z DEBUG inbound.accepted: id=17 network=tcp inbound=\"local-socks\" source=\"127.0.0.1:51000\"\n"
+        "1970-01-01T00:00:00.009Z DEBUG inbound.accepted: id=17 network=tcp inbound=\"local-socks\" principal=\"alice\" source=\"127.0.0.1:51000\"\n"
     );
 
     let mut routing = ConnectionDebugRecord::new(
@@ -196,9 +198,12 @@ fn connection_debug_records_are_stable_sanitized_and_scope_owned() {
         id,
         "tcp",
     );
+    routing.inbound = Some("local-socks");
+    routing.principal = Some("alice");
     routing.rule = Some("private-sites");
     routing.decision = Some("allow");
     routing.egress = Some("balancer:primary");
+    routing.target_resolution = Some("route-only");
     routing.destination = Some("example.net:443");
     let mut json = Vec::new();
     write_connection_debug_record(&mut json, LogFormat::Json, &routing);
@@ -207,7 +212,10 @@ fn connection_debug_records_are_stable_sanitized_and_scope_owned() {
     assert_eq!(parsed["event"], "selected");
     assert_eq!(parsed["decision"], "allow");
     assert_eq!(parsed["egress"], "balancer:primary");
-    for foreign in ["inbound", "source", "balancer", "outbound", "attempt"] {
+    assert_eq!(parsed["inbound"], "local-socks");
+    assert_eq!(parsed["principal"], "alice");
+    assert_eq!(parsed["target_resolution"], "route-only");
+    for foreign in ["source", "balancer", "outbound", "attempt"] {
         assert!(parsed.get(foreign).is_none(), "routing leaked {foreign}");
     }
 
@@ -237,6 +245,10 @@ fn connection_debug_records_are_stable_sanitized_and_scope_owned() {
         "tcp",
     );
     outbound.outbound = Some("edge-a");
+    outbound.protocol = Some("mpp");
+    outbound.origin = Some("local_inbound");
+    outbound.underlay = Some("tcp");
+    outbound.mpp_path = Some("primary-tcp");
     outbound.destination = Some("example.net:443");
     outbound.attempt = Some(2);
     outbound.error = Some(&unsafe_error);
@@ -246,6 +258,10 @@ fn connection_debug_records_are_stable_sanitized_and_scope_owned() {
     assert_eq!(parsed["component"], "outbound");
     assert_eq!(parsed["event"], "failed");
     assert_eq!(parsed["outbound"], "edge-a");
+    assert_eq!(parsed["protocol"], "mpp");
+    assert_eq!(parsed["origin"], "local_inbound");
+    assert_eq!(parsed["underlay"], "tcp");
+    assert_eq!(parsed["mpp_path"], "primary-tcp");
     assert_eq!(parsed["attempt"], 2);
     assert!(
         !parsed["error"]

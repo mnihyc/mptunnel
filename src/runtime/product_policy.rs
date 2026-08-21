@@ -4,9 +4,10 @@ use crate::outbound::{
     DestinationAuthorization, DestinationAuthorizationError, DestinationAuthorizer,
 };
 use crate::product::{
-    DnsPlanId, DnsSyntheticCaptureId, EgressAction, FlowContext, InboundId, InitialDemand, Network,
-    PrincipalId, ProductPolicyGeneration, ProtocolTarget, RouteAuthorizationError,
-    RouteDisposition, RoutePermit, RuleId, SourceEndpoint,
+    AuthorizedDomainTarget, DnsPlanId, DnsSyntheticCaptureId, EgressAction, FlowContext, InboundId,
+    InitialDemand, Network, PrincipalId, ProductPolicyGeneration, ProtocolTarget,
+    RouteAuthorizationError, RouteDisposition, RoutePermit, RuleId, SourceEndpoint,
+    TargetResolutionMode,
 };
 use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
@@ -52,6 +53,7 @@ pub(in crate::runtime) struct ClientOutboundPlan {
     authorization: DestinationAuthorization,
     recovered_dns: Option<SyntheticCaptureRoute>,
     debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    resolution_mode: TargetResolutionMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +190,12 @@ impl ClientOutboundPlan {
         network: Network,
     ) -> Result<Vec<DestinationRouteGroup>, RuntimeError> {
         if self.authorization.target().ip().is_none()
+            && matches!(
+                self.resolution_mode,
+                TargetResolutionMode::Auto
+                    | TargetResolutionMode::AsIs
+                    | TargetResolutionMode::RouteOnly
+            )
             && !self.authorization.requires_post_resolution()
         {
             let permit = self.authorization.decision.permit();
@@ -197,12 +205,21 @@ impl ClientOutboundPlan {
                 .authorizer
                 .authorize_domain(self.authorization.clone())
                 .map_err(map_destination_authorization_error)?;
+            let destination = match self.resolution_mode {
+                TargetResolutionMode::Auto => ProductDestination::domain(domain),
+                TargetResolutionMode::AsIs | TargetResolutionMode::RouteOnly => {
+                    ProductDestination::preserved_domain(domain)
+                }
+                TargetResolutionMode::FullResolve => {
+                    unreachable!("full-resolve domains require routing resolution")
+                }
+            };
             return Ok(vec![DestinationRouteGroup {
                 debug_connection_id: self.debug_connection_id,
                 rule_id: permit.rule_id().clone(),
                 disposition: permit.action().disposition(),
                 selection,
-                destination: ProductDestination::domain(domain),
+                destination,
                 dns_plan,
                 traffic_class,
             }]);
@@ -267,12 +284,33 @@ impl ClientOutboundPlan {
         groups
             .into_iter()
             .map(|group| {
+                let preserve_domain = self.authorization.target().domain().is_some()
+                    && self.resolution_mode == TargetResolutionMode::RouteOnly
+                    && group.permit.action().target_resolution() == TargetResolutionMode::RouteOnly;
+                let destination = if preserve_domain {
+                    // RouteOnly intentionally uses DNS only as routing
+                    // evidence. Retain both forms so a domain-capable selected
+                    // leaf receives the hostname while an IP-only leaf reuses
+                    // the exact authorized answers without a second lookup.
+                    let permit = group
+                        .authorized
+                        .first()
+                        .expect("authorized route group has one target")
+                        .permit()
+                        .clone();
+                    ProductDestination::routed_domain(
+                        AuthorizedDomainTarget::new(permit),
+                        group.authorized,
+                    )?
+                } else {
+                    ProductDestination::resolved(group.authorized)?
+                };
                 Ok(DestinationRouteGroup {
                     debug_connection_id: self.debug_connection_id,
                     rule_id: group.permit.rule_id().clone(),
                     disposition: group.permit.action().disposition(),
                     selection: group.selection,
-                    destination: ProductDestination::resolved(group.authorized)?,
+                    destination,
                     dns_plan: group.dns_plan,
                     traffic_class: group.traffic_class,
                 })
@@ -377,11 +415,16 @@ impl ClientOutboundPlan {
         crate::observability::emit_routing_debug(
             group.debug_connection_id,
             crate::observability::RoutingDebugEvent::Selected,
-            debug_network_label(flow.network()),
-            Some(group.rule_id.as_str()),
-            decision,
-            Some(&egress),
-            &destination,
+            crate::observability::RoutingDebugFields {
+                network: debug_network_label(flow.network()),
+                inbound: Some(flow.inbound().as_str()),
+                principal: Some(flow.principal().as_str()),
+                rule: Some(group.rule_id.as_str()),
+                decision,
+                egress: Some(&egress),
+                target_resolution: Some(self.resolution_mode.as_str()),
+                destination: &destination,
+            },
         );
     }
 
@@ -821,6 +864,7 @@ impl ClientIngressRouter {
                 };
             }
         };
+        let resolution_mode = decision.permit().action().target_resolution();
         if let Some(recovered) = &recovered_dns {
             if recovered.generation != self.registry.dns().generation() {
                 return Err(RuntimeError::DestinationDenied(
@@ -841,12 +885,22 @@ impl ClientIngressRouter {
                 )));
             }
         }
-        // An explicit route DNS selector is an instruction, not metadata. It
-        // must resolve even for a domain-capable proxy/Mpp egress; otherwise
-        // the selected policy and local restricted-address check would be
-        // silently bypassed by next-hop resolution.
-        if decision.permit().action().dns_plan().is_some() || recovered_dns.is_some() {
+        // An explicit route DNS selector is an instruction under RouteOnly and
+        // FullResolve. AsIs is deliberately stronger: routing never performs
+        // a DNS lookup merely because a policy contains an IP-dependent
+        // selector; the delegated outbound receives the original hostname.
+        if resolution_mode != TargetResolutionMode::AsIs
+            && (decision.permit().action().dns_plan().is_some() || recovered_dns.is_some())
+        {
             decision.require_post_resolution();
+        }
+        if flow.target().domain().is_some() {
+            match resolution_mode {
+                TargetResolutionMode::Auto => {}
+                TargetResolutionMode::AsIs => decision.skip_post_resolution(),
+                TargetResolutionMode::RouteOnly => {}
+                TargetResolutionMode::FullResolve => decision.require_post_resolution(),
+            }
         }
         if let Some(egress) = decision.permit().action().egress().cloned() {
             if matches!(egress, EgressAction::Direct) && !decision.requires_post_resolution() {
@@ -855,7 +909,9 @@ impl ClientIngressRouter {
                     decision.permit().rule_id()
                 )));
             }
-            if self.registry.action_requires_family_resolution(&egress)? {
+            if resolution_mode != TargetResolutionMode::AsIs
+                && self.registry.action_requires_family_resolution(&egress)?
+            {
                 decision.require_post_resolution();
             }
             if !decision.requires_post_resolution() {
@@ -876,6 +932,7 @@ impl ClientIngressRouter {
             authorization: DestinationAuthorization { decision },
             recovered_dns,
             debug_connection_id,
+            resolution_mode,
         }))
     }
 }
@@ -908,6 +965,7 @@ fn emit_inbound_debug_for_flow(
         event,
         debug_network_label(flow.network()),
         flow.inbound().as_str(),
+        Some(flow.principal().as_str()),
         source.as_deref(),
         destination.as_deref(),
     );
@@ -927,11 +985,16 @@ fn emit_routing_terminal_debug(
     crate::observability::emit_routing_debug(
         debug_connection_id,
         event,
-        debug_network_label(flow.network()),
-        Some(rule),
-        decision,
-        None,
-        &destination,
+        crate::observability::RoutingDebugFields {
+            network: debug_network_label(flow.network()),
+            inbound: Some(flow.inbound().as_str()),
+            principal: Some(flow.principal().as_str()),
+            rule: Some(rule),
+            decision,
+            egress: None,
+            target_resolution: None,
+            destination: &destination,
+        },
     );
 }
 

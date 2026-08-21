@@ -731,6 +731,8 @@ struct ConnectionDebugRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     inbound: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    principal: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rule: Option<&'a str>,
@@ -739,9 +741,19 @@ struct ConnectionDebugRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     egress: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    target_resolution: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     balancer: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outbound: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    underlay: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mpp_path: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     destination: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -766,12 +778,18 @@ impl<'a> ConnectionDebugRecord<'a> {
             connection_id: id.to_string(),
             network,
             inbound: None,
+            principal: None,
             source: None,
             rule: None,
             decision: None,
             egress: None,
+            target_resolution: None,
             balancer: None,
             outbound: None,
+            protocol: None,
+            origin: None,
+            underlay: None,
+            mpp_path: None,
             destination: None,
             attempt: None,
             error: None,
@@ -785,6 +803,7 @@ pub(crate) fn emit_inbound_debug(
     event: InboundDebugEvent,
     network: &str,
     inbound: &str,
+    principal: Option<&str>,
     source: Option<&str>,
     destination: Option<&str>,
 ) {
@@ -796,27 +815,36 @@ pub(crate) fn emit_inbound_debug(
     };
     let network = sanitize_connection_field(network);
     let inbound = sanitize_connection_field(inbound);
+    let principal = principal.map(sanitize_connection_field);
     let source = source.map(sanitize_connection_field);
     let destination = destination.map(sanitize_connection_field);
     let mut record =
         ConnectionDebugRecord::new(unix_millis(), "inbound", event.as_str(), id, &network);
     record.inbound = Some(&inbound);
+    record.principal = principal.as_deref();
     record.source = source.as_deref();
     record.destination = destination.as_deref();
     emit_connection_debug_record(&record);
 }
 
-/// Emits one routing-owned decision without inbound, balancer, or connector
-/// state. `decision` is the routing verdict; `egress` names an allowed target
-/// as `outbound:<id>` or `balancer:<id>`.
+pub(crate) struct RoutingDebugFields<'a> {
+    pub(crate) network: &'a str,
+    pub(crate) inbound: Option<&'a str>,
+    pub(crate) principal: Option<&'a str>,
+    pub(crate) rule: Option<&'a str>,
+    pub(crate) decision: &'a str,
+    pub(crate) egress: Option<&'a str>,
+    pub(crate) target_resolution: Option<&'a str>,
+    pub(crate) destination: &'a str,
+}
+
+/// Emits one routing-owned decision without balancer or connector state.
+/// `decision` is the routing verdict; `egress` names an allowed target as
+/// `outbound:<id>` or `balancer:<id>`.
 pub(crate) fn emit_routing_debug(
     id: Option<DebugConnectionId>,
     event: RoutingDebugEvent,
-    network: &str,
-    rule: Option<&str>,
-    decision: &str,
-    egress: Option<&str>,
-    destination: &str,
+    fields: RoutingDebugFields<'_>,
 ) {
     if !enabled(LogLevel::Debug) {
         return;
@@ -824,16 +852,22 @@ pub(crate) fn emit_routing_debug(
     let Some(id) = id else {
         return;
     };
-    let network = sanitize_connection_field(network);
-    let rule = rule.map(sanitize_connection_field);
-    let decision = sanitize_connection_field(decision);
-    let egress = egress.map(sanitize_connection_field);
-    let destination = sanitize_connection_field(destination);
+    let network = sanitize_connection_field(fields.network);
+    let inbound = fields.inbound.map(sanitize_connection_field);
+    let principal = fields.principal.map(sanitize_connection_field);
+    let rule = fields.rule.map(sanitize_connection_field);
+    let decision = sanitize_connection_field(fields.decision);
+    let egress = fields.egress.map(sanitize_connection_field);
+    let target_resolution = fields.target_resolution.map(sanitize_connection_field);
+    let destination = sanitize_connection_field(fields.destination);
     let mut record =
         ConnectionDebugRecord::new(unix_millis(), "routing", event.as_str(), id, &network);
     record.rule = rule.as_deref();
+    record.inbound = inbound.as_deref();
+    record.principal = principal.as_deref();
     record.decision = Some(&decision);
     record.egress = egress.as_deref();
+    record.target_resolution = target_resolution.as_deref();
     record.destination = Some(&destination);
     emit_connection_debug_record(&record);
 }
@@ -863,16 +897,25 @@ pub(crate) fn emit_balancer_debug(
     emit_connection_debug_record(&record);
 }
 
-/// Emits one connector-owned connection state without inbound, routing, or
-/// balancer data.
+pub(crate) struct OutboundDebugFields<'a> {
+    pub(crate) network: &'a str,
+    pub(crate) outbound: &'a str,
+    pub(crate) protocol: Option<&'a str>,
+    pub(crate) origin: Option<&'a str>,
+    pub(crate) underlay: Option<&'a str>,
+    pub(crate) mpp_path: Option<&'a str>,
+    pub(crate) destination: &'a str,
+    pub(crate) attempt: usize,
+    pub(crate) error: Option<&'a str>,
+}
+
+/// Emits one connector-owned connection state without routing or balancer
+/// data. `origin` identifies whether the Product flow entered locally or from
+/// an MPP peer, without copying the inbound's other fields into this scope.
 pub(crate) fn emit_outbound_debug(
     id: Option<DebugConnectionId>,
     event: OutboundDebugEvent,
-    network: &str,
-    outbound: &str,
-    destination: &str,
-    attempt: usize,
-    error: Option<&str>,
+    fields: OutboundDebugFields<'_>,
 ) {
     if !enabled(LogLevel::Debug) {
         return;
@@ -880,15 +923,23 @@ pub(crate) fn emit_outbound_debug(
     let Some(id) = id else {
         return;
     };
-    let network = sanitize_connection_field(network);
-    let outbound = sanitize_connection_field(outbound);
-    let destination = sanitize_connection_field(destination);
-    let error = error.map(sanitize_connection_field);
+    let network = sanitize_connection_field(fields.network);
+    let outbound = sanitize_connection_field(fields.outbound);
+    let protocol = fields.protocol.map(sanitize_connection_field);
+    let origin = fields.origin.map(sanitize_connection_field);
+    let underlay = fields.underlay.map(sanitize_connection_field);
+    let mpp_path = fields.mpp_path.map(sanitize_connection_field);
+    let destination = sanitize_connection_field(fields.destination);
+    let error = fields.error.map(sanitize_connection_field);
     let mut record =
         ConnectionDebugRecord::new(unix_millis(), "outbound", event.as_str(), id, &network);
     record.outbound = Some(&outbound);
+    record.protocol = protocol.as_deref();
+    record.origin = origin.as_deref();
+    record.underlay = underlay.as_deref();
+    record.mpp_path = mpp_path.as_deref();
     record.destination = Some(&destination);
-    record.attempt = Some(attempt);
+    record.attempt = Some(fields.attempt);
     record.error = error.as_deref();
     emit_connection_debug_record(&record);
 }
@@ -938,6 +989,7 @@ fn write_connection_debug_record(
         "inbound" => {
             debug_assert!(record.inbound.is_some());
             write_debug_text_field(output, "inbound", record.inbound);
+            write_debug_text_field(output, "principal", record.principal);
             write_debug_text_field(output, "source", record.source);
             write_debug_text_field(output, "destination", record.destination);
         }
@@ -945,8 +997,11 @@ fn write_connection_debug_record(
             debug_assert!(record.destination.is_some() && record.decision.is_some());
             write_debug_text_field(output, "destination", record.destination);
             write_debug_text_field(output, "rule", record.rule);
+            write_debug_text_field(output, "inbound", record.inbound);
+            write_debug_text_field(output, "principal", record.principal);
             write_debug_text_field(output, "decision", record.decision);
             write_debug_text_field(output, "egress", record.egress);
+            write_debug_text_field(output, "target_resolution", record.target_resolution);
         }
         "balancer" => {
             debug_assert!(
@@ -963,6 +1018,10 @@ fn write_connection_debug_record(
                     && record.attempt.is_some()
             );
             write_debug_text_field(output, "outbound", record.outbound);
+            write_debug_text_field(output, "protocol", record.protocol);
+            write_debug_text_field(output, "origin", record.origin);
+            write_debug_text_field(output, "underlay", record.underlay);
+            write_debug_text_field(output, "mpp_path", record.mpp_path);
             write_debug_text_field(output, "destination", record.destination);
             write_debug_text_attempt(output, record.attempt);
             write_debug_text_field(output, "error", record.error);

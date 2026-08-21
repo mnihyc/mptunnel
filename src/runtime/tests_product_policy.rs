@@ -8,13 +8,15 @@ use crate::product::{
     DnsPlanSpec, DnsPolicySpec, DnsRuleId, DnsRuleMatch, DnsRuleSpec, DnsUpstreamEndpoint,
     DnsUpstreamId, DnsUpstreamSpec, DomainName, GatewayBalancerSpec, GatewayMemberSpec,
     GatewayStrategy, InitialDemand, NetworkSet, OutboundId, RouteAction, RouteMatchSpec,
-    RouteRuleSpec, RouteStage, RuleId,
+    RouteRuleSpec, RouteStage, RuleId, TargetResolutionMode,
 };
 use crate::runtime::ingress_runtime::{
     handle_http_connect_client_stream_with_auth, handle_socks5_client_stream_with_auth,
     local_admission_permit_for_test,
 };
-use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
+use crate::runtime::outbound_registry::{
+    ProductDestination, RuntimeOutboundLeaf, RuntimeOutboundRegistry,
+};
 use crate::runtime::path::ClientPathContext;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -523,6 +525,191 @@ async fn stable_domain_route_delegates_canonical_target_without_dns() {
 }
 
 #[tokio::test]
+async fn explicit_target_resolution_modes_control_routing_dns_and_mpp_target_shape() {
+    fn mode_rules(mode: TargetResolutionMode) -> Vec<RouteRuleSpec> {
+        let edge = OutboundId::parse("edge").expect("outbound");
+        vec![
+            terminal_rule(
+                "internal-address",
+                RouteMatchSpec {
+                    destination_cidrs: vec!["10.0.0.0/8".parse().expect("CIDR")],
+                    stages: vec![RouteStage::PostResolution],
+                    ..RouteMatchSpec::default()
+                },
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(edge.clone()),
+                    None,
+                    InitialDemand::Automatic,
+                )
+                .with_target_resolution(mode),
+            ),
+            terminal_rule(
+                "default",
+                RouteMatchSpec::default(),
+                RouteAction::allow(EgressAction::Outbound(edge), None, InitialDemand::Automatic)
+                    .with_target_resolution(mode),
+            ),
+        ]
+    }
+
+    let target = TargetAddr::Domain {
+        host: "internal.example".to_string(),
+        port: 443,
+    };
+
+    let as_is_router = ClientIngressRouter::new(
+        &policy(mode_rules(TargetResolutionMode::AsIs)),
+        registry_with_dns(
+            [("edge", context(7443))],
+            &[],
+            crate::dns::DnsGeneration::from_test_answers(HashMap::new()),
+        ),
+    )
+    .expect("as-is router");
+    let ClientRoute::Open(as_is_plan) = as_is_router
+        .route_udp(&target, source(), anonymous(), inbound())
+        .expect("as-is route")
+    else {
+        panic!("expected as-is open plan");
+    };
+    let as_is_groups = as_is_plan
+        .destination_route_groups(Network::Udp)
+        .await
+        .expect("as-is groups without DNS");
+    assert_eq!(as_is_groups[0].rule_id.as_str(), "default");
+    assert!(matches!(
+        &as_is_groups[0].destination,
+        ProductDestination::PreservedDomain(domain)
+            if domain.flow().target().domain().is_some_and(|domain| domain.as_str() == "internal.example")
+    ));
+
+    for mode in [
+        TargetResolutionMode::RouteOnly,
+        TargetResolutionMode::FullResolve,
+    ] {
+        let router = ClientIngressRouter::new(
+            &policy(mode_rules(mode)),
+            registry_with_dns(
+                [("edge", context(7443))],
+                &[],
+                crate::dns::DnsGeneration::from_test_answers(HashMap::from([(
+                    "internal.example".to_string(),
+                    vec!["10.0.0.7".parse().expect("answer")],
+                )])),
+            ),
+        )
+        .expect("resolution-mode router");
+        let ClientRoute::Open(plan) = router
+            .route_udp(&target, source(), anonymous(), inbound())
+            .expect("resolution-mode route")
+        else {
+            panic!("expected resolution-mode open plan");
+        };
+        let groups = plan
+            .destination_route_groups(Network::Udp)
+            .await
+            .expect("resolution-mode groups");
+        assert_eq!(groups[0].rule_id.as_str(), "internal-address");
+        match (mode, &groups[0].destination) {
+            (
+                TargetResolutionMode::RouteOnly,
+                ProductDestination::RoutedDomain { domain, resolved },
+            ) => {
+                assert_eq!(
+                    domain
+                        .flow()
+                        .target()
+                        .domain()
+                        .map(|domain| domain.as_str()),
+                    Some("internal.example"),
+                );
+                assert_eq!(resolved.targets()[0].address().to_string(), "10.0.0.7");
+            }
+            (TargetResolutionMode::FullResolve, ProductDestination::Resolved(_)) => {}
+            _ => panic!("unexpected target representation for {}", mode.as_str()),
+        }
+    }
+}
+
+#[test]
+fn as_is_terminal_rules_do_not_resolve_for_earlier_address_candidates() {
+    let edge = OutboundId::parse("edge").expect("outbound");
+    let target = TargetAddr::Domain {
+        host: "blocked.example".to_string(),
+        port: 443,
+    };
+    for (terminal, expected) in [
+        (
+            RouteAction::reject().with_target_resolution(TargetResolutionMode::AsIs),
+            ClientPolicyDisposition::Reject,
+        ),
+        (
+            RouteAction::drop().with_target_resolution(TargetResolutionMode::AsIs),
+            ClientPolicyDisposition::Drop,
+        ),
+    ] {
+        let config = policy(vec![
+            terminal_rule(
+                "address-candidate",
+                RouteMatchSpec {
+                    destination_cidrs: vec!["10.0.0.0/8".parse().expect("CIDR")],
+                    stages: vec![RouteStage::PostResolution],
+                    ..RouteMatchSpec::default()
+                },
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(edge.clone()),
+                    None,
+                    InitialDemand::Automatic,
+                )
+                .with_target_resolution(TargetResolutionMode::AsIs),
+            ),
+            terminal_rule("default", RouteMatchSpec::default(), terminal),
+        ]);
+        let router = ClientIngressRouter::new(
+            &config,
+            registry_with_dns(
+                [("edge", context(7443))],
+                &[],
+                crate::dns::DnsGeneration::from_test_answers(HashMap::new()),
+            ),
+        )
+        .expect("as-is terminal router");
+        assert!(matches!(
+            router
+                .route_tcp(&target, source(), anonymous(), inbound())
+                .expect("terminal route"),
+            ClientRoute::Deny(actual) if actual == expected
+        ));
+    }
+
+    let implicit = policy(vec![terminal_rule(
+        "address-candidate",
+        RouteMatchSpec {
+            destination_cidrs: vec!["10.0.0.0/8".parse().expect("CIDR")],
+            stages: vec![RouteStage::PostResolution],
+            ..RouteMatchSpec::default()
+        },
+        RouteAction::allow_restricted(EgressAction::Outbound(edge), None, InitialDemand::Automatic)
+            .with_target_resolution(TargetResolutionMode::AsIs),
+    )]);
+    let router = ClientIngressRouter::new(
+        &implicit,
+        registry_with_dns(
+            [("edge", context(7443))],
+            &[],
+            crate::dns::DnsGeneration::from_test_answers(HashMap::new()),
+        ),
+    )
+    .expect("as-is implicit terminal router");
+    assert!(matches!(
+        router
+            .route_tcp(&target, source(), anonymous(), inbound())
+            .expect("implicit terminal route"),
+        ClientRoute::Deny(ClientPolicyDisposition::Reject)
+    ));
+}
+
+#[tokio::test]
 async fn explicit_route_dns_policy_resolves_before_domain_capable_egress() {
     let edge = context(7443);
     let edge_session = edge.session_id;
@@ -983,6 +1170,62 @@ async fn plain_allow_denies_restricted_literal_before_mpp_open() {
         plan.open_tcp(&target).await,
         Err(RuntimeError::DestinationDenied(_))
     ));
+}
+
+#[tokio::test]
+async fn target_resolution_modes_do_not_change_restricted_literal_authorization() {
+    let target = TargetAddr::Ip("127.0.0.1:443".parse().expect("loopback target"));
+    for mode in [
+        TargetResolutionMode::AsIs,
+        TargetResolutionMode::RouteOnly,
+        TargetResolutionMode::FullResolve,
+    ] {
+        for disposition in [RouteDisposition::Allow, RouteDisposition::AllowRestricted] {
+            let edge_id = OutboundId::parse("edge").expect("outbound");
+            let action = match disposition {
+                RouteDisposition::Allow => RouteAction::allow(
+                    EgressAction::Outbound(edge_id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+                RouteDisposition::AllowRestricted => RouteAction::allow_restricted(
+                    EgressAction::Outbound(edge_id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+                RouteDisposition::Reject | RouteDisposition::Drop => unreachable!(),
+            }
+            .with_target_resolution(mode);
+            let config = policy(vec![terminal_rule(
+                "default",
+                RouteMatchSpec::default(),
+                action,
+            )]);
+            let router =
+                ClientIngressRouter::new(&config, registry([("edge", context(7443))], &[]))
+                    .expect("MPP client/server-symmetric router");
+            let ClientRoute::Open(plan) = router
+                .route_tcp(&target, source(), anonymous(), inbound())
+                .expect("provisional literal route")
+            else {
+                panic!("expected provisional literal plan");
+            };
+            let result = plan.destination_route_groups(Network::Tcp).await;
+            match disposition {
+                RouteDisposition::Allow => {
+                    assert!(matches!(result, Err(RuntimeError::DestinationDenied(_))))
+                }
+                RouteDisposition::AllowRestricted => {
+                    let groups = result.expect("explicit restricted authorization");
+                    assert!(matches!(
+                        groups[0].destination,
+                        ProductDestination::Resolved(_)
+                    ));
+                }
+                RouteDisposition::Reject | RouteDisposition::Drop => unreachable!(),
+            }
+        }
+    }
 }
 
 #[tokio::test]

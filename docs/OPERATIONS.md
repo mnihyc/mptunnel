@@ -136,38 +136,41 @@ Each debug trace uses one process-local, monotonically increasing `id`. Records
 are deliberately separated by ownership so the first glance reads in order:
 
 ```text
-2026-08-06T02:15:10.100Z DEBUG inbound.accepted: id=17 network=tcp inbound="local-socks" source="127.0.0.1:52144" destination="example.com:443"
-2026-08-06T02:15:10.101Z DEBUG routing.selected: id=17 network=tcp destination="example.com:443" rule="default" decision="allow" egress="balancer:internet"
-2026-08-06T02:15:10.102Z DEBUG balancer.selected: id=17 network=tcp balancer="internet" outbound="direct" attempt=1
-2026-08-06T02:15:10.102Z DEBUG outbound.connecting: id=17 network=tcp outbound="direct" destination="example.com:443" attempt=1
-2026-08-06T02:15:10.118Z DEBUG outbound.connected: id=17 network=tcp outbound="direct" destination="example.com:443" attempt=1
-2026-08-06T02:15:10.118Z DEBUG inbound.established: id=17 network=tcp inbound="local-socks"
+2026-08-06T02:15:10.100Z DEBUG inbound.accepted: id=17 network=tcp inbound="local-socks" principal="anonymous" source="127.0.0.1:52144" destination="example.com:443"
+2026-08-06T02:15:10.101Z DEBUG routing.selected: id=17 network=tcp destination="example.com:443" rule="default" inbound="local-socks" principal="anonymous" decision="allow" egress="outbound:remote-mpp" target_resolution="as-is"
+2026-08-06T02:15:10.102Z DEBUG outbound.connecting: id=17 network=tcp outbound="remote-mpp" protocol="mpp" origin="local_inbound" destination="example.com:443" attempt=1
+2026-08-06T02:15:10.118Z DEBUG outbound.connected: id=17 network=tcp outbound="remote-mpp" protocol="mpp" origin="local_inbound" underlay="tcp" mpp_path="primary-tcp" destination="example.com:443" attempt=1
+2026-08-06T02:15:10.118Z DEBUG inbound.established: id=17 network=tcp inbound="local-socks" principal="anonymous"
 ```
 
 The trace begins after an L4 inbound has authenticated (when applicable),
 parsed a target, and accepted the logical request; it is not a raw-socket or
-pre-authentication access log. The inbound scope reports only what that inbound
-accepted and established.
-Routing reports its rule and configured egress. A balancer reports each member
-choice, and the outbound scope reports each configured outbound attempt,
-success, or failure before failover. Direct routes simply omit the balancer
-record. For UDP, one trace represents the logical association becoming ready,
-not every packet. A configured outbound may internally try multiple resolved
-addresses; those connector details remain one outbound attempt in this view.
-Rejected and dropped requests stop at the routing record.
-MPP L3 packets, internal DNS and probe traffic, and physical MPP carrier/path
-state are intentionally outside this connection trace; use the management path
-and session views for current carrier state.
+pre-authentication access log. The inbound scope reports the configured
+inbound, authenticated Product principal, source when one exists, and requested
+destination. Routing reports the exact winning rule, configured egress, and
+target-resolution mode. A balancer reports each member choice, and the outbound
+scope reports each configured outbound protocol, origin, attempt, success, or
+failure before failover. Direct routes simply omit the balancer record. A
+connected reliable MPP stream also reports its selected TCP/QUIC underlay and
+configured MPP path name. For UDP, one trace represents the logical association
+becoming ready, not every packet; per-packet MPP path choices are intentionally
+omitted because they may change. A configured outbound may internally try
+multiple resolved addresses; those connector details remain one outbound
+attempt in this view. Rejected and dropped requests stop at the routing record.
+MPP L3 packets, internal DNS/probe traffic, and raw carrier authentication
+remain outside this connection trace; use the management path and session
+views for current carrier state.
 
 All records are length-bounded and remove terminal control characters. Repeated
 saturation and fault records are rate-limited per call site and report the
 suppressed count on the next record. Authorization, cookies, tokens, passwords,
 credential secrets, and private-key forms are redacted as a final defense.
 Debug connection records are not rate-limited, so all attempts are visible
-while `debug` remains enabled and the sink remains writable. They include source
-and destination addresses and are therefore privacy-sensitive. They never add
-principals, credentials, secrets, payloads, or fields owned by another scope.
-All dynamic fields remain bounded, control-sanitized, and secret-redacted.
+while `debug` remains enabled and the sink remains writable. They include
+source/destination addresses and authenticated principal IDs and are therefore
+privacy-sensitive. They never add credential IDs, credentials, secrets,
+payloads, or fields owned by another scope. All dynamic fields remain bounded,
+control-sanitized, and secret-redacted.
 
 `flow_events = true` additionally emits one sanitized
 open and close record for each observable flow, including its inbound,
@@ -238,13 +241,32 @@ Unauthenticated local proxy, fixed-forward, and TUN-L4 flows use principal
 `anonymous`; authenticated proxy users and MPP peers use their configured
 principal IDs.
 
-A route-selected `dns_policy` is an instruction to resolve and authorize at
-this node, even when the chosen SOCKS5, HTTP CONNECT, HTTPS CONNECT, or MPP
-outbound could carry the domain unchanged. Such a selector must be available
-before resolution: omit `stages` or include `pre-resolution`; a
-post-resolution-only rule or a rule requiring destination-address evidence
-cannot select it. Without an IP-dependent match or route `dns_policy`, a
-domain-capable next hop owns resolution of a delegated domain.
+`[routing].target_resolution` makes hostname ownership explicit on both client
+and server nodes:
+
+- `"as-is"` performs no routing DNS lookup. CIDR/post-resolution rules cannot
+  match a hostname, and a domain-capable SOCKS5, HTTP CONNECT, HTTPS CONNECT,
+  or MPP outbound receives the canonical hostname unchanged.
+- `"route-only"` resolves only when the ordered routing table or an explicit
+  `dns_policy` needs address evidence. The answer selects and authorizes the
+  rule, but a domain-capable outbound still receives the original hostname.
+- `"full-resolve"` resolves every hostname at this node and passes authorized
+  literal addresses to the outbound.
+
+Omitting the field retains the historical demand-driven compatibility behavior:
+stable domain routes delegate the hostname, while IP-dependent routes pass the
+authorized address. A route-selected `dns_policy` is an instruction under
+`route-only`, `full-resolve`, and compatibility behavior. Under `as-is`, it is
+not queried by routing; the outbound owns resolution instead. MPP carrier
+endpoint/bootstrap DNS is separate and always occurs on the MPP client because
+that node must first reach the server.
+
+Under `route-only`, the local answer is routing evidence rather than a
+connect-address pin for a domain-capable next hop: MPP/SOCKS/HTTP may resolve
+the forwarded hostname differently. IP-only direct leaves reuse the retained
+authorized answer and do not perform a second lookup. Use `full-resolve` when
+this node must pin the outbound to its authorized answer; an MPP server always
+applies its own routing and restricted-address policy to the target it receives.
 
 When MPTUNNEL has or resolves a literal address, ordinary allow does not
 authorize loopback, private, link-local, metadata, multicast, or unspecified
@@ -258,6 +280,14 @@ to release its stream). In both cases sibling flows and the shared carrier stay
 alive. MPP inbounds use this same table and may select only a non-MPP outbound
 or a balancer with no MPP member, so an inbound MPP flow cannot chain into
 another MPP outbound.
+
+Target resolution never changes literal-address authorization: the same
+restricted-address rule applies on clients and servers under all three modes.
+An MPP client that intentionally forwards private literals therefore needs its
+own narrow `allow-restricted` rule, and the server independently needs one for
+its native egress. For a hostname under `as-is`, no client-side CIDR rule is
+consulted because the client does not resolve it; the server receives the
+hostname and applies its own selected resolution mode and routing policy.
 
 When one domain returns several addresses, each address is checked against the
 same ordered rules. Public addresses selected by reject/drop rules are omitted

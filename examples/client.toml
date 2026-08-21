@@ -50,6 +50,7 @@ transport_secret = { from = "file", path = "mpp-transport.key" }
 # transport_secret = { from = "hex", value = "REPLACE_WITH_64_HEX_DIGITS" }
 
 [routing]
+target_resolution = "as-is"
 
 [[routing.rules]]
 name = "default"

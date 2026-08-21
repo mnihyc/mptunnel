@@ -316,7 +316,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.assertNotIn("i686-linux-android", package_script)
         self.assertEqual(
             package_script.count("Java_com_v2ray_ang_mpp_MptunnelNative_"),
-            11,
+            12,
         )
         self.assertIn("if ! diff -u", package_script)
         self.assertIn(

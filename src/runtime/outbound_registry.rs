@@ -204,8 +204,18 @@ impl RuntimeOutboundLeaf {
 
     fn supports_destination_family(&self, destination: &ProductDestination) -> bool {
         match (self, destination) {
-            (Self::Mpp { .. }, _) | (_, ProductDestination::Domain(_)) => true,
-            (Self::Local { config, .. }, ProductDestination::Resolved(resolved)) => resolved
+            (Self::Mpp { .. }, _) => true,
+            (
+                Self::Local { config, .. },
+                ProductDestination::Domain(_) | ProductDestination::PreservedDomain(_),
+            ) => !config.requires_ip_target(),
+            (Self::Local { config, .. }, ProductDestination::RoutedDomain { .. })
+                if !config.requires_ip_target() =>
+            {
+                true
+            }
+            (Self::Local { config, .. }, ProductDestination::RoutedDomain { resolved, .. })
+            | (Self::Local { config, .. }, ProductDestination::Resolved(resolved)) => resolved
                 .targets()
                 .iter()
                 .any(|target| config.supports_ip_family(target.address())),
@@ -254,6 +264,27 @@ fn product_network_label(network: Network) -> &'static str {
     }
 }
 
+fn product_origin_label(origin: ProductFlowOriginKind) -> &'static str {
+    match origin {
+        ProductFlowOriginKind::LocalInbound => "local_inbound",
+        ProductFlowOriginKind::MppInbound => "mpp_inbound",
+    }
+}
+
+fn outbound_protocol_label(leaf: &RuntimeOutboundLeaf) -> &'static str {
+    match leaf {
+        RuntimeOutboundLeaf::Mpp { .. } => "mpp",
+        RuntimeOutboundLeaf::Local { config, .. } => match config {
+            OutboundConfig::Direct
+            | OutboundConfig::BindSourceIp(_)
+            | OutboundConfig::BindSourceIps { .. } => "direct",
+            OutboundConfig::Socks5(_) => "socks5",
+            OutboundConfig::HttpConnect(_) => "http-connect",
+            OutboundConfig::HttpsConnect(_) => "https-connect",
+        },
+    }
+}
+
 fn emit_balancer_selection(
     connection_id: Option<crate::observability::DebugConnectionId>,
     network: Network,
@@ -274,6 +305,8 @@ struct OutboundDebugAttempt<'a> {
     connection_id: Option<crate::observability::DebugConnectionId>,
     network: Network,
     outbound: &'a OutboundId,
+    protocol: &'static str,
+    origin: &'static str,
     destination: &'a str,
     attempt: usize,
 }
@@ -283,6 +316,8 @@ impl<'a> OutboundDebugAttempt<'a> {
         connection_id: Option<crate::observability::DebugConnectionId>,
         network: Network,
         outbound: &'a OutboundId,
+        protocol: &'static str,
+        origin: &'static str,
         destination: &'a str,
         attempt: usize,
     ) -> Self {
@@ -290,10 +325,17 @@ impl<'a> OutboundDebugAttempt<'a> {
             connection_id,
             network,
             outbound,
+            protocol,
+            origin,
             destination,
             attempt,
         };
-        state.emit(crate::observability::OutboundDebugEvent::Connecting, None);
+        state.emit(
+            crate::observability::OutboundDebugEvent::Connecting,
+            None,
+            None,
+            None,
+        );
         state
     }
 
@@ -301,8 +343,13 @@ impl<'a> OutboundDebugAttempt<'a> {
         result.inspect_err(|error| self.failed(error))
     }
 
-    fn connected(&self) {
-        self.emit(crate::observability::OutboundDebugEvent::Connected, None);
+    fn connected(&self, underlay: Option<&str>, mpp_path: Option<&str>) {
+        self.emit(
+            crate::observability::OutboundDebugEvent::Connected,
+            underlay,
+            mpp_path,
+            None,
+        );
     }
 
     fn failed(&self, error: &RuntimeError) {
@@ -314,20 +361,48 @@ impl<'a> OutboundDebugAttempt<'a> {
         let error = error.to_string();
         self.emit(
             crate::observability::OutboundDebugEvent::Failed,
+            None,
+            None,
             Some(&error),
         );
     }
 
-    fn emit(&self, event: crate::observability::OutboundDebugEvent, error: Option<&str>) {
+    fn emit(
+        &self,
+        event: crate::observability::OutboundDebugEvent,
+        underlay: Option<&str>,
+        mpp_path: Option<&str>,
+        error: Option<&str>,
+    ) {
         crate::observability::emit_outbound_debug(
             self.connection_id,
             event,
-            product_network_label(self.network),
-            self.outbound.as_str(),
-            self.destination,
-            self.attempt,
-            error,
+            crate::observability::OutboundDebugFields {
+                network: product_network_label(self.network),
+                outbound: self.outbound.as_str(),
+                protocol: Some(self.protocol),
+                origin: Some(self.origin),
+                underlay,
+                mpp_path,
+                destination: self.destination,
+                attempt: self.attempt,
+                error,
+            },
         );
+    }
+}
+
+fn opened_tcp_mpp_debug_path(opened: &OpenedTcpOutbound) -> (Option<&'static str>, Option<&str>) {
+    let OpenedTcpOutbound::Mpp {
+        context, remote, ..
+    } = opened
+    else {
+        return (None, None);
+    };
+    let path_index = remote.path_index();
+    match remote.stream().underlay {
+        crate::protocol::UnderlayProtocol::Tcp => (Some("tcp"), context.tcp_path_name(path_index)),
+        crate::protocol::UnderlayProtocol::Udp => (Some("quic"), context.udp_path_name(path_index)),
     }
 }
 
@@ -386,11 +461,27 @@ pub(in crate::runtime) struct ProductOpenRequest<'a> {
     pub(in crate::runtime) debug_connection_id: Option<crate::observability::DebugConnectionId>,
 }
 
+#[derive(Clone)]
 pub(in crate::runtime) enum ProductDestination {
+    /// Compatibility-mode domain. If a balancer reaches an IP-only member,
+    /// the authorized resolution is promoted for every later attempt.
     Domain(AuthorizedDomainTarget),
+    /// Explicit AsIs/RouteOnly domain. An IP-only member may resolve a cached
+    /// per-attempt copy, while later domain-capable members still receive the
+    /// original hostname.
+    PreservedDomain(AuthorizedDomainTarget),
+    /// RouteOnly used DNS as immutable routing evidence, but the selected
+    /// domain-capable leaf must still receive the original hostname. IP-only
+    /// leaves consume the retained authorized answer set without another DNS
+    /// lookup.
+    RoutedDomain {
+        domain: AuthorizedDomainTarget,
+        resolved: ResolvedProductDestination,
+    },
     Resolved(ResolvedProductDestination),
 }
 
+#[derive(Clone)]
 pub(in crate::runtime) struct ResolvedProductDestination {
     targets: Vec<AuthorizedTarget>,
 }
@@ -408,7 +499,7 @@ impl ResolvedProductDestination {
             .flow()
     }
 
-    fn targets(&self) -> &[AuthorizedTarget] {
+    pub(in crate::runtime) fn targets(&self) -> &[AuthorizedTarget] {
         &self.targets
     }
 }
@@ -418,17 +509,43 @@ impl ProductDestination {
         Self::Domain(domain)
     }
 
+    pub(in crate::runtime) const fn preserved_domain(domain: AuthorizedDomainTarget) -> Self {
+        Self::PreservedDomain(domain)
+    }
+
     pub(in crate::runtime) fn resolved(
         targets: Vec<AuthorizedTarget>,
     ) -> Result<Self, RuntimeError> {
         ResolvedProductDestination::new(targets).map(Self::Resolved)
     }
 
+    pub(in crate::runtime) fn routed_domain(
+        domain: AuthorizedDomainTarget,
+        targets: Vec<AuthorizedTarget>,
+    ) -> Result<Self, RuntimeError> {
+        let resolved = ResolvedProductDestination::new(targets)?;
+        let Some(first) = resolved.targets().first() else {
+            unreachable!("validated resolved Product destination has an address");
+        };
+        if domain.flow() != resolved.flow() || domain.permit() != first.permit() {
+            return Err(RuntimeError::DestinationDenied(
+                "routed domain and authorized addresses have different route identities"
+                    .to_string(),
+            ));
+        }
+        Ok(Self::RoutedDomain { domain, resolved })
+    }
+
     fn flow(&self) -> Result<&FlowContext, RuntimeError> {
         match self {
-            Self::Domain(domain) => Ok(domain.flow()),
+            Self::Domain(domain) | Self::PreservedDomain(domain) => Ok(domain.flow()),
+            Self::RoutedDomain { domain, .. } => Ok(domain.flow()),
             Self::Resolved(resolved) => Ok(resolved.flow()),
         }
+    }
+
+    const fn preserves_domain_across_attempts(&self) -> bool {
+        matches!(self, Self::PreservedDomain(_) | Self::RoutedDomain { .. })
     }
 }
 
@@ -832,7 +949,10 @@ impl RuntimeOutboundRegistry {
         destination: &ProductDestination,
         excluded: &mut Vec<GatewayMemberHandle>,
     ) -> Result<(), RuntimeError> {
-        if matches!(destination, ProductDestination::Domain(_)) {
+        if matches!(
+            destination,
+            ProductDestination::Domain(_) | ProductDestination::PreservedDomain(_)
+        ) {
             return Ok(());
         }
         for member in runtime.members() {
@@ -890,6 +1010,8 @@ impl RuntimeOutboundRegistry {
                     debug_connection_id,
                     Network::Tcp,
                     id,
+                    outbound_protocol_label(&leaf),
+                    product_origin_label(origin_kind),
                     &debug_destination,
                     1,
                 );
@@ -922,7 +1044,8 @@ impl RuntimeOutboundRegistry {
                     )
                     .await,
                 )?;
-                attempt.connected();
+                let (underlay, mpp_path) = opened_tcp_mpp_debug_path(&opened);
+                attempt.connected(underlay, mpp_path);
                 Ok((opened, connect.connected()))
             }
             EgressSelection::Balancer(id) => {
@@ -931,6 +1054,7 @@ impl RuntimeOutboundRegistry {
                 let mut excluded = Vec::with_capacity(attempt_limit);
                 let mut last_error = None;
                 let mut resolution_unavailable = false;
+                let mut resolved_destination = None;
                 self.exclude_ineligible_balancer_members(runtime, &destination, &mut excluded)?;
                 for attempt_number in 1..=attempt_limit {
                     let binding = match runtime.select_for_principal(
@@ -952,7 +1076,34 @@ impl RuntimeOutboundRegistry {
                         attempt_number,
                     );
                     let leaf = self.shell.require_leaf(member, Network::Tcp)?;
-                    if leaf.requires_ip_target() {
+                    let requires_ip_target = leaf.requires_ip_target();
+                    let preserve_domain = destination.preserves_domain_across_attempts();
+                    if requires_ip_target && preserve_domain && resolved_destination.is_none() {
+                        if resolution_unavailable {
+                            excluded.push(handle);
+                            continue;
+                        }
+                        let mut resolved = destination.clone();
+                        if let Err(error) = self
+                            .resolve_destination(
+                                &mut resolved,
+                                dns_plan,
+                                authorizer,
+                                debug_connection_id,
+                            )
+                            .await
+                        {
+                            if matches!(error, RuntimeError::DestinationDenied(_)) {
+                                return Err(error);
+                            }
+                            resolution_unavailable = true;
+                            excluded.push(handle);
+                            last_error = Some(error);
+                            continue;
+                        }
+                        resolved_destination = Some(resolved);
+                    }
+                    if requires_ip_target && !preserve_domain {
                         if resolution_unavailable {
                             excluded.push(handle);
                             continue;
@@ -975,10 +1126,19 @@ impl RuntimeOutboundRegistry {
                             continue;
                         }
                     }
+                    let attempt_destination = if requires_ip_target && preserve_domain {
+                        resolved_destination
+                            .as_mut()
+                            .expect("successful domain resolution is cached")
+                    } else {
+                        &mut destination
+                    };
                     let attempt = OutboundDebugAttempt::begin(
                         debug_connection_id,
                         Network::Tcp,
                         member,
+                        outbound_protocol_label(&leaf),
+                        product_origin_label(origin_kind),
                         &debug_destination,
                         attempt_number,
                     );
@@ -989,20 +1149,20 @@ impl RuntimeOutboundRegistry {
                         }
                         continue;
                     }
-                    if !leaf.supports_destination_family(&destination) {
+                    if !leaf.supports_destination_family(attempt_destination) {
                         let error = leaf.destination_family_error();
                         attempt.failed(&error);
                         excluded.push(handle);
                         last_error.get_or_insert(error);
                         self.exclude_ineligible_balancer_members(
                             runtime,
-                            &destination,
+                            attempt_destination,
                             &mut excluded,
                         )?;
                         continue;
                     }
                     let scope = attempt.result(product_flow_scope(
-                        &destination,
+                        attempt_destination,
                         origin_kind,
                         leaf.id(),
                         Some(id),
@@ -1023,7 +1183,7 @@ impl RuntimeOutboundRegistry {
                         self.open_product_tcp_leaf(
                             leaf,
                             ProductLeafOpen {
-                                destination: &mut destination,
+                                destination: attempt_destination,
                                 dns_plan,
                                 traffic_class,
                                 gateway_lease: Some(binding.lease),
@@ -1034,7 +1194,8 @@ impl RuntimeOutboundRegistry {
                         .await,
                     ) {
                         Ok(opened) => {
-                            attempt.connected();
+                            let (underlay, mpp_path) = opened_tcp_mpp_debug_path(&opened);
+                            attempt.connected(underlay, mpp_path);
                             return Ok((opened, connect.connected()));
                         }
                         Err(error @ RuntimeError::DestinationDenied(_)) => return Err(error),
@@ -1108,6 +1269,8 @@ impl RuntimeOutboundRegistry {
                     debug_connection_id,
                     Network::Udp,
                     id,
+                    outbound_protocol_label(&leaf),
+                    product_origin_label(origin_kind),
                     &debug_destination,
                     1,
                 );
@@ -1140,7 +1303,7 @@ impl RuntimeOutboundRegistry {
                     )
                     .await,
                 )?;
-                attempt.connected();
+                attempt.connected(None, None);
                 Ok((opened, connect.connected()))
             }
             EgressSelection::Balancer(id) => {
@@ -1149,6 +1312,7 @@ impl RuntimeOutboundRegistry {
                 let mut excluded = Vec::with_capacity(attempt_limit);
                 let mut last_error = None;
                 let mut resolution_unavailable = false;
+                let mut resolved_destination = None;
                 self.exclude_ineligible_balancer_members(runtime, &destination, &mut excluded)?;
                 for attempt_number in 1..=attempt_limit {
                     let binding = match runtime.select_for_principal(
@@ -1170,7 +1334,34 @@ impl RuntimeOutboundRegistry {
                         attempt_number,
                     );
                     let leaf = self.shell.require_leaf(member, Network::Udp)?;
-                    if leaf.requires_ip_target() {
+                    let requires_ip_target = leaf.requires_ip_target();
+                    let preserve_domain = destination.preserves_domain_across_attempts();
+                    if requires_ip_target && preserve_domain && resolved_destination.is_none() {
+                        if resolution_unavailable {
+                            excluded.push(handle);
+                            continue;
+                        }
+                        let mut resolved = destination.clone();
+                        if let Err(error) = self
+                            .resolve_destination(
+                                &mut resolved,
+                                dns_plan,
+                                authorizer,
+                                debug_connection_id,
+                            )
+                            .await
+                        {
+                            if matches!(error, RuntimeError::DestinationDenied(_)) {
+                                return Err(error);
+                            }
+                            resolution_unavailable = true;
+                            excluded.push(handle);
+                            last_error = Some(error);
+                            continue;
+                        }
+                        resolved_destination = Some(resolved);
+                    }
+                    if requires_ip_target && !preserve_domain {
                         if resolution_unavailable {
                             excluded.push(handle);
                             continue;
@@ -1193,10 +1384,19 @@ impl RuntimeOutboundRegistry {
                             continue;
                         }
                     }
+                    let attempt_destination = if requires_ip_target && preserve_domain {
+                        resolved_destination
+                            .as_mut()
+                            .expect("successful domain resolution is cached")
+                    } else {
+                        &mut destination
+                    };
                     let attempt = OutboundDebugAttempt::begin(
                         debug_connection_id,
                         Network::Udp,
                         member,
+                        outbound_protocol_label(&leaf),
+                        product_origin_label(origin_kind),
                         &debug_destination,
                         attempt_number,
                     );
@@ -1207,20 +1407,20 @@ impl RuntimeOutboundRegistry {
                         }
                         continue;
                     }
-                    if !leaf.supports_destination_family(&destination) {
+                    if !leaf.supports_destination_family(attempt_destination) {
                         let error = leaf.destination_family_error();
                         attempt.failed(&error);
                         excluded.push(handle);
                         last_error.get_or_insert(error);
                         self.exclude_ineligible_balancer_members(
                             runtime,
-                            &destination,
+                            attempt_destination,
                             &mut excluded,
                         )?;
                         continue;
                     }
                     let scope = attempt.result(product_flow_scope(
-                        &destination,
+                        attempt_destination,
                         origin_kind,
                         leaf.id(),
                         Some(id),
@@ -1241,7 +1441,7 @@ impl RuntimeOutboundRegistry {
                         self.open_product_udp_leaf(
                             leaf,
                             ProductLeafOpen {
-                                destination: &mut destination,
+                                destination: attempt_destination,
                                 dns_plan,
                                 traffic_class,
                                 gateway_lease: Some(binding.lease),
@@ -1252,7 +1452,7 @@ impl RuntimeOutboundRegistry {
                         .await,
                     ) {
                         Ok(opened) => {
-                            attempt.connected();
+                            attempt.connected(None, None);
                             return Ok((opened, connect.connected()));
                         }
                         Err(error @ RuntimeError::DestinationDenied(_)) => return Err(error),
@@ -1452,7 +1652,12 @@ impl RuntimeOutboundRegistry {
         authorizer: &dyn DestinationAuthorizer,
         debug_connection_id: Option<crate::observability::DebugConnectionId>,
     ) -> Result<&'a [AuthorizedTarget], RuntimeError> {
-        if let ProductDestination::Domain(domain) = destination {
+        if let ProductDestination::RoutedDomain { resolved, .. } = destination {
+            *destination = ProductDestination::Resolved(resolved.clone());
+        }
+        if let ProductDestination::Domain(domain) | ProductDestination::PreservedDomain(domain) =
+            destination
+        {
             let deadline =
                 self.destination_resolution_deadline(dns_plan, domain.flow().target())?;
             let authorized = match outbound::resolve_authorized_domain_before(
@@ -1479,7 +1684,9 @@ impl RuntimeOutboundRegistry {
         }
         match destination {
             ProductDestination::Resolved(resolved) => Ok(resolved.targets()),
-            ProductDestination::Domain(_) => {
+            ProductDestination::Domain(_)
+            | ProductDestination::PreservedDomain(_)
+            | ProductDestination::RoutedDomain { .. } => {
                 unreachable!("domain destination was promoted to resolved addresses")
             }
         }
@@ -2013,7 +2220,11 @@ fn connector_target(
     destination: &ProductDestination,
 ) -> Result<outbound::ConnectorTarget<'_>, RuntimeError> {
     match destination {
-        ProductDestination::Domain(domain) => Ok(outbound::ConnectorTarget::Domain(domain)),
+        ProductDestination::Domain(domain)
+        | ProductDestination::PreservedDomain(domain)
+        | ProductDestination::RoutedDomain { domain, .. } => {
+            Ok(outbound::ConnectorTarget::Domain(domain))
+        }
         ProductDestination::Resolved(resolved) => {
             Ok(outbound::ConnectorTarget::Resolved(resolved.targets()))
         }
@@ -2028,7 +2239,9 @@ async fn open_mpp_tcp_destination(
 ) -> Result<(OpenedRemoteStream, TargetAddr), RuntimeError> {
     ensure_destination_network(destination, Network::Tcp)?;
     match destination {
-        ProductDestination::Domain(domain) => {
+        ProductDestination::Domain(domain)
+        | ProductDestination::PreservedDomain(domain)
+        | ProductDestination::RoutedDomain { domain, .. } => {
             let target = outbound::protocol_target_addr(domain.flow().target());
             let remote =
                 open_mpp_tcp_target(context, target.clone(), traffic_class, deadline).await?;
@@ -2069,7 +2282,9 @@ async fn open_mpp_tcp_target(
 fn mpp_udp_target(destination: &ProductDestination) -> Result<TargetAddr, RuntimeError> {
     ensure_destination_network(destination, Network::Udp)?;
     match destination {
-        ProductDestination::Domain(domain) => {
+        ProductDestination::Domain(domain)
+        | ProductDestination::PreservedDomain(domain)
+        | ProductDestination::RoutedDomain { domain, .. } => {
             Ok(outbound::protocol_target_addr(domain.flow().target()))
         }
         ProductDestination::Resolved(resolved) => {

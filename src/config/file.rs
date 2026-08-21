@@ -41,7 +41,7 @@ use crate::product::{
     GatewayStrategy, InboundId, InitialDemand, MAX_RULE_SET_ENVELOPE_BYTES, Network, OutboundId,
     PortRange, PrincipalId, ProtocolTarget, RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage,
     RuleId, RuleSetId, RuleSetPublisher, RuleSetPublisherCatalog, RuleSetPublisherId,
-    TunL3AddressPlan, TunL3AllocationSpec, TunL3ServerSpec, VerifiedRuleSet,
+    TargetResolutionMode, TunL3AddressPlan, TunL3AllocationSpec, TunL3ServerSpec, VerifiedRuleSet,
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{EndpointParseError, PathSpecParseError};
@@ -202,6 +202,7 @@ impl FileConfig {
                     rule_set_publishers,
                     rule_sets,
                     rules,
+                    target_resolution,
                 } = routing;
                 let rule_sets =
                     compile_rule_set_registry(rule_set_publishers, rule_sets, material_base)?;
@@ -210,6 +211,7 @@ impl FileConfig {
                 compile_product_policy(
                     generation,
                     rules,
+                    target_resolution,
                     &rule_sets,
                     &local_inbound_names,
                     &parsed_outbounds,
@@ -1653,6 +1655,11 @@ enum OutboundFileConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoutingFileConfig {
+    /// How hostname targets are represented at the selected outbound. The
+    /// compatibility default keeps the historical demand-driven behavior;
+    /// configurations can opt into `as-is`, `route-only`, or `full-resolve`.
+    #[serde(default)]
+    target_resolution: Option<RoutingTargetResolutionFileValue>,
     #[serde(default)]
     balancers: Vec<RoutingBalancerFileConfig>,
     #[serde(default)]
@@ -1836,6 +1843,24 @@ struct RoutingRuleFileConfig {
     dns_policy: Option<String>,
     initial_demand: Option<RoutingInitialDemandFileValue>,
     explanation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RoutingTargetResolutionFileValue {
+    AsIs,
+    RouteOnly,
+    FullResolve,
+}
+
+impl RoutingTargetResolutionFileValue {
+    const fn into_mode(self) -> TargetResolutionMode {
+        match self {
+            Self::AsIs => TargetResolutionMode::AsIs,
+            Self::RouteOnly => TargetResolutionMode::RouteOnly,
+            Self::FullResolve => TargetResolutionMode::FullResolve,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2342,6 +2367,7 @@ fn compile_rule_set_registry(
 fn compile_product_policy(
     generation: u64,
     rules: Vec<RoutingRuleFileConfig>,
+    default_target_resolution: Option<RoutingTargetResolutionFileValue>,
     rule_sets: &CompiledRuleSetRegistry,
     local_inbounds: &HashSet<String>,
     outbounds: &ParsedOutbounds,
@@ -2352,7 +2378,15 @@ fn compile_product_policy(
 
     let rules = rules
         .into_iter()
-        .map(|rule| compile_product_route_rule(rule, rule_sets, local_inbounds, outbounds))
+        .map(|rule| {
+            compile_product_route_rule(
+                rule,
+                default_target_resolution,
+                rule_sets,
+                local_inbounds,
+                outbounds,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let policy = ProductPolicyConfig {
         generation,
@@ -2366,6 +2400,7 @@ fn compile_product_policy(
 
 fn compile_product_route_rule(
     rule: RoutingRuleFileConfig,
+    default_target_resolution: Option<RoutingTargetResolutionFileValue>,
     rule_sets: &CompiledRuleSetRegistry,
     local_inbounds: &HashSet<String>,
     outbounds: &ParsedOutbounds,
@@ -2499,12 +2534,17 @@ fn compile_product_route_rule(
                 RoutingInitialDemandFileValue::Automatic => InitialDemand::Automatic,
                 RoutingInitialDemandFileValue::Throughput => InitialDemand::Throughput,
             };
+            let target_resolution = default_target_resolution
+                .map(RoutingTargetResolutionFileValue::into_mode)
+                .unwrap_or(TargetResolutionMode::Auto);
             match decision {
                 RoutingDecisionFileValue::Allow => {
                     RouteAction::allow(egress, dns_plan, initial_demand)
+                        .with_target_resolution(target_resolution)
                 }
                 RoutingDecisionFileValue::AllowRestricted => {
                     RouteAction::allow_restricted(egress, dns_plan, initial_demand)
+                        .with_target_resolution(target_resolution)
                 }
                 RoutingDecisionFileValue::Reject | RoutingDecisionFileValue::Drop => {
                     unreachable!("allow decision pattern")
@@ -2523,8 +2563,16 @@ fn compile_product_route_rule(
                 )));
             }
             match decision {
-                RoutingDecisionFileValue::Reject => RouteAction::reject(),
-                RoutingDecisionFileValue::Drop => RouteAction::drop(),
+                RoutingDecisionFileValue::Reject => RouteAction::reject().with_target_resolution(
+                    default_target_resolution
+                        .map(RoutingTargetResolutionFileValue::into_mode)
+                        .unwrap_or(TargetResolutionMode::Auto),
+                ),
+                RoutingDecisionFileValue::Drop => RouteAction::drop().with_target_resolution(
+                    default_target_resolution
+                        .map(RoutingTargetResolutionFileValue::into_mode)
+                        .unwrap_or(TargetResolutionMode::Auto),
+                ),
                 RoutingDecisionFileValue::Allow | RoutingDecisionFileValue::AllowRestricted => {
                     unreachable!("terminal pattern")
                 }

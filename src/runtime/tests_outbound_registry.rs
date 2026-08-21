@@ -94,6 +94,48 @@ fn allow_restricted_destination_policy() -> TestDestinationPolicy {
     }
 }
 
+#[tokio::test]
+async fn routed_domain_keeps_hostname_for_proxy_leaf_and_pins_answers_for_ip_leaf() {
+    let authorizer = allow_restricted_destination_policy();
+    let target = TargetAddr::Domain {
+        host: "route-only.example".to_string(),
+        port: 443,
+    };
+    let authorization = authorizer
+        .begin(Network::Tcp, &target)
+        .expect("destination authorization");
+    let domain = authorizer
+        .authorize_domain(authorization.clone())
+        .expect("authorized domain");
+    let address: IpAddr = "203.0.113.17".parse().expect("routing answer");
+    let resolved = authorizer
+        .authorize_addresses(authorization, &[address])
+        .expect("authorized routing answer");
+    let routed =
+        ProductDestination::routed_domain(domain, resolved).expect("dual route-only destination");
+
+    assert!(matches!(
+        connector_target(&routed).expect("proxy connector target"),
+        outbound::ConnectorTarget::Domain(domain)
+            if domain.flow().target().domain().is_some_and(|value| value.as_str() == "route-only.example")
+    ));
+
+    let registry = RuntimeOutboundRegistry::compile(
+        [local_leaf("direct", OutboundConfig::Direct)],
+        &[],
+        DnsGeneration::from_test_answers(HashMap::new()),
+    )
+    .expect("direct registry");
+    let mut direct = routed.clone();
+    let targets = registry
+        .resolve_destination(&mut direct, None, &authorizer, None)
+        .await
+        .expect("retained authorized answer");
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].address(), address);
+    assert!(matches!(direct, ProductDestination::Resolved(_)));
+}
+
 fn selection(registry: &RuntimeOutboundRegistry, id: &str) -> EgressSelection {
     registry
         .selection_for_action(&EgressAction::Outbound(

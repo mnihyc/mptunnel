@@ -3,6 +3,7 @@ use crate::config::CommandConfig;
 use crate::product::{
     DomainName, EgressAction, FlowContext, InboundId, InitialDemand, Network, PrincipalId,
     ProtocolTarget, RouteDisposition, RouteInput, RouteMismatch, SourceEndpoint,
+    TargetResolutionMode,
 };
 
 const TEST_CERTIFICATE_FILE: &str = "mptunnel-test-certificate.pem";
@@ -458,7 +459,6 @@ outbound = "edge"
             .tls
             .shared_transport_secret_configured()
     );
-
     let server = format!(
         r#"
 [[credentials]]
@@ -2207,6 +2207,16 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
             .tls
             .shared_transport_secret_configured()
     );
+    assert_eq!(
+        client
+            .product_policy
+            .as_ref()
+            .expect("client Product policy")
+            .routes[0]
+            .action
+            .target_resolution(),
+        TargetResolutionMode::AsIs,
+    );
 
     let server = load(include_str!("../../examples/server.toml"));
     let CommandConfig::Node(server) = server.command;
@@ -3023,6 +3033,7 @@ tls_server_name = "mptunnel.test"
 tls_pinned_certificate = { from = "file", path = "mptunnel-test-certificate.pem" }
 
 [routing]
+target_resolution = "route-only"
 
 [[routing.balancers]]
 name = "all-edges"
@@ -3077,6 +3088,10 @@ initial_demand = "automatic"
         decision.action().initial_demand(),
         InitialDemand::Throughput
     );
+    assert_eq!(
+        decision.action().target_resolution(),
+        TargetResolutionMode::RouteOnly
+    );
     assert!(matches!(
         decision.action().egress(),
         Some(EgressAction::Outbound(outbound)) if outbound.as_str() == "edge-a"
@@ -3092,10 +3107,39 @@ initial_demand = "automatic"
     let decision = policy
         .routes()
         .classify(RouteInput::pre_resolution(&default_flow));
+    assert_eq!(
+        decision.action().target_resolution(),
+        TargetResolutionMode::RouteOnly
+    );
     assert!(matches!(
         decision.action().egress(),
         Some(EgressAction::Balancer(balancer)) if balancer.as_str() == "all-edges"
     ));
+}
+
+#[test]
+fn routing_target_resolution_schema_accepts_only_the_three_explicit_modes() {
+    for (value, expected) in [
+        ("as-is", TargetResolutionMode::AsIs),
+        ("route-only", TargetResolutionMode::RouteOnly),
+        ("full-resolve", TargetResolutionMode::FullResolve),
+    ] {
+        let routing =
+            toml::from_str::<RoutingFileConfig>(&format!("target_resolution = \"{value}\""))
+                .expect("target resolution mode");
+        assert_eq!(
+            routing
+                .target_resolution
+                .expect("explicit target resolution")
+                .into_mode(),
+            expected,
+        );
+    }
+
+    let omitted = toml::from_str::<RoutingFileConfig>("").expect("omitted mode");
+    assert!(omitted.target_resolution.is_none());
+    assert!(toml::from_str::<RoutingFileConfig>("target_resolution = \"auto\"").is_err());
+    assert!(toml::from_str::<RoutingFileConfig>("target_resolution = \"invalid\"").is_err());
 }
 
 #[test]

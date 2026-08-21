@@ -265,10 +265,13 @@ address retains the policy and capture that issued it; a route may omit
 Fixed-target listeners use `tcp-forward`, `udp-forward`, or `mixed-forward`;
 the mixed form binds both transports on the same addresses and sends them to
 one target.
-Domain-capable SOCKS5/HTTP/MPP outbounds can receive a domain unchanged, in
-which case that next hop owns name resolution. Selecting `dns_policy` on the
-route or using an IP-dependent rule instead forces resolution and address
-authorization at this MPTUNNEL node. Ranged carrier endpoints use syntax such as
+Domain-capable SOCKS5/HTTP/MPP outbounds can receive a domain unchanged.
+`[routing].target_resolution` makes the ownership explicit: `as-is` never
+resolves during routing, `route-only` resolves only for route/ACL evidence but
+keeps the hostname for a domain-capable outbound, and `full-resolve` passes
+authorized literal IPs. Omission retains the historical demand-driven
+behavior. MPP carrier endpoint DNS is separate from application-target DNS.
+Ranged carrier endpoints use syntax such as
 `quic://server.example:20000-40000`.
 
 All L4 inbounds, including local listeners and `protocol = "mpp"`, use one
@@ -293,9 +296,11 @@ outbound inventory, bound listeners, runtime readiness, and shutdown. The
 default UTC text format is readable at a terminal; newline-delimited JSON,
 append-only files, and sanitized opt-in flow summaries are also supported.
 Set `level = "debug"` to see one correlated, scope-separated trace showing what
-each L4 inbound accepted, which route and optional balancer were selected, and
-each configured outbound attempt and result. UDP is traced per logical
-association; packets and physical MPP carrier internals are not logged.
+each L4 inbound and authenticated principal accepted, which exact route and
+optional balancer were selected, and each configured outbound protocol,
+attempt, and result. Reliable MPP streams include their selected underlay and
+configured path name. UDP is traced per logical association; packets and
+per-packet MPP path choices are not logged.
 One bounded background HTTPS check reports the newest published GitHub release
 without delaying startup or forwarding; an available update includes its
 release-page URL.

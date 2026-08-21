@@ -66,6 +66,14 @@ impl PreResolutionDecision {
         self.requires_post_resolution = true;
     }
 
+    /// Apply an explicit `AsIs` routing strategy after the route table has
+    /// classified the pre-resolution flow. This deliberately does not alter
+    /// literal-IP classification; it only prevents a hostname from being
+    /// resolved merely to compare it with post-resolution rules.
+    pub(crate) fn skip_post_resolution(&mut self) {
+        self.requires_post_resolution = false;
+    }
+
     pub const fn policy_generation(&self) -> u64 {
         self.permit.generation()
     }

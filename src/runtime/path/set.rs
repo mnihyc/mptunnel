@@ -470,6 +470,10 @@ impl ClientPathContext {
             .map(String::as_str)
     }
 
+    pub(in crate::runtime) fn udp_path_name(&self, path_index: usize) -> Option<&str> {
+        self.udp_path_names.get(path_index).map(String::as_str)
+    }
+
     pub(in crate::runtime) fn tcp_path_config_ordinal(&self, path_index: usize) -> Option<usize> {
         self.tcp_path_ordinals.get(path_index).copied()
     }

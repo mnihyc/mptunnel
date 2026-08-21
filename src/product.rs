@@ -63,6 +63,7 @@ pub use routing::{
     BalancerId, CompiledRouteTable, DnsPlanId, EgressAction, InitialDemand, OutboundId, PortRange,
     RouteAction, RouteCompileError, RouteDecision, RouteDisposition, RouteExplanation, RouteInput,
     RouteMatchSpec, RouteMismatch, RouteRuleSpec, RouteRuleTrace, RouteStage, RuleId,
+    TargetResolutionMode,
 };
 pub use rule_set::{
     CompiledRuleSetRegistry, MAX_ENTRIES_ACROSS_RULE_SET_REGISTRY, MAX_ENTRIES_PER_RULE_SET,
@@ -118,10 +119,30 @@ impl ProductPolicyGeneration {
         flow: std::sync::Arc<FlowContext>,
         eligible: impl FnMut(&RouteAction) -> bool,
     ) -> Result<PreResolutionDecision, RouteAuthorizationError> {
-        let (decision, requires_post_resolution) = self
+        let (decision, mut requires_post_resolution) = self
             .routes
             .classify_pre_resolution_with_action_eligibility(flow.as_ref(), eligible)
             .ok_or(RouteAuthorizationError::NoUsableAddress)?;
+        // Resolution strategy is attached to every selected action, including
+        // reject/drop. Otherwise an earlier address-dependent rule could make
+        // an AsIs terminal decision perform DNS before it terminates. Literal
+        // IPs are already fully represented and continue through the normal
+        // post-resolution ACL.
+        if flow.target().domain().is_some() {
+            match decision.action().target_resolution() {
+                crate::product::TargetResolutionMode::Auto => {}
+                crate::product::TargetResolutionMode::AsIs => {
+                    requires_post_resolution = false;
+                }
+                crate::product::TargetResolutionMode::RouteOnly => {}
+                crate::product::TargetResolutionMode::FullResolve
+                    if decision.action().egress().is_some() =>
+                {
+                    requires_post_resolution = true;
+                }
+                crate::product::TargetResolutionMode::FullResolve => {}
+            }
+        }
         if !requires_post_resolution {
             terminal_result(decision)?;
         }

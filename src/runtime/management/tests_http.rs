@@ -412,12 +412,15 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
             "session identity/control must retain the lossless API decimal: {raw_session_identity}"
         );
     }
+    // Git may materialize embedded dashboard assets with CRLF on Windows.
+    // Normalize source text before asserting this formatting-sensitive surface.
+    let dashboard_js_lf = DASHBOARD_JS.replace("\r\n", "\n");
     for filter_identity in [
         "session.session_id,\n        formatSessionId(session.session_id),",
         "flow.session_id,\n        formatSessionId(flow.session_id),",
     ] {
         assert!(
-            DASHBOARD_JS.contains(filter_identity),
+            dashboard_js_lf.contains(filter_identity),
             "filters must match both raw and displayed session identity: {filter_identity}"
         );
     }

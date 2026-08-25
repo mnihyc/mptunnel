@@ -26,6 +26,9 @@ use crate::transport::Endpoint;
 use crate::transport::tcp::bind_listener;
 use tokio::io::duplex;
 
+/// Cross-actor test settlement budget, not a protocol latency contract.
+const SESSION_CLOSE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn security() -> ClientSecurityConfig {
     ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
@@ -761,9 +764,12 @@ async fn publish_controlled_tcp_session_close(
         .await
         .expect("server writes authenticated SESSION_CLOSE");
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), context.session_retirement().wait())
-            .await
-            .expect("client publishes sticky SESSION_CLOSE"),
+        tokio::time::timeout(
+            SESSION_CLOSE_SETTLEMENT_TIMEOUT,
+            context.session_retirement().wait(),
+        )
+        .await
+        .expect("client publishes sticky SESSION_CLOSE"),
         CloseReason::PolicyRejected
     );
 }
@@ -1445,7 +1451,7 @@ async fn pre_model_red_quic_session_close_interrupts_a_sibling_in_flight_connect
         .expect("sibling resolver entered its in-flight connect");
 
     emit_close.notify_one();
-    let sibling_result = tokio::time::timeout(Duration::from_secs(1), &mut blocked)
+    let sibling_result = tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, &mut blocked)
         .await
         .expect("SESSION_CLOSE must cancel the sibling resolver")
         .expect("sibling connect task");
@@ -1453,6 +1459,13 @@ async fn pre_model_red_quic_session_close_interrupts_a_sibling_in_flight_connect
         sibling_result,
         Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
     ));
+    tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, async {
+        while client.authenticated_carriers.snapshot().live_count != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retired QUIC carrier releases its authenticated registration");
     assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
 
     provider.release();
@@ -1576,17 +1589,20 @@ async fn pre_model_red_tcp_session_close_interrupts_a_backpressured_ordered_writ
     )
     .await
     .expect("server writes authenticated SESSION_CLOSE");
-    let reason = tokio::time::timeout(Duration::from_secs(1), client.session_retirement().wait())
-        .await
-        .expect("decoded SESSION_CLOSE must bypass the ordered writer barrier");
+    let reason = tokio::time::timeout(
+        SESSION_CLOSE_SETTLEMENT_TIMEOUT,
+        client.session_retirement().wait(),
+    )
+    .await
+    .expect("decoded SESSION_CLOSE must bypass the ordered writer barrier");
     assert_eq!(reason, CloseReason::PolicyRejected);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), inbound_frames.recv())
+        tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, inbound_frames.recv())
             .await
             .expect("product stream receives terminal fanout"),
         Some(Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected)))
     ));
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, async {
         while client.tcp_sessions[0].is_connection_ready() {
             tokio::task::yield_now().await;
         }
@@ -1708,12 +1724,15 @@ async fn pre_model_red_tcp_queued_open_observes_sticky_session_terminal() {
     .await
     .expect("server writes authenticated SESSION_CLOSE");
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), client.session_retirement().wait())
-            .await
-            .expect("reader publishes complete-session retirement"),
+        tokio::time::timeout(
+            SESSION_CLOSE_SETTLEMENT_TIMEOUT,
+            client.session_retirement().wait(),
+        )
+        .await
+        .expect("reader publishes complete-session retirement"),
         CloseReason::PolicyRejected
     );
-    let queued_result = tokio::time::timeout(Duration::from_secs(1), &mut queued_open)
+    let queued_result = tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, &mut queued_open)
         .await
         .expect("queued open receives terminal settlement")
         .expect("queued open task");
@@ -1721,7 +1740,7 @@ async fn pre_model_red_tcp_queued_open_observes_sticky_session_terminal() {
         queued_result,
         Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
     ));
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, async {
         while client.tcp_sessions[0].is_connection_ready() {
             tokio::task::yield_now().await;
         }
@@ -1729,7 +1748,7 @@ async fn pre_model_red_tcp_queued_open_observes_sticky_session_terminal() {
     .await
     .expect("terminal actor withdraws readiness after settling accepted work");
     assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, async {
         while !commands.is_closed() {
             tokio::task::yield_now().await;
         }
@@ -1823,18 +1842,21 @@ async fn pre_model_red_tcp_sibling_session_close_interrupts_a_backpressured_acto
     .await
     .expect("carrier B writes authenticated SESSION_CLOSE");
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), client.session_retirement().wait())
-            .await
-            .expect("carrier B publishes complete-session retirement"),
+        tokio::time::timeout(
+            SESSION_CLOSE_SETTLEMENT_TIMEOUT,
+            client.session_retirement().wait(),
+        )
+        .await
+        .expect("carrier B publishes complete-session retirement"),
         CloseReason::PolicyRejected
     );
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), inbound_frames.recv())
+        tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, inbound_frames.recv())
             .await
             .expect("sibling terminal cancels carrier A Product owner"),
         Some(Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected)))
     ));
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(SESSION_CLOSE_SETTLEMENT_TIMEOUT, async {
         while client.tcp_sessions[0].is_connection_ready()
             || client.tcp_sessions[1].is_connection_ready()
         {

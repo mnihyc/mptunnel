@@ -132,44 +132,64 @@ still running but degraded, retrying, saturated, or recovering; `info` covers
 configuration and service lifecycle transitions. `debug` includes those levels
 and adds an immediate per-connection trace for routed L4 traffic.
 
-Each debug trace uses one process-local, monotonically increasing `id`. Records
-are deliberately separated by ownership so the first glance reads in order:
+Each debug trace uses one process-local, monotonically increasing `id`. Every
+record repeats the same immutable ingress context so an isolated routing,
+balancer, or outbound line still identifies the accepted request. Event-owned
+fields then describe only that component's decision or outcome:
 
 ```text
-2026-08-06T02:15:10.100Z DEBUG inbound.accepted: id=17 network=tcp inbound="local-socks" principal="anonymous" source="127.0.0.1:52144" destination="example.com:443"
-2026-08-06T02:15:10.101Z DEBUG routing.selected: id=17 network=tcp destination="example.com:443" rule="default" inbound="local-socks" principal="anonymous" decision="allow" egress="outbound:remote-mpp" target_resolution="as-is"
-2026-08-06T02:15:10.102Z DEBUG outbound.connecting: id=17 network=tcp outbound="remote-mpp" protocol="mpp" origin="local_inbound" destination="example.com:443" attempt=1
-2026-08-06T02:15:10.118Z DEBUG outbound.connected: id=17 network=tcp outbound="remote-mpp" protocol="mpp" origin="local_inbound" underlay="tcp" mpp_path="primary-tcp" destination="example.com:443" attempt=1
-2026-08-06T02:15:10.118Z DEBUG inbound.established: id=17 network=tcp inbound="local-socks" principal="anonymous"
+2026-08-06T02:15:10.100Z DEBUG inbound.accepted: id=17 network=tcp origin="local_inbound" inbound="local-socks" principal="anonymous" source="127.0.0.1:52144" source_kind="local_peer" requested_destination="example.com:443"
+2026-08-06T02:15:10.101Z DEBUG routing.selected: id=17 network=tcp origin="local_inbound" inbound="local-socks" principal="anonymous" source="127.0.0.1:52144" source_kind="local_peer" requested_destination="example.com:443" rule="default" decision="allow" egress="outbound:remote-mpp" target_resolution="full-resolve"
+2026-08-06T02:15:10.102Z DEBUG outbound.connecting: id=17 network=tcp origin="local_inbound" inbound="local-socks" principal="anonymous" source="127.0.0.1:52144" source_kind="local_peer" requested_destination="example.com:443" outbound="remote-mpp" outbound_destination="198.51.100.8:443" protocol="mpp" attempt=1
+2026-08-06T02:15:10.118Z DEBUG outbound.connected: id=17 network=tcp origin="local_inbound" inbound="local-socks" principal="anonymous" source="127.0.0.1:52144" source_kind="local_peer" requested_destination="example.com:443" outbound="remote-mpp" outbound_destination="198.51.100.8:443" protocol="mpp" underlay="tcp" mpp_path="primary-tcp" attempt=1
+2026-08-06T02:15:10.118Z DEBUG inbound.established: id=17 network=tcp origin="local_inbound" inbound="local-socks" principal="anonymous" source="127.0.0.1:52144" source_kind="local_peer" requested_destination="example.com:443"
+```
+
+The JSON format exposes the same common and event-owned fields without parsing
+the text message. For example, a server-side MPP route record may be:
+
+```json
+{"timestamp_unix_ms":1785982510101,"level":"debug","component":"routing","event":"selected","connection_id":"42","network":"tcp","origin":"mpp_inbound","inbound":"edge-in","principal":"alice","source":"203.0.113.7:51000","source_kind":"mpp_carrier_peer","requested_destination":"example.net:443","session_id":"91","ingress_underlay":"quic","ingress_path":"mobile-quic","ingress_path_id":"7","ingress_path_instance":"44","rule":"default","decision":"allow","egress":"outbound:direct","target_resolution":"as-is"}
 ```
 
 The trace begins after an L4 inbound has authenticated (when applicable),
 parsed a target, and accepted the logical request; it is not a raw-socket or
-pre-authentication access log. The inbound scope reports the configured
-inbound, authenticated Product principal, source when one exists, and requested
-destination. Routing reports the exact winning rule, configured egress, and
-target-resolution mode. A balancer reports each member choice, and the outbound
-scope reports each configured outbound protocol, origin, attempt, success, or
-failure before failover. Direct routes simply omit the balancer record. A
-connected reliable MPP stream also reports its selected TCP/QUIC underlay and
-configured MPP path name. For UDP, one trace represents the logical association
-becoming ready, not every packet; per-packet MPP path choices are intentionally
-omitted because they may change. A configured outbound may internally try
-multiple resolved addresses; those connector details remain one outbound
-attempt in this view. Rejected and dropped requests stop at the routing record.
-MPP L3 packets, internal DNS/probe traffic, and raw carrier authentication
-remain outside this connection trace; use the management path and session
-views for current carrier state.
+pre-authentication access log. Common fields are `network`, `origin`, `inbound`,
+`principal`, and `requested_destination`. Local inbounds also report the local
+socket peer as `source` with `source_kind="local_peer"`. An MPP inbound instead
+reports the server-observed opening carrier endpoint with
+`source_kind="mpp_carrier_peer"`, plus `session_id`, `ingress_underlay`,
+`ingress_path_id`, and `ingress_path_instance`; `ingress_path` appears only when
+that carrier maps to a named configured path. A carrier peer can be a NAT or
+proxy endpoint. It is not a forwarded application-client address and never
+becomes source-CIDR routing evidence.
+
+Routing owns the exact winning `rule`, configured `egress`, and
+`target_resolution`. A balancer owns each member choice. Outbound records own
+the configured outbound, protocol, attempt, outcome, and
+`outbound_destination`: a hostname delegated as-is or the ordered literal
+candidate set passed after resolution. This remains separate from immutable
+`requested_destination`; when full resolution changes a hostname into an IP,
+both are visible. A connected reliable MPP outbound also reports its selected
+TCP/QUIC `underlay` and configured `mpp_path`, distinct from the `ingress_*`
+fields. Direct routes omit the balancer record. For UDP, one trace represents
+the logical association becoming ready, not every packet; per-packet MPP path
+choices are intentionally omitted because they may change. Rejected and
+dropped requests stop at the routing record. MPP L3 packets, internal
+DNS/probe traffic, and raw carrier authentication remain outside this
+connection trace; use the management path and session views for current
+carrier state.
 
 All records are length-bounded and remove terminal control characters. Repeated
 saturation and fault records are rate-limited per call site and report the
 suppressed count on the next record. Authorization, cookies, tokens, passwords,
 credential secrets, and private-key forms are redacted as a final defense.
 Debug connection records are not rate-limited, so all attempts are visible
-while `debug` remains enabled and the sink remains writable. They include
-source/destination addresses and authenticated principal IDs and are therefore
-privacy-sensitive. They never add credential IDs, credentials, secrets,
-payloads, or fields owned by another scope. All dynamic fields remain bounded,
+while `debug` remains enabled and the sink remains writable. Repeated common
+context increases log volume and cardinality per connection; source/carrier
+endpoints, destinations, session/path identities, and authenticated principal
+IDs are privacy-sensitive. Records never add credential IDs, credentials,
+secrets, payloads, or per-packet data. All dynamic fields remain bounded,
 control-sanitized, and secret-redacted.
 
 `flow_events = true` additionally emits one sanitized
@@ -640,7 +660,15 @@ All data and controls are authenticated under `/api/v4/`:
 - `GET /api/v4/sessions` returns authenticated MPP session ownership.
 - `GET /api/v4/flows` returns bounded active reliable/datagram logical-flow
   detail, including the origin inbound, application target, selected outbound,
-  and optional balancer.
+  optional balancer, and a required typed source observation. Unscoped
+  DNS/probe/test transport work is excluded from active inbound rows rather
+  than projected with an invented or unknown source. `local_peer` is
+  the accepted socket peer for socket inbounds (or the logical packet source
+  endpoint for TUN-L4). `mpp_carrier_peer` is the server-observed authenticated
+  carrier that opened the logical flow; it may be a NAT endpoint, is not a
+  forwarded end-client identity, and never becomes source-CIDR routing
+  evidence. The value is snapshotted at logical-flow open, so later carrier
+  migration, reattachment, or retirement does not relabel an active row.
 - `GET /api/v4/diagnostics` returns local diagnostic capability, peer session
   references, controls, and path state.
 - `GET /api/v4/config` returns `mptunnel.config.v4` with the canonical path,
@@ -737,6 +765,9 @@ or path probes. Native and MPP boundaries never count one flow twice. Path
 delivery rate, queue, and flight remain separate current
 carrier evidence. Numeric identifiers and monotonic byte totals are decimal
 strings so browser clients do not lose 64-bit precision.
+The dashboard renders Session IDs as lowercase, fixed-width 16-digit
+hexadecimal for compact visual correlation, while matching, control payloads,
+and the management API retain the original decimal strings.
 Per-flow detail is capped independently from forwarding capacity; aggregate
 counters remain exact. Diagnostics report both current and cumulative detail
 overflow, and per-session flow counts carry an explicit completeness flag.
@@ -750,10 +781,19 @@ denies. The management-global `allow_peer_diagnostics = true` (or
 authenticated peer on every MPP endpoint regardless of those endpoint
 controls. Permissions are independent of the local HTTP listener and default
 to deny. Either endpoint may initiate from its own management API; the remote
-endpoint's effective policy decides whether it returns data. Responses contain only
-per-session path state, usage, and metrics. They exclude endpoints,
+endpoint's effective policy decides whether it returns data. Wire responses
+contain only per-session path state, usage, and metrics. They exclude endpoints,
 application targets, local resource names, credentials, and every other
-authenticated session. One
+authenticated session. The requester separately correlates each returned
+`(session_id, underlay, path_id)` with the endpoint-local configured path that
+admitted that authenticated carrier. The management response and dashboard may
+therefore show the local path name and configured carrier endpoint, including a
+draining assignment captured while that carrier registration was live; those
+fields were not disclosed by the peer. Correlation is snapshotted with the
+completed result, so later authenticated reuse of the same numeric Path ID
+cannot relabel cached diagnostics. Carrier retirement removes only its exact
+live assignment and cannot erase a newer owner. An unavailable local
+correlation is shown as unknown and is never guessed from configuration order. One
 request per session may be in flight, requests time out, and responders admit
 at most one snapshot request per session per second. A rate-limited or
 codec-oversized complete snapshot returns `unavailable`; it is never truncated.
@@ -765,6 +805,15 @@ the returned `ok`, `disabled`, or `unavailable` code exposes the remote
 endpoint's decision. Either client or server may be the requesting side. The
 Overview and Diagnostics pages show whether this local endpoint will answer
 peer requests. Manual mode sends no periodic local or peer request.
+
+The chart-history selector bounds retained browser history; it is not a zoom
+control. Hovering with a pointer or tapping selects the nearest actual retained
+sample in both charts, and focused charts accept Left/Right/Home/End selection.
+The detail below each chart reports the sample's localized date, time, time
+zone, and raw series values; cumulative byte totals remain lossless decimal
+strings. Selection never interpolates telemetry or changes polling, retention,
+or the management API. Compact axis endpoints remain time-only, so use the
+date-bearing detail when retained history crosses a calendar day.
 
 Path control uses `enabled`, `suspect`, `failed`, or `disabled`. Enabling clears
 the operator disable but leaves a path suspect until fresh carrier liveness

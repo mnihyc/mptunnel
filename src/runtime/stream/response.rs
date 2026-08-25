@@ -16,6 +16,7 @@ use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
+use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::TrafficClass;
 #[cfg(test)]
@@ -153,7 +154,8 @@ impl ResponseStreamBinding {
             session_tracker.clone(),
             next_server_carrier_path_instance_id(),
             PathPolicy::default(),
-        );
+        )
+        .expect("register active test response owner");
         session_tracker.detach_session(session_id);
         binding
     }
@@ -169,14 +171,14 @@ impl ResponseStreamBinding {
         session_tracker: Arc<ServerSessionTracker>,
         path_instance_id: CarrierPathInstanceId,
         local_policy: PathPolicy,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, RuntimeError> {
         let (version, _) = watch::channel(0);
         let key = CarrierPathKey { underlay, path_id };
-        let session_registration = ServerSessionRegistration::new(session_tracker, session_id);
+        let session_registration = ServerSessionRegistration::try_new(session_tracker, session_id)?;
         let load_registration = commands.register_flow(lane);
         let initial_max_data_offset =
             reliable_stream_initial_advertised_window_bytes(underlay, lane, mux_limits);
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
             mux_limits,
@@ -224,11 +226,19 @@ impl ResponseStreamBinding {
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
             version,
-        })
+        }))
     }
 
     pub(in crate::runtime::stream) fn session_send_buffer(&self) -> super::SessionSendBuffer {
         self.session_registration.send_buffer()
+    }
+
+    pub(in crate::runtime::stream) fn attach_output_if_session_active(
+        &self,
+        attachment: ResponseOutputAttachment,
+    ) -> Result<ResponseStreamAttachOutcome, RuntimeError> {
+        self.session_registration
+            .commit_if_active(|| self.attach_output(attachment))
     }
 
     pub(in crate::runtime) fn subscribe_updates(&self) -> watch::Receiver<u64> {

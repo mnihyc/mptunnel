@@ -6,7 +6,7 @@
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::PathRateSample;
 use crate::model::capacity::reliable_relay_buffer_len;
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::path::RelayPathInstance;
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
 use crate::runtime::path::ClientPathContext;
@@ -80,7 +80,12 @@ pub(super) fn opened_test_relay_stream_with_underlay(
     )
 }
 
-pub(super) fn seed_client_bulk_evidence_for_test(context: &ClientPathContext, key: RelayPathKey) {
+pub(super) fn seed_client_bulk_evidence_for_test(
+    context: &ClientPathContext,
+    instance: RelayPathInstance,
+) {
+    context.install_relay_path_instance_for_test(instance);
+    let key = instance.key;
     match key.underlay {
         UnderlayProtocol::Tcp => context.mark_tcp_path_open_success(
             key.index,

@@ -30,6 +30,23 @@ fn tcp_path_test_context(path_count: usize) -> ClientPathContext {
         .expect("request TCP capacity test context")
 }
 
+fn udp_path_load_test_context() -> ClientPathContext {
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("UDP load test secret"),
+    );
+    ClientPathContext::new(
+        vec![
+            "quic://127.0.0.1:12799"
+                .parse::<PathSpec>()
+                .expect("UDP load test path"),
+        ],
+        security,
+        ResourceLimits::default(),
+    )
+    .expect("UDP load test context")
+}
+
 #[test]
 fn tcp_carrier_groups_publish_every_bounded_pool_member() {
     let primary_security = ClientSecurityConfig::for_test(
@@ -288,6 +305,49 @@ fn relay_path_load_lease_rolls_back_scheduler_demand_on_drop() {
     assert_eq!(
         context.health().lock().expect("path health").tcp[0].active_flows,
         0
+    );
+}
+
+#[test]
+fn udp_logical_load_lease_survives_physical_replacement_and_balances_on_drop() {
+    let context = udp_path_load_test_context();
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let predecessor = next_carrier_path_instance_id();
+    context.install_relay_path_instance_for_test(RelayPathInstance {
+        key,
+        path_instance_id: predecessor,
+        attachment_id: 0,
+    });
+    let lease = context
+        .reserve_relay_path_load(key, TrafficClass::RealtimeDatagram)
+        .expect("UDP association load lease");
+    assert_eq!(
+        context.health().lock().expect("UDP predecessor health").udp[0].active_flows,
+        1,
+    );
+
+    let successor = next_carrier_path_instance_id();
+    context.install_relay_path_instance_for_test(RelayPathInstance {
+        key,
+        path_instance_id: successor,
+        attachment_id: 0,
+    });
+    {
+        let health = context.health().lock().expect("UDP successor health");
+        assert_eq!(health.udp[0].path_instance_id(), Some(successor));
+        assert_eq!(
+            health.udp[0].active_flows, 1,
+            "physical N to N+1 publication cannot duplicate or release logical association load",
+        );
+    }
+    drop(lease);
+    assert_eq!(
+        context.health().lock().expect("UDP released health").udp[0].active_flows,
+        0,
+        "success, failure, and cancellation all balance through the same RAII drop",
     );
 }
 

@@ -168,6 +168,11 @@ impl UdpPathEndpoint {
         self.endpoint.accept().await.map(UdpPathConnection::new)
     }
 
+    #[cfg(test)]
+    pub(in crate::runtime) async fn accept_for_test(&self) -> Option<UdpPathConnection> {
+        self.accept().await
+    }
+
     pub(in crate::runtime) fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.endpoint.local_addr()
     }
@@ -176,6 +181,10 @@ impl UdpPathEndpoint {
 impl UdpPathConnection {
     fn new(connection: quic_transport::Connection) -> Self {
         Self { connection }
+    }
+
+    pub(super) fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
     }
 
     pub(super) fn delivery_activity_notify(&self) -> Arc<tokio::sync::Notify> {
@@ -457,18 +466,6 @@ pub(super) fn warn_unexpected_udp_runtime_error(message: &str, err: &RuntimeErro
     if !udp_runtime_error_is_expected_shutdown(err) {
         crate::observability::process_event!(Warn, "quic", "runtime_error", "{message}: {err}");
     }
-}
-
-pub(super) fn quic_path_open_error_is_retryable(err: &RuntimeError) -> bool {
-    matches!(
-        err,
-        RuntimeError::Io(_)
-            | RuntimeError::Udp(_)
-            | RuntimeError::QuicCarrier(_)
-            | RuntimeError::RemoteClosed(_)
-            | RuntimeError::Protocol(_)
-            | RuntimeError::ReliablePathSessionClosed
-    )
 }
 
 pub(super) fn udp_path_command_queue(mux_limits: MuxLimits, _codec_limits: CodecLimits) -> usize {

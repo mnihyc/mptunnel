@@ -14,6 +14,9 @@ use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey}
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::{
+    ReliablePathCarrierTerminalCause, ReliablePathCarrierTerminalSignal,
+};
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
@@ -138,6 +141,7 @@ pub(in crate::runtime) struct ReliableRelayRemotePath {
     pub(in crate::runtime) published_max_data_offset: u64,
     /// Publication fence for the logical receiver's retained cumulative ACK.
     stream_ack_publication: StreamAckPublicationCursor,
+    input_forwarder: ReliableRelayInputForwarder,
     pub(in crate::runtime) stream: ReliablePathStreamHandle,
 }
 
@@ -165,11 +169,161 @@ impl ReliableRelayRemotePath {
     fn depublish_load(&mut self) {
         drop(self.load_lease.take());
     }
+
+    fn stop_input_forwarder(&self) {
+        self.input_forwarder.abort();
+    }
 }
 
 pub(in crate::runtime) struct ReliableRelayRemoteFrame {
     pub(in crate::runtime) instance: RelayPathInstance,
     pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
+}
+
+struct ReliableRelayInputForwarder(tokio::task::JoinHandle<()>);
+
+impl ReliableRelayInputForwarder {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for ReliableRelayInputForwarder {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn forward_reliable_relay_attachment_frame(
+    frames_tx: &mpsc::Sender<ReliableRelayRemoteFrame>,
+    instance: RelayPathInstance,
+    frame: Result<Frame, RuntimeError>,
+    product_terminal_received: &mut bool,
+) -> bool {
+    *product_terminal_received |= matches!(
+        &frame,
+        Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
+    );
+    let carrier_terminal = frame.is_err();
+    frames_tx
+        .send(ReliableRelayRemoteFrame { instance, frame })
+        .await
+        .is_ok()
+        && !carrier_terminal
+}
+
+async fn drain_reliable_relay_attachment_after_terminal(
+    instance: RelayPathInstance,
+    frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
+    frames_tx: &mpsc::Sender<ReliableRelayRemoteFrame>,
+    cause: ReliablePathCarrierTerminalCause,
+    mut product_terminal_received: bool,
+) {
+    // Closing the receiver rejects sends that did not cross admission before
+    // terminal. Tokio still delivers buffered messages and outstanding permits,
+    // so reaching `None` is the exact accepted-input drain boundary.
+    frames.close();
+    while let Some(frame) = frames.recv().await {
+        if !forward_reliable_relay_attachment_frame(
+            frames_tx,
+            instance,
+            frame,
+            &mut product_terminal_received,
+        )
+        .await
+        {
+            return;
+        }
+    }
+    // A product FIN suppresses only an unclassified input-channel closure.
+    // Exact carrier terminal authority remains observable because the other
+    // product direction may still need recovery and final feedback.
+    let _ = frames_tx
+        .send(ReliableRelayRemoteFrame {
+            instance,
+            frame: Err(cause.into_error()),
+        })
+        .await;
+}
+
+async fn forward_reliable_relay_attachment_frames(
+    instance: RelayPathInstance,
+    mut frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+    frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
+    terminal: ReliablePathCarrierTerminalSignal,
+) {
+    let mut product_terminal_received = false;
+    loop {
+        // The sticky check prevents a continuously ready producer from
+        // starving terminal observation. A frame selected concurrently with
+        // terminal had already crossed input admission and remains ordered.
+        if let Some(cause) = terminal.cause() {
+            drain_reliable_relay_attachment_after_terminal(
+                instance,
+                &mut frames,
+                &frames_tx,
+                cause,
+                product_terminal_received,
+            )
+            .await;
+            return;
+        }
+        tokio::select! {
+            biased;
+            frame = frames.recv() => {
+                let Some(frame) = frame else {
+                    if product_terminal_received {
+                        // A product terminal explains input closure but not a
+                        // later output-owner failure. Remain attachment-local
+                        // until exact membership removal aborts this watcher.
+                        tokio::select! {
+                            cause = terminal.wait() => {
+                                let _ = frames_tx
+                                    .send(ReliableRelayRemoteFrame {
+                                        instance,
+                                        frame: Err(cause.into_error()),
+                                    })
+                                    .await;
+                            }
+                            _ = frames_tx.closed() => {}
+                        }
+                    } else {
+                        let cause = terminal
+                            .cause()
+                            .unwrap_or(ReliablePathCarrierTerminalCause::Failed);
+                        let _ = frames_tx
+                            .send(ReliableRelayRemoteFrame {
+                                instance,
+                                frame: Err(cause.into_error()),
+                            })
+                            .await;
+                    }
+                    return;
+                };
+                if !forward_reliable_relay_attachment_frame(
+                    &frames_tx,
+                    instance,
+                    frame,
+                    &mut product_terminal_received,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            cause = terminal.wait() => {
+                drain_reliable_relay_attachment_after_terminal(
+                    instance,
+                    &mut frames,
+                    &frames_tx,
+                    cause,
+                    product_terminal_received,
+                )
+                .await;
+                return;
+            }
+        }
+    }
 }
 
 /// Reports whether attachment-set ownership committed; a rejected pending open
@@ -250,7 +404,7 @@ impl ReliableRelayRemoteSet {
         let choose = |allow_backup: bool| {
             self.paths
                 .iter()
-                .filter_map(|path| context.reliable_path_snapshot(path.key()))
+                .filter_map(|path| context.reliable_path_snapshot_for_instance(path.instance()))
                 .filter(|snapshot| allow_backup || !path_is_backup(*snapshot))
                 .filter_map(|snapshot| {
                     score_path(snapshot, lane, payload_bytes).map(|score| (score.eta_ms, snapshot))
@@ -271,7 +425,7 @@ impl ReliableRelayRemoteSet {
             self.paths
                 .iter()
                 .filter_map(|path| {
-                    let snapshot = context.reliable_path_snapshot(path.key())?;
+                    let snapshot = context.reliable_path_snapshot_for_instance(path.instance())?;
                     if !allow_backup && path_is_backup(snapshot) {
                         return None;
                     }
@@ -583,35 +737,11 @@ impl ReliableRelayRemoteSet {
             // membership is not load until this stream assigns product data.
             drop(load_lease.take());
         }
-        let (stream, mut frames) = stream.into_handle_and_frames();
+        let (stream, frames, terminal) = stream.into_handle_and_frames();
         let frames_tx = self.frames_tx.clone();
-        tokio::spawn(async move {
-            let mut product_terminal_received = false;
-            while let Some(frame) = frames.recv().await {
-                product_terminal_received |= matches!(
-                    &frame,
-                    Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
-                );
-                let done = frame.is_err();
-                if frames_tx
-                    .send(ReliableRelayRemoteFrame { instance, frame })
-                    .await
-                    .is_err()
-                    || done
-                {
-                    return;
-                }
-            }
-            if product_terminal_received {
-                return;
-            }
-            let _ = frames_tx
-                .send(ReliableRelayRemoteFrame {
-                    instance,
-                    frame: Err(RuntimeError::ReliablePathSessionClosed),
-                })
-                .await;
-        });
+        let input_forwarder = ReliableRelayInputForwarder(tokio::spawn(
+            forward_reliable_relay_attachment_frames(instance, frames, frames_tx, terminal),
+        ));
         let mut path = ReliableRelayRemotePath {
             path_index,
             path_instance_id,
@@ -622,6 +752,7 @@ impl ReliableRelayRemoteSet {
             path_proof_generation: 0,
             published_max_data_offset: advertised_recv_max_offset,
             stream_ack_publication: StreamAckPublicationCursor::default(),
+            input_forwarder,
             stream,
         };
         if let Ok(Some(proof_id)) = path.stream.enqueue_path_proof() {
@@ -691,6 +822,7 @@ impl ReliableRelayRemoteSet {
         // The set stops owning every path as one atomic scheduling event even
         // when the first carrier queue makes detach asynchronous.
         for path in &mut paths {
+            path.stop_input_forwarder();
             path.depublish_load();
         }
         paths
@@ -740,6 +872,7 @@ impl ReliableRelayRemoteSet {
         position: usize,
     ) -> Option<ReliableRelayRemotePath> {
         let path = self.paths.remove(position);
+        path.stop_input_forwarder();
         self.membership_generation = self.membership_generation.wrapping_add(1);
         Some(path)
     }

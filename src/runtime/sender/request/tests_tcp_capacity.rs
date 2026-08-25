@@ -57,6 +57,8 @@ impl TcpCapacityFixture {
             .find(|path| path.key().underlay == UnderlayProtocol::Tcp)
             .expect("TCP candidate attachment")
             .instance();
+        context.install_relay_path_instance_for_test(reference);
+        context.install_relay_path_instance_for_test(candidate);
         Self {
             stream_id,
             context,
@@ -174,7 +176,7 @@ async fn tcp_measurement_bounds_existing_carrier_flight_and_does_not_restart() {
     }
     let candidate_snapshot = fixture
         .context
-        .reliable_path_snapshot(fixture.candidate.key)
+        .reliable_path_snapshot_for_instance(fixture.candidate)
         .expect("candidate snapshot");
     let eligible = fixture
         .context

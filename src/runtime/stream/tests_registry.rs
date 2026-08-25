@@ -2,16 +2,18 @@ use super::*;
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS};
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, PathMetricDirection, PathUsage, StreamDemandHint};
+use crate::protocol::{CloseReason, OffsetRange, PathMetricDirection, PathUsage, StreamDemandHint};
 use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::{
-    PathProofObservation, ServerLocalPathProperties, ServerStreamPathAttachment,
+    PathProofObservation, ServerCarrierPeer, ServerLocalPathProperties, ServerStreamPathAttachment,
+    ServerTargetAdmission,
 };
 use std::net::SocketAddr;
-use std::sync::Barrier;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 fn constrained_registry(
@@ -67,6 +69,404 @@ fn native_quic_test_metrics(path_id: PathId) -> PathMetrics {
         data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         data_sample_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
     }
+}
+
+#[test]
+fn accepted_stream_keeps_its_authenticated_opening_carrier_across_reattachment() {
+    let registry = constrained_registry(2, 2);
+    let port = registry.path_port();
+    let session_id = SessionId(588);
+    let stream_id = StreamId(1);
+    let opening_peer = SocketAddr::from(([203, 0, 113, 7], 51_000));
+    let later_peer = SocketAddr::from(([198, 51, 100, 9], 52_000));
+    let opening = port
+        .register_carrier_path_with_observed_peer(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+            ServerCarrierPeer::fixed(opening_peer),
+            Some(Arc::from("opening-tcp")),
+        )
+        .expect("opening carrier");
+    let later = port
+        .register_carrier_path_with_observed_peer(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+            ServerCarrierPeer::fixed(later_peer),
+            Some(Arc::from("later-quic")),
+        )
+        .expect("later carrier");
+    let (opening_commands, _opening_receivers) = reliable_path_command_channels(8);
+    let accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            initial_demand: StreamDemandHint::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: opening,
+                commands: opening_commands,
+                max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("open stream")
+    {
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
+        _ => panic!("expected new response stream"),
+    };
+    let (later_commands, _later_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                initial_demand: StreamDemandHint::Latency,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: later,
+                    commands: later_commands,
+                    max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                },
+                mux_limits: MuxLimits::default(),
+            })
+            .expect("attach later carrier"),
+        ServerReliableStreamOpen::Existing(_)
+    ));
+
+    let ingress = accepted.ingress().expect("opening ingress snapshot");
+    assert_eq!(ingress.peer(), opening_peer);
+    assert_eq!(ingress.underlay(), UnderlayProtocol::Tcp);
+    assert_eq!(ingress.configured_path(), Some("opening-tcp"));
+}
+
+#[test]
+fn detached_ingress_observer_snapshots_migration_without_retaining_carrier_registration() {
+    let registry = constrained_registry(1, 1);
+    let port = registry.path_port();
+    let session_id = SessionId(589);
+    let first_peer = SocketAddr::from(([203, 0, 113, 8], 51_001));
+    let migrated_peer = SocketAddr::from(([198, 51, 100, 10], 52_001));
+    let current_peer = Arc::new(Mutex::new(first_peer));
+    let observed_peer = current_peer.clone();
+    let registration = port
+        .register_carrier_path_with_observed_peer(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+            ServerCarrierPeer::observed(move || *observed_peer.lock().expect("observed peer lock")),
+            Some(Arc::from("mobile-quic")),
+        )
+        .expect("QUIC carrier");
+    let observer = registration
+        .mpp_ingress_observer()
+        .expect("ingress observer");
+    let opened_before_migration = observer.snapshot();
+    drop(registration);
+    assert!(
+        port.management_snapshot().paths.is_empty(),
+        "the observational authority must not retain carrier registration"
+    );
+    *current_peer.lock().expect("current peer lock") = migrated_peer;
+    let opened_after_migration = observer.snapshot();
+
+    assert_eq!(opened_before_migration.peer(), first_peer);
+    assert_eq!(opened_after_migration.peer(), migrated_peer);
+    assert_eq!(opened_before_migration.peer(), first_peer);
+}
+
+#[tokio::test]
+async fn one_opening_peer_snapshot_drives_preflight_and_accepted_flow_identity() {
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
+    let registry = Arc::new(ServerReliableStreamRegistry::with_accept_sender(
+        2,
+        2,
+        accepted_tx,
+        MuxLimits::default(),
+    ));
+    let first_peer = SocketAddr::from(([203, 0, 113, 10], 51_002));
+    let migrated_peer = SocketAddr::from(([198, 51, 100, 11], 52_002));
+    let observer_reads = Arc::new(AtomicUsize::new(0));
+    let reads = observer_reads.clone();
+    let admitted_peer = Arc::new(Mutex::new(None));
+    let routed_peer = admitted_peer.clone();
+    let port =
+        registry
+            .path_port()
+            .with_target_admission(Arc::new(move |_permit, ingress, _target| {
+                *routed_peer.lock().expect("admitted peer lock") = Some(ingress.peer());
+                Ok(ServerTargetAdmission::Allow)
+            }));
+    let registration = port
+        .register_carrier_path_with_observed_peer(
+            SessionId(591),
+            UnderlayProtocol::Udp,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+            ServerCarrierPeer::observed(move || {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_peer
+                } else {
+                    migrated_peer
+                }
+            }),
+            Some(Arc::from("migrating-quic")),
+        )
+        .expect("migrating QUIC carrier");
+    let (commands, _receivers) = reliable_path_command_channels(8);
+
+    assert!(matches!(
+        port.open_or_attach(ServerStreamOpenRequest {
+            session_id: SessionId(591),
+            stream_id: StreamId(1),
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            initial_demand: StreamDemandHint::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration,
+                commands,
+                max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .await
+        .expect("open through target preflight"),
+        ServerStreamOpenOutcome::New(_)
+    ));
+    let accepted = accepted_rx.try_recv().expect("accepted reliable stream");
+    assert_eq!(
+        *admitted_peer.lock().expect("admitted peer lock"),
+        Some(first_peer)
+    );
+    assert_eq!(
+        accepted.ingress().expect("accepted opening ingress").peer(),
+        first_peer
+    );
+    assert_eq!(observer_reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn carrier_activation_and_retirement_scan_form_one_atomic_owner_transition() {
+    let registry = constrained_registry(4, 4);
+    let port = registry.path_port();
+    let session_id = SessionId(590);
+    let initial = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let retirement = port
+        .session_retirement(session_id)
+        .expect("subscribe active session retirement");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let hook_entered = entered.clone();
+    let hook_release = release.clone();
+    registry.set_carrier_activation_after_session_attach_hook(Some(Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    })));
+
+    let late_port = port.clone();
+    let late = std::thread::spawn(move || {
+        late_port.register_carrier_path(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+    });
+    entered.wait();
+    let retiring_registry = registry.clone();
+    let retiring = std::thread::spawn(move || {
+        retiring_registry.retire_session(session_id, CloseReason::PolicyRejected);
+    });
+    while !retirement.is_retired() {
+        std::thread::yield_now();
+    }
+    release.wait();
+    let late = late.join().expect("late carrier activation thread");
+    retiring.join().expect("session retirement thread");
+    registry.set_carrier_activation_after_session_attach_hook(None);
+
+    assert!(matches!(
+        late,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    assert!(
+        port.management_snapshot()
+            .paths
+            .iter()
+            .all(|path| path.session_id != session_id),
+        "no carrier whose activation overlaps the fence may survive the owner scan",
+    );
+    drop(initial);
+}
+
+#[test]
+fn repeated_session_retirement_resweeps_an_exact_late_path_instance() {
+    let registry = constrained_registry(4, 4);
+    let port = registry.path_port();
+    let session_id = SessionId(591);
+    let initial = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let consumed_late_reference = registry
+        .register_realtime_flow(session_id)
+        .expect("reserve the tracker reference represented by the late owner");
+    registry.retire_session(session_id, CloseReason::Normal);
+    assert!(port.management_snapshot().paths.is_empty());
+
+    let identity = ServerCarrierPathIdentity {
+        session_id,
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+        path_instance_id: crate::model::path::next_carrier_path_instance_id(),
+    };
+    let (retirement_completion, mut retired) = watch::channel(false);
+    {
+        let mut paths = registry
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        paths
+            .logical_instances
+            .insert(server_logical_path_key(identity), identity.path_instance_id);
+        paths.session_path_counts.insert(session_id, 1);
+        paths.instances.insert(
+            server_physical_path_key(identity),
+            ServerRegisteredPath {
+                local: ServerLocalPathProperties::default(),
+                state: PeerPathState::Active,
+                path_proof: None,
+                retirement_started: false,
+                retirement_completion,
+            },
+        );
+    }
+
+    assert_eq!(
+        registry.retire_session(session_id, CloseReason::PolicyRejected),
+        CloseReason::Normal,
+        "repeat sweeps preserve the first terminal reason",
+    );
+
+    assert!(*retired.borrow_and_update());
+    assert!(port.management_snapshot().paths.is_empty());
+    assert_eq!(registry.session_tracker.reference_count(session_id), 0);
+    // The repeated exact scan consumed the tracker reference represented by
+    // this synthetic late owner, just as dropping a real registration would.
+    std::mem::forget(consumed_late_reference);
+    drop(initial);
+}
+
+#[tokio::test]
+async fn terminal_session_fence_rejects_existing_stream_reattach_after_carrier_scan() {
+    let registry = constrained_registry(4, 3);
+    let port = registry.path_port();
+    let session_id = SessionId(599);
+    let stream_id = StreamId(1);
+    let first = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let live_sibling = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(1),
+        ServerLocalPathProperties::default(),
+    );
+    let late_sibling = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(2),
+        ServerLocalPathProperties::default(),
+    );
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let mux_limits = MuxLimits::default();
+    let (first_commands, _first_receivers) = reliable_path_command_channels(8);
+    let accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            initial_demand: StreamDemandHint::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first,
+                commands: first_commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open initial response stream")
+    {
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
+        _ => panic!("expected new response stream"),
+    };
+
+    let (live_commands, _live_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: target.clone(),
+                initial_demand: StreamDemandHint::Latency,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: live_sibling,
+                    commands: live_commands,
+                    max_frame_payload_bytes: mux_limits.max_payload_bytes,
+                },
+                mux_limits,
+            })
+            .expect("live session accepts an existing-stream sibling attachment"),
+        ServerReliableStreamOpen::Existing(_)
+    ));
+
+    registry.retire_session(session_id, CloseReason::Normal);
+    assert!(
+        !port
+            .management_snapshot()
+            .paths
+            .iter()
+            .any(|path| { path.path_instance_id == late_sibling.path_instance_id() }),
+        "the sibling carrier scan must finish before the late attach attempt",
+    );
+
+    let (late_commands, _late_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target,
+                initial_demand: StreamDemandHint::Latency,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: late_sibling,
+                    commands: late_commands,
+                    max_frame_payload_bytes: mux_limits.max_payload_bytes,
+                },
+                mux_limits,
+            })
+            .expect("terminal reattach is rejected without mutating the stream"),
+        ServerReliableStreamOpen::Rejected
+    ));
+
+    accepted.close().await;
 }
 
 #[test]

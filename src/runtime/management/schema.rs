@@ -310,10 +310,10 @@ pub(super) struct ManagementFlowStatus {
     pub(super) flow_kind: &'static str,
     pub(super) flow_id: String,
     pub(super) network: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) inbound_kind: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) inbound: Option<String>,
+    pub(super) inbound_kind: &'static str,
+    pub(super) inbound: String,
+    pub(super) source_kind: &'static str,
+    pub(super) source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) outbound: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,6 +363,10 @@ pub(super) struct ManagementPeerStatusResult {
 pub(super) struct ManagementPeerPathStatus {
     pub(super) state: &'static str,
     pub(super) usage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) endpoint: Option<String>,
     pub(super) path_id: String,
     pub(super) underlay: &'static str,
     pub(super) direction: &'static str,

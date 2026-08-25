@@ -19,14 +19,20 @@ use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader};
 use super::metrics::TcpMetricPublisher;
 use crate::protocol::{Frame, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ServerLocalPathProperties;
 use crate::runtime::path::commands::{
     reliable_path_command_channels, reliable_path_command_queue, reliable_path_writer_frame_queue,
 };
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
+use crate::runtime::path::{
+    ServerCarrierPeer, ServerLocalPathProperties, fence_server_carrier_readiness,
+};
 use crate::transport::encrypted::{EncryptedFramedStream, ServerEncryptedStreamAdmission};
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
+
+fn tcp_carrier_peer(stream: &TcpStream) -> Result<ServerCarrierPeer, std::io::Error> {
+    stream.peer_addr().map(ServerCarrierPeer::fixed)
+}
 
 #[cfg(test)]
 pub(in crate::runtime) async fn handle_server_path(
@@ -55,6 +61,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
             "TCP listener received non-TCP local path configuration",
         ));
     }
+    let peer = tcp_carrier_peer(&stream)?;
     let mut tcp_metrics = TcpMetricPublisher::capture(&stream);
     let tls = &context.tls;
     let authentication_deadline =
@@ -132,35 +139,46 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         policy: local_path.policy(),
         initial_metrics: Some(local_metrics),
     };
-    let path_registration = context.reliable_streams.register_carrier_path(
-        session_id,
-        UnderlayProtocol::Tcp,
-        path_id,
-        local_properties,
-        path_join.principal_permit,
-    )?;
-    context
+    let path_registration = context
         .reliable_streams
-        .record_peer_path_usage(&path_registration, 0, peer_usage);
-    context
-        .reliable_streams
-        .record_local_path_metrics(&path_registration, local_metrics, false);
+        .register_carrier_path_with_observed_peer(
+            session_id,
+            UnderlayProtocol::Tcp,
+            path_id,
+            local_properties,
+            path_join.principal_permit,
+            peer,
+            context.configured_path_name(local_path.config_ordinal()),
+        )?;
     let local_usage = local_path.advertised_usage();
-    framed
-        .write_frames(&[
-            Frame::SessionReady,
-            Frame::PathStatus {
-                path_id,
-                sequence: 0,
-                usage: local_usage,
-            },
-        ])
-        .await?;
-    if let Err(err) = framed.flush().await {
-        if encrypted_framed_peer_closed(&err) {
-            return Ok(());
+    let ready = fence_server_carrier_readiness(path_registration.session_retirement(), async {
+        context
+            .reliable_streams
+            .record_peer_path_usage(&path_registration, 0, peer_usage);
+        context.reliable_streams.record_local_path_metrics(
+            &path_registration,
+            local_metrics,
+            false,
+        );
+        framed
+            .write_frames(&[
+                Frame::SessionReady,
+                Frame::PathStatus {
+                    path_id,
+                    sequence: 0,
+                    usage: local_usage,
+                },
+            ])
+            .await?;
+        match framed.flush().await {
+            Ok(()) => Ok(true),
+            Err(err) if encrypted_framed_peer_closed(&err) => Ok(false),
+            Err(err) => Err(RuntimeError::Encrypted(err)),
         }
-        return Err(RuntimeError::Encrypted(err));
+    })
+    .await?;
+    if !ready {
+        return Ok(());
     }
     if let Some(metrics) = tcp_metrics.as_mut() {
         metrics.begin_epoch();
@@ -171,8 +189,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(context.mux_limits));
     let evidence =
         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);
-    let peer_status =
-        context.register_peer_status(session_id, path_registration.principal_permit().principal());
+    let peer_status = context.register_peer_status(&path_registration);
     let (commands_tx, commands_rx) =
         reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
     ServerTcpPathSession::new(ServerTcpPathAdmission {

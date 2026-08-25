@@ -54,8 +54,9 @@ protocol = "direct"
 # protocol = "socks5"
 # endpoint = "127.0.0.1:1080"
 # connect_timeout_ms = 10000
-# Canonical target domains are carried to the SOCKS5 proxy unless an
-# IP-dependent routing rule requires evidence from the selected DNS policy.
+# With `full-resolve` below, SOCKS5 receives an authorized literal IP. Use
+# `route-only` to retain the canonical hostname after local routing evidence,
+# or `as-is` to skip routing DNS entirely.
 
 # Plain HTTP CONNECT relays TCP. Use SOCKS5 when a proxy must relay
 # both TCP and UDP.
@@ -66,6 +67,7 @@ protocol = "direct"
 # connect_timeout_ms = 10000
 
 [routing]
+target_resolution = "full-resolve"
 
 # To permit a private/internal destination, add a narrow rule before the
 # default. `allow-restricted` is the explicit authorization; a plain `allow`
@@ -74,7 +76,8 @@ protocol = "direct"
 # name = "allow-home-network"
 # inbounds = ["mpp-listener"]
 # principal_ids = ["home"]
-# destination_cidrs = ["192.168.0.0/16", "fd00::/8"]
+# Replace the sample ULA /48 with the prefix assigned to your internal network.
+# destination_cidrs = ["192.168.0.0/16", "fd12:3456:789a::/48"]
 # decision = "allow-restricted"
 # outbound = "direct-egress"
 

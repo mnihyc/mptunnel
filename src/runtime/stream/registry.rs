@@ -31,7 +31,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::proof::PathProofObservation;
 use crate::runtime::path::{
     CarrierDeliveryRateSample, ServerCarrierPathIdentity, ServerCarrierPathRetirement,
-    ServerCarrierPathStatusSnapshot, ServerNewStreamPolicy, ServerPathValidation,
+    ServerCarrierPathStatusSnapshot, ServerMppIngress, ServerNewStreamPolicy, ServerPathValidation,
     ServerRealtimeFlowLease, ServerSessionManagementSnapshot, ServerStreamFrameRoute,
     ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
     ServerStreamPort, ServerStreamPortBackend,
@@ -69,6 +69,9 @@ pub(in crate::runtime) struct ServerReliableStreamRegistry {
     registered_path_instances: Mutex<ServerCarrierPathRegistry>,
     closed_streams: Mutex<RecentIdCache<(SessionId, StreamId)>>,
     session_tracker: Arc<ServerSessionTracker>,
+    #[cfg(test)]
+    carrier_activation_after_session_attach_hook:
+        Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 impl std::fmt::Debug for ServerReliableStreamRegistry {
@@ -308,11 +311,19 @@ pub(in crate::runtime) struct AcceptedServerReliableStream {
     session_id: SessionId,
     principal_permit: PrincipalPermit,
     target: TargetAddr,
+    ingress: Option<crate::runtime::path::ServerMppIngress>,
     stream: Option<ReliablePathStream>,
     opening: AcceptedServerReliableStreamOpening,
     session_send_buffer: SessionSendBuffer,
     retirement: Arc<AcceptedServerReliableStreamRetirementInner>,
     supervised: bool,
+}
+
+struct AcceptedServerReliableStreamIdentity {
+    session_id: SessionId,
+    principal_permit: PrincipalPermit,
+    target: TargetAddr,
+    ingress: Option<ServerMppIngress>,
 }
 
 struct AcceptedServerReliableStreamOpening {
@@ -430,12 +441,22 @@ impl AcceptedServerReliableStream {
         self.session_id
     }
 
+    pub(in crate::runtime) fn session_retirement(
+        &self,
+    ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
+        self.retirement.registry.session_retirement(self.session_id)
+    }
+
     pub(in crate::runtime) fn target(&self) -> &TargetAddr {
         &self.target
     }
 
     pub(in crate::runtime) fn principal_permit(&self) -> &PrincipalPermit {
         &self.principal_permit
+    }
+
+    pub(in crate::runtime) fn ingress(&self) -> Option<&crate::runtime::path::ServerMppIngress> {
+        self.ingress.as_ref()
     }
 
     pub(in crate::runtime) fn stream(&self) -> &ReliablePathStream {
@@ -569,6 +590,7 @@ impl ServerReliableStreamRegistry {
     }
 
     /// Production constructor whose session buffer follows configured limits.
+    #[cfg(test)]
     pub(in crate::runtime) fn new_accepting_with_limits(
         limits: MuxLimits,
         max_paths_per_session: usize,
@@ -583,6 +605,27 @@ impl ServerReliableStreamRegistry {
                 max_paths_per_session,
                 accepted,
                 limits,
+            )),
+            receiver,
+        )
+    }
+
+    pub(in crate::runtime) fn new_accepting_with_limits_and_retention(
+        limits: MuxLimits,
+        max_paths_per_session: usize,
+        session_retention_timeout: std::time::Duration,
+    ) -> (
+        Arc<Self>,
+        mpsc::UnboundedReceiver<AcceptedServerReliableStream>,
+    ) {
+        let (accepted, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self::with_accept_sender_and_retention(
+                limits.max_streams,
+                max_paths_per_session,
+                accepted,
+                limits,
+                session_retention_timeout,
             )),
             receiver,
         )
@@ -632,11 +675,28 @@ impl ServerReliableStreamRegistry {
             .expect("register test carrier")
     }
 
+    #[cfg(test)]
     fn with_accept_sender(
         max_streams: usize,
         max_paths_per_session: usize,
         accepted: mpsc::UnboundedSender<AcceptedServerReliableStream>,
         limits: MuxLimits,
+    ) -> Self {
+        Self::with_accept_sender_and_retention(
+            max_streams,
+            max_paths_per_session,
+            accepted,
+            limits,
+            crate::config::DEFAULT_SESSION_RETENTION_TIMEOUT,
+        )
+    }
+
+    fn with_accept_sender_and_retention(
+        max_streams: usize,
+        max_paths_per_session: usize,
+        accepted: mpsc::UnboundedSender<AcceptedServerReliableStream>,
+        limits: MuxLimits,
+        session_retention_timeout: std::time::Duration,
     ) -> Self {
         Self {
             max_streams,
@@ -656,8 +716,25 @@ impl ServerReliableStreamRegistry {
             closed_streams: Mutex::new(RecentIdCache::new(reliable_closed_stream_cache_capacity(
                 max_streams,
             ))),
-            session_tracker: Arc::new(ServerSessionTracker::from_limits(limits, max_streams)),
+            session_tracker: Arc::new(ServerSessionTracker::from_limits_and_retention(
+                limits,
+                max_streams,
+                session_retention_timeout,
+            )),
+            #[cfg(test)]
+            carrier_activation_after_session_attach_hook: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn set_carrier_activation_after_session_attach_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        *self
+            .carrier_activation_after_session_attach_hook
+            .lock()
+            .expect("server carrier activation hook lock") = hook;
     }
 
     /// Hands an admitted stream to this registry's paired target-relay service.
@@ -820,25 +897,70 @@ impl ServerReliableStreamRegistry {
     pub(in crate::runtime) fn register_realtime_flow(
         &self,
         session_id: SessionId,
-    ) -> ServerSessionRegistration {
-        ServerSessionRegistration::new(self.session_tracker.clone(), session_id)
+    ) -> Result<ServerSessionRegistration, RuntimeError> {
+        ServerSessionRegistration::try_new(self.session_tracker.clone(), session_id)
+    }
+
+    pub(in crate::runtime) fn session_retirement(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
+        self.session_tracker.session_retirement(session_id)
+    }
+
+    pub(in crate::runtime) fn retire_session(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        reason: crate::protocol::CloseReason,
+    ) -> crate::protocol::CloseReason {
+        let _first_publication = self.session_tracker.retire_session(session_id, reason);
+        let reason = self
+            .session_tracker
+            .session_retirement(session_id)
+            .ok()
+            .and_then(|retirement| retirement.reason())
+            .unwrap_or(reason);
+        // Publication is first-writer-wins, but the owner sweep is deliberately
+        // repeatable. An activation that linearized before publication is
+        // either already visible here or still holds the owner lock below.
+        let identities = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock")
+            .instances
+            .keys()
+            .filter_map(
+                |(registered_session_id, underlay, path_id, path_instance_id)| {
+                    (*registered_session_id == session_id).then_some(ServerCarrierPathIdentity {
+                        session_id,
+                        underlay: *underlay,
+                        path_id: *path_id,
+                        path_instance_id: *path_instance_id,
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        for identity in identities {
+            let _ = self.retire_carrier_path(identity);
+        }
+        reason
     }
 
     fn accepted_stream(
         self: &Arc<Self>,
-        session_id: SessionId,
-        principal_permit: PrincipalPermit,
-        target: TargetAddr,
+        identity: AcceptedServerReliableStreamIdentity,
         stream: ReliablePathStream,
         opening: AcceptedServerReliableStreamOpening,
         session_send_buffer: SessionSendBuffer,
     ) -> AcceptedServerReliableStream {
+        let session_id = identity.session_id;
         let stream_id = stream.stream_id;
         let close_output = stream.output.clone();
         AcceptedServerReliableStream {
             session_id,
-            principal_permit,
-            target,
+            principal_permit: identity.principal_permit,
+            target: identity.target,
+            ingress: identity.ingress,
             stream: Some(stream),
             opening,
             session_send_buffer,
@@ -862,7 +984,7 @@ impl ServerReliableStreamRegistry {
         identity: ServerCarrierPathIdentity,
         local: crate::runtime::path::ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
         let ServerCarrierPathIdentity {
             session_id,
             underlay: _,
@@ -870,92 +992,90 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         } = identity;
         let logical_key = server_logical_path_key(identity);
-        {
-            let mut paths = self
-                .registered_path_instances
-                .lock()
-                .expect("server active path instance lock");
-            if paths.logical_instances.contains_key(&logical_key) {
-                return Err(RuntimeError::Protocol(
-                    "duplicate server logical carrier path",
-                ));
-            }
-            if paths.logical_instances.len() >= self.max_carrier_paths {
-                return Err(RuntimeError::Protocol(
-                    "server global carrier path limit reached",
-                ));
-            }
-            let session_path_count = paths
-                .session_path_counts
-                .get(&session_id)
-                .copied()
-                .unwrap_or(0);
-            if session_path_count >= self.max_paths_per_session {
-                return Err(RuntimeError::Protocol(
-                    "server session carrier path limit reached",
-                ));
-            }
-            paths
-                .logical_instances
-                .insert(logical_key, path_instance_id);
-            paths
-                .session_path_counts
-                .insert(session_id, session_path_count + 1);
-        }
-
-        if let Err(error) = self
-            .session_tracker
-            .attach_authenticated_session(session_id, &principal_permit)
-        {
-            self.rollback_carrier_path_reservation(identity);
-            return Err(error);
-        }
-
-        let (retirement_completion, _) = watch::channel(false);
-        let inserted = {
-            let mut paths = self
-                .registered_path_instances
-                .lock()
-                .expect("server active path instance lock");
-            if paths.logical_instances.get(&logical_key) != Some(&path_instance_id) {
-                false
-            } else {
-                paths
-                    .instances
-                    .insert(
-                        server_physical_path_key(identity),
-                        ServerRegisteredPath {
-                            local,
-                            state: PeerPathState::Active,
-                            path_proof: None,
-                            retirement_started: false,
-                            retirement_completion,
-                        },
-                    )
-                    .is_none()
-            }
-        };
-        if !inserted {
-            self.rollback_carrier_path_reservation(identity);
-            self.session_tracker.detach_session(session_id);
-            return Err(RuntimeError::Protocol(
-                "server carrier path reservation lost",
-            ));
-        }
-        Ok(())
-    }
-
-    fn rollback_carrier_path_reservation(&self, identity: ServerCarrierPathIdentity) {
-        let logical_key = server_logical_path_key(identity);
         let mut paths = self
             .registered_path_instances
             .lock()
             .expect("server active path instance lock");
-        if paths.logical_instances.get(&logical_key) != Some(&identity.path_instance_id) {
-            return;
+        if paths.logical_instances.contains_key(&logical_key) {
+            return Err(RuntimeError::Protocol(
+                "duplicate server logical carrier path",
+            ));
         }
-        paths.logical_instances.remove(&logical_key);
-        decrement_session_path_count(&mut paths.session_path_counts, identity.session_id);
+        if paths.logical_instances.len() >= self.max_carrier_paths {
+            return Err(RuntimeError::Protocol(
+                "server global carrier path limit reached",
+            ));
+        }
+        let session_path_count = paths
+            .session_path_counts
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        if session_path_count >= self.max_paths_per_session {
+            return Err(RuntimeError::Protocol(
+                "server session carrier path limit reached",
+            ));
+        }
+        // The path-owner lock spans tracker attachment and physical
+        // publication. Retirement publishes under the tracker lock and then
+        // takes this lock to scan, so exactly one transition linearizes first:
+        // a retired attach is rejected, or a successful attach is visible to
+        // that scan. Neither lock is held by tracker callbacks.
+        let (_, session_retirement) = self
+            .session_tracker
+            .attach_authenticated_session(session_id, &principal_permit)?;
+
+        #[cfg(test)]
+        if let Some(hook) = self
+            .carrier_activation_after_session_attach_hook
+            .lock()
+            .expect("server carrier activation hook lock")
+            .clone()
+        {
+            hook();
+        }
+
+        // Publication can race the short interval after tracker attachment.
+        // Abort before publishing either logical or physical ownership; if it
+        // races after this read, retirement is waiting on `paths` and its scan
+        // necessarily observes the instance inserted below.
+        if let Some(reason) = session_retirement.reason() {
+            drop(paths);
+            self.session_tracker.detach_session(session_id);
+            return Err(RuntimeError::RemoteClosed(reason));
+        }
+
+        let (retirement_completion, _) = watch::channel(false);
+        paths
+            .logical_instances
+            .insert(logical_key, path_instance_id);
+        paths
+            .session_path_counts
+            .insert(session_id, session_path_count + 1);
+        if paths
+            .instances
+            .insert(
+                server_physical_path_key(identity),
+                ServerRegisteredPath {
+                    local,
+                    state: PeerPathState::Active,
+                    path_proof: None,
+                    retirement_started: false,
+                    retirement_completion,
+                },
+            )
+            .is_some()
+        {
+            paths.logical_instances.remove(&logical_key);
+            decrement_session_path_count(&mut paths.session_path_counts, session_id);
+            drop(paths);
+            self.session_tracker.detach_session(session_id);
+            return Err(RuntimeError::Protocol(
+                "duplicate server physical carrier path",
+            ));
+        }
+        drop(paths);
+        Ok(session_retirement)
     }
 
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState) {
@@ -1139,9 +1259,19 @@ impl ServerReliableStreamRegistry {
         removed.retirement_completion.send_replace(true);
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn open_or_attach(
         self: &Arc<Self>,
         request: ServerStreamOpenRequest,
+    ) -> Result<ServerReliableStreamOpen, RuntimeError> {
+        let opening_ingress = request.attachment.path_registration.mpp_ingress();
+        self.open_or_attach_with_ingress(request, opening_ingress)
+    }
+
+    fn open_or_attach_with_ingress(
+        self: &Arc<Self>,
+        request: ServerStreamOpenRequest,
+        opening_ingress: Option<ServerMppIngress>,
     ) -> Result<ServerReliableStreamOpen, RuntimeError> {
         let ServerStreamOpenRequest {
             session_id,
@@ -1191,17 +1321,28 @@ impl ServerReliableStreamRegistry {
                 );
                 return Ok(ServerReliableStreamOpen::Rejected);
             }
-            let attach_outcome = entry.binding.attach_output(ResponseOutputAttachment {
-                key: CarrierPathKey { underlay, path_id },
-                path_instance_id,
-                local_policy,
-                commands,
-                state: ResponseOutputAttachmentState {
-                    metrics: initial_metrics,
-                    peer_usage: initial_usage.map(|usage| (usage.sequence, usage.usage)),
-                    path_proof: initial_path_proof,
-                },
-            });
+            let attach_outcome =
+                match entry
+                    .binding
+                    .attach_output_if_session_active(ResponseOutputAttachment {
+                        key: CarrierPathKey { underlay, path_id },
+                        path_instance_id,
+                        local_policy,
+                        commands,
+                        state: ResponseOutputAttachmentState {
+                            metrics: initial_metrics,
+                            peer_usage: initial_usage.map(|usage| (usage.sequence, usage.usage)),
+                            path_proof: initial_path_proof,
+                        },
+                    }) {
+                    Ok(outcome) => outcome,
+                    Err(
+                        RuntimeError::RemoteClosed(_) | RuntimeError::ReliablePathSessionClosed,
+                    ) => {
+                        return Ok(ServerReliableStreamOpen::Rejected);
+                    }
+                    Err(error) => return Err(error),
+                };
             let response_lane = entry.binding.lane();
             if matches!(
                 attach_outcome,
@@ -1294,7 +1435,7 @@ impl ServerReliableStreamRegistry {
             self.session_tracker.clone(),
             path_instance_id,
             local_policy,
-        );
+        )?;
         let session_send_buffer = binding.session_send_buffer();
         if let Some(metrics) = initial_metrics {
             binding.install_stored_path_metrics_for_instance(
@@ -1350,9 +1491,12 @@ impl ServerReliableStreamRegistry {
         };
         Ok(ServerReliableStreamOpen::New(
             Box::new(self.accepted_stream(
-                session_id,
-                path_registration.principal_permit().clone(),
-                target,
+                AcceptedServerReliableStreamIdentity {
+                    session_id,
+                    principal_permit: path_registration.principal_permit().clone(),
+                    target,
+                    ingress: opening_ingress,
+                },
                 stream,
                 AcceptedServerReliableStreamOpening {
                     path_validation: opening_path_validation,
@@ -1471,10 +1615,11 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         } = identity;
         let instance_key = (session_id, underlay, path_id, path_instance_id);
-        if !self
+        let registered_path_instances = self
             .registered_path_instances
             .lock()
-            .expect("server active path instance lock")
+            .expect("server active path instance lock");
+        if !registered_path_instances
             .instances
             .contains_key(&instance_key)
         {
@@ -1492,6 +1637,7 @@ impl ServerReliableStreamRegistry {
                 true
             }
         };
+        drop(registered_path_instances);
         if !changed {
             return;
         }
@@ -1863,7 +2009,7 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         identity: ServerCarrierPathIdentity,
         local: crate::runtime::path::ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
         self.registry
             .activate_carrier_path(identity, local, principal_permit)
     }
@@ -1875,23 +2021,44 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         self.registry.retire_carrier_path(identity)
     }
 
+    fn session_retirement(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
+        self.registry.session_retirement(session_id)
+    }
+
+    fn retire_session(
+        &self,
+        session_id: SessionId,
+        reason: crate::protocol::CloseReason,
+    ) -> crate::protocol::CloseReason {
+        self.registry.retire_session(session_id, reason)
+    }
+
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState) {
         self.registry.set_carrier_path_state(identity, state);
     }
 
-    fn register_realtime_flow(&self, session_id: SessionId) -> ServerRealtimeFlowLease {
-        ServerRealtimeFlowLease::hold(self.registry.register_realtime_flow(session_id))
+    fn register_realtime_flow(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ServerRealtimeFlowLease, RuntimeError> {
+        let registration = self.registry.register_realtime_flow(session_id)?;
+        let retirement = registration.retirement();
+        Ok(ServerRealtimeFlowLease::hold(registration, retirement))
     }
 
     fn open_or_attach<'a>(
         &'a self,
         request: ServerStreamOpenRequest,
         new_stream_policy: ServerNewStreamPolicy,
+        opening_ingress: Option<ServerMppIngress>,
     ) -> Pin<Box<dyn Future<Output = Result<ServerStreamOpenOutcome, RuntimeError>> + Send + 'a>>
     {
         let registry = self.registry.clone();
         Box::pin(async move {
-            match registry.open_or_attach(request)? {
+            match registry.open_or_attach_with_ingress(request, opening_ingress)? {
                 ServerReliableStreamOpen::New(accepted, response_lane) => {
                     let accepted = *accepted;
                     match new_stream_policy {

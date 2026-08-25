@@ -244,7 +244,8 @@ impl RequestTcpCapacityController {
         let Some((reference, reference_model)) = reference else {
             return;
         };
-        let Some(reference_snapshot) = context.reliable_path_snapshot(reference.key) else {
+        let Some(reference_snapshot) = context.reliable_path_snapshot_for_instance(reference)
+        else {
             return;
         };
         if reference_snapshot.active_latency_sensitive_flows > 0
@@ -270,7 +271,7 @@ impl RequestTcpCapacityController {
             .iter()
             .filter(|path| {
                 let instance = path.instance();
-                let snapshot = context.reliable_path_snapshot(instance.key);
+                let snapshot = context.reliable_path_snapshot_for_instance(instance);
                 instance.key != reference.key
                     && instance.key.underlay == UnderlayProtocol::Tcp
                     && context.relay_path_allows_automatic_bulk_use(instance.key)
@@ -286,17 +287,15 @@ impl RequestTcpCapacityController {
                             path.attached_at,
                         )
                     })
-                    && !context.relay_path_has_bulk_model_evidence(
-                        instance.key.underlay,
-                        instance.key.index,
-                    )
+                    && !context.relay_path_instance_has_bulk_model_evidence(instance)
                     && snapshot.is_some_and(request_tcp_capacity_candidate_can_start_receipt)
                     && path
                         .stream
                         .can_enqueue_work_lane_now(ReliableWorkClass::Data, lane)
             })
             .filter_map(|path| {
-                let candidate_snapshot = context.reliable_path_snapshot(path.key())?;
+                let candidate_snapshot =
+                    context.reliable_path_snapshot_for_instance(path.instance())?;
                 let campaign_remaining_bytes =
                     self.campaign.remaining_bytes(stable_candidate_share);
                 let train_envelope_bytes = session_remaining_bytes

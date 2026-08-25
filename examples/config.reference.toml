@@ -34,10 +34,11 @@ format = "text"         # text or newline-delimited json
 console = true          # standard error
 # file = "logs/mptunnel.log"
 flow_events = false     # opt-in destination-bearing flow open/close records
-# `debug` adds a concise, correlated trace for each routed L4 connection or UDP
-# association: inbound acceptance/establishment, route selection, optional
-# balancer choice, and each configured outbound attempt. It does not
-# log packets, DNS/probe work, or physical MPP carrier internals.
+# `debug` adds a correlated trace for each routed L4 connection or UDP
+# association. Every stage repeats immutable inbound/principal/request context;
+# MPP ingress adds the typed opening carrier peer and session/path identity.
+# Routing, optional balancing, and outbound attempts add their own outcomes.
+# It does not log packets, credentials, secrets, or internal DNS/probe work.
 
 # Every secret, password, certificate, and key uses one byte-material source.
 # A source is resolved once when the configuration is loaded. No
@@ -570,12 +571,14 @@ auth_freshness_window_seconds = 300
 #   route-only  - resolve only for an IP-dependent routing decision, then keep
 #                 the original hostname for a domain-capable outbound
 #   full-resolve - resolve every hostname and pass authorized literal IPs
-# Omission retains the historical demand-driven compatibility behavior.
+# Omission retains the historical demand-driven compatibility behavior for
+# existing configurations. This runnable common-client profile explicitly
+# delegates application-target DNS to the MPP server.
 # Resolution mode never changes literal-IP authorization. Private literals
 # require a narrow allow-restricted rule independently on each node that
 # handles them; as-is hostnames bypass CIDR matching only because no local DNS
 # answer exists to match.
-# target_resolution = "route-only"
+target_resolution = "as-is"
 
 # Routing is one ordered, first-match table shared by every L4 local and MPP
 # inbound. A normal rule selects exactly one `outbound` or `balancer`; its
@@ -640,10 +643,12 @@ auth_freshness_window_seconds = 300
 # initial_demand = "throughput" # automatic (default) or throughput
 # explanation = "route signed domain and network policy through the edge"
 
-# A route-selected DNS policy must be known before resolution, so it belongs on
-# a domain/source/inbound/principal rule rather than one selected by a
-# destination CIDR or CIDR-bearing signed set. Such a rule must omit `stages` or
-# include `pre-resolution`; `stages = ["post-resolution"]` is invalid.
+# Under `route-only` or `full-resolve`, a route-selected DNS policy must be
+# known before resolution, so it belongs on a domain/source/inbound/principal
+# rule rather than one selected by a destination CIDR or CIDR-bearing signed
+# set. Such a rule must omit `stages` or include `pre-resolution`;
+# `stages = ["post-resolution"]` is invalid. The active `as-is` mode deliberately
+# ignores route DNS selection, so change the mode before enabling this example.
 # [[routing.rules]]
 # name = "secure-domain-resolution"
 # domain_suffix = ["corp.example"]
@@ -665,15 +670,17 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # When MPTUNNEL has or resolves a literal address, ordinary allow does not
 # authorize loopback, private, link-local, metadata, multicast, or unspecified
 # destinations. A domain delegated unchanged to a domain-capable outbound is
-# resolved at that next hop. Select `dns_policy` on the route or use an
-# IP-dependent/post-resolution rule when this node must enforce the resulting
-# address. Authorize an internal destination only with a narrow rule placed
-# before a broader one.
+# resolved at that next hop. Under the active `as-is` mode, neither a route
+# `dns_policy` nor an IP-dependent rule triggers routing DNS. Change to
+# `route-only` for address-based routing evidence or `full-resolve` to pass an
+# authorized literal to the outbound. Authorize an internal destination only
+# with a narrow rule placed before a broader one.
 # [[routing.rules]]
 # name = "allow-home-service"
 # inbounds = ["mpp-listener"]
 # principal_ids = ["home"]
-# destination_cidrs = ["192.168.1.0/24", "fd00::/8"]
+# Replace the sample ULA /48 with the prefix assigned to your internal network.
+# destination_cidrs = ["192.168.1.0/24", "fd12:3456:789a::/48"]
 # destination_ports = [443]
 # networks = ["tcp"]
 # decision = "allow-restricted"
@@ -813,10 +820,9 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # UTF-8 bytes with no colon or ASCII control characters.
 #
 # Relay through SOCKS5. TCP CONNECT and UDP ASSOCIATE are supported when the
-# proxy implements them. A canonical domain is normally carried to the proxy
-# for next-hop resolution. Routing that needs IP evidence first resolves
-# through the selected DNS policy and carries the
-# authorized literal instead.
+# proxy implements them. `as-is` and `route-only` carry the canonical domain
+# to the proxy for next-hop resolution; `route-only` may use a local answer
+# only as routing evidence. `full-resolve` carries an authorized literal.
 # [[outbounds]]
 # name = "socks5-egress"
 # protocol = "socks5"
@@ -828,8 +834,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # password = { from = "file", path = "proxy-password.key" }
 #
 # Plain HTTP CONNECT carries TCP targets and supports the same referenced
-# authentication table. It preserves a canonical domain unless routing
-# requires authorized IP evidence.
+# authentication table. Target representation follows the same
+# `target_resolution` rules as SOCKS5.
 # [[outbounds]]
 # name = "http-egress"
 # protocol = "http-connect"

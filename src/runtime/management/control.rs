@@ -5,7 +5,7 @@
 
 use super::ManagementTarget;
 use super::http::ManagementHttpError;
-use super::projection::peer_status_result;
+use super::projection::{PeerPathIdentitySource, peer_status_result};
 use crate::protocol::SessionId;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::path_record_failure_cooldown;
@@ -54,6 +54,7 @@ impl ManagementTarget {
             selected.service,
             selected.service_index,
             selected.service_name,
+            selected.identity_source,
         ))
         .map_err(|_| {
             ManagementHttpError::new(
@@ -236,19 +237,20 @@ fn parse_session_id(value: &str) -> Result<SessionId, ManagementHttpError> {
     })
 }
 
-struct PeerStatusSelection {
+struct PeerStatusSelection<'a> {
     broker: PeerStatusBroker,
     session_id: SessionId,
     service: &'static str,
     service_index: usize,
     service_name: Option<String>,
+    identity_source: PeerPathIdentitySource<'a>,
 }
 
-fn select_peer_status_broker(
-    target: &ManagementTarget,
+fn select_peer_status_broker<'a>(
+    target: &'a ManagementTarget,
     request: &PeerDiagnosticsRequest,
     requested_session: SessionId,
-) -> Result<PeerStatusSelection, ManagementHttpError> {
+) -> Result<PeerStatusSelection<'a>, ManagementHttpError> {
     if !matches!(request.service.as_str(), "mpp_outbound" | "mpp_inbound") {
         return Err(ManagementHttpError::new(
             400,
@@ -266,6 +268,7 @@ fn select_peer_status_broker(
                 .outbound
                 .as_ref()
                 .map(|outbound| outbound.as_str().to_string()),
+            PeerPathIdentitySource::Client(context),
             request,
             requested_session,
         ));
@@ -276,6 +279,7 @@ fn select_peer_status_broker(
             "mpp_inbound",
             index,
             Some(context.name.clone()),
+            PeerPathIdentitySource::Server(context),
             request,
             requested_session,
         ));
@@ -287,6 +291,7 @@ fn select_peer_status_broker(
             service: selected.service,
             service_index: selected.service_index,
             service_name: selected.service_name.clone(),
+            identity_source: selected.identity_source,
         }),
         [] => Err(ManagementHttpError::new(
             404,
@@ -301,14 +306,15 @@ fn select_peer_status_broker(
     }
 }
 
-fn peer_broker_candidates(
+fn peer_broker_candidates<'a>(
     broker: &PeerStatusBroker,
     service: &'static str,
     service_index: usize,
     service_name: Option<String>,
+    identity_source: PeerPathIdentitySource<'a>,
     request: &PeerDiagnosticsRequest,
     requested_session: SessionId,
-) -> Vec<PeerStatusSelection> {
+) -> Vec<PeerStatusSelection<'a>> {
     if request.service != service || service_name.as_deref() != Some(request.service_name.as_str())
     {
         return Vec::new();
@@ -323,6 +329,7 @@ fn peer_broker_candidates(
             service,
             service_index,
             service_name: service_name.clone(),
+            identity_source,
         })
         .collect()
 }

@@ -1,6 +1,6 @@
 [package]
 name = "mptunnel"
-version = "0.4.2"
+version = "0.4.3"
 authors = ["mnihyc"]
 edition = "2024"
 description = "Encrypted multipath proxy and tunnel"
@@ -81,6 +81,7 @@ toml_edit = "0.22.27"
 
 [dev-dependencies]
 rcgen = "0.14.8"
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
 quinn-proto = { path = "crates/quinn-proto" }

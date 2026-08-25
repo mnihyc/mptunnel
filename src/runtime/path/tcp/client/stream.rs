@@ -362,6 +362,7 @@ fn tcp_path_stream_error(reason: &RuntimeError) -> RuntimeError {
         RuntimeError::ReliablePathSessionClosed => RuntimeError::ReliablePathSessionClosed,
         RuntimeError::ReliablePathRetired => RuntimeError::ReliablePathRetired,
         RuntimeError::RemoteReset(reason) => RuntimeError::RemoteReset(*reason),
+        RuntimeError::RemotePathClosed(reason) => RuntimeError::RemotePathClosed(*reason),
         RuntimeError::RemoteClosed(reason) => RuntimeError::RemoteClosed(*reason),
         RuntimeError::Protocol(message) => RuntimeError::Protocol(message),
         _ => RuntimeError::ReliablePathSessionClosed,

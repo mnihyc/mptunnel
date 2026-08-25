@@ -9,8 +9,8 @@ use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_in
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{
-    Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId,
-    StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    CloseReason, Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus,
+    SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
@@ -18,6 +18,7 @@ use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -35,19 +36,103 @@ pub(in crate::runtime) struct CarrierDeliveryRateSample {
     pub(in crate::runtime) delivery_window_covered: bool,
 }
 
-/// Keeps response-lane accounting attached to one target-side datagram flow.
+/// Stable notification that the complete authenticated MPP session became
+/// terminal. Native carrier loss and exact-path drain never publish here.
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerSessionRetirement {
+    reason: watch::Receiver<Option<CloseReason>>,
+}
+
+impl ServerSessionRetirement {
+    pub(in crate::runtime) fn pending(reason: watch::Receiver<Option<CloseReason>>) -> Self {
+        Self { reason }
+    }
+
+    pub(in crate::runtime) fn reason(&self) -> Option<CloseReason> {
+        *self.reason.borrow()
+    }
+
+    pub(in crate::runtime) fn is_retired(&self) -> bool {
+        self.reason().is_some()
+    }
+
+    pub(in crate::runtime) async fn wait(mut self) -> CloseReason {
+        loop {
+            if let Some(reason) = *self.reason.borrow_and_update() {
+                return reason;
+            }
+            if self.reason.changed().await.is_err() {
+                std::future::pending::<CloseReason>().await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn active_for_test() -> Self {
+        Self::pending(watch::channel(None).1)
+    }
+}
+
+/// Runs the transport readiness publication under the same sticky terminal
+/// fence carried by the admitted path. A close already published for this
+/// SessionId always wins, even when the transport is immediately writable.
+pub(in crate::runtime) async fn fence_server_carrier_readiness<T>(
+    retirement: ServerSessionRetirement,
+    readiness: impl Future<Output = Result<T, RuntimeError>>,
+) -> Result<T, RuntimeError> {
+    let terminal = retirement.wait();
+    tokio::pin!(terminal);
+    tokio::pin!(readiness);
+    tokio::select! {
+        biased;
+        reason = &mut terminal => Err(RuntimeError::RemoteClosed(reason)),
+        result = &mut readiness => result,
+    }
+}
+
+impl std::fmt::Debug for ServerSessionRetirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerSessionRetirement")
+            .field("reason", &self.reason())
+            .finish()
+    }
+}
+
+/// Keeps one carrier-independent Product owner attached to the authenticated
+/// server session. Datagram workers and retained logical IP tunnels use this
+/// lease so carrier loss cannot discard principal or terminal-session state.
 pub(in crate::runtime) struct ServerRealtimeFlowLease {
     _guard: Box<dyn Send + Sync>,
+    retirement: ServerSessionRetirement,
 }
 
 impl ServerRealtimeFlowLease {
-    pub(in crate::runtime) fn hold<T>(guard: T) -> Self
+    pub(in crate::runtime) fn hold<T>(guard: T, retirement: ServerSessionRetirement) -> Self
     where
         T: Send + Sync + 'static,
     {
         Self {
             _guard: Box::new(guard),
+            retirement,
         }
+    }
+
+    pub(in crate::runtime) fn retirement(&self) -> ServerSessionRetirement {
+        self.retirement.clone()
+    }
+
+    pub(in crate::runtime) fn is_retired(&self) -> bool {
+        self.retirement.is_retired()
+    }
+}
+
+impl std::fmt::Debug for ServerRealtimeFlowLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerRealtimeFlowLease")
+            .field("retirement", &self.retirement)
+            .finish_non_exhaustive()
     }
 }
 
@@ -176,6 +261,8 @@ pub(in crate::runtime) struct AcceptedServerDatagramFlow {
     requests: mpsc::Sender<ServerDatagramWorkerMessage>,
     commands: ReliablePathCommandSender,
     route_lifetime: Arc<()>,
+    retired: Arc<AtomicBool>,
+    session_retirement: ServerSessionRetirement,
     _attachment: Box<dyn Send + Sync>,
 }
 
@@ -185,6 +272,8 @@ impl AcceptedServerDatagramFlow {
         requests: mpsc::Sender<ServerDatagramWorkerMessage>,
         commands: ReliablePathCommandSender,
         route_lifetime: Arc<()>,
+        retired: Arc<AtomicBool>,
+        session_retirement: ServerSessionRetirement,
         attachment: impl Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -192,6 +281,8 @@ impl AcceptedServerDatagramFlow {
             requests,
             commands,
             route_lifetime,
+            retired,
+            session_retirement,
             _attachment: Box::new(attachment),
         }
     }
@@ -204,6 +295,9 @@ impl AcceptedServerDatagramFlow {
         &self,
         request: ServerDatagramRequest,
     ) -> Result<ServerDatagramSendOutcome, RuntimeError> {
+        if self.retired.load(Ordering::Acquire) || self.session_retirement.is_retired() {
+            return Ok(ServerDatagramSendOutcome::Closed);
+        }
         let (admission, admitted) = oneshot::channel();
         match self
             .requests
@@ -223,6 +317,9 @@ impl AcceptedServerDatagramFlow {
     }
 
     pub(in crate::runtime) fn acknowledge_response(&self, received: Vec<OffsetRange>) {
+        if self.retired.load(Ordering::Acquire) || self.session_retirement.is_retired() {
+            return;
+        }
         let _ = self
             .requests
             .try_send(ServerDatagramWorkerMessage::ResponseFeedback { received });
@@ -287,6 +384,7 @@ pub(in crate::runtime) struct ServerDatagramOpenRequest {
     pub(in crate::runtime) flow_id: crate::protocol::DatagramFlowId,
     pub(in crate::runtime) target: TargetAddr,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
+    pub(in crate::runtime) ingress: ServerMppIngress,
 }
 
 type ServerDatagramPortFuture<'a> = Pin<
@@ -300,6 +398,8 @@ type ServerDatagramPortFuture<'a> = Pin<
 /// Target-side datagram service implemented above TCP and QUIC carriers.
 pub(in crate::runtime) trait ServerDatagramPortBackend: Send + Sync {
     fn open<'a>(&'a self, request: ServerDatagramOpenRequest) -> ServerDatagramPortFuture<'a>;
+
+    fn retire_session(&self, _session_id: SessionId) {}
 }
 
 #[derive(Clone)]
@@ -317,6 +417,10 @@ impl ServerDatagramPort {
         request: ServerDatagramOpenRequest,
     ) -> Result<AcceptedServerDatagramFlow, ServerDatagramOpenError> {
         self.backend.open(request).await
+    }
+
+    pub(in crate::runtime) fn retire_session(&self, session_id: SessionId) {
+        self.backend.retire_session(session_id);
     }
 }
 
@@ -378,6 +482,125 @@ pub(in crate::runtime) struct ServerCarrierPathRegistration {
     inner: Arc<ServerCarrierPathRegistrationInner>,
 }
 
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerCarrierPeer {
+    observe: Arc<dyn Fn() -> SocketAddr + Send + Sync>,
+}
+
+impl ServerCarrierPeer {
+    pub(in crate::runtime) fn fixed(peer: SocketAddr) -> Self {
+        Self {
+            observe: Arc::new(move || peer),
+        }
+    }
+
+    pub(in crate::runtime) fn observed(
+        observe: impl Fn() -> SocketAddr + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            observe: Arc::new(observe),
+        }
+    }
+
+    fn current(&self) -> SocketAddr {
+        (self.observe)()
+    }
+}
+
+impl std::fmt::Debug for ServerCarrierPeer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ServerCarrierPeer")
+            .field(&self.current())
+            .finish()
+    }
+}
+
+/// Authenticated opening-carrier identity used for endpoint-local diagnostics.
+/// `peer` is the transport endpoint observed by this server, not an end-client
+/// address forwarded by the MPP peer and never routing source evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runtime) struct ServerMppIngress {
+    session_id: SessionId,
+    peer: SocketAddr,
+    underlay: UnderlayProtocol,
+    configured_path: Option<Arc<str>>,
+    path_id: PathId,
+    path_instance_id: CarrierPathInstanceId,
+}
+
+/// Lightweight observational authority detached from carrier-registration
+/// lifetime. Persistent QUIC datagram streams retain this to snapshot the
+/// current migrated peer at each logical flow open without keeping a retired
+/// carrier registered merely for diagnostics.
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct ServerMppIngressObserver {
+    session_id: SessionId,
+    peer: ServerCarrierPeer,
+    underlay: UnderlayProtocol,
+    configured_path: Option<Arc<str>>,
+    path_id: PathId,
+    path_instance_id: CarrierPathInstanceId,
+}
+
+impl ServerMppIngressObserver {
+    pub(in crate::runtime) fn snapshot(&self) -> ServerMppIngress {
+        ServerMppIngress {
+            session_id: self.session_id,
+            peer: self.peer.current(),
+            underlay: self.underlay,
+            configured_path: self.configured_path.clone(),
+            path_id: self.path_id,
+            path_instance_id: self.path_instance_id,
+        }
+    }
+}
+
+impl ServerMppIngress {
+    #[cfg(test)]
+    pub(in crate::runtime) fn for_test(
+        session_id: SessionId,
+        peer: SocketAddr,
+        underlay: UnderlayProtocol,
+        configured_path: Option<&str>,
+        path_id: PathId,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Self {
+        Self {
+            session_id,
+            peer,
+            underlay,
+            configured_path: configured_path.map(Arc::from),
+            path_id,
+            path_instance_id,
+        }
+    }
+
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(in crate::runtime) fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    pub(in crate::runtime) fn underlay(&self) -> UnderlayProtocol {
+        self.underlay
+    }
+
+    pub(in crate::runtime) fn configured_path(&self) -> Option<&str> {
+        self.configured_path.as_deref()
+    }
+
+    pub(in crate::runtime) fn path_id(&self) -> PathId {
+        self.path_id
+    }
+
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.path_instance_id
+    }
+}
+
 /// Completion authority for one exact carrier's ordered attachment retirement.
 pub(in crate::runtime) struct ServerCarrierPathRetirement {
     completed: watch::Receiver<bool>,
@@ -408,7 +631,15 @@ struct ServerCarrierPathRegistrationInner {
     identity: ServerCarrierPathIdentity,
     local: ServerLocalPathProperties,
     principal_permit: PrincipalPermit,
+    observed_ingress: Option<ServerCarrierObservedIngress>,
+    session_retirement: ServerSessionRetirement,
     validation: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+struct ServerCarrierObservedIngress {
+    peer: ServerCarrierPeer,
+    configured_path: Option<Arc<str>>,
 }
 
 /// Validation authority detached from carrier-registration lifetime.
@@ -459,6 +690,27 @@ impl ServerCarrierPathRegistration {
 
     pub(in crate::runtime) fn principal_permit(&self) -> &PrincipalPermit {
         &self.inner.principal_permit
+    }
+
+    pub(in crate::runtime) fn mpp_ingress(&self) -> Option<ServerMppIngress> {
+        self.mpp_ingress_observer()
+            .map(|observer| observer.snapshot())
+    }
+
+    pub(in crate::runtime) fn mpp_ingress_observer(&self) -> Option<ServerMppIngressObserver> {
+        let observed = self.inner.observed_ingress.as_ref()?;
+        Some(ServerMppIngressObserver {
+            session_id: self.session_id(),
+            peer: observed.peer.clone(),
+            underlay: self.underlay(),
+            configured_path: observed.configured_path.clone(),
+            path_id: self.path_id(),
+            path_instance_id: self.path_instance_id(),
+        })
+    }
+
+    pub(in crate::runtime) fn session_retirement(&self) -> ServerSessionRetirement {
+        self.inner.session_retirement.clone()
     }
 
     /// Returns a fresh challenge until this carrier instance is validated.
@@ -576,21 +828,32 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         identity: ServerCarrierPathIdentity,
         local: ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
-    ) -> Result<(), RuntimeError>;
+    ) -> Result<ServerSessionRetirement, RuntimeError>;
 
     fn retire_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
     ) -> ServerCarrierPathRetirement;
 
+    fn session_retirement(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ServerSessionRetirement, RuntimeError>;
+
+    fn retire_session(&self, session_id: SessionId, reason: CloseReason) -> CloseReason;
+
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState);
 
-    fn register_realtime_flow(&self, session_id: SessionId) -> ServerRealtimeFlowLease;
+    fn register_realtime_flow(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ServerRealtimeFlowLease, RuntimeError>;
 
     fn open_or_attach<'a>(
         &'a self,
         request: ServerStreamOpenRequest,
         new_stream_policy: ServerNewStreamPolicy,
+        opening_ingress: Option<ServerMppIngress>,
     ) -> ServerStreamPortFuture<'a, ServerStreamOpenOutcome>;
 
     fn route_frame<'a>(
@@ -645,10 +908,14 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
 pub(in crate::runtime) struct ServerStreamPort {
     backend: Arc<dyn ServerStreamPortBackend>,
     owner_token: usize,
-    target_admission: Arc<ServerStreamTargetAdmission>,
+    target_admission: Option<Arc<ServerStreamTargetAdmission>>,
 }
 
-pub(in crate::runtime) type ServerStreamTargetAdmission = dyn Fn(&PrincipalPermit, &TargetAddr) -> Result<ServerTargetAdmission, RuntimeError>
+pub(in crate::runtime) type ServerStreamTargetAdmission = dyn Fn(
+        &PrincipalPermit,
+        &ServerMppIngress,
+        &TargetAddr,
+    ) -> Result<ServerTargetAdmission, RuntimeError>
     + Send
     + Sync;
 
@@ -666,7 +933,7 @@ impl ServerStreamPort {
         Self {
             backend,
             owner_token,
-            target_admission: Arc::new(|_, _| Ok(ServerTargetAdmission::Allow)),
+            target_admission: None,
         }
     }
 
@@ -675,23 +942,31 @@ impl ServerStreamPort {
         mut self,
         target_admission: Arc<ServerStreamTargetAdmission>,
     ) -> Self {
-        self.target_admission = target_admission;
+        self.target_admission = Some(target_admission);
         self
     }
 
-    pub(in crate::runtime) fn validate_target(
+    fn validate_target_with_ingress(
         &self,
         path_registration: &ServerCarrierPathRegistration,
         target: &TargetAddr,
+        opening_ingress: Option<&ServerMppIngress>,
     ) -> Result<ServerTargetAdmission, RuntimeError> {
         if !path_registration.belongs_to(self) {
             return Err(RuntimeError::Protocol(
                 "reliable path registration does not match stream service",
             ));
         }
-        (self.target_admission)(path_registration.principal_permit(), target)
+        let Some(target_admission) = &self.target_admission else {
+            return Ok(ServerTargetAdmission::Allow);
+        };
+        let ingress = opening_ingress.ok_or(RuntimeError::Protocol(
+            "authenticated MPP carrier is missing its observed peer",
+        ))?;
+        (target_admission)(path_registration.principal_permit(), ingress, target)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn register_carrier_path(
         &self,
         session_id: SessionId,
@@ -700,14 +975,59 @@ impl ServerStreamPort {
         local: ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        self.register_carrier_path_with_observed_ingress(
+            session_id,
+            underlay,
+            path_id,
+            local,
+            principal_permit,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn register_carrier_path_with_observed_peer(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        local: ServerLocalPathProperties,
+        principal_permit: PrincipalPermit,
+        peer: ServerCarrierPeer,
+        configured_path: Option<Arc<str>>,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        self.register_carrier_path_with_observed_ingress(
+            session_id,
+            underlay,
+            path_id,
+            local,
+            principal_permit,
+            Some(ServerCarrierObservedIngress {
+                peer,
+                configured_path,
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_carrier_path_with_observed_ingress(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        local: ServerLocalPathProperties,
+        principal_permit: PrincipalPermit,
+        observed_ingress: Option<ServerCarrierObservedIngress>,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
         let identity = ServerCarrierPathIdentity {
             session_id,
             underlay,
             path_id,
             path_instance_id: next_carrier_path_instance_id(),
         };
-        self.backend
-            .activate_carrier_path(identity, local, principal_permit.clone())?;
+        let session_retirement =
+            self.backend
+                .activate_carrier_path(identity, local, principal_permit.clone())?;
         Ok(ServerCarrierPathRegistration {
             inner: Arc::new(ServerCarrierPathRegistrationInner {
                 backend: self.backend.clone(),
@@ -715,6 +1035,8 @@ impl ServerStreamPort {
                 identity,
                 local,
                 principal_permit,
+                observed_ingress,
+                session_retirement,
                 validation: Arc::new(AtomicBool::new(false)),
             }),
         })
@@ -728,12 +1050,18 @@ impl ServerStreamPort {
         path_id: PathId,
         local: ServerLocalPathProperties,
     ) -> ServerCarrierPathRegistration {
-        self.register_carrier_path(
+        self.register_carrier_path_with_observed_peer(
             session_id,
             underlay,
             path_id,
             local,
             PrincipalPermit::for_test("test-peer"),
+            ServerCarrierPeer::fixed(
+                "203.0.113.7:51000"
+                    .parse()
+                    .expect("authenticated test carrier peer"),
+            ),
+            None,
         )
         .expect("register test carrier path")
     }
@@ -741,8 +1069,23 @@ impl ServerStreamPort {
     pub(in crate::runtime) fn register_realtime_flow(
         &self,
         session_id: SessionId,
-    ) -> ServerRealtimeFlowLease {
+    ) -> Result<ServerRealtimeFlowLease, RuntimeError> {
         self.backend.register_realtime_flow(session_id)
+    }
+
+    pub(in crate::runtime) fn session_retirement(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ServerSessionRetirement, RuntimeError> {
+        self.backend.session_retirement(session_id)
+    }
+
+    pub(in crate::runtime) fn retire_session(
+        &self,
+        session_id: SessionId,
+        reason: CloseReason,
+    ) -> CloseReason {
+        self.backend.retire_session(session_id, reason)
     }
 
     pub(in crate::runtime) async fn open_or_attach(
@@ -773,13 +1116,21 @@ impl ServerStreamPort {
                 "reliable path registration does not match stream service or session",
             ));
         }
-        match self.validate_target(&request.attachment.path_registration, &request.target)? {
+        // The observed QUIC peer can migrate. Snapshot once at logical OPEN so
+        // preflight policy, debug logs, and accepted-flow telemetry all use
+        // one causal opening identity rather than separate observer reads.
+        let opening_ingress = request.attachment.path_registration.mpp_ingress();
+        match self.validate_target_with_ingress(
+            &request.attachment.path_registration,
+            &request.target,
+            opening_ingress.as_ref(),
+        )? {
             ServerTargetAdmission::Allow => {}
             ServerTargetAdmission::Reject => return Ok(ServerStreamOpenOutcome::Rejected),
             ServerTargetAdmission::Drop => return Ok(ServerStreamOpenOutcome::Dropped),
         }
         self.backend
-            .open_or_attach(request, new_stream_policy)
+            .open_or_attach(request, new_stream_policy, opening_ingress)
             .await
     }
 
@@ -918,4 +1269,42 @@ pub(in crate::runtime) struct OpenedReliableCarrierStream {
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+}
+
+impl OpenedReliableCarrierStream {
+    /// Retires a peer-accepted client stream that lost exact carrier ownership
+    /// before Product attachment commit.
+    pub(in crate::runtime) fn retire_uncommitted(self) -> Result<(), RuntimeError> {
+        self.commands.retire_accepted_stream(self.stream_id)
+    }
+}
+
+#[cfg(test)]
+mod session_retirement_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sticky_session_retirement_wins_even_when_readiness_is_immediately_ready() {
+        let (_reason, retirement) = watch::channel(Some(CloseReason::PolicyRejected));
+        let readiness_polled = Arc::new(AtomicBool::new(false));
+        let observed = readiness_polled.clone();
+
+        let result = fence_server_carrier_readiness(
+            ServerSessionRetirement::pending(retirement),
+            async move {
+                observed.store(true, Ordering::Release);
+                Ok::<(), RuntimeError>(())
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+        ));
+        assert!(
+            !readiness_polled.load(Ordering::Acquire),
+            "the biased terminal fence must win before readiness is polled",
+        );
+    }
 }

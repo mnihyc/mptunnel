@@ -296,7 +296,10 @@ async fn handle_client_udp_stream_input(
                 usage,
             )?;
         }
-        Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+        Frame::SessionClose { reason } => {
+            let reason = state.session_lifecycle().retire(reason);
+            return Err(RuntimeError::RemoteClosed(reason));
+        }
         _ => {
             return Err(RuntimeError::Protocol(
                 "unexpected QUIC UDP path reliable stream frame",

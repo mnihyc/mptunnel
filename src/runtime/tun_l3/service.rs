@@ -10,12 +10,14 @@ use crate::protocol::{
     UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::{ServerCarrierPathRegistration, ServerStreamPort};
+use crate::runtime::path::{
+    ServerCarrierPathRegistration, ServerRealtimeFlowLease, ServerStreamPort,
+};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,14 +66,50 @@ struct ServerIpAttachment {
     carrier: Arc<dyn ServerIpTunnelCarrier>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServerIpTunnelNoAttachmentRetention {
+    epoch: u64,
+    deadline: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerIpTunnelExpiry {
+    principal: PrincipalId,
+    session_id: SessionId,
+    tunnel_id: IpTunnelId,
+    tunnel_generation: u64,
+    retention: ServerIpTunnelNoAttachmentRetention,
+}
+
 #[derive(Debug)]
 struct ServerLogicalIpTunnel {
     session_id: SessionId,
+    session_owner: ServerRealtimeFlowLease,
     tunnel_id: IpTunnelId,
     generation: u64,
+    no_attachment_retention: Option<ServerIpTunnelNoAttachmentRetention>,
     attachments: HashMap<ServerIpCarrierKey, ServerIpAttachment>,
     received_packet_ids: crate::runtime::recent_ids::RecentIdCache<IpPacketId>,
     flows: PacketFlowTable<ServerIpCarrierKey>,
+}
+
+impl ServerLogicalIpTunnel {
+    fn begin_no_attachment_retention(
+        &mut self,
+        next_retention_epoch: &AtomicU64,
+        retention_timeout: Duration,
+    ) -> Option<ServerIpTunnelNoAttachmentRetention> {
+        debug_assert!(self.attachments.is_empty());
+        if self.no_attachment_retention.is_some() {
+            return None;
+        }
+        let retention = ServerIpTunnelNoAttachmentRetention {
+            epoch: next_retention_epoch.fetch_add(1, Ordering::Relaxed),
+            deadline: tokio::time::Instant::now() + retention_timeout,
+        };
+        self.no_attachment_retention = Some(retention);
+        Some(retention)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -91,7 +129,12 @@ struct ServerIpTunnelInner {
     recent_packet_capacity: usize,
     flow_capacity: usize,
     max_paths_per_tunnel: usize,
+    session_retention_timeout: Duration,
     next_packet_id: AtomicU64,
+    next_retention_epoch: AtomicU64,
+    timer_runtime: Option<tokio::runtime::Handle>,
+    #[cfg(test)]
+    open_after_initial_retirement_check_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +185,7 @@ impl ServerIpTunnelService {
         paths: ServerStreamPort,
         max_paths_per_tunnel: usize,
         packet_queue_bytes: usize,
+        session_retention_timeout: Duration,
     ) -> (ServerIpTunnelPort, ServerIpTunnelDevice) {
         let packet_queue_bytes = packet_queue_bytes.max(1);
         let packet_queue = packet_queue_bytes
@@ -159,7 +203,12 @@ impl ServerIpTunnelService {
             recent_packet_capacity: packet_queue.saturating_mul(2),
             flow_capacity: packet_queue,
             max_paths_per_tunnel: max_paths_per_tunnel.max(1),
+            session_retention_timeout,
             next_packet_id: AtomicU64::new(1),
+            next_retention_epoch: AtomicU64::new(1),
+            timer_runtime: tokio::runtime::Handle::try_current().ok(),
+            #[cfg(test)]
+            open_after_initial_retirement_check_hook: Mutex::new(None),
         });
         (
             ServerIpTunnelPort {
@@ -175,6 +224,30 @@ impl ServerIpTunnelPort {
         &self,
         request: ServerIpTunnelOpenRequest<'_>,
     ) -> Result<AcceptedServerIpTunnel, RuntimeError> {
+        let session_id = request.path.session_id();
+        // The logical tunnel survives attachment loss, so it must own the
+        // authenticated session independently of every carrier attachment.
+        // A temporary candidate also gives this opener the exact sticky fence;
+        // insertion transfers it to a new logical owner, while reattachment to
+        // an existing owner drops the redundant reference after `state`.
+        let mut session_owner = Some(self.inner.paths.register_realtime_flow(session_id)?);
+        let session_retirement = session_owner
+            .as_ref()
+            .expect("server IP tunnel session owner candidate")
+            .retirement();
+        if let Some(reason) = session_retirement.reason() {
+            return Err(RuntimeError::RemoteClosed(reason));
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .inner
+            .open_after_initial_retirement_check_hook
+            .lock()
+            .expect("server IP tunnel open hook lock")
+            .clone()
+        {
+            hook();
+        }
         let principal = request.path.principal_permit().principal().clone();
         let allocation = self.inner.plan.peer(&principal).cloned().ok_or_else(|| {
             RuntimeError::DestinationDenied("principal has no TUN-L3 allocation".into())
@@ -187,16 +260,16 @@ impl ServerIpTunnelPort {
         };
         let lifetime = Arc::new(());
         let mut state = self.inner.state.lock().expect("server IP tunnel lock");
+        // Principal takeover and the second sticky-fence read share the owner
+        // lock. A stale opener that was retired while waiting cannot remove or
+        // close the current principal incarnation.
+        if let Some(reason) = session_retirement.reason() {
+            return Err(RuntimeError::RemoteClosed(reason));
+        }
         let replace = state.tunnels.get(&principal).is_some_and(|tunnel| {
             tunnel.session_id != carrier.session_id || tunnel.tunnel_id != request.tunnel_id
         });
-        if replace && let Some(previous) = state.tunnels.remove(&principal) {
-            close_attachments(
-                previous.attachments,
-                previous.tunnel_id,
-                CloseReason::PolicyRejected,
-            );
-        }
+        let replaced_tunnel = replace.then(|| state.tunnels.remove(&principal)).flatten();
         let generation = if let Some(tunnel) = state.tunnels.get(&principal) {
             tunnel.generation
         } else {
@@ -206,8 +279,12 @@ impl ServerIpTunnelPort {
                 principal.clone(),
                 ServerLogicalIpTunnel {
                     session_id: carrier.session_id,
+                    session_owner: session_owner
+                        .take()
+                        .expect("new server IP tunnel takes session ownership"),
                     tunnel_id: request.tunnel_id,
                     generation,
+                    no_attachment_retention: None,
                     attachments: HashMap::new(),
                     received_packet_ids: crate::runtime::recent_ids::RecentIdCache::new(
                         self.inner.recent_packet_capacity,
@@ -232,7 +309,8 @@ impl ServerIpTunnelPort {
                 "TUN-L3 carrier attachment limit reached".into(),
             ));
         }
-        if let Some(previous) = tunnel.attachments.insert(
+        let was_carrierless = tunnel.attachments.is_empty();
+        let replaced_attachment = tunnel.attachments.insert(
             carrier,
             ServerIpAttachment {
                 key: carrier,
@@ -243,12 +321,35 @@ impl ServerIpTunnelPort {
                 lifetime: Arc::downgrade(&lifetime),
                 carrier: request.carrier,
             },
-        ) {
+        );
+        if was_carrierless {
+            // Only a committed 0 -> 1 transition invalidates the absolute
+            // carrierless epoch. Failed and duplicate opens never reach this
+            // boundary and therefore cannot extend the deadline.
+            tunnel.no_attachment_retention = None;
+        }
+        drop(state);
+        // Existing logical tunnels already own the same authenticated session.
+        // Release this opener's redundant reference without holding the TUN
+        // owner lock; takeover similarly drops the displaced owner's lease
+        // only through `replaced_tunnel` below.
+        drop(session_owner);
+        if let Some(previous) = replaced_attachment {
             previous
                 .carrier
                 .close(request.tunnel_id, CloseReason::Normal);
         }
-        drop(state);
+        if let Some(previous) = replaced_tunnel {
+            close_attachments(
+                previous.attachments,
+                previous.tunnel_id,
+                CloseReason::PolicyRejected,
+            );
+        }
+        if let Some(reason) = session_retirement.reason() {
+            self.retire_session(session_id, reason);
+            return Err(RuntimeError::RemoteClosed(reason));
+        }
         Ok(AcceptedServerIpTunnel {
             inner: self.inner.clone(),
             principal,
@@ -264,6 +365,38 @@ impl ServerIpTunnelPort {
 
     pub(in crate::runtime) fn plan(&self) -> &TunL3AddressPlan {
         &self.inner.plan
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_open_after_initial_retirement_check_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        *self
+            .inner
+            .open_after_initial_retirement_check_hook
+            .lock()
+            .expect("server IP tunnel open hook lock") = hook;
+    }
+
+    pub(in crate::runtime) fn retire_session(&self, session_id: SessionId, reason: CloseReason) {
+        let retired = {
+            let mut state = self.inner.state.lock().expect("server IP tunnel lock");
+            let principals = state
+                .tunnels
+                .iter()
+                .filter_map(|(principal, tunnel)| {
+                    (tunnel.session_id == session_id).then_some(principal.clone())
+                })
+                .collect::<Vec<_>>();
+            principals
+                .into_iter()
+                .filter_map(|principal| state.tunnels.remove(&principal))
+                .collect::<Vec<_>>()
+        };
+        for tunnel in retired {
+            close_attachments(tunnel.attachments, tunnel.tunnel_id, reason);
+        }
     }
 }
 
@@ -296,7 +429,8 @@ impl AcceptedServerIpTunnel {
         let Some(tunnel) = state.tunnels.get_mut(&self.principal) else {
             return Ok(false);
         };
-        if tunnel.session_id != self.session_id
+        if tunnel.session_owner.is_retired()
+            || tunnel.session_id != self.session_id
             || tunnel.tunnel_id != self.tunnel_id
             || tunnel.generation != self.tunnel_generation
             || !tunnel
@@ -322,24 +456,105 @@ impl AcceptedServerIpTunnel {
     }
 }
 
-impl Drop for AcceptedServerIpTunnel {
-    fn drop(&mut self) {
-        let mut state = self.inner.state.lock().expect("server IP tunnel lock");
-        let Some(tunnel) = state.tunnels.get_mut(&self.principal) else {
+fn remove_server_ip_attachment(
+    tunnel: &mut ServerLogicalIpTunnel,
+    carrier: ServerIpCarrierKey,
+    attachment_generation: u64,
+    next_retention_epoch: &AtomicU64,
+    retention_timeout: Duration,
+) -> Option<ServerIpTunnelNoAttachmentRetention> {
+    if tunnel
+        .attachments
+        .get(&carrier)
+        .is_none_or(|attachment| attachment.attachment_generation != attachment_generation)
+    {
+        return None;
+    }
+    tunnel.attachments.remove(&carrier);
+    remove_server_carrier_bindings(tunnel, carrier);
+    if tunnel.attachments.is_empty() {
+        tunnel.begin_no_attachment_retention(next_retention_epoch, retention_timeout)
+    } else {
+        None
+    }
+}
+
+fn server_ip_tunnel_expiry(
+    principal: &PrincipalId,
+    tunnel: &ServerLogicalIpTunnel,
+    retention: ServerIpTunnelNoAttachmentRetention,
+) -> ServerIpTunnelExpiry {
+    ServerIpTunnelExpiry {
+        principal: principal.clone(),
+        session_id: tunnel.session_id,
+        tunnel_id: tunnel.tunnel_id,
+        tunnel_generation: tunnel.generation,
+        retention,
+    }
+}
+
+fn spawn_server_ip_tunnel_expiry(inner: &Arc<ServerIpTunnelInner>, expiry: ServerIpTunnelExpiry) {
+    let Some(runtime) = &inner.timer_runtime else {
+        // Production packet services are constructed under their Tokio owner.
+        // Synchronous model-only tests may construct a service without a timer
+        // driver and do not exercise carrierless expiry.
+        return;
+    };
+    let owner = Arc::downgrade(inner);
+    runtime.spawn(async move {
+        tokio::time::sleep_until(expiry.retention.deadline).await;
+        let Some(inner) = owner.upgrade() else {
             return;
         };
-        if tunnel.session_id == self.session_id
-            && tunnel.tunnel_id == self.tunnel_id
-            && tunnel.generation == self.tunnel_generation
-            && tunnel
-                .attachments
-                .get(&self.carrier)
-                .is_some_and(|attachment| {
-                    attachment.attachment_generation == self.attachment_generation
-                })
-        {
-            tunnel.attachments.remove(&self.carrier);
-            remove_server_carrier_bindings(tunnel, self.carrier);
+        expire_server_ip_tunnel(&inner, &expiry);
+    });
+}
+
+fn expire_server_ip_tunnel(inner: &ServerIpTunnelInner, expiry: &ServerIpTunnelExpiry) {
+    let expired = {
+        let mut state = inner.state.lock().expect("server IP tunnel lock");
+        let exact_expired_owner = state.tunnels.get(&expiry.principal).is_some_and(|tunnel| {
+            tunnel.session_id == expiry.session_id
+                && tunnel.tunnel_id == expiry.tunnel_id
+                && tunnel.generation == expiry.tunnel_generation
+                && tunnel.attachments.is_empty()
+                && tunnel.no_attachment_retention == Some(expiry.retention)
+                && tokio::time::Instant::now() >= expiry.retention.deadline
+        });
+        exact_expired_owner
+            .then(|| state.tunnels.remove(&expiry.principal))
+            .flatten()
+    };
+    // Removing the complete logical tunnel transfers the retained session
+    // lease out of the owner lock. Its tracker callback therefore cannot
+    // participate in a TUN-lock/session-tracker lock cycle.
+    drop(expired);
+}
+
+impl Drop for AcceptedServerIpTunnel {
+    fn drop(&mut self) {
+        let expiry = {
+            let mut state = self.inner.state.lock().expect("server IP tunnel lock");
+            let Some(tunnel) = state.tunnels.get_mut(&self.principal) else {
+                return;
+            };
+            if tunnel.session_id != self.session_id
+                || tunnel.tunnel_id != self.tunnel_id
+                || tunnel.generation != self.tunnel_generation
+            {
+                return;
+            }
+            remove_server_ip_attachment(
+                tunnel,
+                self.carrier,
+                self.attachment_generation,
+                &self.inner.next_retention_epoch,
+                self.inner.session_retention_timeout,
+            )
+            .map(|retention| server_ip_tunnel_expiry(&self.principal, tunnel, retention))
+        };
+        if let Some(expiry) = expiry {
+            spawn_server_ip_tunnel_expiry(&self.inner, expiry);
         }
     }
 }
@@ -394,7 +609,7 @@ impl ServerIpTunnelOutput {
 }
 
 fn try_send_server_packet(
-    inner: &ServerIpTunnelInner,
+    inner: &Arc<ServerIpTunnelInner>,
     payload: Bytes,
 ) -> Result<bool, RuntimeError> {
     if payload.len() > usize::from(inner.plan.mtu()) {
@@ -408,35 +623,67 @@ fn try_send_server_packet(
         return Ok(false);
     };
     let packet_id = IpPacketId(inner.next_packet_id.fetch_add(1, Ordering::Relaxed));
-    let mut state = inner.state.lock().expect("server IP tunnel lock");
-    let Some(tunnel) = state.tunnels.get_mut(&principal) else {
-        return Ok(false);
-    };
-    prune_dead_attachments(tunnel);
-    for _ in 0..2 {
-        let Some(carrier) =
-            select_server_carrier(&inner.paths, tunnel, &metadata.flow_key, payload.len())
-        else {
+    let (result, expiry) = {
+        let mut state = inner.state.lock().expect("server IP tunnel lock");
+        let Some(tunnel) = state.tunnels.get_mut(&principal) else {
             return Ok(false);
         };
-        let Some(attachment) = tunnel.attachments.get(&carrier) else {
+        if tunnel.session_owner.is_retired() {
             return Ok(false);
-        };
-        match attachment.carrier.try_send_packet(
-            tunnel.tunnel_id,
-            packet_id,
-            payload.clone(),
-            &inner.carrier_packet_budget,
-        )? {
-            IpTunnelPacketSendOutcome::Accepted => return Ok(true),
-            IpTunnelPacketSendOutcome::Full => return Ok(false),
-            IpTunnelPacketSendOutcome::Retired => {
-                tunnel.attachments.remove(&carrier);
-                remove_server_carrier_bindings(tunnel, carrier);
-            }
         }
+        let mut expiry = if prune_dead_attachments(tunnel) {
+            tunnel
+                .begin_no_attachment_retention(
+                    &inner.next_retention_epoch,
+                    inner.session_retention_timeout,
+                )
+                .map(|retention| server_ip_tunnel_expiry(&principal, tunnel, retention))
+        } else {
+            None
+        };
+        let result = 'dispatch: {
+            for _ in 0..2 {
+                let Some(carrier) =
+                    select_server_carrier(&inner.paths, tunnel, &metadata.flow_key, payload.len())
+                else {
+                    break 'dispatch Ok(false);
+                };
+                let Some(attachment) = tunnel.attachments.get(&carrier) else {
+                    break 'dispatch Ok(false);
+                };
+                let attachment_generation = attachment.attachment_generation;
+                let outcome = attachment.carrier.try_send_packet(
+                    tunnel.tunnel_id,
+                    packet_id,
+                    payload.clone(),
+                    &inner.carrier_packet_budget,
+                );
+                match outcome {
+                    Ok(IpTunnelPacketSendOutcome::Accepted) => break 'dispatch Ok(true),
+                    Ok(IpTunnelPacketSendOutcome::Full) => break 'dispatch Ok(false),
+                    Ok(IpTunnelPacketSendOutcome::Retired) => {
+                        if let Some(retention) = remove_server_ip_attachment(
+                            tunnel,
+                            carrier,
+                            attachment_generation,
+                            &inner.next_retention_epoch,
+                            inner.session_retention_timeout,
+                        ) {
+                            debug_assert!(expiry.is_none());
+                            expiry = Some(server_ip_tunnel_expiry(&principal, tunnel, retention));
+                        }
+                    }
+                    Err(error) => break 'dispatch Err(error),
+                }
+            }
+            Ok(false)
+        };
+        (result, expiry)
+    };
+    if let Some(expiry) = expiry {
+        spawn_server_ip_tunnel_expiry(inner, expiry);
     }
-    Ok(false)
+    result
 }
 
 impl std::fmt::Debug for ServerIpTunnelDevice {
@@ -579,7 +826,8 @@ pub(super) fn server_packet_delivery_rate(
         .unwrap_or_else(crate::runtime::path::model::default_path_rate_bps)
 }
 
-fn prune_dead_attachments(tunnel: &mut ServerLogicalIpTunnel) {
+fn prune_dead_attachments(tunnel: &mut ServerLogicalIpTunnel) -> bool {
+    let had_attachments = !tunnel.attachments.is_empty();
     tunnel
         .attachments
         .retain(|_, attachment| attachment.lifetime.upgrade().is_some());
@@ -587,6 +835,7 @@ fn prune_dead_attachments(tunnel: &mut ServerLogicalIpTunnel) {
     tunnel
         .flows
         .retain_carriers(|carrier| attachments.contains_key(&carrier));
+    had_attachments && tunnel.attachments.is_empty()
 }
 
 fn remove_server_carrier_bindings(tunnel: &mut ServerLogicalIpTunnel, carrier: ServerIpCarrierKey) {

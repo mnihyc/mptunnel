@@ -9,6 +9,7 @@ use crate::product::{BalancerId, FlowContext, InboundId, Network, OutboundId, Ta
 use crate::protocol::{DatagramFlowId, SessionId, StreamId, TargetAddr};
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,10 +48,43 @@ pub(crate) enum ProductFlowOriginKind {
     MppInbound,
 }
 
+/// Endpoint-local ingress observation for authenticated management detail.
+///
+/// An MPP carrier peer is the server-observed opening carrier (possibly a NAT
+/// endpoint), never an end-client identity and never Product routing evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProductFlowSource {
+    pub kind: ProductFlowSourceKind,
+    pub endpoint: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProductFlowSourceKind {
+    LocalPeer,
+    MppCarrierPeer,
+}
+
+impl ProductFlowSource {
+    pub(crate) const fn local_peer(endpoint: SocketAddr) -> Self {
+        Self {
+            kind: ProductFlowSourceKind::LocalPeer,
+            endpoint,
+        }
+    }
+
+    pub(crate) const fn mpp_carrier_peer(endpoint: SocketAddr) -> Self {
+        Self {
+            kind: ProductFlowSourceKind::MppCarrierPeer,
+            endpoint,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProductFlowOrigin {
     pub kind: ProductFlowOriginKind,
     pub inbound: InboundId,
+    pub source: ProductFlowSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,8 +100,10 @@ pub(crate) struct ProductFlowSelection {
 /// Immutable Product identity attached after routing and before payload I/O.
 ///
 /// This scope deliberately contains no connector endpoint, credential, or
-/// carrier detail. A scoped telemetry handle is cloned once per flow; payload
-/// observation then touches only relaxed atomics.
+/// principal. It retains one typed ingress observation for the authenticated
+/// local management API; flow-event logs deliberately do not publish it. A
+/// scoped telemetry handle is cloned once per flow; payload observation then
+/// touches only relaxed atomics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProductFlowScope {
     pub origin: ProductFlowOrigin,
@@ -82,7 +118,18 @@ impl ProductFlowScope {
         flow: &FlowContext,
         outbound: OutboundId,
         balancer: Option<BalancerId>,
+        source: ProductFlowSource,
     ) -> Self {
+        debug_assert!(matches!(
+            (origin_kind, source.kind),
+            (
+                ProductFlowOriginKind::LocalInbound,
+                ProductFlowSourceKind::LocalPeer
+            ) | (
+                ProductFlowOriginKind::MppInbound,
+                ProductFlowSourceKind::MppCarrierPeer
+            )
+        ));
         let target = match flow.target().host() {
             TargetHost::Domain(domain) => TargetAddr::Domain {
                 host: domain.as_str().to_string(),
@@ -97,6 +144,7 @@ impl ProductFlowScope {
             origin: ProductFlowOrigin {
                 kind: origin_kind,
                 inbound: flow.inbound().clone(),
+                source,
             },
             network: flow.network(),
             target,
@@ -410,6 +458,7 @@ pub(crate) struct RuntimeTelemetry {
 }
 
 impl RuntimeTelemetry {
+    #[cfg(test)]
     pub(crate) fn new(active_flow_capacity: usize) -> Self {
         Self::new_inner(active_flow_capacity, true)
     }

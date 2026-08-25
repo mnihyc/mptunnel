@@ -4,10 +4,9 @@ use super::client_stream::{apply_client_udp_path_status, run_client_udp_stream};
 use super::estimator::UdpPathMetricTracker;
 use super::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
-    quic_path_open_error_is_retryable, spawn_quic_path_reader, udp_path_command_queue,
-    udp_path_max_stream_payload_bytes, udp_path_read_frame, udp_path_write_frame,
-    udp_reliable_stream_frame_queue, usable_udp_path_socket_addrs,
-    warn_unexpected_udp_runtime_error,
+    spawn_quic_path_reader, udp_path_command_queue, udp_path_max_stream_payload_bytes,
+    udp_path_read_frame, udp_path_write_frame, udp_reliable_stream_frame_queue,
+    usable_udp_path_socket_addrs, warn_unexpected_udp_runtime_error,
 };
 use super::ip_tunnel::open_client_udp_ip_tunnel;
 #[cfg(feature = "lab-diagnostics")]
@@ -50,7 +49,92 @@ use tokio::sync::Mutex as AsyncMutex;
 // opening every resolver answer in one socket/TLS burst.
 const QUIC_ADDRESS_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 const MAX_QUIC_ADDRESS_ATTEMPTS: usize = 8;
+pub(in crate::runtime) const MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS: usize = 2;
 use tokio::sync::mpsc;
+
+/// Authority carried by an error observed after a client QUIC Product open
+/// has selected an established connection.
+///
+/// Session shutdown is terminal for the authenticated MPP session. A
+/// carrier-lifetime failure may retire only the exact physical owner and use
+/// the released two-attempt reconnect budget. Operation failures retire only
+/// the affected Product attachment and never reconnect the carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ClientUdpErrorDisposition {
+    Session,
+    CarrierLifetime,
+    Operation,
+}
+
+pub(in crate::runtime) fn client_udp_error_disposition(
+    source: &RuntimeError,
+) -> ClientUdpErrorDisposition {
+    match source {
+        RuntimeError::RemoteClosed(_) => ClientUdpErrorDisposition::Session,
+        RuntimeError::QuicCarrier(error)
+            if quic_product_error_has_carrier_lifetime_authority(error) =>
+        {
+            ClientUdpErrorDisposition::CarrierLifetime
+        }
+        _ => ClientUdpErrorDisposition::Operation,
+    }
+}
+
+/// Classifies only evidence that identifies the established physical QUIC
+/// connection as failed or unable to accept another Product request.
+///
+/// `QuicCarrierError::is_path_lifetime_failure` has the broader historical
+/// meaning "the logical reliable path may migrate". In particular, request
+/// stream reset/finish is sufficient to migrate that Product attachment but
+/// is not authority to retire sibling requests sharing the QUIC connection.
+fn quic_product_error_has_carrier_lifetime_authority(source: &QuicCarrierError) -> bool {
+    match source {
+        QuicCarrierError::Io(_)
+        | QuicCarrierError::Connection(_)
+        | QuicCarrierError::H3Connection(_)
+        | QuicCarrierError::H3DriverClosed
+        | QuicCarrierError::Write(quinn::WriteError::ConnectionLost(_))
+        | QuicCarrierError::Read(quinn::ReadError::ConnectionLost(_))
+        | QuicCarrierError::NativeDatagram(quinn::SendDatagramError::ConnectionLost(_)) => true,
+        QuicCarrierError::H3Stream(error) => matches!(
+            error,
+            h3::error::StreamError::ConnectionError(_) | h3::error::StreamError::RemoteClosing
+        ),
+        _ => false,
+    }
+}
+
+fn client_udp_endpoint_error_has_health_authority(source: &RuntimeError) -> bool {
+    matches!(
+        source,
+        RuntimeError::Io(_)
+            | RuntimeError::Udp(_)
+            | RuntimeError::PathOpenTimedOut
+            // In endpoint-establishment context this is emitted only when an
+            // authenticated connection closes before owner publication. The
+            // same generic error observed on a Product request remains
+            // operation-local in `client_udp_error_disposition`.
+            | RuntimeError::ReliablePathSessionClosed
+            | RuntimeError::QuicCarrier(
+                QuicCarrierError::Io(_)
+                    | QuicCarrierError::Connection(_)
+                    | QuicCarrierError::H3Connection(_)
+                    | QuicCarrierError::H3Stream(_)
+                    | QuicCarrierError::H3DriverClosed
+                    | QuicCarrierError::H3StreamFinished
+                    | QuicCarrierError::StreamFinished
+                    | QuicCarrierError::UnexpectedEnd
+                    | QuicCarrierError::ClosedStream(_)
+            )
+    )
+}
+
+fn client_udp_native_close_authorizes_retry(
+    connection_closed: bool,
+    source: &RuntimeError,
+) -> bool {
+    connection_closed && !matches!(source, RuntimeError::RemoteClosed(_))
+}
 
 fn quic_address_attempt_delay(remaining: Duration, unstarted: usize) -> Duration {
     debug_assert!(unstarted > 0 && unstarted < u32::MAX as usize);
@@ -70,6 +154,31 @@ fn next_quic_address_attempt_at(
 pub(in crate::runtime) struct ClientUdpPathSessionHandle {
     runtime: ClientUdpPathSessionRuntime,
     connection: Arc<AsyncMutex<Option<ClientUdpPathConnection>>>,
+    #[cfg(test)]
+    retryable_open_failure_hook:
+        Arc<std::sync::Mutex<Option<ClientUdpRetryableOpenFailureTestHook>>>,
+    #[cfg(test)]
+    accepted_open_hook: Arc<std::sync::Mutex<Option<ClientUdpAcceptedOpenTestHook>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ClientUdpRetryableOpenFailureTestHook {
+    reached: mpsc::UnboundedSender<CarrierPathInstanceId>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientUdpAcceptedOpenKind {
+    Reliable,
+    Datagram,
+}
+
+#[cfg(test)]
+struct ClientUdpAcceptedOpenTestHook {
+    reached: mpsc::UnboundedSender<(ClientUdpAcceptedOpenKind, CarrierPathInstanceId)>,
+    resume: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for ClientUdpPathSessionHandle {
@@ -84,15 +193,30 @@ impl ClientUdpPathSessionHandle {
         Self {
             runtime,
             connection: Arc::new(AsyncMutex::new(None)),
+            #[cfg(test)]
+            retryable_open_failure_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            accepted_open_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) async fn prepare_connection(
         &self,
         open_deadline: tokio::time::Instant,
     ) -> Result<Option<Duration>, RuntimeError> {
+        Ok(self
+            .prepare_connection_for_probe(open_deadline)
+            .await?
+            .map(|(_, elapsed)| elapsed))
+    }
+
+    pub(in crate::runtime) async fn prepare_connection_for_probe(
+        &self,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<Option<(CarrierPathInstanceId, Duration)>, RuntimeError> {
         let (carrier, newly_connected) = self.ensure_connection_with_status(open_deadline).await?;
-        Ok(newly_connected.then(|| carrier.connection.rtt()))
+        Ok(newly_connected.then(|| (carrier.path_instance_id, carrier.connection.rtt())))
     }
 
     pub(in crate::runtime) async fn open_stream(
@@ -104,61 +228,173 @@ impl ClientUdpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
-        let open = async {
-            let connection = self.ensure_connection(open_deadline).await?;
-            match open_client_udp_stream_on_connection(
-                connection,
-                stream_id,
-                target.clone(),
-                lane,
-                initial_demand,
-                advertised_recv_max_offset,
-                self.runtime.clone(),
+        for attempt in 0..MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS {
+            let expected_path_instance_id = self
+                .runtime
+                .state
+                .path_instance_id(UnderlayProtocol::Udp, self.runtime.path_index);
+            let connection =
+                match tokio::time::timeout_at(open_deadline, self.ensure_connection(open_deadline))
+                    .await
+                    .map_err(|_| RuntimeError::PathOpenTimedOut)
+                    .and_then(|result| result)
+                {
+                    Ok(connection) => connection,
+                    Err(source) => {
+                        if client_udp_endpoint_error_has_health_authority(&source) {
+                            self.runtime
+                                .state
+                                .mark_udp_path_establishment_failure_if_current(
+                                    self.runtime.path_index,
+                                    expected_path_instance_id,
+                                );
+                        }
+                        return Err(source);
+                    }
+                };
+            let path_instance_id = connection.path_instance_id;
+            let result = tokio::time::timeout_at(
+                open_deadline,
+                open_client_udp_stream_on_connection(
+                    connection,
+                    stream_id,
+                    target.clone(),
+                    lane,
+                    initial_demand,
+                    advertised_recv_max_offset,
+                    self.runtime.clone(),
+                ),
             )
             .await
-            {
-                Ok(stream) => Ok(stream),
-                Err(err) if quic_path_open_error_is_retryable(&err) => {
-                    self.drop_failed_connection().await;
-                    let connection = self.ensure_connection(open_deadline).await?;
-                    open_client_udp_stream_on_connection(
-                        connection,
-                        stream_id,
-                        target,
-                        lane,
-                        initial_demand,
-                        advertised_recv_max_offset,
-                        self.runtime.clone(),
+            .map_err(|_| RuntimeError::PathOpenTimedOut)
+            .and_then(|result| result);
+            match result {
+                Ok(stream) => {
+                    #[cfg(test)]
+                    self.pause_accepted_open_for_test(
+                        ClientUdpAcceptedOpenKind::Reliable,
+                        path_instance_id,
                     )
-                    .await
+                    .await;
+                    let committed = tokio::time::timeout_at(
+                        open_deadline,
+                        self.try_commit_opened_instance(path_instance_id),
+                    )
+                    .await;
+                    let commit_timed_out = match committed {
+                        Ok(true) => return Ok(stream),
+                        Ok(false) => false,
+                        Err(_) => true,
+                    };
+                    let _ = stream.retire_uncommitted();
+                    if commit_timed_out {
+                        return Err(RuntimeError::PathOpenTimedOut);
+                    }
+                    if attempt + 1 < MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(RuntimeError::ReliablePathRetired);
                 }
-                Err(err) => Err(err),
+                Err(source) => {
+                    #[cfg(test)]
+                    if client_udp_error_disposition(&source)
+                        == ClientUdpErrorDisposition::CarrierLifetime
+                    {
+                        self.pause_retryable_open_failure_for_test(path_instance_id)
+                            .await;
+                    }
+                    let disposition = self
+                        .settle_established_error(path_instance_id, &source)
+                        .await;
+                    if disposition == ClientUdpErrorDisposition::CarrierLifetime
+                        && attempt + 1 < MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS
+                    {
+                        continue;
+                    }
+                    return Err(source);
+                }
             }
-        };
-        tokio::time::timeout_at(open_deadline, open)
-            .await
-            .map_err(|_| RuntimeError::PathOpenTimedOut)?
+        }
+        unreachable!("bounded QUIC Product stream-open attempts return from the loop")
     }
 
     pub(in crate::runtime) async fn open_datagram_stream(
         &self,
         open_deadline: tokio::time::Instant,
     ) -> Result<ClientUdpDatagramStream, RuntimeError> {
-        let open = async {
-            let connection = self.ensure_connection(open_deadline).await?;
-            match open_client_udp_datagram_stream(connection, self.runtime.clone()).await {
-                Ok(stream) => Ok(stream),
-                Err(err) if quic_path_open_error_is_retryable(&err) => {
-                    self.drop_failed_connection().await;
-                    let connection = self.ensure_connection(open_deadline).await?;
-                    open_client_udp_datagram_stream(connection, self.runtime.clone()).await
-                }
-                Err(err) => Err(err),
-            }
-        };
-        tokio::time::timeout_at(open_deadline, open)
+        for attempt in 0..MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS {
+            let expected_path_instance_id = self
+                .runtime
+                .state
+                .path_instance_id(UnderlayProtocol::Udp, self.runtime.path_index);
+            let connection =
+                match tokio::time::timeout_at(open_deadline, self.ensure_connection(open_deadline))
+                    .await
+                    .map_err(|_| RuntimeError::PathOpenTimedOut)
+                    .and_then(|result| result)
+                {
+                    Ok(connection) => connection,
+                    Err(source) => {
+                        if client_udp_endpoint_error_has_health_authority(&source) {
+                            self.runtime
+                                .state
+                                .mark_udp_path_establishment_failure_if_current(
+                                    self.runtime.path_index,
+                                    expected_path_instance_id,
+                                );
+                        }
+                        return Err(source);
+                    }
+                };
+            let path_instance_id = connection.path_instance_id;
+            let result = tokio::time::timeout_at(
+                open_deadline,
+                open_client_udp_datagram_stream(connection, self.runtime.clone()),
+            )
             .await
-            .map_err(|_| RuntimeError::PathOpenTimedOut)?
+            .map_err(|_| RuntimeError::PathOpenTimedOut)
+            .and_then(|result| result);
+            match result {
+                Ok(stream) => {
+                    #[cfg(test)]
+                    self.pause_accepted_open_for_test(
+                        ClientUdpAcceptedOpenKind::Datagram,
+                        path_instance_id,
+                    )
+                    .await;
+                    let committed = tokio::time::timeout_at(
+                        open_deadline,
+                        self.try_commit_opened_instance(path_instance_id),
+                    )
+                    .await;
+                    let commit_timed_out = match committed {
+                        Ok(true) => return Ok(stream),
+                        Ok(false) => false,
+                        Err(_) => true,
+                    };
+                    stream.retire_uncommitted();
+                    if commit_timed_out {
+                        return Err(RuntimeError::PathOpenTimedOut);
+                    }
+                    if attempt + 1 < MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(RuntimeError::ReliablePathRetired);
+                }
+                Err(source) => {
+                    let disposition = self
+                        .settle_established_error(path_instance_id, &source)
+                        .await;
+                    if disposition == ClientUdpErrorDisposition::CarrierLifetime
+                        && attempt + 1 < MAX_CLIENT_UDP_EXACT_OPEN_ATTEMPTS
+                    {
+                        continue;
+                    }
+                    return Err(source);
+                }
+            }
+        }
+        unreachable!("bounded QUIC Product datagram-open attempts return from the loop")
     }
 
     pub(in crate::runtime) async fn open_ip_tunnel_attachment(
@@ -172,7 +408,12 @@ impl ClientUdpPathSessionHandle {
             let connection_lifetime = connection.connection.clone();
             match open_client_udp_ip_tunnel(connection, self.runtime.clone(), tunnel_id).await {
                 Ok(attachment) => Ok(attachment),
-                Err(_err) if connection_lifetime.is_closed() => {
+                Err(err)
+                    if client_udp_native_close_authorizes_retry(
+                        connection_lifetime.is_closed(),
+                        &err,
+                    ) =>
+                {
                     self.drop_failed_connection_instance(path_instance_id).await;
                     let connection = self.ensure_connection(open_deadline).await?;
                     open_client_udp_ip_tunnel(connection, self.runtime.clone(), tunnel_id).await
@@ -196,53 +437,207 @@ impl ClientUdpPathSessionHandle {
         &self,
         open_deadline: tokio::time::Instant,
     ) -> Result<(ClientUdpCarrierInstance, bool), RuntimeError> {
+        self.runtime.state.session_lifecycle().ensure_active()?;
         let mut current = self.connection.lock().await;
-        if current
+        self.runtime.state.session_lifecycle().ensure_active()?;
+        if let Some(failed) = current
             .as_ref()
-            .is_some_and(|connection| connection.carrier.connection.is_closed())
+            .filter(|connection| connection.carrier.connection.is_closed())
+            .map(|connection| connection.carrier.path_instance_id)
         {
-            current.take();
+            self.retire_connection_owner_locked(&mut current, failed);
         }
         if let Some(connection) = current.as_ref() {
-            return Ok((connection.carrier.clone(), false));
+            return self
+                .runtime
+                .state
+                .session_lifecycle()
+                .commit_if_active(|| (connection.carrier.clone(), false))
+                .map_err(RuntimeError::RemoteClosed);
         }
-        let connection = connect_client_udp_path(&self.runtime, open_deadline).await?;
-        let carrier = connection.carrier.clone();
-        *current = Some(connection);
+        let mut pending = Some(connect_client_udp_path(&self.runtime, open_deadline).await?);
+        let carrier = pending
+            .as_ref()
+            .expect("new QUIC carrier awaits owner publication")
+            .carrier
+            .clone();
+        let peer_usage = pending
+            .as_ref()
+            .expect("new QUIC carrier awaits health publication")
+            .peer_usage;
+        let published = self
+            .runtime
+            .state
+            .session_lifecycle()
+            .commit_if_active(|| {
+                self.runtime.state.publish_udp_peer_path_usage_committed(
+                    self.runtime.path_index,
+                    carrier.path_instance_id,
+                    0,
+                    peer_usage,
+                    || !carrier.connection.is_closed(),
+                    || {
+                        let mut connection = pending
+                            .take()
+                            .expect("new QUIC carrier awaits owner publication");
+                        connection._authenticated_carrier =
+                            Some(self.runtime.authenticated_carriers.register());
+                        *current = Some(connection);
+                    },
+                )
+            })
+            .map_err(RuntimeError::RemoteClosed)?;
+        if !published {
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        }
+        current
+            .as_mut()
+            .expect("published QUIC carrier has one physical owner")
+            .start_background_tasks(&self.runtime);
         Ok((carrier, true))
     }
 
-    async fn drop_failed_connection(&self) {
-        let mut current = self.connection.lock().await;
-        if let Some(connection) = current.take() {
-            self.runtime.state.mark_path_instance_data_plane_failure(
-                RelayPathKey {
-                    underlay: UnderlayProtocol::Udp,
-                    index: self.runtime.path_index,
-                },
-                connection.carrier.path_instance_id,
-            );
-            connection.carrier.connection.close();
-        }
-    }
-
-    async fn drop_failed_connection_instance(&self, failed: CarrierPathInstanceId) {
-        let mut current = self.connection.lock().await;
+    fn retire_connection_owner_locked(
+        &self,
+        current: &mut Option<ClientUdpPathConnection>,
+        failed: CarrierPathInstanceId,
+    ) -> bool {
         if !current
             .as_ref()
             .is_some_and(|connection| connection.carrier.path_instance_id == failed)
         {
-            return;
+            return false;
         }
-        let connection = current.take().expect("matched QUIC carrier instance");
-        self.runtime.state.mark_path_instance_data_plane_failure(
+        let mut retired = None;
+        self.runtime.state.settle_udp_path_instance_failure(
+            self.runtime.path_index,
+            failed,
+            || {
+                retired = current.take();
+            },
+        );
+        if let Some(connection) = retired {
+            connection.carrier.connection.close();
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn retire_failed_connection_instance(&self, failed: CarrierPathInstanceId) -> bool {
+        let mut current = self.connection.lock().await;
+        self.retire_connection_owner_locked(&mut current, failed)
+    }
+
+    /// Compatibility path for IP-tunnel open, whose settlement remains
+    /// outside C4. It retains the released exact-instance health publication.
+    async fn drop_failed_connection_instance(&self, failed: CarrierPathInstanceId) {
+        self.retire_failed_connection_instance(failed).await;
+    }
+
+    pub(in crate::runtime) async fn settle_established_error(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+        source: &RuntimeError,
+    ) -> ClientUdpErrorDisposition {
+        let disposition = client_udp_error_disposition(source);
+        self.settle_established_disposition(path_instance_id, disposition)
+            .await
+    }
+
+    pub(in crate::runtime) async fn settle_established_disposition(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+        disposition: ClientUdpErrorDisposition,
+    ) -> ClientUdpErrorDisposition {
+        match disposition {
+            ClientUdpErrorDisposition::Session => {}
+            ClientUdpErrorDisposition::CarrierLifetime => {
+                self.retire_failed_connection_instance(path_instance_id)
+                    .await;
+            }
+            ClientUdpErrorDisposition::Operation => {
+                let physically_closed = {
+                    let current = self.connection.lock().await;
+                    current.as_ref().is_some_and(|connection| {
+                        connection.carrier.path_instance_id == path_instance_id
+                            && connection.carrier.connection.is_closed()
+                    })
+                };
+                if physically_closed {
+                    // Physical closure is independent exact-instance
+                    // evidence. It may retire N, but it cannot change this
+                    // operation-local Product disposition or authorize retry.
+                    self.retire_failed_connection_instance(path_instance_id)
+                        .await;
+                }
+            }
+        }
+        disposition
+    }
+
+    async fn try_commit_opened_instance(&self, path_instance_id: CarrierPathInstanceId) -> bool {
+        let current = self.connection.lock().await;
+        let Some(connection) = current.as_ref().filter(|connection| {
+            connection.carrier.path_instance_id == path_instance_id
+                && !connection.carrier.connection.is_closed()
+        }) else {
+            return false;
+        };
+        debug_assert_eq!(connection.carrier.path_instance_id, path_instance_id);
+        self.runtime.state.try_commit_path_instance(
             RelayPathKey {
                 underlay: UnderlayProtocol::Udp,
                 index: self.runtime.path_index,
             },
-            connection.carrier.path_instance_id,
-        );
-        connection.carrier.connection.close();
+            path_instance_id,
+        )
+    }
+
+    #[cfg(test)]
+    fn set_retryable_open_failure_hook(&self, hook: Option<ClientUdpRetryableOpenFailureTestHook>) {
+        *self
+            .retryable_open_failure_hook
+            .lock()
+            .expect("client QUIC open-failure hook lock") = hook;
+    }
+
+    #[cfg(test)]
+    async fn pause_retryable_open_failure_for_test(&self, opened: CarrierPathInstanceId) {
+        let hook = self
+            .retryable_open_failure_hook
+            .lock()
+            .expect("client QUIC open-failure hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            let _ = hook.reached.send(opened);
+            hook.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_accepted_open_hook(&self, hook: Option<ClientUdpAcceptedOpenTestHook>) {
+        *self
+            .accepted_open_hook
+            .lock()
+            .expect("client QUIC accepted-open hook lock") = hook;
+    }
+
+    #[cfg(test)]
+    async fn pause_accepted_open_for_test(
+        &self,
+        kind: ClientUdpAcceptedOpenKind,
+        path_instance_id: CarrierPathInstanceId,
+    ) {
+        let hook = self
+            .accepted_open_hook
+            .lock()
+            .expect("client QUIC accepted-open hook lock")
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.send((kind, path_instance_id));
+            hook.resume.notified().await;
+        }
     }
 
     pub(in crate::runtime) async fn wait_for_connection_instance_change(
@@ -311,18 +706,108 @@ pub(super) struct ClientUdpCarrierInstance {
 }
 
 struct ClientUdpPathConnection {
-    _endpoint: UdpPathEndpoint,
+    endpoint: UdpPathEndpoint,
     carrier: ClientUdpCarrierInstance,
-    _authenticated_carrier: crate::runtime::path::AuthenticatedCarrierRegistration,
+    peer_usage: PathUsage,
+    _authenticated_carrier: Option<crate::runtime::path::AuthenticatedCarrierRegistration>,
+    startup: Option<ClientUdpPathConnectionStartup>,
+    lifecycle_task: Option<tokio::task::JoinHandle<()>>,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
     control_task: Option<tokio::task::JoinHandle<()>>,
     port_migration_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct ClientUdpPathConnectionStartup {
+    control_send: UdpPathSendStream,
+    control_recv: UdpPathRecvStream,
+    canonical_remote: std::net::SocketAddr,
+}
+
+impl ClientUdpPathConnection {
+    /// Starts exact-instance observers only after the physical owner and its
+    /// health identity are atomically visible. The caller still holds the
+    /// connection-owner mutex, so no Product open can overtake startup.
+    fn start_background_tasks(&mut self, runtime: &ClientUdpPathSessionRuntime) {
+        let ClientUdpPathConnectionStartup {
+            control_send,
+            control_recv,
+            canonical_remote,
+        } = self
+            .startup
+            .take()
+            .expect("new QUIC carrier starts its observers exactly once");
+        let path_instance_id = self.carrier.path_instance_id;
+        let connection = self.carrier.connection.clone();
+        let authenticated_carrier = self
+            ._authenticated_carrier
+            .take()
+            .expect("published QUIC carrier owns one authenticated registration");
+        let retirement = runtime.state.session_retirement();
+        let lifecycle_connection = connection.clone();
+        let lifecycle_state = runtime.state.clone();
+        let path_index = runtime.path_index;
+        self.lifecycle_task = Some(tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _reason = retirement.wait() => {
+                    lifecycle_state.mark_path_instance_data_plane_failure(
+                        RelayPathKey {
+                            underlay: UnderlayProtocol::Udp,
+                            index: path_index,
+                        },
+                        path_instance_id,
+                    );
+                    lifecycle_connection.close();
+                }
+                _ = lifecycle_connection.wait_closed() => {}
+            }
+            drop(authenticated_carrier);
+        }));
+        self.metrics_task = Some(spawn_client_udp_path_metrics(
+            runtime.clone(),
+            connection.clone(),
+            path_instance_id,
+        ));
+        let peer_status = runtime.peer_status.register_path(
+            runtime.session_id,
+            UnderlayProtocol::Udp,
+            PathId(runtime.path_index as u16),
+            runtime.config_index,
+        );
+        let control_connection = connection.clone();
+        let control_runtime = runtime.clone();
+        self.control_task = Some(tokio::spawn(async move {
+            if let Err(err) = run_client_udp_control_stream(
+                control_send,
+                control_recv,
+                peer_status,
+                control_runtime,
+            )
+            .await
+            {
+                warn_unexpected_udp_runtime_error("client QUIC control stream failed", &err);
+                control_connection.close();
+            }
+        }));
+        self.port_migration_task = runtime.path().port_hop_interval().map(|interval| {
+            spawn_client_udp_port_migration(
+                runtime.clone(),
+                self.endpoint.clone(),
+                connection,
+                canonical_remote,
+                interval,
+            )
+        });
+    }
 }
 
 // The metrics loop holds a carrier clone, so the session must retire it explicitly.
 impl Drop for ClientUdpPathConnection {
     fn drop(&mut self) {
         self.carrier.connection.close();
+        if let Some(task) = self.lifecycle_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.metrics_task.take() {
             task.abort();
         }
@@ -418,10 +903,20 @@ pub(in crate::runtime) struct ClientUdpDatagramStream {
     pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
 }
 
+impl ClientUdpDatagramStream {
+    fn retire_uncommitted(self) {
+        // No MPP datagram flow owns this request yet. Dropping both HTTP/3
+        // halves closes only this request, and the receive-half drop retires
+        // its native-datagram route; sibling requests retain the connection.
+        drop(self);
+    }
+}
+
 async fn connect_client_udp_path(
     runtime: &ClientUdpPathSessionRuntime,
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientUdpPathConnection, RuntimeError> {
+    runtime.state.session_lifecycle().ensure_active()?;
     let connect = async {
         let remote_port = runtime.path().endpoint.ports().select().map_err(|error| {
             RuntimeError::Io(std::io::Error::other(format!(
@@ -513,57 +1008,45 @@ async fn connect_client_udp_path(
         // Address retry owns only carrier establishment. Authenticate exactly
         // once so a rejected MPP identity is never retried as a DNS decision.
         let (peer_usage, control_send, control_recv) =
-            perform_client_udp_path_handshake(&connection, runtime).await?;
+            match perform_client_udp_path_handshake(&connection, runtime).await {
+                Ok(handshake) => handshake,
+                Err(RuntimeError::RemoteClosed(reason)) => {
+                    let reason = runtime.state.session_lifecycle().retire(reason);
+                    return Err(RuntimeError::RemoteClosed(reason));
+                }
+                Err(error) => return Err(error),
+            };
         let path_instance_id = next_carrier_path_instance_id();
-        runtime.state.install_peer_path_usage(
-            UnderlayProtocol::Udp,
-            runtime.path_index,
-            path_instance_id,
-            0,
-            peer_usage,
-        );
-        let metrics_task =
-            spawn_client_udp_path_metrics(runtime.clone(), connection.clone(), path_instance_id);
-        let peer_status = runtime.peer_status.register(runtime.session_id);
-        let control_connection = connection.clone();
-        let control_runtime = runtime.clone();
-        let control_task = tokio::spawn(async move {
-            if let Err(err) = run_client_udp_control_stream(
-                control_send,
-                control_recv,
-                peer_status,
-                control_runtime,
-            )
-            .await
-            {
-                warn_unexpected_udp_runtime_error("client QUIC control stream failed", &err);
-                control_connection.close();
-            }
-        });
-        let port_migration_task = runtime.path().port_hop_interval().map(|interval| {
-            spawn_client_udp_port_migration(
-                runtime.clone(),
-                endpoint.clone(),
-                connection.clone(),
-                canonical_remote,
-                interval,
-            )
-        });
         Ok(ClientUdpPathConnection {
-            _endpoint: endpoint,
+            endpoint,
             carrier: ClientUdpCarrierInstance {
                 connection,
                 path_instance_id,
             },
-            _authenticated_carrier: runtime.authenticated_carriers.register(),
-            metrics_task: Some(metrics_task),
-            control_task: Some(control_task),
-            port_migration_task,
+            peer_usage,
+            _authenticated_carrier: None,
+            startup: Some(ClientUdpPathConnectionStartup {
+                control_send,
+                control_recv,
+                canonical_remote,
+            }),
+            lifecycle_task: None,
+            metrics_task: None,
+            control_task: None,
+            port_migration_task: None,
         })
     };
-    tokio::time::timeout_at(open_deadline, connect)
-        .await
-        .map_err(|_| RuntimeError::PathOpenTimedOut)?
+    let retirement = runtime.state.session_retirement().wait();
+    tokio::pin!(retirement);
+    let connect = tokio::time::timeout_at(open_deadline, connect);
+    tokio::pin!(connect);
+    tokio::select! {
+        biased;
+        reason = &mut retirement => Err(RuntimeError::RemoteClosed(reason)),
+        result = &mut connect => {
+            result.map_err(|_| RuntimeError::PathOpenTimedOut)?
+        }
+    }
 }
 
 struct EstablishedClientUdpPath {
@@ -728,7 +1211,10 @@ async fn perform_client_udp_path_handshake(
                     "invalid UDP path usage advertisement",
                 ));
             }
-            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+            Frame::SessionClose { reason } => {
+                let reason = runtime.state.session_lifecycle().retire(reason);
+                return Err(RuntimeError::RemoteClosed(reason));
+            }
             _ => {
                 return Err(RuntimeError::Protocol(
                     "unexpected UDP path handshake frame",
@@ -778,6 +1264,7 @@ async fn run_client_udp_control_stream(
                 None
             }
             ClientUdpControlEvent::Frame(Ok(Frame::SessionClose { reason })) => {
+                let reason = runtime.state.session_lifecycle().retire(reason);
                 return Err(RuntimeError::RemoteClosed(reason));
             }
             ClientUdpControlEvent::Frame(Ok(_)) => {
@@ -923,7 +1410,10 @@ async fn read_client_udp_stream_open_accept(
                 )?;
             }
             Frame::SessionReady => {}
-            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+            Frame::SessionClose { reason } => {
+                let reason = state.session_lifecycle().retire(reason);
+                return Err(RuntimeError::RemoteClosed(reason));
+            }
             _ => {
                 return Err(RuntimeError::Protocol(
                     "unexpected QUIC UDP path stream open frame",

@@ -39,7 +39,7 @@ use std::time::Instant;
 /// One coherent path-owner sample used by request scheduling.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ReliableRequestPathEvidence {
-    pub(in crate::runtime) key: RelayPathKey,
+    pub(in crate::runtime) instance: RelayPathInstance,
     pub(in crate::runtime) shared_snapshot: Option<PathSnapshot>,
     pub(in crate::runtime) tcp: Option<ReliableRequestTcpPathEvidence>,
     pub(in crate::runtime) has_bulk_model_evidence: bool,
@@ -667,7 +667,7 @@ impl ClientPathContext {
         include_bulk_admission: bool,
     ) -> ReliableRequestPathBatchObservation
     where
-        I: IntoIterator<Item = (RelayPathKey, Option<RelayPathProofEpoch>)>,
+        I: IntoIterator<Item = (RelayPathInstance, Option<RelayPathProofEpoch>)>,
     {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
@@ -701,35 +701,30 @@ impl ClientPathContext {
         });
         let paths = attached_paths
             .into_iter()
-            .map(|(key, proof)| {
+            .map(|(instance, proof)| {
+                let key = instance.key;
                 let observed = match key.underlay {
                     UnderlayProtocol::Tcp => self
                         .tcp_path_spec(key.index)
                         .zip(health.tcp_record(key.index))
-                        .map(|(path, record)| {
-                            let observation = bulk_observations
-                                .as_ref()
-                                .and_then(|(tcp, _)| tcp.get(key.index))
-                                .copied()
-                                .unwrap_or_else(|| record.observation_at(now));
-                            (path, observation, record)
+                        .and_then(|(path, record)| {
+                            record
+                                .observation_for_instance_at(instance.path_instance_id, now)
+                                .map(|observation| (path, observation, record))
                         }),
                     UnderlayProtocol::Udp => self
                         .udp_paths
                         .get(key.index)
                         .zip(health.udp.get(key.index))
-                        .map(|(path, record)| {
-                            let observation = bulk_observations
-                                .as_ref()
-                                .and_then(|(_, udp)| udp.get(key.index))
-                                .copied()
-                                .unwrap_or_else(|| record.observation_at(now));
-                            (path, observation, record)
+                        .and_then(|(path, record)| {
+                            record
+                                .observation_for_instance_at(instance.path_instance_id, now)
+                                .map(|observation| (path, observation, record))
                         }),
                 };
                 let Some((path, observation, record)) = observed else {
                     return ReliableRequestPathEvidence {
-                        key,
+                        instance,
                         shared_snapshot: None,
                         tcp: None,
                         has_bulk_model_evidence: false,
@@ -749,7 +744,7 @@ impl ClientPathContext {
                             .is_some()
                 });
                 ReliableRequestPathEvidence {
-                    key,
+                    instance,
                     shared_snapshot: Some(path_snapshot(path, key.index, observation)),
                     tcp: (key.underlay == UnderlayProtocol::Tcp).then(|| {
                         ReliableRequestTcpPathEvidence {
@@ -896,13 +891,24 @@ impl ClientPathContext {
         )
     }
 
-    pub(in crate::runtime) fn tcp_native_drain_observed(&self, index: usize) -> bool {
-        self.state
-            .health()
-            .lock()
-            .expect("client path health lock")
-            .tcp_record(index)
-            .is_some_and(|record| record.native_drain_observed)
+    pub(in crate::runtime) fn tcp_native_drain_observed_for_instance(
+        &self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        instance.key.underlay == UnderlayProtocol::Tcp
+            && self
+                .state
+                .health()
+                .lock()
+                .expect("client path health lock")
+                .tcp_record(instance.key.index)
+                .is_some_and(|record| {
+                    record.path_instance_id() == Some(instance.path_instance_id)
+                        && record
+                            .observation_for_instance_at(instance.path_instance_id, Instant::now())
+                            .is_some()
+                        && record.native_drain_observed
+                })
     }
 
     pub(in crate::runtime) fn reliable_path_rtt_is_observed(&self, key: RelayPathKey) -> bool {
@@ -1104,6 +1110,7 @@ impl ClientPathContext {
         ))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn relay_path_has_bulk_model_evidence(
         &self,
         underlay: UnderlayProtocol,
@@ -1175,6 +1182,22 @@ impl ClientPathContext {
             0,
             crate::protocol::PathUsage::Available,
         );
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn update_relay_path_usage_for_test(
+        &self,
+        instance: RelayPathInstance,
+        sequence: u64,
+        usage: crate::protocol::PathUsage,
+    ) -> bool {
+        self.state.update_peer_path_usage(
+            instance.key.underlay,
+            instance.key.index,
+            instance.path_instance_id,
+            sequence,
+            usage,
+        )
     }
 
     pub(in crate::runtime) fn relay_path_has_fresh_proof(

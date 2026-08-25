@@ -29,13 +29,13 @@ use crate::model::timing::reliable_relay_tail_reinjection_delay;
 use crate::model::work::RangeRecoveryState;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
-use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestPathRelease, RequestStreamState,
 };
 use crate::runtime::stream::{ReliableRelayRemotePath, ReliableRelayRemoteSet};
 use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance};
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -54,7 +54,7 @@ pub(super) fn observe_request_relay_scheduling(
     let path_evidence = context.observe_reliable_request_paths(
         remote_paths.iter().map(|path| {
             (
-                path.key(),
+                path.instance(),
                 path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
                     proof_id,
                     proof_generation: path.path_proof_generation,
@@ -81,16 +81,19 @@ pub(super) fn observe_request_relay_scheduling(
         .zip(path_evidence.paths)
         .map(|(path, evidence)| {
             let instance = path.instance();
-            debug_assert_eq!(instance.key, evidence.key);
+            debug_assert_eq!(instance, evidence.instance);
+            let exact_instance_live = evidence.shared_snapshot.is_some();
             let original_data_eligible =
                 !stale_paths.contains(&instance) || !has_nonstale_product_output;
             RequestRelayPathObservation {
                 instance,
-                can_enqueue_frame: original_data_eligible
+                can_enqueue_frame: exact_instance_live
+                    && original_data_eligible
                     && frame
                         .map(|frame| path.stream.can_enqueue_frame_now(frame, lane))
                         .unwrap_or(true),
-                can_enqueue_stream_lane: original_data_eligible
+                can_enqueue_stream_lane: exact_instance_live
+                    && original_data_eligible
                     && frame
                         .map(|frame| path.stream.can_enqueue_frame_now(frame, path.stream.lane))
                         .unwrap_or(true),
@@ -141,21 +144,111 @@ fn relay_path_can_enqueue_frame_for_cause_now(
 fn observed_request_load_expectation(
     observation: &RequestRelaySchedulingObservation,
     instance: RelayPathInstance,
-) -> Result<Option<(RelayPathKey, u32, u32)>, RuntimeError> {
+) -> Result<Option<(RelayPathKey, u32, u32)>, RequestMultipathPlanError> {
     let path = observation
         .path_by_instance(instance)
-        .ok_or(RuntimeError::SenderServiceBlocked)?;
+        .ok_or(RequestMultipathPlanError::ServiceBlocked)?;
     if path.load_owned {
         return Ok(None);
     }
     let snapshot = path
         .shared_snapshot
-        .ok_or(RuntimeError::SenderServiceBlocked)?;
+        .ok_or(RequestMultipathPlanError::ServiceBlocked)?;
     Ok(Some((
         instance.key,
         snapshot.active_flows,
         snapshot.active_latency_sensitive_flows,
     )))
+}
+
+/// Why one serialized request decision produced no carrier intent.
+///
+/// `OutputUnavailable` is a definitive Product/recovery result. In contrast,
+/// `OrderedTerminalPending` means the exact attachment is still registered but
+/// has frozen fresh command admission; its input forwarder remains the sole
+/// authority for publishing the ordered terminal and triggering removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RequestMultipathPlanError {
+    ServiceBlocked,
+    OrderedTerminalPending,
+    OutputUnavailable,
+}
+
+fn blocked_attachment_set_error(remotes: &ReliableRelayRemoteSet) -> RequestMultipathPlanError {
+    if remotes
+        .paths
+        .iter()
+        .any(|path| path.stream.product_admission_active())
+    {
+        RequestMultipathPlanError::ServiceBlocked
+    } else {
+        debug_assert!(!remotes.paths.is_empty());
+        RequestMultipathPlanError::OrderedTerminalPending
+    }
+}
+
+fn require_active_exact_attachment(
+    remotes: &ReliableRelayRemoteSet,
+    required: RelayPathInstance,
+) -> Result<(), RequestMultipathPlanError> {
+    let Some(path) = remotes
+        .paths
+        .iter()
+        .find(|path| path.instance() == required)
+    else {
+        return Err(RequestMultipathPlanError::OutputUnavailable);
+    };
+    if !path.stream.product_admission_active() {
+        return Err(RequestMultipathPlanError::OrderedTerminalPending);
+    }
+    Ok(())
+}
+
+/// Health and directional usage determine the current RFC regular/backup set.
+/// Active and Suspect deliberately share one schedulable class; Failed,
+/// Draining, manual disable, missing readiness usage, and lane policy do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestPathEligibility {
+    Unavailable,
+    Regular,
+    Backup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestPathEligibilityExpectation {
+    instance: RelayPathInstance,
+    eligibility: RequestPathEligibility,
+}
+
+fn request_path_eligibility(
+    snapshot: Option<PathSnapshot>,
+    lane: TrafficClass,
+) -> RequestPathEligibility {
+    let Some(snapshot) = snapshot.filter(|snapshot| snapshot.peer_usage.is_some()) else {
+        return RequestPathEligibility::Unavailable;
+    };
+    if !scheduler::path_is_schedulable(snapshot, lane) {
+        return RequestPathEligibility::Unavailable;
+    }
+    if scheduler::path_is_backup(snapshot) {
+        RequestPathEligibility::Backup
+    } else {
+        RequestPathEligibility::Regular
+    }
+}
+
+fn request_path_eligibility_expectation(
+    observation: &RequestRelaySchedulingObservation,
+    lane: TrafficClass,
+) -> SmallVec<[RequestPathEligibilityExpectation; 4]> {
+    observation
+        .paths
+        .iter()
+        .map(|path| RequestPathEligibilityExpectation {
+            instance: path.instance,
+            eligibility: request_path_eligibility(path.shared_snapshot, lane),
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -164,6 +257,7 @@ pub(super) struct RequestMultipathPlan {
     product_mutation: RequestProductSendMutation,
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
     request_proof_expectation: Option<RelayPathProofEpoch>,
+    path_eligibility_expectation: SmallVec<[RequestPathEligibilityExpectation; 4]>,
 }
 
 /// Preparation may enqueue control evidence but never publishes unique data.
@@ -211,6 +305,7 @@ impl RequestMultipathPlan {
             product_mutation,
             request_load_expectation: None,
             request_proof_expectation: None,
+            path_eligibility_expectation: SmallVec::new(),
         }
     }
 
@@ -224,6 +319,51 @@ impl RequestMultipathPlan {
 
     pub(super) fn proof_expectation(&self) -> Option<RelayPathProofEpoch> {
         self.request_proof_expectation
+    }
+
+    fn with_eligibility_expectation(
+        mut self,
+        observation: &RequestRelaySchedulingObservation,
+        lane: TrafficClass,
+    ) -> Result<Self, RequestMultipathPlanError> {
+        self.path_eligibility_expectation = request_path_eligibility_expectation(observation, lane);
+        self.path_eligibility_expectation
+            .iter()
+            .find(|expectation| expectation.instance == self.target.instance)
+            .filter(|expectation| expectation.eligibility != RequestPathEligibility::Unavailable)
+            .ok_or(RequestMultipathPlanError::ServiceBlocked)?;
+        Ok(self)
+    }
+
+    /// Revalidates the exact physical owners and the RFC regular/backup
+    /// eligibility set immediately before carrier publication. Topology can
+    /// stay unchanged across replacement, disable, drain, failure, or a peer
+    /// usage update, so membership generation alone is not an apply fence.
+    pub(super) fn target_retains_exact_eligibility(
+        &self,
+        context: &ClientPathContext,
+        lane: TrafficClass,
+    ) -> bool {
+        let current = context.observe_reliable_request_paths(
+            self.path_eligibility_expectation
+                .iter()
+                .map(|expectation| (expectation.instance, None)),
+            0,
+            false,
+        );
+        let current_expectation = current
+            .paths
+            .iter()
+            .map(|path| RequestPathEligibilityExpectation {
+                instance: path.instance,
+                eligibility: request_path_eligibility(path.shared_snapshot, lane),
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        current_expectation == self.path_eligibility_expectation
+            && current_expectation.iter().any(|expectation| {
+                expectation.instance == self.target.instance
+                    && expectation.eligibility != RequestPathEligibility::Unavailable
+            })
     }
 }
 
@@ -271,8 +411,8 @@ impl RequestMultipathController {
             .original_transmission_underlay_for_frame(preview);
         // A replacement carrier with the same numeric path key must not lend
         // its RTT or congestion evidence to an older attachment's flight.
-        let original_path_timing =
-            original_path.and_then(|instance| context.reliable_path_snapshot(instance.key));
+        let original_path_timing = original_path
+            .and_then(|instance| context.reliable_path_snapshot_for_instance(instance));
         let live_instances = remotes.path_instances();
         let avoid_instances = self
             .request
@@ -289,12 +429,11 @@ impl RequestMultipathController {
             )
             .ok()
             .and_then(|position| {
-                let key = remotes.paths[position].key();
                 let instance = remotes.paths[position].instance();
-                if !context.relay_path_has_bulk_model_evidence(key.underlay, key.index) {
+                if !context.relay_path_instance_has_bulk_model_evidence(instance) {
                     return None;
                 }
-                let snapshot = context.reliable_path_snapshot(key)?;
+                let snapshot = context.reliable_path_snapshot_for_instance(instance)?;
                 let score = scheduler::score_path(
                     snapshot,
                     lane,
@@ -359,14 +498,14 @@ impl RequestMultipathController {
         self.request_owner_capable_instances(remotes)
     }
 
-    pub(super) fn original_transmission_keys_for_frame(
+    pub(super) fn original_transmission_instances_for_frame(
         &self,
         frame: &Frame,
         live_instances: &[RelayPathInstance],
-    ) -> Vec<RelayPathKey> {
+    ) -> Vec<RelayPathInstance> {
         self.request
             .flights
-            .original_transmission_keys_for_frame(frame, live_instances)
+            .original_transmission_instances_for_frame(frame, live_instances)
     }
 
     pub(super) fn tail_reinjection_owner_keys(
@@ -475,7 +614,7 @@ impl RequestMultipathController {
             .iter()
             .filter(|path| path.instance() != original_path)
             .filter(|path| !self.request.stale_paths.contains(&path.instance()))
-            .filter(|path| !path.stream.output_is_terminally_closed())
+            .filter(|path| path.stream.product_admission_active())
             .map(|path| path.instance())
             .collect()
     }
@@ -496,7 +635,7 @@ impl RequestMultipathController {
         remotes.paths.iter().any(|path| {
             path.instance() != candidate
                 && !self.request.stale_paths.contains(&path.instance())
-                && !path.stream.output_is_terminally_closed()
+                && path.stream.product_admission_active()
         })
     }
 
@@ -512,8 +651,8 @@ impl RequestMultipathController {
                 .iter()
                 .filter(|path| !excluded.contains(&path.instance()))
                 .filter(|path| !self.request.stale_paths.contains(&path.instance()))
-                .filter(|path| !path.stream.output_is_terminally_closed())
-                .filter_map(|path| context.reliable_path_snapshot(path.key()))
+                .filter(|path| path.stream.product_admission_active())
+                .filter_map(|path| context.reliable_path_snapshot_for_instance(path.instance()))
                 .filter(|snapshot| allow_backup || !scheduler::path_is_backup(*snapshot))
                 .filter_map(|snapshot| {
                     scheduler::score_path(snapshot, TrafficClass::Latency, PATH_OPEN_SCORE_BYTES)
@@ -594,7 +733,7 @@ impl RequestMultipathController {
             .iter()
             .filter_map(|path| {
                 let instance = path.instance();
-                let snapshot = context.reliable_path_snapshot(instance.key)?;
+                let snapshot = context.reliable_path_snapshot_for_instance(instance)?;
                 if snapshot.state != scheduler::PathState::Active {
                     return None;
                 }
@@ -650,9 +789,9 @@ impl RequestMultipathController {
         frame: &Frame,
         lane: TrafficClass,
         cause: RelaySendCause,
-    ) -> Result<PreparedRequestMultipathDecision, RuntimeError> {
+    ) -> Result<PreparedRequestMultipathDecision, RequestMultipathPlanError> {
         if remotes.paths.is_empty() {
-            return Err(RuntimeError::ReliablePathSessionClosed);
+            return Err(RequestMultipathPlanError::OutputUnavailable);
         }
         let membership_generation = remotes.membership_generation();
         let unique_data_payload_bytes = (matches!(frame, Frame::StreamData { .. })
@@ -673,7 +812,7 @@ impl RequestMultipathController {
                 .flights
                 .has_missing_original_transmission_before_offset(offset, &remotes.path_instances())
         {
-            return Err(RuntimeError::SenderServiceBlocked);
+            return Err(RequestMultipathPlanError::ServiceBlocked);
         }
         self.next_send_index %= remotes.paths.len();
         self.reconcile_request_path_state(context, remotes);
@@ -694,28 +833,33 @@ impl RequestMultipathController {
         lane: TrafficClass,
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
-    ) -> Result<RequestMultipathPlan, RuntimeError> {
+    ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
         let prepared = self.prepare_relay_path_decision(context, remotes, frame, lane, cause)?;
-        if let Some(target) = cause.completion_tail_target()
-            && self.tail_reinjection_earlier_completion_target(context, remotes, frame, lane)
+        if let Some(target) = cause.completion_tail_target() {
+            require_active_exact_attachment(remotes, target.instance)?;
+            if self.tail_reinjection_earlier_completion_target(context, remotes, frame, lane)
                 != Some(target)
-        {
-            return Err(RuntimeError::ReliablePathSessionClosed);
+            {
+                return Err(RequestMultipathPlanError::OutputUnavailable);
+            }
         }
+        let scoring_payload_bytes = reliable_stream_frame_accounted_bytes(frame);
+        let observe_bulk_admission = prepared.unique_data_payload_bytes.is_some()
+            && lane.is_bulk()
+            && remotes.paths.len() > 1
+            && avoid_instances.is_empty();
+        let relay_observation = observe_request_relay_scheduling(
+            context,
+            remotes.stream_id(),
+            prepared.membership_generation,
+            &remotes.paths,
+            Some(frame),
+            lane,
+            scoring_payload_bytes,
+            observe_bulk_admission,
+            &self.request.stale_paths,
+        );
         if let Some(payload_bytes) = prepared.unique_data_payload_bytes {
-            let observe_bulk_admission =
-                lane.is_bulk() && remotes.paths.len() > 1 && avoid_instances.is_empty();
-            let relay_observation = observe_request_relay_scheduling(
-                context,
-                remotes.stream_id(),
-                prepared.membership_generation,
-                &remotes.paths,
-                Some(frame),
-                lane,
-                payload_bytes,
-                observe_bulk_admission,
-                &self.request.stale_paths,
-            );
             self.reconcile_request_path_state(context, remotes);
             match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
                 observation: &relay_observation,
@@ -739,7 +883,7 @@ impl RequestMultipathController {
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
-                    return Ok(selection);
+                    return selection.with_eligibility_expectation(&relay_observation, lane);
                 }
                 BulkRelayPathChoice::SelectedAckClockMeasurement {
                     candidate,
@@ -768,7 +912,7 @@ impl RequestMultipathController {
                     } else {
                         (0, 0)
                     };
-                    return Ok(RequestMultipathPlan {
+                    let selection = RequestMultipathPlan {
                         target: RequestMultipathTarget {
                             membership_generation: relay_observation.membership_generation,
                             instance: candidate,
@@ -786,7 +930,9 @@ impl RequestMultipathController {
                             candidate,
                         )?,
                         request_proof_expectation: Some(proof),
-                    });
+                        path_eligibility_expectation: SmallVec::new(),
+                    };
+                    return selection.with_eligibility_expectation(&relay_observation, lane);
                 }
                 BulkRelayPathChoice::SelectedAckClockMeasurementFence {
                     reference,
@@ -806,7 +952,7 @@ impl RequestMultipathController {
                         } else {
                             (0, 0)
                         };
-                    return Ok(RequestMultipathPlan {
+                    let selection = RequestMultipathPlan {
                         target: RequestMultipathTarget {
                             membership_generation: relay_observation.membership_generation,
                             instance: reference,
@@ -823,9 +969,13 @@ impl RequestMultipathController {
                             reference,
                         )?,
                         request_proof_expectation: None,
-                    });
+                        path_eligibility_expectation: SmallVec::new(),
+                    };
+                    return selection.with_eligibility_expectation(&relay_observation, lane);
                 }
-                BulkRelayPathChoice::Blocked => return Err(RuntimeError::SenderServiceBlocked),
+                BulkRelayPathChoice::Blocked => {
+                    return Err(blocked_attachment_set_error(remotes));
+                }
                 BulkRelayPathChoice::NotApplicable => {
                     let instance = match choose_observed_ordinary_data_path(
                         &relay_observation,
@@ -836,10 +986,10 @@ impl RequestMultipathController {
                     ) {
                         ObservedOrdinaryPathChoice::Selected(instance) => instance,
                         ObservedOrdinaryPathChoice::Blocked => {
-                            return Err(RuntimeError::SenderServiceBlocked);
+                            return Err(blocked_attachment_set_error(remotes));
                         }
                         ObservedOrdinaryPathChoice::NoLivePath => {
-                            return Err(RuntimeError::ReliablePathSessionClosed);
+                            return Err(RequestMultipathPlanError::OutputUnavailable);
                         }
                     };
                     let mut selection = RequestMultipathPlan::new(
@@ -851,7 +1001,7 @@ impl RequestMultipathController {
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
-                    return Ok(selection);
+                    return selection.with_eligibility_expectation(&relay_observation, lane);
                 }
             }
         }
@@ -868,13 +1018,14 @@ impl RequestMultipathController {
         } else {
             RequestProductSendMutation::None
         };
-        Ok(RequestMultipathPlan::new(
+        RequestMultipathPlan::new(
             RequestMultipathTarget {
                 membership_generation: prepared.membership_generation,
                 instance: remotes.paths[position].instance(),
             },
             product_mutation,
-        ))
+        )
+        .with_eligibility_expectation(&relay_observation, lane)
     }
 
     pub(super) fn commit_enqueued_request_product_send(
@@ -1641,15 +1792,17 @@ impl RequestMultipathController {
             && self.request.flights.has_recent_reinjection_on_instance(
                 frame,
                 path.instance(),
-                reliable_relay_tail_reinjection_delay(context.reliable_path_snapshot(path.key())),
+                reliable_relay_tail_reinjection_delay(
+                    context.reliable_path_snapshot_for_instance(path.instance()),
+                ),
             )
         {
             return false;
         }
 
-        let snapshot = context.reliable_path_snapshot(path.key());
+        let snapshot = context.reliable_path_snapshot_for_instance(path.instance());
         if path.key().underlay == UnderlayProtocol::Tcp
-            && context.tcp_native_drain_observed(path.key().index)
+            && context.tcp_native_drain_observed_for_instance(path.instance())
             && let Some(snapshot) = snapshot
         {
             return snapshot.bytes_in_flight == 0 && snapshot.queue_bytes == 0;
@@ -1668,13 +1821,16 @@ impl RequestMultipathController {
         lane: TrafficClass,
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
-    ) -> Result<usize, RuntimeError> {
+    ) -> Result<usize, RequestMultipathPlanError> {
         let ack_gap_reinjection = cause.is_ack_gap_reinjection();
         let completion_tail_target = cause.completion_tail_target();
         let requires_measured_reinjection_target = cause.is_persistent_ack_gap_reinjection();
         let required_client_target = cause
             .persistent_client_target()
             .or_else(|| completion_tail_target.map(|target| target.instance));
+        if let Some(required) = required_client_target {
+            require_active_exact_attachment(remotes, required)?;
+        }
         let invalid_persistent_target =
             matches!(cause, RelaySendCause::PersistentServerAckGapReinjection(_));
         let live_tail_recovery = matches!(
@@ -1683,15 +1839,19 @@ impl RequestMultipathController {
         );
         let requires_distinct_output = live_tail_recovery || ack_gap_reinjection;
         let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
-        let ordinary_path_allowed = |path: &ReliableRelayRemotePath| {
+        let operation_path_in_scope = |path: &ReliableRelayRemotePath| {
             !self.request.stale_paths.contains(&path.instance())
                 && !invalid_persistent_target
                 && required_client_target.is_none_or(|required| path.instance() == required)
-                && (completion_tail_target.is_none()
-                    || context.relay_path_instance_has_bulk_model_evidence(path.instance()))
+                && (!requires_distinct_output || !avoid_instances.contains(&path.instance()))
+        };
+        let ordinary_path_allowed = |path: &ReliableRelayRemotePath| {
+            operation_path_in_scope(path)
+                && context
+                    .reliable_path_snapshot_for_instance(path.instance())
+                    .is_some()
                 && (!requires_measured_reinjection_target
-                    || context
-                        .relay_path_has_bulk_model_evidence(path.key().underlay, path.key().index))
+                    || context.relay_path_instance_has_bulk_model_evidence(path.instance()))
         };
         let busy_reinjection_allowed = cause.permits_busy_carrier_recovery() && !live_tail_recovery;
         let carrier_reinjection_ready = |path: &ReliableRelayRemotePath, require_idle: bool| {
@@ -1711,11 +1871,7 @@ impl RequestMultipathController {
                 .filter(|(_, path)| carrier_reinjection_ready(path, require_idle))
                 .filter(|(_, path)| can_enqueue(path))
                 .filter_map(|(position, path)| {
-                    let snapshot = if completion_tail_target.is_some() {
-                        context.reliable_path_snapshot_for_instance(path.instance())?
-                    } else {
-                        context.reliable_path_snapshot(path.key())?
-                    };
+                    let snapshot = context.reliable_path_snapshot_for_instance(path.instance())?;
                     if !allow_backup && scheduler::path_is_backup(snapshot) {
                         return None;
                     }
@@ -1765,7 +1921,7 @@ impl RequestMultipathController {
                 .filter(|(_, path)| {
                     allow_backup
                         || context
-                            .reliable_path_snapshot(path.key())
+                            .reliable_path_snapshot_for_instance(path.instance())
                             .is_none_or(|snapshot| !scheduler::path_is_backup(snapshot))
                 })
                 .map(|(position, _)| position)
@@ -1790,17 +1946,21 @@ impl RequestMultipathController {
         if let Some(position) = capacity_fallback {
             return Ok(position);
         }
-        let has_eligible_path = remotes.paths.iter().any(ordinary_path_allowed);
-        let has_distinct_eligible_path = remotes
+        let has_active_eligible_path = remotes
             .paths
             .iter()
-            .any(|path| ordinary_path_allowed(path) && !avoid_instances.contains(&path.instance()));
-        if (requires_distinct_output && has_distinct_eligible_path)
-            || (!requires_distinct_output && has_eligible_path)
+            .any(|path| ordinary_path_allowed(path) && path.stream.product_admission_active());
+        if has_active_eligible_path {
+            return Err(RequestMultipathPlanError::ServiceBlocked);
+        }
+        if remotes
+            .paths
+            .iter()
+            .any(|path| operation_path_in_scope(path) && !path.stream.product_admission_active())
         {
-            Err(RuntimeError::SenderServiceBlocked)
+            Err(RequestMultipathPlanError::OrderedTerminalPending)
         } else {
-            Err(RuntimeError::ReliablePathSessionClosed)
+            Err(RequestMultipathPlanError::OutputUnavailable)
         }
     }
 }

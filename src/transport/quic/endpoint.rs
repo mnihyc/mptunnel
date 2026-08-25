@@ -244,6 +244,10 @@ impl Connection {
         })
     }
 
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
         let stream = self.presentation.open().await?;
         let known_datagram_flows = Arc::new(std::sync::Mutex::new(DatagramFlowRegistry::new(

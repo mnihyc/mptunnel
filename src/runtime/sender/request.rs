@@ -4,7 +4,7 @@
 //! observe/intent/apply scheduling cycle. TCP keeps its portable fallback;
 //! QUIC path use is gated by validation and native writer backpressure.
 
-use self::multipath::RequestMultipathController;
+use self::multipath::{RequestMultipathController, RequestMultipathPlanError};
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
     CarrierEmitMode, ClientReinjectionOutputIdentity, RelaySendCause, RelaySendOutcome,
@@ -614,20 +614,6 @@ impl RequestSenderService {
     ) -> Result<(RelayPathInstance, usize), RuntimeError> {
         let mut last_error = None;
         while !remotes.paths.is_empty() {
-            if let Some(instance) = remotes
-                .paths
-                .iter()
-                .find(|path| path.stream.output_is_terminally_closed())
-                .map(|path| path.instance())
-            {
-                // Capacity and closure are different scheduling facts. Retire
-                // a dead carrier before fallback can hide its owner debt.
-                last_error = Some(RuntimeError::ReliablePathSessionClosed);
-                self.fail_client_path_instance(context, remotes, instance)
-                    .await;
-                self.multipath.normalize_cursor(remotes.paths.len());
-                continue;
-            }
             let stream_lane = remotes
                 .paths
                 .last()
@@ -643,10 +629,15 @@ impl RequestSenderService {
                 avoid_instances,
             ) {
                 Ok(plan) => plan,
-                Err(RuntimeError::SenderServiceBlocked) => {
+                Err(
+                    RequestMultipathPlanError::ServiceBlocked
+                    | RequestMultipathPlanError::OrderedTerminalPending,
+                ) => {
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
-                Err(err) => return Err(last_error.unwrap_or(err)),
+                Err(RequestMultipathPlanError::OutputUnavailable) => {
+                    return Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed));
+                }
             };
             let (membership_generation, instance) = plan.target();
             let Some(position) =
@@ -728,6 +719,20 @@ impl RequestSenderService {
                     cause.is_reinjection(),
                 ) {
                     Ok(command) => {
+                        if !plan.target_retains_exact_eligibility(context, selection_lane) {
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "request_path_apply",
+                                format_args!(
+                                    "phase=exact_eligibility_stale stream_id={} underlay={:?} path_index={} instance_id={}",
+                                    self.multipath.stream_id().0,
+                                    instance.key.underlay,
+                                    instance.key.index,
+                                    instance.attachment_id,
+                                ),
+                            );
+                            return Err(RuntimeError::SenderServiceBlocked);
+                        }
                         if let Some(claim) = request_load_claim {
                             // The exact path owns the lease after queue
                             // reservation and before carrier publication; path
@@ -763,10 +768,13 @@ impl RequestSenderService {
                 Ok(payload_bytes) => {
                     return Ok((instance, payload_bytes));
                 }
-                Err(RuntimeError::SenderServiceBlocked) => {
+                Err(
+                    RequestFrameAdmissionError::ServiceBlocked
+                    | RequestFrameAdmissionError::OrderedTerminalPending,
+                ) => {
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
-                Err(err) => {
+                Err(RequestFrameAdmissionError::Runtime(err)) => {
                     last_error = Some(err);
                     self.fail_client_path_instance(context, remotes, instance)
                         .await;
@@ -785,18 +793,11 @@ impl RequestSenderService {
         progress: &mut ReliableRecvProgress,
         request: RelayRecvProgressSend,
     ) -> Result<bool, RuntimeError> {
-        let closed_outputs = remotes
-            .paths
-            .iter()
-            .filter(|path| path.stream.request_control_frame_queue_is_closed())
-            .map(|path| path.instance())
-            .collect::<Vec<_>>();
-        for instance in closed_outputs {
-            self.fail_client_path_instance(context, remotes, instance)
-                .await;
-        }
         if !remotes.has_receive_feedback_output() {
-            return Err(RuntimeError::ReliablePathSessionClosed);
+            // Closed command admission is not attachment-removal authority.
+            // Preserve cumulative feedback until the ordered carrier terminal
+            // event removes this exact attachment or a successor accepts it.
+            return Ok(false);
         }
 
         let mut sent_any = false;
@@ -982,11 +983,11 @@ impl RequestSenderService {
             return false;
         }
         let reinjection_limit = reliable_critical_tail_reinjection_limit_bytes(
-            live_keys
+            live_instances
                 .iter()
-                .map(|key| {
+                .map(|instance| {
                     adaptive_reliable_relay_reinjection_bytes(
-                        context.reliable_path_snapshot(*key),
+                        context.reliable_path_snapshot_for_instance(*instance),
                         lane,
                         context.mux_limits,
                     )
@@ -1008,9 +1009,13 @@ impl RequestSenderService {
         );
         let mut queued = false;
         for frame in reinjection_frames {
-            let expected_owner_keys = self
+            let expected_owner_instances = self
                 .multipath
-                .original_transmission_keys_for_frame(&frame, &live_instances);
+                .original_transmission_instances_for_frame(&frame, &live_instances);
+            let expected_owner_keys = expected_owner_instances
+                .iter()
+                .map(|instance| instance.key)
+                .collect::<Vec<_>>();
             if expected_owner_keys.is_empty()
                 || !live_keys
                     .iter()
@@ -1018,10 +1023,12 @@ impl RequestSenderService {
             {
                 break;
             }
-            let first_reinjection_after = expected_owner_keys
+            let first_reinjection_after = expected_owner_instances
                 .iter()
-                .map(|key| {
-                    reliable_relay_tail_reinjection_delay(context.reliable_path_snapshot(*key))
+                .map(|instance| {
+                    reliable_relay_tail_reinjection_delay(
+                        context.reliable_path_snapshot_for_instance(*instance),
+                    )
                 })
                 .max()
                 .unwrap_or_default();
@@ -1084,11 +1091,7 @@ impl RequestSenderService {
     ) -> RequestPathRecoveryOutcome {
         let mut outcome = RequestPathRecoveryOutcome::default();
         for original_instance in self.multipath.request_recovery_original_paths(remotes) {
-            let original_snapshot = if remotes.contains_path_instance(original_instance) {
-                context.reliable_path_snapshot(original_instance.key)
-            } else {
-                context.reliable_path_snapshot_for_instance(original_instance)
-            };
+            let original_snapshot = context.reliable_path_snapshot_for_instance(original_instance);
             let retry_after = reliable_data_retransmission_interval(
                 Some(original_instance.key.underlay),
                 original_snapshot,
@@ -1227,7 +1230,8 @@ fn emit_request_frame_with_mode(
 ) -> Result<(), RuntimeError> {
     let commands = fixed_request_output_commands(&stream.output)?;
     let reservation =
-        reserve_request_frame_with_mode(commands, frame, lane, emit_mode, reinjection)?;
+        reserve_request_frame_with_mode(commands, frame, lane, emit_mode, reinjection)
+            .map_err(RequestFrameAdmissionError::into_runtime)?;
     reservation.commit();
     Ok(())
 }
@@ -1249,14 +1253,50 @@ fn reserve_request_frame_with_mode<'a>(
     lane: TrafficClass,
     emit_mode: CarrierEmitMode,
     reinjection: bool,
-) -> Result<ReliablePathFrameReservation<'a>, RuntimeError> {
-    if reinjection {
+) -> Result<ReliablePathFrameReservation<'a>, RequestFrameAdmissionError> {
+    let result = if reinjection {
         commands.try_reserve_reinjection_frame(frame, lane)
     } else {
         emit_mode.try_reserve_frame(commands, frame, lane)
+    };
+    result.map_err(RequestFrameAdmissionError::from_runtime)
+}
+
+/// Request-local classification of synchronous command admission.
+///
+/// At this boundary the caller still owns a generation-fenced exact attachment,
+/// so a closed command pipe means its ordered terminal is pending rather than
+/// that Product membership is already absent.
+#[derive(Debug)]
+enum RequestFrameAdmissionError {
+    ServiceBlocked,
+    OrderedTerminalPending,
+    Runtime(RuntimeError),
+}
+
+impl RequestFrameAdmissionError {
+    fn from_runtime(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::SenderServiceBlocked => Self::ServiceBlocked,
+            RuntimeError::ReliablePathSessionClosed => Self::OrderedTerminalPending,
+            error => Self::Runtime(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_runtime(self) -> RuntimeError {
+        match self {
+            Self::ServiceBlocked => RuntimeError::SenderServiceBlocked,
+            Self::OrderedTerminalPending => RuntimeError::ReliablePathSessionClosed,
+            Self::Runtime(error) => error,
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "tests_request.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_c3_common.rs"]
+mod tests_c3_common;

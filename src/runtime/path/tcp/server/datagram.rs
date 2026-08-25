@@ -3,11 +3,9 @@
 //! The carrier owns flow membership and wire replies; accepted target workers
 //! and their policy lifetime arrive through the neutral datagram port.
 
-use crate::product::PrincipalPermit;
 use crate::protocol::frame::datagram_feedback_range;
-use crate::protocol::{DatagramFlowId, DatagramId, Frame, SessionId, TargetAddr};
+use crate::protocol::{DatagramFlowId, DatagramId, Frame};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, ServerDatagramOpenFailure, ServerDatagramOpenRequest,
@@ -41,12 +39,9 @@ impl ServerTcpDatagramState {
     pub(in crate::runtime::path::tcp) async fn open(
         &mut self,
         context: &ServerPathContext,
-        commands: &ReliablePathCommandSender,
-        session_id: SessionId,
-        principal_permit: PrincipalPermit,
-        flow_id: DatagramFlowId,
-        target: TargetAddr,
+        request: ServerDatagramOpenRequest,
     ) -> Result<ServerTcpDatagramEffect, RuntimeError> {
+        let flow_id = request.flow_id;
         if self.flows.iter().any(|flow| flow.flow_id() == flow_id) {
             return Err(RuntimeError::Protocol("duplicate TCP datagram flow"));
         }
@@ -61,16 +56,7 @@ impl ServerTcpDatagramState {
         let datagrams = context.datagrams.as_ref().ok_or(RuntimeError::Protocol(
             "L4 datagram service is unavailable for this MPP inbound",
         ))?;
-        let flow = match datagrams
-            .open(ServerDatagramOpenRequest {
-                session_id,
-                principal_permit,
-                flow_id,
-                target,
-                commands: commands.clone(),
-            })
-            .await
-        {
+        let flow = match datagrams.open(request).await {
             Ok(flow) => flow,
             Err(failure) => match failure.into_failure() {
                 ServerDatagramOpenFailure::Capacity => {

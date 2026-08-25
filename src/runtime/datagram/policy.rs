@@ -44,8 +44,13 @@ pub(in crate::runtime) fn datagram_remaining_ttl_ms(expires_at: tokio::time::Ins
 }
 
 pub(in crate::runtime) enum DatagramPathSendError {
-    PayloadLimitExceeded { limit: usize },
+    PayloadLimitExceeded {
+        limit: usize,
+    },
     Timeout,
+    /// QUIC Product-open settlement already applied its endpoint/exact scope.
+    /// The association may reselect, but must not publish a second failure.
+    UdpPathOpen(RuntimeError),
     Runtime(RuntimeError),
 }
 

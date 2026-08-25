@@ -24,7 +24,9 @@ use crate::runtime::path::{
     ServerPathContext,
 };
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusResult};
-use crate::runtime::telemetry::{ActiveProductFlowSnapshot, ProductFlowId, ProductFlowOriginKind};
+use crate::runtime::telemetry::{
+    ActiveProductFlowSnapshot, ProductFlowId, ProductFlowOriginKind, ProductFlowSourceKind,
+};
 use crate::scheduler::{PathSnapshot, PathState as SchedulerPathState};
 use crate::transport::PathSpec;
 use std::collections::BTreeMap;
@@ -98,6 +100,7 @@ pub(super) fn collect_snapshot(
             "mpp_outbound",
             index,
             service_name,
+            PeerPathIdentitySource::Client(context),
         ));
     }
     for (index, context) in target.servers.iter().enumerate() {
@@ -120,6 +123,7 @@ pub(super) fn collect_snapshot(
             "mpp_inbound",
             index,
             Some(context.name.clone()),
+            PeerPathIdentitySource::Server(context),
         ));
     }
     telemetry.add(target.product_telemetry.snapshot(), now);
@@ -323,13 +327,72 @@ fn latest_peer_results(
     service: &'static str,
     service_index: usize,
     service_name: Option<String>,
+    identity_source: PeerPathIdentitySource<'_>,
 ) -> Vec<ManagementPeerStatusResult> {
     broker
         .session_ids()
         .into_iter()
         .filter_map(|session_id| broker.latest(session_id))
-        .map(|result| peer_status_result(result, service, service_index, service_name.clone()))
+        .map(|result| {
+            peer_status_result(
+                result,
+                service,
+                service_index,
+                service_name.clone(),
+                identity_source,
+            )
+        })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PeerPathIdentitySource<'a> {
+    Client(&'a ClientPathContext),
+    Server(&'a ServerPathContext),
+}
+
+#[derive(Debug)]
+struct LocalPeerPathIdentity {
+    path: String,
+    endpoint: String,
+}
+
+impl PeerPathIdentitySource<'_> {
+    fn resolve(
+        self,
+        underlay: UnderlayProtocol,
+        local_index: usize,
+    ) -> Option<LocalPeerPathIdentity> {
+        match self {
+            Self::Client(context) => {
+                let (path, spec) = match underlay {
+                    UnderlayProtocol::Tcp => (
+                        context.tcp_path_name(local_index)?.to_string(),
+                        context.tcp_path_spec(local_index)?,
+                    ),
+                    UnderlayProtocol::Udp => (
+                        context.udp_path_name(local_index)?.to_string(),
+                        context.udp_paths.get(local_index)?,
+                    ),
+                };
+                Some(LocalPeerPathIdentity {
+                    path,
+                    endpoint: path_endpoint(spec),
+                })
+            }
+            Self::Server(context) => {
+                let path = context.configured_path_names.get(local_index)?.clone();
+                let spec = context.server_paths.get(local_index)?;
+                if spec.underlay != underlay {
+                    return None;
+                }
+                Some(LocalPeerPathIdentity {
+                    path,
+                    endpoint: path_endpoint(spec),
+                })
+            }
+        }
+    }
 }
 
 pub(super) fn peer_status_result(
@@ -337,9 +400,17 @@ pub(super) fn peer_status_result(
     service: &'static str,
     service_index: usize,
     service_name: Option<String>,
+    identity_source: PeerPathIdentitySource<'_>,
 ) -> ManagementPeerStatusResult {
-    let received_unix_ms = result
-        .received_at
+    let PeerStatusResult {
+        session_id,
+        request_id,
+        code,
+        paths,
+        local_path_indices,
+        received_at,
+    } = result;
+    let received_unix_ms = received_at
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
             duration.as_millis().min(u64::MAX as u128) as u64
@@ -348,35 +419,44 @@ pub(super) fn peer_status_result(
         service,
         service_index,
         service_name,
-        session_id: result.session_id.0.to_string(),
-        request_id: result.request_id.to_string(),
-        code: peer_status_code_name(result.code),
+        session_id: session_id.0.to_string(),
+        request_id: request_id.to_string(),
+        code: peer_status_code_name(code),
         received_unix_ms,
-        paths: result
-            .paths
+        paths: paths
             .into_iter()
-            .map(|path| ManagementPeerPathStatus {
-                state: peer_path_state_name(path.state),
-                usage: path_usage_name(path.usage),
-                path_id: path.metrics.path_id.0.to_string(),
-                underlay: underlay_name(path.metrics.underlay),
-                direction: metric_direction_name(path.metrics.direction),
-                metric_epoch: path.metrics.metric_epoch.to_string(),
-                metric_age_us: path.metrics.metric_age_us,
-                srtt_us: path.metrics.srtt_us,
-                rttvar_us: path.metrics.rttvar_us,
-                jitter_us: path.metrics.jitter_us,
-                delivery_rate_bps: path.metrics.delivery_rate_bps.to_string(),
-                pacing_rate_bps: path.metrics.pacing_rate_bps.to_string(),
-                loss_ppm: path.metrics.loss_ppm,
-                ecn_ppm: path.metrics.ecn_ppm,
-                bytes_in_flight: path.metrics.bytes_in_flight.to_string(),
-                queue_bytes: path.metrics.queue_bytes.to_string(),
-                inflight_limit_bytes: path.metrics.inflight_limit_bytes.to_string(),
-                confidence_ppm: path.metrics.confidence_ppm,
-                app_limited: path.metrics.app_limited,
-                data_sample_count: path.metrics.data_sample_count,
-                data_sample_bytes: path.metrics.data_sample_bytes.to_string(),
+            .map(|path| {
+                let identity = local_path_indices
+                    .get(&(path.metrics.underlay, path.metrics.path_id))
+                    .copied()
+                    .and_then(|local_index| {
+                        identity_source.resolve(path.metrics.underlay, local_index)
+                    });
+                ManagementPeerPathStatus {
+                    state: peer_path_state_name(path.state),
+                    usage: path_usage_name(path.usage),
+                    path: identity.as_ref().map(|identity| identity.path.clone()),
+                    endpoint: identity.map(|identity| identity.endpoint),
+                    path_id: path.metrics.path_id.0.to_string(),
+                    underlay: underlay_name(path.metrics.underlay),
+                    direction: metric_direction_name(path.metrics.direction),
+                    metric_epoch: path.metrics.metric_epoch.to_string(),
+                    metric_age_us: path.metrics.metric_age_us,
+                    srtt_us: path.metrics.srtt_us,
+                    rttvar_us: path.metrics.rttvar_us,
+                    jitter_us: path.metrics.jitter_us,
+                    delivery_rate_bps: path.metrics.delivery_rate_bps.to_string(),
+                    pacing_rate_bps: path.metrics.pacing_rate_bps.to_string(),
+                    loss_ppm: path.metrics.loss_ppm,
+                    ecn_ppm: path.metrics.ecn_ppm,
+                    bytes_in_flight: path.metrics.bytes_in_flight.to_string(),
+                    queue_bytes: path.metrics.queue_bytes.to_string(),
+                    inflight_limit_bytes: path.metrics.inflight_limit_bytes.to_string(),
+                    confidence_ppm: path.metrics.confidence_ppm,
+                    app_limited: path.metrics.app_limited,
+                    data_sample_count: path.metrics.data_sample_count,
+                    data_sample_bytes: path.metrics.data_sample_bytes.to_string(),
+                }
             })
             .collect(),
     }
@@ -821,26 +901,33 @@ fn collect_server(
     }
 }
 
-pub(super) fn flow_status(flow: ActiveProductFlowSnapshot, now: Instant) -> ManagementFlowStatus {
+pub(super) fn flow_status(
+    flow: ActiveProductFlowSnapshot,
+    now: Instant,
+) -> Option<ManagementFlowStatus> {
+    let origin = flow.origin.as_ref()?;
     let flow_kind = match flow.flow_id {
         ProductFlowId::Reliable(_) | ProductFlowId::NativeReliable => "reliable",
         ProductFlowId::Datagram(_) | ProductFlowId::NativeDatagram => "datagram",
     };
-    let (inbound_kind, inbound) = flow.origin.as_ref().map_or((None, None), |origin| {
-        let kind = match origin.kind {
-            ProductFlowOriginKind::LocalInbound => "local",
-            ProductFlowOriginKind::MppInbound => "mpp",
-        };
-        (Some(kind), Some(origin.inbound.as_str().to_string()))
-    });
+    let inbound_kind = match origin.kind {
+        ProductFlowOriginKind::LocalInbound => "local",
+        ProductFlowOriginKind::MppInbound => "mpp",
+    };
+    let source_kind = match origin.source.kind {
+        ProductFlowSourceKind::LocalPeer => "local_peer",
+        ProductFlowSourceKind::MppCarrierPeer => "mpp_carrier_peer",
+    };
     let selection = flow.selection.as_ref();
-    ManagementFlowStatus {
+    Some(ManagementFlowStatus {
         session_id: flow.session_id.map(|id| id.0.to_string()),
         flow_kind,
         flow_id: flow.display_id.to_string(),
         network: network_name(flow.network),
         inbound_kind,
-        inbound,
+        inbound: origin.inbound.as_str().to_string(),
+        source_kind,
+        source: origin.source.endpoint.to_string(),
         outbound: selection.map(|selection| selection.outbound.as_str().to_string()),
         balancer: selection
             .and_then(|selection| selection.balancer.as_ref())
@@ -860,7 +947,7 @@ pub(super) fn flow_status(flow: ActiveProductFlowSnapshot, now: Instant) -> Mana
             from_peer_bytes: flow.io.from_peer_bytes,
             from_peer_packets: flow.io.from_peer_packets,
         }),
-    }
+    })
 }
 
 const fn network_name(network: Network) -> &'static str {

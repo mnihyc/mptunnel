@@ -22,9 +22,23 @@ pub(in crate::runtime) type EncryptedTcpWriter = EncryptedFramedWriter<TcpStream
 /// Decouples socket reads from actor work while preserving frame order and the
 /// first terminal transport error.
 pub(in crate::runtime) fn spawn_encrypted_tcp_reader(
-    mut reader: EncryptedTcpReader,
+    reader: EncryptedTcpReader,
     queue_size: usize,
 ) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>> {
+    spawn_encrypted_tcp_reader_with_observer(reader, queue_size, |_| {})
+}
+
+/// Observes one completely authenticated and decoded frame before bounded
+/// actor delivery. Session-wide terminal publication uses this boundary so a
+/// blocked ordered writer cannot defer a peer SESSION_CLOSE behind its write.
+pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_observer<Observe>(
+    mut reader: EncryptedTcpReader,
+    queue_size: usize,
+    mut observe: Observe,
+) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>
+where
+    Observe: FnMut(&Frame) + Send + 'static,
+{
     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
     tokio::spawn(async move {
         loop {
@@ -32,6 +46,9 @@ pub(in crate::runtime) fn spawn_encrypted_tcp_reader(
                 _ = frames_tx.closed() => break,
                 frame = reader.read_frame() => frame,
             };
+            if let Ok(frame) = frame.as_ref() {
+                observe(frame);
+            }
             let done = frame.is_err();
             #[cfg(feature = "lab-diagnostics")]
             let bytes = frame

@@ -73,6 +73,10 @@ async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
         .expect("crossing settlement control remains ordered after the application fence");
     receivers.close_for_path_drain();
     assert!(commands.is_closed(), "path drain stops all queue admission");
+    assert!(
+        !commands.is_terminal(),
+        "closed drain admission is not unexpected carrier failure"
+    );
     let mut draining = Box::pin(recv_reliable_path_command_during_drain(&mut receivers));
     let control = draining
         .as_mut()
@@ -111,6 +115,9 @@ async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
             .is_none(),
         "terminal drain follows every accepted queue reservation"
     );
+    assert!(receivers.finish_planned_path_retirement());
+    assert!(commands.is_terminal());
+    assert!(commands.is_planned_retirement());
 }
 
 #[tokio::test]

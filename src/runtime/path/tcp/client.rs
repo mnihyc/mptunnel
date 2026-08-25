@@ -26,10 +26,11 @@ use self::session::{
 };
 pub(in crate::runtime) use self::state::ClientTcpPathSessionRuntime;
 use self::stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
-use crate::model::path::CarrierPathInstanceId;
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::performance::ResourceLimits;
 use crate::protocol::{
     CloseReason, Frame, IpPacketId, IpTunnelId, PathId, StreamDemandHint, StreamId, TargetAddr,
+    UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -64,6 +65,11 @@ impl ClientTcpIpTunnelAttachment {
         &self,
         open_deadline: tokio::time::Instant,
     ) -> Result<(), RuntimeError> {
+        self.handle
+            .runtime
+            .state
+            .session_lifecycle()
+            .ensure_active()?;
         if !self.is_current() {
             return Err(RuntimeError::ReliablePathRetired);
         }
@@ -92,6 +98,11 @@ impl ClientTcpIpTunnelAttachment {
         packet_id: IpPacketId,
         payload: Bytes,
     ) -> Result<(), RuntimeError> {
+        self.handle
+            .runtime
+            .state
+            .session_lifecycle()
+            .ensure_active()?;
         if !self.is_current() {
             return Err(RuntimeError::ReliablePathRetired);
         }
@@ -211,7 +222,44 @@ impl ClientTcpPathSessionHandle {
         }
     }
 
+    async fn complete_session_operation<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, RuntimeError>>,
+    ) -> Result<T, RuntimeError> {
+        let retirement = self.runtime.state.session_retirement().wait();
+        tokio::pin!(retirement);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            reason = &mut retirement => Err(RuntimeError::RemoteClosed(reason)),
+            result = &mut operation => match self.runtime.state.session_lifecycle().reason() {
+                Some(reason) => Err(RuntimeError::RemoteClosed(reason)),
+                None => result,
+            },
+        }
+    }
+
     pub(in crate::runtime) async fn open_stream_with_deadlines(
+        &self,
+        stream_id: StreamId,
+        target: TargetAddr,
+        lane: TrafficClass,
+        initial_demand: StreamDemandHint,
+        open_deadlines: ClientTcpOpenDeadlines,
+        advertised_recv_max_offset: u64,
+    ) -> Result<ClientTcpOpenedStream, RuntimeError> {
+        self.complete_session_operation(self.open_stream_with_deadlines_active(
+            stream_id,
+            target,
+            lane,
+            initial_demand,
+            open_deadlines,
+            advertised_recv_max_offset,
+        ))
+        .await
+    }
+
+    async fn open_stream_with_deadlines_active(
         &self,
         stream_id: StreamId,
         target: TargetAddr,
@@ -275,7 +323,17 @@ impl ClientTcpPathSessionHandle {
             match response {
                 ClientTcpOpenResponse::Opened(opened) => {
                     cancellation.disarm();
-                    return Ok(opened);
+                    if self
+                        .try_commit_opened_stream(session.path_id, opened.carrier.path_instance_id)
+                    {
+                        return Ok(opened);
+                    }
+                    // The actor accepted the stream on N, but exact native
+                    // failure published N+1 before this owner received the
+                    // response. Retire only N's accepted attachment and retry
+                    // within the existing setup deadline.
+                    let _ = opened.carrier.retire_uncommitted();
+                    continue;
                 }
                 ClientTcpOpenResponse::RejectedWithoutOpen(_)
                     if !self.session_slot_is_current(session.path_id) =>
@@ -299,6 +357,17 @@ impl ClientTcpPathSessionHandle {
 
     /// Registers a product-datagram route on this path's existing TCP actor.
     pub(in crate::runtime) async fn open_datagram_attachment(
+        &self,
+        open_deadline: tokio::time::Instant,
+        frame_queue: usize,
+    ) -> Result<ClientTcpDatagramAttachment, RuntimeError> {
+        self.complete_session_operation(
+            self.open_datagram_attachment_active(open_deadline, frame_queue),
+        )
+        .await
+    }
+
+    async fn open_datagram_attachment_active(
         &self,
         open_deadline: tokio::time::Instant,
         frame_queue: usize,
@@ -374,6 +443,17 @@ impl ClientTcpPathSessionHandle {
         tunnel_id: IpTunnelId,
         open_deadline: tokio::time::Instant,
     ) -> Result<ClientTcpIpTunnelAttachment, RuntimeError> {
+        self.complete_session_operation(
+            self.prepare_ip_tunnel_attachment_active(tunnel_id, open_deadline),
+        )
+        .await
+    }
+
+    async fn prepare_ip_tunnel_attachment_active(
+        &self,
+        tunnel_id: IpTunnelId,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<ClientTcpIpTunnelAttachment, RuntimeError> {
         let mut changes = self.runtime.carrier_groups.subscribe();
         loop {
             let (session, observed_instance) = self
@@ -418,6 +498,23 @@ impl ClientTcpPathSessionHandle {
         endpoint_generation: u64,
         remote_port: Option<u16>,
     ) -> Result<Option<Duration>, RuntimeError> {
+        self.complete_session_operation(
+            self.prepare_connection_for_endpoint_generation_on_port_active(
+                open_deadline,
+                endpoint_generation,
+                remote_port,
+            ),
+        )
+        .await
+    }
+
+    async fn prepare_connection_for_endpoint_generation_on_port_active(
+        &self,
+        open_deadline: tokio::time::Instant,
+        endpoint_generation: u64,
+        remote_port: Option<u16>,
+    ) -> Result<Option<Duration>, RuntimeError> {
+        self.runtime.state.session_lifecycle().ensure_active()?;
         if !self.runtime.endpoint_policy.allows(endpoint_generation) {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
@@ -455,6 +552,21 @@ impl ClientTcpPathSessionHandle {
         endpoint_generation: u64,
         remote_port: u16,
     ) -> Result<ClientTcpCarrierReplacement, RuntimeError> {
+        self.complete_session_operation(self.replace_connection_for_endpoint_generation_active(
+            open_deadline,
+            endpoint_generation,
+            remote_port,
+        ))
+        .await
+    }
+
+    async fn replace_connection_for_endpoint_generation_active(
+        &self,
+        open_deadline: tokio::time::Instant,
+        endpoint_generation: u64,
+        remote_port: u16,
+    ) -> Result<ClientTcpCarrierReplacement, RuntimeError> {
+        self.runtime.state.session_lifecycle().ensure_active()?;
         if !self.runtime.endpoint_policy.allows(endpoint_generation) {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
@@ -516,39 +628,46 @@ impl ClientTcpPathSessionHandle {
 
         let promoted = self
             .runtime
-            .endpoint_policy
-            .with_current(endpoint_generation, || {
-                let mut member = self.member.lock().expect("TCP carrier member lock");
-                if !member.successor_establishing
-                    || member.current.as_ref().map(|slot| slot.path_id) != Some(predecessor.path_id)
-                {
-                    return false;
-                }
-                if !publish_client_tcp_replacement_connection_committed(
-                    &runtime,
-                    &mut connection,
-                    expected_instance,
-                    Some(readiness_rtt),
-                    |path_instance_id, selected_port| {
-                        let current = self.ready_carrier_instance.load(Ordering::Acquire);
-                        assert!(
-                            current == 0 || current == expected_instance.as_u64(),
-                            "carrier member cannot publish two concurrent successors"
-                        );
-                        self.ready_carrier_instance
-                            .store(path_instance_id.as_u64(), Ordering::Release);
-                        self.ready_remote_port
-                            .store(u32::from(selected_port), Ordering::Release);
-                        member.retiring_predecessor = Some(predecessor.clone());
-                        member.current = Some(successor.clone());
-                        member.successor_establishing = false;
-                        self.runtime.carrier_groups.publish_change();
-                    },
-                ) {
-                    return false;
-                }
-                true
+            .state
+            .session_lifecycle()
+            .commit_if_active(|| {
+                self.runtime
+                    .endpoint_policy
+                    .with_current(endpoint_generation, || {
+                        let mut member = self.member.lock().expect("TCP carrier member lock");
+                        if !member.successor_establishing
+                            || member.current.as_ref().map(|slot| slot.path_id)
+                                != Some(predecessor.path_id)
+                        {
+                            return false;
+                        }
+                        if !publish_client_tcp_replacement_connection_committed(
+                            &runtime,
+                            &mut connection,
+                            expected_instance,
+                            Some(readiness_rtt),
+                            |path_instance_id, selected_port| {
+                                let current = self.ready_carrier_instance.load(Ordering::Acquire);
+                                assert!(
+                                    current == 0 || current == expected_instance.as_u64(),
+                                    "carrier member cannot publish two concurrent successors"
+                                );
+                                self.ready_carrier_instance
+                                    .store(path_instance_id.as_u64(), Ordering::Release);
+                                self.ready_remote_port
+                                    .store(u32::from(selected_port), Ordering::Release);
+                                member.retiring_predecessor = Some(predecessor.clone());
+                                member.current = Some(successor.clone());
+                                member.successor_establishing = false;
+                                self.runtime.carrier_groups.publish_change();
+                            },
+                        ) {
+                            return false;
+                        }
+                        true
+                    })
             })
+            .map_err(RuntimeError::RemoteClosed)?
             .unwrap_or(false);
         if !promoted {
             return Err(RuntimeError::NoSchedulableTcpPath);
@@ -599,9 +718,9 @@ impl ClientTcpPathSessionHandle {
     }
 
     pub(in crate::runtime) fn begin_path_drain(&self) {
+        let mut member = self.member.lock().expect("TCP carrier member lock");
         self.ready_carrier_instance.store(0, Ordering::Release);
         self.ready_remote_port.store(0, Ordering::Release);
-        let mut member = self.member.lock().expect("TCP carrier member lock");
         clear_terminal_tcp_predecessor(&mut member);
         if let Some(session) = member.current.as_ref()
             && !session.terminal.load(Ordering::Acquire)
@@ -622,6 +741,7 @@ impl ClientTcpPathSessionHandle {
         &self,
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
+        let mut member = self.member.lock().expect("TCP carrier member lock");
         if self
             .ready_carrier_instance
             .compare_exchange(
@@ -635,7 +755,6 @@ impl ClientTcpPathSessionHandle {
             return false;
         }
         self.ready_remote_port.store(0, Ordering::Release);
-        let mut member = self.member.lock().expect("TCP carrier member lock");
         clear_terminal_tcp_predecessor(&mut member);
         let Some(current) = member
             .current
@@ -651,6 +770,9 @@ impl ClientTcpPathSessionHandle {
     }
 
     pub(in crate::runtime) fn can_plan_replacement(&self) -> bool {
+        if self.runtime.state.session_lifecycle().reason().is_some() {
+            return false;
+        }
         let mut member = self.member.lock().expect("TCP carrier member lock");
         clear_terminal_tcp_predecessor(&mut member);
         !member.successor_establishing
@@ -662,6 +784,9 @@ impl ClientTcpPathSessionHandle {
     }
 
     pub(in crate::runtime) fn can_establish(&self) -> bool {
+        if self.runtime.state.session_lifecycle().reason().is_some() {
+            return false;
+        }
         let member = self.member.lock().expect("TCP carrier member lock");
         member
             .current
@@ -690,40 +815,46 @@ impl ClientTcpPathSessionHandle {
         endpoint_generation: u64,
     ) -> Result<bool, RuntimeError> {
         self.runtime
-            .endpoint_policy
-            .with_current(endpoint_generation, || {
-                let mut member = self.member.lock().expect("TCP carrier member lock");
-                clear_terminal_tcp_predecessor(&mut member);
-                let Some(current) = member
-                    .current
-                    .as_ref()
-                    .filter(|slot| !slot.terminal.load(Ordering::Acquire))
-                    .cloned()
-                else {
-                    return false;
-                };
-                if member.successor_establishing || member.retiring_predecessor.is_some() {
-                    return false;
-                }
-                let Some(path_instance_id) = self.connection_instance_id() else {
-                    return false;
-                };
-                if !self
-                    .runtime
-                    .state
-                    .begin_tcp_replacement_if_product_quiescent(
-                        self.runtime.path_index,
-                        path_instance_id,
-                    )
-                {
-                    return false;
-                }
-                self.ready_carrier_instance.store(0, Ordering::Release);
-                self.ready_remote_port.store(0, Ordering::Release);
-                self.runtime.carrier_groups.publish_change();
-                current.commands.begin_path_drain();
-                true
+            .state
+            .session_lifecycle()
+            .commit_if_active(|| {
+                self.runtime
+                    .endpoint_policy
+                    .with_current(endpoint_generation, || {
+                        let mut member = self.member.lock().expect("TCP carrier member lock");
+                        clear_terminal_tcp_predecessor(&mut member);
+                        let Some(current) = member
+                            .current
+                            .as_ref()
+                            .filter(|slot| !slot.terminal.load(Ordering::Acquire))
+                            .cloned()
+                        else {
+                            return false;
+                        };
+                        if member.successor_establishing || member.retiring_predecessor.is_some() {
+                            return false;
+                        }
+                        let Some(path_instance_id) = self.connection_instance_id() else {
+                            return false;
+                        };
+                        if !self
+                            .runtime
+                            .state
+                            .begin_tcp_replacement_if_product_quiescent(
+                                self.runtime.path_index,
+                                path_instance_id,
+                            )
+                        {
+                            return false;
+                        }
+                        self.ready_carrier_instance.store(0, Ordering::Release);
+                        self.ready_remote_port.store(0, Ordering::Release);
+                        self.runtime.carrier_groups.publish_change();
+                        current.commands.begin_path_drain();
+                        true
+                    })
             })
+            .map_err(RuntimeError::RemoteClosed)?
             .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 
@@ -733,6 +864,7 @@ impl ClientTcpPathSessionHandle {
         deadline: tokio::time::Instant,
     ) -> Result<(ClientTcpPathSessionSlot, u64), RuntimeError> {
         loop {
+            self.runtime.state.session_lifecycle().ensure_active()?;
             if !self.runtime.endpoint_policy.snapshot().enabled {
                 return Err(RuntimeError::NoSchedulableTcpPath);
             }
@@ -771,50 +903,82 @@ impl ClientTcpPathSessionHandle {
             .is_some_and(|slot| slot.path_id == path_id && !slot.terminal.load(Ordering::Acquire))
     }
 
+    /// Commits an accepted value while holding the same member lock used by
+    /// TCP replacement publication. The state-level lifecycle transaction
+    /// then orders this commit against exact failure/publication.
+    fn try_commit_opened_stream(
+        &self,
+        path_id: PathId,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let member = self.member.lock().expect("TCP carrier member lock");
+        if !member
+            .current
+            .as_ref()
+            .is_some_and(|slot| slot.path_id == path_id && !slot.terminal.load(Ordering::Acquire))
+            || self.connection_instance_id() != Some(path_instance_id)
+        {
+            return false;
+        }
+        self.runtime.state.try_commit_path_instance(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: self.runtime.path_index,
+            },
+            path_instance_id,
+        )
+    }
+
     fn ensure_session_slot_for_endpoint_generation(
         &self,
         endpoint_generation: u64,
         remote_port: Option<u16>,
     ) -> Result<ClientTcpPathSessionSlot, RuntimeError> {
         self.runtime
-            .endpoint_policy
-            .with_current(endpoint_generation, || {
-                let mut member = self.member.lock().expect("TCP carrier member lock");
-                if let Some(session) = member.current.as_ref()
-                    && !session.terminal.load(Ordering::Acquire)
-                {
-                    return Ok(session.clone());
-                }
-                if member.successor_establishing {
-                    return Err(RuntimeError::NoSchedulableTcpPath);
-                }
+            .state
+            .session_lifecycle()
+            .commit_if_active(|| {
+                self.runtime
+                    .endpoint_policy
+                    .with_current(endpoint_generation, || {
+                        let mut member = self.member.lock().expect("TCP carrier member lock");
+                        if let Some(session) = member.current.as_ref()
+                            && !session.terminal.load(Ordering::Acquire)
+                        {
+                            return Ok(session.clone());
+                        }
+                        if member.successor_establishing {
+                            return Err(RuntimeError::NoSchedulableTcpPath);
+                        }
 
-                let (commands, receivers) =
-                    reliable_path_command_channels(self.runtime.command_queue);
-                let terminal = Arc::new(AtomicBool::new(false));
-                let reservation = self
-                    .runtime
-                    .carrier_groups
-                    .reserve(self.runtime.config_index)
-                    .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-                let path_id = reservation.path_id();
-                let runtime = self.runtime.for_carrier(path_id, remote_port);
-                tokio::spawn(run_client_tcp_path_session(
-                    runtime,
-                    receivers,
-                    self.ready_carrier_instance.clone(),
-                    self.ready_remote_port.clone(),
-                    terminal.clone(),
-                    reservation,
-                ));
-                let session = ClientTcpPathSessionSlot {
-                    commands,
-                    terminal,
-                    path_id,
-                };
-                member.current = Some(session.clone());
-                Ok(session)
+                        let (commands, receivers) =
+                            reliable_path_command_channels(self.runtime.command_queue);
+                        let terminal = Arc::new(AtomicBool::new(false));
+                        let reservation = self
+                            .runtime
+                            .carrier_groups
+                            .reserve(self.runtime.config_index)
+                            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+                        let path_id = reservation.path_id();
+                        let runtime = self.runtime.for_carrier(path_id, remote_port);
+                        tokio::spawn(run_client_tcp_path_session(
+                            runtime,
+                            receivers,
+                            self.ready_carrier_instance.clone(),
+                            self.ready_remote_port.clone(),
+                            terminal.clone(),
+                            reservation,
+                        ));
+                        let session = ClientTcpPathSessionSlot {
+                            commands,
+                            terminal,
+                            path_id,
+                        };
+                        member.current = Some(session.clone());
+                        Ok(session)
+                    })
             })
+            .map_err(RuntimeError::RemoteClosed)?
             .ok_or(RuntimeError::NoSchedulableTcpPath)?
     }
 }

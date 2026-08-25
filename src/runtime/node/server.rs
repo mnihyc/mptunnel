@@ -99,7 +99,7 @@ pub(in crate::runtime) async fn run(
         tls,
         performance,
         resources,
-        RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
+        RuntimeTelemetry::generation_owner(active_flow_detail_capacity(resources.max_streams)),
         session.retention_timeout,
         management.peer_diagnostics_enabled(),
         PeerDiagnosticsPrincipalPolicy::Deny,
@@ -249,12 +249,13 @@ pub(super) fn new_identity_runtime_with_metadata(
             let admission_router = router.clone();
             let admission_inbound = inbound.clone();
             let reliable_stream_port = reliable_streams.path_port().with_target_admission(
-                Arc::new(move |permit, target| {
+                Arc::new(move |permit, ingress, target| {
                     outbound::validate_target(target)?;
-                    match admission_router.preflight_mpp_tcp(
+                    match admission_router.preflight_mpp_tcp_with_ingress(
                         target,
                         permit.principal().clone(),
                         admission_inbound.clone(),
+                        ingress,
                     )? {
                         ClientRoute::Open(_) => Ok(ServerTargetAdmission::Allow),
                         ClientRoute::Deny(ClientPolicyDisposition::Reject) => {
@@ -281,11 +282,11 @@ pub(super) fn new_identity_runtime_with_metadata(
             )
         }
         (None, true) => {
-            let (reliable_streams, receiver) =
-                crate::runtime::stream::ServerReliableStreamRegistry::new_accepting_with_limits(
-                    mux_limits,
-                    resources.max_paths,
-                );
+            let (reliable_streams, receiver) = crate::runtime::stream::ServerReliableStreamRegistry::new_accepting_with_limits_and_retention(
+                mux_limits,
+                resources.max_paths,
+                session_retention_timeout,
+            );
             drop(receiver);
             (reliable_streams.path_port(), None, None)
         }
@@ -306,6 +307,7 @@ pub(super) fn new_identity_runtime_with_metadata(
             reliable_stream_port.clone(),
             resources.max_paths,
             mux_limits.max_datagram_queue_bytes,
+            session_retention_timeout,
         );
         (Some(port), Some(device))
     });

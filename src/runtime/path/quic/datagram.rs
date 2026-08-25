@@ -23,7 +23,7 @@ use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, ServerDatagramOpenFailure, ServerDatagramOpenRequest,
     ServerDatagramRequest, ServerDatagramSendOutcome, ServerDatagramTombstone,
-    ServerDatagramTombstoneCache,
+    ServerDatagramTombstoneCache, ServerMppIngress, ServerMppIngressObserver,
 };
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
@@ -31,6 +31,7 @@ use std::time::Instant;
 pub(super) struct ServerUdpDatagramStreamContext {
     pub(super) session_id: SessionId,
     pub(super) principal_permit: PrincipalPermit,
+    pub(super) ingress: ServerMppIngressObserver,
     pub(super) flow_id: DatagramFlowId,
     pub(super) target: TargetAddr,
 }
@@ -70,6 +71,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
             &mut tombstones,
             stream_context.session_id,
             stream_context.principal_permit.clone(),
+            stream_context.ingress.snapshot(),
             stream_context.flow_id,
             stream_context.target,
         )
@@ -91,6 +93,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
                             &mut tombstones,
                             stream_context.session_id,
                             stream_context.principal_permit.clone(),
+                            stream_context.ingress.snapshot(),
                             flow_id,
                             target,
                         ).await?;
@@ -173,7 +176,10 @@ pub(super) async fn handle_server_udp_datagram_stream(
                     Some(Ok(Frame::Ping { nonce })) => {
                         udp_path_write_frame(&mut send, &Frame::Pong { nonce }, context.codec_limits).await?;
                     }
-                    Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
+                    Some(Ok(Frame::SessionClose { reason })) => {
+                        context.retire_session(stream_context.session_id, reason);
+                        return Err(RuntimeError::RemoteClosed(reason));
+                    }
                     Some(Ok(_)) => return Err(RuntimeError::Protocol("unexpected server QUIC UDP path datagram stream frame")),
                     Some(Err(err)) if super::io::udp_path_input_finished(&err) => {
                         if saw_silent_drop {
@@ -450,6 +456,7 @@ async fn open_server_udp_datagram_flow(
     tombstones: &mut ServerDatagramTombstoneCache,
     session_id: SessionId,
     principal_permit: PrincipalPermit,
+    ingress: ServerMppIngress,
     flow_id: DatagramFlowId,
     target: TargetAddr,
 ) -> Result<ServerUdpDatagramOpenOutcome, RuntimeError> {
@@ -477,6 +484,7 @@ async fn open_server_udp_datagram_flow(
             flow_id,
             target,
             commands: commands_tx.clone(),
+            ingress,
         })
         .await
     {

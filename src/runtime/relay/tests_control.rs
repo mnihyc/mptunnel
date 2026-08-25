@@ -2,7 +2,7 @@ use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::reliable_relay_buffer_len;
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{CloseReason, OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels, try_recv_reliable_path_priority_command,
@@ -10,6 +10,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::sync::mpsc;
@@ -18,6 +19,261 @@ fn test_security() -> ClientSecurityConfig {
     ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     )
+}
+
+fn test_opened_remote_stream(
+    stream_id: StreamId,
+    path_index: usize,
+    commands: crate::runtime::path::commands::ReliablePathCommandSender,
+    frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+) -> OpenedRemoteStream {
+    OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: MuxLimits::default().max_stream_window_bytes,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(path_index as u16),
+                commands,
+                MuxLimits::default(),
+            ),
+            frames: frames.into(),
+        },
+        path_index,
+    )
+}
+
+async fn wait_for_buffered_remote_frame(remotes: &ReliableRelayRemoteSet) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !remotes.has_buffered_frame() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("relay frame-forwarder deadline");
+}
+
+#[tokio::test]
+async fn stale_path_failure_does_not_blacklist_same_key_successor() {
+    let stream_id = StreamId(905);
+    let path = "tcp://127.0.0.1:10905"
+        .parse::<PathSpec>()
+        .expect("test path");
+    let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
+        .expect("client context");
+    let (old_commands, _old_command_receivers) = reliable_path_command_channels(8);
+    let (_old_frames_tx, old_frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream(stream_id, 0, old_commands, old_frames_rx),
+        8,
+    );
+    let stale = remotes.paths[0].instance();
+    drop(
+        remotes
+            .remove_path_instance(stale)
+            .expect("remove predecessor attachment"),
+    );
+
+    let (replacement_commands, _replacement_command_receivers) = reliable_path_command_channels(8);
+    let (_replacement_frames_tx, replacement_frames_rx) = mpsc::channel(1);
+    remotes.attach(test_opened_remote_stream(
+        stream_id,
+        0,
+        replacement_commands,
+        replacement_frames_rx,
+    ));
+    let successor = remotes.paths[0].instance();
+    assert_eq!(successor.key, stale.key);
+    assert_ne!(successor, stale);
+
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut excluded = HashSet::new();
+    resolve_client_relay_path_error(
+        &mut sender,
+        &context,
+        &mut remotes,
+        &mut excluded,
+        stale,
+        false,
+    )
+    .await;
+
+    assert_eq!(remotes.paths.len(), 1);
+    assert_eq!(remotes.paths[0].instance(), successor);
+    assert!(
+        !excluded.contains(&successor.key),
+        "a delayed exact-instance miss must not blacklist the live same-key successor"
+    );
+}
+
+#[tokio::test]
+async fn matching_path_failure_still_removes_and_excludes_the_failed_key() {
+    let stream_id = StreamId(906);
+    let path = "tcp://127.0.0.1:10906"
+        .parse::<PathSpec>()
+        .expect("test path");
+    let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
+        .expect("client context");
+    let (commands, _command_receivers) = reliable_path_command_channels(8);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream(stream_id, 0, commands, frames_rx),
+        8,
+    );
+    let failed = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(failed);
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut excluded = HashSet::new();
+
+    resolve_client_relay_path_error(
+        &mut sender,
+        &context,
+        &mut remotes,
+        &mut excluded,
+        failed,
+        false,
+    )
+    .await;
+
+    assert!(remotes.is_empty());
+    assert!(excluded.contains(&failed.key));
+    let health = context.health().lock().expect("path health");
+    assert_eq!(health.tcp[0].consecutive_failures, 1);
+}
+
+#[tokio::test]
+async fn planned_drain_before_path_close_does_not_publish_terminal() {
+    let stream_id = StreamId(909);
+    let (commands, mut command_receivers) = reliable_path_command_channels(8);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream(stream_id, 0, commands.clone(), frames_rx),
+        8,
+    );
+
+    // Production starts the exact-instance planned lifecycle before the actor
+    // closes fresh command admission, then waits for ordered PATH_CLOSE. No
+    // ReliablePathRetired input can exist throughout this interval.
+    commands.begin_path_drain();
+    command_receivers.close_for_path_drain();
+    assert!(
+        !commands.is_terminal(),
+        "closed admission remains a nonterminal planned-drain phase"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), remotes.recv_frame())
+            .await
+            .is_err(),
+        "planned drain cannot publish a terminal event before ordered PATH_CLOSE"
+    );
+    drop(command_receivers);
+}
+
+#[tokio::test]
+async fn planned_retirement_follows_every_preaccepted_frame_through_cap_one_fan_in() {
+    let stream_id = StreamId(910);
+    let (commands, mut command_receivers) = reliable_path_command_channels(8);
+    let (frames_tx, frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream(stream_id, 0, commands.clone(), frames_rx),
+        1,
+    );
+    let instance = remotes.paths[0].instance();
+
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"A"),
+        }))
+        .await
+        .expect("queue first carrier frame");
+    wait_for_buffered_remote_frame(&remotes).await;
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 1,
+            payload: Bytes::from_static(b"B"),
+        }))
+        .await
+        .expect("queue second carrier frame");
+    let held_input_permit = tokio::time::timeout(Duration::from_secs(1), frames_tx.reserve())
+        .await
+        .expect("forwarder accepted second frame")
+        .expect("carrier input remains open");
+
+    commands.begin_path_drain();
+    command_receivers.close_for_path_drain();
+    assert!(command_receivers.finish_planned_path_retirement());
+    assert!(commands.is_terminal());
+
+    let first = remotes
+        .try_recv_frame()
+        .expect("first merged carrier frame");
+    assert_eq!(first.instance, instance);
+    assert!(matches!(
+        first.frame,
+        Ok(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        }) if payload == Bytes::from_static(b"A")
+    ));
+    let second = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+        .await
+        .expect("second frame deadline")
+        .expect("second merged carrier frame");
+    assert_eq!(second.instance, instance);
+    assert!(matches!(
+        second.frame,
+        Ok(Frame::StreamData {
+            offset: 1,
+            payload,
+            ..
+        }) if payload == Bytes::from_static(b"B")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), remotes.recv_frame())
+            .await
+            .is_err(),
+        "terminal cannot bypass a pre-terminal input reservation"
+    );
+    drop(held_input_permit);
+    let terminal = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+        .await
+        .expect("planned terminal deadline")
+        .expect("planned terminal frame");
+    assert_eq!(terminal.instance, instance);
+    assert!(matches!(
+        terminal.frame,
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+}
+
+#[tokio::test]
+async fn unexpected_output_owner_drop_closes_retained_input_with_failure() {
+    let stream_id = StreamId(908);
+    let (commands, command_receivers) = reliable_path_command_channels(8);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream(stream_id, 0, commands, frames_rx),
+        8,
+    );
+    let instance = remotes.paths[0].instance();
+    drop(command_receivers);
+
+    let terminal = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+        .await
+        .expect("unexpected carrier terminal deadline")
+        .expect("unexpected carrier terminal frame");
+    assert_eq!(terminal.instance, instance);
+    assert!(matches!(
+        terminal.frame,
+        Err(RuntimeError::ReliablePathSessionClosed)
+    ));
 }
 
 #[tokio::test]
@@ -120,6 +376,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
 
 async fn closed_output_relay(
     stream_id: StreamId,
+    preaccepted_input: Option<Frame>,
 ) -> (
     tokio::io::DuplexStream,
     tokio::task::JoinHandle<Result<PathDeliveryStats, RuntimeError>>,
@@ -140,8 +397,14 @@ async fn closed_output_relay(
 
     let limits = context.mux_limits;
     let (commands, command_receivers) = reliable_path_command_channels(4);
-    drop(command_receivers);
     let (frames_tx, frames_rx) = mpsc::channel(4);
+    if let Some(frame) = preaccepted_input {
+        frames_tx
+            .send(Ok(frame))
+            .await
+            .expect("queue pre-terminal carrier input");
+    }
+    drop(command_receivers);
     let opened = OpenedRemoteStream::pending(
         ReliablePathStream {
             stream_id,
@@ -237,6 +500,65 @@ async fn blocked_feedback_relay(
     (application, relay, frames_tx, command_receivers)
 }
 
+#[tokio::test]
+async fn sticky_session_terminal_at_relay_entry_preempts_without_polling_a_saturated_carrier_queue()
+{
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve unused endpoint");
+    let unused_addr = unused.local_addr().expect("unused endpoint address");
+    drop(unused);
+    let path = format!("tcp://{unused_addr}")
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
+        .expect("client context");
+    let limits = context.mux_limits;
+    let stream_id = StreamId(609);
+    let (commands, _command_receivers) = reliable_path_command_channels(1);
+    let (frames_tx, frames_rx) = mpsc::channel(1);
+    frames_tx
+        .try_send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: Bytes::from_static(b"accepted before close"),
+        }))
+        .expect("saturate established carrier frame queue");
+    assert_eq!(frames_tx.capacity(), 0);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let (_application, relay_side) = duplex(4096);
+    context.retire_session(CloseReason::PolicyRejected);
+
+    let result = relay_migrating_tcp_stream(
+        relay_side,
+        &context,
+        MppPerformanceConfig::default(),
+        ReliableRelayOpenSpec::new(TargetAddr::Ip(unused_addr), TrafficClass::Latency),
+        opened,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+}
+
 async fn assert_absolute_retention_timeout(
     relay: &mut tokio::task::JoinHandle<Result<PathDeliveryStats, RuntimeError>>,
 ) {
@@ -254,7 +576,7 @@ async fn assert_absolute_retention_timeout(
 
 #[tokio::test]
 async fn send_first_carrier_loss_enters_absolute_session_retention() {
-    let (mut application, mut relay, frames_tx) = closed_output_relay(StreamId(610)).await;
+    let (mut application, mut relay, frames_tx) = closed_output_relay(StreamId(610), None).await;
 
     application
         .write_all(b"send-first failure")
@@ -266,14 +588,14 @@ async fn send_first_carrier_loss_enters_absolute_session_retention() {
 
 #[tokio::test]
 async fn fin_feedback_carrier_loss_enters_absolute_session_retention() {
-    let (application, mut relay, frames_tx) = closed_output_relay(StreamId(612)).await;
-    frames_tx
-        .send(Ok(Frame::StreamFin {
+    let (application, mut relay, frames_tx) = closed_output_relay(
+        StreamId(612),
+        Some(Frame::StreamFin {
             stream_id: StreamId(612),
             final_offset: 0,
-        }))
-        .await
-        .expect("remote FIN");
+        }),
+    )
+    .await;
 
     assert_absolute_retention_timeout(&mut relay).await;
     drop(application);

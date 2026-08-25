@@ -307,6 +307,9 @@ impl ClientTcpCarrierGroups {
         retry_interval: Duration,
         retry: &mut [ClientTcpMemberRetry],
     ) {
+        if context.ensure_session_active().is_err() {
+            return;
+        }
         assert_eq!(
             retry.len(),
             context.tcp_sessions.len(),

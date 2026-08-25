@@ -348,7 +348,225 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("formatRttMicros(path.rttvar_us)"));
     assert!(DASHBOARD_JS.contains("formatBytes(path.inflight_limit_bytes)"));
     assert!(DASHBOARD_JS.contains("formatDuration(finiteNumber(path.metric_age_us) / 1000)"));
+    for (heading, expected_count) in [
+        (
+            r#"title="Configured path / endpoint / Path ID / physical carrier instance">Path</th>"#,
+            2,
+        ),
+        (
+            r#"title="Service name / service kind / MPP session (16-hex)">Service</th>"#,
+            2,
+        ),
+        (
+            r#"title="Queue / native carrier flight / MPP data flight / native limit">Flight</th>"#,
+            2,
+        ),
+        (
+            r#"title="Locally configured path / endpoint / peer Path ID / metric epoch">Path</th>"#,
+            2,
+        ),
+        (
+            r#"title="Queue / native carrier flight / native limit">Flight</th>"#,
+            2,
+        ),
+    ] {
+        assert_eq!(
+            DASHBOARD_HTML.matches(heading).count(),
+            expected_count,
+            "missing or duplicated path-table heading contract: {heading}"
+        );
+    }
+    assert!(DASHBOARD_HTML.contains(r#"<th scope="col">Source</th>"#));
+    assert!(!DASHBOARD_HTML.contains("Queue / native / MPP / cap"));
+    assert!(DASHBOARD_CSS.contains("min-width: 1540px;"));
+    assert!(DASHBOARD_JS.contains("path.endpoint || \"Local mapping unavailable\""));
+    assert!(DASHBOARD_JS.contains("formatIdentifier(path.path)"));
+    assert!(DASHBOARD_JS.contains("function formatSessionId(value)"));
+    assert!(
+        DASHBOARD_JS.contains(r#"typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)"#)
+    );
+    assert!(DASHBOARD_JS.contains("const sessionId = BigInt(String(value));"));
+    assert!(DASHBOARD_JS.contains("sessionId.toString(16).padStart(16, \"0\")"));
+    for visible_session_surface in [
+        r#"flow.session_id ? formatSessionId(flow.session_id) : "Local""#,
+        r#""cell-secondary cell-mono", formatSessionId(path.session_id)"#,
+        r#"appendCell(row, "Session", formatSessionId(session.session_id), "cell-mono");"#,
+        r#"" / Session " + formatSessionId(session.session_id)"#,
+        r#"serviceLabel(selectedSession) + " / " + formatSessionId(selectedSession.session_id)"#,
+        r#"serviceLabel(result) + " / " + formatSessionId(result.session_id) + " / ""#,
+        r#"appendMetric(elements.peerResultSummary, "Session", formatSessionId(result.session_id));"#,
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(visible_session_surface),
+            "missing hex session display surface: {visible_session_surface}"
+        );
+    }
+    for raw_session_identity in [
+        r#"return String(session.service) + ":" + String(session.service_name) + ":" + String(session.session_id);"#,
+        r#"String(result.session_id) === String(session.session_id)"#,
+        r#"String(state.peerResult.session_id) === String(selectedSession.session_id)"#,
+        "session_id: session.session_id",
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(raw_session_identity),
+            "session identity/control must retain the lossless API decimal: {raw_session_identity}"
+        );
+    }
+    for filter_identity in [
+        "session.session_id,\n        formatSessionId(session.session_id),",
+        "flow.session_id,\n        formatSessionId(flow.session_id),",
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(filter_identity),
+            "filters must match both raw and displayed session identity: {filter_identity}"
+        );
+    }
+    assert_eq!(
+        format!("{:016x}", 9_203_593_540_056_189_687_u64),
+        "7fb9bb8fdc210af7"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"createElement("span", "cell-primary cell-mono", flow.source)"#)
+    );
+    assert!(!DASHBOARD_JS.contains("flow.source ||"));
+    assert!(DASHBOARD_JS.contains("titleCase(flow.source_kind)"));
+    assert!(DASHBOARD_JS.contains(r#"typeof flow.inbound !== "string""#));
+    assert!(DASHBOARD_JS.contains("!Array.isArray(payload.flows)"));
+    assert!(DASHBOARD_JS.contains(r#"flow.inbound_kind !== "local""#));
+    assert!(DASHBOARD_JS.contains(r#"typeof flow.source !== "string""#));
+    assert!(DASHBOARD_JS.contains(r#"flow.source_kind !== "local_peer""#));
+    assert!(DASHBOARD_JS.contains(r#""cell-primary", flow.inbound"#));
+    assert!(!DASHBOARD_JS.contains("flow.inbound ||"));
+    let local_row = DASHBOARD_JS
+        .split_once("function createPathRow(pathValue)")
+        .expect("local path row renderer")
+        .1
+        .split_once("function renderPathRows")
+        .expect("end of local path row renderer")
+        .0;
+    let peer_row = DASHBOARD_JS
+        .split_once("function appendPeerPathRow(body, pathValue)")
+        .expect("peer path row renderer")
+        .1
+        .split_once("function renderPeerPaths")
+        .expect("end of peer path row renderer")
+        .0;
+    for (surface, labels) in [
+        (
+            local_row,
+            &[
+                "State", "Path", "Service", "Carrier", "Use", "Latency", "Rate", "Loss", "Flight",
+                "Evidence", "Flows",
+            ][..],
+        ),
+        (
+            peer_row,
+            &[
+                "State", "Path", "Carrier", "Use", "Latency", "Rate", "Loss", "Flight", "Evidence",
+            ][..],
+        ),
+    ] {
+        let mut remainder = surface;
+        for label in labels {
+            let marker = format!(r#"appendCell(row, "{label}""#);
+            remainder = remainder
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("missing or out-of-order data label: {label}"))
+                .1;
+        }
+    }
+    let peer = DASHBOARD_HTML
+        .find("overview-peer-title")
+        .expect("peer section");
+    let connections = DASHBOARD_HTML
+        .find("overview-connections-title")
+        .expect("inbound connections section");
+    let outbound = DASHBOARD_HTML
+        .find("outbound-services-title")
+        .expect("outbound section");
+    assert!(peer < connections && connections < outbound);
+    assert_eq!(
+        DASHBOARD_HTML.matches("overview-connections-title").count(),
+        2
+    );
     assert!(!DASHBOARD_JS.contains("Refreshing runtime status"));
     assert!(DASHBOARD_JS.contains("window.localStorage.setItem(TOKEN_STORAGE_KEY, token);"));
     assert!(DASHBOARD_JS.contains("window.localStorage.setItem(NAVIGATION_STORAGE_KEY"));
+}
+
+#[test]
+fn dashboard_charts_select_real_retained_samples_without_viewport_controls() {
+    for surface in [
+        r#"id="traffic-chart" tabindex="0""#,
+        r#"id="flows-chart" tabindex="0""#,
+        r#"id="traffic-chart-detail""#,
+        r#"id="flows-chart-detail""#,
+    ] {
+        assert!(
+            DASHBOARD_HTML.contains(surface),
+            "missing chart surface: {surface}"
+        );
+    }
+    for contract in [
+        "function nearestChartSampleIndex(samples, timestamp)",
+        "const timestamp = state.chartSamples[index].timestamp_unix_ms;",
+        "state.selectedChartTimestamp = timestamp;",
+        "state.chartSelectionTouched = index !== state.chartSamples.length - 1;",
+        "state.chartSelectionTouched = false;",
+        "(event.clientX - rect.left) * (layout.width / rect.width)",
+        "formatChartTimestamp(sample.timestamp_unix_ms)",
+        "sample.to_peer_bytes + \" B (\"",
+        "sample.from_peer_bytes + \" B (\"",
+        "const trafficHasData = trends.length > 0;",
+        "let maximumValue = 0;",
+        "maximumValue = Math.max(maximumValue",
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(contract),
+            "missing chart contract: {contract}"
+        );
+    }
+    assert!(!DASHBOARD_JS.contains("Math.max.apply"));
+    assert!(!DASHBOARD_JS.contains("addEventListener(\"wheel\""));
+    for rejected_viewport_model in [
+        "chartViewport",
+        "CHART_ZOOM",
+        "zoomChart",
+        "panChart",
+        "resetChart",
+        "is-panning",
+    ] {
+        assert!(
+            !DASHBOARD_JS.contains(rejected_viewport_model)
+                && !DASHBOARD_HTML.contains(rejected_viewport_model)
+                && !DASHBOARD_CSS.contains(rejected_viewport_model),
+            "chart viewport control leaked into the selection-only model: {rejected_viewport_model}"
+        );
+    }
+    assert!(DASHBOARD_CSS.contains("touch-action: pan-y pinch-zoom;"));
+    assert!(DASHBOARD_HTML.contains(r#"<p id="traffic-chart-detail" class="chart-detail">"#));
+    assert!(DASHBOARD_HTML.contains(r#"<p id="flows-chart-detail" class="chart-detail">"#));
+    let reconcile = DASHBOARD_JS
+        .split_once("function reconcileChartSelection()")
+        .expect("chart selection reconciliation")
+        .1
+        .split_once("function selectChartSample")
+        .expect("end of chart selection reconciliation")
+        .0;
+    assert!(
+        reconcile.contains("samples[index].timestamp_unix_ms !== state.selectedChartTimestamp")
+    );
+    assert!(reconcile.contains("samples[samples.length - 1].timestamp_unix_ms"));
+    assert!(reconcile.contains("state.chartSelectionTouched = false;"));
+    let interaction = DASHBOARD_JS
+        .split_once("function bindChartInteraction(canvas)")
+        .expect("chart interaction binding")
+        .1
+        .split_once("function trimChartSamples()")
+        .expect("end of chart interaction binding")
+        .0;
+    assert!(interaction.contains(r#"event.key === "End""#));
+    assert!(interaction.contains("selectChartSample(index, true);"));
+    assert!(interaction.contains(r#"canvas.addEventListener("pointerleave""#));
+    assert!(interaction.contains("selectChartSample(state.chartSamples.length - 1, false);"));
 }

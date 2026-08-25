@@ -2,17 +2,21 @@
 
 use super::DatagramSessionEvent;
 use super::UDP_PATH_HANDSHAKE_TIMEOUT;
-use super::association::{DatagramPathSend, runtime_error_is_datagram_response_timeout};
+use super::association::DatagramPathSend;
+#[cfg(test)]
+use super::association::runtime_error_is_datagram_response_timeout;
 use super::policy::{DatagramPathSendError, datagram_remaining_ttl_ms};
 use super::quic_session::{UdpDatagramClientSession, open_udp_datagram_session_on_path};
 use crate::model::capacity::{QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY};
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::model::timing::default_transport_pto;
-use crate::protocol::{DatagramFlowId, DatagramId, Frame};
+use crate::protocol::{DatagramFlowId, DatagramId, Frame, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::model::{
     UdpPathRuntimeModel, path_is_endpoint_only, udp_observation_has_datagram_feedback,
 };
-use crate::runtime::path::{ClientPathContext, UdpPathCandidate};
+use crate::runtime::path::quic::client::{ClientUdpErrorDisposition, client_udp_error_disposition};
+use crate::runtime::path::{ClientPathContext, RelayPathLoadLease, UdpPathCandidate};
 use crate::scheduler::{PathSnapshot, path_within_adaptive_lead_hysteresis};
 use crate::transport::RateHint;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +55,7 @@ fn udp_association_candidate_order(
 pub(in crate::runtime) struct UdpDatagramAssociationPath {
     pub(in crate::runtime) session: UdpDatagramClientSession,
     pub(in crate::runtime) pacer: UdpDatagramPacer,
+    _load_lease: RelayPathLoadLease,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,16 +109,34 @@ impl UdpDatagramClientAssociation {
                 self.last_successful_path = Some(path_index);
                 Ok(())
             }
-            Err(DatagramPathSendError::Runtime(source))
-                if udp_datagram_error_is_path_retryable(&source) =>
-            {
-                self.remove_path(path_index);
-                self.suppress_path_after_carrier_failure(
-                    path_index,
-                    default_transport_pto(),
-                    datagram_remaining_ttl_ms(product_deadline),
-                );
-                self.context.mark_udp_path_failure(path_index);
+            Err(DatagramPathSendError::Runtime(source)) => {
+                let settlement_owner = self
+                    .paths
+                    .iter()
+                    .find(|path| path.session.path_index == path_index)
+                    .map(|path| path.session.error_settlement_owner());
+                let disposition = client_udp_error_disposition(&source);
+                if let Some((owner, path_instance_id)) = settlement_owner {
+                    owner
+                        .settle_established_disposition(path_instance_id, disposition)
+                        .await;
+                }
+                // Every runtime send failure ends this Product request. The
+                // typed disposition decides only whether the exact physical
+                // owner may also be retired; dropping the association path
+                // releases its logical lease while preserving a live carrier
+                // for a later fresh request.
+                let _ = self.remove_path(path_index);
+                if disposition == ClientUdpErrorDisposition::CarrierLifetime {
+                    self.suppress_path_after_carrier_failure(
+                        path_index,
+                        default_transport_pto(),
+                        datagram_remaining_ttl_ms(product_deadline),
+                    );
+                }
+                Err(DatagramPathSendError::runtime(source))
+            }
+            Err(DatagramPathSendError::UdpPathOpen(source)) => {
                 Err(DatagramPathSendError::runtime(source))
             }
             Err(error) => Err(error),
@@ -156,11 +179,11 @@ impl UdpDatagramClientAssociation {
         let mut close_error = None;
         while let Some(mut path) = self.paths.pop() {
             let close_result = path.session.close().await;
-            self.context.mark_udp_datagram_path_delivery(
+            self.context.mark_udp_datagram_path_delivery_for_instance(
                 path.session.path_index,
+                path.session.path_instance_id(),
                 path.session.delivery_stats(),
             );
-            self.context.release_udp_path_load(path.session.path_index);
             if close_error.is_none()
                 && let Err(err) = close_result
             {
@@ -211,13 +234,22 @@ impl UdpDatagramClientAssociation {
         else {
             return Ok(DatagramSessionEvent::Control);
         };
+        let path_instance_id = self.paths[position].session.path_instance_id();
         let result = self.paths[position].session.handle_frame(frame).await;
         if let Some(observation) = self.paths[position].session.take_feedback_observation() {
-            self.context.mark_udp_path_feedback(path_index, observation);
+            self.context.mark_udp_path_feedback_for_instance(
+                path_index,
+                path_instance_id,
+                observation,
+            );
         }
-        if result.is_err() {
-            self.remove_path(path_index);
-            self.context.mark_udp_path_failure(path_index);
+        if let Err(source) = &result {
+            let disposition = client_udp_error_disposition(source);
+            let (owner, owner_instance_id) = self.paths[position].session.error_settlement_owner();
+            let _ = owner
+                .settle_established_disposition(owner_instance_id, disposition)
+                .await;
+            let _ = self.remove_path(path_index);
         }
         result
     }
@@ -240,9 +272,23 @@ impl UdpDatagramClientAssociation {
         self.paths.iter().any(|path| path.session.has_flow(flow_id))
     }
 
-    pub(in crate::runtime) fn handle_receive_error(&mut self, path_index: usize) {
-        self.remove_path(path_index);
-        self.context.mark_udp_path_failure(path_index);
+    pub(in crate::runtime) async fn handle_receive_error(
+        &mut self,
+        path_index: usize,
+        disposition: ClientUdpErrorDisposition,
+    ) -> ClientUdpErrorDisposition {
+        let settlement_owner = self
+            .paths
+            .iter()
+            .find(|path| path.session.path_index == path_index)
+            .map(|path| path.session.error_settlement_owner());
+        if let Some((owner, path_instance_id)) = settlement_owner {
+            owner
+                .settle_established_disposition(path_instance_id, disposition)
+                .await;
+        }
+        let _ = self.remove_path(path_index);
+        disposition
     }
 
     pub(in crate::runtime) fn select_path_candidate(
@@ -436,8 +482,8 @@ impl UdpDatagramClientAssociation {
         let position = self
             .ensure_path_session(path_index, open_deadline)
             .await
-            .map_err(DatagramPathSendError::runtime)?;
-        let (observation_path_index, observation, result, connection_usable) = {
+            .map_err(DatagramPathSendError::UdpPathOpen)?;
+        let (observation_path_index, observation_path_instance_id, observation, result) = {
             let path = self.paths.get_mut(position).ok_or_else(|| {
                 DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath)
             })?;
@@ -464,31 +510,22 @@ impl UdpDatagramClientAssociation {
             let observation = path.session.take_feedback_observation();
             (
                 path.session.path_index,
+                path.session.path_instance_id(),
                 observation,
                 result,
-                path.session.connection_usable,
             )
         };
         if let Some(observation) = observation {
-            self.context
-                .mark_udp_path_feedback(observation_path_index, observation);
+            self.context.mark_udp_path_feedback_for_instance(
+                observation_path_index,
+                observation_path_instance_id,
+                observation,
+            );
         }
 
         match result {
-            Ok(()) => {
-                if !connection_usable {
-                    self.remove_path(path_index);
-                    self.context.mark_udp_path_failure(path_index);
-                }
-                Ok(())
-            }
-            Err(DatagramPathSendError::Timeout) => {
-                if !connection_usable {
-                    self.remove_path(path_index);
-                    self.context.mark_udp_path_failure(path_index);
-                }
-                Err(DatagramPathSendError::Timeout)
-            }
+            Ok(()) => Ok(()),
+            Err(DatagramPathSendError::Timeout) => Err(DatagramPathSendError::Timeout),
             Err(err) => Err(err),
         }
     }
@@ -505,46 +542,51 @@ impl UdpDatagramClientAssociation {
         {
             return Ok(position);
         }
+        // Logical Product load is reserved before carrier I/O and owned by
+        // this exact association-path value. Physical carrier replacement may
+        // change telemetry identity, but cannot create or release this load.
+        let load_lease = self
+            .context
+            .reserve_relay_path_load(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index: path_index,
+                },
+                crate::scheduler::TrafficClass::RealtimeDatagram,
+            )
+            .ok_or(RuntimeError::NoSchedulableUdpPath)?;
         let session =
             open_udp_datagram_session_on_path(&self.context, path_index, open_deadline).await?;
         self.paths.push(UdpDatagramAssociationPath {
             session,
             pacer: UdpDatagramPacer::new(),
+            _load_lease: load_lease,
         });
         Ok(self.paths.len() - 1)
     }
 
-    fn remove_path(&mut self, path_index: usize) {
-        let Some(position) = self
+    fn remove_path(&mut self, path_index: usize) -> Option<CarrierPathInstanceId> {
+        let position = self
             .paths
             .iter()
-            .position(|path| path.session.path_index == path_index)
-        else {
-            return;
-        };
+            .position(|path| path.session.path_index == path_index)?;
         let path = self.paths.swap_remove(position);
-        self.context.mark_udp_datagram_path_delivery(
+        let path_instance_id = path.session.path_instance_id();
+        self.context.mark_udp_datagram_path_delivery_for_instance(
             path.session.path_index,
+            path_instance_id,
             path.session.delivery_stats(),
         );
-        self.context.release_udp_path_load(path.session.path_index);
+        Some(path_instance_id)
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) fn udp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
     if runtime_error_is_datagram_response_timeout(err) {
         return false;
     }
-    matches!(
-        err,
-        RuntimeError::Io(_)
-            | RuntimeError::Udp(_)
-            | RuntimeError::QuicCarrier(_)
-            | RuntimeError::Auth(_)
-            | RuntimeError::RemoteClosed(_)
-            | RuntimeError::PathOpenTimedOut
-            | RuntimeError::Protocol(_)
-    )
+    client_udp_error_disposition(err) == ClientUdpErrorDisposition::CarrierLifetime
 }
 
 pub(in crate::runtime) fn udp_datagram_path_open_timeout(

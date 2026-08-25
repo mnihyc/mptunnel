@@ -20,6 +20,9 @@ EXHAUSTIVE = (
 NETEM = (Path(__file__).resolve().parent / "configure-netem.sh").read_text(
     encoding="utf-8"
 )
+RANDOM_INTERNET = (
+    Path(__file__).resolve().parent / "run-random-internet-experiments.sh"
+).read_text(encoding="utf-8")
 
 
 class RunnerContractTests(unittest.TestCase):
@@ -50,7 +53,10 @@ class RunnerContractTests(unittest.TestCase):
             "\n}", 1
         )[0]
         self.assertIn("MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES", SCRIPT)
-        self.assertIn("baseline_vmess_*|baseline_hysteria2_*", skipped)
+        self.assertIn(
+            "baseline_vmess_*|baseline_hysteria2_*|baseline_mptcp_*",
+            skipped,
+        )
         self.assertIn('status="fail"', skipped)
         self.assertIn(
             'MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1',
@@ -444,6 +450,139 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('"172.31.10.20"', hysteria_upload)
         self.assertIn('"20 mbps"', SCRIPT)
         self.assertIn('"200 mbps"', SCRIPT)
+
+    def test_seeded_random_netem_is_directional_and_protocol_neutral(self):
+        apply_netem = SCRIPT.split("apply_netem() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        startup = SCRIPT.split("write_run_manifest\n", 1)[1]
+
+        self.assertIn(
+            'default_netem_mode="${MPTUNNEL_LAB_NETEM_MODE:-apply}"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '[[ "$mode" =~ ^internet-five-path-epoch-([0-9]+)$ ]]',
+            apply_netem,
+        )
+        self.assertIn('exec_netem client "${mode}-client"', apply_netem)
+        self.assertIn('exec_netem server "${mode}-server"', apply_netem)
+        self.assertIn('exec_netem target "${mode}-server"', apply_netem)
+        self.assertIn(
+            '-e MPTUNNEL_LAB_INTERNET_SEED="$internet_seed"', SCRIPT
+        )
+        self.assertIn(
+            '-e MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES="$internet_include_outages"',
+            SCRIPT,
+        )
+        self.assertIn('apply_netem "$default_netem_mode"', startup)
+
+        for default_argument in (
+            'local netem_mode="${3:-$default_netem_mode}"',
+            'local netem_mode="${2:-$default_netem_mode}"',
+        ):
+            self.assertIn(default_argument, SCRIPT)
+        start_client = SCRIPT.split("start_client() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn(
+            'start_client_with_netem "$profile" "$default_netem_mode"',
+            start_client,
+        )
+        self.assertIn(
+            'start_client_with_netem "$case_name" asymmetric', SCRIPT
+        )
+        self.assertIn(
+            'run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_equal_fat" ideal-all-fat',
+            SCRIPT,
+        )
+
+    def test_random_internet_matrix_replays_one_canonical_schedule(self):
+        self.assertIn(
+            'schedule_script="$script_dir/internet_condition_schedule.py"',
+            RANDOM_INTERNET,
+        )
+        self.assertIn('python3 "$schedule_script" generate', RANDOM_INTERNET)
+        self.assertIn(
+            'validate --schedule "$schedule_file"', RANDOM_INTERNET
+        )
+        self.assertIn(
+            'metadata --schedule "$schedule_file"', RANDOM_INTERNET
+        )
+        self.assertIn(
+            'MPTUNNEL_LAB_INTERNET_EPOCHS:-7', RANDOM_INTERNET
+        )
+        self.assertIn(
+            'MPTUNNEL_LAB_NETEM_MODE="$netem_mode"', RANDOM_INTERNET
+        )
+        self.assertIn(
+            'MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256="$schedule_sha256"',
+            RANDOM_INTERNET,
+        )
+        self.assertIn(
+            'MPTUNNEL_LAB_REQUIRE_VALID_HOST="${MPTUNNEL_LAB_REQUIRE_VALID_HOST:-1}"',
+            RANDOM_INTERNET,
+        )
+        self.assertIn(
+            'MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES="${MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES:-1}"',
+            RANDOM_INTERNET,
+        )
+        self.assertIn('BUILD_PRODUCT="$build_product"', RANDOM_INTERNET)
+        self.assertIn("first_run=0", RANDOM_INTERNET)
+        self.assertIn('RESULT_DIR="$run_result_dir"', RANDOM_INTERNET)
+        for subject in (
+            "direct_balanced",
+            "baseline_vmess_tcp_single_balanced",
+            "baseline_hysteria2_udp_single_balanced",
+            "baseline_mptcp_tcp_multipath_all",
+            "mptunnel_tcp_single_balanced",
+            "mptunnel_udp_stream_single_balanced",
+            "mptunnel_tcp_multipath_all",
+            "mptunnel_udp_stream_multipath_all",
+            "mptunnel_udp_single_balanced",
+            "mptunnel_udp_multipath_all",
+            "mptunnel_client_direct_balanced",
+            "mptunnel_client_direct_balanced_upload",
+        ):
+            self.assertIn(subject, RANDOM_INTERNET)
+
+    def test_active_mpp_client_keeps_an_explicit_direct_outbound_control(self):
+        client = SCRIPT.split("socks_client_config_toml() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn('name = "lab-client-direct"', client)
+        self.assertIn('protocol = "direct"', client)
+        direct_rule = client.split(
+            'name = "allow-lab-client-direct-control"', 1
+        )[1].split("[[routing.rules]]", 1)[0]
+        self.assertIn('destination_cidrs = ["172.31.15.30/32"]', direct_rule)
+        self.assertIn('outbound = "lab-client-direct"', direct_rule)
+        self.assertLess(
+            client.index('name = "allow-lab-client-direct-control"'),
+            client.index('name = "allow-lab-private-targets"'),
+        )
+        self.assertIn('"mptunnel_client_direct_balanced"', SCRIPT)
+        self.assertIn('"mptunnel_client_direct_balanced_upload"', SCRIPT)
+
+    def test_random_hysteria_brutal_rates_match_scheduled_directions(self):
+        self.assertIn('if row["subnet_prefix"] == "172.31.15"', RANDOM_INTERNET)
+        self.assertIn('rates["client"]', RANDOM_INTERNET)
+        self.assertIn('rates["server"]', RANDOM_INTERNET)
+        self.assertIn(
+            'MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE="$hysteria_client_rate"',
+            RANDOM_INTERNET,
+        )
+        self.assertIn(
+            'MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE="$hysteria_server_rate"',
+            RANDOM_INTERNET,
+        )
+        balanced_case = SCRIPT.split(
+            'if should_run_case "baseline_hysteria2_udp_single_balanced";', 1
+        )[1].split("\nfi", 1)[0]
+        self.assertIn("MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE", balanced_case)
+        self.assertIn("MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE", balanced_case)
+        self.assertIn('"$default_netem_mode"', balanced_case)
 
     def test_hysteria2_product_baselines_enable_brutal_at_shaped_rate(self):
         self.assertIn("hysteria_bandwidth_from_netem_rate", SCRIPT)

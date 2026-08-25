@@ -16,6 +16,7 @@ use crate::runtime::product_policy::ClientOutboundPlan;
 use crate::runtime::telemetry::ProductFlowCounter;
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -33,7 +34,7 @@ pub(in crate::runtime) enum UdpEdgeCompletion<M> {
         lane_id: usize,
         target: TargetAddr,
         metadata: M,
-        result: Result<(), RuntimeError>,
+        result: Result<(), Arc<RuntimeError>>,
     },
     Discarded {
         lane_id: usize,
@@ -143,15 +144,13 @@ async fn run_udp_edge_lane<M>(
             return;
         }
         Err(error) => {
-            let _ = send_udp_edge_completion(
+            report_terminal_udp_edge_requests(
+                lane_id,
+                &mut requests,
                 &completions,
                 &mut cancelled,
-                UdpEdgeCompletion::Sent {
-                    lane_id,
-                    target: initial.target,
-                    metadata: initial.metadata,
-                    result: Err(error),
-                },
+                Some(initial),
+                error,
             )
             .await;
             return;
@@ -280,9 +279,14 @@ async fn run_mpp_udp_edge_lane<M>(
 {
     let _product_flow = product_flow;
     let reported_target = initial.target.clone();
+    let session_retirement = context.session_retirement().wait();
+    tokio::pin!(session_retirement);
     let mut association = match DatagramClientAssociation::new(context).await {
         Ok(association) => association,
         Err(error) => {
+            // Once association construction is terminal, this actor must stop
+            // accepting before feedback or completion reporting can block.
+            requests.close();
             if let Some(lease) = gateway_lease.as_mut()
                 && let Err(feedback) = lease.failed(error.to_string())
             {
@@ -293,15 +297,13 @@ async fn run_mpp_udp_edge_lane<M>(
                     "MPP balancer UDP open-failure feedback failed: {feedback}"
                 );
             }
-            let _ = send_udp_edge_completion(
+            report_terminal_udp_edge_requests(
+                lane_id,
+                &mut requests,
                 &completions,
                 &mut cancelled,
-                UdpEdgeCompletion::Sent {
-                    lane_id,
-                    target: initial.target,
-                    metadata: initial.metadata,
-                    result: Err(error),
-                },
+                Some(initial),
+                error,
             )
             .await;
             return;
@@ -326,11 +328,17 @@ async fn run_mpp_udp_edge_lane<M>(
         return;
     }
 
+    let mut terminal_session_reason = None;
     loop {
         let retry_deadline = association.next_retry_deadline();
         let has_retry = retry_deadline.is_some();
         let retry_deadline = retry_deadline.unwrap_or_else(tokio::time::Instant::now);
         tokio::select! {
+            biased;
+            reason = &mut session_retirement => {
+                terminal_session_reason = Some(reason);
+                break;
+            }
             result = cancelled.changed() => {
                 if result.is_err() || *cancelled.borrow() {
                     break;
@@ -423,7 +431,18 @@ async fn run_mpp_udp_edge_lane<M>(
             }
         }
     }
-    let close_error = match association.close().await {
+    if let Some(reason) = terminal_session_reason {
+        report_terminal_udp_edge_requests(
+            lane_id,
+            &mut requests,
+            &completions,
+            &mut cancelled,
+            None,
+            RuntimeError::RemoteClosed(reason),
+        )
+        .await;
+    }
+    let association_close_error = match association.close().await {
         Ok(()) => None,
         Err(error) => {
             crate::observability::process_event!(
@@ -435,6 +454,9 @@ async fn run_mpp_udp_edge_lane<M>(
             Some(error.to_string())
         }
     };
+    let close_error = terminal_session_reason
+        .map(|reason| RuntimeError::RemoteClosed(reason).to_string())
+        .or(association_close_error);
     if let Some(lease) = gateway_lease.as_mut()
         && let Err(error) = lease.completed(close_error)
     {
@@ -521,7 +543,7 @@ where
             lane_id: context.lane_id,
             target,
             metadata,
-            result,
+            result: result.map_err(Arc::new),
         },
     )
     .await
@@ -636,6 +658,11 @@ async fn run_native_udp_edge_lane<M, S>(
                         counter.record_datagram_from_peer(len as u64);
                     }
                     Err(error) => {
+                        // The native association has selected a terminal receive
+                        // failure and will never poll this request queue again.
+                        // Close first so every concurrent request is either
+                        // rejected exactly or owned by the drain below.
+                        requests.close();
                         crate::observability::process_event!(
                             Warn,
                             "udp_outbound",
@@ -647,6 +674,15 @@ async fn run_native_udp_edge_lane<M, S>(
                             Some(error.to_string()),
                         );
                         runtime_failed = true;
+                        report_terminal_udp_edge_requests(
+                            lane_id,
+                            &mut requests,
+                            &completions,
+                            &mut cancelled,
+                            None,
+                            error,
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -701,7 +737,7 @@ where
             lane_id,
             target,
             metadata,
-            result,
+            result: result.map_err(Arc::new),
         },
     )
     .await
@@ -731,6 +767,61 @@ async fn send_udp_edge_completion<M>(
     }
 }
 
+/// Close a terminal lane before reporting, then settle every request that was
+/// already accepted by its bounded queue with the same terminal cause.
+async fn report_terminal_udp_edge_requests<M>(
+    lane_id: usize,
+    requests: &mut mpsc::Receiver<UdpEdgeRequest<M>>,
+    completions: &mpsc::Sender<UdpEdgeCompletion<M>>,
+    cancelled: &mut tokio::sync::watch::Receiver<bool>,
+    initial: Option<UdpEdgeRequest<M>>,
+    error: RuntimeError,
+) {
+    requests.close();
+    let error = Arc::new(error);
+    if let Some(request) = initial
+        && !send_udp_edge_completion(
+            completions,
+            cancelled,
+            UdpEdgeCompletion::Sent {
+                lane_id,
+                target: request.target,
+                metadata: request.metadata,
+                result: Err(Arc::clone(&error)),
+            },
+        )
+        .await
+    {
+        return;
+    }
+    while let Some(request) = requests.recv().await {
+        if !send_udp_edge_completion(
+            completions,
+            cancelled,
+            UdpEdgeCompletion::Sent {
+                lane_id,
+                target: request.target,
+                metadata: request.metadata,
+                result: Err(Arc::clone(&error)),
+            },
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+fn reap_finished_udp_edge_lanes<M>(lanes: &mut Vec<UdpEdgeLane<M>>) {
+    lanes.retain(|lane| {
+        lane.pending != 0
+            || !lane
+                .handle
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+    });
+}
+
 pub(in crate::runtime) fn dispatch_udp_edge_request<M>(
     lanes: &mut Vec<UdpEdgeLane<M>>,
     next_lane_id: &mut usize,
@@ -743,39 +834,53 @@ where
     M: Clone + Eq + Send + Sync + 'static,
 {
     let queue_slots = udp_edge_queue_slots(mux_limits);
-    let total_pending = lanes.iter().map(|lane| lane.pending).sum::<usize>();
-    if total_pending >= queue_slots {
-        return Err(request);
-    }
-    let mut position = lanes
-        .iter()
-        .position(|lane| lane.metadata == request.metadata);
-    if position.is_none() {
-        if lanes.len() >= queue_slots.min(mux_limits.max_streams) {
+    let lane_limit = queue_slots.min(mux_limits.max_streams);
+    let mut request = request;
+    loop {
+        // A closed request sender marks a terminal reporter, not a finished
+        // actor. Reap only the task boundary and only after all of its accepted
+        // completions have been observed by the owner.
+        reap_finished_udp_edge_lanes(lanes);
+        let total_pending = lanes.iter().map(|lane| lane.pending).sum::<usize>();
+        if total_pending >= queue_slots {
             return Err(request);
         }
-        let lane_id = *next_lane_id;
-        *next_lane_id = next_lane_id.saturating_add(1);
-        lanes.push(spawn_udp_edge_lane(
-            lane_id,
-            request.metadata.clone(),
-            plan.clone(),
-            mux_limits,
-            completions.clone(),
-        ));
-        position = Some(lanes.len() - 1);
-    }
 
-    let position = position.expect("UDP edge association exists");
-    match lanes[position].requests.try_send(request) {
-        Ok(()) => {
-            lanes[position].pending = lanes[position].pending.saturating_add(1);
-            Ok(())
+        let mut position = lanes
+            .iter()
+            .position(|lane| lane.metadata == request.metadata && !lane.requests.is_closed());
+        if position.is_none() {
+            // Terminal reporters remain live lanes and therefore consume the
+            // same association bound. A successor is legal only in spare
+            // capacity; it never evicts or aborts a reporter.
+            if lanes.len() >= lane_limit {
+                return Err(request);
+            }
+            let lane_id = *next_lane_id;
+            *next_lane_id = next_lane_id.saturating_add(1);
+            lanes.push(spawn_udp_edge_lane(
+                lane_id,
+                request.metadata.clone(),
+                plan.clone(),
+                mux_limits,
+                completions.clone(),
+            ));
+            position = Some(lanes.len() - 1);
         }
-        Err(mpsc::error::TrySendError::Full(request)) => Err(request),
-        Err(mpsc::error::TrySendError::Closed(request)) => {
-            lanes.swap_remove(position);
-            Err(request)
+
+        let position = position.expect("UDP edge association exists");
+        match lanes[position].requests.try_send(request) {
+            Ok(()) => {
+                lanes[position].pending = lanes[position].pending.saturating_add(1);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Full(rejected)) => return Err(rejected),
+            Err(mpsc::error::TrySendError::Closed(rejected)) => {
+                // The receiver crossed its terminal boundary after selection.
+                // This exact request was not accepted; retry admission without
+                // removing or aborting the reporter.
+                request = rejected;
+            }
         }
     }
 }
@@ -795,11 +900,11 @@ pub(in crate::runtime) fn finish_udp_edge_completion<M>(
     }
 }
 
-/// Cancel and remove exactly one association lane.
+/// Cancel every lane belonging to one exact external association generation.
 ///
-/// Callers that can recycle an external association key must include their
-/// own generation in `metadata`; completions already queued by the removed
-/// lane can otherwise be mistaken for the replacement association.
+/// Terminal reporting can briefly overlap a successor with the same metadata.
+/// External expiry owns the whole generation and therefore removes every such
+/// lane; callers that recycle keys must include their generation in `metadata`.
 pub(in crate::runtime) fn remove_udp_edge_lane<M>(
     lanes: &mut Vec<UdpEdgeLane<M>>,
     metadata: &M,
@@ -807,7 +912,24 @@ pub(in crate::runtime) fn remove_udp_edge_lane<M>(
 where
     M: Eq,
 {
-    let Some(position) = lanes.iter().position(|lane| lane.metadata == *metadata) else {
+    let previous_len = lanes.len();
+    lanes.retain(|lane| lane.metadata != *metadata);
+    lanes.len() != previous_len
+}
+
+/// Reap one exact internal lane after its task and completion accounting end.
+pub(in crate::runtime) fn reap_finished_udp_edge_lane_instance<M>(
+    lanes: &mut Vec<UdpEdgeLane<M>>,
+    lane_id: usize,
+) -> bool {
+    let Some(position) = lanes.iter().position(|lane| {
+        lane.lane_id == lane_id
+            && lane.pending == 0
+            && lane
+                .handle
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+    }) else {
         return false;
     };
     lanes.swap_remove(position);

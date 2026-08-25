@@ -229,6 +229,8 @@ struct ReliablePathCommandQueueMetrics {
     capacity_released: Arc<Notify>,
     tcp_capacity_probe: TcpCapacityProbeLeaseState,
     lifecycle: ReliablePathCarrierLifecycle,
+    #[cfg(test)]
+    last_accepted_open_stream: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -250,7 +252,28 @@ struct ReliablePathCarrierLifecycle {
 
 const RELIABLE_PATH_CARRIER_ACTIVE: u8 = 0;
 const RELIABLE_PATH_CARRIER_DRAINING: u8 = 1;
-const RELIABLE_PATH_CARRIER_TERMINAL: u8 = 2;
+const RELIABLE_PATH_CARRIER_TERMINAL_FAILED: u8 = 2;
+const RELIABLE_PATH_CARRIER_TERMINAL_RETIRED: u8 = 3;
+
+/// Sticky terminal classification for one exact fixed carrier output.
+///
+/// Input fan-in observes this independently from command-channel ownership so
+/// it can freeze input admission, drain every frame accepted before terminal,
+/// and publish one ordered fallback when the input producer cannot do so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ReliablePathCarrierTerminalCause {
+    Failed,
+    Retired,
+}
+
+impl ReliablePathCarrierTerminalCause {
+    pub(in crate::runtime) fn into_error(self) -> RuntimeError {
+        match self {
+            Self::Failed => RuntimeError::ReliablePathSessionClosed,
+            Self::Retired => RuntimeError::ReliablePathRetired,
+        }
+    }
+}
 
 impl Default for ReliablePathCarrierLifecycle {
     fn default() -> Self {
@@ -282,17 +305,54 @@ impl ReliablePathCarrierLifecycle {
     }
 
     fn is_terminal(&self) -> bool {
-        self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_TERMINAL
+        self.phase.load(Ordering::Acquire) >= RELIABLE_PATH_CARRIER_TERMINAL_FAILED
     }
 
-    fn finish(&self) {
-        if self
+    fn terminal_cause(&self) -> Option<ReliablePathCarrierTerminalCause> {
+        match self.phase.load(Ordering::Acquire) {
+            RELIABLE_PATH_CARRIER_TERMINAL_FAILED => Some(ReliablePathCarrierTerminalCause::Failed),
+            RELIABLE_PATH_CARRIER_TERMINAL_RETIRED => {
+                Some(ReliablePathCarrierTerminalCause::Retired)
+            }
+            _ => None,
+        }
+    }
+
+    fn finish_failed(&self) {
+        let mut phase = self.phase.load(Ordering::Acquire);
+        loop {
+            if phase >= RELIABLE_PATH_CARRIER_TERMINAL_FAILED {
+                return;
+            }
+            match self.phase.compare_exchange_weak(
+                phase,
+                RELIABLE_PATH_CARRIER_TERMINAL_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.changed.notify_waiters();
+                    return;
+                }
+                Err(current) => phase = current,
+            }
+        }
+    }
+
+    fn finish_planned_retirement(&self) -> bool {
+        let finished = self
             .phase
-            .swap(RELIABLE_PATH_CARRIER_TERMINAL, Ordering::AcqRel)
-            != RELIABLE_PATH_CARRIER_TERMINAL
-        {
+            .compare_exchange(
+                RELIABLE_PATH_CARRIER_DRAINING,
+                RELIABLE_PATH_CARRIER_TERMINAL_RETIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if finished {
             self.changed.notify_waiters();
         }
+        finished
     }
 
     async fn wait_for_drain(&self) {
@@ -302,6 +362,18 @@ impl ReliablePathCarrierLifecycle {
             changed.as_mut().enable();
             if !self.is_active() {
                 return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_for_terminal(&self) -> ReliablePathCarrierTerminalCause {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(cause) = self.terminal_cause() {
+                return cause;
             }
             changed.await;
         }
@@ -320,6 +392,23 @@ impl ReliablePathDrainSignal {
 
     pub(in crate::runtime) fn is_terminal(&self) -> bool {
         self.metrics.lifecycle.is_terminal()
+    }
+}
+
+/// Cloneable exact-carrier terminal observer retained by an attachment's input
+/// forwarder after the carrier command owner itself has gone away.
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct ReliablePathCarrierTerminalSignal {
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
+}
+
+impl ReliablePathCarrierTerminalSignal {
+    pub(in crate::runtime) fn cause(&self) -> Option<ReliablePathCarrierTerminalCause> {
+        self.metrics.lifecycle.terminal_cause()
+    }
+
+    pub(in crate::runtime) async fn wait(&self) -> ReliablePathCarrierTerminalCause {
+        self.metrics.lifecycle.wait_for_terminal().await
     }
 }
 
@@ -531,6 +620,13 @@ impl ReliablePathCommandReceivers {
         self.path_drain_phase = Some(ReliablePathCommandDrainPhase::Retirement);
     }
 
+    /// Publishes the authoritative terminal reason only after ordered drain
+    /// completed. A later receiver drop cannot overwrite planned retirement
+    /// with generic carrier failure.
+    pub(in crate::runtime) fn finish_planned_path_retirement(&self) -> bool {
+        self.metrics.lifecycle.finish_planned_retirement()
+    }
+
     fn take_queued_command(&self, command: QueuedReliablePathCommand) -> ReliablePathCommand {
         let (command, accounted_bytes) = command.into_parts();
         self.dequeued_unreleased_bytes
@@ -588,7 +684,7 @@ impl ReliablePathCommandReceivers {
 
 impl Drop for ReliablePathCommandReceivers {
     fn drop(&mut self) {
-        self.metrics.lifecycle.finish();
+        self.metrics.lifecycle.finish_failed();
         // Queued envelopes reconcile themselves. This covers a command already
         // removed from mpsc when a writer exits through an async error path.
         let outstanding = self.dequeued_unreleased_bytes.swap(0, Ordering::Relaxed);
@@ -609,8 +705,14 @@ impl ReliablePathCommandSender {
     /// settlement. Unlike planned drain, no failed physical connection is
     /// retained to exchange ordered retirement frames.
     pub(in crate::runtime) fn terminate_failed_path(&self) {
-        self.metrics.lifecycle.finish();
+        self.metrics.lifecycle.finish_failed();
         self.metrics.capacity_released.notify_waiters();
+    }
+
+    pub(in crate::runtime) fn terminal_signal(&self) -> ReliablePathCarrierTerminalSignal {
+        ReliablePathCarrierTerminalSignal {
+            metrics: self.metrics.clone(),
+        }
     }
 
     pub(in crate::runtime) fn register_flow(
@@ -641,6 +743,24 @@ impl ReliablePathCommandSender {
                 && self.reinjection.capacity() > 0,
             data_ready: product_open && data_open && self.data.capacity() > 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn open_stream_command_accepted_for_test(
+        &self,
+        stream_id: StreamId,
+    ) -> bool {
+        self.metrics
+            .last_accepted_open_stream
+            .load(Ordering::Acquire)
+            == stream_id.0
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn control_queue_len_for_test(&self) -> usize {
+        self.control
+            .max_capacity()
+            .saturating_sub(self.control.capacity())
     }
 
     pub(in crate::runtime) fn retire_accepted_stream(
@@ -675,6 +795,11 @@ impl ReliablePathCommandSender {
         let stream_id = reliable_path_command_stream_id(&command).unwrap_or(StreamId(0));
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
+        #[cfg(test)]
+        let accepted_open_stream = match &command {
+            ReliablePathCommand::OpenStream { stream_id, .. } => Some(*stream_id),
+            _ => None,
+        };
         let requires_product_admission = reliable_path_command_requires_product_admission(&command);
         let result = match self.control.reserve().await {
             Ok(permit) if !requires_product_admission || self.metrics.lifecycle.is_active() => {
@@ -683,6 +808,12 @@ impl ReliablePathCommandSender {
                     0,
                     self.metrics.clone(),
                 ));
+                #[cfg(test)]
+                if let Some(stream_id) = accepted_open_stream {
+                    self.metrics
+                        .last_accepted_open_stream
+                        .store(stream_id.0, Ordering::Release);
+                }
                 Ok(())
             }
             Ok(_) | Err(_) => Err(mpsc::error::SendError(command)),
@@ -1129,6 +1260,19 @@ impl ReliablePathCommandSender {
             && self.priority.is_closed()
             && self.reinjection.is_closed()
             && self.data.is_closed()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn is_terminal(&self) -> bool {
+        self.metrics.lifecycle.is_terminal()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn is_planned_retirement(&self) -> bool {
+        matches!(
+            self.metrics.lifecycle.terminal_cause(),
+            Some(ReliablePathCarrierTerminalCause::Retired)
+        )
     }
 
     pub(in crate::runtime) fn product_admission_active(&self) -> bool {

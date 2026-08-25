@@ -16,7 +16,9 @@ use crate::protocol::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
-use crate::runtime::path::commands::{recv_reliable_path_command, reliable_path_command_channels};
+use crate::runtime::path::commands::{
+    ReliablePathCarrierTerminalCause, recv_reliable_path_command, reliable_path_command_channels,
+};
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, PathProofObservation, ServerDatagramOpenError,
     ServerDatagramOpenRequest, ServerDatagramPort, ServerDatagramPortBackend,
@@ -130,6 +132,8 @@ impl ServerDatagramPortBackend for ScriptedDatagramBackend {
                         requests,
                         request.commands,
                         Arc::new(()),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        crate::runtime::path::ServerSessionRetirement::active_for_test(),
                         (),
                     ))
                 }
@@ -218,6 +222,52 @@ async fn server_tcp_native_sender_deadline_wakes_an_idle_actor() {
     .expect("open carrier");
 
     assert!(matches!(event, ServerTcpPathEvent::SenderObservationDue));
+}
+
+#[tokio::test]
+async fn server_tcp_observed_ingress_captures_the_real_carrier_socket_peer() {
+    let security = ServerSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("test shared secret"),
+    );
+    let context = new_identity_runtime(
+        Vec::new(),
+        OutboundConfig::Direct,
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        security,
+        MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+    )
+    .paths;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind real TCP carrier");
+    let client = TcpStream::connect(listener.local_addr().expect("TCP carrier address"))
+        .await
+        .expect("connect real TCP carrier");
+    let expected_peer = client.local_addr().expect("client carrier endpoint");
+    let (server, _) = listener.accept().await.expect("accept real TCP carrier");
+    let observed_peer = super::super::tcp_carrier_peer(&server).expect("observe TCP carrier peer");
+    let registration = context
+        .reliable_streams
+        .register_carrier_path_with_observed_peer(
+            SessionId(206),
+            UnderlayProtocol::Tcp,
+            PathId(3),
+            ServerLocalPathProperties::default(),
+            crate::product::PrincipalPermit::for_test("test-peer"),
+            observed_peer,
+            Some(Arc::from("tcp-test")),
+        )
+        .expect("register observed TCP carrier");
+
+    let ingress = registration.mpp_ingress().expect("TCP observed ingress");
+    assert_eq!(ingress.peer(), expected_peer);
+    assert_eq!(ingress.session_id(), SessionId(206));
+    assert_eq!(ingress.underlay(), UnderlayProtocol::Tcp);
+    assert_eq!(ingress.configured_path(), Some("tcp-test"));
+    assert_eq!(ingress.path_id(), PathId(3));
+    assert_eq!(ingress.path_instance_id(), registration.path_instance_id());
 }
 
 async fn server_tcp_test_session(
@@ -383,7 +433,7 @@ async fn server_tcp_route_denials_are_flow_local_and_drop_is_silent() {
         .context
         .reliable_streams
         .clone()
-        .with_target_admission(Arc::new(|_, target| {
+        .with_target_admission(Arc::new(|_, _, target| {
             Ok(match target.port() {
                 81 => ServerTargetAdmission::Reject,
                 82 => ServerTargetAdmission::Drop,
@@ -971,6 +1021,7 @@ async fn server_tcp_path_close_is_the_aggregate_responder_suffix() {
     let path_id = PathId(0);
     let (session, mut client_framed, commands, path_frames, _reliable_relay) =
         server_tcp_test_session(session_id, path_id).await;
+    let terminal = commands.terminal_signal();
     commands
         .try_enqueue_admitted_frame(
             Frame::PathProofData {
@@ -994,6 +1045,11 @@ async fn server_tcp_path_close_is_the_aggregate_responder_suffix() {
         .await
         .expect("aggregate TCP path drain timeout")
         .expect("complete aggregate TCP path drain");
+    assert_eq!(
+        terminal.cause(),
+        Some(ReliablePathCarrierTerminalCause::Retired),
+        "a successfully flushed responder PATH_CLOSE is planned carrier retirement"
+    );
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
             .await

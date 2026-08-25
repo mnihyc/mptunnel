@@ -315,6 +315,7 @@ async fn run_server_udp_reliable_stream_loop(
                     ..
                 }))) if proof_path_id == path_id => {}
                 Ok(Some(Ok(Frame::SessionClose { reason }))) => {
+                    context.retire_session(session_id, reason);
                     return Err(RuntimeError::RemoteClosed(reason));
                 }
                 Ok(Some(Ok(
@@ -510,7 +511,10 @@ async fn run_server_udp_reliable_stream_loop(
                             "PATH_CAPACITY frames are not valid on QUIC carriers",
                         ));
                     }
-                    Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
+                    Some(Ok(Frame::SessionClose { reason })) => {
+                        context.retire_session(session_id, reason);
+                        return Err(RuntimeError::RemoteClosed(reason));
+                    }
                     Some(Ok(frame)) => {
                         crate::observability::process_event!(
                             Warn,

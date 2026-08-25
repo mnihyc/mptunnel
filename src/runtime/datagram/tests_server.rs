@@ -37,18 +37,37 @@ impl TestServerDatagramPort {
             let mut carriers = self.carriers.lock().expect("test carrier registry");
             carriers.entry(request.session_id).or_insert_with(|| {
                 self.reliable_streams
-                    .register_carrier_path(
+                    .register_carrier_path_with_observed_peer(
                         request.session_id,
                         crate::protocol::UnderlayProtocol::Udp,
                         crate::protocol::PathId(0),
                         crate::runtime::path::ServerLocalPathProperties::default(),
                         request.principal_permit.clone(),
+                        crate::runtime::path::ServerCarrierPeer::fixed(
+                            "203.0.113.7:51000"
+                                .parse()
+                                .expect("authenticated test carrier peer"),
+                        ),
+                        Some(Arc::from("test-quic")),
                     )
                     .expect("register authenticated test carrier")
             });
         }
         self.inner.open(request).await
     }
+}
+
+fn test_ingress(session_id: SessionId) -> crate::runtime::path::ServerMppIngress {
+    crate::runtime::path::ServerMppIngress::for_test(
+        session_id,
+        "203.0.113.7:51000"
+            .parse()
+            .expect("authenticated test carrier peer"),
+        crate::protocol::UnderlayProtocol::Udp,
+        Some("test-quic"),
+        crate::protocol::PathId(0),
+        crate::model::path::CarrierPathInstanceId::from_raw(1),
+    )
 }
 
 fn test_server_datagram_port(telemetry: RuntimeTelemetry) -> TestServerDatagramPort {
@@ -133,6 +152,7 @@ async fn shared_session_registry_saturation_is_an_explicit_capacity_failure() {
             flow_id: DatagramFlowId(1),
             target: TargetAddr::Ip("127.0.0.1:9".parse().expect("first target")),
             commands: carrier_a_commands,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("occupy the shared session registry from carrier A");
@@ -144,6 +164,7 @@ async fn shared_session_registry_saturation_is_an_explicit_capacity_failure() {
             flow_id: DatagramFlowId(2),
             target: TargetAddr::Ip("127.0.0.1:10".parse().expect("second target")),
             commands: carrier_b_commands,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect_err("carrier B must observe the shared session limit");
@@ -221,6 +242,7 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
             flow_id,
             target: crate::protocol::TargetAddr::Ip(target_addr),
             commands,
+            ingress: test_ingress(SessionId(20)),
         })
         .await
         .expect("open target-side datagram flow");
@@ -297,6 +319,7 @@ async fn distinct_client_datagrams_are_admitted_without_waiting_for_target_data(
             flow_id: DatagramFlowId(26),
             target: TargetAddr::Ip(target_addr),
             commands,
+            ingress: test_ingress(SessionId(25)),
         })
         .await
         .expect("open target-side datagram flow");
@@ -370,6 +393,7 @@ async fn one_client_datagram_forwards_all_target_datagrams_with_direction_local_
             flow_id,
             target: TargetAddr::Ip(target_addr),
             commands,
+            ingress: test_ingress(SessionId(27)),
         })
         .await
         .expect("open target-side datagram flow");
@@ -466,6 +490,7 @@ async fn delayed_target_datagram_after_later_request_is_not_mislabeled() {
             flow_id,
             target: TargetAddr::Ip(target_addr),
             commands,
+            ingress: test_ingress(SessionId(29)),
         })
         .await
         .expect("open target-side datagram flow");
@@ -555,6 +580,7 @@ async fn same_client_datagram_across_attachments_is_forwarded_once() {
             flow_id,
             target: target.clone(),
             commands: commands_a,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open first carrier attachment");
@@ -565,6 +591,7 @@ async fn same_client_datagram_across_attachments_is_forwarded_once() {
             flow_id,
             target,
             commands: commands_b,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open retry carrier attachment");
@@ -660,6 +687,7 @@ async fn cached_server_datagram_replay_preserves_direction_local_id() {
             flow_id,
             target: target.clone(),
             commands: commands_a,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open first carrier attachment");
@@ -698,6 +726,7 @@ async fn cached_server_datagram_replay_preserves_direction_local_id() {
             flow_id,
             target,
             commands: commands_b,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open retry carrier attachment");
@@ -762,6 +791,7 @@ async fn same_client_datagram_id_with_different_payload_is_rejected() {
             flow_id,
             target: target.clone(),
             commands: commands_a,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open first carrier attachment");
@@ -772,6 +802,7 @@ async fn same_client_datagram_id_with_different_payload_is_rejected() {
             flow_id,
             target,
             commands: commands_b,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open second carrier attachment");
@@ -843,6 +874,7 @@ async fn cached_target_datagram_is_delivered_when_live_route_capacity_returns() 
             flow_id,
             target: TargetAddr::Ip(target_addr),
             commands: commands.clone(),
+            ingress: test_ingress(SessionId(47)),
         })
         .await
         .expect("open target-side datagram flow");
@@ -938,6 +970,7 @@ async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_exten
             flow_id,
             target: target_address.clone(),
             commands,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open target-side datagram flow");
@@ -1005,6 +1038,7 @@ async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_exten
             flow_id,
             target: target_address,
             commands: replacement_commands,
+            ingress: test_ingress(session_id),
         })
         .await
         .expect("open replacement after retained flow expiry");

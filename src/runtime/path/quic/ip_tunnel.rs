@@ -119,6 +119,10 @@ pub(super) async fn open_client_udp_ip_tunnel(
                 path_instance_id: carrier.path_instance_id,
             });
         }
+        Frame::SessionClose { reason } => {
+            let reason = runtime.state.session_lifecycle().retire(*reason);
+            return Err(RuntimeError::RemoteClosed(reason));
+        }
         _ => {
             return Err(RuntimeError::Protocol(
                 "unexpected QUIC IP tunnel open response",
@@ -231,6 +235,10 @@ async fn run_client_udp_ip_tunnel(
                                 &Frame::Pong { nonce },
                                 runtime.codec_limits,
                             ).await?;
+                        }
+                        Ok(Frame::SessionClose { reason }) => {
+                            let reason = runtime.state.session_lifecycle().retire(reason);
+                            return Err(RuntimeError::RemoteClosed(reason));
                         }
                         Err(error) if udp_path_input_finished(&error) => return Ok(()),
                         Err(error) => return Err(error),
@@ -419,6 +427,10 @@ pub(super) async fn handle_server_udp_ip_tunnel(
                         payload,
                     }) if packet_tunnel == tunnel_id => {
                         let _ = accepted.receive(packet_id, payload)?;
+                    }
+                    Ok(Frame::SessionClose { reason }) => {
+                        context.retire_session(path_registration.session_id(), reason);
+                        return Err(RuntimeError::RemoteClosed(reason));
                     }
                     Ok(Frame::IpTunnelClose { tunnel_id: closed_tunnel, .. })
                         if closed_tunnel == tunnel_id =>

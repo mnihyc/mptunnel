@@ -100,6 +100,26 @@ fn client_relay_finished(
         && !remotes.has_pending_stream_ack_publication()
 }
 
+async fn resolve_client_relay_path_error(
+    sender: &mut RequestSenderService,
+    context: &ClientPathContext,
+    remotes: &mut ReliableRelayRemoteSet,
+    recovery_excluded_paths: &mut std::collections::HashSet<crate::model::path::RelayPathKey>,
+    instance: crate::model::path::RelayPathInstance,
+    planned_retirement: bool,
+) {
+    if planned_retirement {
+        remotes.retire_path_instance(instance).await;
+    } else {
+        let removed = sender
+            .fail_client_path_instance(context, remotes, instance)
+            .await;
+        if removed {
+            recovery_excluded_paths.insert(instance.key);
+        }
+    }
+}
+
 fn record_final_recv_progress_enqueue(
     state: &mut ClientRelayState,
     sent: bool,
@@ -234,7 +254,28 @@ pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _session_product_flow = context.reserve_session_product_flow();
+    let retirement = context.session_retirement().wait();
+    let active = relay_migrating_tcp_stream_active(local, context, performance, spec, remote);
+    tokio::pin!(retirement);
+    tokio::pin!(active);
+    tokio::select! {
+        biased;
+        reason = &mut retirement => Err(RuntimeError::RemoteClosed(reason)),
+        result = &mut active => result,
+    }
+}
+
+async fn relay_migrating_tcp_stream_active<S>(
+    local: S,
+    context: &ClientPathContext,
+    performance: MppPerformanceConfig,
+    spec: ReliableRelayOpenSpec,
+    remote: OpenedRemoteStream,
+) -> Result<PathDeliveryStats, RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _session_product_flow = context.reserve_session_product_flow()?;
     let initial_lane = remote.stream().lane;
     let initial_recv_max_offset = reliable_stream_initial_advertised_window_bytes(
         remote.stream().underlay,
@@ -290,20 +331,6 @@ where
     let result = loop {
         if client_relay_finished(&state, &send_stream, &recv_stream, &sender_queue, &remotes) {
             break Ok(state.delivery.total);
-        }
-        if deferred_remote_frame.is_none()
-            && let Some(instance) = remotes
-                .paths
-                .iter()
-                .find(|path| path.stream.output_is_terminally_closed())
-                .map(|path| path.instance())
-        {
-            // Terminal command ownership is an authoritative carrier-loss
-            // event even when its independent input queue is still retained.
-            deferred_remote_frame = Some(ReliableRelayRemoteFrame {
-                instance,
-                frame: Err(RuntimeError::ReliablePathSessionClosed),
-            });
         }
         if remotes.is_empty() {
             let now = Instant::now();
@@ -1864,7 +1891,6 @@ where
                         break Err(err);
                     }
                 };
-                let path_key = instance.key;
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
@@ -1882,14 +1908,15 @@ where
                                 err,
                             ),
                         );
-                        if planned_retirement {
-                            remotes.retire_path_instance(instance).await;
-                        } else {
-                            sender
-                                .fail_client_path_instance(context, &mut remotes, instance)
-                                .await;
-                            state.recovery.excluded_paths.insert(path_key);
-                        }
+                        resolve_client_relay_path_error(
+                            &mut sender,
+                            context,
+                            &mut remotes,
+                            &mut state.recovery.excluded_paths,
+                            instance,
+                            planned_retirement,
+                        )
+                        .await;
                         match recover_reliable_relay_after_path_failure(
                             &mut sender,
                             &mut sender_queue,
@@ -2344,3 +2371,7 @@ where
 #[cfg(test)]
 #[path = "tests_control.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_c3_common.rs"]
+mod tests_c3_common;

@@ -19,7 +19,8 @@ use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_exte
 use crate::protocol::{Frame, OffsetRange, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandSender, RequestTcpCapacityProbeRequest,
+    ReliablePathCarrierTerminalSignal, ReliablePathCommand, ReliablePathCommandSender,
+    RequestTcpCapacityProbeRequest,
 };
 #[cfg(test)]
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
@@ -202,7 +203,12 @@ impl ReliablePathStream {
     ) -> (
         ReliablePathStreamHandle,
         mpsc::Receiver<Result<Frame, RuntimeError>>,
+        ReliablePathCarrierTerminalSignal,
     ) {
+        let terminal = self
+            .output
+            .terminal_signal()
+            .expect("accepted remote stream has one fixed carrier lifecycle");
         (
             ReliablePathStreamHandle {
                 stream_id: self.stream_id,
@@ -213,6 +219,7 @@ impl ReliablePathStream {
                 output: self.output,
             },
             self.frames.into_carrier_frames(),
+            terminal,
         )
     }
 
@@ -773,8 +780,15 @@ impl ReliablePathStreamHandle {
         self.output.capacity_notifies()
     }
 
+    /// Compatibility probe for pre-model red/control fixtures. The post-model
+    /// answer comes from the authoritative ordered lifecycle, not channel
+    /// ownership, so planned drain remains non-terminal until retirement.
+    #[cfg(test)]
     pub(in crate::runtime) fn output_is_terminally_closed(&self) -> bool {
-        self.output.is_terminally_closed()
+        self.output
+            .terminal_signal()
+            .and_then(|signal| signal.cause())
+            .is_some()
     }
 
     pub(in crate::runtime) fn product_admission_active(&self) -> bool {
@@ -1018,12 +1032,10 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    /// Fixed request outputs die with their carrier command port. Switchable
-    /// response outputs remain live while the binding can select another port.
-    fn is_terminally_closed(&self) -> bool {
+    fn terminal_signal(&self) -> Option<ReliablePathCarrierTerminalSignal> {
         match self {
-            Self::Fixed(fixed) => fixed.commands().is_closed(),
-            Self::Switchable(_) => false,
+            Self::Fixed(fixed) => Some(fixed.commands().terminal_signal()),
+            Self::Switchable(_) => None,
         }
     }
 

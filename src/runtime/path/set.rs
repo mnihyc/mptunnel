@@ -42,6 +42,8 @@ use crate::transport::SystemCarrierNetworkProvider;
 use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Process-owned dependencies shared by every carrier in one client path group.
@@ -91,9 +93,188 @@ pub struct ClientPathContext {
     pub(in crate::runtime) session_send_buffer: SessionSendBuffer,
     #[cfg(test)]
     pub(in crate::runtime) proxy_auth: ProxyAuthConfig,
+    #[cfg(test)]
+    outward_settlement_test: Arc<Mutex<ClientOutwardSettlementTestState>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientOutwardSettlementCheckpoint {
+    ReliableTcpAccepted { path_index: usize },
+    TcpDatagramAttachmentAccepted { path_index: usize },
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ClientOutwardSettlementTestHook {
+    checkpoint: ClientOutwardSettlementCheckpoint,
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ClientOutwardSettlementTestState {
+    hook: Option<ClientOutwardSettlementTestHook>,
+    reliable_selection_passes: usize,
+    datagram_candidate_attempts: usize,
+}
+
+#[cfg(test)]
+pub(in crate::runtime) struct ClientOutwardSettlementTestControl {
+    reached: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl ClientOutwardSettlementTestControl {
+    pub(in crate::runtime) async fn wait_reached(&mut self) {
+        self.reached
+            .recv()
+            .await
+            .expect("outward-settlement test checkpoint");
+    }
+
+    pub(in crate::runtime) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClientOutwardSettlementTestControl {
+    fn drop(&mut self) {
+        self.release.notify_one();
+    }
 }
 
 impl ClientPathContext {
+    #[cfg(test)]
+    fn arm_outward_settlement_test(
+        &self,
+        checkpoint: ClientOutwardSettlementCheckpoint,
+    ) -> ClientOutwardSettlementTestControl {
+        let (reached_tx, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut state = self
+            .outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state");
+        assert!(
+            state.hook.is_none(),
+            "one context may own only one outward-settlement test hook"
+        );
+        state.reliable_selection_passes = 0;
+        state.datagram_candidate_attempts = 0;
+        state.hook = Some(ClientOutwardSettlementTestHook {
+            checkpoint,
+            reached: reached_tx,
+            release: release.clone(),
+        });
+        ClientOutwardSettlementTestControl {
+            reached: reached_rx,
+            release,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn arm_reliable_tcp_settlement_test(
+        &self,
+        path_index: usize,
+    ) -> ClientOutwardSettlementTestControl {
+        self.arm_outward_settlement_test(ClientOutwardSettlementCheckpoint::ReliableTcpAccepted {
+            path_index,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn arm_tcp_datagram_settlement_test(
+        &self,
+        path_index: usize,
+    ) -> ClientOutwardSettlementTestControl {
+        self.arm_outward_settlement_test(
+            ClientOutwardSettlementCheckpoint::TcpDatagramAttachmentAccepted { path_index },
+        )
+    }
+
+    #[cfg(test)]
+    async fn pause_outward_settlement_test(&self, checkpoint: ClientOutwardSettlementCheckpoint) {
+        let hook = {
+            let mut state = self
+                .outward_settlement_test
+                .lock()
+                .expect("outward-settlement test state");
+            if state
+                .hook
+                .as_ref()
+                .is_some_and(|hook| hook.checkpoint == checkpoint)
+            {
+                state.hook.take()
+            } else {
+                None
+            }
+        };
+        let Some(hook) = hook else {
+            return;
+        };
+        if hook.reached.send(()).is_ok() {
+            hook.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) async fn pause_reliable_tcp_settlement_for_test(
+        &self,
+        path_index: usize,
+    ) {
+        self.pause_outward_settlement_test(
+            ClientOutwardSettlementCheckpoint::ReliableTcpAccepted { path_index },
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) async fn pause_tcp_datagram_settlement_for_test(
+        &self,
+        path_index: usize,
+    ) {
+        self.pause_outward_settlement_test(
+            ClientOutwardSettlementCheckpoint::TcpDatagramAttachmentAccepted { path_index },
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn record_reliable_selection_pass_for_test(&self) {
+        self.outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state")
+            .reliable_selection_passes += 1;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn reliable_selection_passes_for_test(&self) -> usize {
+        self.outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state")
+            .reliable_selection_passes
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn record_datagram_candidate_attempt_for_test(&self) {
+        self.outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state")
+            .datagram_candidate_attempts += 1;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn datagram_candidate_attempts_for_test(&self) -> usize {
+        self.outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state")
+            .datagram_candidate_attempts
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) fn peer_path_usage(
         &self,
@@ -417,6 +598,10 @@ impl ClientPathContext {
             session_send_buffer,
             #[cfg(test)]
             proxy_auth: ProxyAuthConfig::disabled(),
+            #[cfg(test)]
+            outward_settlement_test: Arc::new(Mutex::new(
+                ClientOutwardSettlementTestState::default(),
+            )),
         })
     }
 

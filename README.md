@@ -295,12 +295,14 @@ Logging starts with the running version, configuration source, safe inbound and
 outbound inventory, bound listeners, runtime readiness, and shutdown. The
 default UTC text format is readable at a terminal; newline-delimited JSON,
 append-only files, and sanitized opt-in flow summaries are also supported.
-Set `level = "debug"` to see one correlated, scope-separated trace showing what
-each L4 inbound and authenticated principal accepted, which exact route and
-optional balancer were selected, and each configured outbound protocol,
-attempt, and result. Reliable MPP streams include their selected underlay and
-configured path name. UDP is traced per logical association; packets and
-per-packet MPP path choices are not logged.
+Set `level = "debug"` to see one correlated trace whose inbound, routing,
+optional balancer, and outbound records repeat the same accepted-request
+context. It includes the principal, requested destination, a typed local or MPP
+carrier peer, the exact route, and each configured outbound destination,
+protocol, attempt, and result. Server-side MPP records also identify the
+opening session and ingress carrier/path; reliable MPP outbound records include
+their independently selected underlay and path. UDP is traced per logical
+association; packets and per-packet MPP path choices are not logged.
 One bounded background HTTPS check reports the newest published GitHub release
 without delaying startup or forwarding; an available update includes its
 release-page URL.

@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use crate::lab_diagnostics::lab_diagnostic;
 
 pub(in crate::runtime) struct UdpDatagramClientSession {
-    _path_session: ClientUdpPathSessionHandle,
+    path_session: ClientUdpPathSessionHandle,
     stream: ClientUdpDatagramStream,
     flows: Vec<DatagramClientFlow>,
     mux_limits: MuxLimits,
@@ -49,10 +49,19 @@ pub(in crate::runtime) struct UdpDatagramClientSession {
     sent_datagrams: SentDatagramEvidence,
     last_datagram_rtt: Option<Duration>,
     last_feedback_observation: Option<UdpDatagramPathObservation>,
-    pub(in crate::runtime) connection_usable: bool,
 }
 
 impl UdpDatagramClientSession {
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.stream.path_instance_id
+    }
+
+    pub(in crate::runtime) fn error_settlement_owner(
+        &self,
+    ) -> (ClientUdpPathSessionHandle, CarrierPathInstanceId) {
+        (self.path_session.clone(), self.stream.path_instance_id)
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) async fn open(
         path: &PathSpec,
@@ -159,7 +168,7 @@ impl UdpDatagramClientSession {
         let stream = path_session.open_datagram_stream(open_deadline).await?;
         let path_id = stream.path_id;
         Ok(Self {
-            _path_session: path_session,
+            path_session,
             stream,
             flows: Vec::new(),
             mux_limits,
@@ -169,7 +178,6 @@ impl UdpDatagramClientSession {
             sent_datagrams: SentDatagramEvidence::new(mux_limits),
             last_datagram_rtt: None,
             last_feedback_observation: None,
-            connection_usable: true,
         })
     }
 
@@ -318,7 +326,10 @@ impl UdpDatagramClientSession {
             }
             Frame::SessionReady | Frame::Pong { .. } => Ok(DatagramSessionEvent::Control),
             Frame::DatagramClose { .. } => Err(RuntimeError::Protocol("datagram flow closed")),
-            Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
+            Frame::SessionClose { reason } => {
+                let reason = self.stream.runtime.state.session_lifecycle().retire(reason);
+                Err(RuntimeError::RemoteClosed(reason))
+            }
             _ => Err(RuntimeError::Protocol("unexpected UDP datagram frame")),
         }
     }
@@ -430,6 +441,7 @@ impl UdpDatagramClientSession {
                     }
                     Frame::SessionReady => {}
                     Frame::SessionClose { reason } => {
+                        let reason = self.stream.runtime.state.session_lifecycle().retire(reason);
                         break Err(RuntimeError::RemoteClosed(reason));
                     }
                     _ => break Err(RuntimeError::Protocol("unexpected UDP path probe frame")),
@@ -560,6 +572,10 @@ pub(super) async fn open_udp_datagram_session_on_path(
         open_deadline,
     )
     .await?;
-    context.mark_udp_path_open_success(path_index, started_at.elapsed());
+    let _ = context.mark_udp_path_reserved_open_success_for_instance(
+        path_index,
+        session.path_instance_id(),
+        started_at.elapsed(),
+    );
     Ok(session)
 }

@@ -389,7 +389,7 @@ pub(super) fn update_request_path_staleness(
                 candidate,
                 sender.request_path_has_reinjection_path(remotes, candidate),
                 Some(candidate.key.underlay),
-                context.reliable_path_snapshot(candidate.key),
+                context.reliable_path_snapshot_for_instance(candidate),
             )
         })
         .collect::<SmallVec<[_; 4]>>();

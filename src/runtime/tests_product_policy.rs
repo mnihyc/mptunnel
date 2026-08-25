@@ -10,6 +10,7 @@ use crate::product::{
     GatewayStrategy, InitialDemand, NetworkSet, OutboundId, RouteAction, RouteMatchSpec,
     RouteRuleSpec, RouteStage, RuleId, TargetResolutionMode,
 };
+use crate::protocol::{PathId, SessionId, UnderlayProtocol};
 use crate::runtime::ingress_runtime::{
     handle_http_connect_client_stream_with_auth, handle_socks5_client_stream_with_auth,
     local_admission_permit_for_test,
@@ -102,6 +103,17 @@ fn anonymous() -> PrincipalId {
     PrincipalId::parse("anonymous").expect("principal")
 }
 
+fn mpp_ingress() -> ServerMppIngress {
+    ServerMppIngress::for_test(
+        SessionId(88),
+        "203.0.113.7:51000".parse().expect("carrier peer"),
+        UnderlayProtocol::Udp,
+        Some("mobile-quic"),
+        PathId(4),
+        crate::model::path::CarrierPathInstanceId::from_raw(99),
+    )
+}
+
 #[test]
 fn restricted_address_is_a_named_routing_rejection_debug_decision() {
     let rule = RuleId::parse("public-only").expect("rule");
@@ -143,18 +155,109 @@ async fn final_route_group_preserves_debug_connection_rule_and_allow_restricted_
     else {
         panic!("expected open route");
     };
+    assert_eq!(
+        plan.flow_source,
+        crate::runtime::telemetry::ProductFlowSource::local_peer(source())
+    );
     let connection_id = crate::observability::DebugConnectionId::for_test(41);
-    plan.debug_connection_id = Some(connection_id);
+    let debug_source = source().to_string();
+    plan.debug_connection = Some(crate::observability::ConnectionDebugContext::for_test(
+        connection_id,
+        crate::observability::ConnectionDebugContextFields {
+            network: "udp",
+            origin: "local_inbound",
+            inbound: "local-socks",
+            principal: "anonymous",
+            source: Some(&debug_source),
+            source_kind: Some(crate::observability::ConnectionDebugSourceKind::LocalPeer),
+            requested_destination: "private.example:443",
+            session_id: None,
+            ingress_underlay: None,
+            ingress_path: None,
+            ingress_path_id: None,
+            ingress_path_instance: None,
+        },
+    ));
 
     let groups = plan
         .destination_route_groups(Network::Udp)
         .await
         .expect("final route groups");
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].debug_connection_id, Some(connection_id));
+    assert_eq!(
+        groups[0]
+            .debug_connection
+            .as_ref()
+            .map(crate::observability::ConnectionDebugContext::id_for_test),
+        Some(connection_id)
+    );
     assert_eq!(groups[0].rule_id, selected_rule);
     assert_eq!(groups[0].disposition, RouteDisposition::AllowRestricted);
     assert_eq!(groups[0].selection, EgressSelection::Outbound(edge_id),);
+}
+
+#[tokio::test]
+async fn mpp_carrier_peer_is_trace_context_not_source_cidr_routing_evidence() {
+    let carrier_match = OutboundId::parse("carrier-match").expect("outbound");
+    let fallback = OutboundId::parse("fallback").expect("outbound");
+    let routes = vec![
+        rule(
+            "carrier-source-must-not-match",
+            RouteMatchSpec {
+                source_cidrs: vec!["203.0.113.0/24".parse().expect("carrier CIDR")],
+                ..RouteMatchSpec::default()
+            },
+            EgressAction::Outbound(carrier_match.clone()),
+        ),
+        rule(
+            "fallback",
+            RouteMatchSpec::default(),
+            EgressAction::Outbound(fallback.clone()),
+        ),
+    ];
+    let leaf = |id: OutboundId| RuntimeOutboundLeaf::Local {
+        id,
+        config: OutboundConfig::Direct,
+        connect_timeout: Duration::from_millis(100),
+        native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+    };
+    let registry = RuntimeOutboundRegistry::compile(
+        [leaf(carrier_match), leaf(fallback.clone())],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("native outbound registry");
+    let router = ClientIngressRouter::new(&policy(routes), registry).expect("MPP router");
+    let ingress = ServerMppIngress::for_test(
+        SessionId(88),
+        "203.0.113.7:51000".parse().expect("carrier peer"),
+        UnderlayProtocol::Udp,
+        Some("mobile-quic"),
+        PathId(4),
+        crate::model::path::CarrierPathInstanceId::from_raw(99),
+    );
+    let target = TargetAddr::Ip("1.1.1.1:443".parse().expect("target"));
+    let ClientRoute::Open(plan) = router
+        .route_mpp_tcp_with_ingress(&target, anonymous(), inbound(), &ingress)
+        .expect("route MPP request")
+    else {
+        panic!("expected open MPP route");
+    };
+    assert!(plan.authorizer.flow.source().is_none());
+    assert_eq!(
+        plan.flow_source,
+        crate::runtime::telemetry::ProductFlowSource::mpp_carrier_peer(
+            "203.0.113.7:51000".parse().expect("carrier peer"),
+        ),
+        "the authenticated opening carrier is telemetry identity, not routing source evidence"
+    );
+    let groups = plan
+        .destination_route_groups(Network::Tcp)
+        .await
+        .expect("route groups");
+
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].selection, EgressSelection::Outbound(fallback));
 }
 
 #[tokio::test]
@@ -1078,6 +1181,7 @@ fn deny_actions_finish_before_target_lookup_or_destination_open_authority() {
                     &target,
                     anonymous(),
                     inbound(),
+                    &mpp_ingress(),
                     || {
                         terminal_trace_allocations
                             .set(terminal_trace_allocations.get().saturating_add(1));
@@ -1118,15 +1222,21 @@ fn mpp_tcp_preflight_preserves_allow_without_a_trace_identity() {
 
     let terminal_trace_allocations = Cell::<usize>::new(0);
     let ClientRoute::Open(plan) = router
-        .preflight_mpp_tcp_with_terminal_debug_connection(&target, anonymous(), inbound(), || {
-            terminal_trace_allocations.set(terminal_trace_allocations.get().saturating_add(1));
-            Some(crate::observability::DebugConnectionId::for_test(74))
-        })
+        .preflight_mpp_tcp_with_terminal_debug_connection(
+            &target,
+            anonymous(),
+            inbound(),
+            &mpp_ingress(),
+            || {
+                terminal_trace_allocations.set(terminal_trace_allocations.get().saturating_add(1));
+                Some(crate::observability::DebugConnectionId::for_test(74))
+            },
+        )
         .expect("allowed MPP TCP preflight")
     else {
         panic!("expected allowed preflight plan");
     };
-    assert_eq!(plan.debug_connection_id, None);
+    assert!(plan.debug_connection.is_none());
     assert_eq!(terminal_trace_allocations.get(), 0);
 
     let loopback = TargetAddr::Ip("127.0.0.1:443".parse().expect("loopback target"));
@@ -1137,6 +1247,7 @@ fn mpp_tcp_preflight_preserves_allow_without_a_trace_identity() {
                 &loopback,
                 anonymous(),
                 inbound(),
+                &mpp_ingress(),
                 || {
                     terminal_trace_allocations
                         .set(terminal_trace_allocations.get().saturating_add(1));

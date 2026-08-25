@@ -526,9 +526,19 @@ pub(in crate::runtime) async fn run_client_tun_l3(
     let _registration = context.ip_tunnels.register(event_sink.clone())?;
     let supervisors = spawn_carrier_supervisors(&context, tunnel_id, event_sink);
     let mut state = ClientIpTunnelState::new(tunnel_id, 1, packet_bytes);
+    context.ensure_session_active()?;
+    let session_retirement = context.session_retirement().wait();
+    tokio::pin!(session_retirement);
 
     while state.parameters.is_none() || !state.has_ready_carrier() {
-        let Some(input) = events_rx.recv().await else {
+        let input = tokio::select! {
+            biased;
+            reason = &mut session_retirement => {
+                return Err(RuntimeError::RemoteClosed(reason));
+            }
+            input = events_rx.recv() => input,
+        };
+        let Some(input) = input else {
             return Err(RuntimeError::Protocol("TUN-L3 carrier event source closed"));
         };
         match input {
@@ -541,7 +551,7 @@ pub(in crate::runtime) async fn run_client_tun_l3(
             ClientIpTunnelInput::CarrierUpdate {
                 update, processed, ..
             } => {
-                state.apply_update(update)?;
+                context.commit_if_session_active(|| state.apply_update(update))??;
                 let _ = processed.send(());
             }
         }
@@ -587,27 +597,32 @@ pub(in crate::runtime) async fn run_client_tun_l3(
         }
         Ok::<(), RuntimeError>(())
     });
-    if let Some(managed) = managed.as_mut() {
-        managed.signal_ready();
-    }
-    crate::observability::emit_lifecycle(
-        crate::config::LogLevel::Info,
-        "inbound",
-        "ready",
-        format_args!(
-            "{inbound}: TUN-L3 packet ingress ready on {interface}; {} carrier attachment(s)",
-            state
-                .carriers
-                .values()
-                .filter(|carrier| carrier.ready)
-                .count()
-        ),
-    );
-    readiness.ready();
+    context.commit_if_session_active(|| {
+        if let Some(managed) = managed.as_mut() {
+            managed.signal_ready();
+        }
+        crate::observability::emit_lifecycle(
+            crate::config::LogLevel::Info,
+            "inbound",
+            "ready",
+            format_args!(
+                "{inbound}: TUN-L3 packet ingress ready on {interface}; {} carrier attachment(s)",
+                state
+                    .carriers
+                    .values()
+                    .filter(|carrier| carrier.ready)
+                    .count()
+            ),
+        );
+        readiness.ready();
+    })?;
 
     loop {
         tokio::select! {
             biased;
+            reason = &mut session_retirement => {
+                return Err(RuntimeError::RemoteClosed(reason));
+            }
             input = events_rx.recv() => {
                 let Some(input) = input else {
                     return Err(RuntimeError::Protocol("TUN-L3 carrier event source closed"));
@@ -629,7 +644,7 @@ pub(in crate::runtime) async fn run_client_tun_l3(
                     ClientIpTunnelInput::CarrierUpdate {
                         update, processed, ..
                     } => {
-                        state.apply_update(update)?;
+                        context.commit_if_session_active(|| state.apply_update(update))??;
                         let _ = processed.send(());
                     }
                 }
@@ -738,11 +753,15 @@ async fn run_udp_carrier_supervisor(
                 {
                     return;
                 }
-                if start.send(()).is_err() {
-                    let _ = events
-                        .send_update(ClientIpCarrierUpdate::Retired { key })
-                        .await;
-                    return;
+                match context.commit_if_session_active(|| start.send(())) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(())) => {
+                        let _ = events
+                            .send_update(ClientIpCarrierUpdate::Retired { key })
+                            .await;
+                        return;
+                    }
+                    Err(_) => return,
                 }
                 let close_reason = tokio::select! {
                     _ = attachment.wait_retired() => None,

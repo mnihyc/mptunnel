@@ -16,7 +16,10 @@ use crate::protocol::{Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
-use crate::runtime::path::{ServerCarrierPathRegistration, ServerLocalPathProperties};
+use crate::runtime::path::{
+    ServerCarrierPathRegistration, ServerCarrierPeer, ServerLocalPathProperties,
+    fence_server_carrier_readiness,
+};
 use crate::runtime::peer_status::PeerStatusCarrier;
 use crate::scheduler::TrafficClass;
 use crate::transport::PathSpec;
@@ -110,8 +113,7 @@ async fn handle_server_udp_connection(
     drop(authentication_slot);
     let session_id = path_registration.session_id();
     let path_id = path_registration.path_id();
-    let peer_status =
-        context.register_peer_status(session_id, path_registration.principal_permit().principal());
+    let peer_status = context.register_peer_status(&path_registration);
     let control = run_server_udp_control_stream(
         control_send,
         control_recv,
@@ -130,6 +132,8 @@ async fn handle_server_udp_connection(
     let retirement =
         context.wait_for_credential_retirement(path_registration.principal_permit().clone());
     tokio::pin!(retirement);
+    let session_retirement = path_registration.session_retirement().wait();
+    tokio::pin!(session_retirement);
     let result = loop {
         // QUIC stream credit bounds live children. Eagerly reaping completed
         // actors also bounds retained JoinSet output under sustained churn.
@@ -144,6 +148,10 @@ async fn handle_server_udp_connection(
             }
         }
         tokio::select! {
+            biased;
+            reason = &mut session_retirement => {
+                break Err(RuntimeError::RemoteClosed(reason));
+            }
             () = &mut retirement => {
                 break Ok(());
             }
@@ -236,7 +244,7 @@ async fn accept_server_udp_path_handshake(
         // chooses to open a matching request stream.
         let (mut send, mut recv) = connection.accept_bi().await?;
         send.set_traffic_class(TrafficClass::Control)?;
-        match admit_server_udp_path(&mut send, &mut recv, local_path, context).await {
+        match admit_server_udp_path(connection, &mut send, &mut recv, local_path, context).await {
             Ok(registration) => Ok((registration, send, recv)),
             Err(err) => {
                 let _ = udp_path_reject_stream(&mut send).await;
@@ -249,7 +257,24 @@ async fn accept_server_udp_path_handshake(
     .and_then(|result| result)
 }
 
+#[cfg(test)]
+pub(in crate::runtime) async fn accept_server_udp_path_handshake_for_test(
+    connection: &UdpPathConnection,
+    local_path: &ServerLocalPath,
+    context: &ServerPathContext,
+) -> Result<
+    (
+        ServerCarrierPathRegistration,
+        UdpPathSendStream,
+        UdpPathRecvStream,
+    ),
+    RuntimeError,
+> {
+    accept_server_udp_path_handshake(connection, local_path, context).await
+}
+
 async fn admit_server_udp_path(
+    connection: &UdpPathConnection,
     send: &mut UdpPathSendStream,
     recv: &mut UdpPathRecvStream,
     local_path: &ServerLocalPath,
@@ -299,33 +324,44 @@ async fn admit_server_udp_path(
     };
     let local_usage = local_path.advertised_usage();
     let local_metrics = local_path.startup_metrics(path_id);
-    let path_registration = context.reliable_streams.register_carrier_path(
-        session_id,
-        UnderlayProtocol::Udp,
-        path_id,
-        ServerLocalPathProperties {
-            config_ordinal: local_path.config_ordinal(),
-            policy: local_path.policy(),
-            initial_metrics: Some(local_metrics),
-        },
-        path_join.principal_permit,
-    )?;
-    context
+    let observed = connection.clone();
+    let path_registration = context
         .reliable_streams
-        .record_peer_path_usage(&path_registration, 0, peer_usage);
-    context
-        .reliable_streams
-        .record_local_path_metrics(&path_registration, local_metrics, false);
-    udp_path_write_frame(send, &Frame::SessionReady, context.codec_limits).await?;
-    udp_path_write_frame(
-        send,
-        &Frame::PathStatus {
+        .register_carrier_path_with_observed_peer(
+            session_id,
+            UnderlayProtocol::Udp,
             path_id,
-            sequence: 0,
-            usage: local_usage,
-        },
-        context.codec_limits,
-    )
+            ServerLocalPathProperties {
+                config_ordinal: local_path.config_ordinal(),
+                policy: local_path.policy(),
+                initial_metrics: Some(local_metrics),
+            },
+            path_join.principal_permit,
+            ServerCarrierPeer::observed(move || observed.remote_address()),
+            context.configured_path_name(local_path.config_ordinal()),
+        )?;
+    fence_server_carrier_readiness(path_registration.session_retirement(), async {
+        context
+            .reliable_streams
+            .record_peer_path_usage(&path_registration, 0, peer_usage);
+        context.reliable_streams.record_local_path_metrics(
+            &path_registration,
+            local_metrics,
+            false,
+        );
+        udp_path_write_frame(send, &Frame::SessionReady, context.codec_limits).await?;
+        udp_path_write_frame(
+            send,
+            &Frame::PathStatus {
+                path_id,
+                sequence: 0,
+                usage: local_usage,
+            },
+            context.codec_limits,
+        )
+        .await?;
+        Ok(())
+    })
     .await?;
     Ok(path_registration)
 }
@@ -365,7 +401,10 @@ async fn run_server_udp_control_stream(
                 let _ = peer_status.receive_response(request_id, code, paths);
                 None
             }
-            ServerUdpControlEvent::Frame(Ok(Frame::SessionClose { .. })) => return Ok(()),
+            ServerUdpControlEvent::Frame(Ok(Frame::SessionClose { reason })) => {
+                context.retire_session(session_id, reason);
+                return Err(RuntimeError::RemoteClosed(reason));
+            }
             ServerUdpControlEvent::Frame(Ok(_)) => {
                 return Err(RuntimeError::Protocol(
                     "unexpected QUIC UDP control stream frame",
@@ -455,6 +494,11 @@ pub(super) async fn handle_server_udp_bidi_stream(
                 ServerUdpDatagramStreamContext {
                     session_id,
                     principal_permit: path_registration.principal_permit().clone(),
+                    ingress: path_registration.mpp_ingress_observer().ok_or(
+                        RuntimeError::Protocol(
+                            "active QUIC carrier is missing its authenticated socket peer",
+                        ),
+                    )?,
                     flow_id,
                     target,
                 },
@@ -475,3 +519,7 @@ pub(super) async fn handle_server_udp_bidi_stream(
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "tests_server.rs"]
+mod tests;

@@ -722,6 +722,24 @@ h3 {
   display: block;
   width: 100%;
   height: 180px;
+  cursor: crosshair;
+  touch-action: pan-y pinch-zoom;
+}
+
+.canvas-frame canvas:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+
+.chart-detail {
+  display: block;
+  min-height: 1.25rem;
+  margin: 0;
+  padding-top: 6px;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .canvas-empty {
@@ -800,7 +818,7 @@ h3 {
 }
 
 .records-table--connections {
-  min-width: 1240px;
+  min-width: 1400px;
 }
 
 .records-table--sessions {
@@ -812,7 +830,7 @@ h3 {
 }
 
 .records-table--paths-complete {
-  min-width: 1880px;
+  min-width: 1540px;
 }
 
 .overview-connections {

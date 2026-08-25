@@ -640,7 +640,7 @@ fn write_suppressed(output: &mut Vec<u8>, suppressed: u64) {
 /// Process-local correlation identity for one debug-logged connection.
 ///
 /// The value is deliberately opaque to callers: it exists only to correlate
-/// scope-owned connection records and is never a protocol flow ID.
+/// connection-stage records and is never a protocol flow ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DebugConnectionId(u64);
 
@@ -669,6 +669,114 @@ pub(crate) fn next_debug_connection_id() -> Option<DebugConnectionId> {
         })
         .ok()
         .map(DebugConnectionId)
+}
+
+/// Immutable ingress-owned context repeated on every record in one routed L4
+/// trace. Repeating these fields makes an isolated routing, balancer, or
+/// outbound record independently useful without changing which component owns
+/// the event-specific outcome.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectionDebugContext {
+    inner: Arc<ConnectionDebugContextInner>,
+}
+
+#[derive(Debug)]
+struct ConnectionDebugContextInner {
+    id: DebugConnectionId,
+    network: String,
+    origin: String,
+    inbound: String,
+    principal: String,
+    source: Option<String>,
+    source_kind: Option<&'static str>,
+    requested_destination: String,
+    session_id: Option<String>,
+    ingress_underlay: Option<String>,
+    ingress_path: Option<String>,
+    ingress_path_id: Option<String>,
+    ingress_path_instance: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionDebugSourceKind {
+    LocalPeer,
+    MppCarrierPeer,
+}
+
+impl ConnectionDebugSourceKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPeer => "local_peer",
+            Self::MppCarrierPeer => "mpp_carrier_peer",
+        }
+    }
+}
+
+pub(crate) struct ConnectionDebugContextFields<'a> {
+    pub(crate) network: &'a str,
+    pub(crate) origin: &'a str,
+    pub(crate) inbound: &'a str,
+    pub(crate) principal: &'a str,
+    pub(crate) source: Option<&'a str>,
+    pub(crate) source_kind: Option<ConnectionDebugSourceKind>,
+    pub(crate) requested_destination: &'a str,
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) ingress_underlay: Option<&'a str>,
+    pub(crate) ingress_path: Option<&'a str>,
+    pub(crate) ingress_path_id: Option<&'a str>,
+    pub(crate) ingress_path_instance: Option<&'a str>,
+}
+
+fn build_connection_debug_context(
+    id: DebugConnectionId,
+    fields: ConnectionDebugContextFields<'_>,
+) -> ConnectionDebugContext {
+    debug_assert_eq!(
+        fields.source.is_some(),
+        fields.source_kind.is_some(),
+        "a debug source endpoint and its semantics must be published together"
+    );
+    ConnectionDebugContext {
+        inner: Arc::new(ConnectionDebugContextInner {
+            id,
+            network: sanitize_connection_field(fields.network),
+            origin: sanitize_connection_field(fields.origin),
+            inbound: sanitize_connection_field(fields.inbound),
+            principal: sanitize_connection_field(fields.principal),
+            source: fields.source.map(sanitize_connection_field),
+            source_kind: fields.source_kind.map(ConnectionDebugSourceKind::as_str),
+            requested_destination: sanitize_connection_field(fields.requested_destination),
+            session_id: fields.session_id.map(sanitize_connection_field),
+            ingress_underlay: fields.ingress_underlay.map(sanitize_connection_field),
+            ingress_path: fields.ingress_path.map(sanitize_connection_field),
+            ingress_path_id: fields.ingress_path_id.map(sanitize_connection_field),
+            ingress_path_instance: fields.ingress_path_instance.map(sanitize_connection_field),
+        }),
+    }
+}
+
+pub(crate) fn connection_debug_context(
+    id: Option<DebugConnectionId>,
+    fields: ConnectionDebugContextFields<'_>,
+) -> Option<ConnectionDebugContext> {
+    if !enabled(LogLevel::Debug) {
+        return None;
+    }
+    id.map(|id| build_connection_debug_context(id, fields))
+}
+
+#[cfg(test)]
+impl ConnectionDebugContext {
+    pub(crate) fn for_test(
+        id: DebugConnectionId,
+        fields: ConnectionDebugContextFields<'_>,
+    ) -> Self {
+        build_connection_debug_context(id, fields)
+    }
+
+    pub(crate) fn id_for_test(&self) -> DebugConnectionId {
+        self.inner.id
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,12 +836,24 @@ struct ConnectionDebugRecord<'a> {
     event: &'static str,
     connection_id: String,
     network: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    inbound: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    principal: Option<&'a str>,
+    origin: &'a str,
+    inbound: &'a str,
+    principal: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_kind: Option<&'a str>,
+    requested_destination: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress_underlay: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress_path_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress_path_instance: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rule: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -747,15 +867,13 @@ struct ConnectionDebugRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     outbound: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    protocol: Option<&'a str>,
+    outbound_destination: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    origin: Option<&'a str>,
+    protocol: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     underlay: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mpp_path: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    destination: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -767,115 +885,94 @@ impl<'a> ConnectionDebugRecord<'a> {
         timestamp_unix_ms: u64,
         component: &'static str,
         event: &'static str,
-        id: DebugConnectionId,
-        network: &'a str,
+        context: &'a ConnectionDebugContext,
     ) -> Self {
+        let common = context.inner.as_ref();
         Self {
             timestamp_unix_ms,
             level: LogLevel::Debug.as_str(),
             component,
             event,
-            connection_id: id.to_string(),
-            network,
-            inbound: None,
-            principal: None,
-            source: None,
+            connection_id: common.id.to_string(),
+            network: &common.network,
+            origin: &common.origin,
+            inbound: &common.inbound,
+            principal: &common.principal,
+            source: common.source.as_deref(),
+            source_kind: common.source_kind,
+            requested_destination: &common.requested_destination,
+            session_id: common.session_id.as_deref(),
+            ingress_underlay: common.ingress_underlay.as_deref(),
+            ingress_path: common.ingress_path.as_deref(),
+            ingress_path_id: common.ingress_path_id.as_deref(),
+            ingress_path_instance: common.ingress_path_instance.as_deref(),
             rule: None,
             decision: None,
             egress: None,
             target_resolution: None,
             balancer: None,
             outbound: None,
+            outbound_destination: None,
             protocol: None,
-            origin: None,
             underlay: None,
             mpp_path: None,
-            destination: None,
             attempt: None,
             error: None,
         }
     }
 }
 
-/// Emits one inbound-owned connection state without outbound or routing data.
+/// Emits one inbound-owned state with the trace's immutable ingress context.
 pub(crate) fn emit_inbound_debug(
-    id: Option<DebugConnectionId>,
+    context: Option<&ConnectionDebugContext>,
     event: InboundDebugEvent,
-    network: &str,
-    inbound: &str,
-    principal: Option<&str>,
-    source: Option<&str>,
-    destination: Option<&str>,
 ) {
     if !enabled(LogLevel::Debug) {
         return;
     }
-    let Some(id) = id else {
+    let Some(context) = context else {
         return;
     };
-    let network = sanitize_connection_field(network);
-    let inbound = sanitize_connection_field(inbound);
-    let principal = principal.map(sanitize_connection_field);
-    let source = source.map(sanitize_connection_field);
-    let destination = destination.map(sanitize_connection_field);
-    let mut record =
-        ConnectionDebugRecord::new(unix_millis(), "inbound", event.as_str(), id, &network);
-    record.inbound = Some(&inbound);
-    record.principal = principal.as_deref();
-    record.source = source.as_deref();
-    record.destination = destination.as_deref();
+    let record = ConnectionDebugRecord::new(unix_millis(), "inbound", event.as_str(), context);
     emit_connection_debug_record(&record);
 }
 
 pub(crate) struct RoutingDebugFields<'a> {
-    pub(crate) network: &'a str,
-    pub(crate) inbound: Option<&'a str>,
-    pub(crate) principal: Option<&'a str>,
     pub(crate) rule: Option<&'a str>,
     pub(crate) decision: &'a str,
     pub(crate) egress: Option<&'a str>,
     pub(crate) target_resolution: Option<&'a str>,
-    pub(crate) destination: &'a str,
 }
 
-/// Emits one routing-owned decision without balancer or connector state.
+/// Emits one routing-owned decision over the trace's immutable ingress context.
 /// `decision` is the routing verdict; `egress` names an allowed target as
 /// `outbound:<id>` or `balancer:<id>`.
 pub(crate) fn emit_routing_debug(
-    id: Option<DebugConnectionId>,
+    context: Option<&ConnectionDebugContext>,
     event: RoutingDebugEvent,
     fields: RoutingDebugFields<'_>,
 ) {
     if !enabled(LogLevel::Debug) {
         return;
     }
-    let Some(id) = id else {
+    let Some(context) = context else {
         return;
     };
-    let network = sanitize_connection_field(fields.network);
-    let inbound = fields.inbound.map(sanitize_connection_field);
-    let principal = fields.principal.map(sanitize_connection_field);
     let rule = fields.rule.map(sanitize_connection_field);
     let decision = sanitize_connection_field(fields.decision);
     let egress = fields.egress.map(sanitize_connection_field);
     let target_resolution = fields.target_resolution.map(sanitize_connection_field);
-    let destination = sanitize_connection_field(fields.destination);
-    let mut record =
-        ConnectionDebugRecord::new(unix_millis(), "routing", event.as_str(), id, &network);
+    let mut record = ConnectionDebugRecord::new(unix_millis(), "routing", event.as_str(), context);
     record.rule = rule.as_deref();
-    record.inbound = inbound.as_deref();
-    record.principal = principal.as_deref();
     record.decision = Some(&decision);
     record.egress = egress.as_deref();
     record.target_resolution = target_resolution.as_deref();
-    record.destination = Some(&destination);
     emit_connection_debug_record(&record);
 }
 
-/// Emits a concrete member selection owned only by the named balancer.
+/// Emits a concrete member selection over the immutable ingress context.
 pub(crate) fn emit_balancer_debug(
-    id: Option<DebugConnectionId>,
-    network: &str,
+    context: Option<&ConnectionDebugContext>,
     balancer: &str,
     outbound: &str,
     attempt: usize,
@@ -883,14 +980,12 @@ pub(crate) fn emit_balancer_debug(
     if !enabled(LogLevel::Debug) {
         return;
     }
-    let Some(id) = id else {
+    let Some(context) = context else {
         return;
     };
-    let network = sanitize_connection_field(network);
     let balancer = sanitize_connection_field(balancer);
     let outbound = sanitize_connection_field(outbound);
-    let mut record =
-        ConnectionDebugRecord::new(unix_millis(), "balancer", "selected", id, &network);
+    let mut record = ConnectionDebugRecord::new(unix_millis(), "balancer", "selected", context);
     record.balancer = Some(&balancer);
     record.outbound = Some(&outbound);
     record.attempt = Some(attempt);
@@ -898,47 +993,40 @@ pub(crate) fn emit_balancer_debug(
 }
 
 pub(crate) struct OutboundDebugFields<'a> {
-    pub(crate) network: &'a str,
     pub(crate) outbound: &'a str,
+    pub(crate) outbound_destination: &'a str,
     pub(crate) protocol: Option<&'a str>,
-    pub(crate) origin: Option<&'a str>,
     pub(crate) underlay: Option<&'a str>,
     pub(crate) mpp_path: Option<&'a str>,
-    pub(crate) destination: &'a str,
     pub(crate) attempt: usize,
     pub(crate) error: Option<&'a str>,
 }
 
-/// Emits one connector-owned connection state without routing or balancer
-/// data. `origin` identifies whether the Product flow entered locally or from
-/// an MPP peer, without copying the inbound's other fields into this scope.
+/// Emits one connector-owned connection state over the immutable ingress
+/// context. Routing and balancer outcomes remain owned by their own events.
 pub(crate) fn emit_outbound_debug(
-    id: Option<DebugConnectionId>,
+    context: Option<&ConnectionDebugContext>,
     event: OutboundDebugEvent,
     fields: OutboundDebugFields<'_>,
 ) {
     if !enabled(LogLevel::Debug) {
         return;
     }
-    let Some(id) = id else {
+    let Some(context) = context else {
         return;
     };
-    let network = sanitize_connection_field(fields.network);
     let outbound = sanitize_connection_field(fields.outbound);
+    let outbound_destination = sanitize_connection_field(fields.outbound_destination);
     let protocol = fields.protocol.map(sanitize_connection_field);
-    let origin = fields.origin.map(sanitize_connection_field);
     let underlay = fields.underlay.map(sanitize_connection_field);
     let mpp_path = fields.mpp_path.map(sanitize_connection_field);
-    let destination = sanitize_connection_field(fields.destination);
     let error = fields.error.map(sanitize_connection_field);
-    let mut record =
-        ConnectionDebugRecord::new(unix_millis(), "outbound", event.as_str(), id, &network);
+    let mut record = ConnectionDebugRecord::new(unix_millis(), "outbound", event.as_str(), context);
     record.outbound = Some(&outbound);
+    record.outbound_destination = Some(&outbound_destination);
     record.protocol = protocol.as_deref();
-    record.origin = origin.as_deref();
     record.underlay = underlay.as_deref();
     record.mpp_path = mpp_path.as_deref();
-    record.destination = Some(&destination);
     record.attempt = Some(fields.attempt);
     record.error = error.as_deref();
     emit_connection_debug_record(&record);
@@ -985,20 +1073,30 @@ fn write_connection_debug_record(
         "id={} network={}",
         record.connection_id, record.network
     );
+    write_debug_text_field(output, "origin", Some(record.origin));
+    write_debug_text_field(output, "inbound", Some(record.inbound));
+    write_debug_text_field(output, "principal", Some(record.principal));
+    write_debug_text_field(output, "source", record.source);
+    write_debug_text_field(output, "source_kind", record.source_kind);
+    write_debug_text_field(
+        output,
+        "requested_destination",
+        Some(record.requested_destination),
+    );
+    write_debug_text_field(output, "session_id", record.session_id);
+    write_debug_text_field(output, "ingress_underlay", record.ingress_underlay);
+    write_debug_text_field(output, "ingress_path", record.ingress_path);
+    write_debug_text_field(output, "ingress_path_id", record.ingress_path_id);
+    write_debug_text_field(
+        output,
+        "ingress_path_instance",
+        record.ingress_path_instance,
+    );
     match record.component {
-        "inbound" => {
-            debug_assert!(record.inbound.is_some());
-            write_debug_text_field(output, "inbound", record.inbound);
-            write_debug_text_field(output, "principal", record.principal);
-            write_debug_text_field(output, "source", record.source);
-            write_debug_text_field(output, "destination", record.destination);
-        }
+        "inbound" => {}
         "routing" => {
-            debug_assert!(record.destination.is_some() && record.decision.is_some());
-            write_debug_text_field(output, "destination", record.destination);
+            debug_assert!(record.decision.is_some());
             write_debug_text_field(output, "rule", record.rule);
-            write_debug_text_field(output, "inbound", record.inbound);
-            write_debug_text_field(output, "principal", record.principal);
             write_debug_text_field(output, "decision", record.decision);
             write_debug_text_field(output, "egress", record.egress);
             write_debug_text_field(output, "target_resolution", record.target_resolution);
@@ -1014,15 +1112,14 @@ fn write_connection_debug_record(
         "outbound" => {
             debug_assert!(
                 record.outbound.is_some()
-                    && record.destination.is_some()
+                    && record.outbound_destination.is_some()
                     && record.attempt.is_some()
             );
             write_debug_text_field(output, "outbound", record.outbound);
+            write_debug_text_field(output, "outbound_destination", record.outbound_destination);
             write_debug_text_field(output, "protocol", record.protocol);
-            write_debug_text_field(output, "origin", record.origin);
             write_debug_text_field(output, "underlay", record.underlay);
             write_debug_text_field(output, "mpp_path", record.mpp_path);
-            write_debug_text_field(output, "destination", record.destination);
             write_debug_text_attempt(output, record.attempt);
             write_debug_text_field(output, "error", record.error);
         }

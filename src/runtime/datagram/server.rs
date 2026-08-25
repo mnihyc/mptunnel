@@ -19,7 +19,7 @@ use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{OnceCell, mpsc};
@@ -51,6 +51,7 @@ struct ServerDatagramFlowSlot {
     worker: OnceCell<mpsc::Sender<ServerDatagramWorkerMessage>>,
     attachments: Arc<AtomicUsize>,
     attachment_changes: Arc<tokio::sync::Notify>,
+    retired: Arc<AtomicBool>,
 }
 
 struct ServerDatagramAttachment {
@@ -132,6 +133,7 @@ impl ServerDatagramService {
             worker: OnceCell::new(),
             attachments: Arc::new(AtomicUsize::new(0)),
             attachment_changes: Arc::new(tokio::sync::Notify::new()),
+            retired: Arc::new(AtomicBool::new(false)),
         });
         flows.insert(key, slot.clone());
         Ok(slot)
@@ -170,6 +172,7 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                 flow_id,
                 target,
                 commands,
+                ingress,
             } = request;
             outbound::validate_target(&target)
                 .map_err(|error| ServerDatagramOpenError::new(error.into()))?;
@@ -179,9 +182,14 @@ impl ServerDatagramPortBackend for ServerDatagramService {
             let worker = slot
                 .worker
                 .get_or_try_init(|| async {
-                    let route =
-                        self.router
-                            .route_mpp_udp(&target, principal, self.inbound.clone())?;
+                    let realtime_registration =
+                        self.reliable_streams.register_realtime_flow(session_id)?;
+                    let route = self.router.route_mpp_udp_with_ingress(
+                        &target,
+                        principal,
+                        self.inbound.clone(),
+                        &ingress,
+                    )?;
                     let plan = match route {
                         ClientRoute::Open(plan) => plan,
                         ClientRoute::Deny(ClientPolicyDisposition::Reject) => {
@@ -206,8 +214,6 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                         .telemetry
                         .scoped(_product_flow.scope().clone())
                         .open_datagram_flow(Some(session_id), flow_id, target.clone());
-                    let realtime_registration =
-                        self.reliable_streams.register_realtime_flow(session_id);
                     Ok::<_, RuntimeError>(spawn_server_datagram_flow_worker(
                         key,
                         outbound_socket,
@@ -252,14 +258,45 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                     "server datagram worker closed during attachment",
                 ))
             })?;
+            let session_retirement = self
+                .reliable_streams
+                .session_retirement(session_id)
+                .map_err(ServerDatagramOpenError::new)?;
+            if let Some(reason) = session_retirement.reason() {
+                slot.retired.store(true, Ordering::Release);
+                Self::remove_flow_slot_if_current(&self.flows, key, &slot);
+                return Err(ServerDatagramOpenError::new(RuntimeError::RemoteClosed(
+                    reason,
+                )));
+            }
             Ok(AcceptedServerDatagramFlow::holding(
                 flow_id,
                 worker,
                 commands,
                 route_lifetime,
+                slot.retired.clone(),
+                session_retirement,
                 attachment,
             ))
         })
+    }
+
+    fn retire_session(&self, session_id: SessionId) {
+        let retired = {
+            let mut flows = self.flows.lock().expect("server datagram registry lock");
+            let keys = flows
+                .keys()
+                .filter(|(flow_session_id, _)| *flow_session_id == session_id)
+                .copied()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| flows.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for slot in retired {
+            slot.retired.store(true, Ordering::Release);
+            slot.attachment_changes.notify_waiters();
+        }
     }
 }
 
@@ -329,6 +366,8 @@ fn spawn_server_datagram_flow_worker(
         let mut response_buffer = bytes::BytesMut::zeroed(response_buffer_len);
         let mut state = ServerDatagramFlowState::new(mux_limits);
         let mut idle_deadline = Instant::now() + session_retention_timeout;
+        let session_retirement = realtime_registration.retirement().wait();
+        tokio::pin!(session_retirement);
         loop {
             prune_server_datagram_state(&mut state, mux_limits, Instant::now());
             queue_server_datagram_responses(key.1, &mut state);
@@ -337,6 +376,10 @@ fn spawn_server_datagram_flow_worker(
             let attachment_changes = slot.upgrade().map(|slot| slot.attachment_changes.clone());
             let has_attachment_changes = attachment_changes.is_some();
             tokio::select! {
+                biased;
+                _ = &mut session_retirement => {
+                    break;
+                }
                 message = requests_rx.recv() => {
                     let Some(message) = message else {
                         break;

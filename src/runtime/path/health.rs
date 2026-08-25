@@ -325,6 +325,35 @@ impl ClientPathHealthRecord {
             && self.data_plane_failure_instance_id != self.path_instance_id
     }
 
+    pub(in crate::runtime) fn accepts_endpoint_failure_for_expected_owner(
+        &self,
+        expected_path_instance_id: Option<CarrierPathInstanceId>,
+    ) -> bool {
+        match expected_path_instance_id {
+            Some(expected) => {
+                self.path_instance_id == Some(expected)
+                    && self.data_plane_failure_instance_id != Some(expected)
+            }
+            None => self.path_instance_id.is_none(),
+        }
+    }
+
+    /// Whether this exact authenticated physical instance may become a
+    /// Product owner. This is lifecycle state only; sampled telemetry is not
+    /// part of the commit decision.
+    pub(in crate::runtime) fn accepts_product_commit(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        !self.manual_disabled
+            && self.path_instance_id == Some(path_instance_id)
+            && self.data_plane_failure_instance_id != Some(path_instance_id)
+            && !matches!(
+                self.state,
+                SchedulerPathState::Failed | SchedulerPathState::Draining
+            )
+    }
+
     /// Product admission owns these counters from before carrier I/O until the
     /// exact logical attachment releases them. Planned physical replacement
     /// may therefore use this lock-coherent boundary without an idle timer.
@@ -574,6 +603,18 @@ impl ClientPathHealthRecord {
         self.record_success(elapsed);
     }
 
+    pub(in crate::runtime) fn mark_success_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) -> bool {
+        if !self.accepts_liveness_sample(path_instance_id) {
+            return false;
+        }
+        self.mark_success(elapsed);
+        true
+    }
+
     fn record_success(&mut self, elapsed: Duration) {
         self.mark_liveness_success();
         let sample_ms = elapsed.as_secs_f64() * 1000.0;
@@ -629,6 +670,7 @@ impl ClientPathHealthRecord {
         self.failed_until = None;
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_open_success(&mut self, _elapsed: Duration, lane: TrafficClass) {
         if self.manual_disabled {
             return;
@@ -648,7 +690,7 @@ impl ClientPathHealthRecord {
         elapsed: Duration,
         lane: TrafficClass,
     ) -> bool {
-        if !self.accepts_native_carrier_observation(path_instance_id) {
+        if !self.accepts_liveness_sample(path_instance_id) {
             return false;
         }
         self.mark_open_success(elapsed, lane);
@@ -685,7 +727,7 @@ impl ClientPathHealthRecord {
         path_instance_id: CarrierPathInstanceId,
         elapsed: Duration,
     ) -> bool {
-        if !self.accepts_native_carrier_observation(path_instance_id) {
+        if !self.accepts_liveness_sample(path_instance_id) {
             return false;
         }
         self.mark_reserved_open_success(elapsed);
@@ -722,6 +764,18 @@ impl ClientPathHealthRecord {
             Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
             None => sample_bps,
         });
+    }
+
+    pub(in crate::runtime) fn mark_delivery_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        sample: PathRateSample,
+    ) -> bool {
+        if !self.accepts_liveness_sample(path_instance_id) {
+            return false;
+        }
+        self.mark_delivery(sample);
+        true
     }
 
     pub(in crate::runtime) fn mark_product_delivery(&mut self, sample: PathRateSample) {
@@ -796,12 +850,24 @@ impl ClientPathHealthRecord {
         });
     }
 
+    pub(in crate::runtime) fn mark_udp_datagram_feedback_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        observation: UdpDatagramPathObservation,
+    ) -> bool {
+        if !self.accepts_liveness_sample(path_instance_id) {
+            return false;
+        }
+        self.mark_udp_datagram_feedback(observation);
+        true
+    }
+
     pub(in crate::runtime) fn mark_quic_path_metrics(
         &mut self,
         path_instance_id: CarrierPathInstanceId,
         metrics: UdpPathMetrics,
     ) {
-        if !self.accepts_native_carrier_observation(path_instance_id) {
+        if !self.accepts_liveness_sample(path_instance_id) {
             return;
         }
         self.mark_liveness_success();
@@ -833,6 +899,11 @@ impl ClientPathHealthRecord {
         !self.manual_disabled
             && self.path_instance_id == Some(path_instance_id)
             && self.data_plane_failure_instance_id != Some(path_instance_id)
+    }
+
+    fn accepts_liveness_sample(&self, path_instance_id: CarrierPathInstanceId) -> bool {
+        self.state != SchedulerPathState::Draining
+            && self.accepts_native_carrier_observation(path_instance_id)
     }
 
     pub(in crate::runtime) fn mark_failure(

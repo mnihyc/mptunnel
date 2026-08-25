@@ -166,6 +166,8 @@ impl ServerDatagramPortBackend for ScriptedQuicDatagramBackend {
                         requests,
                         request.commands,
                         Arc::new(()),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        crate::runtime::path::ServerSessionRetirement::active_for_test(),
                         (),
                     ))
                 }
@@ -885,7 +887,7 @@ async fn server_quic_route_denials_are_stream_local_and_drop_has_no_response() {
         .context
         .reliable_streams
         .clone()
-        .with_target_admission(Arc::new(|_, target| {
+        .with_target_admission(Arc::new(|_, _, target| {
             Ok(match target.port() {
                 81 => ServerTargetAdmission::Reject,
                 82 => ServerTargetAdmission::Drop,

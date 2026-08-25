@@ -154,9 +154,13 @@
             </div>
           </header>
           <div class="canvas-frame">
-            <canvas id="traffic-chart" aria-label="Transfer speed history"></canvas>
+            <canvas id="traffic-chart" tabindex="0" aria-label="Transfer speed history"
+                    aria-describedby="traffic-chart-detail"></canvas>
             <p id="traffic-chart-empty" class="canvas-empty">Waiting for traffic samples</p>
           </div>
+          <p id="traffic-chart-detail" class="chart-detail">
+            Waiting for a traffic sample
+          </p>
         </article>
 
         <article class="chart-tool" aria-labelledby="flows-chart-title">
@@ -170,43 +174,15 @@
             </div>
           </header>
           <div class="canvas-frame">
-            <canvas id="flows-chart" aria-label="Active flow history"></canvas>
+            <canvas id="flows-chart" tabindex="0" aria-label="Active flow history"
+                    aria-describedby="flows-chart-detail"></canvas>
             <p id="flows-chart-empty" class="canvas-empty">Waiting for flow samples</p>
           </div>
+          <p id="flows-chart-detail" class="chart-detail">
+            Waiting for a flow sample
+          </p>
         </article>
       </div>
-
-      <section class="data-section data-section--wide overview-connections"
-               aria-labelledby="overview-connections-title">
-        <div class="data-section__header data-section__header--actions">
-          <div>
-            <h2 id="overview-connections-title">Inbound connections</h2>
-            <p class="section-meta">Visible active logical streams and datagram associations.</p>
-          </div>
-          <span id="overview-connections-count" class="badge badge--neutral">0 active</span>
-        </div>
-        <div class="table-wrap table-wrap--records">
-          <table class="records-table records-table--connections">
-            <thead>
-              <tr>
-                <th scope="col">Type</th>
-                <th scope="col">Inbound</th>
-                <th scope="col">Connection</th>
-                <th scope="col">Network</th>
-                <th scope="col">Destination</th>
-                <th scope="col">Outbound</th>
-                <th scope="col">Age / idle</th>
-                <th scope="col" title="Upload / download / packets">↑ / ↓ / pkt</th>
-              </tr>
-            </thead>
-            <tbody id="overview-connections-body"></tbody>
-          </table>
-        </div>
-        <div id="overview-connections-empty" class="empty-state empty-state--compact" hidden>
-          <h3>No active inbound connections</h3>
-          <p>Configured listeners remain visible in the inbound services table below.</p>
-        </div>
-      </section>
 
       <div class="overview-grid">
         <div class="overview-grid__primary">
@@ -362,16 +338,16 @@
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col" title="Configured path / physical carrier instance">Path / inst</th>
-                <th scope="col" title="Service / MPP session">Svc / sess</th>
-                <th scope="col" title="Carrier / TCP member and pool size">Net / pool</th>
-                <th scope="col" title="Path usage / metric direction">Use / dir</th>
-                <th scope="col" title="Round-trip time / jitter">RTT / jit</th>
-                <th scope="col" title="Delivery rate / pacing rate">Rate / pace</th>
-                <th scope="col">Loss / ECN</th>
-                <th scope="col" title="Queue / native flight / MPP flight / native limit">Queue / native / MPP / cap</th>
-                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Conf / n / bytes / age / app</th>
-                <th scope="col" title="Active flows / latency-sensitive flows">Flows / fast</th>
+                <th scope="col" title="Configured path / endpoint / Path ID / physical carrier instance">Path</th>
+                <th scope="col" title="Service name / service kind / MPP session (16-hex)">Service</th>
+                <th scope="col" title="Carrier / TCP member and pool size">Carrier</th>
+                <th scope="col" title="Path usage / metric direction / source / policy">Use</th>
+                <th scope="col" title="Round-trip time / jitter">Latency</th>
+                <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                <th scope="col" title="Loss / ECN">Loss</th>
+                <th scope="col" title="Queue / native carrier flight / MPP data flight / native limit">Flight</th>
+                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
+                <th scope="col" title="Active flows / latency-sensitive flows">Flows</th>
               </tr>
             </thead>
             <tbody id="overview-paths-body"></tbody>
@@ -398,14 +374,14 @@
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col" title="Peer path / metric epoch">Path / epoch</th>
-                <th scope="col" title="Carrier">Net</th>
-                <th scope="col" title="Path usage / metric direction">Use / dir</th>
-                <th scope="col" title="Round-trip time / RTT variation / jitter">RTT / var / jit</th>
-                <th scope="col" title="Delivery rate / pacing rate">Rate / pace</th>
-                <th scope="col">Loss / ECN</th>
-                <th scope="col" title="Queue / native flight / native limit">Queue / flight / cap</th>
-                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Conf / n / bytes / age / app</th>
+                <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch">Path</th>
+                <th scope="col" title="Carrier">Carrier</th>
+                <th scope="col" title="Path usage / metric direction">Use</th>
+                <th scope="col" title="Round-trip time / RTT variation / jitter">Latency</th>
+                <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                <th scope="col" title="Loss / ECN">Loss</th>
+                <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
+                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
               </tr>
             </thead>
             <tbody id="overview-peer-paths-body"></tbody>
@@ -413,6 +389,39 @@
         </div>
         <div id="overview-peer-paths-empty" class="empty-state empty-state--compact">
           <h3>No peer path sample</h3>
+        </div>
+      </section>
+
+      <section class="data-section data-section--wide overview-connections"
+               aria-labelledby="overview-connections-title">
+        <div class="data-section__header data-section__header--actions">
+          <div>
+            <h2 id="overview-connections-title">Inbound connections</h2>
+            <p class="section-meta">Visible active logical streams and datagram associations.</p>
+          </div>
+          <span id="overview-connections-count" class="badge badge--neutral">0 active</span>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table records-table--connections">
+            <thead>
+              <tr>
+                <th scope="col">Type</th>
+                <th scope="col">Inbound</th>
+                <th scope="col">Source</th>
+                <th scope="col">Connection</th>
+                <th scope="col">Network</th>
+                <th scope="col">Destination</th>
+                <th scope="col">Outbound</th>
+                <th scope="col">Age / idle</th>
+                <th scope="col" title="Upload / download / packets">↑ / ↓ / pkt</th>
+              </tr>
+            </thead>
+            <tbody id="overview-connections-body"></tbody>
+          </table>
+        </div>
+        <div id="overview-connections-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No active inbound connections</h3>
+          <p>Configured listeners remain visible in the inbound services inventory.</p>
         </div>
       </section>
 
@@ -558,16 +567,16 @@
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col" title="Configured path / physical carrier instance">Path / inst</th>
-                <th scope="col" title="Service / MPP session">Svc / sess</th>
-                <th scope="col" title="Carrier / TCP member and pool size">Net / pool</th>
-                <th scope="col" title="Path usage / metric direction">Use / dir</th>
-                <th scope="col" title="Round-trip time / jitter">RTT / jit</th>
-                <th scope="col" title="Delivery rate / pacing rate">Rate / pace</th>
-                <th scope="col">Loss / ECN</th>
-                <th scope="col" title="Queue / native flight / MPP flight / native limit">Queue / native / MPP / cap</th>
-                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Conf / n / bytes / age / app</th>
-                <th scope="col" title="Active flows / latency-sensitive flows">Flows / fast</th>
+                <th scope="col" title="Configured path / endpoint / Path ID / physical carrier instance">Path</th>
+                <th scope="col" title="Service name / service kind / MPP session (16-hex)">Service</th>
+                <th scope="col" title="Carrier / TCP member and pool size">Carrier</th>
+                <th scope="col" title="Path usage / metric direction / source / policy">Use</th>
+                <th scope="col" title="Round-trip time / jitter">Latency</th>
+                <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                <th scope="col" title="Loss / ECN">Loss</th>
+                <th scope="col" title="Queue / native carrier flight / MPP data flight / native limit">Flight</th>
+                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
+                <th scope="col" title="Active flows / latency-sensitive flows">Flows</th>
               </tr>
             </thead>
             <tbody id="paths-body"></tbody>
@@ -601,6 +610,7 @@
               <tr>
                 <th scope="col">Type</th>
                 <th scope="col">Inbound</th>
+                <th scope="col">Source</th>
                 <th scope="col">Connection</th>
                 <th scope="col">Network</th>
                 <th scope="col">Destination</th>
@@ -659,14 +669,14 @@
                 <thead>
                   <tr>
                     <th scope="col">State</th>
-                    <th scope="col" title="Peer path / metric epoch">Path / epoch</th>
-                    <th scope="col" title="Carrier">Net</th>
-                    <th scope="col" title="Path usage / metric direction">Use / dir</th>
-                    <th scope="col" title="Round-trip time / RTT variation / jitter">RTT / var / jit</th>
-                    <th scope="col" title="Delivery rate / pacing rate">Rate / pace</th>
-                    <th scope="col">Loss / ECN</th>
-                    <th scope="col" title="Queue / native flight / native limit">Queue / flight / cap</th>
-                    <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Conf / n / bytes / age / app</th>
+                    <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch">Path</th>
+                    <th scope="col" title="Carrier">Carrier</th>
+                    <th scope="col" title="Path usage / metric direction">Use</th>
+                    <th scope="col" title="Round-trip time / RTT variation / jitter">Latency</th>
+                    <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                    <th scope="col" title="Loss / ECN">Loss</th>
+                    <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
+                    <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
                   </tr>
                 </thead>
                 <tbody id="peer-paths-body"></tbody>

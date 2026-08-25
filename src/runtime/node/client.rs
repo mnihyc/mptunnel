@@ -2,6 +2,7 @@
 
 use crate::config::{LocalIngressConfig, MppOutboundConfig};
 use crate::ingress::IngressConfig;
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::performance::ResourceLimits;
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
@@ -266,7 +267,8 @@ enum PathProbeResult {
     Tcp,
     Udp {
         path_index: usize,
-        result: Result<Option<Duration>, RuntimeError>,
+        expected_path_instance_id: Option<CarrierPathInstanceId>,
+        result: Result<Option<(CarrierPathInstanceId, Duration)>, RuntimeError>,
     },
 }
 
@@ -293,13 +295,15 @@ async fn probe_selected_paths(
         }
     }
     for path_index in 0..context.udp_paths.len() {
-        if !context.should_probe_udp_path(path_index) {
+        let Some(expected_path_instance_id) = context.udp_path_probe_expected_instance(path_index)
+        else {
             continue;
-        }
+        };
         let context = context.clone();
         probes.spawn(async move {
             PathProbeResult::Udp {
                 path_index,
+                expected_path_instance_id,
                 result: probe_udp_client_path(&context, path_index, timeout).await,
             }
         });
@@ -311,18 +315,27 @@ async fn probe_selected_paths(
             Ok(PathProbeResult::Tcp) => {}
             Ok(PathProbeResult::Udp {
                 path_index,
-                result: Ok(Some(elapsed)),
+                result: Ok(Some((path_instance_id, elapsed))),
+                ..
             }) => {
-                context.mark_udp_path_probe_success(path_index, elapsed);
+                context.mark_udp_path_probe_success_for_instance(
+                    path_index,
+                    path_instance_id,
+                    elapsed,
+                );
             }
             Ok(PathProbeResult::Udp {
                 result: Ok(None), ..
             }) => {}
             Ok(PathProbeResult::Udp {
                 path_index,
+                expected_path_instance_id,
                 result: Err(_),
             }) => {
-                context.mark_udp_path_failure(path_index);
+                context.mark_udp_path_establishment_failure_if_current(
+                    path_index,
+                    expected_path_instance_id,
+                );
             }
             Err(err) => crate::observability::process_event!(
                 Warn,

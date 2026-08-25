@@ -11,6 +11,8 @@ services:
       - NET_ADMIN
     volumes:
       - ..:/workspace
+      - ${MPTUNNEL_LAB_BUILD_ROOT:-../target}:/workspace/target
+      - ${MPTUNNEL_LAB_TMP_ROOT:-../.tmp}:/workspace/.tmp
     working_dir: /workspace
     command: sleep infinity
     networks:
@@ -65,6 +67,8 @@ services:
       - NET_ADMIN
     volumes:
       - ..:/workspace
+      - ${MPTUNNEL_LAB_BUILD_ROOT:-../target}:/workspace/target
+      - ${MPTUNNEL_LAB_TMP_ROOT:-../.tmp}:/workspace/.tmp
     working_dir: /workspace
     command: sleep infinity
     networks:
@@ -121,6 +125,8 @@ services:
       - NET_ADMIN
     volumes:
       - ..:/workspace
+      - ${MPTUNNEL_LAB_BUILD_ROOT:-../target}:/workspace/target
+      - ${MPTUNNEL_LAB_TMP_ROOT:-../.tmp}:/workspace/.tmp
     working_dir: /workspace
     command: sleep infinity
     networks:

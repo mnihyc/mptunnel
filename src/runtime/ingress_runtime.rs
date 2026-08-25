@@ -7,6 +7,7 @@ use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
 use crate::ingress::{
     LocalIngressAdmissionConfig, ProxyAuthConfig, TcpForwardConfig, UdpForwardConfig,
 };
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::performance::MppPerformanceConfig;
@@ -14,8 +15,8 @@ use crate::product::{InboundId, PrincipalId};
 use crate::protocol::TargetAddr;
 use crate::runtime::datagram::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, remove_udp_edge_lane,
-    udp_edge_completion_queue,
+    dispatch_udp_edge_request, finish_udp_edge_completion, reap_finished_udp_edge_lane_instance,
+    remove_udp_edge_lane, udp_edge_completion_queue,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::outbound_registry::relay_opened_tcp;
@@ -868,11 +869,11 @@ pub(super) async fn run_udp_forward_client_socket(
                         }
                     }
                     UdpEdgeCompletion::Sent {
-                        metadata,
-                        result: Err(RuntimeError::OutboundUnavailable(_)),
+                        lane_id,
+                        result: Err(error),
                         ..
-                    } => {
-                        remove_udp_edge_lane(&mut lanes, &metadata);
+                    } if matches!(error.as_ref(), RuntimeError::OutboundUnavailable(_)) => {
+                        let _ = reap_finished_udp_edge_lane_instance(&mut lanes, lane_id);
                     }
                     UdpEdgeCompletion::Sent {
                         metadata,
@@ -1501,11 +1502,11 @@ where
                         }
                     }
                     UdpEdgeCompletion::Sent {
-                        metadata,
-                        result: Err(RuntimeError::OutboundUnavailable(_)),
+                        lane_id,
+                        result: Err(error),
                         ..
-                    } => {
-                        remove_udp_edge_lane(&mut lanes, &metadata);
+                    } if matches!(error.as_ref(), RuntimeError::OutboundUnavailable(_)) => {
+                        let _ = reap_finished_udp_edge_lane_instance(&mut lanes, lane_id);
                     }
                     UdpEdgeCompletion::Sent {
                         target,
@@ -1608,7 +1609,7 @@ pub(super) async fn probe_udp_client_path(
     context: &ClientPathContext,
     path_index: usize,
     timeout: Duration,
-) -> Result<Option<Duration>, RuntimeError> {
+) -> Result<Option<(CarrierPathInstanceId, Duration)>, RuntimeError> {
     let durable_path_session = context
         .udp_sessions
         .get(path_index)
@@ -1617,7 +1618,7 @@ pub(super) async fn probe_udp_client_path(
     // Cold validation prepares the authenticated Product carrier. Once live,
     // QUIC's own connection RTT and liveness remain the only carrier evidence.
     durable_path_session
-        .prepare_connection(probe_deadline)
+        .prepare_connection_for_probe(probe_deadline)
         .await
 }
 

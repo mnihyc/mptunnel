@@ -158,7 +158,10 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
                 .receive_response(request_id, code, paths);
             Ok(())
         }
-        Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
+        Frame::SessionClose { reason } => {
+            let reason = runtime.state.session_lifecycle().retire(reason);
+            Err(RuntimeError::RemoteClosed(reason))
+        }
         Frame::PathDrain { .. } => Err(RuntimeError::Protocol(
             "TCP client received peer path drain request",
         )),

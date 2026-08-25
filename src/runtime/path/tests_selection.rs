@@ -108,6 +108,59 @@ fn authenticated_output_uses_startup_prior_before_exact_measurement() {
 }
 
 #[test]
+fn physical_replacement_preserves_logical_configured_slot_load() {
+    let context = packet_path_context(&["tcp://127.0.0.1:12710"]);
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let predecessor = RelayPathInstance {
+        key,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 1,
+    };
+    context.install_relay_path_instance_for_test(predecessor);
+    let lease = context
+        .try_reserve_relay_path_load_if_unchanged(key, TrafficClass::Throughput, 0, 0)
+        .expect("logical path load reservation");
+    let successor = RelayPathInstance {
+        key,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 2,
+    };
+    context.install_relay_path_instance_for_test(successor);
+
+    assert!(
+        context
+            .reliable_path_snapshot_for_instance(predecessor)
+            .is_none()
+    );
+    let successor_snapshot = context
+        .reliable_path_snapshot_for_instance(successor)
+        .expect("successor exact health");
+    assert_eq!(successor_snapshot.active_flows, 1);
+    let observation =
+        context.observe_reliable_request_paths([(successor, None)], PATH_OPEN_SCORE_BYTES, false);
+    assert_eq!(observation.paths[0].instance, successor);
+    assert_eq!(
+        observation.paths[0]
+            .shared_snapshot
+            .expect("exact successor observation")
+            .active_flows,
+        1,
+    );
+
+    drop(lease);
+    assert_eq!(
+        context
+            .reliable_path_snapshot_for_instance(successor)
+            .expect("successor remains current")
+            .active_flows,
+        0,
+    );
+}
+
+#[test]
 fn packet_candidates_require_the_current_instance_and_do_not_consume_product_state() {
     let context = packet_path_context(&["quic://127.0.0.1:12720?initial-rate-mbps=80"]);
     let key = RelayPathKey {

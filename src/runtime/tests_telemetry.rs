@@ -121,6 +121,9 @@ fn generation_owner_records_only_scoped_product_flows_with_immutable_attribution
         &flow,
         crate::product::OutboundId::parse("edge-b").expect("outbound"),
         Some(crate::product::BalancerId::parse("daily-egress").expect("balancer")),
+        crate::runtime::telemetry::ProductFlowSource::local_peer(
+            "127.0.0.1:32100".parse().expect("local peer"),
+        ),
     );
     let native = telemetry.open_native_reliable_flow(scope);
     native.counter().record_to_peer_bytes(7);
@@ -140,6 +143,17 @@ fn generation_owner_records_only_scoped_product_flows_with_immutable_attribution
     assert_eq!(
         active.origin.as_ref().map(|origin| origin.inbound.as_str()),
         Some("local-socks")
+    );
+    assert_eq!(
+        active
+            .origin
+            .as_ref()
+            .map(|origin| origin.source)
+            .map(|source| (source.kind, source.endpoint)),
+        Some((
+            crate::runtime::telemetry::ProductFlowSourceKind::LocalPeer,
+            "127.0.0.1:32100".parse().expect("local peer"),
+        ))
     );
     let selection = active.selection.as_ref().expect("selection");
     assert_eq!(selection.outbound.as_str(), "edge-b");

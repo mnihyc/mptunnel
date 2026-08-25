@@ -81,9 +81,10 @@ every TOML section, material source, DNS protocol, and carrier URI option. Run
 `./mptunnel --help` for the simple CLI surface.
 
 For an immediate connection trace, set `level = "debug"` in `[logging]` or use
-`--log-level debug`. The correlated records show inbound acceptance, routing,
-optional balancing, and configured outbound results without logging
-packets or physical MPP carrier internals.
+`--log-level debug`. Inbound, routing, optional balancing, and outbound records
+repeat the accepted request context; MPP ingress includes the typed opening
+carrier peer and session/path identity. Packets, credentials, secrets, and
+per-packet path choices are not logged.
 
 ## Service helpers
 

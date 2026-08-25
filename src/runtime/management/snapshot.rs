@@ -142,7 +142,7 @@ impl TelemetryAggregate {
             snapshot
                 .active_flows
                 .into_iter()
-                .map(|flow| flow_status(flow, now)),
+                .filter_map(|flow| flow_status(flow, now)),
         );
     }
 

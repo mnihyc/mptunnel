@@ -1,7 +1,7 @@
 use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
-use crate::model::capacity::adaptive_reliable_relay_inflight_bytes;
+use crate::model::capacity::{adaptive_reliable_relay_inflight_bytes, reliable_relay_buffer_len};
 use crate::model::work::{
     ReliableWorkClass, reliable_critical_tail_reinjection_limit_bytes,
     reliable_reinjection_service_limit_bytes,
@@ -15,7 +15,8 @@ use crate::runtime::path::commands::{
 use crate::runtime::sender::response::ServerResponseSenderService;
 use crate::runtime::stream::response::ResponseStreamBinding;
 use crate::runtime::stream::{
-    FixedReliablePathOutput, ReliableRelayAttachOutcome, ReliableRelayRemotePath,
+    FixedReliablePathOutput, OpenedRemoteStream, ReliablePathStream, ReliableRelayAttachOutcome,
+    ReliableRelayRemotePath,
 };
 use crate::transport::PathSpec;
 use std::sync::Arc;
@@ -69,6 +70,37 @@ fn request_handle(output: ReliablePathStreamOutput) -> ReliablePathStreamHandle 
         max_frame_payload_bytes: 16 * 1024,
         output,
     }
+}
+
+fn opened_request_stream_with_retained_input(
+    stream_id: StreamId,
+    commands: crate::runtime::path::commands::ReliablePathCommandSender,
+) -> (
+    OpenedRemoteStream,
+    tokio::sync::mpsc::Sender<Result<Frame, RuntimeError>>,
+) {
+    let (frames_tx, frames_rx) = tokio::sync::mpsc::channel(1);
+    let limits = MuxLimits::default();
+    (
+        OpenedRemoteStream::pending(
+            ReliablePathStream {
+                stream_id,
+                max_offset: limits.max_stream_window_bytes,
+                lane: TrafficClass::Throughput,
+                underlay: UnderlayProtocol::Tcp,
+                max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+                output: ReliablePathStreamOutput::fixed(
+                    UnderlayProtocol::Tcp,
+                    PathId(0),
+                    commands,
+                    limits,
+                ),
+                frames: frames_rx.into(),
+            },
+            0,
+        ),
+        frames_tx,
+    )
 }
 
 #[test]
@@ -144,6 +176,152 @@ fn request_dispatch_rejects_switchable_response_output() {
 }
 
 #[tokio::test]
+async fn request_planner_and_reservation_preserve_closed_admission_identity() {
+    let stream_id = StreamId(711);
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10711"]);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let (opened, _frames_tx) =
+        opened_request_stream_with_retained_input(stream_id, commands.clone());
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    consume_client_path_proof_for_test(&mut receivers);
+    let instance = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(instance);
+    let frame = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: Bytes::from_static(b"payload"),
+    };
+    let mut controller = RequestMultipathController::new(stream_id);
+
+    let initial_plan = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &frame,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("active attachment is initially selectable");
+    assert_eq!(initial_plan.target().1, instance);
+    // Installing the exact physical health owner advances the proof epoch.
+    // C9 preparation refreshes that priority proof, so consume it before the
+    // test deliberately fills and later drains the independent data lane.
+    consume_client_path_proof_for_test(&mut receivers);
+    commands
+        .try_enqueue_admitted_frame(frame.clone(), TrafficClass::Throughput)
+        .expect("fill the active data command queue");
+    assert!(matches!(
+        controller.plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &frame,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        ),
+        Err(RequestMultipathPlanError::ServiceBlocked)
+    ));
+    let busy = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("release the active queue slot");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&busy));
+
+    let selected_before_close = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &frame,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("selection precedes the synchronous admission-close race");
+    let (generation, selected) = selected_before_close.target();
+    assert_eq!(selected, instance);
+    commands.begin_path_drain();
+    receivers.close_for_path_drain();
+    let position = remotes
+        .path_position_at_generation(generation, selected)
+        .expect("exact selected membership remains registered");
+    let selected_commands = fixed_request_output_commands(&remotes.paths[position].stream.output)
+        .expect("client output is fixed");
+    assert!(matches!(
+        reserve_request_frame_with_mode(
+            selected_commands,
+            frame,
+            TrafficClass::Throughput,
+            CarrierEmitMode::Classified,
+            false,
+        ),
+        Err(RequestFrameAdmissionError::OrderedTerminalPending)
+    ));
+    assert!(remotes.contains_path_instance(instance));
+    assert!(receivers.finish_planned_path_retirement());
+}
+
+#[tokio::test]
+async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent() {
+    let stream_id = StreamId(712);
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10712"]);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (opened, _frames_tx) =
+        opened_request_stream_with_retained_input(stream_id, commands.clone());
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    consume_client_path_proof_for_test(&mut receivers);
+    let instance = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(instance);
+    let snapshot = context
+        .reliable_path_snapshot_for_instance(instance)
+        .expect("installed exact path evidence");
+    let cause = RelaySendCause::persistent_client_ack_gap_reinjection(
+        ClientReinjectionOutputIdentity { instance },
+        snapshot,
+    );
+    let frame = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: Bytes::from_static(b"repair"),
+    };
+    let mut sender = RequestSenderService::new(stream_id);
+
+    commands.begin_path_drain();
+    receivers.close_for_path_drain();
+    assert!(matches!(
+        sender
+            .send_reinjection_frame(&context, &mut remotes, frame.clone(), cause)
+            .await,
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(
+        remotes.contains_path_instance(instance),
+        "closed admission cannot remove ahead of the ordered terminal"
+    );
+
+    assert!(receivers.finish_planned_path_retirement());
+    let terminal = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
+        .await
+        .expect("ordered terminal deadline")
+        .expect("ordered terminal frame");
+    assert_eq!(terminal.instance, instance);
+    assert!(matches!(
+        terminal.frame,
+        Err(RuntimeError::ReliablePathRetired)
+    ));
+    drop(
+        remotes
+            .remove_path_instance(instance)
+            .expect("terminal receiver removes the exact attachment"),
+    );
+    assert!(matches!(
+        sender
+            .send_reinjection_frame(&context, &mut remotes, frame, cause)
+            .await,
+        Err(RuntimeError::ReliablePathSessionClosed)
+    ));
+}
+
+#[tokio::test]
 async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output() {
     let stream_id = StreamId(90);
     let context = client_test_context_with_paths(&[
@@ -177,6 +355,26 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         proof_only_commands,
     ));
     consume_client_path_proof_for_test(&mut proof_only_receivers);
+    let tcp = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Tcp)
+        .map(ReliableRelayRemotePath::instance)
+        .expect("slow TCP original path");
+    let udp = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        })
+        .expect("measured UDP path");
+    let proof_only = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        })
+        .expect("proof-only UDP path");
+    context.install_relay_path_instance_for_test(tcp);
+    context.install_relay_path_instance_for_test(proof_only);
 
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
@@ -187,15 +385,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         .send_data(Bytes::from(vec![0x42; 4096]))
         .expect("later delivered data");
     let mut sender = RequestSenderService::new(stream_id);
-    sender.record_original_frame_for_test(
-        remotes
-            .paths
-            .iter()
-            .find(|path| path.key().underlay == UnderlayProtocol::Tcp)
-            .map(ReliableRelayRemotePath::instance)
-            .expect("slow TCP original path"),
-        &blocked,
-    );
+    sender.record_original_frame_for_test(tcp, &blocked);
     let ranges = [OffsetRange {
         start: 4096,
         end: 8192,
@@ -222,13 +412,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         unproven_reinjection_path.is_none(),
         "proof-only membership may carry a bounded reinjection quantum but must not authorize a BDP-sized burst from configured hints"
     );
-    seed_client_bulk_evidence_for_test(
-        &context,
-        RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: 0,
-        },
-    );
+    seed_client_bulk_evidence_for_test(&context, udp);
     let observation = sender.data_ack_gap_reinjection_model(
         &context,
         &remotes,
@@ -287,13 +471,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         "the shared repair and path-flight envelopes preserve the target-sized service authority",
     );
 
-    seed_client_bulk_evidence_for_test(
-        &context,
-        RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: 1,
-        },
-    );
+    seed_client_bulk_evidence_for_test(&context, proof_only);
 
     udp_commands
         .try_enqueue_admitted_frame(
@@ -383,14 +561,14 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
         ReliableRelayAttachOutcome::Attached
     );
     consume_client_path_proof_for_test(&mut udp_receivers);
-    seed_client_bulk_evidence_for_test(&context, tcp.key);
-    seed_client_bulk_evidence_for_test(
-        &context,
-        RelayPathKey {
+    let udp = remotes
+        .path_instance_for_key(RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
-        },
-    );
+        })
+        .expect("UDP tail-recovery path");
+    seed_client_bulk_evidence_for_test(&context, tcp);
+    seed_client_bulk_evidence_for_test(&context, udp);
 
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(stream_id, limits);

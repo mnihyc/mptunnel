@@ -103,6 +103,10 @@ impl TcpDatagramClientAssociation {
             .await
         {
             Ok(session) => {
+                #[cfg(test)]
+                self.context
+                    .pause_tcp_datagram_settlement_for_test(path_index)
+                    .await;
                 self.context
                     .mark_tcp_path_reserved_open_success_for_instance(
                         path_index,

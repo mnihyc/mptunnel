@@ -53,6 +53,9 @@ pub enum RuntimeError {
     RouteRejected,
     RouteDropped,
     RemoteReset(ResetReason),
+    /// A carrier-local non-normal `PATH_CLOSE`. Unlike `SESSION_CLOSE`, this
+    /// does not make the complete MPP SessionId terminal.
+    RemotePathClosed(CloseReason),
     RemoteClosed(CloseReason),
     AuthenticationRejected(&'static str),
     CredentialAdmission(crate::product::CredentialAdmissionError),
@@ -74,7 +77,7 @@ pub(in crate::runtime) fn reliable_path_error_is_migratable(err: &RuntimeError) 
             | RuntimeError::ReliablePathRetired
             | RuntimeError::Tcp(_)
             | RuntimeError::Encrypted(_)
-            | RuntimeError::RemoteClosed(_)
+            | RuntimeError::RemotePathClosed(_)
             | RuntimeError::Protocol(_)
     )
 }
@@ -240,6 +243,7 @@ impl std::fmt::Display for RuntimeError {
             Self::RouteRejected => write!(f, "destination rejected by routing policy"),
             Self::RouteDropped => write!(f, "destination silently dropped by routing policy"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
+            Self::RemotePathClosed(reason) => write!(f, "remote closed carrier path: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
             Self::AuthenticationRejected(message) => {
                 write!(f, "authentication rejected: {message}")
@@ -296,6 +300,7 @@ impl std::error::Error for RuntimeError {
             | Self::RouteRejected
             | Self::RouteDropped
             | Self::RemoteReset(_)
+            | Self::RemotePathClosed(_)
             | Self::RemoteClosed(_)
             | Self::AuthenticationRejected(_)
             | Self::CredentialAdmission(_)

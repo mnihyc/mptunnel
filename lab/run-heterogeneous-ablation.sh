@@ -198,6 +198,38 @@ management_snapshot_port="${MPTUNNEL_LAB_MANAGEMENT_PORT:-17600}"
 management_token="${MPTUNNEL_LAB_MANAGEMENT_TOKEN:-mptunnel-lab-management-token}"
 fail_on_bad_status="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1}"
 require_competitor_baselines="${MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES:-0}"
+default_netem_mode="${MPTUNNEL_LAB_NETEM_MODE:-apply}"
+internet_seed="${MPTUNNEL_LAB_INTERNET_SEED:-mptunnel-random-internet-v1}"
+internet_schedule_file="${MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE:-}"
+internet_schedule_sha256="${MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256:-}"
+case "$default_netem_mode" in
+  apply) ;;
+  *)
+    if [[ ! "$default_netem_mode" =~ ^internet-five-path-epoch-[0-9]+$ ]]; then
+      echo "MPTUNNEL_LAB_NETEM_MODE must be apply or internet-five-path-epoch-N" >&2
+      exit 2
+    fi
+    ;;
+esac
+if [[ -z "$internet_seed" ]]; then
+  echo "MPTUNNEL_LAB_INTERNET_SEED must not be empty" >&2
+  exit 2
+fi
+if [[ -n "$internet_schedule_file" || -n "$internet_schedule_sha256" ]]; then
+  if [[ -z "$internet_schedule_file" \
+    || ! "$internet_schedule_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE and a lowercase SHA-256 identity must be provided together" >&2
+    exit 2
+  fi
+fi
+case "${MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES:-0}" in
+  1|true|True|TRUE|yes|Yes|YES) internet_include_outages=1 ;;
+  0|false|False|FALSE|no|No|NO) internet_include_outages=0 ;;
+  *)
+    echo "MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES must be 0/1, false/true, or no/yes" >&2
+    exit 2
+    ;;
+esac
 lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
 case "${MPTUNNEL_LAB_COLLECT_LOGS:-auto}" in
   auto)
@@ -438,6 +470,10 @@ exec_netem() {
     -e MPTUNNEL_LAB_MATRIX_GOOD_LOSS="${MPTUNNEL_LAB_MATRIX_GOOD_LOSS:-1.00%}" \
     -e MPTUNNEL_LAB_MATRIX_POOR_LOSS="${MPTUNNEL_LAB_MATRIX_POOR_LOSS:-15.00%}" \
     -e MPTUNNEL_LAB_SCALE_SEED="$scale_seed" \
+    -e MPTUNNEL_LAB_INTERNET_SEED="$internet_seed" \
+    -e MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES="$internet_include_outages" \
+    -e MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE="$internet_schedule_file" \
+    -e MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256="$internet_schedule_sha256" \
     -e MPTUNNEL_LAB_BLACKHOLE_LOSS="${MPTUNNEL_LAB_BLACKHOLE_LOSS:-100%}" \
     -e MPTUNNEL_LAB_SPIKE_FAT_RATE="${MPTUNNEL_LAB_SPIKE_FAT_RATE:-20mbit}" \
     -e MPTUNNEL_LAB_SPIKE_FAT_DELAY="${MPTUNNEL_LAB_SPIKE_FAT_DELAY:-900ms}" \
@@ -957,7 +993,19 @@ tls_server_name = "mptunnel.test"
 tls_pinned_certificate = { from = "file", path = ${certificate_path_json} }
 ${transport_security}
 
+[[outbounds]]
+name = "lab-client-direct"
+protocol = "direct"
+
 [routing]
+
+[[routing.rules]]
+name = "allow-lab-client-direct-control"
+inbounds = ["lab-socks"]
+destination_cidrs = ["172.31.15.30/32"]
+networks = ["tcp", "udp"]
+decision = "allow-restricted"
+outbound = "lab-client-direct"
 
 [[routing.rules]]
 name = "allow-lab-private-targets"
@@ -1413,7 +1461,7 @@ append_skipped_result() {
   local status="skipped"
   if flag_enabled "$require_competitor_baselines"; then
     case "$case_name" in
-      baseline_vmess_*|baseline_hysteria2_*) status="fail" ;;
+      baseline_vmess_*|baseline_hysteria2_*|baseline_mptcp_*) status="fail" ;;
     esac
   fi
   CASE_NAME="$case_name" PROTOCOL="$protocol" REASON="$reason" STATUS="$status" \
@@ -1571,6 +1619,7 @@ run_tcp_download_probe_case() {
   local synchronized_start="${5:-0}"
   local probe_path="${6:-$large_http_path}"
   local probe_timeout="${7:-$curl_timeout}"
+  local probe_target="${8:-172.31.40.30:8080}"
   local out_file="/tmp/mptunnel-probe-${case_name}.out"
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
   local telemetry_pid synchronized_start_arg="" probe_process_timeout
@@ -1592,7 +1641,7 @@ PY
   telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${probe_path}' --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --parallel-downloads '${probe_workers}' --request-lifecycle '${request_lifecycle}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target '${probe_target}' --path '${probe_path}' --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --parallel-downloads '${probe_workers}' --request-lifecycle '${request_lifecycle}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
@@ -1777,6 +1826,7 @@ run_tcp_upload_probe_case() {
   local probe_workers="${3:-$bulk_connections}"
   local synchronized_start="${4:-0}"
   local probe_timeout="${5:-$curl_timeout}"
+  local probe_target="${6:-172.31.40.30:${tcp_upload_target_port}}"
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
   local telemetry_pid observer_started_ns observer_stopped_ns
@@ -1807,7 +1857,7 @@ PY
   set +e
   local output probe_stderr
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --parallel-uploads '${probe_workers}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target '${probe_target}' --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --parallel-uploads '${probe_workers}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
   freeze_target_tcp_sink
   observer_freeze_exit_code="$?"
@@ -1995,6 +2045,10 @@ apply_netem() {
   local mode="$1"
   if [[ "$mode" == "asymmetric" ]]; then
     apply_asymmetric_netem
+  elif [[ "$mode" =~ ^internet-five-path-epoch-([0-9]+)$ ]]; then
+    exec_netem client "${mode}-client"
+    exec_netem server "${mode}-server"
+    exec_netem target "${mode}-server"
   elif [[ "$mode" =~ ^scale-(access|gigabit|multi-gigabit)-epoch-0$ ]]; then
     prepare_path_variation_initial_epoch "${BASH_REMATCH[1]}"
     exec_netem target clear >/dev/null
@@ -2278,6 +2332,8 @@ validate_client_runtime_case_filter() {
     mptunnel_tun_udp_stream_single_low_latency_upload
     mptunnel_tun_udp_stream_single_balanced_upload
     mptunnel_tun_mixed_multipath_all_upload
+    mptunnel_tun_app_bypass_balanced
+    mptunnel_tun_app_bypass_balanced_upload
   )
   IFS=',' read -r -a patterns <<< "$case_filter"
   for pattern in "${patterns[@]}"; do
@@ -2395,7 +2451,7 @@ start_client_with_netem() {
 start_client() {
   local profile="$1"
   shift
-  start_client_with_netem "$profile" apply "$@"
+  start_client_with_netem "$profile" "$default_netem_mode" "$@"
 }
 
 start_tun_client() {
@@ -2413,11 +2469,12 @@ start_tun_client() {
       compose down --remove-orphans >/dev/null 2>&1 || true
       compose up -d --remove-orphans >/dev/null
     fi
-    apply_netem apply
+    apply_netem "$default_netem_mode"
     start_target_services
     start_server
   else
     stop_client
+    apply_netem "$default_netem_mode"
   fi
   local config_path="/tmp/mptunnel-client-${profile}.toml"
   write_in client "$config_path" "$(tun_client_config_toml "$path_args")"
@@ -2447,6 +2504,25 @@ run_tun_upload_case() {
   shift
   start_tun_client "$case_name" "$@"
   run_unproxied_upload_probe_case "$case_name" "172.31.40.30:${tcp_upload_target_port}" 1 "tun-upload"
+}
+
+run_tun_bypass_download_case() {
+  local case_name="$1"
+  shift
+  start_tun_client "$case_name" "$@"
+  # start_tun_client installs only the 172.31.40.30/32 TUN route. This target
+  # remains on the ordinary client routing table and is therefore a negative
+  # control for traffic intentionally bypassing the active tunnel.
+  run_unproxied_download_probe_case \
+    "$case_name" "tun-app-bypass" "172.31.15.30:8080" 0
+}
+
+run_tun_bypass_upload_case() {
+  local case_name="$1"
+  shift
+  start_tun_client "$case_name" "$@"
+  run_unproxied_upload_probe_case \
+    "$case_name" "172.31.15.30:${tcp_upload_target_port}" 0 "tun-app-bypass-upload"
 }
 
 run_udp_case() {
@@ -2594,7 +2670,7 @@ PY
 run_vmess_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
-  local netem_mode="${3:-apply}"
+  local netem_mode="${3:-$default_netem_mode}"
   prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
     append_skipped_result "$case_name" "vmess" "xray baseline binary unavailable"
@@ -2624,7 +2700,7 @@ run_vmess_baseline_case() {
 run_vmess_baseline_upload_case() {
   local case_name="$1"
   local server_ip="$2"
-  local netem_mode="${3:-apply}"
+  local netem_mode="${3:-$default_netem_mode}"
   prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
     append_skipped_result "$case_name" "vmess-upload" "xray baseline binary unavailable"
@@ -2654,7 +2730,7 @@ run_vmess_baseline_upload_case() {
 run_hysteria2_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
-  local netem_mode="${3:-apply}"
+  local netem_mode="${3:-$default_netem_mode}"
   local brutal_up="${4:-}"
   local brutal_down="${5:-$brutal_up}"
   prepare_baseline_profile "$netem_mode"
@@ -2689,7 +2765,7 @@ run_hysteria2_baseline_case() {
 run_hysteria2_baseline_upload_case() {
   local case_name="$1"
   local server_ip="$2"
-  local netem_mode="${3:-apply}"
+  local netem_mode="${3:-$default_netem_mode}"
   local brutal_up="${4:-}"
   local brutal_down="${5:-$brutal_up}"
   prepare_baseline_profile "$netem_mode"
@@ -2788,7 +2864,7 @@ check_mptcp_baseline_case() {
 
 run_mptcp_baseline_case() {
   local case_name="$1"
-  local netem_mode="${2:-apply}"
+  local netem_mode="${2:-$default_netem_mode}"
   prepare_baseline_case "$netem_mode"
   if ! check_mptcp_baseline_case "$case_name" "mptcp"; then
     return 0
@@ -2822,7 +2898,7 @@ run_mptcp_baseline_case() {
 
 run_mptcp_baseline_upload_case() {
   local case_name="$1"
-  local netem_mode="${2:-apply}"
+  local netem_mode="${2:-$default_netem_mode}"
   prepare_baseline_case "$netem_mode"
   if ! check_mptcp_baseline_case "$case_name" "mptcp-upload"; then
     return 0
@@ -2995,7 +3071,7 @@ record_mixed_probe_case() {
 run_direct_mixed_case() {
   local case_name="$1"
   local target_ip="$2"
-  local netem_mode="${3:-apply}"
+  local netem_mode="${3:-$default_netem_mode}"
   if [[ "$isolate_cases" == "1" ]]; then
     stop_client
     if [[ "$isolate_containers" == "1" ]]; then
@@ -3023,6 +3099,30 @@ run_direct_mixed_case() {
   append_mixed_probe_result "$case_name" "$exit_code" "$output" "" "" 0
 }
 
+prepare_seeded_direct_case() {
+  # Legacy fixed profiles are deterministic without resetting their random
+  # process. Seeded netem is part of a paired experiment, so every direct
+  # subject must start from the same empty queue and PRNG state as proxies and
+  # mptunnel subjects.
+  if [[ "$default_netem_mode" =~ ^internet-five-path-epoch-[0-9]+$ ]]; then
+    prepare_baseline_case "$default_netem_mode"
+  fi
+}
+
+run_direct_download_case() {
+  local case_name="$1"
+  local target="$2"
+  prepare_seeded_direct_case
+  run_unproxied_download_probe_case "$case_name" "tcp" "$target"
+}
+
+run_direct_upload_case() {
+  local case_name="$1"
+  local target="$2"
+  prepare_seeded_direct_case
+  run_unproxied_upload_probe_case "$case_name" "$target"
+}
+
 run_direct_unconstrained_download_case() {
   local case_name="$1"
   local target="$2"
@@ -3037,6 +3137,37 @@ run_direct_unconstrained_upload_case() {
   prepare_baseline_case unconstrained
   run_unproxied_upload_probe_case "$case_name" "$target"
   apply_netem apply
+}
+
+run_client_direct_download_case() {
+  local case_name="$1"
+  shift
+  start_client "$case_name" "$@"
+  # The proxy and MPP carriers remain active, but this exact destination is
+  # selected by the client's first routing rule and must use ordinary direct
+  # egress without entering the MPP server.
+  run_tcp_download_probe_case \
+    "$case_name" \
+    "$load_duration_seconds" \
+    "$bulk_connections" \
+    duration \
+    0 \
+    "$large_http_path" \
+    "$curl_timeout" \
+    "172.31.15.30:8080"
+}
+
+run_client_direct_upload_case() {
+  local case_name="$1"
+  shift
+  start_client "$case_name" "$@"
+  run_tcp_upload_probe_case \
+    "$case_name" \
+    "$load_duration_seconds" \
+    "$bulk_connections" \
+    0 \
+    "$curl_timeout" \
+    "172.31.15.30:${tcp_upload_target_port}"
 }
 
 run_mixed_case() {
@@ -3853,7 +3984,7 @@ refresh_result_reproducibility
 write_run_manifest
 
 start_target_services
-apply_netem apply
+apply_netem "$default_netem_mode"
 start_server
 
 tcp_carrier_max="${MPTUNNEL_LAB_TCP_CARRIER_MAX:-}"
@@ -3939,28 +4070,28 @@ udp_scale_all="--path 'quic://172.31.51.20:${server_port}' \
 mixed_scale_all="${tcp_scale_all} ${udp_scale_all}"
 
 if should_run_case "direct_low_latency"; then
-  run_unproxied_download_probe_case "direct_low_latency" "tcp" "172.31.10.30:8080"
+  run_direct_download_case "direct_low_latency" "172.31.10.30:8080"
 fi
 if should_run_case "direct_balanced"; then
-  run_unproxied_download_probe_case "direct_balanced" "tcp" "172.31.15.30:8080"
+  run_direct_download_case "direct_balanced" "172.31.15.30:8080"
 fi
 if should_run_case "direct_cross_continent_high_bandwidth"; then
-  run_unproxied_download_probe_case "direct_cross_continent_high_bandwidth" "tcp" "172.31.20.30:8080"
+  run_direct_download_case "direct_cross_continent_high_bandwidth" "172.31.20.30:8080"
 fi
 if should_run_case "direct_poor_internet"; then
-  run_unproxied_download_probe_case "direct_poor_internet" "tcp" "172.31.30.30:8080"
+  run_direct_download_case "direct_poor_internet" "172.31.30.30:8080"
 fi
 if should_run_case "direct_upload_low_latency"; then
-  run_unproxied_upload_probe_case "direct_upload_low_latency" "172.31.10.30:${tcp_upload_target_port}"
+  run_direct_upload_case "direct_upload_low_latency" "172.31.10.30:${tcp_upload_target_port}"
 fi
 if should_run_case "direct_upload_balanced"; then
-  run_unproxied_upload_probe_case "direct_upload_balanced" "172.31.15.30:${tcp_upload_target_port}"
+  run_direct_upload_case "direct_upload_balanced" "172.31.15.30:${tcp_upload_target_port}"
 fi
 if should_run_case "direct_upload_cross_continent_high_bandwidth"; then
-  run_unproxied_upload_probe_case "direct_upload_cross_continent_high_bandwidth" "172.31.20.30:${tcp_upload_target_port}"
+  run_direct_upload_case "direct_upload_cross_continent_high_bandwidth" "172.31.20.30:${tcp_upload_target_port}"
 fi
 if should_run_case "direct_upload_poor_internet"; then
-  run_unproxied_upload_probe_case "direct_upload_poor_internet" "172.31.30.30:${tcp_upload_target_port}"
+  run_direct_upload_case "direct_upload_poor_internet" "172.31.30.30:${tcp_upload_target_port}"
 fi
 if should_run_case "direct_unconstrained"; then
   run_direct_unconstrained_download_case "direct_unconstrained" "172.31.10.30:8080"
@@ -3986,6 +4117,15 @@ if should_run_case "direct_mixed_unconstrained"; then
   apply_netem apply
 fi
 
+if should_run_case "mptunnel_client_direct_balanced"; then
+  run_client_direct_download_case \
+    "mptunnel_client_direct_balanced" "$tcp_all $udp_all"
+fi
+if should_run_case "mptunnel_client_direct_balanced_upload"; then
+  run_client_direct_upload_case \
+    "mptunnel_client_direct_balanced_upload" "$tcp_all $udp_all"
+fi
+
 if should_run_case "baseline_vmess_tcp_single_balanced"; then
   run_vmess_baseline_case "baseline_vmess_tcp_single_balanced" "172.31.15.20"
 fi
@@ -4009,8 +4149,16 @@ if should_run_case "baseline_vmess_tcp_single_unconstrained_upload"; then
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_balanced"; then
-  hysteria_rate="$(hysteria_bandwidth_from_netem_rate "${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}")"
-  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_balanced" "172.31.15.20" apply "$hysteria_rate" "$hysteria_rate"
+  hysteria_up_rate="$(hysteria_bandwidth_from_netem_rate \
+    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+  hysteria_down_rate="$(hysteria_bandwidth_from_netem_rate \
+    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+  run_hysteria2_baseline_case \
+    "baseline_hysteria2_udp_single_balanced" \
+    "172.31.15.20" \
+    "$default_netem_mode" \
+    "$hysteria_up_rate" \
+    "$hysteria_down_rate"
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth"; then
@@ -4019,8 +4167,16 @@ if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_balanced_upload"; then
-  hysteria_rate="$(hysteria_bandwidth_from_netem_rate "${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}")"
-  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_balanced_upload" "172.31.15.20" apply "$hysteria_rate" "$hysteria_rate"
+  hysteria_up_rate="$(hysteria_bandwidth_from_netem_rate \
+    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+  hysteria_down_rate="$(hysteria_bandwidth_from_netem_rate \
+    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+  run_hysteria2_baseline_upload_case \
+    "baseline_hysteria2_udp_single_balanced_upload" \
+    "172.31.15.20" \
+    "$default_netem_mode" \
+    "$hysteria_up_rate" \
+    "$hysteria_down_rate"
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload"; then
@@ -4065,6 +4221,9 @@ fi
 
 if should_run_case "baseline_mptcp_tcp_multipath_all"; then
   run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_all"
+fi
+if should_run_case "baseline_mptcp_tcp_multipath_all_upload"; then
+  run_mptcp_baseline_upload_case "baseline_mptcp_tcp_multipath_all_upload"
 fi
 if should_run_case "baseline_mptcp_tcp_multipath_unconstrained"; then
   run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_unconstrained" unconstrained
@@ -4413,6 +4572,16 @@ fi
 
 if should_run_case "mptunnel_tun_mixed_multipath_all_upload"; then
   run_tun_upload_case "mptunnel_tun_mixed_multipath_all_upload" "$tcp_all $udp_all"
+fi
+
+if should_run_case "mptunnel_tun_app_bypass_balanced"; then
+  run_tun_bypass_download_case \
+    "mptunnel_tun_app_bypass_balanced" "$tcp_all $udp_all"
+fi
+
+if should_run_case "mptunnel_tun_app_bypass_balanced_upload"; then
+  run_tun_bypass_upload_case \
+    "mptunnel_tun_app_bypass_balanced_upload" "$tcp_all $udp_all"
 fi
 
 if should_run_case "mptunnel_udp_single_low_latency"; then

@@ -79,12 +79,14 @@
     trafficChart: byId("traffic-chart"),
     trafficChartEmpty: byId("traffic-chart-empty"),
     trafficChartWindow: byId("traffic-chart-window"),
+    trafficChartDetail: byId("traffic-chart-detail"),
     trafficChartTitle: byId("traffic-chart-title"),
     chartModeSpeed: byId("chart-mode-speed"),
     chartModeTotal: byId("chart-mode-total"),
     flowsChart: byId("flows-chart"),
     flowsChartEmpty: byId("flows-chart-empty"),
     flowsChartWindow: byId("flows-chart-window"),
+    flowsChartDetail: byId("flows-chart-detail"),
     peerCapability: byId("peer-capability"),
     peerAllowBadge: byId("peer-allow-badge"),
     peerSessionSelect: byId("peer-session-select"),
@@ -128,6 +130,9 @@
     chartWindowMs: readStoredChartWindow(),
     chartSamples: [],
     chartSampleTimestamps: new Set(),
+    selectedChartTimestamp: null,
+    chartSelectionTouched: false,
+    chartLayouts: new Map(),
     trafficChartMode: "speed",
     navigationCollapsed: readStoredNavigationCollapsed(),
     refreshTimer: null,
@@ -469,6 +474,21 @@
     }).format(date);
   }
 
+  function formatChartTimestamp(timestamp) {
+    const date = new Date(finiteNumber(timestamp));
+    if (Number.isNaN(date.getTime())) return "--";
+    return new Intl.DateTimeFormat(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      fractionalSecondDigits: 3,
+      timeZoneName: "short"
+    }).format(date);
+  }
+
   function formatRtt(milliseconds) {
     const value = finiteNumber(milliseconds);
     if (value <= 0) return "--";
@@ -491,6 +511,18 @@
   function formatIdentifier(value) {
     const stringValue = String(value === undefined || value === null || value === "" ? "--" : value);
     return stringValue;
+  }
+
+  function formatSessionId(value) {
+    const stringValue = formatIdentifier(value);
+    if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return stringValue;
+    try {
+      const sessionId = BigInt(String(value));
+      if (sessionId < 0n || sessionId > 18446744073709551615n) return stringValue;
+      return sessionId.toString(16).padStart(16, "0");
+    } catch (_error) {
+      return stringValue;
+    }
   }
 
   function titleCase(value) {
@@ -592,6 +624,20 @@
     if (payload.schema !== EXPECTED_SCHEMA) {
       throw new Error("Unsupported management schema: " + String(payload.schema || "missing"));
     }
+    if (!Array.isArray(payload.flows)) {
+      throw new Error("Management status response is missing its flow inventory");
+    }
+    payload.flows.forEach(function (flowValue) {
+      const flow = asObject(flowValue);
+      if (
+        typeof flow.inbound !== "string" || flow.inbound.length === 0 ||
+        (flow.inbound_kind !== "local" && flow.inbound_kind !== "mpp") ||
+        typeof flow.source !== "string" || flow.source.length === 0 ||
+        (flow.source_kind !== "local_peer" && flow.source_kind !== "mpp_carrier_peer")
+      ) {
+        throw new Error("Management flow is missing its typed ingress source");
+      }
+    });
     return payload;
   }
 
@@ -1011,19 +1057,24 @@
     appendCell(row, "Type", badge(titleCase(flow.flow_kind), flow.flow_kind === "datagram" ? "warning" : "neutral"));
 
     const inbound = createElement("div");
-    inbound.append(createElement("span", "cell-primary", flow.inbound || "--"));
+    inbound.append(createElement("span", "cell-primary", flow.inbound));
     inbound.append(createElement("span", "cell-secondary", titleCase(flow.inbound_kind)));
     appendCell(row, "Inbound", inbound);
+
+    const source = createElement("div");
+    source.append(createElement("span", "cell-primary cell-mono", flow.source));
+    source.append(createElement("span", "cell-secondary", titleCase(flow.source_kind)));
+    appendCell(row, "Source", source);
 
     const connection = createElement("div");
     connection.append(createElement("span", "cell-mono", formatIdentifier(flow.flow_id)));
     connection.append(createElement(
       "span",
       "cell-secondary cell-mono",
-      flow.session_id ? formatIdentifier(flow.session_id) : "Local"
+      flow.session_id ? formatSessionId(flow.session_id) : "Local"
     ));
     appendCell(row, "Connection", connection);
-    appendCell(row, "Network", String(flow.network || "--").toUpperCase());
+    appendCell(row, "Network", String(flow.network).toUpperCase());
     appendCell(row, "Destination", flow.target ? String(flow.target) : "Multiple");
 
     const egress = createElement("div");
@@ -1070,7 +1121,7 @@
     elements.inboundServicesCount.className = "badge " + (hiddenFlows > 0n ? "badge--warning" : "badge--neutral");
     inbounds.forEach(function (inbound) {
       const row = createElement("tr");
-      const inboundFlows = flows.filter(function (flow) { return String(flow.inbound || "") === String(inbound.name || ""); });
+      const inboundFlows = flows.filter(function (flow) { return String(flow.inbound) === String(inbound.name || ""); });
       appendCell(row, "Name", inbound.name || titleCase(inbound.protocol), "cell-primary");
       appendCell(row, "Proto", titleCase(inbound.protocol));
       const listeners = asArray(inbound.listen).map(String);
@@ -1423,12 +1474,13 @@
       "cell-secondary cell-mono",
       formatIdentifier(path.path_id) + " / " + formatIdentifier(path.path_instance_id)
     ));
-    appendCell(row, "Path / inst", identity);
+    appendCell(row, "Path", identity);
 
     const service = createElement("div");
     service.append(createElement("span", "cell-primary", serviceLabel(path)));
-    service.append(createElement("span", "cell-secondary", titleCase(path.service) + " / " + formatIdentifier(path.session_id)));
-    appendCell(row, "Svc / sess", service);
+    service.append(createElement("span", "cell-secondary", titleCase(path.service)));
+    service.append(createElement("span", "cell-secondary cell-mono", formatSessionId(path.session_id)));
+    appendCell(row, "Service", service);
 
     const carrier = createElement("div");
     carrier.append(createElement("span", "cell-primary", carrierLabel(path.underlay)));
@@ -1442,7 +1494,7 @@
     } else {
       carrier.append(createElement("span", "cell-secondary", "--"));
     }
-    appendCell(row, "Net / bounds", carrier);
+    appendCell(row, "Carrier", carrier);
 
     const usage = createElement("div");
     if (path.usage) usage.append(stateIndicator(path.usage));
@@ -1456,22 +1508,22 @@
         pathPolicyLabel(path.policy)
       ].filter(Boolean).join(" / ")
     ));
-    appendCell(row, "Use / dir", usage);
+    appendCell(row, "Use", usage);
 
     const rtt = createElement("div");
     rtt.append(createElement("span", "cell-primary", formatRtt(path.srtt_ms)));
     rtt.append(createElement("span", "cell-secondary", formatRtt(path.jitter_ms)));
-    appendCell(row, "RTT / jit", rtt);
+    appendCell(row, "Latency", rtt);
 
     const delivery = createElement("div");
     delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
     delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
-    appendCell(row, "Rate / pace", delivery);
+    appendCell(row, "Rate", delivery);
 
     const loss = createElement("div");
     loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
     loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
-    appendCell(row, "Loss / ECN", loss);
+    appendCell(row, "Loss", loss);
 
     const flight = createElement("div");
     flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes)));
@@ -1481,7 +1533,7 @@
       formatBytes(path.bytes_in_flight) + " / " + formatBytes(path.data_level_bytes_in_flight)
     ));
     flight.append(createElement("span", "cell-secondary", formatBytes(path.inflight_limit_bytes)));
-    appendCell(row, "Queue / native / MPP / cap", flight);
+    appendCell(row, "Flight", flight);
 
     const evidence = createElement("div");
     evidence.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm)));
@@ -1496,12 +1548,12 @@
       (path.last_delivery_age_ms === undefined ? "--" : formatDuration(path.last_delivery_age_ms)) +
         " / " + (path.app_limited ? "1" : "0")
     ));
-    appendCell(row, "Conf / n / bytes / age / app", evidence);
+    appendCell(row, "Evidence", evidence);
 
     const flows = createElement("div");
     flows.append(createElement("span", "cell-primary", formatCount(path.active_flows)));
     flows.append(createElement("span", "cell-secondary", formatCount(path.active_latency_sensitive_flows)));
-    appendCell(row, "Flows / fast", flows);
+    appendCell(row, "Flows", flows);
     return row;
   }
 
@@ -1532,7 +1584,7 @@
     const session = asObject(sessionValue);
     const row = createElement("tr");
     appendCell(row, "State", stateIndicator(session.state));
-    appendCell(row, "Session", formatIdentifier(session.session_id), "cell-mono");
+    appendCell(row, "Session", formatSessionId(session.session_id), "cell-mono");
     appendCell(row, "Service", serviceLabel(session));
     appendCell(row, "Carriers", formatCount(session.carrier_count));
     appendCell(row, "References", session.reference_count === undefined ? "--" : formatCount(session.reference_count));
@@ -1554,7 +1606,14 @@
     const query = elements.sessionFilter.value.trim().toLowerCase();
     const sessions = asArray(state.status.sessions).filter(function (session) {
       if (!query) return true;
-      return [session.state, session.session_id, session.service, session.service_name, session.service_index]
+      return [
+        session.state,
+        session.session_id,
+        formatSessionId(session.session_id),
+        session.service,
+        session.service_name,
+        session.service_index
+      ]
         .some(function (value) { return String(value === undefined || value === null ? "" : value).toLowerCase().includes(query); });
     });
     elements.sessionsBody.replaceChildren();
@@ -1567,10 +1626,13 @@
         flow.flow_kind,
         flow.flow_id,
         flow.session_id,
+        formatSessionId(flow.session_id),
         flow.target,
         flow.network,
         flow.inbound_kind,
         flow.inbound,
+        flow.source_kind,
+        flow.source,
         flow.outbound,
         flow.balancer
       ].some(function (value) { return String(value === undefined || value === null ? "" : value).toLowerCase().includes(query); });
@@ -1609,7 +1671,7 @@
         const option = createElement(
           "option",
           "",
-          serviceLabel(session) + " / Session " + formatIdentifier(session.session_id)
+          serviceLabel(session) + " / Session " + formatSessionId(session.session_id)
         );
         option.value = peerSessionKey(session);
         elements.peerSessionSelect.append(option);
@@ -1688,15 +1750,20 @@
     appendCell(row, "State", stateIndicator(path.state));
 
     const identity = createElement("div");
-    identity.append(createElement("span", "cell-primary cell-mono", formatIdentifier(path.path_id)));
-    identity.append(createElement("span", "cell-secondary cell-mono", formatIdentifier(path.metric_epoch)));
-    appendCell(row, "Path / epoch", identity);
-    appendCell(row, "Net", carrierLabel(path.underlay));
+    identity.append(createElement("span", "cell-primary", formatIdentifier(path.path)));
+    identity.append(createElement("span", "cell-secondary", path.endpoint || "Local mapping unavailable"));
+    identity.append(createElement(
+      "span",
+      "cell-secondary cell-mono",
+      formatIdentifier(path.path_id) + " / " + formatIdentifier(path.metric_epoch)
+    ));
+    appendCell(row, "Path", identity);
+    appendCell(row, "Carrier", carrierLabel(path.underlay));
 
     const useDirection = createElement("div");
     useDirection.append(stateIndicator(path.usage));
     useDirection.append(createElement("span", "cell-secondary", directionLabel(path.direction)));
-    appendCell(row, "Use / dir", useDirection);
+    appendCell(row, "Use", useDirection);
 
     const rtt = createElement("div");
     rtt.append(createElement("span", "cell-primary", formatRttMicros(path.srtt_us)));
@@ -1705,17 +1772,17 @@
       "cell-secondary",
       formatRttMicros(path.rttvar_us) + " / " + formatRttMicros(path.jitter_us)
     ));
-    appendCell(row, "RTT / var / jit", rtt);
+    appendCell(row, "Latency", rtt);
 
     const delivery = createElement("div");
     delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
     delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
-    appendCell(row, "Rate / pace", delivery);
+    appendCell(row, "Rate", delivery);
 
     const loss = createElement("div");
     loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
     loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
-    appendCell(row, "Loss / ECN", loss);
+    appendCell(row, "Loss", loss);
 
     const flight = createElement("div");
     flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes)));
@@ -1724,7 +1791,7 @@
       "cell-secondary",
       formatBytes(path.bytes_in_flight) + " / " + formatBytes(path.inflight_limit_bytes)
     ));
-    appendCell(row, "Queue / flight / cap", flight);
+    appendCell(row, "Flight", flight);
 
     const samples = createElement("div");
     samples.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm)));
@@ -1734,7 +1801,7 @@
       formatCount(path.data_sample_count) + " / " + formatBytes(path.data_sample_bytes) + " / " +
         formatDuration(finiteNumber(path.metric_age_us) / 1000) + " / " + (path.app_limited ? "1" : "0")
     ));
-    appendCell(row, "Conf / n / bytes / age / app", samples);
+    appendCell(row, "Evidence", samples);
     body.append(row);
   }
 
@@ -1750,7 +1817,7 @@
       elements.overviewPeerState.className = "badge badge--neutral";
       elements.overviewPeerState.textContent = "No sample";
       elements.overviewPeerContext.textContent = selectedSession
-        ? serviceLabel(selectedSession) + " / " + formatIdentifier(selectedSession.session_id)
+        ? serviceLabel(selectedSession) + " / " + formatSessionId(selectedSession.session_id)
         : "No connected peer";
       renderPeerPaths(elements.overviewPeerPathsBody, elements.overviewPeerPathsEmpty, null);
       return;
@@ -1759,7 +1826,7 @@
     elements.overviewPeerState.className = "badge " + (ok ? "badge--success" : "badge--warning");
     elements.overviewPeerState.textContent = titleCase(result.code);
     elements.overviewPeerContext.textContent =
-      serviceLabel(result) + " / " + formatIdentifier(result.session_id) + " / " +
+      serviceLabel(result) + " / " + formatSessionId(result.session_id) + " / " +
       formatRelative(result.received_unix_ms);
     renderPeerPaths(elements.overviewPeerPathsBody, elements.overviewPeerPathsEmpty, result);
   }
@@ -1775,7 +1842,7 @@
     elements.peerResultSummary.replaceChildren();
     appendMetric(elements.peerResultSummary, "Result", titleCase(result.code));
     appendMetric(elements.peerResultSummary, "Service", serviceLabel(result));
-    appendMetric(elements.peerResultSummary, "Session", formatIdentifier(result.session_id));
+    appendMetric(elements.peerResultSummary, "Session", formatSessionId(result.session_id));
     appendMetric(elements.peerResultSummary, "Request", formatIdentifier(result.request_id));
     appendMetric(elements.peerResultSummary, "Received", formatRelative(result.received_unix_ms));
 
@@ -1901,11 +1968,13 @@
     const context = surface.context;
     const width = surface.width;
     const height = surface.height;
-    const values = [];
+    let maximumValue = 0;
     series.forEach(function (line) {
-      samples.forEach(function (sample) { values.push(Math.max(0, finiteNumber(line.value(sample)))); });
+      samples.forEach(function (sample) {
+        maximumValue = Math.max(maximumValue, Math.max(0, finiteNumber(line.value(sample))));
+      });
     });
-    const maximum = niceMaximum(values.length > 0 ? Math.max.apply(null, values) : 0, options.integerOnly);
+    const maximum = niceMaximum(maximumValue, options.integerOnly);
     context.font = "11px ui-sans-serif, system-ui, sans-serif";
     const axisWidth = Math.ceil(context.measureText(options.axisLabel(maximum)).width);
     const padding = { top: 14, right: 12, bottom: 29, left: Math.max(50, axisWidth + 10) };
@@ -1940,8 +2009,25 @@
     context.textAlign = "right";
     context.fillText(lastTime ? formatWallTime(lastTime) : "--", width - padding.right, height - 3);
 
-    if (samples.length === 0) return;
+    const layout = {
+      width: width,
+      height: height,
+      plotLeft: padding.left,
+      plotRight: width - padding.right,
+      firstTime: firstTime,
+      lastTime: lastTime
+    };
+    if (samples.length === 0) return layout;
     const timeSpan = Math.max(1, lastTime - firstTime);
+    function sampleX(sample) {
+      const timestamp = finiteNumber(sample.timestamp_unix_ms);
+      const ratio = samples.length === 1 ? 1 : (timestamp - firstTime) / timeSpan;
+      return padding.left + Math.max(0, Math.min(1, ratio)) * plotWidth;
+    }
+    function sampleY(line, sample) {
+      const value = Math.max(0, finiteNumber(line.value(sample)));
+      return padding.top + plotHeight - Math.min(1, value / maximum) * plotHeight;
+    }
     series.forEach(function (line) {
       context.beginPath();
       context.lineWidth = 2;
@@ -1949,24 +2035,44 @@
       context.lineCap = "round";
       context.strokeStyle = line.color;
       samples.forEach(function (sample, index) {
-        const timestamp = finiteNumber(sample.timestamp_unix_ms);
-        const xRatio = samples.length === 1 ? 1 : (timestamp - firstTime) / timeSpan;
-        const x = padding.left + Math.max(0, Math.min(1, xRatio)) * plotWidth;
-        const value = Math.max(0, finiteNumber(line.value(sample)));
-        const y = padding.top + plotHeight - Math.min(1, value / maximum) * plotHeight;
+        const x = sampleX(sample);
+        const y = sampleY(line, sample);
         if (index === 0) context.moveTo(x, y);
         else context.lineTo(x, y);
       });
       context.stroke();
       if (samples.length === 1) {
-        const value = Math.max(0, finiteNumber(line.value(samples[0])));
-        const y = padding.top + plotHeight - Math.min(1, value / maximum) * plotHeight;
         context.beginPath();
         context.fillStyle = line.color;
-        context.arc(padding.left + plotWidth, y, 3, 0, Math.PI * 2);
+        context.arc(sampleX(samples[0]), sampleY(line, samples[0]), 3, 0, Math.PI * 2);
         context.fill();
       }
     });
+    if (options.selectedTimestamp !== null && options.selectedTimestamp !== undefined) {
+      const selectedIndex = nearestChartSampleIndex(samples, options.selectedTimestamp);
+      if (selectedIndex >= 0) {
+        const selected = samples[selectedIndex];
+        const x = sampleX(selected);
+        context.beginPath();
+        context.lineWidth = 1;
+        context.strokeStyle = "#425466";
+        context.setLineDash([3, 3]);
+        context.moveTo(Math.round(x) + 0.5, padding.top);
+        context.lineTo(Math.round(x) + 0.5, padding.top + plotHeight);
+        context.stroke();
+        context.setLineDash([]);
+        series.forEach(function (line) {
+          context.beginPath();
+          context.fillStyle = "#ffffff";
+          context.strokeStyle = line.color;
+          context.lineWidth = 2;
+          context.arc(x, sampleY(line, selected), 4, 0, Math.PI * 2);
+          context.fill();
+          context.stroke();
+        });
+      }
+    }
+    return layout;
   }
 
   function compactTrendSample(sample) {
@@ -1975,11 +2081,11 @@
     if (timestamp <= 0) return null;
     return {
       timestamp_unix_ms: timestamp,
-      to_peer_bps: finiteNumber(value.to_peer_bps),
-      from_peer_bps: finiteNumber(value.from_peer_bps),
+      to_peer_bps: unsignedDecimal(value.to_peer_bps),
+      from_peer_bps: unsignedDecimal(value.from_peer_bps),
       to_peer_bytes: unsignedDecimal(value.to_peer_bytes),
       from_peer_bytes: unsignedDecimal(value.from_peer_bytes),
-      active_flows: finiteNumber(value.active_flows)
+      active_flows: unsignedDecimal(value.active_flows)
     };
   }
 
@@ -2024,6 +2130,134 @@
     };
   }
 
+  function nearestChartSampleIndex(samples, timestamp) {
+    if (samples.length === 0) return -1;
+    const target = finiteNumber(timestamp);
+    let low = 0;
+    let high = samples.length - 1;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (finiteNumber(samples[middle].timestamp_unix_ms) < target) low = middle + 1;
+      else high = middle;
+    }
+    if (low === 0) return 0;
+    const before = finiteNumber(samples[low - 1].timestamp_unix_ms);
+    const after = finiteNumber(samples[low].timestamp_unix_ms);
+    return target - before <= after - target ? low - 1 : low;
+  }
+
+  function reconcileChartSelection() {
+    const samples = state.chartSamples;
+    if (samples.length === 0) {
+      state.selectedChartTimestamp = null;
+      return;
+    }
+    if (!state.chartSelectionTouched || state.selectedChartTimestamp === null) {
+      state.selectedChartTimestamp = samples[samples.length - 1].timestamp_unix_ms;
+      return;
+    }
+    const index = nearestChartSampleIndex(samples, state.selectedChartTimestamp);
+    if (samples[index].timestamp_unix_ms !== state.selectedChartTimestamp) {
+      state.selectedChartTimestamp = samples[samples.length - 1].timestamp_unix_ms;
+      state.chartSelectionTouched = false;
+    }
+  }
+
+  function selectChartSample(index, touched) {
+    if (index < 0 || index >= state.chartSamples.length) return;
+    const timestamp = state.chartSamples[index].timestamp_unix_ms;
+    const changed = state.selectedChartTimestamp !== timestamp;
+    state.selectedChartTimestamp = timestamp;
+    if (touched) state.chartSelectionTouched = index !== state.chartSamples.length - 1;
+    if (changed) window.requestAnimationFrame(drawCharts);
+  }
+
+  function selectedChartSample() {
+    const index = nearestChartSampleIndex(state.chartSamples, state.selectedChartTimestamp);
+    return index < 0 ? null : state.chartSamples[index];
+  }
+
+  function renderChartDetails(speedMode) {
+    const sample = selectedChartSample();
+    if (!sample) {
+      replaceText(elements.trafficChartDetail, "Waiting for a traffic sample");
+      replaceText(elements.flowsChartDetail, "Waiting for a flow sample");
+      return;
+    }
+    const timestamp = formatChartTimestamp(sample.timestamp_unix_ms);
+    const trafficDetail = speedMode
+      ? timestamp + " · Upload " + sample.to_peer_bps + " bps (" + formatByteSpeed(sample.to_peer_bps) +
+        ") · Download " + sample.from_peer_bps + " bps (" + formatByteSpeed(sample.from_peer_bps) + ")"
+      : timestamp + " · Uploaded " + sample.to_peer_bytes + " B (" + formatBytes(sample.to_peer_bytes) +
+        ") · Downloaded " + sample.from_peer_bytes + " B (" + formatBytes(sample.from_peer_bytes) + ")";
+    replaceText(elements.trafficChartDetail, trafficDetail);
+    replaceText(elements.flowsChartDetail, timestamp + " · Active flows " + sample.active_flows);
+  }
+
+  function selectChartSampleAtPointer(canvas, event) {
+    const layout = state.chartLayouts.get(canvas.id);
+    if (!layout || state.chartSamples.length === 0) return;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const cssX = (event.clientX - rect.left) * (layout.width / rect.width);
+    const plotWidth = Math.max(1, layout.plotRight - layout.plotLeft);
+    const ratio = Math.max(0, Math.min(1, (cssX - layout.plotLeft) / plotWidth));
+    const timestamp = layout.firstTime + ratio * Math.max(0, layout.lastTime - layout.firstTime);
+    selectChartSample(nearestChartSampleIndex(state.chartSamples, timestamp), true);
+  }
+
+  function bindChartInteraction(canvas) {
+    let touchStart = null;
+    canvas.addEventListener("pointermove", function (event) {
+      if (event.pointerType === "mouse" || event.pointerType === "pen") {
+        selectChartSampleAtPointer(canvas, event);
+      }
+    });
+    canvas.addEventListener("pointerleave", function (event) {
+      if (
+        (event.pointerType === "mouse" || event.pointerType === "pen") &&
+        state.chartSamples.length > 0
+      ) {
+        state.chartSelectionTouched = false;
+        selectChartSample(state.chartSamples.length - 1, false);
+      }
+    });
+    canvas.addEventListener("pointerdown", function (event) {
+      if (event.pointerType === "mouse") {
+        selectChartSampleAtPointer(canvas, event);
+        return;
+      }
+      touchStart = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    });
+    canvas.addEventListener("pointerup", function (event) {
+      if (
+        touchStart && touchStart.pointerId === event.pointerId &&
+        Math.hypot(event.clientX - touchStart.x, event.clientY - touchStart.y) <= 10
+      ) {
+        selectChartSampleAtPointer(canvas, event);
+      }
+      touchStart = null;
+    });
+    canvas.addEventListener("pointercancel", function () { touchStart = null; });
+    canvas.addEventListener("focus", function () {
+      if (state.selectedChartTimestamp === null && state.chartSamples.length > 0) {
+        selectChartSample(state.chartSamples.length - 1, false);
+      }
+    });
+    canvas.addEventListener("keydown", function (event) {
+      const samples = state.chartSamples;
+      if (samples.length === 0) return;
+      let index = nearestChartSampleIndex(samples, state.selectedChartTimestamp);
+      if (event.key === "ArrowLeft") index = Math.max(0, index - 1);
+      else if (event.key === "ArrowRight") index = Math.min(samples.length - 1, index + 1);
+      else if (event.key === "Home") index = 0;
+      else if (event.key === "End") index = samples.length - 1;
+      else return;
+      event.preventDefault();
+      selectChartSample(index, true);
+    });
+  }
+
   function trimChartSamples() {
     if (state.chartWindowMs === 0 || state.chartSamples.length === 0) return;
     const newest = state.chartSamples[state.chartSamples.length - 1].timestamp_unix_ms;
@@ -2041,6 +2275,7 @@
       });
       state.chartSamples.splice(0, removeCount);
     }
+    reconcileChartSelection();
   }
 
   function mergeChartSamples(samples) {
@@ -2062,6 +2297,7 @@
       });
     }
     trimChartSamples();
+    reconcileChartSelection();
   }
 
   function chartWindowName() {
@@ -2105,11 +2341,7 @@
     const speedMode = state.trafficChartMode === "speed";
     const totalPlot = speedMode ? null : totalTrafficPlot(trends);
     const trafficTrends = speedMode ? trends : totalPlot.samples;
-    const trafficHasData = trends.length > 1 && trends.some(function (sample) {
-      return speedMode
-        ? finiteNumber(sample.to_peer_bps) > 0 || finiteNumber(sample.from_peer_bps) > 0
-        : unsignedBigInt(sample.to_peer_bytes) > 0n || unsignedBigInt(sample.from_peer_bytes) > 0n;
-    });
+    const trafficHasData = trends.length > 0;
     elements.trafficChartEmpty.hidden = trafficHasData;
     elements.flowsChartEmpty.hidden = trends.length > 0;
     replaceText(elements.trafficChartTitle, speedMode ? "Transfer speed" : "Total traffic");
@@ -2117,7 +2349,7 @@
     elements.chartModeSpeed.setAttribute("aria-pressed", speedMode ? "true" : "false");
     elements.chartModeTotal.classList.toggle("is-active", !speedMode);
     elements.chartModeTotal.setAttribute("aria-pressed", speedMode ? "false" : "true");
-    drawLineChart(
+    const trafficLayout = drawLineChart(
       elements.trafficChart,
       trafficTrends,
       [
@@ -2130,14 +2362,25 @@
           value: function (sample) { return speedMode ? sample.from_peer_bps : sample.from_peer_bytes; }
         }
       ],
-      { integerOnly: false, axisLabel: speedMode ? formatChartSpeed : totalPlot.axisLabel }
+      {
+        integerOnly: false,
+        axisLabel: speedMode ? formatChartSpeed : totalPlot.axisLabel,
+        selectedTimestamp: state.selectedChartTimestamp
+      }
     );
-    drawLineChart(
+    const flowsLayout = drawLineChart(
       elements.flowsChart,
       trends,
       [{ color: "#a45b08", value: function (sample) { return sample.active_flows; } }],
-      { integerOnly: true, axisLabel: function (value) { return Math.round(value).toString(); } }
+      {
+        integerOnly: true,
+        axisLabel: function (value) { return Math.round(value).toString(); },
+        selectedTimestamp: state.selectedChartTimestamp
+      }
     );
+    state.chartLayouts.set(elements.trafficChart.id, trafficLayout);
+    state.chartLayouts.set(elements.flowsChart.id, flowsLayout);
+    renderChartDetails(speedMode);
     const rates = asObject(asObject(state.status.traffic).rates);
     const total = asObject(asObject(state.status.traffic).total);
     elements.trafficChart.setAttribute("aria-label", speedMode
@@ -2238,6 +2481,8 @@
     elements.chartModeTotal.addEventListener("click", function () {
       selectTrafficChartMode("total");
     });
+    bindChartInteraction(elements.trafficChart);
+    bindChartInteraction(elements.flowsChart);
     elements.accessButton.addEventListener("click", function () {
       showAuthDialog(state.bearerToken ? "Replace the bearer token saved for this dashboard address." : "Enter the token configured for this endpoint.");
     });

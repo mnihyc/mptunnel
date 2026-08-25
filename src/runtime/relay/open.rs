@@ -19,6 +19,7 @@ use crate::protocol::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
+use crate::runtime::path::quic::client::{ClientUdpErrorDisposition, client_udp_error_disposition};
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{OpenedRemoteStream, ReliablePathStream};
 use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
@@ -52,6 +53,8 @@ pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
     payload_bytes: usize,
     attempted: &mut Vec<RelayPathKey>,
 ) -> Result<Option<ReliableInitialOpenAttempt>, RuntimeError> {
+    #[cfg(test)]
+    context.record_reliable_selection_pass_for_test();
     let candidate_count = context
         .tcp_paths
         .len()
@@ -173,6 +176,16 @@ async fn open_reliable_initial_attempt(
 }
 
 pub(in crate::runtime) async fn open_remote_stream(
+    context: &ClientPathContext,
+    target: TargetAddr,
+    lane: TrafficClass,
+) -> Result<OpenedRemoteStream, RuntimeError> {
+    context
+        .complete_session_operation(open_remote_stream_active(context, target, lane))
+        .await
+}
+
+async fn open_remote_stream_active(
     context: &ClientPathContext,
     target: TargetAddr,
     lane: TrafficClass,
@@ -355,6 +368,10 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
         path_index,
         advertised_recv_max_offset,
     );
+    #[cfg(test)]
+    context
+        .pause_reliable_tcp_settlement_for_test(path_index)
+        .await;
     tokio::time::timeout_at(
         open_deadline,
         send_open_path_metrics(pending.stream(), Some(path_metrics)),
@@ -482,10 +499,17 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
             advertised_recv_max_offset,
         )
         .await?;
+    // The handle has already atomically committed this exact carrier owner.
+    let path_instance_id = carrier.path_instance_id;
     let pending =
         OpenedRemoteStream::from_opened_carrier(carrier, path_index, advertised_recv_max_offset);
     let elapsed = started_at.elapsed();
-    context.mark_udp_stream_reserved_open_success(path_index, elapsed, true);
+    let _ = context.mark_udp_stream_reserved_open_success_for_instance(
+        path_index,
+        path_instance_id,
+        elapsed,
+        true,
+    );
     send_open_path_metrics(
         pending.stream(),
         context.relay_path_metrics(UnderlayProtocol::Udp, path_index),
@@ -522,7 +546,7 @@ pub(in crate::runtime) fn stream_open_error_is_path_retryable(err: &RuntimeError
             | RuntimeError::Tcp(_)
             | RuntimeError::Encrypted(_)
             | RuntimeError::Auth(_)
-            | RuntimeError::RemoteClosed(_)
+            | RuntimeError::RemotePathClosed(_)
             | RuntimeError::ReliablePathSessionClosed
             | RuntimeError::PathHeartbeatTimeout
             | RuntimeError::PathOpenTimedOut
@@ -531,14 +555,18 @@ pub(in crate::runtime) fn stream_open_error_is_path_retryable(err: &RuntimeError
 }
 
 pub(in crate::runtime) fn udp_stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
+    if client_udp_error_disposition(err) == ClientUdpErrorDisposition::Session {
+        return false;
+    }
     matches!(
         err,
         RuntimeError::Io(_)
             | RuntimeError::Udp(_)
             | RuntimeError::QuicCarrier(_)
             | RuntimeError::Auth(_)
-            | RuntimeError::RemoteClosed(_)
+            | RuntimeError::RemotePathClosed(_)
             | RuntimeError::ReliablePathSessionClosed
+            | RuntimeError::ReliablePathRetired
             | RuntimeError::PathHeartbeatTimeout
             | RuntimeError::PathOpenTimedOut
             | RuntimeError::Protocol(_)

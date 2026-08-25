@@ -15,6 +15,8 @@ use crate::runtime::outbound_registry::{
     EgressSelection, OpenedTcpOutbound, OpenedUdpOutbound, ProductDestination, ProductOpenRequest,
     RuntimeOutboundRegistry,
 };
+use crate::runtime::path::ServerMppIngress;
+use crate::runtime::telemetry::ProductFlowSource;
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -39,6 +41,12 @@ enum RouteOrigin {
     Mpp,
 }
 
+#[derive(Clone, Copy)]
+enum RouteIngress<'a> {
+    Local(SourceEndpoint),
+    Mpp(&'a ServerMppIngress),
+}
+
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientIngressRouter {
     policy: Arc<ProductPolicyGeneration>,
@@ -52,7 +60,8 @@ pub(in crate::runtime) struct ClientOutboundPlan {
     authorizer: ProductFlowDestinationAuthorizer,
     authorization: DestinationAuthorization,
     recovered_dns: Option<SyntheticCaptureRoute>,
-    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    debug_connection: Option<crate::observability::ConnectionDebugContext>,
+    flow_source: ProductFlowSource,
     resolution_mode: TargetResolutionMode,
 }
 
@@ -76,7 +85,7 @@ impl RecoveredTunTarget {
 }
 
 struct DestinationRouteGroup {
-    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    debug_connection: Option<crate::observability::ConnectionDebugContext>,
     rule_id: RuleId,
     disposition: RouteDisposition,
     selection: EgressSelection,
@@ -114,7 +123,8 @@ impl ClientOutboundPlan {
                 authorizer: &self.authorizer,
                 dns_plan: group.dns_plan.as_ref(),
                 traffic_class: group.traffic_class,
-                debug_connection_id: group.debug_connection_id,
+                debug_connection: group.debug_connection.clone(),
+                flow_source: self.flow_source,
             };
             let opened = match self.origin {
                 RouteOrigin::Local => self.registry.open_product_tcp(request).await,
@@ -155,7 +165,8 @@ impl ClientOutboundPlan {
                 authorizer: &self.authorizer,
                 dns_plan: group.dns_plan.as_ref(),
                 traffic_class: group.traffic_class,
-                debug_connection_id: group.debug_connection_id,
+                debug_connection: group.debug_connection.clone(),
+                flow_source: self.flow_source,
             };
             let opened = match self.origin {
                 RouteOrigin::Local => self.registry.open_product_udp(request).await,
@@ -215,7 +226,7 @@ impl ClientOutboundPlan {
                 }
             };
             return Ok(vec![DestinationRouteGroup {
-                debug_connection_id: self.debug_connection_id,
+                debug_connection: self.debug_connection.clone(),
                 rule_id: permit.rule_id().clone(),
                 disposition: permit.action().disposition(),
                 selection,
@@ -306,7 +317,7 @@ impl ClientOutboundPlan {
                     ProductDestination::resolved(group.authorized)?
                 };
                 Ok(DestinationRouteGroup {
-                    debug_connection_id: self.debug_connection_id,
+                    debug_connection: self.debug_connection.clone(),
                     rule_id: group.permit.rule_id().clone(),
                     disposition: group.permit.action().disposition(),
                     selection: group.selection,
@@ -386,14 +397,13 @@ impl ClientOutboundPlan {
 
     fn emit_inbound_established(&self) {
         emit_inbound_debug_for_flow(
-            self.debug_connection_id,
+            self.debug_connection.as_ref(),
             crate::observability::InboundDebugEvent::Established,
-            self.authorizer.flow.as_ref(),
         );
     }
 
     fn emit_routing_selected(&self, group: &DestinationRouteGroup) {
-        if group.debug_connection_id.is_none() {
+        if group.debug_connection.is_none() {
             return;
         }
         let egress = match &group.selection {
@@ -410,27 +420,21 @@ impl ClientOutboundPlan {
             group.disposition,
             RouteDisposition::Allow | RouteDisposition::AllowRestricted
         ));
-        let flow = self.authorizer.flow.as_ref();
-        let destination = flow.target().authority();
         crate::observability::emit_routing_debug(
-            group.debug_connection_id,
+            group.debug_connection.as_ref(),
             crate::observability::RoutingDebugEvent::Selected,
             crate::observability::RoutingDebugFields {
-                network: debug_network_label(flow.network()),
-                inbound: Some(flow.inbound().as_str()),
-                principal: Some(flow.principal().as_str()),
                 rule: Some(group.rule_id.as_str()),
                 decision,
                 egress: Some(&egress),
                 target_resolution: Some(self.resolution_mode.as_str()),
-                destination: &destination,
             },
         );
     }
 
     fn emit_routing_terminal_error(&self, error: &RouteAuthorizationError) {
         emit_product_routing_terminal_debug(
-            self.debug_connection_id,
+            self.debug_connection.as_ref(),
             self.authorizer.flow.as_ref(),
             error,
         );
@@ -438,14 +442,14 @@ impl ClientOutboundPlan {
 }
 
 pub(super) fn emit_product_routing_terminal_debug(
-    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    debug_connection: Option<&crate::observability::ConnectionDebugContext>,
     flow: &FlowContext,
     error: &RouteAuthorizationError,
 ) {
     let Some((event, rule, decision)) = routing_terminal_debug_fields(error) else {
         return;
     };
-    emit_routing_terminal_debug(debug_connection_id, event, flow, rule, decision);
+    emit_routing_terminal_debug(debug_connection, event, flow, rule, decision);
 }
 
 fn routing_terminal_debug_fields(
@@ -600,10 +604,9 @@ impl ClientIngressRouter {
         self.route(
             Network::Tcp,
             recovered.target(),
-            Some(SourceEndpoint::from_socket_addr(source)),
+            RouteIngress::Local(SourceEndpoint::from_socket_addr(source)),
             principal,
             inbound,
-            RouteOrigin::Local,
             recovered.synthetic_capture.clone(),
         )
     }
@@ -618,10 +621,9 @@ impl ClientIngressRouter {
         self.route(
             Network::Udp,
             recovered.target(),
-            Some(SourceEndpoint::from_socket_addr(source)),
+            RouteIngress::Local(SourceEndpoint::from_socket_addr(source)),
             principal,
             inbound,
-            RouteOrigin::Local,
             recovered.synthetic_capture.clone(),
         )
     }
@@ -636,10 +638,9 @@ impl ClientIngressRouter {
         self.route(
             Network::Tcp,
             target,
-            Some(SourceEndpoint::from_socket_addr(source)),
+            RouteIngress::Local(SourceEndpoint::from_socket_addr(source)),
             principal,
             inbound,
-            RouteOrigin::Local,
             None,
         )
     }
@@ -654,27 +655,26 @@ impl ClientIngressRouter {
         self.route(
             Network::Udp,
             target,
-            Some(SourceEndpoint::from_socket_addr(source)),
+            RouteIngress::Local(SourceEndpoint::from_socket_addr(source)),
             principal,
             inbound,
-            RouteOrigin::Local,
             None,
         )
     }
 
-    pub(in crate::runtime) fn route_mpp_tcp(
+    pub(in crate::runtime) fn route_mpp_tcp_with_ingress(
         &self,
         target: &TargetAddr,
         principal: PrincipalId,
         inbound: InboundId,
+        ingress: &ServerMppIngress,
     ) -> Result<ClientRoute, RuntimeError> {
         self.route(
             Network::Tcp,
             target,
-            None,
+            RouteIngress::Mpp(ingress),
             principal,
             inbound,
-            RouteOrigin::Mpp,
             None,
         )
     }
@@ -682,36 +682,58 @@ impl ClientIngressRouter {
     /// Performs the server opening-path policy check silently. An allowed
     /// logical stream is traced later by its relay actor; a terminal decision
     /// is repeated once with a trace identity because no relay will follow.
-    pub(in crate::runtime) fn preflight_mpp_tcp(
+    pub(in crate::runtime) fn preflight_mpp_tcp_with_ingress(
         &self,
         target: &TargetAddr,
         principal: PrincipalId,
         inbound: InboundId,
+        ingress: &ServerMppIngress,
     ) -> Result<ClientRoute, RuntimeError> {
-        self.preflight_mpp_tcp_with_terminal_debug_connection(
+        self.preflight_mpp_tcp_with_ingress_and_terminal_debug_connection(
             target,
             principal,
             inbound,
+            ingress,
             crate::observability::next_debug_connection_id,
         )
     }
 
+    #[cfg(test)]
     fn preflight_mpp_tcp_with_terminal_debug_connection(
         &self,
         target: &TargetAddr,
         principal: PrincipalId,
         inbound: InboundId,
+        ingress: &ServerMppIngress,
+        terminal_debug_connection: impl FnOnce() -> Option<crate::observability::DebugConnectionId>,
+    ) -> Result<ClientRoute, RuntimeError> {
+        self.preflight_mpp_tcp_with_ingress_and_terminal_debug_connection(
+            target,
+            principal,
+            inbound,
+            ingress,
+            terminal_debug_connection,
+        )
+    }
+
+    fn preflight_mpp_tcp_with_ingress_and_terminal_debug_connection(
+        &self,
+        target: &TargetAddr,
+        principal: PrincipalId,
+        inbound: InboundId,
+        ingress: &ServerMppIngress,
         terminal_debug_connection: impl FnOnce() -> Option<crate::observability::DebugConnectionId>,
     ) -> Result<ClientRoute, RuntimeError> {
         let traced_principal = principal.clone();
         let traced_inbound = inbound.clone();
-        let preflight = self.preflight_mpp_tcp_once(target, principal, inbound, None);
+        let preflight = self.preflight_mpp_tcp_once(target, principal, inbound, ingress, None);
         match preflight {
             Ok(allowed @ ClientRoute::Open(_)) => Ok(allowed),
             Ok(ClientRoute::Deny(_)) | Err(_) => self.preflight_mpp_tcp_once(
                 target,
                 traced_principal,
                 traced_inbound,
+                ingress,
                 terminal_debug_connection(),
             ),
         }
@@ -722,15 +744,15 @@ impl ClientIngressRouter {
         target: &TargetAddr,
         principal: PrincipalId,
         inbound: InboundId,
+        ingress: &ServerMppIngress,
         debug_connection_id: Option<crate::observability::DebugConnectionId>,
     ) -> Result<ClientRoute, RuntimeError> {
         let route = self.route_with_debug_connection(
             Network::Tcp,
             target,
-            None,
+            RouteIngress::Mpp(ingress),
             principal,
             inbound,
-            RouteOrigin::Mpp,
             None,
             debug_connection_id,
         )?;
@@ -769,19 +791,19 @@ impl ClientIngressRouter {
         }
     }
 
-    pub(in crate::runtime) fn route_mpp_udp(
+    pub(in crate::runtime) fn route_mpp_udp_with_ingress(
         &self,
         target: &TargetAddr,
         principal: PrincipalId,
         inbound: InboundId,
+        ingress: &ServerMppIngress,
     ) -> Result<ClientRoute, RuntimeError> {
         self.route(
             Network::Udp,
             target,
-            None,
+            RouteIngress::Mpp(ingress),
             principal,
             inbound,
-            RouteOrigin::Mpp,
             None,
         )
     }
@@ -794,20 +816,18 @@ impl ClientIngressRouter {
         &self,
         network: Network,
         target: &TargetAddr,
-        source: Option<SourceEndpoint>,
+        ingress: RouteIngress<'_>,
         principal: PrincipalId,
         inbound: InboundId,
-        origin: RouteOrigin,
         recovered_dns: Option<SyntheticCaptureRoute>,
     ) -> Result<ClientRoute, RuntimeError> {
         let debug_connection_id = crate::observability::next_debug_connection_id();
         self.route_with_debug_connection(
             network,
             target,
-            source,
+            ingress,
             principal,
             inbound,
-            origin,
             recovered_dns,
             debug_connection_id,
         )
@@ -821,24 +841,37 @@ impl ClientIngressRouter {
         &self,
         network: Network,
         target: &TargetAddr,
-        source: Option<SourceEndpoint>,
+        ingress: RouteIngress<'_>,
         principal: PrincipalId,
         inbound: InboundId,
-        origin: RouteOrigin,
         recovered_dns: Option<SyntheticCaptureRoute>,
         debug_connection_id: Option<crate::observability::DebugConnectionId>,
     ) -> Result<ClientRoute, RuntimeError> {
         let normalized_target = protocol_target(target)?;
-        let flow = Arc::new(match source {
-            Some(source) => {
-                FlowContext::new(network, normalized_target, source, principal, inbound)
-            }
-            None => FlowContext::without_source(network, normalized_target, principal, inbound),
-        });
-        emit_inbound_debug_for_flow(
+        let (flow, origin, observed_ingress, flow_source) = match ingress {
+            RouteIngress::Local(source) => (
+                FlowContext::new(network, normalized_target, source, principal, inbound),
+                RouteOrigin::Local,
+                None,
+                ProductFlowSource::local_peer(SocketAddr::new(source.address(), source.port())),
+            ),
+            RouteIngress::Mpp(ingress) => (
+                FlowContext::without_source(network, normalized_target, principal, inbound),
+                RouteOrigin::Mpp,
+                Some(ingress),
+                ProductFlowSource::mpp_carrier_peer(ingress.peer()),
+            ),
+        };
+        let flow = Arc::new(flow);
+        let debug_connection = build_connection_debug_context(
             debug_connection_id,
-            crate::observability::InboundDebugEvent::Accepted,
             flow.as_ref(),
+            origin,
+            observed_ingress,
+        );
+        emit_inbound_debug_for_flow(
+            debug_connection.as_ref(),
+            crate::observability::InboundDebugEvent::Accepted,
         );
         let decision =
             self.policy
@@ -852,7 +885,11 @@ impl ClientIngressRouter {
         let mut decision = match decision {
             Ok(decision) => decision,
             Err(error) => {
-                emit_product_routing_terminal_debug(debug_connection_id, flow.as_ref(), &error);
+                emit_product_routing_terminal_debug(
+                    debug_connection.as_ref(),
+                    flow.as_ref(),
+                    &error,
+                );
                 return match error {
                     RouteAuthorizationError::Rejected { .. } => {
                         Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject))
@@ -931,7 +968,8 @@ impl ClientIngressRouter {
             authorizer,
             authorization: DestinationAuthorization { decision },
             recovered_dns,
-            debug_connection_id,
+            debug_connection,
+            flow_source,
             resolution_mode,
         }))
     }
@@ -944,56 +982,94 @@ const fn debug_network_label(network: Network) -> &'static str {
     }
 }
 
-fn emit_inbound_debug_for_flow(
-    debug_connection_id: Option<crate::observability::DebugConnectionId>,
-    event: crate::observability::InboundDebugEvent,
-    flow: &FlowContext,
-) {
-    if debug_connection_id.is_none() {
-        return;
+const fn debug_origin_label(origin: RouteOrigin) -> &'static str {
+    match origin {
+        RouteOrigin::Local => "local_inbound",
+        RouteOrigin::Mpp => "mpp_inbound",
     }
-    let (source, destination) = match event {
-        crate::observability::InboundDebugEvent::Accepted => (
-            flow.source()
-                .map(|source| SocketAddr::new(source.address(), source.port()).to_string()),
-            Some(flow.target().authority()),
-        ),
-        crate::observability::InboundDebugEvent::Established => (None, None),
-    };
-    crate::observability::emit_inbound_debug(
-        debug_connection_id,
-        event,
-        debug_network_label(flow.network()),
-        flow.inbound().as_str(),
-        Some(flow.principal().as_str()),
-        source.as_deref(),
-        destination.as_deref(),
-    );
+}
+
+const fn debug_ingress_underlay_label(underlay: crate::protocol::UnderlayProtocol) -> &'static str {
+    match underlay {
+        crate::protocol::UnderlayProtocol::Tcp => "tcp",
+        crate::protocol::UnderlayProtocol::Udp => "quic",
+    }
+}
+
+fn build_connection_debug_context(
+    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    flow: &FlowContext,
+    origin: RouteOrigin,
+    ingress: Option<&ServerMppIngress>,
+) -> Option<crate::observability::ConnectionDebugContext> {
+    let debug_connection_id = debug_connection_id?;
+    // Production MPP carriers always provide an authenticated observational
+    // ingress snapshot. If a live log-level transition races that snapshot,
+    // omit the whole new trace instead of publishing a misleading MPP trace
+    // without its required carrier source.
+    if origin == RouteOrigin::Mpp && ingress.is_none() {
+        return None;
+    }
+    let local_source = flow
+        .source()
+        .map(|source| SocketAddr::new(source.address(), source.port()).to_string());
+    let mpp_source = ingress.map(|ingress| ingress.peer().to_string());
+    let source = local_source.as_deref().or(mpp_source.as_deref());
+    let source_kind = local_source
+        .as_ref()
+        .map(|_| crate::observability::ConnectionDebugSourceKind::LocalPeer)
+        .or_else(|| {
+            mpp_source
+                .as_ref()
+                .map(|_| crate::observability::ConnectionDebugSourceKind::MppCarrierPeer)
+        });
+    let destination = flow.target().authority();
+    let session_id = ingress.map(|ingress| ingress.session_id().0.to_string());
+    let ingress_path_id = ingress.map(|ingress| ingress.path_id().0.to_string());
+    let ingress_path_instance =
+        ingress.map(|ingress| ingress.path_instance_id().as_u64().to_string());
+    crate::observability::connection_debug_context(
+        Some(debug_connection_id),
+        crate::observability::ConnectionDebugContextFields {
+            network: debug_network_label(flow.network()),
+            origin: debug_origin_label(origin),
+            inbound: flow.inbound().as_str(),
+            principal: flow.principal().as_str(),
+            source,
+            source_kind,
+            requested_destination: &destination,
+            session_id: session_id.as_deref(),
+            ingress_underlay: ingress
+                .map(|ingress| debug_ingress_underlay_label(ingress.underlay())),
+            ingress_path: ingress.and_then(ServerMppIngress::configured_path),
+            ingress_path_id: ingress_path_id.as_deref(),
+            ingress_path_instance: ingress_path_instance.as_deref(),
+        },
+    )
+}
+
+fn emit_inbound_debug_for_flow(
+    debug_connection: Option<&crate::observability::ConnectionDebugContext>,
+    event: crate::observability::InboundDebugEvent,
+) {
+    crate::observability::emit_inbound_debug(debug_connection, event);
 }
 
 fn emit_routing_terminal_debug(
-    debug_connection_id: Option<crate::observability::DebugConnectionId>,
+    debug_connection: Option<&crate::observability::ConnectionDebugContext>,
     event: crate::observability::RoutingDebugEvent,
-    flow: &FlowContext,
+    _flow: &FlowContext,
     rule: &str,
     decision: &str,
 ) {
-    if debug_connection_id.is_none() {
-        return;
-    }
-    let destination = flow.target().authority();
     crate::observability::emit_routing_debug(
-        debug_connection_id,
+        debug_connection,
         event,
         crate::observability::RoutingDebugFields {
-            network: debug_network_label(flow.network()),
-            inbound: Some(flow.inbound().as_str()),
-            principal: Some(flow.principal().as_str()),
             rule: Some(rule),
             decision,
             egress: None,
             target_resolution: None,
-            destination: &destination,
         },
     );
 }

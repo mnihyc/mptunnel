@@ -101,6 +101,11 @@ matrix_poor_jitter="${MPTUNNEL_LAB_MATRIX_POOR_JITTER:-60ms}"
 matrix_good_loss="${MPTUNNEL_LAB_MATRIX_GOOD_LOSS:-1.00%}"
 matrix_poor_loss="${MPTUNNEL_LAB_MATRIX_POOR_LOSS:-15.00%}"
 scale_seed="${MPTUNNEL_LAB_SCALE_SEED:-mptunnel-scale-links}"
+internet_seed="${MPTUNNEL_LAB_INTERNET_SEED:-mptunnel-random-internet-v1}"
+internet_include_outages="${MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES:-0}"
+internet_schedule_script="${MPTUNNEL_LAB_INTERNET_SCHEDULE_SCRIPT:-/workspace/lab/internet_condition_schedule.py}"
+internet_schedule_file="${MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE:-}"
+internet_schedule_sha256="${MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256:-}"
 
 scale_subnet_prefixes=(
   172.31.10 172.31.15 172.31.16 172.31.20 172.31.30
@@ -253,6 +258,299 @@ apply_scale_epoch() {
     return 1
   fi
   printf '%s\n' "$profile_json"
+}
+
+internet_contract_error() {
+  echo "invalid seeded Internet-condition schedule: $*" >&2
+  return 2
+}
+
+internet_percentage_is_valid() {
+  local token="$1"
+  local numeric whole fraction=""
+
+  # Keep tc arguments bounded as well as syntactically constrained. The
+  # generator emits percentages, never probability fractions.
+  if [[ ${#token} -gt 32 \
+    || ! "$token" =~ ^[0-9]{1,3}([.][0-9]+)?%$ ]]; then
+    return 1
+  fi
+  numeric="${token%%%}"
+  whole="${numeric%%.*}"
+  if [[ "$numeric" == *.* ]]; then
+    fraction="${numeric#*.}"
+  fi
+  if (( 10#$whole > 100 )); then
+    return 1
+  fi
+  if (( 10#$whole == 100 )) && [[ "$fraction" =~ [1-9] ]]; then
+    return 1
+  fi
+}
+
+internet_rate_is_valid() {
+  local token="$1"
+  if [[ ${#token} -gt 32 \
+    || ! "$token" =~ ^([0-9]+)([.][0-9]+)?([kmgt]?)(bit|bps)$ ]]; then
+    return 1
+  fi
+  # A syntactically valid zero rate is not a usable netem rate.
+  [[ "${BASH_REMATCH[1]}${BASH_REMATCH[2]:-}" =~ [1-9] ]]
+}
+
+internet_duration_is_valid() {
+  local token="$1"
+  [[ ${#token} -le 32 \
+    && "$token" =~ ^[0-9]+([.][0-9]+)?(ns|us|ms|s)$ ]]
+}
+
+internet_netem_seed_is_valid() {
+  local token="$1"
+  [[ "$token" =~ ^[0-9]+$ && ${#token} -le 10 ]] || return 1
+  (( 10#$token >= 1 && 10#$token <= 4294967295 ))
+}
+
+require_netem_seed_support() {
+  local iface="$1"
+  local help_text
+
+  # `help` is parsed before qdisc mutation, so this detects both the iproute2
+  # spelling and its support without perturbing a link. Reproducible random
+  # loss is part of this mode's contract; silently omitting seed would make
+  # nominally paired protocol runs experience different packet loss.
+  help_text="$(tc qdisc add dev "$iface" root netem help 2>&1 || true)"
+  if [[ ! "$help_text" =~ (^|[[:space:]])seed([[:space:]]|$) ]]; then
+    echo "tc netem does not advertise seed support; seeded Internet-condition runs require an iproute2/kernel netem combination with 'seed SEED' support" >&2
+    return 2
+  fi
+}
+
+apply_internet_profile_to_interface() {
+  local operation="$1"
+  local iface="$2"
+  local rate="$3"
+  local delay="$4"
+  local jitter="$5"
+  local delay_correlation="$6"
+  local loss="$7"
+  local loss_correlation="$8"
+  local reorder="$9"
+  local reorder_correlation="${10}"
+  local duplicate="${11}"
+  local corrupt="${12}"
+  local netem_seed="${13}"
+  local outage="${14}"
+  local limit_packets="${15}"
+  local effective_loss="$loss"
+  local -a qdisc_args
+
+  if [[ "$outage" == "1" ]]; then
+    effective_loss="100%"
+  fi
+
+  qdisc_args=(
+    tc qdisc "$operation" dev "$iface" root netem
+    limit "$limit_packets"
+    rate "$rate"
+  )
+  case "$jitter" in
+    0|0ms|0us|0ns|0s)
+      qdisc_args+=(delay "$delay")
+      ;;
+    *)
+      qdisc_args+=(
+        delay "$delay" "$jitter" "$delay_correlation" distribution normal
+      )
+      ;;
+  esac
+  qdisc_args+=(
+    loss random "$effective_loss" "$loss_correlation"
+    reorder "$reorder" "$reorder_correlation"
+    duplicate "$duplicate"
+    corrupt "$corrupt"
+    seed "$netem_seed"
+  )
+  if ! "${qdisc_args[@]}"; then
+    echo "failed to apply seeded tc netem profile on $iface; tc advertised seed support, but the running kernel must also support seeded netem" >&2
+    return 2
+  fi
+}
+
+apply_internet_five_path_epoch() {
+  local epoch="$1"
+  local direction="$2"
+  local operation="replace" schedule_tsv line subnet_prefix iface limit_packets
+  local -a fields=()
+  local -a outage_args=()
+  local -a schedule_args=()
+  local -a subnets=() rates=() delays=() jitters=()
+  local -a delay_correlations=() losses=() loss_correlations=()
+  local -a reorders=() reorder_correlations=() duplicates=() corruptions=()
+  local -a netem_seeds=() outages=() ifaces=() limits=()
+  local -A seen_subnets=()
+  local row_count=0 index
+
+  # Every matrix subject is an independent static replay. The runner tears its
+  # containers down between epochs, and reapplying a subject must reset both
+  # the queue and netem's seeded packet process. Epoch number is therefore not
+  # qdisc lifecycle state. Dynamic in-flight transitions use the separate
+  # flapping lab rather than this static comparison mode.
+
+  case "$internet_include_outages" in
+    0) ;;
+    1) outage_args=(--include-outages) ;;
+    *)
+      internet_contract_error \
+        "MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES must be 0 or 1"
+      return
+      ;;
+  esac
+
+  if [[ -n "$internet_schedule_file" ]]; then
+    if [[ ! "$internet_schedule_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+      internet_contract_error \
+        "artifact replay requires MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256"
+      return
+    fi
+    schedule_args=(
+      replay
+      --schedule "$internet_schedule_file"
+      --expect-sha256 "$internet_schedule_sha256"
+      --epoch "$epoch"
+      --direction "$direction"
+      --format tsv
+    )
+  else
+    if [[ -n "$internet_schedule_sha256" ]]; then
+      internet_contract_error \
+        "schedule identity was provided without MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE"
+      return
+    fi
+    schedule_args=(
+      render
+      --seed "$internet_seed"
+      --epoch "$epoch"
+      --direction "$direction"
+      --topology five-path
+      --format tsv
+      "${outage_args[@]}"
+    )
+  fi
+
+  if ! schedule_tsv="$(python3 "$internet_schedule_script" "${schedule_args[@]}")"; then
+    echo "failed to render seeded Internet-condition schedule" >&2
+    return 2
+  fi
+  if [[ -z "$schedule_tsv" ]]; then
+    internet_contract_error "generator returned no rows"
+    return
+  fi
+
+  # Parse into one array per column and validate every row before touching a
+  # qdisc. No schedule value is interpreted as shell source.
+  while IFS= read -r line; do
+    fields=()
+    IFS=$'\t' read -r -a fields <<< "$line"
+    if [[ ${#fields[@]} -ne 13 ]]; then
+      internet_contract_error \
+        "row $((row_count + 1)) has ${#fields[@]} columns; expected 13"
+      return
+    fi
+    subnet_prefix="${fields[0]}"
+    case "$subnet_prefix" in
+      172.31.10|172.31.15|172.31.16|172.31.20|172.31.30) ;;
+      *)
+        internet_contract_error \
+          "row $((row_count + 1)) has an unexpected subnet prefix"
+        return
+        ;;
+    esac
+    if [[ -n "${seen_subnets[$subnet_prefix]:-}" ]]; then
+      internet_contract_error "duplicate subnet prefix $subnet_prefix"
+      return
+    fi
+    seen_subnets[$subnet_prefix]=1
+    if ! internet_rate_is_valid "${fields[1]}"; then
+      internet_contract_error "row $((row_count + 1)) has an invalid rate"
+      return
+    fi
+    if ! internet_duration_is_valid "${fields[2]}" \
+      || ! internet_duration_is_valid "${fields[3]}"; then
+      internet_contract_error \
+        "row $((row_count + 1)) has an invalid delay or jitter"
+      return
+    fi
+    for index in 4 5 6 7 8 9 10; do
+      if ! internet_percentage_is_valid "${fields[$index]}"; then
+        internet_contract_error \
+          "row $((row_count + 1)) column $((index + 1)) is not a 0..100% token"
+        return
+      fi
+    done
+    if ! internet_netem_seed_is_valid "${fields[11]}"; then
+      internet_contract_error \
+        "row $((row_count + 1)) has an invalid or zero uint32 netem seed"
+      return
+    fi
+    if [[ "${fields[12]}" != "0" && "${fields[12]}" != "1" ]]; then
+      internet_contract_error "row $((row_count + 1)) has an invalid outage flag"
+      return
+    fi
+
+    subnets+=("$subnet_prefix")
+    rates+=("${fields[1]}")
+    delays+=("${fields[2]}")
+    jitters+=("${fields[3]}")
+    delay_correlations+=("${fields[4]}")
+    losses+=("${fields[5]}")
+    loss_correlations+=("${fields[6]}")
+    reorders+=("${fields[7]}")
+    reorder_correlations+=("${fields[8]}")
+    duplicates+=("${fields[9]}")
+    corruptions+=("${fields[10]}")
+    netem_seeds+=("${fields[11]}")
+    outages+=("${fields[12]}")
+    ((row_count += 1))
+  done <<< "$schedule_tsv"
+
+  if [[ "$row_count" -ne 5 ]]; then
+    internet_contract_error \
+      "five-path topology returned $row_count unique rows; expected 5"
+    return
+  fi
+
+  # Resolve all interfaces and queue limits before applying the first row, so
+  # topology or generator mistakes cannot leave a knowingly partial profile.
+  for ((index = 0; index < row_count; index += 1)); do
+    iface="$(interface_for_subnet "${subnets[$index]}")"
+    if [[ -z "$iface" ]]; then
+      internet_contract_error \
+        "five-path topology is missing subnet ${subnets[$index]}.0/24"
+      return
+    fi
+    limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
+      netem_limit_packets \
+        "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}"
+    )}"
+    if [[ ! "$limit_packets" =~ ^[1-9][0-9]*$ ]]; then
+      echo "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS must be a positive integer" >&2
+      return 2
+    fi
+    ifaces+=("$iface")
+    limits+=("$limit_packets")
+  done
+
+  require_netem_seed_support "${ifaces[0]}"
+  for ((index = 0; index < row_count; index += 1)); do
+    apply_internet_profile_to_interface \
+      "$operation" "${ifaces[$index]}" \
+      "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}" \
+      "${delay_correlations[$index]}" \
+      "${losses[$index]}" "${loss_correlations[$index]}" \
+      "${reorders[$index]}" "${reorder_correlations[$index]}" \
+      "${duplicates[$index]}" "${corruptions[$index]}" \
+      "${netem_seeds[$index]}" "${outages[$index]}" "${limits[$index]}"
+  done
 }
 
 apply_tcp_per_flow_qos() {
@@ -441,6 +739,14 @@ case "$mode" in
       exit 2
     fi
     ;;
+  internet-five-path-epoch-*-client|internet-five-path-epoch-*-server)
+    if [[ "$mode" =~ ^internet-five-path-epoch-([0-9]+)-(client|server)$ ]]; then
+      apply_internet_five_path_epoch "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else
+      echo "invalid Internet-condition epoch mode: $mode" >&2
+      exit 2
+    fi
+    ;;
   matrix-b*)
     bits="${mode#matrix-}"
     if [[ "$bits" != b[01][01][01] ]]; then
@@ -502,7 +808,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|internet-five-path-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

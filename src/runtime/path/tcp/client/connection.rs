@@ -4,7 +4,7 @@
 //! telemetry, and liveness. Reliable-stream proof and capacity policy belong to
 //! the reliable client actor, while datagram sessions reuse this carrier alone.
 
-use super::super::io::{EncryptedTcpWriter, spawn_encrypted_tcp_reader};
+use super::super::io::{EncryptedTcpWriter, spawn_encrypted_tcp_reader_with_observer};
 use super::super::metrics::TcpMetricPublisher;
 use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
@@ -12,6 +12,7 @@ use crate::protocol::codec::CodecLimits;
 use crate::protocol::{Frame, PathId, PathUsage, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
+use crate::runtime::path::client_session::ClientSessionLifecycle;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
 use crate::runtime::path::tcp::admission::ClientTcpPathAuthentication;
 use crate::transport::encrypted::{
@@ -19,6 +20,7 @@ use crate::transport::encrypted::{
 };
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
+use std::net::Shutdown;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -37,6 +39,7 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     pub(in crate::runtime) peer_usage: PathUsage,
     /// One authenticated readiness exchange, excluding TCP connection setup.
     pub(in crate::runtime) readiness_rtt: Duration,
+    lifecycle_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Immutable inputs for one concrete TCP carrier instance.
@@ -50,9 +53,18 @@ pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) carrier_network: &'a dyn CarrierNetworkProvider,
+    pub(in crate::runtime) session_lifecycle: ClientSessionLifecycle,
     /// Exact configured port selected by the lifecycle owner. Initial and
     /// failure establishment leave this unset and select uniformly once.
     pub(in crate::runtime) remote_port: Option<u16>,
+}
+
+impl Drop for ClientTcpCarrierConnection {
+    fn drop(&mut self) {
+        if let Some(task) = self.lifecycle_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl ClientTcpCarrierConnection {
@@ -131,6 +143,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         codec_limits,
         mux_limits,
         carrier_network,
+        session_lifecycle,
         remote_port,
     } = request;
     let connect = async {
@@ -155,6 +168,12 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         )
         .await?;
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
+        // Keep one native owner outside the split TLS/Noise halves. A complete
+        // SessionId retirement can then cancel an in-progress encrypted read
+        // or write without weakening the ordered writer interlock.
+        let tcp_stream = tcp_stream.into_std()?;
+        let shutdown_stream = tcp_stream.try_clone()?;
+        let tcp_stream = tokio::net::TcpStream::from_std(tcp_stream)?;
         let mut framed = EncryptedFramedStream::connect(tcp_stream, tls, codec_limits).await?;
         let transport_binding = framed.tcp_admission_binding()?;
         let (admission_prelude, path_join) = ClientTcpPathAuthentication::for_session(
@@ -215,6 +234,23 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         }
 
         let (reader, writer) = framed.split()?;
+        let observed_lifecycle = session_lifecycle.clone();
+        let frames = spawn_encrypted_tcp_reader_with_observer(
+            reader,
+            reliable_path_writer_frame_queue(mux_limits),
+            move |frame| {
+                if let Frame::SessionClose { reason } = frame {
+                    observed_lifecycle.retire(*reason);
+                }
+            },
+        );
+        let lifecycle_task = {
+            let retirement = session_lifecycle.retirement();
+            tokio::spawn(async move {
+                let _reason = retirement.wait().await;
+                let _ = shutdown_stream.shutdown(Shutdown::Both);
+            })
+        };
         let now = tokio::time::Instant::now();
         let heartbeat_delay =
             heartbeat_renewal_delay(mux_limits.tcp_path_heartbeat_interval, random_u64()?);
@@ -222,10 +258,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             path_id,
             remote_port,
             writer,
-            frames: spawn_encrypted_tcp_reader(
-                reader,
-                reliable_path_writer_frame_queue(mux_limits),
-            ),
+            frames,
             heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
             heartbeat_delay,
             heartbeat_timeout: mux_limits.tcp_path_heartbeat_timeout,
@@ -235,6 +268,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             peer_usage_sequence: 0,
             peer_usage: peer_usage.expect("path usage checked before carrier creation"),
             readiness_rtt,
+            lifecycle_task: Some(lifecycle_task),
         })
     };
     tokio::time::timeout_at(open_deadline, connect)

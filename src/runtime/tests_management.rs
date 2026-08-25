@@ -497,6 +497,166 @@ fn client_status_exposes_named_inventory_without_credentials() {
 }
 
 #[test]
+fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignment() {
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    );
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![
+            ClientPathConfig {
+                name: "primary-tcp".to_string(),
+                tls: crate::transport::encrypted::test_client_tls_config(),
+                spec: "tcp://127.0.0.1:7443-7445?max-tcp-carriers=3"
+                    .parse()
+                    .expect("TCP path"),
+                security: security.clone(),
+            },
+            ClientPathConfig {
+                name: "backup-quic".to_string(),
+                tls: crate::transport::encrypted::test_client_tls_config(),
+                spec: "quic://127.0.0.1:7444".parse().expect("QUIC path"),
+                security,
+            },
+        ],
+        ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
+    )
+    .expect("context");
+    let draining = context.peer_status.register_path(
+        context.session_id,
+        crate::protocol::UnderlayProtocol::Tcp,
+        crate::protocol::PathId(47),
+        2,
+    );
+    let _keeper = context.peer_status.register_path(
+        context.session_id,
+        crate::protocol::UnderlayProtocol::Udp,
+        crate::protocol::PathId(0),
+        0,
+    );
+    let result = crate::runtime::peer_status::PeerStatusResult {
+        session_id: context.session_id,
+        request_id: 9,
+        code: crate::protocol::PeerStatusCode::Ok,
+        paths: vec![crate::protocol::PeerPathStatus {
+            state: crate::protocol::PeerPathState::Draining,
+            usage: crate::protocol::PathUsage::Available,
+            metrics: crate::protocol::PathMetrics {
+                path_id: crate::protocol::PathId(47),
+                underlay: crate::protocol::UnderlayProtocol::Tcp,
+                direction: crate::protocol::PathMetricDirection::ServerToClient,
+                metric_epoch: 1,
+                metric_age_us: 0,
+                srtt_us: 10_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 10_000_000,
+                pacing_rate_bps: 10_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: 0,
+                inflight_hi_bytes: 0,
+                confidence_ppm: 0,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+            },
+        }],
+        local_path_indices: std::collections::BTreeMap::from([(
+            (
+                crate::protocol::UnderlayProtocol::Tcp,
+                crate::protocol::PathId(47),
+            ),
+            2,
+        )]),
+        received_at: std::time::SystemTime::now(),
+    };
+    drop(draining);
+    let projected = super::projection::peer_status_result(
+        result,
+        "mpp_outbound",
+        0,
+        Some("edge-mpp".to_string()),
+        super::projection::PeerPathIdentitySource::Client(&context),
+    );
+
+    assert_eq!(projected.paths.len(), 1);
+    assert_eq!(projected.paths[0].path.as_deref(), Some("primary-tcp"));
+    assert_eq!(
+        projected.paths[0].endpoint.as_deref(),
+        Some("tcp://127.0.0.1:7443-7445")
+    );
+    let encoded = serde_json::to_value(projected).expect("peer status JSON");
+    assert_eq!(encoded["paths"][0]["path"], "primary-tcp");
+    assert_eq!(encoded["paths"][0]["endpoint"], "tcp://127.0.0.1:7443-7445");
+}
+
+#[test]
+fn mpp_flow_projects_the_authenticated_opening_carrier_as_typed_source() {
+    let now = std::time::Instant::now();
+    let status = super::projection::flow_status(
+        crate::runtime::telemetry::ActiveProductFlowSnapshot {
+            display_id: 17,
+            session_id: Some(crate::protocol::SessionId(91)),
+            flow_id: crate::runtime::telemetry::ProductFlowId::Reliable(crate::protocol::StreamId(
+                4,
+            )),
+            network: crate::product::Network::Tcp,
+            target: Some(crate::protocol::TargetAddr::Domain {
+                host: "service.example".to_string(),
+                port: 443,
+            }),
+            origin: Some(crate::runtime::telemetry::ProductFlowOrigin {
+                kind: crate::runtime::telemetry::ProductFlowOriginKind::MppInbound,
+                inbound: crate::product::InboundId::parse("edge-in").expect("inbound"),
+                source: crate::runtime::telemetry::ProductFlowSource::mpp_carrier_peer(
+                    "203.0.113.7:51000".parse().expect("carrier peer"),
+                ),
+            }),
+            selection: Some(crate::runtime::telemetry::ProductFlowSelection {
+                outbound: OutboundId::parse("direct").expect("outbound"),
+                balancer: None,
+                member: None,
+            }),
+            started_at: now,
+            last_activity_at: now,
+            io: crate::runtime::telemetry::ProductIoSnapshot::default(),
+        },
+        now,
+    )
+    .expect("scoped MPP flow");
+
+    assert_eq!(status.source_kind, "mpp_carrier_peer");
+    assert_eq!(status.source, "203.0.113.7:51000");
+    let encoded = serde_json::to_value(status).expect("MPP flow JSON");
+    assert_eq!(encoded["source_kind"], "mpp_carrier_peer");
+    assert_eq!(encoded["source"], "203.0.113.7:51000");
+}
+
+#[test]
+fn unscoped_internal_telemetry_is_not_projected_as_an_inbound_row() {
+    let telemetry = RuntimeTelemetry::new(2);
+    let _internal = telemetry.open_reliable_flow(
+        None,
+        crate::protocol::StreamId(7),
+        crate::protocol::TargetAddr::Ip("127.0.0.1:853".parse().expect("internal target")),
+    );
+    let mut aggregate = super::snapshot::TelemetryAggregate::default();
+    aggregate.add(telemetry.snapshot(), std::time::Instant::now());
+
+    assert!(
+        aggregate.flows.is_empty(),
+        "unscoped DNS/probe/test transport work has no inbound source authority"
+    );
+}
+
+#[test]
 fn status_projects_the_bounded_tcp_carrier_pool() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
@@ -575,6 +735,9 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
         &product_flow,
         OutboundId::parse("edge-b").expect("outbound"),
         Some(BalancerId::parse("daily-egress").expect("balancer")),
+        crate::runtime::telemetry::ProductFlowSource::local_peer(
+            "127.0.0.1:42000".parse().expect("local peer"),
+        ),
     );
     let _active_flow = product_telemetry.scoped(scope).open_reliable_flow(
         Some(context.session_id),
@@ -611,13 +774,21 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     assert_eq!(status.flows.len(), 1);
     assert_eq!(status.flows[0].flow_id, "1");
     assert_eq!(status.flows[0].network, "tcp");
-    assert_eq!(status.flows[0].inbound.as_deref(), Some("local-socks"));
+    assert_eq!(status.flows[0].inbound_kind, "local");
+    assert_eq!(status.flows[0].inbound, "local-socks");
+    assert_eq!(status.flows[0].source_kind, "local_peer");
+    assert_eq!(status.flows[0].source, "127.0.0.1:42000");
     assert_eq!(status.flows[0].outbound.as_deref(), Some("edge-b"));
     assert_eq!(status.flows[0].balancer.as_deref(), Some("daily-egress"));
     assert_eq!(
         status.flows[0].target.as_deref(),
         Some("service.example:443")
     );
+    let encoded_flow = serde_json::to_value(&status.flows[0]).expect("flow JSON");
+    assert_eq!(encoded_flow["source_kind"], "local_peer");
+    assert_eq!(encoded_flow["source"], "127.0.0.1:42000");
+    assert_eq!(encoded_flow["inbound_kind"], "local");
+    assert_eq!(encoded_flow["inbound"], "local-socks");
     assert_eq!(status.diagnostics.peer_sessions.len(), 1);
     assert_eq!(status.diagnostics.peer_sessions[0].service, "mpp_outbound");
     assert_eq!(status.diagnostics.peer_sessions[0].service_index, 0);

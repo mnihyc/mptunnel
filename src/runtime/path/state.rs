@@ -3,6 +3,7 @@
 //! One health lock makes mixed TCP/QUIC observations coherent. Each carrier
 //! module owns its reservation, proof, and rollback transaction.
 
+use super::client_session::{ClientSessionLifecycle, ClientSessionRetirement};
 use super::commands::CapacityProbeCommandTicket;
 use super::health::{ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView};
 use super::model::{
@@ -39,10 +40,15 @@ pub(in crate::runtime) struct ClientTcpCarrierPublication {
     pub(in crate::runtime) readiness_rtt: Option<Duration>,
 }
 
-/// One lock domain for coherent health, load, and carrier budget composition.
+/// Coherent health/load state plus a narrow physical-lifecycle transaction.
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathState {
+    // Serializes only authority-bearing physical-carrier publication,
+    // retirement, failure, and Product-open commit. Sampled RTT/rate/loss
+    // telemetry remains on `health` alone and cannot delay lifecycle commits.
+    carrier_lifecycle: Mutex<()>,
     health: Mutex<ClientPathHealth>,
+    session_lifecycle: ClientSessionLifecycle,
     // Accessed only while `health` is locked so logical Product ownership and
     // physical replacement share one transaction boundary.
     active_product_flows: AtomicU64,
@@ -55,7 +61,9 @@ impl ClientPathState {
     pub(in crate::runtime) fn new(health: ClientPathHealth) -> Arc<Self> {
         let tcp_path_count = health.tcp.len();
         Arc::new(Self {
+            carrier_lifecycle: Mutex::new(()),
             health: Mutex::new(health),
+            session_lifecycle: ClientSessionLifecycle::new(),
             active_product_flows: AtomicU64::new(0),
             next_reliable_stream_id: Mutex::new(0),
             next_datagram_flow_id: Mutex::new(0),
@@ -65,6 +73,14 @@ impl ClientPathState {
 
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         &self.health
+    }
+
+    pub(in crate::runtime) fn session_lifecycle(&self) -> &ClientSessionLifecycle {
+        &self.session_lifecycle
+    }
+
+    pub(in crate::runtime) fn session_retirement(&self) -> ClientSessionRetirement {
+        self.session_lifecycle.retirement()
     }
 
     /// Applies one path mutation while owning the coherent health lock.
@@ -93,6 +109,7 @@ impl ClientPathState {
 
     /// Installs the first preference from a newly authenticated carrier. A new
     /// carrier instance restarts its sequence space at zero.
+    #[cfg(test)]
     pub(in crate::runtime) fn install_peer_path_usage(
         &self,
         underlay: UnderlayProtocol,
@@ -101,9 +118,104 @@ impl ClientPathState {
         sequence: u64,
         usage: PathUsage,
     ) {
-        let _ = self.mutate_path_eligibility(RelayPathKey { underlay, index }, |record| {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
+        let mut health = self.health.lock().expect("client path health lock");
+        if let Some(record) = health.path_record_mut(RelayPathKey { underlay, index }) {
             record.install_peer_usage(path_instance_id, sequence, usage);
+        }
+    }
+
+    pub(in crate::runtime) fn path_instance_id(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) -> Option<CarrierPathInstanceId> {
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .path_record(RelayPathKey { underlay, index })
+            .and_then(ClientPathHealthRecord::path_instance_id)
+    }
+
+    /// Publishes the physical QUIC owner and its scheduler identity in one
+    /// owner-held lifecycle transaction. The caller already owns the QUIC
+    /// connection slot, establishing the global order
+    /// `connection owner -> carrier lifecycle -> health`.
+    pub(in crate::runtime) fn publish_udp_peer_path_usage_committed(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+        carrier_is_live: impl FnOnce() -> bool,
+        publish_owner: impl FnOnce(),
+    ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
+        let mut health = self.health.lock().expect("client path health lock");
+        if !carrier_is_live() {
+            return false;
+        }
+        let Some(record) = health.udp.get_mut(index) else {
+            return false;
+        };
+        record.install_peer_usage(path_instance_id, sequence, usage);
+        publish_owner();
+        true
+    }
+
+    /// Publishes exact physical failure and removes the matching QUIC owner in
+    /// the same lifecycle transaction. `retire_owner` must not wait or acquire
+    /// another lock; the caller already holds the connection-owner mutex.
+    pub(in crate::runtime) fn settle_udp_path_instance_failure(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        retire_owner: impl FnOnce(),
+    ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("client path health lock");
+        let has_schedulable_alternative =
+            path_records_have_schedulable_alternative(&health.udp, index, now);
+        let marked = health.udp.get_mut(index).is_some_and(|record| {
+            record.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
         });
+        // The connection owner is authoritative for physical membership even
+        // when an exact callback already published the same health failure.
+        retire_owner();
+        marked
+    }
+
+    pub(in crate::runtime) fn mark_udp_path_establishment_failure_if_current(
+        &self,
+        index: usize,
+        expected_path_instance_id: Option<CarrierPathInstanceId>,
+    ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("client path health lock");
+        let has_schedulable_alternative =
+            path_records_have_schedulable_alternative(&health.udp, index, now);
+        let Some(current) = health.udp.get_mut(index) else {
+            return false;
+        };
+        if !current.accepts_endpoint_failure_for_expected_owner(expected_path_instance_id) {
+            return false;
+        }
+        current.mark_failure(now, has_schedulable_alternative);
+        true
     }
 
     /// Publishes while the caller owns the matching endpoint-policy
@@ -114,21 +226,35 @@ impl ClientPathState {
         publication: ClientTcpCarrierPublication,
         publish_readiness: impl FnOnce(),
     ) {
-        let mut health = self.health.lock().expect("client path health lock");
-        let record = health
-            .tcp
-            .get_mut(publication.path_index)
-            .expect("TCP carrier actor must have one health record");
-        record.install_tcp_peer_usage(
-            publication.path_id,
-            publication.path_instance_id,
-            publication.peer_usage_sequence,
-            publication.peer_usage,
-        );
-        if let Some(readiness_rtt) = publication.readiness_rtt {
-            record.mark_success(readiness_rtt);
+        {
+            let _lifecycle = self
+                .carrier_lifecycle
+                .lock()
+                .expect("client carrier lifecycle lock");
+            let mut health = self.health.lock().expect("client path health lock");
+            let record = health
+                .tcp
+                .get_mut(publication.path_index)
+                .expect("TCP carrier actor must have one health record");
+            record.install_tcp_peer_usage(
+                publication.path_id,
+                publication.path_instance_id,
+                publication.peer_usage_sequence,
+                publication.peer_usage,
+            );
+            publish_readiness();
         }
-        publish_readiness();
+        if let Some(readiness_rtt) = publication.readiness_rtt {
+            let _ = self.mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: publication.path_index,
+                },
+                |record| {
+                    record.mark_success_for_instance(publication.path_instance_id, readiness_rtt)
+                },
+            );
+        }
     }
 
     /// Commits a provisional TCP successor only while the predecessor still
@@ -140,28 +266,43 @@ impl ClientPathState {
         publication: ClientTcpCarrierPublication,
         publish_readiness: impl FnOnce(),
     ) -> bool {
-        let mut health = self.health.lock().expect("client path health lock");
-        if self.active_product_flows.load(Ordering::Relaxed) != 0 || !health.is_product_quiescent()
         {
-            return false;
+            let _lifecycle = self
+                .carrier_lifecycle
+                .lock()
+                .expect("client carrier lifecycle lock");
+            let mut health = self.health.lock().expect("client path health lock");
+            if self.active_product_flows.load(Ordering::Relaxed) != 0
+                || !health.is_product_quiescent()
+            {
+                return false;
+            }
+            let record = health
+                .tcp
+                .get_mut(publication.path_index)
+                .expect("TCP carrier actor must have one health record");
+            if !record.is_product_quiescent_for_instance(predecessor_instance_id) {
+                return false;
+            }
+            record.install_tcp_peer_usage(
+                publication.path_id,
+                publication.path_instance_id,
+                publication.peer_usage_sequence,
+                publication.peer_usage,
+            );
+            publish_readiness();
         }
-        let record = health
-            .tcp
-            .get_mut(publication.path_index)
-            .expect("TCP carrier actor must have one health record");
-        if !record.is_product_quiescent_for_instance(predecessor_instance_id) {
-            return false;
-        }
-        record.install_tcp_peer_usage(
-            publication.path_id,
-            publication.path_instance_id,
-            publication.peer_usage_sequence,
-            publication.peer_usage,
-        );
         if let Some(readiness_rtt) = publication.readiness_rtt {
-            record.mark_success(readiness_rtt);
+            let _ = self.mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: publication.path_index,
+                },
+                |record| {
+                    record.mark_success_for_instance(publication.path_instance_id, readiness_rtt)
+                },
+            );
         }
-        publish_readiness();
         true
     }
 
@@ -186,6 +327,10 @@ impl ClientPathState {
         index: usize,
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
         let mut health = self.health.lock().expect("client path health lock");
         if self.active_product_flows.load(Ordering::Relaxed) != 0 || !health.is_product_quiescent()
         {
@@ -268,6 +413,10 @@ impl ClientPathState {
         key: RelayPathKey,
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
         let now = Instant::now();
         let mut health = self.health.lock().expect("client path health lock");
         let has_schedulable_alternative = match key.underlay {
@@ -289,6 +438,10 @@ impl ClientPathState {
         key: RelayPathKey,
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
         let mut health = self.health.lock().expect("client path health lock");
         let Some(record) = health.path_record_mut(key) else {
             return false;
@@ -301,11 +454,35 @@ impl ClientPathState {
         key: RelayPathKey,
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
         let mut health = self.health.lock().expect("client path health lock");
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
         record.begin_planned_instance_retirement(path_instance_id)
+    }
+
+    /// Linearization point between an accepted Product value and physical
+    /// carrier replacement/failure. A successful return makes the accepted
+    /// value the durable owner; a later replacement is subsequent lifecycle,
+    /// not grounds for retroactively rejecting that value.
+    pub(in crate::runtime) fn try_commit_path_instance(
+        &self,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let _lifecycle = self
+            .carrier_lifecycle
+            .lock()
+            .expect("client carrier lifecycle lock");
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .path_record(key)
+            .is_some_and(|record| record.accepts_product_commit(path_instance_id))
     }
 
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_session(
@@ -542,12 +719,61 @@ impl ClientPathContext {
         self.state.health()
     }
 
-    pub(in crate::runtime) fn reserve_session_product_flow(&self) -> ClientSessionProductFlowLease {
-        self.state.acquire_product_flow();
-        ClientSessionProductFlowLease {
+    pub(in crate::runtime) fn session_retirement(&self) -> ClientSessionRetirement {
+        self.state.session_retirement()
+    }
+
+    pub(in crate::runtime) fn ensure_session_active(&self) -> Result<(), RuntimeError> {
+        self.state.session_lifecycle().ensure_active()
+    }
+
+    /// Completes one outward Product operation against the sticky SessionId
+    /// terminal. The first terminal reason owns a concurrently ready result and
+    /// is checked again after ordinary settlement.
+    pub(in crate::runtime) async fn complete_session_operation<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, RuntimeError>>,
+    ) -> Result<T, RuntimeError> {
+        let retirement = self.session_retirement();
+        let terminal = retirement.clone().wait();
+        tokio::pin!(terminal);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            reason = &mut terminal => Err(RuntimeError::RemoteClosed(reason)),
+            result = &mut operation => match retirement.reason() {
+                Some(reason) => Err(RuntimeError::RemoteClosed(reason)),
+                None => result,
+            },
+        }
+    }
+
+    pub(in crate::runtime) fn commit_if_session_active<T>(
+        &self,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, RuntimeError> {
+        self.state
+            .session_lifecycle()
+            .commit_if_active(commit)
+            .map_err(RuntimeError::RemoteClosed)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn retire_session(
+        &self,
+        reason: crate::protocol::CloseReason,
+    ) -> crate::protocol::CloseReason {
+        self.state.session_lifecycle().retire(reason)
+    }
+
+    pub(in crate::runtime) fn reserve_session_product_flow(
+        &self,
+    ) -> Result<ClientSessionProductFlowLease, RuntimeError> {
+        self.commit_if_session_active(|| self.state.acquire_product_flow())?;
+        Ok(ClientSessionProductFlowLease {
             state: self.state.clone(),
             tcp_carrier_groups: self.tcp_carrier_groups.clone(),
-        }
+        })
     }
 
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
@@ -645,32 +871,36 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn allocate_reliable_stream_id(&self) -> Result<StreamId, RuntimeError> {
-        let mut next = self
-            .state
-            .next_reliable_stream_id
-            .lock()
-            .expect("client reliable stream ID lock");
-        let stream_id = StreamId(*next);
-        *next = next
-            .checked_add(1)
-            .ok_or(RuntimeError::Protocol("reliable stream ID overflow"))?;
-        Ok(stream_id)
+        self.commit_if_session_active(|| {
+            let mut next = self
+                .state
+                .next_reliable_stream_id
+                .lock()
+                .expect("client reliable stream ID lock");
+            let stream_id = StreamId(*next);
+            *next = next
+                .checked_add(1)
+                .ok_or(RuntimeError::Protocol("reliable stream ID overflow"))?;
+            Ok(stream_id)
+        })?
     }
 
     /// Allocates one data-level flow identity shared by every carrier retry.
     pub(in crate::runtime) fn allocate_datagram_flow_id(
         &self,
     ) -> Result<DatagramFlowId, RuntimeError> {
-        let mut next = self
-            .state
-            .next_datagram_flow_id
-            .lock()
-            .expect("client datagram flow ID lock");
-        let flow_id = DatagramFlowId(*next);
-        *next = next
-            .checked_add(1)
-            .ok_or(RuntimeError::Protocol("datagram flow ID overflow"))?;
-        Ok(flow_id)
+        self.commit_if_session_active(|| {
+            let mut next = self
+                .state
+                .next_datagram_flow_id
+                .lock()
+                .expect("client datagram flow ID lock");
+            let flow_id = DatagramFlowId(*next);
+            *next = next
+                .checked_add(1)
+                .ok_or(RuntimeError::Protocol("datagram flow ID overflow"))?;
+            Ok(flow_id)
+        })?
     }
 
     /// Returns the only owner of the newly published scheduler load.
@@ -680,10 +910,14 @@ impl ClientPathContext {
         lane: TrafficClass,
     ) -> Option<RelayPathLoadLease> {
         let now = Instant::now();
-        if !self
-            .state
-            .mutate_path_eligibility(key, |record| record.reserve_load(lane, now))?
-        {
+        let reserved = self
+            .commit_if_session_active(|| {
+                self.state
+                    .mutate_path_eligibility(key, |record| record.reserve_load(lane, now))
+                    .unwrap_or(false)
+            })
+            .ok()?;
+        if !reserved {
             return None;
         }
         Some(RelayPathLoadLease::new(
@@ -737,17 +971,20 @@ impl ClientPathContext {
         path_instance_id: CarrierPathInstanceId,
         elapsed: Duration,
     ) -> bool {
-        self.state
-            .mutate_path_eligibility(
-                RelayPathKey {
-                    underlay: UnderlayProtocol::Tcp,
-                    index,
-                },
-                |current| {
-                    current.mark_reserved_open_success_for_instance(path_instance_id, elapsed)
-                },
-            )
-            .unwrap_or(false)
+        self.commit_if_session_active(|| {
+            self.state
+                .mutate_path_eligibility(
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index,
+                    },
+                    |current| {
+                        current.mark_reserved_open_success_for_instance(path_instance_id, elapsed)
+                    },
+                )
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -794,24 +1031,30 @@ impl ClientPathContext {
         }
     }
 
-    pub(in crate::runtime) fn mark_udp_stream_reserved_open_success(
+    pub(in crate::runtime) fn mark_udp_stream_reserved_open_success_for_instance(
         &self,
         index: usize,
+        path_instance_id: CarrierPathInstanceId,
         elapsed: Duration,
         accepted: bool,
-    ) {
+    ) -> bool {
         if !accepted {
-            return;
+            return false;
         }
-        let _ = self.state.mutate_path_eligibility(
-            RelayPathKey {
-                underlay: UnderlayProtocol::Udp,
-                index,
-            },
-            |current| {
-                current.mark_reserved_open_success(elapsed);
-            },
-        );
+        self.commit_if_session_active(|| {
+            self.state
+                .mutate_path_eligibility(
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Udp,
+                        index,
+                    },
+                    |current| {
+                        current.mark_reserved_open_success_for_instance(path_instance_id, elapsed)
+                    },
+                )
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
     }
 
     pub(in crate::runtime) fn mark_relay_path_data_plane_failure(&self, path: RelayPathInstance) {
@@ -1012,31 +1255,74 @@ impl ClientPathContext {
         }
     }
 
+    pub(in crate::runtime) fn mark_udp_path_reserved_open_success_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) -> bool {
+        self.state
+            .mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                |current| {
+                    current.mark_reserved_open_success_for_instance(path_instance_id, elapsed)
+                },
+            )
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_path_open_success(&self, index: usize, elapsed: Duration) {
-        let _ = self.state.mutate_path_eligibility(
-            RelayPathKey {
-                underlay: UnderlayProtocol::Udp,
-                index,
-            },
-            |current| {
-                current.mark_open_success(elapsed, TrafficClass::RealtimeDatagram);
-            },
-        );
+        let _ = self.commit_if_session_active(|| {
+            let _ = self.state.mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                |current| current.mark_open_success(elapsed, TrafficClass::RealtimeDatagram),
+            );
+        });
     }
 
+    pub(in crate::runtime) fn mark_udp_path_probe_success_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) -> bool {
+        self.state
+            .mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                |current| current.mark_success_for_instance(path_instance_id, elapsed),
+            )
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_path_probe_success(&self, index: usize, elapsed: Duration) {
-        let _ = self.state.mutate_path_eligibility(
-            RelayPathKey {
-                underlay: UnderlayProtocol::Udp,
-                index,
-            },
-            |current| {
-                current.mark_success(elapsed);
-            },
-        );
+        let _ = self.commit_if_session_active(|| {
+            let _ = self.state.mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                |current| current.mark_success(elapsed),
+            );
+        });
     }
 
-    pub(in crate::runtime) fn should_probe_udp_path(&self, index: usize) -> bool {
+    /// Returns the exact physical carrier observed at the probe decision, or
+    /// `None` inside `Some` when probing an endpoint without a carrier.
+    pub(in crate::runtime) fn udp_path_probe_expected_instance(
+        &self,
+        index: usize,
+    ) -> Option<Option<CarrierPathInstanceId>> {
         let now = Instant::now();
         self.state
             .mutate_path_eligibility(
@@ -1046,13 +1332,15 @@ impl ClientPathContext {
                 },
                 |record| {
                     record.maintain(now);
-                    !record.manual_disabled
-                        && path_observation_is_idle_for_probe(record.observation_at(now))
+                    (!record.manual_disabled
+                        && path_observation_is_idle_for_probe(record.observation_at(now)))
+                    .then(|| record.path_instance_id())
                 },
             )
-            .unwrap_or(false)
+            .flatten()
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn release_udp_path_load(&self, index: usize) {
         if let Some(current) = self
             .state
@@ -1066,6 +1354,31 @@ impl ClientPathContext {
         }
     }
 
+    pub(in crate::runtime) fn mark_udp_datagram_path_delivery_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        stats: PathDeliveryStats,
+    ) -> bool {
+        let Some(sample) = stats.rate_sample() else {
+            return false;
+        };
+        self.state
+            .mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                |current| {
+                    // Datagram goodput ranks datagram paths but never proves reliable
+                    // product ownership or unlocks ordered-stream overlap.
+                    current.mark_delivery_for_instance(path_instance_id, sample)
+                },
+            )
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_datagram_path_delivery(
         &self,
         index: usize,
@@ -1079,14 +1392,30 @@ impl ClientPathContext {
                 underlay: UnderlayProtocol::Udp,
                 index,
             },
-            |current| {
-                // Datagram goodput ranks datagram paths but never proves reliable
-                // product ownership or unlocks ordered-stream overlap.
-                current.mark_delivery(sample);
-            },
+            |current| current.mark_delivery(sample),
         );
     }
 
+    pub(in crate::runtime) fn mark_udp_path_feedback_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        observation: UdpDatagramPathObservation,
+    ) -> bool {
+        self.state
+            .mutate_path_eligibility(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                |current| {
+                    current.mark_udp_datagram_feedback_for_instance(path_instance_id, observation)
+                },
+            )
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_path_feedback(
         &self,
         index: usize,
@@ -1097,12 +1426,20 @@ impl ClientPathContext {
                 underlay: UnderlayProtocol::Udp,
                 index,
             },
-            |current| {
-                current.mark_udp_datagram_feedback(observation);
-            },
+            |current| current.mark_udp_datagram_feedback(observation),
         );
     }
 
+    pub(in crate::runtime) fn mark_udp_path_establishment_failure_if_current(
+        &self,
+        index: usize,
+        expected_path_instance_id: Option<CarrierPathInstanceId>,
+    ) -> bool {
+        self.state
+            .mark_udp_path_establishment_failure_if_current(index, expected_path_instance_id)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_path_failure(&self, index: usize) {
         let now = Instant::now();
         let mut health = self.state.health.lock().expect("client path health lock");

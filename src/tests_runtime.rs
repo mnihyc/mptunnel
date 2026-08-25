@@ -2,14 +2,16 @@ use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
 use crate::outbound::OutboundConfig;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
-use crate::protocol::{PathUsage, StreamDemandHint};
+use crate::protocol::{CloseReason, PathUsage, StreamDemandHint};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
     reliable_path_writer_frame_queue_for_payload,
     reliable_path_writer_should_coalesce_partial_bulk_run,
 };
-use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
+use crate::runtime::path::quic::server::{
+    accept_server_udp_path_handshake_for_test, bind_server_udp_endpoint, run_server_udp_listener,
+};
 use crate::runtime::path::{
     ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerLocalPath,
     ServerLocalPathProperties, ServerStreamOpenRequest, ServerStreamPathAttachment,
@@ -76,6 +78,67 @@ impl crate::transport::CarrierNetworkProvider for CountingCarrierNetworkProvider
             .lock()
             .expect("socket identities lock")
             .push(request.identity);
+        crate::transport::CarrierSocket::system(request)
+    }
+}
+
+struct GatedCarrierResolver {
+    blocked_path_ordinal: usize,
+    started: std::sync::atomic::AtomicBool,
+    started_notify: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl GatedCarrierResolver {
+    fn new(blocked_path_ordinal: usize) -> Self {
+        Self {
+            blocked_path_ordinal,
+            started: std::sync::atomic::AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_started(&self) {
+        while !self.started.load(std::sync::atomic::Ordering::Acquire) {
+            self.started_notify.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl crate::transport::CarrierNetworkProvider for GatedCarrierResolver {
+    fn resolve<'a>(
+        &'a self,
+        request: crate::transport::CarrierResolutionRequest<'a>,
+    ) -> crate::transport::CarrierResolutionFuture<'a> {
+        if request.identity.path_ordinal != self.blocked_path_ordinal {
+            return <crate::transport::SystemCarrierNetworkProvider as crate::transport::CarrierNetworkProvider>::resolve(
+                &crate::transport::SystemCarrierNetworkProvider,
+                request,
+            );
+        }
+        Box::pin(async move {
+            request.validate()?;
+            self.started
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.started_notify.notify_waiters();
+            self.release.notified().await;
+            <crate::transport::SystemCarrierNetworkProvider as crate::transport::CarrierNetworkProvider>::resolve(
+                &crate::transport::SystemCarrierNetworkProvider,
+                request,
+            )
+            .await
+        })
+    }
+
+    fn create_socket(
+        &self,
+        request: crate::transport::CarrierSocketRequest<'_>,
+    ) -> std::io::Result<crate::transport::CarrierSocket> {
         crate::transport::CarrierSocket::system(request)
     }
 }
@@ -573,6 +636,525 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
     (path, handle)
 }
 
+#[derive(Clone)]
+struct TcpSessionCloseControl {
+    send_close: Arc<tokio::sync::Notify>,
+    close_written: Arc<tokio::sync::Notify>,
+    release_server: Arc<tokio::sync::Notify>,
+}
+
+async fn spawn_tcp_session_close_controlled(
+    accept_stream: bool,
+) -> (
+    PathSpec,
+    TcpSessionCloseControl,
+    tokio::task::JoinHandle<Result<(), RuntimeError>>,
+) {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let control = TcpSessionCloseControl {
+        send_close: Arc::new(tokio::sync::Notify::new()),
+        close_written: Arc::new(tokio::sync::Notify::new()),
+        release_server: Arc::new(tokio::sync::Notify::new()),
+    };
+    let server_control = control.clone();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let security = server_security();
+        let mut framed = EncryptedFramedStream::accept(
+            stream,
+            &crate::transport::encrypted::test_server_tls_config(),
+            CodecLimits::default(),
+        )
+        .await?;
+        let transport_binding = framed.tcp_admission_binding()?;
+        let encoded = framed.read_tcp_admission().await?;
+        let authenticated = crate::runtime::path::tcp::admission::authenticate_prelude(
+            &security,
+            crate::runtime::path::authentication::ProductCredentialAdmission::from_security(
+                &security,
+            ),
+            &encoded,
+            &transport_binding,
+        )?
+        .ok_or(RuntimeError::Protocol("invalid TCP admission prelude"))?;
+        let joined = authenticated
+            .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
+            .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
+        let path_id = joined.path_id;
+        match framed.read_frame().await? {
+            Frame::PathStatus {
+                path_id: status_path_id,
+                sequence: 0,
+                ..
+            } if status_path_id == path_id => {}
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "invalid initial TCP path usage advertisement",
+                ));
+            }
+        }
+        framed.write_frame(&Frame::SessionReady).await?;
+        framed
+            .write_frame(&Frame::PathStatus {
+                path_id,
+                sequence: 0,
+                usage: PathUsage::Available,
+            })
+            .await?;
+        framed.flush().await?;
+
+        if accept_stream {
+            let stream_id = loop {
+                match framed.read_frame().await? {
+                    Frame::OpenStream { stream_id, .. } => break stream_id,
+                    Frame::PathMetrics { .. } => {}
+                    _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
+                }
+            };
+            framed
+                .write_frame(&Frame::StreamMaxData {
+                    stream_id,
+                    max_offset: ResourceLimits::default().max_stream_window_bytes,
+                })
+                .await?;
+            framed.flush().await?;
+        }
+
+        server_control.send_close.notified().await;
+        framed
+            .write_frame(&Frame::SessionClose {
+                reason: CloseReason::PolicyRejected,
+            })
+            .await?;
+        framed.flush().await?;
+        server_control.close_written.notify_one();
+        server_control.release_server.notified().await;
+        Ok(())
+    });
+    (path, control, handle)
+}
+
+async fn prepare_tcp_test_carrier(context: &ClientPathContext, path_index: usize) {
+    context.tcp_sessions[path_index]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("prepare controlled TCP carrier");
+}
+
+async fn wait_for_tcp_test_carrier_retirement(context: &ClientPathContext, path_index: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while context.tcp_sessions[path_index].is_connection_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TCP carrier retirement");
+}
+
+async fn publish_controlled_tcp_session_close(
+    context: &ClientPathContext,
+    control: &TcpSessionCloseControl,
+) {
+    control.send_close.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), control.close_written.notified())
+        .await
+        .expect("server writes authenticated SESSION_CLOSE");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), context.session_retirement().wait())
+            .await
+            .expect("client publishes sticky SESSION_CLOSE"),
+        CloseReason::PolicyRejected
+    );
+}
+
+fn set_tcp_test_path_latency(path: &mut PathSpec, initial_srtt_ms: u32) {
+    path.metadata.initial_srtt_ms = Some(initial_srtt_ms);
+    path.metadata.initial_rate = RateHint::BitsPerSecond(100_000_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_model_red_outward_tcp_open_prefers_sticky_session_terminal() {
+    let (path, server_control, server) = spawn_tcp_session_close_controlled(true).await;
+    let client =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let mut settlement = client.arm_reliable_tcp_settlement_test(0);
+    let open_context = client.clone();
+    let open = tokio::spawn(async move {
+        crate::runtime::relay::open::open_remote_stream(
+            &open_context,
+            TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
+            TrafficClass::Latency,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), settlement.wait_reached())
+        .await
+        .expect("accepted reliable Product reaches outward settlement");
+    publish_controlled_tcp_session_close(&client, &server_control).await;
+    settlement.release();
+    let result = tokio::time::timeout(Duration::from_secs(2), open)
+        .await
+        .expect("outward reliable open settles")
+        .expect("outward reliable task");
+    assert!(matches!(
+        result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    assert_eq!(client.reliable_selection_passes_for_test(), 1);
+    wait_for_tcp_test_carrier_retirement(&client, 0).await;
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+    assert_eq!(
+        client.health().lock().expect("path health").tcp[0].active_flows,
+        0
+    );
+
+    server_control.release_server.notify_one();
+    server
+        .await
+        .expect("controlled server task")
+        .expect("controlled server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_model_red_outward_tcp_open_does_not_retry_after_sticky_terminal() {
+    let (mut first_path, server_control, server) = spawn_tcp_session_close_controlled(true).await;
+    let mut unused_path = reserve_tcp_path().await;
+    set_tcp_test_path_latency(&mut first_path, 20);
+    set_tcp_test_path_latency(&mut unused_path, 400);
+    let client = ClientPathContext::new(
+        vec![first_path, unused_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let mut settlement = client.arm_reliable_tcp_settlement_test(0);
+    let open_context = client.clone();
+    let open = tokio::spawn(async move {
+        crate::runtime::relay::open::open_remote_stream(
+            &open_context,
+            TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
+            TrafficClass::Latency,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), settlement.wait_reached())
+        .await
+        .expect("first accepted open reaches outward settlement");
+    publish_controlled_tcp_session_close(&client, &server_control).await;
+    settlement.release();
+    let result = tokio::time::timeout(Duration::from_secs(2), open)
+        .await
+        .expect("outward reliable open settles")
+        .expect("outward reliable task");
+    assert!(matches!(
+        result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    assert_eq!(
+        client.reliable_selection_passes_for_test(),
+        1,
+        "sticky session retirement must prevent a second selection pass"
+    );
+    assert!(!client.tcp_sessions[1].is_connection_ready());
+    assert!(
+        client
+            .health()
+            .lock()
+            .expect("path health")
+            .tcp
+            .iter()
+            .all(|path| path.active_flows == 0)
+    );
+
+    server_control.release_server.notify_one();
+    server
+        .await
+        .expect("controlled server task")
+        .expect("controlled server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_outward_tcp_open_without_terminal_preserves_success() {
+    let (path, server_control, server) = spawn_tcp_session_close_controlled(true).await;
+    let client =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let mut settlement = client.arm_reliable_tcp_settlement_test(0);
+    let open_context = client.clone();
+    let open = tokio::spawn(async move {
+        crate::runtime::relay::open::open_remote_stream(
+            &open_context,
+            TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
+            TrafficClass::Latency,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), settlement.wait_reached())
+        .await
+        .expect("accepted open reaches outward settlement");
+    client
+        .ensure_session_active()
+        .expect("control session remains active");
+    settlement.release();
+    let opened = tokio::time::timeout(Duration::from_secs(2), open)
+        .await
+        .expect("outward reliable open settles")
+        .expect("outward reliable task")
+        .expect("no-terminal open succeeds");
+    assert_eq!(opened.path_index(), 0);
+    assert_eq!(client.reliable_selection_passes_for_test(), 1);
+    assert_eq!(
+        client.health().lock().expect("path health").tcp[0].active_flows,
+        1
+    );
+    opened.close().await;
+    assert_eq!(
+        client.health().lock().expect("path health").tcp[0].active_flows,
+        0
+    );
+
+    publish_controlled_tcp_session_close(&client, &server_control).await;
+    server_control.release_server.notify_one();
+    server
+        .await
+        .expect("controlled server task")
+        .expect("controlled server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_model_red_outward_tcp_datagram_prefers_sticky_session_terminal() {
+    let (path, server_control, server) = spawn_tcp_session_close_controlled(false).await;
+    let client =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let mut settlement = client.arm_tcp_datagram_settlement_test(0);
+    let mut association = DatagramClientAssociation::new(client.clone())
+        .await
+        .expect("datagram association");
+    let send = tokio::spawn(async move {
+        let result = association
+            .send_to_fresh_datagram_with_route_hint(
+                TargetAddr::Ip("127.0.0.1:9".parse().expect("target")),
+                Bytes::from_static(b"ping"),
+                2_000,
+                None,
+            )
+            .await;
+        (association, result)
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), settlement.wait_reached())
+        .await
+        .expect("accepted datagram attachment reaches outward settlement");
+    publish_controlled_tcp_session_close(&client, &server_control).await;
+    settlement.release();
+    let (association, result) = tokio::time::timeout(Duration::from_secs(2), send)
+        .await
+        .expect("outward datagram send settles")
+        .expect("outward datagram task");
+    assert!(matches!(
+        result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    assert_eq!(client.datagram_candidate_attempts_for_test(), 1);
+    assert!(association.next_retry_deadline().is_none());
+    assert!(!association.can_receive());
+    drop(association);
+    wait_for_tcp_test_carrier_retirement(&client, 0).await;
+    assert_eq!(
+        client.health().lock().expect("path health").tcp[0].active_flows,
+        0
+    );
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+
+    server_control.release_server.notify_one();
+    server
+        .await
+        .expect("controlled server task")
+        .expect("controlled server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_model_red_outward_tcp_datagram_does_not_retry_after_sticky_terminal() {
+    let (mut first_path, server_control, server) = spawn_tcp_session_close_controlled(false).await;
+    let mut unused_path = reserve_tcp_path().await;
+    set_tcp_test_path_latency(&mut first_path, 20);
+    set_tcp_test_path_latency(&mut unused_path, 400);
+    let client = ClientPathContext::new(
+        vec![first_path, unused_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let mut settlement = client.arm_tcp_datagram_settlement_test(0);
+    let mut association = DatagramClientAssociation::new(client.clone())
+        .await
+        .expect("datagram association");
+    let send = tokio::spawn(async move {
+        let result = association
+            .send_to_fresh_datagram_with_route_hint(
+                TargetAddr::Ip("127.0.0.1:9".parse().expect("target")),
+                Bytes::from_static(b"ping"),
+                3_000,
+                None,
+            )
+            .await;
+        (association, result)
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), settlement.wait_reached())
+        .await
+        .expect("first accepted attachment reaches outward settlement");
+    publish_controlled_tcp_session_close(&client, &server_control).await;
+    settlement.release();
+    let (association, result) = tokio::time::timeout(Duration::from_secs(2), send)
+        .await
+        .expect("outward datagram send settles")
+        .expect("outward datagram task");
+    assert!(matches!(
+        result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    assert_eq!(
+        client.datagram_candidate_attempts_for_test(),
+        1,
+        "sticky session retirement must prevent a second datagram candidate"
+    );
+    assert!(association.next_retry_deadline().is_none());
+    drop(association);
+    assert!(
+        client
+            .health()
+            .lock()
+            .expect("path health")
+            .tcp
+            .iter()
+            .all(|path| path.active_flows == 0)
+    );
+
+    server_control.release_server.notify_one();
+    server
+        .await
+        .expect("controlled server task")
+        .expect("controlled server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_outward_tcp_datagram_without_terminal_preserves_success() {
+    let (target_addr, target) = spawn_udp_echo_target().await;
+    let (path, server) = spawn_server_path(OutboundConfig::Direct).await;
+    let client =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let mut settlement = client.arm_tcp_datagram_settlement_test(0);
+    let mut association = DatagramClientAssociation::new(client.clone())
+        .await
+        .expect("datagram association");
+    let send = tokio::spawn(async move {
+        let result = association
+            .send_to_fresh_datagram_with_route_hint(
+                TargetAddr::Ip(target_addr),
+                Bytes::from_static(b"ping"),
+                2_000,
+                None,
+            )
+            .await;
+        (association, result)
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), settlement.wait_reached())
+        .await
+        .expect("accepted attachment reaches outward settlement");
+    client
+        .ensure_session_active()
+        .expect("control session remains active");
+    settlement.release();
+    let (mut association, result) = tokio::time::timeout(Duration::from_secs(5), send)
+        .await
+        .expect("outward datagram send settles")
+        .expect("outward datagram task");
+    result.expect("no-terminal datagram send succeeds");
+    assert_eq!(client.datagram_candidate_attempts_for_test(), 1);
+    target
+        .await
+        .expect("UDP target receives real Product datagram");
+    client
+        .ensure_session_active()
+        .expect("successful send keeps SessionId active");
+    let _ = association.close().await;
+    drop(association);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_outward_tcp_datagram_retries_after_native_carrier_loss() {
+    let (target_addr, target) = spawn_udp_echo_target().await;
+    let (mut first_path, _first_control, first_server) =
+        spawn_tcp_session_close_controlled(false).await;
+    let (mut second_path, second_server) = spawn_server_path(OutboundConfig::Direct).await;
+    set_tcp_test_path_latency(&mut first_path, 20);
+    set_tcp_test_path_latency(&mut second_path, 400);
+    second_path.metadata.policy.backup = true;
+    let client = ClientPathContext::new(
+        vec![first_path, second_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    prepare_tcp_test_carrier(&client, 1).await;
+    let mut settlement = client.arm_tcp_datagram_settlement_test(0);
+    let mut association = DatagramClientAssociation::new(client.clone())
+        .await
+        .expect("datagram association");
+    let send = tokio::spawn(async move {
+        let result = association
+            .send_to_fresh_datagram_with_route_hint(
+                TargetAddr::Ip(target_addr),
+                Bytes::from_static(b"ping"),
+                4_000,
+                None,
+            )
+            .await;
+        (association, result)
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), settlement.wait_reached())
+        .await
+        .expect("first accepted attachment reaches outward settlement");
+    first_server.abort();
+    let _ = first_server.await;
+    wait_for_tcp_test_carrier_retirement(&client, 0).await;
+    client
+        .ensure_session_active()
+        .expect("native carrier loss is not SESSION_CLOSE");
+    settlement.release();
+    let (mut association, result) = tokio::time::timeout(Duration::from_secs(5), send)
+        .await
+        .expect("two-attempt outward datagram send")
+        .expect("outward datagram task");
+    result.expect("second TCP carrier sends Product datagram");
+    assert_eq!(client.datagram_candidate_attempts_for_test(), 2);
+    target.await.expect("fallback UDP target receives datagram");
+    client
+        .ensure_session_active()
+        .expect("successful fallback keeps SessionId active");
+    let _ = association.close().await;
+    drop(association);
+
+    second_server.abort();
+    let _ = second_server.await;
+}
+
 async fn spawn_notified_server_path(
     path: PathSpec,
     marker: u8,
@@ -624,6 +1206,96 @@ async fn spawn_udp_server_path(
         }
     });
     (path, server)
+}
+
+async fn spawn_udp_server_path_with_resources(
+    outbound: OutboundConfig,
+    resources: ResourceLimits,
+) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    let path = reserve_udp_path().await;
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay,
+    } = new_identity_runtime(
+        Vec::new(),
+        outbound,
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        server_security(),
+        MppPerformanceConfig::default(),
+        resources,
+    );
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind udp path");
+    let local_path = ServerLocalPath::new(0, path.clone());
+    let server = tokio::spawn(async move {
+        tokio::select! {
+            result = run_server_udp_listener(endpoint, local_path, paths) => result,
+            result = reliable_relay.expect("L4 test server has a reliable relay").run() => result,
+        }
+    });
+    (path, server)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn datagram_product_open_deadline_does_not_fail_the_live_udp_carrier() {
+    let resources = ResourceLimits {
+        max_quic_concurrent_bidi_streams: 1,
+        ..ResourceLimits::default()
+    };
+    let (path, server) =
+        spawn_udp_server_path_with_resources(OutboundConfig::Direct, resources).await;
+    let context =
+        ClientPathContext::new(vec![path], security(), resources).expect("client path context");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+    let carrier_instance = context
+        .health()
+        .lock()
+        .expect("established carrier health")
+        .udp[0]
+        .path_instance_id()
+        .expect("control stream established the carrier");
+
+    let target = UdpSocket::bind("127.0.0.1:0").await.expect("UDP target");
+    let mut association = DatagramClientAssociation::new(context.clone())
+        .await
+        .expect("datagram association");
+    let started_at = tokio::time::Instant::now();
+    let error = association
+        .send_to_fresh_datagram_with_policy(
+            TargetAddr::Ip(target.local_addr().expect("UDP target address")),
+            Bytes::from_static(b"stream-credit deadline"),
+            100,
+            None,
+            TrafficClass::RealtimeDatagram,
+        )
+        .await
+        .expect_err("the sole QUIC bidi credit remains owned by the control stream");
+    assert!(matches!(error, RuntimeError::PathOpenTimedOut));
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "the operation-local Product deadline bounds outer association settlement",
+    );
+
+    {
+        let health = context.health().lock().expect("live carrier health");
+        let current = &health.udp[0];
+        assert_eq!(current.path_instance_id(), Some(carrier_instance));
+        assert_eq!(
+            current.state,
+            crate::scheduler::PathState::Active,
+            "Product stream-credit exhaustion is not evidence that the carrier failed",
+        );
+        assert_eq!(current.consecutive_failures, 0);
+        assert_eq!(
+            current.active_flows, 0,
+            "a cancelled Product open releases its key-scoped load lease",
+        );
+    }
+
+    association.close().await.expect("close association");
+    server.abort();
+    let _ = server.await;
 }
 
 async fn quic_admission_with_existing_registration(
@@ -694,6 +1366,596 @@ async fn quic_session_principal_rejection_precedes_readiness() {
         "different-principal carrier received readiness"
     );
     assert_eq!(peer_usage, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_model_red_quic_session_close_interrupts_a_sibling_in_flight_connect() {
+    let path = reserve_udp_path().await;
+    let provider = Arc::new(GatedCarrierResolver::new(1));
+    let client = ClientPathContext::new_with_carrier_network(
+        vec![
+            crate::config::ClientPathConfig {
+                name: "rejecting-path".to_string(),
+                tls: crate::transport::encrypted::test_client_tls_config(),
+                spec: path.clone(),
+                security: security(),
+            },
+            crate::config::ClientPathConfig {
+                name: "blocked-sibling".to_string(),
+                tls: crate::transport::encrypted::test_client_tls_config(),
+                spec: path.clone(),
+                security: security(),
+            },
+        ],
+        ResourceLimits::default(),
+        None,
+        0,
+        provider.clone(),
+    )
+    .expect("client context");
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay: _,
+    } = server_runtime(OutboundConfig::Direct);
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind terminal UDP endpoint");
+    let emit_close = Arc::new(tokio::sync::Notify::new());
+    let release_server = Arc::new(tokio::sync::Notify::new());
+    let server_emit_close = emit_close.clone();
+    let server_release = release_server.clone();
+    let server = tokio::spawn(async move {
+        let connection = endpoint
+            .accept_for_test()
+            .await
+            .ok_or(RuntimeError::Protocol("test QUIC endpoint closed"))?;
+        let (_registration, mut control_send, _control_recv) =
+            accept_server_udp_path_handshake_for_test(
+                &connection,
+                &ServerLocalPath::new(0, path),
+                &paths,
+            )
+            .await?;
+        server_emit_close.notified().await;
+        crate::runtime::path::quic::io::udp_path_write_frame(
+            &mut control_send,
+            &Frame::SessionClose {
+                reason: CloseReason::PolicyRejected,
+            },
+            paths.codec_limits,
+        )
+        .await?;
+        server_release.notified().await;
+        Ok::<(), RuntimeError>(())
+    });
+
+    client.udp_sessions[0]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .expect("establish authenticated carrier that can emit SESSION_CLOSE");
+
+    let blocked_session = client.udp_sessions[1].clone();
+    let mut blocked = tokio::spawn(async move {
+        blocked_session
+            .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.wait_started())
+        .await
+        .expect("sibling resolver entered its in-flight connect");
+
+    emit_close.notify_one();
+    let sibling_result = tokio::time::timeout(Duration::from_secs(1), &mut blocked)
+        .await
+        .expect("SESSION_CLOSE must cancel the sibling resolver")
+        .expect("sibling connect task");
+    assert!(matches!(
+        sibling_result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+
+    provider.release();
+    release_server.notify_one();
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn active_quic_in_flight_connect_remains_owned_until_its_resolver_releases() {
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
+    let provider = Arc::new(GatedCarrierResolver::new(0));
+    let client = ClientPathContext::new_with_carrier_network(
+        vec![crate::config::ClientPathConfig {
+            name: "gated-active-path".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: path,
+            security: security(),
+        }],
+        ResourceLimits::default(),
+        None,
+        0,
+        provider.clone(),
+    )
+    .expect("client context");
+    let session = client.udp_sessions[0].clone();
+    let mut preparing = tokio::spawn(async move {
+        session
+            .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), provider.wait_started())
+        .await
+        .expect("resolver gate entered");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut preparing)
+            .await
+            .is_err(),
+        "an active session must not cancel an in-flight connection"
+    );
+    client
+        .ensure_session_active()
+        .expect("session stays active");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+
+    provider.release();
+    preparing
+        .await
+        .expect("prepare task")
+        .expect("released active QUIC connection");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 1);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_model_red_tcp_session_close_interrupts_a_backpressured_ordered_writer() {
+    let (path, server_control, server) = spawn_tcp_session_close_controlled(true).await;
+    let resources = ResourceLimits::default();
+    let client = ClientPathContext::new(vec![path], security(), resources).expect("client context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let stream_id = StreamId(997);
+    let opened = client.tcp_sessions[0]
+        .open_stream_with_deadlines(
+            stream_id,
+            TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
+            TrafficClass::Throughput,
+            StreamDemandHint::Throughput,
+            crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            ),
+            resources.max_stream_window_bytes,
+        )
+        .await
+        .expect("open TCP product stream");
+    let max_frame_payload_bytes = opened.carrier.max_frame_payload_bytes;
+    let commands = opened.carrier.commands.clone();
+    let mut inbound_frames = opened.carrier.frames;
+    let flood_commands = commands.clone();
+    let flood = tokio::spawn(async move {
+        let payload = Bytes::from(vec![0x5a; max_frame_payload_bytes]);
+        while flood_commands
+            .send_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 0,
+                    payload: payload.clone(),
+                },
+                TrafficClass::Throughput,
+            )
+            .await
+            .is_ok()
+        {}
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !commands
+                .queue_snapshot()
+                .can_enqueue_lane(TrafficClass::Throughput)
+            {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                if !commands
+                    .queue_snapshot()
+                    .can_enqueue_lane(TrafficClass::Throughput)
+                {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TCP writer reaches sustained carrier backpressure");
+
+    server_control.send_close.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        server_control.close_written.notified(),
+    )
+    .await
+    .expect("server writes authenticated SESSION_CLOSE");
+    let reason = tokio::time::timeout(Duration::from_secs(1), client.session_retirement().wait())
+        .await
+        .expect("decoded SESSION_CLOSE must bypass the ordered writer barrier");
+    assert_eq!(reason, CloseReason::PolicyRejected);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), inbound_frames.recv())
+            .await
+            .expect("product stream receives terminal fanout"),
+        Some(Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected)))
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.tcp_sessions[0].is_connection_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal TCP actor withdraws readiness");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+    assert!(matches!(
+        client.tcp_sessions[0]
+            .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+
+    flood.abort();
+    let _ = flood.await;
+    server_control.release_server.notify_one();
+    server
+        .await
+        .expect("server task")
+        .expect("server SESSION_CLOSE schedule");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_model_red_tcp_queued_open_observes_sticky_session_terminal() {
+    let (path, server_control, server) = spawn_tcp_session_close_controlled(true).await;
+    let resources = ResourceLimits::default();
+    let client = ClientPathContext::new(vec![path], security(), resources).expect("client context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let active_stream_id = StreamId(1_001);
+    let opened = client.tcp_sessions[0]
+        .open_stream_with_deadlines(
+            active_stream_id,
+            TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
+            TrafficClass::Throughput,
+            StreamDemandHint::Throughput,
+            crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            ),
+            resources.max_stream_window_bytes,
+        )
+        .await
+        .expect("open first TCP product stream");
+    let max_frame_payload_bytes = opened.carrier.max_frame_payload_bytes;
+    let commands = opened.carrier.commands.clone();
+    let _inbound_frames = opened.carrier.frames;
+    let flood_commands = commands.clone();
+    let flood = tokio::spawn(async move {
+        let payload = Bytes::from(vec![0x7c; max_frame_payload_bytes]);
+        while flood_commands
+            .send_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id: active_stream_id,
+                    offset: 0,
+                    payload: payload.clone(),
+                },
+                TrafficClass::Throughput,
+            )
+            .await
+            .is_ok()
+        {}
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !commands
+                .queue_snapshot()
+                .can_enqueue_lane(TrafficClass::Throughput)
+            {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                if !commands
+                    .queue_snapshot()
+                    .can_enqueue_lane(TrafficClass::Throughput)
+                {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TCP writer reaches sustained carrier backpressure");
+
+    let queued_stream_id = StreamId(1_002);
+    let queued_session = client.tcp_sessions[0].clone();
+    let mut queued_open = tokio::spawn(async move {
+        queued_session
+            .open_stream_with_deadlines(
+                queued_stream_id,
+                TargetAddr::Ip("127.0.0.1:81".parse().expect("target")),
+                TrafficClass::Latency,
+                StreamDemandHint::Latency,
+                crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                ),
+                resources.max_stream_window_bytes,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !commands.open_stream_command_accepted_for_test(queued_stream_id)
+            || commands.control_queue_len_for_test() == 0
+        {
+            assert!(
+                !queued_open.is_finished(),
+                "second open completed before its command was accepted"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second OPEN_STREAM crosses the accepted-command boundary");
+
+    server_control.send_close.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        server_control.close_written.notified(),
+    )
+    .await
+    .expect("server writes authenticated SESSION_CLOSE");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), client.session_retirement().wait())
+            .await
+            .expect("reader publishes complete-session retirement"),
+        CloseReason::PolicyRejected
+    );
+    let queued_result = tokio::time::timeout(Duration::from_secs(1), &mut queued_open)
+        .await
+        .expect("queued open receives terminal settlement")
+        .expect("queued open task");
+    assert!(matches!(
+        queued_result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.tcp_sessions[0].is_connection_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal actor withdraws readiness after settling accepted work");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !commands.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal actor releases the accepted command queue");
+
+    flood.abort();
+    let _ = flood.await;
+    server_control.release_server.notify_one();
+    server
+        .await
+        .expect("server task")
+        .expect("server SESSION_CLOSE schedule");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_model_red_tcp_sibling_session_close_interrupts_a_backpressured_actor() {
+    let (blocked_path, blocked_control, blocked_server) =
+        spawn_tcp_session_close_controlled(true).await;
+    let (closing_path, closing_control, closing_server) =
+        spawn_tcp_session_close_controlled(false).await;
+    let resources = ResourceLimits::default();
+    let client = ClientPathContext::new(vec![blocked_path, closing_path], security(), resources)
+        .expect("two-carrier client context");
+    prepare_tcp_test_carrier(&client, 0).await;
+    let stream_id = StreamId(998);
+    let opened = client.tcp_sessions[0]
+        .open_stream_with_deadlines(
+            stream_id,
+            TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
+            TrafficClass::Throughput,
+            StreamDemandHint::Throughput,
+            crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            ),
+            resources.max_stream_window_bytes,
+        )
+        .await
+        .expect("open stream on carrier A");
+    client.tcp_sessions[1]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("prepare sibling carrier B");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 2);
+
+    let max_frame_payload_bytes = opened.carrier.max_frame_payload_bytes;
+    let commands = opened.carrier.commands.clone();
+    let mut inbound_frames = opened.carrier.frames;
+    let flood_commands = commands.clone();
+    let flood = tokio::spawn(async move {
+        let payload = Bytes::from(vec![0x6b; max_frame_payload_bytes]);
+        while flood_commands
+            .send_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 0,
+                    payload: payload.clone(),
+                },
+                TrafficClass::Throughput,
+            )
+            .await
+            .is_ok()
+        {}
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !commands
+                .queue_snapshot()
+                .can_enqueue_lane(TrafficClass::Throughput)
+            {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                if !commands
+                    .queue_snapshot()
+                    .can_enqueue_lane(TrafficClass::Throughput)
+                {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("carrier A reaches sustained writer backpressure");
+
+    closing_control.send_close.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        closing_control.close_written.notified(),
+    )
+    .await
+    .expect("carrier B writes authenticated SESSION_CLOSE");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), client.session_retirement().wait())
+            .await
+            .expect("carrier B publishes complete-session retirement"),
+        CloseReason::PolicyRejected
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), inbound_frames.recv())
+            .await
+            .expect("sibling terminal cancels carrier A Product owner"),
+        Some(Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected)))
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.tcp_sessions[0].is_connection_ready()
+            || client.tcp_sessions[1].is_connection_ready()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("complete-session retirement withdraws both TCP carriers");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+
+    flood.abort();
+    let _ = flood.await;
+    closing_control.release_server.notify_one();
+    closing_server
+        .await
+        .expect("closing server task")
+        .expect("closing carrier schedule");
+    blocked_server.abort();
+    let _ = blocked_server.await;
+    drop(blocked_control);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_native_carrier_loss_preserves_the_session_and_allows_reconnect() {
+    let (path, first_server) = spawn_server_path(OutboundConfig::Direct).await;
+    let client = ClientPathContext::new(vec![path.clone()], security(), ResourceLimits::default())
+        .expect("client context");
+    client.tcp_sessions[0]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("prepare first TCP carrier");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 1);
+
+    first_server.abort();
+    let _ = first_server.await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.tcp_sessions[0].is_connection_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native loss withdraws only the failed carrier");
+    client
+        .ensure_session_active()
+        .expect("native carrier loss is not SESSION_CLOSE");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 0);
+
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+    let replacement_server =
+        spawn_notified_server_path(path, 7, OutboundConfig::Direct, accepted_tx).await;
+    client.tcp_sessions[0]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("reconnect after carrier-local native loss");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+            .await
+            .expect("replacement accept timeout"),
+        Some(7)
+    );
+    client
+        .ensure_session_active()
+        .expect("replacement preserves the same active SessionId");
+    assert_eq!(client.authenticated_carriers.snapshot().live_count, 1);
+
+    replacement_server.abort();
+    let _ = replacement_server.await;
+}
+
+#[derive(Default)]
+struct UnexpectedPacketDeviceProvider {
+    open_count: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::platform::PacketDeviceProvider for UnexpectedPacketDeviceProvider {
+    fn open(
+        &self,
+        _config: &crate::platform::PacketDeviceConfig<'_>,
+    ) -> std::io::Result<crate::platform::PacketDevice> {
+        self.open_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Err(std::io::Error::other(
+            "terminal TUN startup must not open a packet device",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn terminal_tun_startup_refuses_before_packet_device_or_readiness_publication() {
+    let path = reserve_tcp_path().await;
+    let client = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+        .expect("client context");
+    client.retire_session(CloseReason::PolicyRejected);
+    let devices = Arc::new(UnexpectedPacketDeviceProvider::default());
+    let generation = crate::runtime::RuntimeGenerationControl::new();
+    let barrier = crate::runtime::readiness::RuntimeReadinessBarrier::new(generation.clone());
+    let readiness = barrier.require("terminal-tun-test");
+    barrier.seal();
+
+    let result = crate::runtime::tun_l3::run_client_tun_l3(
+        "terminal-tun".to_string(),
+        crate::ingress::TunL3IngressConfig {
+            outbound: crate::product::OutboundId::parse("terminal-tun").expect("outbound ID"),
+            interface_name: None,
+        },
+        client,
+        devices.clone(),
+        readiness,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
+    ));
+    assert_eq!(
+        devices
+            .open_count
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert!(!generation.is_ready());
 }
 
 #[tokio::test(flavor = "multi_thread")]

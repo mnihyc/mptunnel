@@ -2194,8 +2194,30 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
             .tls
             .shared_transport_secret_configured()
     );
+    assert_eq!(
+        reference
+            .product_policy
+            .as_ref()
+            .expect("reference Product policy")
+            .routes[0]
+            .action
+            .target_resolution(),
+        TargetResolutionMode::AsIs,
+    );
 
     let client = load(include_str!("../../examples/client.toml"));
+    assert_eq!(
+        client.management.listen,
+        ["127.0.0.1:7600"
+            .parse()
+            .expect("client management listener")]
+    );
+    assert_eq!(
+        client.management.token.as_deref(),
+        Some("operator-token-123")
+    );
+    assert!(client.management.dashboard);
+    assert!(!client.management.allow_peer_diagnostics);
     let CommandConfig::Node(client) = client.command;
     assert_eq!(client.forwarding_mode, ForwardingMode::L4);
     assert!(client.servers.is_empty());
@@ -2207,16 +2229,135 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
             .tls
             .shared_transport_secret_configured()
     );
+    assert!(matches!(
+        local_outbound(&client, "internal-direct"),
+        OutboundConfig::Direct
+    ));
+    let client_policy = client
+        .product_policy
+        .as_ref()
+        .expect("client Product policy");
+    assert_eq!(client_policy.routes.len(), 3);
+    let metadata_reject = &client_policy.routes[0];
+    assert_eq!(metadata_reject.id.as_str(), "reject-internal-metadata");
     assert_eq!(
-        client
-            .product_policy
-            .as_ref()
-            .expect("client Product policy")
-            .routes[0]
-            .action
-            .target_resolution(),
+        metadata_reject.matcher.destination_cidrs,
+        ["fd00:ec2::254/128"]
+            .into_iter()
+            .map(str::parse::<ipnet::IpNet>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("metadata reject CIDR"),
+    );
+    assert_eq!(
+        metadata_reject.matcher.inbounds,
+        [InboundId::parse("local-mixed").expect("client inbound")]
+    );
+    assert_eq!(
+        metadata_reject.action.disposition(),
+        RouteDisposition::Reject
+    );
+    assert!(metadata_reject.action.egress().is_none());
+    let internal_direct = &client_policy.routes[1];
+    assert_eq!(internal_direct.id.as_str(), "bypass-internal-literals");
+    assert_eq!(
+        internal_direct.matcher.destination_cidrs,
+        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+            .into_iter()
+            .map(str::parse::<ipnet::IpNet>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("internal bypass CIDRs"),
+    );
+    assert_eq!(
+        internal_direct.matcher.inbounds,
+        [InboundId::parse("local-mixed").expect("client inbound")]
+    );
+    assert_eq!(
+        internal_direct.action.disposition(),
+        RouteDisposition::AllowRestricted
+    );
+    assert!(matches!(
+        internal_direct.action.egress(),
+        Some(EgressAction::Outbound(outbound)) if outbound.as_str() == "internal-direct"
+    ));
+    let mpp_default = &client_policy.routes[2];
+    assert_eq!(mpp_default.id.as_str(), "default");
+    assert!(mpp_default.matcher.is_catch_all());
+    assert_eq!(mpp_default.action.disposition(), RouteDisposition::Allow);
+    assert!(matches!(
+        mpp_default.action.egress(),
+        Some(EgressAction::Outbound(outbound)) if outbound.as_str() == "remote-mpp"
+    ));
+    assert_eq!(
+        metadata_reject.action.target_resolution(),
         TargetResolutionMode::AsIs,
     );
+    assert_eq!(
+        internal_direct.action.target_resolution(),
+        TargetResolutionMode::AsIs,
+    );
+    assert_eq!(
+        mpp_default.action.target_resolution(),
+        TargetResolutionMode::AsIs,
+    );
+    let compiled_client_policy = client_policy.compile().expect("compiled client policy");
+    for (index, target) in ["10.1.2.3", "172.16.1.2", "192.168.1.10", "fd00::10"]
+        .into_iter()
+        .enumerate()
+    {
+        let literal_internal_flow = FlowContext::new(
+            Network::Tcp,
+            ProtocolTarget::from_host_port(target, 443).expect("literal internal target"),
+            SourceEndpoint::new(
+                "127.0.0.1".parse().expect("client source"),
+                40_000 + u16::try_from(index).expect("small bypass sample index"),
+            ),
+            PrincipalId::parse("anonymous").expect("client principal"),
+            InboundId::parse("local-mixed").expect("client inbound"),
+        );
+        let literal_internal = compiled_client_policy
+            .routes()
+            .classify(RouteInput::pre_resolution(&literal_internal_flow));
+        assert_eq!(
+            literal_internal.rule_id().as_str(),
+            "bypass-internal-literals"
+        );
+        assert_eq!(
+            literal_internal.action().disposition(),
+            RouteDisposition::AllowRestricted
+        );
+    }
+    let metadata_flow = FlowContext::new(
+        Network::Tcp,
+        ProtocolTarget::from_host_port("fd00:ec2::254", 80).expect("metadata target"),
+        SourceEndpoint::new("127.0.0.1".parse().expect("client source"), 40_010),
+        PrincipalId::parse("anonymous").expect("client principal"),
+        InboundId::parse("local-mixed").expect("client inbound"),
+    );
+    let metadata = compiled_client_policy
+        .routes()
+        .classify(RouteInput::pre_resolution(&metadata_flow));
+    assert_eq!(metadata.rule_id().as_str(), "reject-internal-metadata");
+    assert_eq!(metadata.action().disposition(), RouteDisposition::Reject);
+    assert!(metadata.action().egress().is_none());
+    let hostname_flow = FlowContext::new(
+        Network::Tcp,
+        ProtocolTarget::from_host_port("router.home.arpa", 443).expect("hostname target"),
+        SourceEndpoint::new("127.0.0.1".parse().expect("client source"), 40_001),
+        PrincipalId::parse("anonymous").expect("client principal"),
+        InboundId::parse("local-mixed").expect("client inbound"),
+    );
+    let hostname = compiled_client_policy
+        .evaluate_pre_resolution_shared(std::sync::Arc::new(hostname_flow))
+        .expect("AsIs hostname decision");
+    assert!(!hostname.requires_post_resolution());
+    assert_eq!(hostname.permit().rule_id().as_str(), "default");
+    assert!(matches!(
+        hostname.permit().action().egress(),
+        Some(EgressAction::Outbound(outbound)) if outbound.as_str() == "remote-mpp"
+    ));
+    compiled_client_policy
+        .authorize_domain(hostname)
+        .expect("AsIs hostname remains delegable to MPP");
 
     let server = load(include_str!("../../examples/server.toml"));
     let CommandConfig::Node(server) = server.command;
@@ -2228,6 +2369,16 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     assert_eq!(server.servers[0].paths.len(), 2);
     assert!(server.servers[0].tls.shared_transport_secret_configured());
     assert!(mpp_outbounds(&server).is_empty());
+    assert_eq!(
+        server
+            .product_policy
+            .as_ref()
+            .expect("server Product policy")
+            .routes[0]
+            .action
+            .target_resolution(),
+        TargetResolutionMode::FullResolve,
+    );
 }
 
 #[test]

@@ -211,11 +211,17 @@ async fn run_client_tcp_path_session_inner(
     let drain_signal = commands.path_drain_signal();
     let drain_requested = drain_signal.wait();
     tokio::pin!(drain_requested);
+    let session_closed = runtime.state.session_retirement().wait();
+    tokio::pin!(session_closed);
 
     loop {
         if state.connection.is_none() {
             tokio::select! {
                 biased;
+                _reason = &mut session_closed => {
+                    actor_terminal.finish();
+                    return;
+                }
                 _ = &mut drain_requested => {
                     commands.close_for_path_drain();
                     while let Some(command) =
@@ -301,6 +307,22 @@ async fn run_client_tcp_path_session_inner(
             .expect("checked connected TCP path session");
         tokio::select! {
             biased;
+            reason = &mut session_closed => {
+                let error = RuntimeError::RemoteClosed(reason);
+                fail_client_tcp_products(
+                    &mut state.streams,
+                    &mut state.datagrams,
+                    &error,
+                    &runtime,
+                );
+                retire_failed_client_tcp_connection(
+                    &runtime,
+                    &mut state,
+                    &mut carrier_readiness,
+                );
+                actor_terminal.finish();
+                return;
+            }
             _ = &mut drain_requested, if !draining => {
                 if drain_signal.is_terminal() {
                     let error = RuntimeError::ReliablePathSessionClosed;
@@ -308,6 +330,7 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         &error,
+                        &runtime,
                     );
                     retire_failed_client_tcp_connection(
                         &runtime,
@@ -352,7 +375,12 @@ async fn run_client_tcp_path_session_inner(
                     &mut state.streams,
                     &mut state.closed_streams,
                 ).await {
-                    fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                    fail_client_tcp_products(
+                        &mut state.streams,
+                        &mut state.datagrams,
+                        &err,
+                        &runtime,
+                    );
                     crate::observability::process_event!(
                         Warn,
                         "tcp",
@@ -375,7 +403,12 @@ async fn run_client_tcp_path_session_inner(
                     }
                     .await;
                     if let Err(err) = result {
-                        fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                        fail_client_tcp_products(
+                            &mut state.streams,
+                            &mut state.datagrams,
+                            &err,
+                            &runtime,
+                        );
                         crate::observability::process_event!(
                             Warn,
                             "tcp",
@@ -423,7 +456,12 @@ async fn run_client_tcp_path_session_inner(
                             .await,
                         };
                         if let Err(err) = result {
-                            fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                            fail_client_tcp_products(
+                                &mut state.streams,
+                                &mut state.datagrams,
+                                &err,
+                                &runtime,
+                            );
                             crate::observability::process_event!(
                                 Warn,
                                 "tcp",
@@ -451,7 +489,12 @@ async fn run_client_tcp_path_session_inner(
                             )
                             .await;
                             if let Err(err) = result {
-                                fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                                fail_client_tcp_products(
+                                    &mut state.streams,
+                                    &mut state.datagrams,
+                                    &err,
+                                    &runtime,
+                                );
                                 crate::observability::process_event!(
                                     Warn,
                                     "tcp",
@@ -466,7 +509,12 @@ async fn run_client_tcp_path_session_inner(
                     }
                     Some(Err(err)) => {
                         let err = RuntimeError::Encrypted(err);
-                        fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                        fail_client_tcp_products(
+                            &mut state.streams,
+                            &mut state.datagrams,
+                            &err,
+                            &runtime,
+                        );
                         crate::observability::process_event!(
                             Warn,
                             "tcp",
@@ -479,7 +527,12 @@ async fn run_client_tcp_path_session_inner(
                     }
                     None => {
                         let err = RuntimeError::ReliablePathSessionClosed;
-                        fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                        fail_client_tcp_products(
+                            &mut state.streams,
+                            &mut state.datagrams,
+                            &err,
+                            &runtime,
+                        );
                         drop_connection = true;
                     }
                 }
@@ -525,7 +578,12 @@ async fn run_client_tcp_path_session_inner(
                             .await
                         };
                         if let Err(err) = result {
-                            fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                            fail_client_tcp_products(
+                                &mut state.streams,
+                                &mut state.datagrams,
+                                &err,
+                                &runtime,
+                            );
                             crate::observability::process_event!(
                                 Warn,
                                 "tcp",
@@ -551,7 +609,12 @@ async fn run_client_tcp_path_session_inner(
             _ = &mut heartbeat_timer, if !request_probe_pending && !draining => {
                 if let Err(err) = connection.carrier.tick_heartbeat().await
                 {
-                    fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
+                    fail_client_tcp_products(
+                        &mut state.streams,
+                        &mut state.datagrams,
+                        &err,
+                        &runtime,
+                    );
                     crate::observability::process_event!(
                         Warn,
                         "tcp",
@@ -583,8 +646,10 @@ async fn run_client_tcp_path_session_inner(
                 Ok(result) => result,
                 Err(_) => Err(RuntimeError::ReliablePathSessionClosed),
             };
+            let planned_retirement_completed =
+                drain_result.is_ok() && commands.finish_planned_path_retirement();
             match &drain_result {
-                Ok(()) => {
+                Ok(()) if planned_retirement_completed => {
                     runtime.state.retire_path_instance_planned(
                         RelayPathKey {
                             underlay: UnderlayProtocol::Tcp,
@@ -596,17 +661,34 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         &RuntimeError::ReliablePathRetired,
+                        &runtime,
+                    );
+                }
+                Ok(()) => {
+                    // Another exact lifecycle owner made failure terminal
+                    // before ordered PATH_CLOSE completed. First terminal
+                    // publication wins; do not relabel it as planned drain.
+                    fail_client_tcp_products(
+                        &mut state.streams,
+                        &mut state.datagrams,
+                        &RuntimeError::ReliablePathSessionClosed,
+                        &runtime,
                     );
                 }
                 Err(error) => {
-                    fail_client_tcp_products(&mut state.streams, &mut state.datagrams, error);
+                    fail_client_tcp_products(
+                        &mut state.streams,
+                        &mut state.datagrams,
+                        error,
+                        &runtime,
+                    );
                 }
             }
             assert!(
                 state.streams.is_empty() && state.datagrams.is_empty(),
                 "terminal TCP path drain transfers or releases every Product attachment"
             );
-            if drain_result.is_err() {
+            if !planned_retirement_completed {
                 retire_failed_client_tcp_connection(&runtime, &mut state, &mut carrier_readiness);
             } else {
                 state.connection = None;
@@ -857,7 +939,7 @@ async fn apply_client_tcp_drain_frame(
         } if close_path_id != connection.carrier.path_id => Err(RuntimeError::Protocol(
             "TCP path close acknowledgment path mismatch",
         )),
-        Frame::PathClose { reason, .. } => Err(RuntimeError::RemoteClosed(reason)),
+        Frame::PathClose { reason, .. } => Err(RuntimeError::RemotePathClosed(reason)),
         Frame::PathDrain { .. } => Err(RuntimeError::Protocol(
             "TCP client received peer path drain request",
         )),
@@ -971,7 +1053,7 @@ async fn handle_disconnected_client_tcp_command(
                         Some(readiness_rtt),
                     ) {
                         state.connection = None;
-                        let _ = response.send(Err(RuntimeError::NoSchedulableTcpPath));
+                        let _ = response.send(Err(client_tcp_publication_refusal(runtime)));
                         return;
                     }
                     let _ = response.send(Ok(Some(readiness_rtt)));
@@ -1039,7 +1121,7 @@ async fn handle_disconnected_client_tcp_command(
                     ) {
                         state.connection = None;
                         let _ = response.send(ClientTcpOpenResponse::RejectedWithoutOpen(
-                            RuntimeError::NoSchedulableTcpPath,
+                            client_tcp_publication_refusal(runtime),
                         ));
                         return;
                     }
@@ -1132,7 +1214,7 @@ async fn handle_disconnected_client_tcp_command(
                     ) {
                         state.connection = None;
                         state.datagrams.remove_attachment(attachment_id);
-                        let _ = response.send(Err(RuntimeError::NoSchedulableTcpPath));
+                        let _ = response.send(Err(client_tcp_publication_refusal(runtime)));
                         return;
                     }
                     let connection = state
@@ -1185,7 +1267,14 @@ fn fail_client_tcp_products(
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     datagrams: &mut ClientTcpDatagramState,
     error: &RuntimeError,
+    runtime: &ClientTcpPathSessionRuntime,
 ) {
+    let terminal_error = runtime
+        .state
+        .session_lifecycle()
+        .reason()
+        .map(RuntimeError::RemoteClosed);
+    let error = terminal_error.as_ref().unwrap_or(error);
     fail_client_tcp_streams(streams, error);
     datagrams.clear();
 }
@@ -1218,6 +1307,7 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
     open_deadline: tokio::time::Instant,
     endpoint_generation: u64,
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
+    runtime.state.session_lifecycle().ensure_active()?;
     if !runtime.endpoint_policy.allows(endpoint_generation) {
         return Err(RuntimeError::NoSchedulableTcpPath);
     }
@@ -1236,6 +1326,7 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
             codec_limits: runtime.codec_limits,
             mux_limits: runtime.mux_limits,
             carrier_network: runtime.carrier_network.as_ref(),
+            session_lifecycle: runtime.state.session_lifecycle().clone(),
             remote_port: runtime.remote_port,
         },
         open_deadline,
@@ -1244,15 +1335,31 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
     let mut policy_changes = runtime.endpoint_policy.subscribe();
     let policy_changed = wait_for_endpoint_policy_change(&mut policy_changes, endpoint_generation);
     tokio::pin!(policy_changed);
-    let carrier = tokio::select! {
+    let session_closed = runtime.state.session_retirement().wait();
+    tokio::pin!(session_closed);
+    let carrier_result = tokio::select! {
         biased;
+        reason = &mut session_closed => return Err(RuntimeError::RemoteClosed(reason)),
         _ = &mut policy_changed => return Err(RuntimeError::NoSchedulableTcpPath),
-        result = &mut connect => result?,
+        result = &mut connect => result,
+    };
+    let carrier = match carrier_result {
+        Ok(carrier) => carrier,
+        Err(RuntimeError::RemoteClosed(reason)) => {
+            let reason = runtime.state.session_lifecycle().retire(reason);
+            return Err(RuntimeError::RemoteClosed(reason));
+        }
+        Err(error) => return Err(error),
     };
     debug_assert_eq!(carrier.path_id, path_id);
     let path_instance_id = next_carrier_path_instance_id();
     startup_snapshot.peer_usage = Some(carrier.peer_usage);
-    let peer_status = runtime.peer_status.register(runtime.session_id);
+    let peer_status = runtime.peer_status.register_path(
+        runtime.session_id,
+        UnderlayProtocol::Tcp,
+        path_id,
+        runtime.path_index,
+    );
     Ok(ClientTcpPathConnection::new(
         path_instance_id,
         startup_snapshot,
@@ -1271,22 +1378,34 @@ fn publish_client_tcp_connection(
     readiness_rtt: Option<Duration>,
 ) -> bool {
     runtime
-        .endpoint_policy
-        .with_current(endpoint_generation, || {
-            let connection = state
-                .connection
-                .as_mut()
-                .expect("TCP readiness requires an actor-owned connection");
-            publish_client_tcp_connection_committed(
-                runtime,
-                connection,
-                readiness_rtt,
-                |path_instance_id, remote_port| {
-                    carrier_readiness.publish(path_instance_id, remote_port);
-                },
-            );
+        .state
+        .session_lifecycle()
+        .commit_if_active(|| {
+            runtime
+                .endpoint_policy
+                .with_current(endpoint_generation, || {
+                    let connection = state
+                        .connection
+                        .as_mut()
+                        .expect("TCP readiness requires an actor-owned connection");
+                    publish_client_tcp_connection_committed(
+                        runtime,
+                        connection,
+                        readiness_rtt,
+                        |path_instance_id, remote_port| {
+                            carrier_readiness.publish(path_instance_id, remote_port);
+                        },
+                    );
+                })
         })
-        .is_some()
+        .is_ok_and(|publication| publication.is_some())
+}
+
+fn client_tcp_publication_refusal(runtime: &ClientTcpPathSessionRuntime) -> RuntimeError {
+    runtime.state.session_lifecycle().reason().map_or(
+        RuntimeError::NoSchedulableTcpPath,
+        RuntimeError::RemoteClosed,
+    )
 }
 
 pub(in crate::runtime::path::tcp) fn publish_client_tcp_connection_committed(

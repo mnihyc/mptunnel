@@ -6,7 +6,7 @@ use crate::product::{InboundId, PrincipalId};
 use crate::protocol::TargetAddr;
 use crate::runtime::datagram::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, remove_udp_edge_lane,
+    dispatch_udp_edge_request, finish_udp_edge_completion, reap_finished_udp_edge_lane_instance,
     udp_edge_completion_queue,
 };
 use crate::runtime::error::RuntimeError;
@@ -600,11 +600,11 @@ async fn handle_tun_udp_flow(
                             .map_err(|_| RuntimeError::Protocol("TUN UDP response channel closed"))?;
                     }
                     UdpEdgeCompletion::Sent {
-                        metadata,
-                        result: Err(RuntimeError::OutboundUnavailable(_)),
+                        lane_id,
+                        result: Err(error),
                         ..
-                    } => {
-                        remove_udp_edge_lane(&mut lanes, &metadata);
+                    } if matches!(error.as_ref(), RuntimeError::OutboundUnavailable(_)) => {
+                        let _ = reap_finished_udp_edge_lane_instance(&mut lanes, lane_id);
                     }
                     UdpEdgeCompletion::Sent {
                         metadata,

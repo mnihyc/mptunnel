@@ -4,7 +4,7 @@
 //! carrier, correlates one request per session, and caches the latest result.
 
 use crate::protocol::codec::{CodecLimits, peer_status_response_path_limit};
-use crate::protocol::{Frame, PeerPathStatus, PeerStatusCode, SessionId};
+use crate::protocol::{Frame, PathId, PeerPathStatus, PeerStatusCode, SessionId, UnderlayProtocol};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -20,7 +20,22 @@ pub(in crate::runtime) struct PeerStatusResult {
     pub(in crate::runtime) request_id: u64,
     pub(in crate::runtime) code: PeerStatusCode,
     pub(in crate::runtime) paths: Vec<PeerPathStatus>,
+    /// Endpoint-local identities captured with this exact response. Keeping
+    /// them on the result prevents later authenticated PathId reuse from
+    /// relabeling cached diagnostics.
+    pub(in crate::runtime) local_path_indices: BTreeMap<(UnderlayProtocol, PathId), usize>,
     pub(in crate::runtime) received_at: SystemTime,
+}
+
+impl PeerStatusResult {
+    #[cfg(test)]
+    pub(in crate::runtime) fn local_path_index(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+    ) -> Option<usize> {
+        self.local_path_indices.get(&(underlay, path_id)).copied()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,11 +84,21 @@ struct PeerStatusBrokerState {
 struct PeerStatusSession {
     allow_incoming: bool,
     carriers: BTreeMap<u64, mpsc::Sender<u64>>,
+    // Endpoint-local correlation only. The peer returns opaque wire PathIds;
+    // management may map them back to the local configured path that admitted
+    // the authenticated carrier without putting names or endpoints on wire.
+    local_path_assignments: BTreeMap<(UnderlayProtocol, PathId), LocalPathAssignment>,
     preferred_registration: Option<u64>,
     last_attempted_registration: Option<u64>,
     last_incoming_response_at: Option<Instant>,
     pending: Option<PendingPeerStatusRequest>,
     latest: Option<PeerStatusResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalPathAssignment {
+    local_path_index: usize,
+    registration_id: u64,
 }
 
 #[derive(Debug)]
@@ -87,6 +112,7 @@ pub(in crate::runtime) struct PeerStatusCarrier {
     broker: PeerStatusBroker,
     session_id: SessionId,
     registration_id: u64,
+    local_path_identity: Option<(UnderlayProtocol, PathId)>,
     requests: mpsc::Receiver<u64>,
 }
 
@@ -177,21 +203,70 @@ impl PeerStatusBroker {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn register(&self, session_id: SessionId) -> PeerStatusCarrier {
         self.register_with_incoming(session_id, false)
     }
 
+    pub(in crate::runtime) fn register_path(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        local_path_index: usize,
+    ) -> PeerStatusCarrier {
+        self.register_path_with_incoming(session_id, underlay, path_id, local_path_index, false)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn register_with_incoming(
         &self,
         session_id: SessionId,
         allow_incoming: bool,
     ) -> PeerStatusCarrier {
+        self.register_inner(session_id, allow_incoming, None)
+    }
+
+    pub(in crate::runtime) fn register_path_with_incoming(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        local_path_index: usize,
+        allow_incoming: bool,
+    ) -> PeerStatusCarrier {
+        self.register_inner(
+            session_id,
+            allow_incoming,
+            Some(((underlay, path_id), local_path_index)),
+        )
+    }
+
+    fn register_inner(
+        &self,
+        session_id: SessionId,
+        allow_incoming: bool,
+        local_path: Option<((UnderlayProtocol, PathId), usize)>,
+    ) -> PeerStatusCarrier {
         let (requests, requests_rx) = mpsc::channel(PEER_STATUS_COMMAND_CAPACITY);
+        let local_path_identity = local_path.map(|(identity, _)| identity);
         let registration_id = {
             let mut state = self.inner.state.lock().expect("peer status broker lock");
             let registration_id = next_nonzero(&mut state.next_registration_id);
             let session = state.sessions.entry(session_id).or_default();
             session.allow_incoming |= allow_incoming;
+            if let Some((identity, local_path_index)) = local_path {
+                // Only successful carrier authentication installs or replaces
+                // a live assignment. Completed response objects snapshot the
+                // then-current value, so this reuse cannot relabel cached data.
+                session.local_path_assignments.insert(
+                    identity,
+                    LocalPathAssignment {
+                        local_path_index,
+                        registration_id,
+                    },
+                );
+            }
             session.carriers.insert(registration_id, requests);
             registration_id
         };
@@ -199,8 +274,26 @@ impl PeerStatusBroker {
             broker: self.clone(),
             session_id,
             registration_id,
+            local_path_identity,
             requests: requests_rx,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn local_path_index(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+    ) -> Option<usize> {
+        self.inner
+            .state
+            .lock()
+            .expect("peer status broker lock")
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.local_path_assignments.get(&(underlay, path_id)))
+            .map(|assignment| assignment.local_path_index)
     }
 
     pub(in crate::runtime) fn session_ids(&self) -> Vec<SessionId> {
@@ -292,11 +385,22 @@ impl PeerStatusBroker {
             return false;
         };
         session.preferred_registration = Some(pending.registration_id);
+        let local_path_indices = paths
+            .iter()
+            .filter_map(|path| {
+                let identity = (path.metrics.underlay, path.metrics.path_id);
+                session
+                    .local_path_assignments
+                    .get(&identity)
+                    .map(|assignment| (identity, assignment.local_path_index))
+            })
+            .collect();
         let result = PeerStatusResult {
             session_id,
             request_id,
             code,
             paths,
+            local_path_indices,
             received_at: SystemTime::now(),
         };
         session.latest = Some(result.clone());
@@ -334,10 +438,23 @@ impl PeerStatusBroker {
                 .is_some_and(|session| session.allow_incoming)
     }
 
-    fn unregister(&self, session_id: SessionId, registration_id: u64) {
+    fn unregister(
+        &self,
+        session_id: SessionId,
+        registration_id: u64,
+        local_path_identity: Option<(UnderlayProtocol, PathId)>,
+    ) {
         let mut state = self.inner.state.lock().expect("peer status broker lock");
         let remove_session = if let Some(session) = state.sessions.get_mut(&session_id) {
             session.carriers.remove(&registration_id);
+            if let Some(identity) = local_path_identity
+                && session
+                    .local_path_assignments
+                    .get(&identity)
+                    .is_some_and(|assignment| assignment.registration_id == registration_id)
+            {
+                session.local_path_assignments.remove(&identity);
+            }
             if session.preferred_registration == Some(registration_id) {
                 session.preferred_registration = None;
             }
@@ -420,8 +537,11 @@ impl PeerStatusCarrier {
 
 impl Drop for PeerStatusCarrier {
     fn drop(&mut self) {
-        self.broker
-            .unregister(self.session_id, self.registration_id);
+        self.broker.unregister(
+            self.session_id,
+            self.registration_id,
+            self.local_path_identity,
+        );
     }
 }
 

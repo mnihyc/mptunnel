@@ -103,10 +103,12 @@ impl ServerReliableRelayService {
     pub(in crate::runtime) fn new(
         context: ServerReliableRelayContext,
     ) -> (Arc<ServerReliableStreamRegistry>, Self) {
-        let (registry, accepted) = ServerReliableStreamRegistry::new_accepting_with_limits(
-            context.mux_limits,
-            context.max_paths_per_session,
-        );
+        let (registry, accepted) =
+            ServerReliableStreamRegistry::new_accepting_with_limits_and_retention(
+                context.mux_limits,
+                context.max_paths_per_session,
+                context.session_retention_timeout,
+            );
         let context = Arc::new(context);
         (registry, Self { context, accepted })
     }
@@ -131,10 +133,21 @@ impl ServerReliableRelayService {
                             "server reliable stream accept service closed",
                         ));
                     };
+                    let session_retirement = match accepted.session_retirement() {
+                        Ok(retirement) => retirement,
+                        Err(_) => {
+                            accepted.close().await;
+                            continue;
+                        }
+                    };
                     let retirement = accepted.supervise();
                     let context = self.context.clone();
                     let task = relays.spawn(async move {
-                        relay_accepted_stream(context, accepted).await
+                        tokio::select! {
+                            biased;
+                            _ = session_retirement.wait() => Ok(()),
+                            result = relay_accepted_stream(context, accepted) => result,
+                        }
                     });
                     let replaced = retirements.insert(task.id(), retirement);
                     debug_assert!(replaced.is_none());
@@ -204,10 +217,14 @@ async fn relay_accepted_stream(
     let session_id = accepted.session_id();
     let stream_id = accepted.stream().stream_id;
     let target = accepted.target().clone();
-    let outbound_stream = match context.router.route_mpp_tcp(
+    let ingress = accepted.ingress().ok_or(RuntimeError::Protocol(
+        "accepted MPP stream is missing its authenticated opening carrier peer",
+    ))?;
+    let outbound_stream = match context.router.route_mpp_tcp_with_ingress(
         &target,
         accepted.principal_permit().principal().clone(),
         context.inbound.clone(),
+        ingress,
     ) {
         Ok(ClientRoute::Open(plan)) => plan.open_tcp(&target).await,
         Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject)) => Err(RuntimeError::RouteRejected),

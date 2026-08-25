@@ -22,6 +22,10 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(in crate::runtime) use super::queue::recv_reliable_path_command_during_drain;
 pub(in crate::runtime) use super::queue::{
+    ReliablePathCarrierTerminalCause, ReliablePathCarrierTerminalSignal, ReliablePathCommandSender,
+    ReliablePathFrameReservation, ReliablePathLoadRegistration,
+};
+pub(in crate::runtime) use super::queue::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels, reliable_path_command_pending_bytes,
     reliable_path_command_queue, reliable_path_command_writer_run_budget_bytes,
@@ -30,9 +34,6 @@ pub(in crate::runtime) use super::queue::{
     reliable_path_receivers_closed, reliable_path_writer_frame_queue, reliable_stream_frame_queue,
     reliable_stream_frame_queue_for_payload, try_coalesce_reliable_path_writer_run,
     try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
-};
-pub(in crate::runtime) use super::queue::{
-    ReliablePathCommandSender, ReliablePathFrameReservation, ReliablePathLoadRegistration,
 };
 #[cfg(test)]
 pub(in crate::runtime) use super::queue::{

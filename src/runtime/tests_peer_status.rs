@@ -35,6 +35,12 @@ fn status(path_id: u16) -> PeerPathStatus {
     }
 }
 
+fn status_for(underlay: UnderlayProtocol, path_id: u16) -> PeerPathStatus {
+    let mut status = status(path_id);
+    status.metrics.underlay = underlay;
+    status
+}
+
 #[test]
 fn disabled_responder_does_not_sample_local_paths() {
     let broker = PeerStatusBroker::new(false);
@@ -149,6 +155,130 @@ fn unrepresentable_snapshot_reports_unavailable() {
             code: PeerStatusCode::Unavailable,
             paths: Vec::new(),
         }
+    );
+}
+
+#[tokio::test]
+async fn response_identity_is_causal_registration_owned_and_underlay_scoped() {
+    let broker = PeerStatusBroker::new(true);
+    let session_id = SessionId(14);
+    let mut predecessor = broker.register_path(session_id, UnderlayProtocol::Tcp, PathId(47), 2);
+
+    let old_request = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(session_id).await })
+    };
+    let old_request_id = predecessor.recv_request().await.expect("old request");
+    assert!(predecessor.receive_response(
+        old_request_id,
+        PeerStatusCode::Ok,
+        vec![status_for(UnderlayProtocol::Tcp, 47)],
+    ));
+    let old_result = old_request
+        .await
+        .expect("old request task")
+        .expect("old result");
+    assert_eq!(
+        old_result.local_path_index(UnderlayProtocol::Tcp, PathId(47)),
+        Some(2)
+    );
+
+    let mut successor = broker.register_path(session_id, UnderlayProtocol::Tcp, PathId(47), 3);
+    let udp = broker.register_path(session_id, UnderlayProtocol::Udp, PathId(47), 8);
+    drop(predecessor);
+
+    assert_eq!(
+        broker.local_path_index(session_id, UnderlayProtocol::Tcp, PathId(47)),
+        Some(3),
+        "stale predecessor cleanup must not erase its authenticated successor"
+    );
+    assert_eq!(
+        broker.local_path_index(session_id, UnderlayProtocol::Udp, PathId(47)),
+        Some(8),
+        "equal numeric PathIds on different underlays are independent"
+    );
+    assert_eq!(
+        broker
+            .latest(session_id)
+            .expect("cached old result")
+            .local_path_index(UnderlayProtocol::Tcp, PathId(47)),
+        Some(2),
+        "authenticated reuse must not relabel a cached response"
+    );
+
+    let new_request = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(session_id).await })
+    };
+    let new_request_id = successor.recv_request().await.expect("new request");
+    assert!(successor.receive_response(
+        new_request_id,
+        PeerStatusCode::Ok,
+        vec![
+            status_for(UnderlayProtocol::Tcp, 47),
+            status_for(UnderlayProtocol::Udp, 47),
+        ],
+    ));
+    let new_result = new_request
+        .await
+        .expect("new request task")
+        .expect("new result");
+    assert_eq!(
+        new_result.local_path_index(UnderlayProtocol::Tcp, PathId(47)),
+        Some(3)
+    );
+    assert_eq!(
+        new_result.local_path_index(UnderlayProtocol::Udp, PathId(47)),
+        Some(8)
+    );
+    assert_eq!(
+        old_result.local_path_index(UnderlayProtocol::Tcp, PathId(47)),
+        Some(2),
+        "an already returned result remains immutable"
+    );
+
+    drop(successor);
+    assert_eq!(
+        broker.local_path_index(session_id, UnderlayProtocol::Tcp, PathId(47)),
+        None
+    );
+    assert_eq!(
+        broker.local_path_index(session_id, UnderlayProtocol::Udp, PathId(47)),
+        Some(8)
+    );
+    assert_eq!(
+        new_result.local_path_index(UnderlayProtocol::Tcp, PathId(47)),
+        Some(3),
+        "registration retirement cannot rewrite a completed response"
+    );
+
+    drop(udp);
+    assert!(broker.session_ids().is_empty());
+}
+
+#[tokio::test]
+async fn scoped_server_registration_uses_the_same_response_identity_snapshot() {
+    let broker = PeerStatusBroker::with_scoped_incoming(false, true);
+    let session_id = SessionId(15);
+    let mut server_carrier =
+        broker.register_path_with_incoming(session_id, UnderlayProtocol::Udp, PathId(9), 4, true);
+    let request = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.request(session_id).await })
+    };
+    let request_id = server_carrier.recv_request().await.expect("server request");
+    assert!(server_carrier.receive_response(
+        request_id,
+        PeerStatusCode::Ok,
+        vec![status_for(UnderlayProtocol::Udp, 9)],
+    ));
+    let result = request
+        .await
+        .expect("server request task")
+        .expect("server result");
+    assert_eq!(
+        result.local_path_index(UnderlayProtocol::Udp, PathId(9)),
+        Some(4)
     );
 }
 

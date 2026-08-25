@@ -22,7 +22,9 @@ use crate::runtime::path::commands::{
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::path::{ServerCarrierPathRegistration, ServerStreamFrameRoute};
+use crate::runtime::path::{
+    ServerCarrierPathRegistration, ServerDatagramOpenRequest, ServerStreamFrameRoute,
+};
 use crate::runtime::peer_status::PeerStatusCarrier;
 use crate::transport::encrypted::EncryptedFramedTransportError;
 #[cfg(feature = "lab-diagnostics")]
@@ -121,9 +123,13 @@ impl ServerTcpPathSession {
             .context
             .wait_for_credential_retirement(self.path_registration.principal_permit().clone());
         tokio::pin!(retirement);
+        let session_retirement = self.path_registration.session_retirement().wait();
+        tokio::pin!(session_retirement);
         tokio::select! {
-            result = self.run_active() => result,
+            biased;
+            reason = &mut session_retirement => Err(RuntimeError::RemoteClosed(reason)),
             () = &mut retirement => Ok(()),
+            result = self.run_active() => result,
         }
     }
 
@@ -313,7 +319,10 @@ impl ServerTcpPathSession {
         {
             return Ok(());
         }
-        let _ = self.writer.flush().await?;
+        if !self.writer.flush().await? {
+            return Ok(());
+        }
+        let _ = self.commands_rx.finish_planned_path_retirement();
         Ok(())
     }
 
@@ -363,15 +372,24 @@ impl ServerTcpPathSession {
             Frame::OpenDatagramFlow {
                 flow_id, target, ..
             } if self.state == ServerTcpCarrierState::Active => {
+                let ingress =
+                    self.path_registration
+                        .mpp_ingress()
+                        .ok_or(RuntimeError::Protocol(
+                            "active TCP carrier is missing its authenticated socket peer",
+                        ))?;
                 let effect = self
                     .datagrams
                     .open(
                         &self.context,
-                        &self.commands_tx,
-                        self.session_id,
-                        self.path_registration.principal_permit().clone(),
-                        flow_id,
-                        target,
+                        ServerDatagramOpenRequest {
+                            session_id: self.session_id,
+                            principal_permit: self.path_registration.principal_permit().clone(),
+                            flow_id,
+                            target,
+                            commands: self.commands_tx.clone(),
+                            ingress,
+                        },
                     )
                     .await?;
                 self.apply_datagram_effect(effect).await
@@ -595,7 +613,10 @@ impl ServerTcpPathSession {
             Frame::PathClose { .. } => Err(RuntimeError::Protocol(
                 "TCP server received peer path close",
             )),
-            Frame::SessionClose { .. } => Ok(ServerTcpFrameDisposition::Stop),
+            Frame::SessionClose { reason } => {
+                self.context.retire_session(self.session_id, reason);
+                Ok(ServerTcpFrameDisposition::Stop)
+            }
             _ => Err(RuntimeError::Protocol("unexpected TCP path session frame")),
         }
     }

@@ -7,6 +7,13 @@ import struct
 import time
 
 
+FLOAT_TIME_EPSILON_SECONDS = 1e-9
+
+
+def attempt_has_response_budget(now, load_deadline, timeout):
+    return now + timeout <= load_deadline + FLOAT_TIME_EPSILON_SECONDS
+
+
 def parse_host_port(value):
     if value.startswith("["):
         host, rest = value[1:].split("]", 1)
@@ -128,11 +135,13 @@ def main():
     body_len = max(4, args.payload_bytes)
     index = 0
     while time.monotonic() < deadline:
-        payload = struct.pack("!I", index) + bytes([index % 251]) * (body_len - 4)
         started = time.monotonic()
+        if not attempt_has_response_budget(started, deadline, timeout):
+            break
+        payload = struct.pack("!I", index) + bytes([index % 251]) * (body_len - 4)
         attempted += 1
         udp.sendto(target_prefix + payload, (relay_host, relay_port))
-        packet_deadline = min(started + timeout, deadline)
+        packet_deadline = started + timeout
         while True:
             remaining = packet_deadline - time.monotonic()
             if remaining <= 0:

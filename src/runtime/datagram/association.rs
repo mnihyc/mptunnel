@@ -11,6 +11,7 @@ use crate::model::path::RelayPathKey;
 use crate::mux::datagram::DatagramError;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::quic::client::{ClientUdpErrorDisposition, client_udp_error_disposition};
 use crate::runtime::path::tcp::client::ClientTcpDatagramInbound;
 use crate::runtime::path::{ClientPathContext, ClientSessionProductFlowLease};
 use crate::runtime::telemetry::{ProductFlowCounter, ProductFlowLease};
@@ -108,6 +109,7 @@ pub(in crate::runtime) enum DatagramClientReceive {
 
 impl DatagramClientAssociation {
     pub(in crate::runtime) async fn new(context: ClientPathContext) -> Result<Self, RuntimeError> {
+        context.ensure_session_active()?;
         if context.udp_paths.is_empty() && context.tcp_paths.is_empty() {
             return Err(RuntimeError::NoDatagramPath);
         }
@@ -147,7 +149,7 @@ impl DatagramClientAssociation {
                     target.clone(),
                 );
                 let telemetry_counter = telemetry_flow.counter();
-                let session_product_flow = self.context.reserve_session_product_flow();
+                let session_product_flow = self.context.reserve_session_product_flow()?;
                 self.product_flows.push(DatagramClientProductFlow {
                     target,
                     flow_id,
@@ -256,6 +258,31 @@ impl DatagramClientAssociation {
         route_hint: Option<RelayPathKey>,
         traffic_class: TrafficClass,
     ) -> Result<(), RuntimeError> {
+        let context = self.context.clone();
+        let result = context
+            .complete_session_operation(self.send_to_fresh_datagram_with_policy_active(
+                target,
+                payload,
+                ttl_ms,
+                route_hint,
+                traffic_class,
+            ))
+            .await;
+        if matches!(&result, Err(RuntimeError::RemoteClosed(_))) {
+            self.pending.clear();
+            self.pending_bytes = 0;
+        }
+        result
+    }
+
+    async fn send_to_fresh_datagram_with_policy_active(
+        &mut self,
+        target: TargetAddr,
+        payload: Bytes,
+        ttl_ms: u32,
+        route_hint: Option<RelayPathKey>,
+        traffic_class: TrafficClass,
+    ) -> Result<(), RuntimeError> {
         self.prune_pending(tokio::time::Instant::now());
         let (flow_id, datagram_id, telemetry_counter) =
             self.allocate_product_datagram(target.clone())?;
@@ -299,6 +326,8 @@ impl DatagramClientAssociation {
                 ),
             );
             attempted_paths.push(candidate.key);
+            #[cfg(test)]
+            self.context.record_datagram_candidate_attempt_for_test();
             match self
                 .send_on_path(
                     candidate.key,
@@ -786,10 +815,14 @@ impl DatagramClientAssociation {
                 let session_event = match result {
                     Ok(event) => event,
                     Err(error) => {
-                        self.schedule_reinjection_after_path_failure(RelayPathKey {
-                            underlay: UnderlayProtocol::Udp,
-                            index: path_index,
-                        });
+                        if client_udp_error_disposition(&error)
+                            != ClientUdpErrorDisposition::Session
+                        {
+                            self.schedule_reinjection_after_path_failure(RelayPathKey {
+                                underlay: UnderlayProtocol::Udp,
+                                index: path_index,
+                            });
+                        }
                         return Err(error);
                     }
                 };
@@ -805,13 +838,18 @@ impl DatagramClientAssociation {
                 path_index,
                 frame: Err(err),
             } => {
-                if let Some(udp) = self.udp.as_mut() {
-                    udp.handle_receive_error(path_index);
+                let disposition = client_udp_error_disposition(&err);
+                let disposition = if let Some(udp) = self.udp.as_mut() {
+                    udp.handle_receive_error(path_index, disposition).await
+                } else {
+                    disposition
+                };
+                if disposition != ClientUdpErrorDisposition::Session {
+                    self.schedule_reinjection_after_path_failure(RelayPathKey {
+                        underlay: UnderlayProtocol::Udp,
+                        index: path_index,
+                    });
                 }
-                self.schedule_reinjection_after_path_failure(RelayPathKey {
-                    underlay: UnderlayProtocol::Udp,
-                    index: path_index,
-                });
                 return Err(err);
             }
         };
@@ -1030,12 +1068,16 @@ fn datagram_path_send_error_into_runtime(
             })
         }
         DatagramPathSendError::Timeout => RuntimeError::PathOpenTimedOut,
+        DatagramPathSendError::UdpPathOpen(source) => source,
         DatagramPathSendError::Runtime(source) => source,
     }
 }
 
 pub(in crate::runtime) fn datagram_underlay_error_is_retryable(err: &RuntimeError) -> bool {
     if runtime_error_is_datagram_response_timeout(err) {
+        return false;
+    }
+    if client_udp_error_disposition(err) == ClientUdpErrorDisposition::Session {
         return false;
     }
     matches!(
@@ -1049,11 +1091,12 @@ pub(in crate::runtime) fn datagram_underlay_error_is_retryable(err: &RuntimeErro
             | RuntimeError::Encrypted(_)
             | RuntimeError::QuicCarrier(_)
             | RuntimeError::Auth(_)
-            | RuntimeError::RemoteClosed(_)
+            | RuntimeError::RemotePathClosed(_)
             | RuntimeError::Protocol(_)
             | RuntimeError::PathOpenTimedOut
             | RuntimeError::PathHeartbeatTimeout
             | RuntimeError::ReliablePathSessionClosed
+            | RuntimeError::ReliablePathRetired
     )
 }
 

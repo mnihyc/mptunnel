@@ -8,7 +8,7 @@ use crate::product::{
 };
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    AuthNonce, PathId, PathMetricDirection, PathMetrics, PeerPathStatus, SessionId,
+    AuthNonce, CloseReason, PathId, PathMetricDirection, PathMetrics, PeerPathStatus, SessionId,
     UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
@@ -177,14 +177,39 @@ pub(in crate::runtime) struct ServerPathContext {
 }
 
 impl ServerPathContext {
+    pub(in crate::runtime) fn configured_path_name(
+        &self,
+        config_ordinal: usize,
+    ) -> Option<Arc<str>> {
+        self.configured_path_names
+            .get(config_ordinal)
+            .map(|name| Arc::from(name.as_str()))
+    }
+
+    /// Atomically fences new Product admission before retiring every owner of
+    /// the authenticated SessionId. Exact carrier/flow close paths never call
+    /// this complete-session transaction.
+    pub(in crate::runtime) fn retire_session(&self, session_id: SessionId, reason: CloseReason) {
+        let reason = self.reliable_streams.retire_session(session_id, reason);
+        if let Some(datagrams) = &self.datagrams {
+            datagrams.retire_session(session_id);
+        }
+        if let Some(ip_tunnels) = &self.ip_tunnels {
+            ip_tunnels.retire_session(session_id, reason);
+        }
+    }
+
     pub(in crate::runtime) fn register_peer_status(
         &self,
-        session_id: SessionId,
-        principal: &crate::product::PrincipalId,
+        path: &crate::runtime::path::ServerCarrierPathRegistration,
     ) -> PeerStatusCarrier {
-        self.peer_status.register_with_incoming(
-            session_id,
-            self.peer_diagnostics_principals.allows(principal),
+        self.peer_status.register_path_with_incoming(
+            path.session_id(),
+            path.underlay(),
+            path.path_id(),
+            path.local_config_ordinal(),
+            self.peer_diagnostics_principals
+                .allows(path.principal_permit().principal()),
         )
     }
 

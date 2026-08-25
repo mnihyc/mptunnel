@@ -1303,6 +1303,17 @@ exact carrier lifetime and MUST NOT be retried on the same carrier instance.
 Lifecycle close delivery MUST NOT be discarded or blocked indefinitely behind
 packet-payload queue pressure.
 
+When the attachment set makes a true non-empty-to-empty transition, an endpoint
+that retains the carrierless logical tunnel starts one absolute retention epoch
+using `[session].retention_timeout_ms`. A successful empty-to-non-empty
+reattachment cancels that epoch. A failed, refused, duplicate, superseded, or
+stale open or close does not start, restart, or extend it. If the deadline is
+reached while the same principal, session, tunnel incarnation, retention epoch,
+and empty attachment set remain current, the endpoint destroys that logical
+tunnel. The server then releases the tunnel's retained authenticated-session
+and principal-allocation ownership. A later attachment creates a new logical
+incarnation through ordinary admission; it does not revive expired state.
+
 ### 9.4 IP packet delivery and carrier selection
 
 `IP_PACKET(tunnel_id, packet_id, payload)` carries exactly one complete IPv4 or
@@ -1662,7 +1673,8 @@ Endpoints MUST enforce configured bounds for:
   reservations, `PathId` allocation, and drain work;
 - TCP group removal and bound-reduction drains and carrierless-session
   retention; and
-- all teardown and no-attachment retention.
+- all teardown and no-attachment retention, including carrierless logical IP
+  tunnels and their authenticated-session ownership.
 
 A protocol violation closes the smallest safe scope: product flow, stream,
 carrier, or session according to the corrupted state. Authentication failure

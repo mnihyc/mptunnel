@@ -4,17 +4,18 @@
 //! This module rejects host-file material references before compiling that
 //! document entirely in memory, then owns the runtime thread,
 //! listener-readiness barrier, and synchronous `VpnService.protect(int)`
-//! callback.
+//! callback when the host has not already excluded this process from its VPN.
 
 use crate::config::{LogLevel, load_config_toml_str};
 use crate::observability::{HostLogSink, HostLogSinkRegistration};
 use crate::platform::SystemPacketDeviceProvider;
 use crate::runtime::{
-    RuntimeHostControl, RuntimeHostPhase, RuntimeHostStats, run_with_vpn_host_providers_and_control,
+    RuntimeHostControl, RuntimeHostPhase, RuntimeHostStats,
+    run_with_all_host_providers_and_control, run_with_vpn_host_providers_and_control,
 };
 use crate::transport::{
     HostSocketHandle, HostSocketProtectionRequest, HostSocketProtector,
-    SystemCarrierNetworkProvider,
+    SystemCarrierNetworkProvider, SystemNativeSocketConfigurator,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -1926,7 +1927,7 @@ fn duration_from_java(value: jlong, name: &str) -> Result<Duration, AndroidBridg
 
 fn start_runtime(
     config: crate::config::AppConfig,
-    protector: AndroidSocketProtector,
+    protector: Option<AndroidSocketProtector>,
     log_sink: AndroidLogSink,
     ready_timeout: Duration,
 ) -> Result<bool, AndroidBridgeError> {
@@ -2016,7 +2017,7 @@ fn start_runtime(
 
 fn run_runtime_thread(
     config: crate::config::AppConfig,
-    protector: AndroidSocketProtector,
+    protector: Option<AndroidSocketProtector>,
     control: RuntimeHostControl,
     status: Arc<SharedStatus>,
     log_sink_registration: HostLogSinkRegistration,
@@ -2040,14 +2041,36 @@ fn run_runtime_thread(
                     Err(_) => {}
                 }
             });
-            let result = run_with_vpn_host_providers_and_control(
-                config,
-                Arc::new(SystemPacketDeviceProvider),
-                Arc::new(SystemCarrierNetworkProvider),
-                Arc::new(protector),
-                control.clone(),
-            )
-            .await;
+            let result = match protector {
+                Some(protector) => {
+                    run_with_vpn_host_providers_and_control(
+                        config,
+                        Arc::new(SystemPacketDeviceProvider),
+                        Arc::new(SystemCarrierNetworkProvider),
+                        Arc::new(protector),
+                        control.clone(),
+                    )
+                    .await
+                }
+                None => {
+                    // A null JNI protector is an explicit whole-process
+                    // ownership choice: the Android host has excluded its own
+                    // package from the VPN, so every native socket below an
+                    // MPP carrier or direct/proxy/DNS transport is already
+                    // outside that VPN. DNS still follows its configured
+                    // direct or outbound-routed egress policy.
+                    // Host carrier authority remains intact, so endpoint
+                    // hostnames still resolve through the Android host network.
+                    run_with_all_host_providers_and_control(
+                        config,
+                        Arc::new(SystemPacketDeviceProvider),
+                        Arc::new(SystemCarrierNetworkProvider),
+                        Arc::new(SystemNativeSocketConfigurator),
+                        control.clone(),
+                    )
+                    .await
+                }
+            };
             readiness.abort();
             result
         }),
@@ -2273,9 +2296,6 @@ pub fn native_start<'caller>(
 ) -> jboolean {
     unowned_env
         .with_env(|env| -> Result<jboolean, AndroidBridgeError> {
-            if protector.is_null() {
-                return Err(bridge_error("socket protector must not be null"));
-            }
             if log_sink.is_null() {
                 return Err(bridge_error("log sink must not be null"));
             }
@@ -2284,13 +2304,17 @@ pub fn native_start<'caller>(
             reserve_start()?;
             let result = (|| {
                 let config = compile_inline_config(&config_toml)?;
-                let protector_callback = env.new_global_ref(&protector)?;
+                let protector = if protector.is_null() {
+                    None
+                } else {
+                    Some(AndroidSocketProtector {
+                        callback: env.new_global_ref(&protector)?,
+                    })
+                };
                 let log_callback = env.new_global_ref(&log_sink)?;
                 start_runtime(
                     config,
-                    AndroidSocketProtector {
-                        callback: protector_callback,
-                    },
+                    protector,
                     AndroidLogSink {
                         callback: log_callback,
                     },

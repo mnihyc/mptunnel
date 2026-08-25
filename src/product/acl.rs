@@ -2,7 +2,7 @@ use crate::product::flow::{FlowContext, ProtocolTarget};
 use crate::product::routing::{RouteAction, RouteDecision, RuleId};
 use std::error::Error;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 pub(crate) const MAX_RESOLUTION_ADDRESSES: usize = 64;
@@ -354,14 +354,12 @@ pub(crate) fn restricted_ip_class(address: IpAddr) -> Option<RestrictedIpClass> 
 }
 
 fn is_metadata(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            address == Ipv4Addr::new(169, 254, 169, 254)
-                || address == Ipv4Addr::new(169, 254, 170, 2)
-                || address == Ipv4Addr::new(100, 100, 100, 200)
-        }
-        IpAddr::V6(address) => address == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
-    }
+    let IpAddr::V4(address) = address else {
+        return false;
+    };
+    address == Ipv4Addr::new(169, 254, 169, 254)
+        || address == Ipv4Addr::new(169, 254, 170, 2)
+        || address == Ipv4Addr::new(100, 100, 100, 200)
 }
 
 pub(crate) const fn canonical_ip(address: IpAddr) -> IpAddr {

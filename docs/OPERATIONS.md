@@ -43,15 +43,30 @@ Catch-all Android hosts must call `runtime::run_with_vpn_host_providers` with:
 The same protector is applied exactly once to every carrier and
 MPTUNNEL-created native target/proxy/DNS TCP/UDP socket, after source binding
 and before connect or first send. Returning an error drops the socket and fails
-the egress attempt closed. Operating-system DNS policies are rejected before
-device or socket startup: OS resolver sockets are hidden from this callback and
-therefore cannot safely bypass a catch-all VPN. Configure a DNS server with a
-literal `address`, optionally routed through an `outbound`, instead.
+the egress attempt closed. On these strict callback APIs, operating-system DNS
+policies are rejected before device or socket startup: OS resolver sockets are
+hidden from this callback and therefore cannot safely bypass a catch-all VPN.
+Configure a DNS server with a literal `address`, optionally routed through an
+`outbound`, instead.
 Never close or retain the borrowed descriptor; duplicate it explicitly if the
 host needs separate ownership. The carrier provider must only resolve,
 select/bind a native network, and create the socket; it must not invoke the
 protector independently. Apple packet-tunnel embeddings use the same callback
 for their equivalent native-network exclusion or binding.
+
+The Android JNI `nativeStart` protector is nullable as one explicit alternative
+host contract. Passing a non-null callback selects the strict behavior above.
+Passing null is valid only when the embedding application has excluded its own
+package/process from the VPN: that process-wide exclusion must already place
+every MPTUNNEL carrier, direct/proxy egress, and internally created DNS socket
+on the ordinary host network. This is a whole native-socket ownership choice,
+not a DNS-only exception, and it does not force internal DNS direct: an
+internal DNS upstream configured through an `outbound` still uses that
+outbound. MPP endpoint hostnames still use the host system carrier resolver.
+Android VPN DNS publication and the DNS traffic originating from VPN client
+applications remain owned by the embedding application and can traverse its
+local proxy independently of MPTUNNEL's internal `[dns]` policy. Never pass
+null while the embedding process itself is captured by the VPN.
 
 `run_with_packet_device_provider` and `run_with_host_providers` leave some
 egress socket classes on system behavior and are not valid for a catch-all

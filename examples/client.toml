@@ -36,11 +36,14 @@ listen = ["127.0.0.1:1080"]
 # listen = ["127.0.0.1:853"]
 # target = "resolver.example:853"
 
-# Native bypass for explicitly requested internal IP addresses. The routing
-# rule below limits this outbound to RFC 1918 IPv4 and RFC 4193 IPv6 ULA space.
-[[outbounds]]
-name = "internal-direct"
-protocol = "direct"
+# Optional V2Ray-style `geoip:private` bypass. Its CIDRs intentionally include
+# special-use, loopback, link-local, multicast, and documentation space in
+# addition to RFC 1918 IPv4 and RFC 4193 IPv6 ULA space. Uncomment this entire
+# outbound together with the matching routing rule below only when that broad
+# local bypass is intended.
+# [[outbounds]]
+# name = "private-direct"
+# protocol = "direct"
 
 [[outbounds]]
 name = "remote-mpp"
@@ -68,25 +71,48 @@ transport_secret = { from = "file", path = "mpp-transport.key" }
 [routing]
 target_resolution = "as-is"
 
-# The IPv6 metadata endpoint below is inside ULA space. Keep this exact reject
-# before the broader internal bypass so `allow-restricted` cannot authorize it.
-[[routing.rules]]
-name = "reject-internal-metadata"
-inbounds = ["local-mixed"]
-destination_cidrs = ["fd00:ec2::254/128"]
-decision = "reject"
+# This is the complete CIDR set emitted by V2Fly's `geoip:private` source, not
+# only the RFC 1918 ranges. Under `as-is`, it matches literal targets only;
+# hostnames remain unchanged and use `remote-mpp`. Uncomment the complete rule
+# together with `private-direct` above to opt in.
+# [[routing.rules]]
+# name = "bypass-v2ray-private-literals"
+# inbounds = ["local-mixed"]
+# destination_cidrs = [
+#   "0.0.0.0/8",
+#   "10.0.0.0/8",
+#   "100.64.0.0/10",
+#   "127.0.0.0/8",
+#   "169.254.0.0/16",
+#   "172.16.0.0/12",
+#   "192.0.0.0/24",
+#   "192.0.2.0/24",
+#   "192.88.99.0/24",
+#   "192.168.0.0/16",
+#   "198.18.0.0/15",
+#   "198.51.100.0/24",
+#   "203.0.113.0/24",
+#   "224.0.0.0/4",
+#   "240.0.0.0/4",
+#   "255.255.255.255/32",
+#   "::/128",
+#   "::1/128",
+#   "fc00::/7",
+#   "fe80::/10",
+#   "ff00::/8",
+# ]
+# decision = "allow-restricted"
+# outbound = "private-direct"
 
-# `as-is` never resolves a hostname during routing, so this CIDR rule matches
-# only a literal internal IP requested by the application. Hostname requests
-# remain unchanged and use `remote-mpp` below, even if DNS at the server later
-# returns an internal address. Use `route-only` or `full-resolve` only when
-# local hostname classification is intentional.
+# Literal targets from the local proxy, including a private VPN DNS endpoint,
+# are delegated to the MPP server. This permission applies only to the
+# `remote-mpp` hop; the server independently authorizes its actual egress.
 [[routing.rules]]
-name = "bypass-internal-literals"
+name = "delegate-literal-targets"
 inbounds = ["local-mixed"]
-destination_cidrs = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+destination_cidrs = ["0.0.0.0/0", "::/0"]
 decision = "allow-restricted"
-outbound = "internal-direct"
+outbound = "remote-mpp"
 
 [[routing.rules]]
 name = "default"

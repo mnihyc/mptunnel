@@ -47,6 +47,30 @@ protocol = "direct"
 # Replace the global `system` server with named UDP/TCP/DoT/DoH/DoQ servers
 # for explicit or encrypted resolution.
 
+# Optional explicit DNS policies. With this whole block commented, MPTUNNEL
+# uses its implicit operating-system resolver and default policy. Uncomment it
+# as one block, then set `default = "plain"` to select the UDP-with-TCP-fallback
+# alternative instead.
+# [dns]
+# default = "system"
+#
+# [[dns.servers]]
+# name = "system"
+# protocol = "system"
+#
+# [[dns.servers]]
+# name = "plain-udp-tcp"
+# protocol = "udp-tcp"
+# address = "1.1.1.1:53"
+#
+# [[dns.policies]]
+# name = "system"
+# servers = ["system"]
+#
+# [[dns.policies]]
+# name = "plain"
+# servers = ["plain-udp-tcp"]
+
 # To relay through SOCKS5, change the routing rule below to
 # `outbound = "socks5-egress"`, then uncomment this complete block.
 # [[outbounds]]

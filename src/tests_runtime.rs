@@ -1612,8 +1612,12 @@ async fn pre_model_red_tcp_session_close_interrupts_a_backpressured_ordered_writ
         Err(RuntimeError::RemoteClosed(CloseReason::PolicyRejected))
     ));
 
-    flood.abort();
-    let _ = flood.await;
+    tokio::time::timeout_at(actor_settlement_deadline, flood)
+        .await
+        .expect("terminal actor wakes the blocked ordered producer")
+        .expect("ordered producer task");
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
     server_control.release_server.notify_one();
     server
         .await

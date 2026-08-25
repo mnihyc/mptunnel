@@ -105,6 +105,30 @@ fn literal_dns_policy() -> DnsPolicyConfig {
     }
 }
 
+fn proxy_only_system_dns_config(listen: SocketAddr) -> AppConfig {
+    crate::config::load_config_toml_str(&format!(
+        r#"
+[logging]
+level = "off"
+
+[[inbounds]]
+name = "local-mixed"
+protocol = "mixed"
+listen = ["{listen}"]
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+outbound = "direct"
+"#
+    ))
+    .expect("proxy-only system-DNS config")
+}
+
 #[tokio::test]
 async fn public_vpn_runtime_entry_contract_fails_closed_before_host_io() {
     let system_dns = tun_host_runtime_config(TunHostConfig::External);
@@ -114,7 +138,7 @@ async fn public_vpn_runtime_entry_contract_fails_closed_before_host_io() {
         Err(RuntimeError::ProductPolicy(message)) if message == VPN_HOST_SYSTEM_DNS_ERROR
     ));
     let runtime_error = run_with_vpn_host_providers(
-        system_dns,
+        system_dns.clone(),
         Arc::new(SystemPacketDeviceProvider),
         Arc::new(AuthoritativeCarrierNetworkProvider {
             address: "192.0.2.254:443".parse().expect("host address"),
@@ -125,6 +149,21 @@ async fn public_vpn_runtime_entry_contract_fails_closed_before_host_io() {
     .expect_err("system DNS must fail before host adapters start");
     assert!(matches!(
         runtime_error,
+        RuntimeError::ProductPolicy(message) if message == VPN_HOST_SYSTEM_DNS_ERROR
+    ));
+    let controlled_error = run_with_vpn_host_providers_and_control(
+        system_dns.clone(),
+        Arc::new(SystemPacketDeviceProvider),
+        Arc::new(AuthoritativeCarrierNetworkProvider {
+            address: "192.0.2.254:443".parse().expect("host address"),
+        }),
+        Arc::new(PanicHostSocketProtector),
+        RuntimeHostControl::for_config(&system_dns),
+    )
+    .await
+    .expect_err("controlled protected runtime must retain strict system-DNS rejection");
+    assert!(matches!(
+        controlled_error,
         RuntimeError::ProductPolicy(message) if message == VPN_HOST_SYSTEM_DNS_ERROR
     ));
 
@@ -143,6 +182,79 @@ async fn public_vpn_runtime_entry_contract_fails_closed_before_host_io() {
     assert!(matches!(
         require_external_tun_host(&tun_host_runtime_config(managed)),
         Err(RuntimeError::Protocol(PUBLIC_RUNTIME_MANAGED_VPN_ERROR))
+    ));
+}
+
+#[tokio::test]
+async fn unprotected_controlled_host_runtime_accepts_system_dns_and_preserves_guards() {
+    let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let listen = port_reservation.local_addr().expect("reserved address");
+    drop(port_reservation);
+    let config = proxy_only_system_dns_config(listen);
+
+    assert!(matches!(
+        require_protectable_vpn_dns(&config),
+        Err(RuntimeError::ProductPolicy(message)) if message == VPN_HOST_SYSTEM_DNS_ERROR
+    ));
+
+    let control = RuntimeHostControl::for_config(&config);
+    let runtime_control = control.clone();
+    let runtime = tokio::spawn(run_with_all_host_providers_and_control(
+        config.clone(),
+        Arc::new(SystemPacketDeviceProvider),
+        Arc::new(SystemCarrierNetworkProvider),
+        Arc::new(SystemNativeSocketConfigurator),
+        runtime_control,
+    ));
+    tokio::time::timeout(Duration::from_secs(2), control.wait_until_ready())
+        .await
+        .expect("proxy listener readiness deadline")
+        .expect("proxy listener readiness");
+    control.request_shutdown();
+    tokio::time::timeout(Duration::from_secs(2), runtime)
+        .await
+        .expect("proxy runtime shutdown deadline")
+        .expect("proxy runtime task")
+        .expect("proxy runtime shutdown");
+
+    let mut mismatched = config.clone();
+    mismatched.resources.max_streams = 1;
+    let mismatch_error = run_with_all_host_providers_and_control(
+        mismatched,
+        Arc::new(SystemPacketDeviceProvider),
+        Arc::new(SystemCarrierNetworkProvider),
+        Arc::new(SystemNativeSocketConfigurator),
+        RuntimeHostControl::for_config(&config),
+    )
+    .await
+    .expect_err("mismatched host control must fail closed");
+    assert!(matches!(
+        mismatch_error,
+        RuntimeError::Protocol(
+            "runtime host control was created for a different resource envelope"
+        )
+    ));
+
+    let managed = TunHostConfig::Managed(ManagedVpnConfig {
+        route_mode: crate::platform::RouteMode::Full,
+        excludes: Vec::new(),
+        local_lan: false,
+        dns_capture_servers: vec!["10.88.0.53".parse().expect("DNS capture")],
+        platform: ManagedVpnPlatformConfig::default(),
+    });
+    let managed = tun_host_runtime_config(managed);
+    let managed_error = run_with_all_host_providers_and_control(
+        managed.clone(),
+        Arc::new(SystemPacketDeviceProvider),
+        Arc::new(SystemCarrierNetworkProvider),
+        Arc::new(SystemNativeSocketConfigurator),
+        RuntimeHostControl::for_config(&managed),
+    )
+    .await
+    .expect_err("managed TUN must remain application-lifecycle owned");
+    assert!(matches!(
+        managed_error,
+        RuntimeError::Protocol(PUBLIC_RUNTIME_MANAGED_VPN_ERROR)
     ));
 }
 

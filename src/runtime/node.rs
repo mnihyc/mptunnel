@@ -320,6 +320,53 @@ pub async fn run_with_vpn_host_providers_and_control(
 ) -> Result<(), RuntimeError> {
     require_external_tun_host(&config)?;
     require_protectable_vpn_dns(&config)?;
+    let carrier_network: Arc<dyn CarrierNetworkProvider> = Arc::new(
+        ProtectedCarrierNetworkProvider::new(carrier_network, socket_protector.clone()),
+    );
+    let native_sockets: Arc<dyn NativeSocketConfigurator> =
+        Arc::new(ProtectedNativeSocketConfigurator::new(socket_protector));
+    run_validated_all_host_providers_and_control(
+        config,
+        packet_devices,
+        carrier_network,
+        native_sockets,
+        control,
+    )
+    .await
+}
+
+/// Runs one externally owned host generation with independent carrier and
+/// native-socket adapters plus host-visible lifecycle control.
+///
+/// This crate-private seam is used by an embedding whose process-wide network
+/// exclusion already keeps every MPTUNNEL-created socket outside its VPN. It
+/// deliberately does not weaken the public catch-all VPN entry points.
+#[cfg(any(target_os = "android", test))]
+pub(crate) async fn run_with_all_host_providers_and_control(
+    config: AppConfig,
+    packet_devices: Arc<dyn PacketDeviceProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
+    native_sockets: Arc<dyn NativeSocketConfigurator>,
+    control: RuntimeHostControl,
+) -> Result<(), RuntimeError> {
+    require_external_tun_host(&config)?;
+    run_validated_all_host_providers_and_control(
+        config,
+        packet_devices,
+        carrier_network,
+        native_sockets,
+        control,
+    )
+    .await
+}
+
+async fn run_validated_all_host_providers_and_control(
+    config: AppConfig,
+    packet_devices: Arc<dyn PacketDeviceProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
+    native_sockets: Arc<dyn NativeSocketConfigurator>,
+    control: RuntimeHostControl,
+) -> Result<(), RuntimeError> {
     if control.active_flow_capacity()
         != crate::runtime::telemetry::active_flow_detail_capacity(config.resources.max_streams)
     {
@@ -327,11 +374,6 @@ pub async fn run_with_vpn_host_providers_and_control(
             "runtime host control was created for a different resource envelope",
         ));
     }
-    let carrier_network: Arc<dyn CarrierNetworkProvider> = Arc::new(
-        ProtectedCarrierNetworkProvider::new(carrier_network, socket_protector.clone()),
-    );
-    let native_sockets: Arc<dyn NativeSocketConfigurator> =
-        Arc::new(ProtectedNativeSocketConfigurator::new(socket_protector));
     public_runtime_result(
         run_with_generation_and_host_providers(
             config,

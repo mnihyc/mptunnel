@@ -122,15 +122,21 @@ platform`.
 MPTUNNEL is a foreground console process on Windows. A native Windows Service
 wrapper and installer are not included. The Android archive is a command-line
 binary, not an APK or one-click `VpnService` application. Android VPN hosts
-must establish the TUN descriptor, bind carrier sockets to the selected
-network, protect every carrier, target, proxy, and DNS socket before I/O, and
-use external TUN host mode. Low-level host-provider APIs reject process-managed
-TUN mode because they do not own OS route/DNS publication.
+must establish the TUN descriptor and use external TUN host mode. A catch-all
+host must bind carrier sockets to the selected network and protect every
+carrier, target, proxy, and MPTUNNEL-internal DNS socket before I/O. Low-level
+host-provider APIs reject process-managed TUN mode because they do not own OS
+route/DNS publication.
 
-The JNI start contract is `nativeStart(String, SocketProtector,
-MptunnelLogSink, long): boolean`. `MptunnelLogSink.log(String level, String
-message)` receives each already-filtered, redacted, bounded, and rendered
-record once; the callback replaces stderr delivery in the embedded runtime.
+The JNI start contract is `nativeStart(String, SocketProtector?,
+MptunnelLogSink, long): boolean`. A non-null protector selects the strict
+catch-all behavior above. Null is valid only when the Android host has already
+excluded its whole application process from the VPN, placing every
+MPTUNNEL-created native socket on the ordinary host network; it is not a
+DNS-only exception. Android VPN DNS publication and captured application DNS
+traffic remain host-owned. `MptunnelLogSink.log(String level, String message)`
+receives each already-filtered, redacted, bounded, and rendered record once;
+the callback replaces stderr delivery in the embedded runtime.
 Hosts should expose `[logging].level` with its ordinary `info` default and the
 supported `off`, `error`, `warn`, `info`, and `debug` values.
 

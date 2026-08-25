@@ -206,26 +206,61 @@ async fn run_client_tcp_path_session_inner(
         ),
     };
     let mut pending_frames = Vec::<Frame>::new();
+    let session_closed = runtime.state.session_retirement().wait();
+    tokio::pin!(session_closed);
+    let terminal_reason = {
+        let active = run_client_tcp_path_session_active(
+            &runtime,
+            &mut commands,
+            &mut actor_terminal,
+            &mut carrier_readiness,
+            &mut state,
+            &mut pending_frames,
+        );
+        tokio::pin!(active);
+        tokio::select! {
+            biased;
+            reason = &mut session_closed => Some(reason),
+            () = &mut active => None,
+        }
+    };
+    let Some(reason) = terminal_reason else {
+        return;
+    };
+
+    let error = RuntimeError::RemoteClosed(reason);
+    fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &error, &runtime);
+    if state.connection.is_some() {
+        retire_failed_client_tcp_connection(&runtime, &mut state, &mut carrier_readiness);
+    }
+    actor_terminal.finish();
+}
+
+/// Runs every await that owns client TCP carrier state. Session retirement
+/// races this complete future so no platform-specific native socket wakeup can
+/// defer terminal Product fanout or actor cleanup.
+async fn run_client_tcp_path_session_active(
+    runtime: &ClientTcpPathSessionRuntime,
+    commands: &mut ReliablePathCommandReceivers,
+    actor_terminal: &mut ClientTcpPathActorTerminal,
+    carrier_readiness: &mut ClientTcpCarrierReadiness,
+    state: &mut ClientTcpPathSessionState,
+    pending_frames: &mut Vec<Frame>,
+) {
     let mut draining = false;
     let mut drain_deadline = None;
     let drain_signal = commands.path_drain_signal();
     let drain_requested = drain_signal.wait();
     tokio::pin!(drain_requested);
-    let session_closed = runtime.state.session_retirement().wait();
-    tokio::pin!(session_closed);
 
     loop {
         if state.connection.is_none() {
             tokio::select! {
                 biased;
-                _reason = &mut session_closed => {
-                    actor_terminal.finish();
-                    return;
-                }
                 _ = &mut drain_requested => {
                     commands.close_for_path_drain();
                     while let Some(command) =
-                        recv_reliable_path_command_during_drain(&mut commands).await
+                        recv_reliable_path_command_during_drain(commands).await
                     {
                         let pending_bytes = reliable_path_command_pending_bytes(&command);
                         reject_client_tcp_command_for_path_drain(command);
@@ -234,14 +269,14 @@ async fn run_client_tcp_path_session_inner(
                     actor_terminal.finish();
                     return;
                 }
-                command = recv_reliable_path_command(&mut commands) => match command {
+                command = recv_reliable_path_command(commands) => match command {
                     Some(command) => {
                         let pending_bytes = reliable_path_command_pending_bytes(&command);
                         handle_disconnected_client_tcp_command(
                             command,
-                            &runtime,
-                            &mut state,
-                            &mut carrier_readiness,
+                            runtime,
+                            state,
+                            carrier_readiness,
                         )
                         .await;
                         commands.release_pending_command_bytes(pending_bytes);
@@ -269,7 +304,7 @@ async fn run_client_tcp_path_session_inner(
             tokio::time::sleep_until(pending_open_deadline.unwrap_or(heartbeat_at));
         tokio::pin!(pending_open_timer);
 
-        let receivers_open = !reliable_path_receivers_closed(&commands);
+        let receivers_open = !reliable_path_receivers_closed(commands);
         if !receivers_open && !draining {
             // No lifecycle owner remains. Native carrier termination is valid;
             // graceful retirement requires an actor-owned PATH_DRAIN followed
@@ -307,22 +342,6 @@ async fn run_client_tcp_path_session_inner(
             .expect("checked connected TCP path session");
         tokio::select! {
             biased;
-            reason = &mut session_closed => {
-                let error = RuntimeError::RemoteClosed(reason);
-                fail_client_tcp_products(
-                    &mut state.streams,
-                    &mut state.datagrams,
-                    &error,
-                    &runtime,
-                );
-                retire_failed_client_tcp_connection(
-                    &runtime,
-                    &mut state,
-                    &mut carrier_readiness,
-                );
-                actor_terminal.finish();
-                return;
-            }
             _ = &mut drain_requested, if !draining => {
                 if drain_signal.is_terminal() {
                     let error = RuntimeError::ReliablePathSessionClosed;
@@ -330,21 +349,21 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         &error,
-                        &runtime,
+                        runtime,
                     );
                     retire_failed_client_tcp_connection(
-                        &runtime,
-                        &mut state,
-                        &mut carrier_readiness,
+                        runtime,
+                        state,
+                        carrier_readiness,
                     );
                     actor_terminal.finish();
                     return;
                 }
                 begin_client_tcp_path_drain(
                     connection,
-                    &mut commands,
-                    &mut carrier_readiness,
-                    &runtime,
+                    commands,
+                    carrier_readiness,
+                    runtime,
                 );
                 draining = true;
                 drain_deadline =
@@ -379,7 +398,7 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         &err,
-                        &runtime,
+                        runtime,
                     );
                     crate::observability::process_event!(
                         Warn,
@@ -407,7 +426,7 @@ async fn run_client_tcp_path_session_inner(
                             &mut state.streams,
                             &mut state.datagrams,
                             &err,
-                            &runtime,
+                            runtime,
                         );
                         crate::observability::process_event!(
                             Warn,
@@ -437,7 +456,7 @@ async fn run_client_tcp_path_session_inner(
                                     &mut state.streams,
                                     &mut state.closed_streams,
                                     &mut state.datagrams,
-                                    &runtime,
+                                    runtime,
                                 ),
                             )
                             .await
@@ -451,7 +470,7 @@ async fn run_client_tcp_path_session_inner(
                                 &mut state.streams,
                                 &mut state.closed_streams,
                                 &mut state.datagrams,
-                                &runtime,
+                                runtime,
                             )
                             .await,
                         };
@@ -460,7 +479,7 @@ async fn run_client_tcp_path_session_inner(
                                 &mut state.streams,
                                 &mut state.datagrams,
                                 &err,
-                                &runtime,
+                                runtime,
                             );
                             crate::observability::process_event!(
                                 Warn,
@@ -472,20 +491,20 @@ async fn run_client_tcp_path_session_inner(
                             );
                             drop_connection = true;
                         } else if command_may_recv && !draining
-                            && let Some(command) = try_recv_reliable_path_command(&mut commands)
+                            && let Some(command) = try_recv_reliable_path_command(commands)
                         {
                             let result = handle_connected_client_tcp_command_run::<true>(
                                 command,
-                                &mut commands,
+                                commands,
                                 connection,
                                 &mut state.streams,
                                 &mut state.closed_streams,
                                 &mut state.datagrams,
-                                &runtime,
+                                runtime,
                                 carrier_readiness.current_instance_raw(),
                                 runtime.stream_frame_queue,
                                 runtime.mux_limits,
-                                &mut pending_frames,
+                                pending_frames,
                             )
                             .await;
                             if let Err(err) = result {
@@ -493,7 +512,7 @@ async fn run_client_tcp_path_session_inner(
                                     &mut state.streams,
                                     &mut state.datagrams,
                                     &err,
-                                    &runtime,
+                                    runtime,
                                 );
                                 crate::observability::process_event!(
                                     Warn,
@@ -513,7 +532,7 @@ async fn run_client_tcp_path_session_inner(
                             &mut state.streams,
                             &mut state.datagrams,
                             &err,
-                            &runtime,
+                            runtime,
                         );
                         crate::observability::process_event!(
                             Warn,
@@ -531,13 +550,13 @@ async fn run_client_tcp_path_session_inner(
                             &mut state.streams,
                             &mut state.datagrams,
                             &err,
-                            &runtime,
+                            runtime,
                         );
                         drop_connection = true;
                     }
                 }
             }
-            command = recv_client_tcp_command(&mut commands, draining), if command_may_recv => {
+            command = recv_client_tcp_command(commands, draining), if command_may_recv => {
                 match command {
                     Some(command) => {
                         let result = if draining {
@@ -546,14 +565,14 @@ async fn run_client_tcp_path_session_inner(
                                     .expect("draining TCP path owns one retention deadline"),
                                 handle_draining_client_tcp_command(
                                     command,
-                                    &mut commands,
+                                    commands,
                                     connection,
                                     &mut state.streams,
                                     &mut state.closed_streams,
                                     &mut state.datagrams,
-                                    &runtime,
+                                    runtime,
                                     carrier_readiness.current_instance_raw(),
-                                    &mut pending_frames,
+                                    pending_frames,
                                 ),
                             )
                             .await
@@ -564,16 +583,16 @@ async fn run_client_tcp_path_session_inner(
                         } else {
                             handle_connected_client_tcp_command_run::<true>(
                                 command,
-                                &mut commands,
+                                commands,
                                 connection,
                                 &mut state.streams,
                                 &mut state.closed_streams,
                                 &mut state.datagrams,
-                                &runtime,
+                                runtime,
                                 carrier_readiness.current_instance_raw(),
                                 runtime.stream_frame_queue,
                                 runtime.mux_limits,
-                                &mut pending_frames,
+                                pending_frames,
                             )
                             .await
                         };
@@ -582,7 +601,7 @@ async fn run_client_tcp_path_session_inner(
                                 &mut state.streams,
                                 &mut state.datagrams,
                                 &err,
-                                &runtime,
+                                runtime,
                             );
                             crate::observability::process_event!(
                                 Warn,
@@ -598,7 +617,7 @@ async fn run_client_tcp_path_session_inner(
                     None => {
                         if draining {
                             finish_drain = true;
-                        } else if reliable_path_receivers_closed(&commands) {
+                        } else if reliable_path_receivers_closed(commands) {
                             // See the receiver-closed boundary above. Do not
                             // manufacture the peer's PATH_CLOSE receipt.
                             return;
@@ -613,7 +632,7 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         &err,
-                        &runtime,
+                        runtime,
                     );
                     crate::observability::process_event!(
                         Warn,
@@ -637,8 +656,8 @@ async fn run_client_tcp_path_session_inner(
                     &mut state.streams,
                     &mut state.closed_streams,
                     &mut state.datagrams,
-                    &runtime,
-                    &mut pending_frames,
+                    runtime,
+                    pending_frames,
                 ),
             )
             .await
@@ -661,7 +680,7 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         &RuntimeError::ReliablePathRetired,
-                        &runtime,
+                        runtime,
                     );
                 }
                 Ok(()) => {
@@ -672,7 +691,7 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         &RuntimeError::ReliablePathSessionClosed,
-                        &runtime,
+                        runtime,
                     );
                 }
                 Err(error) => {
@@ -680,7 +699,7 @@ async fn run_client_tcp_path_session_inner(
                         &mut state.streams,
                         &mut state.datagrams,
                         error,
-                        &runtime,
+                        runtime,
                     );
                 }
             }
@@ -689,7 +708,7 @@ async fn run_client_tcp_path_session_inner(
                 "terminal TCP path drain transfers or releases every Product attachment"
             );
             if !planned_retirement_completed {
-                retire_failed_client_tcp_connection(&runtime, &mut state, &mut carrier_readiness);
+                retire_failed_client_tcp_connection(runtime, state, carrier_readiness);
             } else {
                 state.connection = None;
                 carrier_readiness.clear();
@@ -698,7 +717,7 @@ async fn run_client_tcp_path_session_inner(
             return;
         }
         if drop_connection {
-            retire_failed_client_tcp_connection(&runtime, &mut state, &mut carrier_readiness);
+            retire_failed_client_tcp_connection(runtime, state, carrier_readiness);
             actor_terminal.finish();
             return;
         }

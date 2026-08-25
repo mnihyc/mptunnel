@@ -281,7 +281,6 @@ fn restricted_classifier_covers_internal_and_metadata_ranges() {
         ("169.254.169.254", RestrictedIpClass::Metadata),
         ("169.254.170.2", RestrictedIpClass::Metadata),
         ("100.100.100.200", RestrictedIpClass::Metadata),
-        ("fd00:ec2::254", RestrictedIpClass::Metadata),
     ];
     for (address, class) in cases {
         assert_eq!(

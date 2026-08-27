@@ -3505,6 +3505,162 @@ fn preferred_address() {
     pair.connect();
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ControllerTraceEvent {
+    Ack {
+        space: SpaceId,
+        packet_number: u64,
+        bytes: u64,
+    },
+    End {
+        space: SpaceId,
+        largest_packet_number: u64,
+    },
+    Mtu(u16),
+}
+
+#[derive(Debug)]
+struct ControllerTrace {
+    events: Arc<Mutex<Vec<ControllerTraceEvent>>>,
+}
+
+impl Controller for ControllerTrace {
+    fn on_ack(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        bytes: u64,
+        packet_number: u64,
+        space: SpaceId,
+        _app_limited: bool,
+        _rtt: &RttEstimator,
+    ) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ControllerTraceEvent::Ack {
+                space,
+                packet_number,
+                bytes,
+            });
+    }
+
+    fn on_end_acks(
+        &mut self,
+        _now: Instant,
+        _in_flight: u64,
+        _app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+        space: SpaceId,
+    ) {
+        if let Some(largest_packet_number) = largest_packet_num_acked {
+            self.events
+                .lock()
+                .unwrap()
+                .push(ControllerTraceEvent::End {
+                    space,
+                    largest_packet_number,
+                });
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: SpaceId,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ControllerTraceEvent::Mtu(new_mtu));
+    }
+
+    fn window(&self) -> u64 {
+        u64::MAX / 2
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(Self {
+            events: self.events.clone(),
+        })
+    }
+
+    fn initial_window(&self) -> u64 {
+        u64::MAX / 2
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+struct ControllerTraceFactory {
+    events: Arc<Mutex<Vec<ControllerTraceEvent>>>,
+}
+
+impl ControllerFactory for ControllerTraceFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(ControllerTrace {
+            events: self.events.clone(),
+        })
+    }
+}
+
+fn traced_client_config(events: Arc<Mutex<Vec<ControllerTraceEvent>>>) -> ClientConfig {
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(ControllerTraceFactory { events }));
+    let mut config = client_config();
+    config.transport = Arc::new(transport);
+    config
+}
+
+#[test]
+fn mtu_update_follows_the_complete_ack_transaction() {
+    let _guard = subscribe();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut pair = Pair::default();
+    pair.connect_with(traced_client_config(events.clone()));
+
+    let events = events.lock().unwrap();
+    let mut stretched_mtu_ack = None;
+    for (mtu_index, event) in events.iter().enumerate() {
+        if !matches!(event, ControllerTraceEvent::Mtu(_)) {
+            continue;
+        }
+        assert!(
+            mtu_index > 0 && matches!(events[mtu_index - 1], ControllerTraceEvent::End { .. }),
+            "MTU callback split a controller ACK transaction: {events:?}"
+        );
+
+        let mut ack_count = 0usize;
+        let mut index = mtu_index - 1;
+        while index > 0 {
+            index -= 1;
+            if matches!(events[index], ControllerTraceEvent::Ack { .. }) {
+                ack_count += 1;
+            } else {
+                break;
+            }
+        }
+        if ack_count > 1 {
+            stretched_mtu_ack = Some(ack_count);
+        }
+    }
+
+    assert!(
+        stretched_mtu_ack.is_some(),
+        "test did not produce a stretched ACK containing an MTU probe: {events:?}"
+    );
+}
+
 /// A controller whose window is effectively unbounded but which always reports a low pacing
 /// rate, so the only thing that can ever block a send is the pacer. Counts how many times the
 /// connection reports the spec's `C.is_cwnd_limited` signal.

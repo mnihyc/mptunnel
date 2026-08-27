@@ -21,6 +21,10 @@ const MAX_BW_FILTER_LEN: usize = 2;
 /// equivalent to BBR.ExtraAckedFilterLen <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.11>
 const EXTRA_ACKED_FILTER_LEN: usize = 10;
 
+/// Before BBR has established a full pipe, retain ACK-aggregation evidence for one packet-timed
+/// round so a smaller ACK in the same evidence round cannot erase an earlier aggregation peak.
+const STARTUP_EXTRA_ACKED_FILTER_LEN: usize = 1;
+
 /// safety mechanism to flag packets as stale within our tracking VecDeque. rounds refer to <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1>.
 /// The value of 10 rounds is picked because normally after max(kTimeThreshold * max(smoothed_rtt, latest_rtt), kGranularity) <https://datatracker.ietf.org/doc/html/rfc9002#section-6.1.2>
 /// the packet should have been declared lost already, this is just to guarantee that the VecDeque doesn't grow indefinitely.
@@ -438,6 +442,10 @@ pub struct Bbr3 {
     packets: [VecDeque<BbrPacket>; 3],
     /// equivalent to RS: Per-ACK Rate Sample State <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.2>
     rs: Option<BbrRateSample>,
+    /// True while per-packet delivery callbacks are accumulating the rate sample for one ACK.
+    /// The completed sample remains in `rs` after `on_end_acks` because Quinn performs loss
+    /// detection after ending the ACK batch; the first packet callback of the next ACK replaces it.
+    ack_epoch_open: bool,
     /// equivalent to BBR.rounds_since_bw_probe: rounds since last bw probe state.
     rounds_since_bw_probe: u64,
     /// equivalent to BBR.bw_probe_wait: random wait time before entering probing state again
@@ -609,6 +617,7 @@ impl Bbr3 {
             app_limited: 0,
             lost: 0,
             rs: None,
+            ack_epoch_open: false,
             packets: Default::default(),
             rounds_since_bw_probe: 0,
             bw_probe_wait: Duration::ZERO,
@@ -774,12 +783,17 @@ impl Bbr3 {
             .extra_acked_delivered
             .saturating_sub(expected_delivered);
         extra = Ord::min(extra, self.cwnd);
-        if self.full_bw_reached {
-            self.extra_acked_filter.update_max(self.round_count, extra);
-            self.extra_acked = self.extra_acked_filter.get_max();
+        let filter_len = if self.full_bw_reached {
+            EXTRA_ACKED_FILTER_LEN
         } else {
-            self.extra_acked = extra; // In startup, just remember 1 round
-        }
+            STARTUP_EXTRA_ACKED_FILTER_LEN
+        };
+        self.extra_acked_filter.update_max_with_window(
+            self.round_count,
+            extra,
+            filter_len as u64,
+        );
+        self.extra_acked = self.extra_acked_filter.get_max();
     }
 
     /// equivalent to BBRCheckFullBWReached <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.1.2-6>
@@ -1680,9 +1694,10 @@ impl Controller for Bbr3 {
         self.cwnd_limited_this_round = true;
     }
 
-    /// UpdateRateSample accumulates `C.delivered` and `C.delivered_time` for every ACKed packet,
-    /// independently of the newest-packet branch that folds the rate sample into the model, so
-    /// neither may be conditional on a rate sample already existing.
+    /// UpdateRateSample accumulates `C.delivered` and `C.delivered_time` for every ACKed packet
+    /// and chooses the most recently sent packet as the source of the per-ACK sample state.
+    /// Model and control updates are deferred until `on_end_acks`, after GenerateRateSample has
+    /// produced the current ACK's delivery-rate sample.
     /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-4.1.2.3>
     fn on_ack(
         &mut self,
@@ -1692,9 +1707,15 @@ impl Controller for Bbr3 {
         packet_number: u64,
         space: SpaceId,
         _app_limited: bool,
-        rtt: &RttEstimator,
+        _rtt: &RttEstimator,
     ) {
         self.check_recovery_done(sent);
+        if !self.ack_epoch_open {
+            // InitRateSample: do not carry packet-selection or delivery-rate state across ACKs.
+            // The previous completed sample was retained only for loss detection after its ACK.
+            self.rs = None;
+            self.ack_epoch_open = true;
+        }
         self.delivered += bytes;
         self.delivered_time = Some(now);
         if let Some(mut rate_sample) = self.rs {
@@ -1708,8 +1729,8 @@ impl Controller for Bbr3 {
             if let Some(p) = self.packets[space as usize].get_mut(p_index) {
                 p.acknowledged = true;
                 if let Some(mut rate_sample) = self.rs {
-                    rate_sample.rtt = now - p.send_time;
                     if is_newest_packet {
+                        rate_sample.rtt = now - p.send_time;
                         rate_sample.prior_delivered = p.delivered;
                         rate_sample.is_app_limited = p.is_app_limited;
                         rate_sample.tx_in_flight = p.tx_in_flight;
@@ -1721,18 +1742,10 @@ impl Controller for Bbr3 {
                         self.first_send_time = Some(p.send_time);
                         rate_sample.last_packet = *p;
                         self.rs = Some(rate_sample);
-                        self.update_model_and_state(rate_sample.last_packet, now);
-                        self.update_control_parameters();
-                        // Zero newly_acked after folding so each packet's bytes count once;
-                        // one ACK covers many packets and the model steps run per packet.
-                        if let Some(mut rate_sample) = self.rs {
-                            rate_sample.newly_acked = 0;
-                            self.rs = Some(rate_sample);
-                        }
                     }
                 } else {
                     let rate_sample = BbrRateSample {
-                        rtt: rtt.get(),
+                        rtt: now - p.send_time,
                         interval: Duration::ZERO,
                         delivery_rate: 0.0,
                         is_app_limited: p.is_app_limited,
@@ -1748,13 +1761,6 @@ impl Controller for Bbr3 {
                     };
                     self.rs = Some(rate_sample);
                     self.first_send_time = Some(p.send_time);
-                    self.update_model_and_state(rate_sample.last_packet, now);
-                    self.update_control_parameters();
-                    // Drain newly_acked after folding, as in the branch above.
-                    if let Some(mut rate_sample) = self.rs {
-                        rate_sample.newly_acked = 0;
-                        self.rs = Some(rate_sample);
-                    }
                 }
             }
         }
@@ -1763,7 +1769,7 @@ impl Controller for Bbr3 {
     /// equivalent to GenerateRateSample <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-4.1.2.4>
     fn on_end_acks(
         &mut self,
-        _now: Instant,
+        now: Instant,
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
@@ -1785,23 +1791,31 @@ impl Controller for Bbr3 {
                     }
                 }
             }
-            if let Some(mut rate_sample) = self.rs {
-                rate_sample.interval = Ord::max(rate_sample.send_elapsed, rate_sample.ack_elapsed);
-                rate_sample.delivered = self.delivered.saturating_sub(rate_sample.prior_delivered);
-                // ignore this condition on an initially high min rtt as per <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-4.1.2.3-5>
-                if rate_sample.interval < self.min_rtt
-                    && self.min_rtt != Duration::from_secs(u64::MAX)
-                {
-                    return;
+            if self.ack_epoch_open {
+                if let Some(mut rate_sample) = self.rs {
+                    rate_sample.interval =
+                        Ord::max(rate_sample.send_elapsed, rate_sample.ack_elapsed);
+                    rate_sample.delivered =
+                        self.delivered.saturating_sub(rate_sample.prior_delivered);
+                    // ignore this condition on an initially high min rtt as per <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-4.1.2.3-5>
+                    let valid_interval = rate_sample.interval >= self.min_rtt
+                        || self.min_rtt == Duration::from_secs(u64::MAX);
+                    if valid_interval && rate_sample.interval != Duration::ZERO {
+                        rate_sample.delivery_rate =
+                            rate_sample.delivered as f64 / rate_sample.interval.as_secs_f64();
+                    }
+                    self.rs = Some(rate_sample);
+                    // UpdateOnACK consumes exactly this ACK's completed sample, exactly once.
+                    self.update_model_and_state(rate_sample.last_packet, now);
+                    self.update_control_parameters();
+
+                    // Preserve the completed sample for post-ACK loss processing, but close the
+                    // ACK-local accounting epoch so the next packet callback replaces it.
+                    rate_sample.newly_acked = 0;
+                    rate_sample.lost = 0;
+                    self.rs = Some(rate_sample);
                 }
-                if rate_sample.interval != Duration::ZERO {
-                    rate_sample.delivery_rate =
-                        rate_sample.delivered as f64 / rate_sample.interval.as_secs_f64();
-                }
-                self.rs = Some(rate_sample);
-                rate_sample.newly_acked = 0;
-                rate_sample.lost = 0;
-                self.rs = Some(rate_sample);
+                self.ack_epoch_open = false;
             }
         }
     }
@@ -2018,6 +2032,230 @@ mod test {
     type UndoSnapshot = (Option<BbrState>, f64, u64, u64);
     /// A loss episode: (pre-loss undo snapshot, post-loss state, post-loss inflight_longterm).
     type LossEpisode = (UndoSnapshot, BbrState, u64);
+
+    #[test]
+    fn stretched_ack_consumes_one_current_sample_before_model_and_controls() {
+        let base = Instant::now();
+        let now = base + Duration::from_millis(100);
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+
+        // Three packets from one ACK are reported in a deliberately reordered callback sequence.
+        // Their send-time ordering, not callback order, must select packet 3 for RS state and RTT.
+        for (packet_number, send_offset_ms) in [(1, 0), (2, 10), (3, 20)] {
+            bbr.on_packet_sent(
+                base + Duration::from_millis(send_offset_ms),
+                smss as u16,
+                packet_number,
+                SpaceId::Data,
+            );
+        }
+
+        // Model the completed sample retained after the preceding ACK for post-ACK loss handling.
+        // If packet callbacks consume this stale plateau sample, the first callback increments
+        // full_bw_count to its threshold and falsely exits STARTUP before the current sample exists.
+        // Its newest packet was sent after packets 1 and 2, so the first callback also proves a
+        // reordered older packet starts a fresh ACK-local sample rather than extending this one.
+        let mut prior_packet = bbr.packets[SpaceId::Data as usize][0];
+        prior_packet.packet_number = 0;
+        prior_packet.send_time = base + Duration::from_millis(15);
+        bbr.rs = Some(BbrRateSample {
+            delivery_rate: 10_000.0,
+            is_app_limited: false,
+            interval: Duration::from_millis(100),
+            delivered: smss,
+            prior_delivered: 0,
+            send_elapsed: Duration::ZERO,
+            ack_elapsed: Duration::from_millis(100),
+            rtt: Duration::from_millis(100),
+            tx_in_flight: smss,
+            newly_acked: 0,
+            lost: 0,
+            last_end_seq: 0,
+            last_packet: prior_packet,
+        });
+        bbr.first_send_time = Some(prior_packet.send_time);
+        bbr.full_bw = 10_000.0;
+        bbr.full_bw_count = MAX_FULL_BW_COUNT - 1;
+        bbr.min_rtt = Duration::from_millis(50);
+        bbr.min_rtt_stamp = Some(now);
+        bbr.probe_rtt_min_delay = Duration::from_millis(50);
+        bbr.probe_rtt_min_stamp = Some(now);
+
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let cwnd_before = bbr.cwnd;
+        for (packet_number, send_offset_ms) in [(1, 0), (3, 20), (2, 10)] {
+            bbr.on_ack(
+                now,
+                base + Duration::from_millis(send_offset_ms),
+                smss,
+                packet_number,
+                SpaceId::Data,
+                false,
+                &rtt,
+            );
+
+            assert_eq!(bbr.state, BbrState::Startup);
+            assert_eq!(bbr.round_count, 0);
+            assert_eq!(bbr.full_bw_count, MAX_FULL_BW_COUNT - 1);
+            assert_eq!(bbr.cwnd, cwnd_before);
+        }
+
+        let pending = bbr.rs.expect("current ACK sample");
+        assert_eq!(pending.last_end_seq, 3);
+        assert_eq!(pending.rtt, Duration::from_millis(80));
+        assert_eq!(pending.newly_acked, 3 * smss);
+        assert_eq!(pending.delivery_rate, 0.0);
+
+        bbr.on_end_acks(now, 0, false, Some(3), SpaceId::Data);
+
+        let completed = bbr.rs.expect("completed ACK sample");
+        assert_eq!(completed.last_end_seq, 3);
+        assert_eq!(completed.rtt, Duration::from_millis(80));
+        assert_eq!(completed.interval, Duration::from_millis(100));
+        assert_eq!(completed.delivery_rate, 3.0 * smss as f64 / 0.1);
+        assert_eq!(completed.newly_acked, 0);
+        assert_eq!(completed.lost, 0);
+        assert_eq!(bbr.round_count, 1);
+        assert_eq!(bbr.full_bw_count, 0);
+        assert!(!bbr.full_bw_reached);
+        assert_eq!(bbr.state, BbrState::Startup);
+        assert_eq!(bbr.cwnd, cwnd_before + 3 * smss);
+
+        // The connection applies a probe's final MTU only after ending the ACK transaction.
+        // With ACK-local byte credit already consumed and cleared, recomputing controls cannot
+        // consume a partial batch or credit the stretched ACK a second time.
+        let cwnd_after_ack = bbr.cwnd;
+        bbr.on_mtu_update((smss + 100) as u16);
+        assert_eq!(bbr.cwnd, cwnd_after_ack);
+        let after_mtu = bbr.rs.expect("completed sample survives the MTU callback");
+        assert_eq!(after_mtu.newly_acked, 0);
+        assert_eq!(after_mtu.last_end_seq, 3);
+    }
+
+    #[test]
+    fn invalid_ack_sample_still_updates_once_and_closes_epoch() {
+        let sent = Instant::now();
+        let now = sent + Duration::from_millis(100);
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+        bbr.min_rtt = Duration::from_millis(200);
+        bbr.min_rtt_stamp = Some(now);
+        bbr.probe_rtt_min_delay = Duration::from_millis(200);
+        bbr.probe_rtt_min_stamp = Some(now);
+        bbr.on_packet_sent(sent, smss as u16, 1, SpaceId::Data);
+
+        let cwnd_before = bbr.cwnd;
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        bbr.on_ack(now, sent, smss, 1, SpaceId::Data, false, &rtt);
+        assert_eq!(bbr.round_count, 0);
+        assert_eq!(bbr.cwnd, cwnd_before);
+
+        bbr.on_end_acks(now, 0, false, Some(1), SpaceId::Data);
+
+        let completed = bbr.rs.expect("invalid sample remains available to loss handling");
+        assert!(!bbr.ack_epoch_open);
+        assert_eq!(completed.interval, Duration::from_millis(100));
+        assert_eq!(completed.delivery_rate, 0.0);
+        assert_eq!(completed.newly_acked, 0);
+        assert_eq!(completed.lost, 0);
+        assert_eq!(bbr.round_count, 1);
+        assert_eq!(bbr.cwnd, cwnd_before + smss);
+
+        // The next ACK replaces the retained invalid sample before accumulating bytes, rather
+        // than inheriting its packet selection or zero-rate accounting epoch.
+        let second_sent = now + Duration::from_millis(10);
+        let second_now = second_sent + Duration::from_millis(100);
+        bbr.on_packet_sent(second_sent, smss as u16, 2, SpaceId::Data);
+        bbr.on_ack(
+            second_now,
+            second_sent,
+            smss,
+            2,
+            SpaceId::Data,
+            false,
+            &rtt,
+        );
+        let second_pending = bbr.rs.expect("second ACK-local sample");
+        assert!(bbr.ack_epoch_open);
+        assert_eq!(second_pending.last_end_seq, 2);
+        assert_eq!(second_pending.prior_delivered, smss);
+        assert_eq!(second_pending.newly_acked, smss);
+        assert_eq!(second_pending.delivery_rate, 0.0);
+        assert_eq!(bbr.cwnd, cwnd_before + smss);
+
+        bbr.on_end_acks(second_now, 0, false, Some(2), SpaceId::Data);
+        assert!(!bbr.ack_epoch_open);
+        assert_eq!(bbr.round_count, 2);
+        assert_eq!(bbr.cwnd, cwnd_before + 2 * smss);
+    }
+
+    #[test]
+    fn completed_sample_serves_loss_then_next_ack_replaces_it() {
+        let sent = Instant::now();
+        let now = sent + Duration::from_millis(100);
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+        bbr.min_rtt = Duration::from_millis(50);
+        bbr.min_rtt_stamp = Some(now);
+        bbr.probe_rtt_min_delay = Duration::from_millis(50);
+        bbr.probe_rtt_min_stamp = Some(now);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+
+        bbr.on_packet_sent(sent, smss as u16, 1, SpaceId::Data);
+        bbr.on_ack(now, sent, smss, 1, SpaceId::Data, false, &rtt);
+        bbr.on_end_acks(now, 0, false, Some(1), SpaceId::Data);
+        let completed = bbr.rs.expect("completed sample");
+        assert_eq!(completed.last_end_seq, 1);
+        assert_eq!(completed.lost, 0);
+
+        // Quinn detects packet loss after on_end_acks (and timers can detect it before the next
+        // ACK), so the completed sample must remain available to attribute the loss volume and
+        // send-time inflight while ProbeBW is sampling congestion.
+        bbr.full_bw_reached = true;
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.bw_probe_samples = true;
+        let lost_sent = now + Duration::from_millis(10);
+        // Keep one packet loss below the ProbeBW high-loss threshold so the sample retains the
+        // packet's direct send-time inflight value rather than the loss-prefix crossing point.
+        bbr.inflight = 100 * smss;
+        bbr.on_packet_sent(lost_sent, smss as u16, 2, SpaceId::Data);
+        let loss_transaction = bbr.on_packet_lost(
+            smss as u16,
+            2,
+            SpaceId::Data,
+            lost_sent + Duration::from_millis(100),
+        );
+        assert!(loss_transaction.is_some());
+        let after_loss = bbr.rs.expect("completed sample remains the loss workspace");
+        assert_eq!(after_loss.last_end_seq, 1);
+        assert_eq!(after_loss.tx_in_flight, 101 * smss);
+        assert_eq!(after_loss.lost, smss);
+
+        // Mirror the connection's in-flight removal, then start the next ACK. Its first packet
+        // callback must replace all loss-workspace fields with a fresh ACK-local sample.
+        bbr.inflight = 0;
+        let next_sent = lost_sent + Duration::from_millis(110);
+        let next_now = next_sent + Duration::from_millis(100);
+        bbr.on_packet_sent(next_sent, smss as u16, 3, SpaceId::Data);
+        bbr.on_ack(
+            next_now,
+            next_sent,
+            smss,
+            3,
+            SpaceId::Data,
+            false,
+            &rtt,
+        );
+        let next_pending = bbr.rs.expect("next ACK replaces loss workspace");
+        assert_eq!(next_pending.last_end_seq, 3);
+        assert_eq!(next_pending.newly_acked, smss);
+        assert_eq!(next_pending.lost, 0);
+        assert_eq!(next_pending.delivery_rate, 0.0);
+
+        bbr.on_end_acks(next_now, 0, false, Some(3), SpaceId::Data);
+        assert!(!bbr.ack_epoch_open);
+    }
 
     #[test]
     fn probe_stopping_advances_max_bw_filter_once() {
@@ -4562,6 +4800,114 @@ mod test {
             !entered_probe_rtt,
             "connection must skip PROBE_RTT after restarting from idle (idle_restart set)"
         );
+    }
+
+    #[test]
+    fn startup_extra_acked_retains_peak_for_exactly_one_evidence_round() {
+        let now = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+        bbr.bw = 1_000.0;
+        bbr.cwnd = 10_000;
+        bbr.round_count = 7;
+        bbr.extra_acked_interval_start = Some(now);
+
+        let packet = BbrPacket {
+            delivered: 0,
+            delivered_time: now,
+            first_send_time: now,
+            send_time: now,
+            is_app_limited: false,
+            tx_in_flight: smss,
+            packet_number: 0,
+            space: SpaceId::Data,
+            size: smss as u16,
+            lost: 0,
+            acknowledged: true,
+            stale: false,
+            round_count: 7,
+        };
+        let sample = |newly_acked| BbrRateSample {
+            delivery_rate: 1_000.0,
+            is_app_limited: false,
+            interval: Duration::from_secs(1),
+            delivered: newly_acked,
+            prior_delivered: 0,
+            send_elapsed: Duration::from_secs(1),
+            ack_elapsed: Duration::from_secs(1),
+            rtt: Duration::from_millis(100),
+            tx_in_flight: smss,
+            newly_acked,
+            lost: 0,
+            last_end_seq: 0,
+            last_packet: packet,
+        };
+
+        // Establish a large aggregation peak in round 7.
+        bbr.rs = Some(sample(1_000));
+        bbr.update_ack_aggregation(now);
+        assert_eq!(bbr.extra_acked, 1_000);
+
+        // One second later, expected delivery catches the epoch total and resets the aggregation
+        // epoch. The small ACK that starts the replacement epoch must not erase the peak while
+        // the filter clock is still in the same packet-timed round. The pre-fix direct assignment
+        // produced 100 here and deterministically failed this assertion.
+        bbr.rs = Some(sample(100));
+        bbr.update_ack_aggregation(now + Duration::from_secs(1));
+        assert_eq!(bbr.extra_acked, 1_000);
+
+        // The one-round Startup window keeps that peak for the following evidence round, then
+        // expires it when the clock advances a second round beyond its origin.
+        bbr.round_count = 8;
+        bbr.rs = Some(sample(80));
+        bbr.update_ack_aggregation(now + Duration::from_secs(2));
+        assert_eq!(bbr.extra_acked, 1_000);
+
+        bbr.round_count = 9;
+        bbr.rs = Some(sample(60));
+        bbr.update_ack_aggregation(now + Duration::from_secs(3));
+        assert_eq!(bbr.extra_acked, 80);
+
+        // Expanding the window on the first post-full-pipe ACK retains the still-current Startup
+        // evidence rather than resetting the filter at the phase boundary.
+        bbr.full_bw_reached = true;
+        bbr.round_count = 10;
+        bbr.rs = Some(sample(70));
+        bbr.update_ack_aggregation(now + Duration::from_secs(4));
+        assert_eq!(bbr.extra_acked, 80);
+
+        // Establish a new peak under the ten-round horizon.
+        bbr.extra_acked_delivered = 0;
+        bbr.extra_acked_interval_start = Some(now + Duration::from_secs(4));
+        bbr.rs = Some(sample(2_000));
+        bbr.update_ack_aggregation(now + Duration::from_secs(4));
+        assert_eq!(bbr.extra_acked, 2_000);
+
+        // A spurious Startup loss recovery returns full_bw_reached to false. The next atomic
+        // filter update must therefore shrink the horizon back to one round: retain the peak in
+        // its immediate evidence round, then expire it one further round later.
+        let transaction = RecoveryTransactionId::new(1);
+        bbr.undo_transaction = Some(transaction);
+        bbr.undo_state = Some(BbrState::Startup);
+        bbr.state = BbrState::Drain;
+        bbr.prior_cwnd = bbr.cwnd;
+        assert!(bbr.on_spurious_congestion_event(transaction));
+        assert_eq!(bbr.state, BbrState::Startup);
+        assert!(!bbr.full_bw_reached);
+
+        bbr.round_count = 11;
+        bbr.extra_acked_delivered = 0;
+        bbr.extra_acked_interval_start = Some(now + Duration::from_secs(5));
+        bbr.rs = Some(sample(50));
+        bbr.update_ack_aggregation(now + Duration::from_secs(5));
+        assert_eq!(bbr.extra_acked, 2_000);
+
+        bbr.round_count = 12;
+        bbr.extra_acked_delivered = 0;
+        bbr.extra_acked_interval_start = Some(now + Duration::from_secs(6));
+        bbr.rs = Some(sample(40));
+        bbr.update_ack_aggregation(now + Duration::from_secs(6));
+        assert_eq!(bbr.extra_acked, 50);
     }
 
     /// A.12: Achieving expected STARTUP bandwidth on a link with ACK aggregation.
@@ -7326,10 +7672,9 @@ mod test {
                 inflight -= MSS;
                 rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
 
-                // update_max_bw runs inside on_ack, on the sample already pending from
-                // the previous on_end_acks. Snapshot max_bw and state around on_ack, and
-                // read that sample (bbr.rs) between on_ack and on_end_acks: that is
-                // exactly what update_max_bw's guard consumed.
+                // GenerateRateSample and update_max_bw run once at on_end_acks. Snapshot max_bw
+                // and state around the complete ACK transaction, then inspect the completed
+                // current sample that update_max_bw's app-limited guard consumed.
                 let state_before = bbr.state;
                 let max_bw_before = bbr.max_bw;
                 bbr.on_ack(
@@ -7341,9 +7686,6 @@ mod test {
                     app_limited_phase,
                     &rtt_est,
                 );
-                let max_bw_after = bbr.max_bw;
-                let state_after = bbr.state;
-                let sample = bbr.rs;
                 bbr.on_end_acks(
                     at(now_ns),
                     inflight,
@@ -7351,6 +7693,9 @@ mod test {
                     Some(p.pn),
                     SpaceId::Data,
                 );
+                let max_bw_after = bbr.max_bw;
+                let state_after = bbr.state;
+                let sample = bbr.rs;
 
                 // Flip to the application-limited phase the moment PROBE_BW is entered,
                 // so the pipe drains to APP_WINDOW during PROBE_DOWN and the first

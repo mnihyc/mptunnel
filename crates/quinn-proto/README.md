@@ -29,6 +29,15 @@ deviations from upstream 0.11.16 are:
 - BBR3 publishes byte-per-second pacing and bandwidth metrics plus its send
   quantum. Quinn's single token-bucket pacer preserves sub-byte elapsed credit,
   and the connection bounds the actual GSO batch by that quantum;
+- BBR3 treats each received ACK as one draft-06 transaction: per-packet
+  callbacks initialize and accumulate one ACK-local rate sample using the
+  newest packet's send state, then ACK-batch completion generates the current
+  rate and runs the model and controls exactly once. The completed sample is
+  retained until the next ACK epoch for Quinn's post-ACK or timer-driven loss
+  detection;
+- draft-06 section 5.5.9 ACK aggregation feeds every completed ACK into one
+  dynamic windowed maximum atomically: its horizon is one packet-timed round
+  before `full_bw_reached` and ten rounds afterwards;
 - an opt-in controller hook lets a genuinely new network path start fresh
   congestion state while retaining a connection-scoped instrumentation owner;
   controllers that do not implement the hook retain Quinn's factory-reset
@@ -86,12 +95,15 @@ dependency housekeeping. Use a clean worktree and one exact candidate version:
    private Initial, H3 compatibility, `SpaceId`, legacy BBR compatibility, and
    ACK-derived MPTUNNEL telemetry.
 4. Run formatting and a source-diff review. The BBR3 model must pass its
-   focused lifecycle, A.15, precautionary-transition, packet-feasibility, and
-   spurious-recovery tests, followed by the full BBR3 controller suite.
+   focused lifecycle, stretched/reordered ACK-epoch, invalid-rate-sample,
+   Startup ACK-aggregation window-boundary, A.15, precautionary-transition,
+   packet-feasibility, and spurious-recovery tests, followed by the full BBR3
+   controller suite.
 5. Run focused connection tests for partial/final/expired and cross-space late
    ACKs, recovery-transaction completion and CE/expiry taint, controller/path
-   ownership, ACK-only loss, ECN attribution, pacing-only blocking, and the
-   actual send-quantum GSO bound.
+   ownership, Retry ACK closure, ACK/MTU callback serialization, ACK-only loss,
+   ECN attribution, pacing-only blocking, and the actual send-quantum GSO
+   bound.
 6. With one external target directory, run the full `quinn-proto` suite,
    MPTUNNEL's focused QUIC wrapper tests, and the workspace check. Compiling
    without the protected tests is not an update.

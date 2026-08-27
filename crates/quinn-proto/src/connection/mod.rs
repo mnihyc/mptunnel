@@ -1569,6 +1569,7 @@ impl Connection {
         let mut live_ecn_marked_packets = 0u64;
         let mut live_ecn_marked_noncurrent_epoch = false;
         let mut largest_current_live_ecn_acked = None;
+        let mut mtu_updated = false;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
                 let ecn_marked = info.ecn_marked;
@@ -1594,12 +1595,7 @@ impl Connection {
                 }
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
-                let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
-                if mtu_updated {
-                    self.path
-                        .congestion
-                        .on_mtu_update(self.path.mtud.current_mtu());
-                }
+                mtu_updated |= self.path.mtud.on_acked(space, packet, info.size);
 
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
@@ -1629,6 +1625,14 @@ impl Connection {
                 Some(largest_packet),
                 space,
             );
+        }
+        if mtu_updated {
+            // MTUD state changes immediately, but congestion-controller callbacks are serialized:
+            // one received ACK is one complete controller transaction, followed by at most one
+            // notification carrying the final MTU reached by that ACK.
+            self.path
+                .congestion
+                .on_mtu_update(self.path.mtud.current_mtu());
         }
 
         if new_largest {
@@ -2759,7 +2763,21 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, 0, SpaceId::Initial, info);
+                    if self
+                        .on_packet_acked(now, 0, SpaceId::Initial, info)
+                        .is_some()
+                    {
+                        // Retry implicitly acknowledges the first Initial. Pair the synthetic
+                        // per-packet callback with the same ACK-batch boundary as a wire ACK so
+                        // rate-sampling controllers never retain an open Initial-space epoch.
+                        self.path.congestion.on_end_acks(
+                            now,
+                            self.path.in_flight.bytes,
+                            self.app_limited,
+                            Some(0),
+                            SpaceId::Initial,
+                        );
+                    }
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials

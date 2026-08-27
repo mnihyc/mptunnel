@@ -51,6 +51,22 @@ impl MaxFilter {
         self.subwin_update(sample);
     }
 
+    /// Update the tracked maximum using an explicit time horizon for this update.
+    ///
+    /// This is the atomic form of the draft's `UpdateWindowedMaxFilter(...,
+    /// window_length=...)`: ACK-aggregation selects a one-round horizon before a full pipe is
+    /// established and a longer horizon afterwards. Existing in-window evidence is retained
+    /// when the horizon changes and normal update expiry applies the new boundary immediately.
+    pub(super) fn update_max_with_window(
+        &mut self,
+        current_round: u64,
+        measurement: u64,
+        window: u64,
+    ) {
+        self.window = window;
+        self.update_max(current_round, measurement);
+    }
+
     /// As time advances, update the 1st, 2nd, and 3rd choices
     fn subwin_update(&mut self, sample: MaxSample) {
         let dt = sample.round.saturating_sub(self.samples[0].round);
@@ -151,5 +167,28 @@ mod test {
         assert_eq!(100, max_filter.get_max());
         max_filter.update_max(round + 18, 130);
         assert_eq!(130, max_filter.get_max());
+    }
+
+    #[test]
+    fn changing_window_changes_peak_lifetime_without_erasing_current_evidence() {
+        let mut max_filter = MaxFilter::new(10);
+
+        // A one-round horizon keeps the peak throughout its round and the following evidence
+        // round, then expires it when the filter clock advances two rounds beyond the peak.
+        max_filter.update_max_with_window(7, 100, 1);
+        max_filter.update_max_with_window(7, 10, 1);
+        assert_eq!(100, max_filter.get_max());
+        max_filter.update_max_with_window(8, 9, 1);
+        assert_eq!(100, max_filter.get_max());
+        max_filter.update_max_with_window(9, 8, 1);
+        assert_eq!(9, max_filter.get_max());
+
+        // Expanding the horizon retains the current evidence and applies the longer lifetime to
+        // subsequent samples without reconstructing already-expired history.
+        max_filter.update_max_with_window(9, 200, 10);
+        max_filter.update_max_with_window(19, 20, 10);
+        assert_eq!(200, max_filter.get_max());
+        max_filter.update_max_with_window(20, 15, 10);
+        assert_eq!(20, max_filter.get_max());
     }
 }

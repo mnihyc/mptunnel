@@ -24,6 +24,41 @@ fn stateless_retry() {
 }
 
 #[test]
+fn retry_implicit_initial_ack_closes_its_controller_epoch() {
+    let _guard = subscribe();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    pair.connect_with(traced_client_config(events.clone()));
+
+    let events = events.lock().unwrap();
+    let matches = events
+        .windows(2)
+        .filter(|events| {
+            matches!(
+                events,
+                [
+                    ControllerTraceEvent::Ack {
+                        space: SpaceId::Initial,
+                        packet_number: 0,
+                        ..
+                    },
+                    ControllerTraceEvent::End {
+                        space: SpaceId::Initial,
+                        largest_packet_number: 0,
+                    }
+                ]
+            )
+        })
+        .count();
+
+    assert_eq!(
+        matches, 1,
+        "Retry must emit exactly one adjacent Initial ACK/end pair: {events:?}"
+    );
+}
+
+#[test]
 fn retry_token_expired() {
     let _guard = subscribe();
 

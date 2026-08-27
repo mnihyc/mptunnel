@@ -52,6 +52,11 @@ pub(super) struct PathData {
 
     /// Tag uniquely identifying a path in a connection
     generation: u64,
+    /// Identity of the congestion-controller model that owns packet callbacks.
+    ///
+    /// NAT rebinding preserves this value because it clones the same model. A fresh network path
+    /// or explicit reset advances it so delayed evidence cannot mutate the replacement model.
+    controller_epoch: u64,
 }
 
 impl PathData {
@@ -154,6 +159,7 @@ impl PathData {
             #[cfg(feature = "qlog")]
             recovery_metrics: RecoveryMetrics::default(),
             generation,
+            controller_epoch: generation,
         }
     }
 
@@ -168,7 +174,12 @@ impl PathData {
         Self {
             remote,
             rtt: prev.rtt,
-            pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
+            pacing: Pacer::new(
+                smoothed_rtt,
+                congestion.window(),
+                prev.current_mtu(),
+                now,
+            ),
             sending_ecn: true,
             congestion,
             challenge: None,
@@ -183,13 +194,19 @@ impl PathData {
             #[cfg(feature = "qlog")]
             recovery_metrics: prev.recovery_metrics.clone(),
             generation,
+            controller_epoch: prev.controller_epoch,
         }
     }
 
     /// Resets RTT, congestion control and MTU states.
     ///
     /// This is useful when it is known the underlying path has changed.
-    pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
+    pub(super) fn reset(
+        &mut self,
+        now: Instant,
+        config: &TransportConfig,
+        controller_epoch: u64,
+    ) {
         self.rtt = RttEstimator::new(config.initial_rtt);
         let current_mtu = config.get_initial_mtu();
         self.congestion = self
@@ -201,6 +218,8 @@ impl PathData {
                     .clone()
                     .build(now, current_mtu)
             });
+        self.controller_epoch = controller_epoch;
+        self.first_packet_after_rtt_sample = None;
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
     }
 
@@ -261,6 +280,10 @@ impl PathData {
 
     pub(super) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(super) fn controller_epoch(&self) -> u64 {
+        self.controller_epoch
     }
 }
 
@@ -350,7 +373,7 @@ pub struct RttEstimator {
 }
 
 impl RttEstimator {
-    fn new(initial_rtt: Duration) -> Self {
+    pub(crate) fn new(initial_rtt: Duration) -> Self {
         Self {
             latest: initial_rtt,
             smoothed: None,
@@ -492,7 +515,10 @@ mod tests {
             _now: Instant,
             _sent: Instant,
             _is_persistent_congestion: bool,
+            _is_ecn: bool,
             _lost_bytes: u64,
+            _largest_lost: u64,
+            _space: crate::packet::SpaceId,
         ) {
         }
 
@@ -570,6 +596,7 @@ mod tests {
         config.congestion_controller_factory(factory.clone());
         let now = Instant::now();
         let initial = path(&config, 0, now);
+        assert_eq!(initial.controller_epoch(), 0);
 
         let rebound = PathData::from_previous(
             "127.0.0.1:8443".parse().expect("rebound address"),
@@ -579,6 +606,7 @@ mod tests {
         );
         assert_eq!(controller(&rebound).lineage, controller(&initial).lineage);
         assert_eq!(controller(&rebound).epoch, controller(&initial).epoch);
+        assert_eq!(rebound.controller_epoch(), initial.controller_epoch());
 
         let mut migrated = PathData::for_new_network_path(
             "[::1]:443".parse().expect("new network address"),
@@ -591,11 +619,13 @@ mod tests {
         );
         assert_eq!(controller(&migrated).lineage, controller(&initial).lineage);
         assert_eq!(controller(&migrated).epoch, controller(&initial).epoch + 1);
+        assert_eq!(migrated.controller_epoch(), 2);
         assert_eq!(factory.builds.load(Ordering::Relaxed), 1);
 
-        migrated.reset(now, &config);
+        migrated.reset(now, &config, 3);
         assert_eq!(controller(&migrated).lineage, controller(&initial).lineage);
         assert_eq!(controller(&migrated).epoch, controller(&initial).epoch + 2);
+        assert_eq!(migrated.controller_epoch(), 3);
         assert_eq!(factory.builds.load(Ordering::Relaxed), 1);
     }
 

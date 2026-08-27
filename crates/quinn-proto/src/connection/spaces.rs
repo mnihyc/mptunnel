@@ -11,7 +11,8 @@ use tracing::trace;
 
 use super::assembler::Assembler;
 use crate::{
-    congestion::PacketDeliveryState, connection::StreamsState, crypto::Keys, frame,
+    congestion::{PacketDeliveryState, RecoveryTransactionId}, connection::StreamsState,
+    crypto::Keys, frame,
     packet::SpaceId, range_set::ArrayRangeSet, shared::IssuedCid, Dir, Duration, Instant,
     SocketAddr, StreamId, TransportError, VarInt,
 };
@@ -32,7 +33,6 @@ pub(super) struct PacketSpace {
     pub(super) next_packet_number: u64,
     /// The largest packet number the remote peer acknowledged in an ACK frame.
     pub(super) largest_acked_packet: Option<u64>,
-    pub(super) largest_acked_packet_sent: Instant,
     /// The highest-numbered ACK-eliciting packet we've sent
     pub(super) largest_ack_eliciting_sent: u64,
     /// Number of packets in `sent_packets` with numbers above `largest_ack_eliciting_sent`
@@ -40,6 +40,8 @@ pub(super) struct PacketSpace {
     /// Transmitted but not acked
     // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
     pub(super) sent_packets: BTreeMap<u64, SentPacket>,
+    /// Packets retained after loss declaration so late ACKs can identify a spurious episode.
+    pub(super) lost_packets: BTreeMap<u64, LostPacket>,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -69,8 +71,16 @@ pub(super) struct PacketSpace {
     pub(super) sent_with_keys: u64,
 }
 
+/// Result of validating a cumulative ACK_ECN block against the previous in-order block.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) struct EcnValidation {
+    pub(super) congestion_experienced: bool,
+    /// Total ECT(0), ECT(1), and CE counter increase since the prior validation point.
+    pub(super) total_increase: u64,
+}
+
 impl PacketSpace {
-    pub(super) fn new(now: Instant) -> Self {
+    pub(super) fn new(_now: Instant) -> Self {
         Self {
             crypto: None,
             dedup: Dedup::new(),
@@ -81,10 +91,10 @@ impl PacketSpace {
 
             next_packet_number: 0,
             largest_acked_packet: None,
-            largest_acked_packet_sent: now,
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
             sent_packets: BTreeMap::new(),
+            lost_packets: BTreeMap::new(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -174,9 +184,9 @@ impl PacketSpace {
     /// Verifies sanity of an ECN block and returns whether congestion was encountered.
     pub(super) fn detect_ecn(
         &mut self,
-        newly_acked: u64,
+        accounted_ect0: u64,
         ecn: frame::EcnCounts,
-    ) -> Result<bool, &'static str> {
+    ) -> Result<EcnValidation, &'static str> {
         let ect0_increase = ecn
             .ect0
             .checked_sub(self.ecn_feedback.ect0)
@@ -190,18 +200,22 @@ impl PacketSpace {
             .checked_sub(self.ecn_feedback.ce)
             .ok_or("peer CE count regression")?;
         let total_increase = ect0_increase + ect1_increase + ce_increase;
-        if total_increase < newly_acked {
+        if total_increase < accounted_ect0 {
             return Err("ECN bleaching");
         }
-        if (ect0_increase + ce_increase) < newly_acked || ect1_increase != 0 {
+        if (ect0_increase + ce_increase) < accounted_ect0 || ect1_increase != 0 {
             return Err("ECN corruption");
         }
-        // If total_increase > newly_acked (which happens when ACKs are lost), this is required by
+        // If total_increase > accounted_ect0 (which happens when ACK feedback is lost or
+        // reordered), this is required by
         // the draft so that long-term drift does not occur. If =, then the only question is whether
         // to count CE packets as CE or ECT0. Recording them as CE is more consistent and keeps the
         // congestion check obvious.
         self.ecn_feedback = ecn;
-        Ok(ce_increase != 0)
+        Ok(EcnValidation {
+            congestion_experienced: ce_increase != 0,
+            total_increase,
+        })
     }
 
     /// Stop tracking sent packet `number`, and return what we knew about it
@@ -283,12 +297,19 @@ impl IndexMut<SpaceId> for [PacketSpace; 3] {
 pub(super) struct SentPacket {
     /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was sent
     pub(super) path_generation: u64,
+    /// Congestion-controller model that owns this packet's delivery/loss callbacks.
+    pub(super) controller_epoch: u64,
+    /// Whether this packet was transmitted with an ECN-capable codepoint.
+    pub(super) ecn_marked: bool,
     /// The time the packet was sent.
     pub(super) time_sent: Instant,
+    /// Compact congestion-controller delivery state captured when the packet entered flight.
+    /// Read only through [`Self::delivery_state`] because controllers may return no payload.
+    pub(super) delivery_state_payload: StoredPacketDeliveryState,
+    /// Whether [`Self::delivery_state_payload`] contains controller-provided state.
+    pub(super) has_delivery_state: bool,
     /// Whether the sender lacked application data when this packet entered flight.
     pub(super) app_limited: bool,
-    /// Congestion-controller delivery state captured when the packet entered flight.
-    pub(super) delivery_state: Option<PacketDeliveryState>,
     /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
     /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
     /// "in flight" packet.
@@ -305,6 +326,77 @@ pub(super) struct SentPacket {
     ///
     /// The actual application data is stored with the stream state.
     pub(super) stream_frames: frame::StreamMetaVec,
+}
+
+impl SentPacket {
+    pub(super) fn store_delivery_state(
+        time_sent: Instant,
+        state: Option<PacketDeliveryState>,
+    ) -> (StoredPacketDeliveryState, bool) {
+        let Some(state) = state else {
+            return (StoredPacketDeliveryState::EMPTY, false);
+        };
+        let delivered_before_send_ns = u64::try_from(
+            time_sent
+                .saturating_duration_since(state.delivered_time)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        (
+            StoredPacketDeliveryState {
+                delivered: state.delivered,
+                delivered_before_send_ns,
+                send_elapsed_ns: state.send_elapsed_ns,
+            },
+            true,
+        )
+    }
+
+    pub(super) fn delivery_state(&self) -> Option<PacketDeliveryState> {
+        self.has_delivery_state.then(|| PacketDeliveryState {
+            delivered: self.delivery_state_payload.delivered,
+            delivered_time: self
+                .time_sent
+                .checked_sub(Duration::from_nanos(
+                    self.delivery_state_payload.delivered_before_send_ns,
+                ))
+                .unwrap_or(self.time_sent),
+            send_elapsed_ns: self.delivery_state_payload.send_elapsed_ns,
+        })
+    }
+}
+
+/// Storage form of [`PacketDeliveryState`] relative to [`SentPacket::time_sent`].
+///
+/// The controller contract makes `delivered_time` a prior-delivery timestamp, so storing its
+/// distance from the send time retains the full useful range in 24 bytes. A `u64` nanosecond
+/// duration spans roughly 584 years, matching the existing compact send-elapsed representation.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StoredPacketDeliveryState {
+    delivered: u64,
+    delivered_before_send_ns: u64,
+    send_elapsed_ns: u64,
+}
+
+impl StoredPacketDeliveryState {
+    const EMPTY: Self = Self {
+        delivered: 0,
+        delivered_before_send_ns: 0,
+        send_elapsed_ns: 0,
+    };
+}
+
+/// Minimal retained evidence for a packet declared lost.
+#[derive(Debug)]
+pub(super) struct LostPacket {
+    /// Original transmission time, used to expire evidence after two PTOs.
+    pub(super) time_sent: Instant,
+    /// Congestion-controller model whose loss episode retained this evidence.
+    pub(super) controller_epoch: u64,
+    /// Exact controller undo transaction, if this loss can contribute proof of spurious recovery.
+    pub(super) recovery_transaction: Option<RecoveryTransactionId>,
+    /// Whether the original transmission carried an ECN-capable codepoint.
+    pub(super) ecn_marked: bool,
 }
 
 /// Retransmittable data queue
@@ -1090,5 +1182,41 @@ mod test {
         // over time.
         let size = std::mem::size_of::<SentPacket>();
         assert!(size <= 128, "SentPacket grew to {size} bytes");
+    }
+
+    #[test]
+    fn sent_packet_delivery_state_accessor_preserves_some_and_none() {
+        fn packet(now: Instant, state: Option<PacketDeliveryState>) -> SentPacket {
+            let (delivery_state_payload, has_delivery_state) =
+                SentPacket::store_delivery_state(now, state);
+            SentPacket {
+                path_generation: 0,
+                controller_epoch: 0,
+                ecn_marked: false,
+                time_sent: now,
+                delivery_state_payload,
+                has_delivery_state,
+                app_limited: false,
+                size: 0,
+                ack_eliciting: false,
+                largest_acked: None,
+                retransmits: ThinRetransmits::default(),
+                stream_frames: frame::StreamMetaVec::default(),
+            }
+        }
+
+        let now = Instant::now();
+        let expected = PacketDeliveryState {
+            delivered: 41,
+            delivered_time: now.checked_sub(Duration::from_millis(7)).unwrap(),
+            send_elapsed_ns: 17,
+        };
+        let actual = packet(now, Some(expected))
+            .delivery_state()
+            .expect("present controller state must round-trip");
+        assert_eq!(actual.delivered, expected.delivered);
+        assert_eq!(actual.delivered_time, expected.delivered_time);
+        assert_eq!(actual.send_elapsed_ns, expected.send_elapsed_ns);
+        assert!(packet(now, None).delivery_state().is_none());
     }
 }

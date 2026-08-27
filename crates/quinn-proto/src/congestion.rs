@@ -1,17 +1,34 @@
 //! Logic for controlling the rate at which data is sent
 
 use crate::connection::RttEstimator;
-use crate::Instant;
+pub use crate::packet::SpaceId;
+use crate::{Duration, Instant};
 use std::any::Any;
 use std::sync::Arc;
 
 mod bbr;
+mod bbr3;
 mod cubic;
 mod new_reno;
 
 pub use bbr::{Bbr, BbrConfig};
+pub use bbr3::{Bbr3, Bbr3Config};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
+
+/// Opaque identity of one congestion-controller recovery/undo transaction.
+///
+/// The transport retains this with declared-loss evidence so a late ACK can only undo the exact
+/// model snapshot created by the corresponding RFC 9002 recovery episode.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct RecoveryTransactionId(pub(crate) u64);
+
+impl RecoveryTransactionId {
+    /// Construct an identity unique within one controller instance.
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
@@ -27,10 +44,14 @@ pub trait Controller: Send + Sync {
         bytes: u16,
         prior_in_flight: u64,
         packet_number: u64,
+        space: SpaceId,
         app_limited: bool,
     ) -> Option<PacketDeliveryState> {
         None
     }
+
+    /// The connection had data to send but was blocked by the congestion window.
+    fn on_cwnd_limited(&mut self) {}
 
     /// Packet deliveries were confirmed
     ///
@@ -42,6 +63,8 @@ pub trait Controller: Send + Sync {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        packet_number: u64,
+        space: SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -56,10 +79,19 @@ pub trait Controller: Send + Sync {
         bytes: u64,
         app_limited: bool,
         packet_number: u64,
+        space: SpaceId,
         packet_state: Option<PacketDeliveryState>,
         rtt: &RttEstimator,
     ) {
-        self.on_ack(now, sent, bytes, app_limited, rtt);
+        self.on_ack(
+            now,
+            sent,
+            bytes,
+            packet_number,
+            space,
+            app_limited,
+            rtt,
+        );
     }
 
     /// Packets are acked in batches, all with the same `now` argument. This indicates one of those batches has completed.
@@ -70,6 +102,7 @@ pub trait Controller: Send + Sync {
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
+        space: SpaceId,
     ) {
     }
 
@@ -84,11 +117,48 @@ pub trait Controller: Send + Sync {
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
+        is_ecn: bool,
         lost_bytes: u64,
+        largest_lost: u64,
+        space: SpaceId,
     );
+
+    /// One packet was just lost.
+    #[allow(unused_variables)]
+    fn on_packet_lost(
+        &mut self,
+        lost_bytes: u16,
+        packet_number: u64,
+        space: SpaceId,
+        now: Instant,
+    ) -> Option<RecoveryTransactionId> {
+        None
+    }
+
+    /// All retained packets from one recovery transaction were acknowledged late.
+    #[allow(unused_variables)]
+    fn on_spurious_congestion_event(&mut self, transaction: RecoveryTransactionId) -> bool {
+        false
+    }
+
+    /// Retained evidence for a recovery transaction expired or became ambiguous.
+    #[allow(unused_variables)]
+    fn on_recovery_transaction_abandoned(&mut self, transaction: RecoveryTransactionId) {}
+
+    /// A transport-valid CE interval makes any packet-loss undo snapshot ambiguous.
+    fn on_validated_ecn_congestion_event(&mut self) {}
 
     /// The known MTU for the current network path has been updated
     fn on_mtu_update(&mut self, new_mtu: u16);
+
+    /// The peer's ACK-frequency parameters have changed.
+    #[allow(unused_variables)]
+    fn on_ack_frequency_update(
+        &mut self,
+        ack_eliciting_threshold: u64,
+        requested_max_ack_delay: Duration,
+    ) {
+    }
 
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
@@ -99,12 +169,16 @@ pub trait Controller: Send + Sync {
             congestion_window: self.window(),
             ssthresh: None,
             pacing_rate: None,
+            bandwidth_estimate: None,
+            send_quantum: None,
         }
     }
 
-    /// Controller-selected pacing rate in bytes per second.
+    /// Legacy compatibility hook for downstream controllers.
+    ///
+    /// Quinn's pacer consumes [`ControllerMetrics::pacing_rate`] exclusively.
     fn pacing_rate(&self) -> Option<u64> {
-        None
+        self.metrics().pacing_rate
     }
 
     /// Duplicate the controller's state
@@ -149,8 +223,12 @@ pub struct ControllerMetrics {
     pub congestion_window: u64,
     /// Slow start threshold (bytes)
     pub ssthresh: Option<u64>,
-    /// Pacing rate (bits/s)
+    /// Pacing rate (bytes/s)
     pub pacing_rate: Option<u64>,
+    /// Estimated sustainable path bandwidth (bytes/s)
+    pub bandwidth_estimate: Option<u64>,
+    /// Controller-selected maximum send batch (bytes)
+    pub send_quantum: Option<u64>,
 }
 
 /// Constructs controllers on demand

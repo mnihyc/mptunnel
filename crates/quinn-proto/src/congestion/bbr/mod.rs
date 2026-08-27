@@ -401,6 +401,7 @@ impl Controller for Bbr {
         bytes: u16,
         prior_in_flight: u64,
         packet_number: u64,
+        _space: crate::congestion::SpaceId,
         app_limited: bool,
     ) -> Option<PacketDeliveryState> {
         Some(self.max_bandwidth.on_packet_sent(
@@ -417,6 +418,8 @@ impl Controller for Bbr {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        _packet_number: u64,
+        _space: crate::congestion::SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -430,6 +433,7 @@ impl Controller for Bbr {
         bytes: u64,
         app_limited: bool,
         packet_number: u64,
+        _space: crate::congestion::SpaceId,
         packet_state: Option<PacketDeliveryState>,
         rtt: &RttEstimator,
     ) {
@@ -450,6 +454,7 @@ impl Controller for Bbr {
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
+        _space: crate::congestion::SpaceId,
     ) {
         let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
         let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
@@ -503,7 +508,10 @@ impl Controller for Bbr {
         _now: Instant,
         _sent: Instant,
         _is_persistent_congestion: bool,
+        _is_ecn: bool,
         lost_bytes: u64,
+        _largest_lost: u64,
+        _space: crate::congestion::SpaceId,
     ) {
         self.loss_state.lost_bytes += lost_bytes;
     }
@@ -528,7 +536,9 @@ impl Controller for Bbr {
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
-            pacing_rate: Some(self.pacing_rate * 8),
+            pacing_rate: (self.pacing_rate != 0).then_some(self.pacing_rate),
+            bandwidth_estimate: None,
+            send_quantum: None,
         }
     }
 

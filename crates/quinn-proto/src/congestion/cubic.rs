@@ -96,6 +96,8 @@ impl Controller for Cubic {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        _packet_number: u64,
+        _space: crate::congestion::SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -167,7 +169,10 @@ impl Controller for Cubic {
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
+        _is_ecn: bool,
         _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: crate::congestion::SpaceId,
     ) {
         if self
             .recovery_start_time
@@ -226,6 +231,8 @@ impl Controller for Cubic {
             congestion_window: self.window(),
             ssthresh: Some(self.ssthresh),
             pacing_rate: None,
+            bandwidth_estimate: None,
+            send_quantum: None,
         }
     }
 
@@ -287,7 +294,15 @@ mod tests {
         cubic.ssthresh = window;
         cubic.cubic_state.w_max = 12.0 * BASE_DATAGRAM_SIZE as f64;
 
-        cubic.on_congestion_event(now, now + Duration::from_millis(1), false, 0);
+        cubic.on_congestion_event(
+            now,
+            now + Duration::from_millis(1),
+            false,
+            false,
+            0,
+            0,
+            crate::congestion::SpaceId::Data,
+        );
 
         assert_eq!(
             cubic.cubic_state.w_max,

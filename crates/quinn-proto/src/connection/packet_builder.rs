@@ -7,7 +7,7 @@ use crate::{
     connection::ConnectionSide,
     frame::{self, Close},
     packet::{Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId, FIXED_BIT},
-    ConnectionId, Instant, TransportError, TransportErrorCode,
+    ConnectionId, EcnCodepoint, Instant, TransportError, TransportErrorCode,
 };
 
 pub(super) struct PacketBuilder {
@@ -184,6 +184,7 @@ impl PacketBuilder {
     pub(super) fn finish_and_track(
         self,
         now: Instant,
+        transmit_ecn: Option<EcnCodepoint>,
         conn: &mut Connection,
         sent: Option<SentFrames>,
         buffer: &mut Vec<u8>,
@@ -208,18 +209,26 @@ impl PacketBuilder {
                 size,
                 conn.path.in_flight.bytes,
                 exact_number,
+                space_id,
                 conn.app_limited,
             )
         } else {
             None
         };
+        let (delivery_state_payload, has_delivery_state) =
+            SentPacket::store_delivery_state(now, delivery_state);
 
         let packet = SentPacket {
             path_generation: conn.path.generation(),
+            controller_epoch: conn.path.controller_epoch(),
+            // This is supplied by the caller from the codepoint on the actual `Transmit`; path
+            // policy alone is insufficient for the deliberately unmarked off-path response.
+            ecn_marked: transmit_ecn.is_some(),
             largest_acked: sent.largest_acked,
             time_sent: now,
+            delivery_state_payload,
+            has_delivery_state,
             app_limited: conn.app_limited,
-            delivery_state,
             size,
             ack_eliciting,
             retransmits: sent.retransmits,

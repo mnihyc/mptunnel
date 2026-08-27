@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     convert::TryFrom,
     fmt, io, mem,
     net::{IpAddr, SocketAddr},
@@ -18,6 +18,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
+    congestion::RecoveryTransactionId,
     config::{ServerConfig, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
@@ -72,7 +73,10 @@ mod spaces;
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use spaces::{
+    EcnValidation, LostPacket, PacketNumberFilter, PacketSpace, SendableFrames, SentPacket,
+    ThinRetransmits,
+};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -495,6 +499,14 @@ impl Connection {
             false => 1,
             true => max_datagrams,
         };
+        let controller_metrics = self.path.congestion.metrics();
+        let max_datagrams = match controller_metrics.send_quantum {
+            Some(send_quantum) => {
+                let datagrams = send_quantum / u64::from(self.path.current_mtu());
+                max_datagrams.min(usize::try_from(datagrams).unwrap_or(usize::MAX).max(1))
+            }
+            None => max_datagrams,
+        };
 
         let mut num_datagrams = 0;
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
@@ -505,6 +517,10 @@ impl Connection {
         if let Some(challenge) = self.send_path_challenge(now, buf) {
             return Some(challenge);
         }
+        // Every normally emitted datagram in this poll uses this exact codepoint. Pass the same
+        // decision into packet tracking so later ECN validation counts only packets that were
+        // actually marked on the wire.
+        let transmit_ecn = self.path.sending_ecn.then_some(EcnCodepoint::Ect0);
 
         // If we need to send a probe, make sure we have something to send.
         for space in SpaceId::iter() {
@@ -550,7 +566,10 @@ impl Connection {
         let mut sent_frames = None;
         let mut pad_datagram = false;
         let mut pad_datagram_to_mtu = false;
-        let mut congestion_blocked = false;
+        // Pacing and congestion-window stalls both mean the application was not the limiter.
+        let mut send_blocked = false;
+        // Only a full congestion window supplies BBR's C.is_cwnd_limited signal.
+        let mut cwnd_blocked = false;
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -638,9 +657,10 @@ impl Connection {
                     debug_assert!(untracked_bytes <= segment_size as u64);
 
                     let bytes_to_send = segment_size as u64 + untracked_bytes;
-                    if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
+                    if self.path.in_flight.bytes + bytes_to_send > self.path.congestion.window() {
                         space_idx += 1;
-                        congestion_blocked = true;
+                        send_blocked = true;
+                        cwnd_blocked = true;
                         // We continue instead of breaking here in order to avoid
                         // blocking loss probes queued for higher spaces.
                         trace!("blocked by congestion control");
@@ -649,17 +669,15 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    let pacing_rate = self.path.congestion.pacing_rate();
                     if let Some(delay) = self.path.pacing.delay(
                         smoothed_rtt,
                         bytes_to_send,
                         self.path.current_mtu(),
-                        self.path.congestion.window(),
                         now,
-                        pacing_rate,
+                        &controller_metrics,
                     ) {
                         self.timers.set(Timer::Pacing, delay);
-                        congestion_blocked = true;
+                        send_blocked = true;
                         // Loss probes should be subject to pacing, even though
                         // they are not congestion controlled.
                         trace!("blocked by pacing");
@@ -707,7 +725,13 @@ impl Connection {
                         builder.pad_to(segment_size as u16);
                     }
 
-                    builder.finish_and_track(now, self, sent_frames.take(), buf);
+                    builder.finish_and_track(
+                        now,
+                        transmit_ecn,
+                        self,
+                        sent_frames.take(),
+                        buf,
+                    );
 
                     if num_datagrams == 1 {
                         // Set the segment size for this GSO batch to the size of the first UDP
@@ -775,7 +799,13 @@ impl Connection {
                 // datagram.
                 // Finish current packet without adding extra padding
                 if let Some(builder) = builder_storage.take() {
-                    builder.finish_and_track(now, self, sent_frames.take(), buf);
+                    builder.finish_and_track(
+                        now,
+                        transmit_ecn,
+                        self,
+                        sent_frames.take(),
+                        buf,
+                    );
                 }
             }
 
@@ -896,6 +926,7 @@ impl Connection {
                     builder.pad_to(MIN_INITIAL_SIZE);
                     builder.finish_and_track(
                         now,
+                        None,
                         self,
                         Some(SentFrames {
                             non_retransmits: true,
@@ -961,7 +992,7 @@ impl Connection {
             }
 
             let last_packet_number = builder.exact_number;
-            builder.finish_and_track(now, self, sent_frames, buf);
+            builder.finish_and_track(now, transmit_ecn, self, sent_frames, buf);
             self.path
                 .congestion
                 .on_sent(now, buf.len() as u64, last_packet_number);
@@ -974,7 +1005,11 @@ impl Connection {
             );
         }
 
-        self.app_limited = buf.is_empty() && !congestion_blocked;
+        self.app_limited = buf.is_empty() && !send_blocked;
+
+        if cwnd_blocked {
+            self.path.congestion.on_cwnd_limited();
+        }
 
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
@@ -1013,7 +1048,13 @@ impl Connection {
                 non_retransmits: true,
                 ..Default::default()
             };
-            builder.finish_and_track(now, self, Some(sent_frames), buf);
+            builder.finish_and_track(
+                now,
+                transmit_ecn,
+                self,
+                Some(sent_frames),
+                buf,
+            );
 
             self.stats.path.sent_plpmtud_probes += 1;
             num_datagrams = 1;
@@ -1033,11 +1074,7 @@ impl Connection {
         Some(Transmit {
             destination: self.path.remote,
             size: buf.len(),
-            ecn: if self.path.sending_ecn {
-                Some(EcnCodepoint::Ect0)
-            } else {
-                None
-            },
+            ecn: transmit_ecn,
             segment_size: match num_datagrams {
                 1 => None,
                 _ => Some(segment_size),
@@ -1303,6 +1340,7 @@ impl Connection {
         let mut stats = self.stats;
         stats.path.rtt = self.path.rtt.get();
         stats.path.cwnd = self.path.congestion.window();
+        stats.path.bandwidth_estimate = self.path.congestion.metrics().bandwidth_estimate;
         stats.path.current_mtu = self.path.mtud.current_mtu();
 
         stats
@@ -1432,7 +1470,8 @@ impl Connection {
     /// faster or reduce loss to settle on optimal values by restarting from the initial
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
-        self.path.reset(now, &self.config);
+        self.path_counter = self.path_counter.wrapping_add(1);
+        self.path.reset(now, &self.config, self.path_counter);
     }
 
     /// Modify the number of remotely initiated streams that may be concurrently open
@@ -1481,18 +1520,18 @@ impl Connection {
             let space = &mut self.spaces[space];
             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
                 space.largest_acked_packet = Some(ack.largest);
-                if let Some(info) = space.sent_packets.get(&ack.largest) {
-                    // This should always succeed, but a misbehaving peer might ACK a packet we
-                    // haven't sent. At worst, that will result in us spuriously reducing the
-                    // congestion window.
-                    space.largest_acked_packet_sent = info.time_sent;
-                }
                 true
             } else {
                 false
             }
         };
 
+        let retained_ack = self.detect_spurious_loss(now, &ack, space);
+        for &transaction in &retained_ack.abandoned_transactions {
+            self.path
+                .congestion
+                .on_recovery_transaction_abandoned(transaction);
+        }
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
@@ -1503,12 +1542,41 @@ impl Connection {
         }
 
         if newly_acked.is_empty() {
+            // A late ACK can acknowledge retained loss evidence after the live sent-packet entry
+            // was removed. It still advances the packet-space ECN baseline when it is the newest
+            // ACK and the retained packet was actually sent ECT(0), but it has no live packet
+            // identity that the current controller can consume.
+            if new_largest && self.path.sending_ecn {
+                if let Some(ecn) = ack.ecn {
+                    self.process_ecn(
+                        now,
+                        space,
+                        retained_ack.ecn_marked_packets,
+                        ecn,
+                        None,
+                    );
+                } else if retained_ack.ecn_marked_packets != 0 {
+                    debug!("ECN not acknowledged by peer");
+                    self.path.sending_ecn = false;
+                }
+            }
+            self.finish_spurious_loss_detection(&retained_ack);
             return Ok(());
         }
 
-        let mut ack_eliciting_acked = false;
+        let mut largest_current_controller_acked = None;
+        let mut largest_current_rtt_acked = None;
+        let mut live_ecn_marked_packets = 0u64;
+        let mut live_ecn_marked_noncurrent_epoch = false;
+        let mut largest_current_live_ecn_acked = None;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
+                let ecn_marked = info.ecn_marked;
+                if ecn_marked {
+                    live_ecn_marked_packets = live_ecn_marked_packets.saturating_add(1);
+                    live_ecn_marked_noncurrent_epoch |=
+                        info.controller_epoch != self.path.controller_epoch();
+                }
                 if let Some(acked) = info.largest_acked {
                     // Assume ACKs for all packets below the largest acknowledged in `packet` have
                     // been received. This can cause the peer to spuriously retransmit if some of
@@ -1517,7 +1585,13 @@ impl Connection {
                     // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
                     self.spaces[space].pending_acks.subtract_below(acked);
                 }
-                ack_eliciting_acked |= info.ack_eliciting;
+                if path_owns_rtt_sample(
+                    &info,
+                    self.path.generation(),
+                    self.path.controller_epoch(),
+                ) {
+                    largest_current_rtt_acked = Some((packet, info.time_sent));
+                }
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
                 let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
@@ -1530,31 +1604,49 @@ impl Connection {
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
 
-                self.on_packet_acked(now, packet, info);
+                if let Some(sent) = self.on_packet_acked(now, packet, space, info) {
+                    largest_current_controller_acked = Some((packet, sent));
+                    if ecn_marked {
+                        largest_current_live_ecn_acked = Some((packet, sent));
+                    }
+                }
             }
         }
 
-        self.path.congestion.on_end_acks(
-            now,
-            self.path.in_flight.bytes,
-            self.app_limited,
-            self.spaces[space].largest_acked_packet,
+        let (ecn_marked_packets, current_controller_ecn_ack) = ecn_ack_accounting(
+            retained_ack.ecn_marked_packets,
+            retained_ack.ecn_marked_noncurrent_epoch,
+            live_ecn_marked_packets,
+            live_ecn_marked_noncurrent_epoch,
+            largest_current_live_ecn_acked,
         );
 
-        if new_largest && ack_eliciting_acked {
-            let ack_delay = if space != SpaceId::Data {
-                Duration::from_micros(0)
-            } else {
-                cmp::min(
-                    self.ack_frequency.peer_max_ack_delay,
-                    Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
-                )
-            };
-            let rtt = now.saturating_duration_since(self.spaces[space].largest_acked_packet_sent);
-            self.path.rtt.update(ack_delay, rtt);
-            if self.path.first_packet_after_rtt_sample.is_none() {
-                self.path.first_packet_after_rtt_sample =
-                    Some((space, self.spaces[space].next_packet_number));
+        if let Some((largest_packet, _)) = largest_current_controller_acked {
+            self.path.congestion.on_end_acks(
+                now,
+                self.path.in_flight.bytes,
+                self.app_limited,
+                Some(largest_packet),
+                space,
+            );
+        }
+
+        if new_largest {
+            if let Some((_, current_sent)) = largest_current_rtt_acked {
+                let ack_delay = if space != SpaceId::Data {
+                    Duration::from_micros(0)
+                } else {
+                    cmp::min(
+                        self.ack_frequency.peer_max_ack_delay,
+                        Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
+                    )
+                };
+                let rtt = now.saturating_duration_since(current_sent);
+                self.path.rtt.update(ack_delay, rtt);
+                if self.path.first_packet_after_rtt_sample.is_none() {
+                    self.path.first_packet_after_rtt_sample =
+                        Some((space, self.spaces[space].next_packet_number));
+                }
             }
         }
 
@@ -1573,18 +1665,87 @@ impl Connection {
                 // of newly acked packets that remains well-defined in the presence of arbitrary packet
                 // reordering.
                 if new_largest {
-                    let sent = self.spaces[space].largest_acked_packet_sent;
-                    self.process_ecn(now, space, newly_acked.len() as u64, ecn, sent);
+                    self.process_ecn(
+                        now,
+                        space,
+                        ecn_marked_packets,
+                        ecn,
+                        current_controller_ecn_ack,
+                    );
                 }
-            } else {
-                // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
+            } else if ecn_marked_packets != 0 {
+                // Only a packet actually emitted with ECT(0) supplies evidence that the peer or
+                // path failed to acknowledge ECN.
                 debug!("ECN not acknowledged by peer");
                 self.path.sending_ecn = false;
             }
         }
 
+        // This ACK can both finish old evidence and introduce a new loss or valid CE. Resolve those
+        // signals first, then accept undo only if the exact transaction still owns a complete
+        // cross-space proof.
+        self.finish_spurious_loss_detection(&retained_ack);
         self.set_loss_detection_timer(now);
         Ok(())
+    }
+
+    fn detect_spurious_loss(
+        &mut self,
+        now: Instant,
+        ack: &frame::Ack,
+        space: SpaceId,
+    ) -> SpuriousLossDetection {
+        let retention = 2 * self.path.rtt.pto_base();
+        let controller_epoch = self.path.controller_epoch();
+        detect_spurious_loss_in_spaces(
+            &mut self.spaces,
+            now,
+            retention,
+            ack,
+            space,
+            controller_epoch,
+        )
+    }
+
+    fn finish_spurious_loss_detection(&mut self, detection: &SpuriousLossDetection) {
+        let controller_epoch = self.path.controller_epoch();
+        for &transaction in &detection.matched_transactions {
+            if has_retained_loss_for_transaction(
+                &self.spaces,
+                controller_epoch,
+                transaction,
+            ) {
+                continue;
+            }
+            if self
+                .path
+                .congestion
+                .on_spurious_congestion_event(transaction)
+            {
+                self.stats.path.spurious_congestion_events = self
+                    .stats
+                    .path
+                    .spurious_congestion_events
+                    .saturating_add(1);
+            }
+        }
+    }
+
+    /// Expire retained loss evidence after two PTOs, matching current-main Quinn.
+    fn drain_lost_packets(&mut self, now: Instant) {
+        let two_pto = 2 * self.path.rtt.pto_base();
+        let controller_epoch = self.path.controller_epoch();
+        let abandoned = expire_retained_losses_in_spaces(
+            &mut self.spaces,
+            now,
+            two_pto,
+            controller_epoch,
+        );
+        for transaction in abandoned {
+            self.path
+                .congestion
+                .on_recovery_transaction_abandoned(transaction);
+        }
     }
 
     /// Process a new ECN block from an in-order ACK
@@ -1592,11 +1753,11 @@ impl Connection {
         &mut self,
         now: Instant,
         space: SpaceId,
-        newly_acked: u64,
+        accounted_ect0: u64,
         ecn: frame::EcnCounts,
-        largest_sent_time: Instant,
+        current_controller_ack: Option<(u64, Instant)>,
     ) {
-        match self.spaces[space].detect_ecn(newly_acked, ecn) {
+        match self.spaces[space].detect_ecn(accounted_ect0, ecn) {
             Err(e) => {
                 debug!("halting ECN due to verification failure: {}", e);
                 self.path.sending_ecn = false;
@@ -1604,21 +1765,67 @@ impl Connection {
                 // future attempts to use ECN on new paths.
                 self.spaces[space].ecn_feedback = frame::EcnCounts::ZERO;
             }
-            Ok(false) => {}
-            Ok(true) => {
-                self.stats.path.congestion_events += 1;
-                self.path
-                    .congestion
-                    .on_congestion_event(now, largest_sent_time, false, 0);
+            Ok(validation) => {
+                if validation.congestion_experienced {
+                    // CE is transport evidence even when its cumulative cohort cannot be safely
+                    // attributed to the current congestion-controller epoch.
+                    self.stats.path.congestion_events =
+                        self.stats.path.congestion_events.saturating_add(1);
+                }
+                if let Some((largest_sent, largest_sent_time)) = ecn_congestion_controller_ack(
+                    validation,
+                    accounted_ect0,
+                    current_controller_ack,
+                ) {
+                    self.path.congestion.on_congestion_event(
+                        now,
+                        largest_sent_time,
+                        false,
+                        true,
+                        0,
+                        largest_sent,
+                        space,
+                    );
+                } else if validation.congestion_experienced {
+                    trace!(
+                        accounted = accounted_ect0,
+                        cumulative_delta = validation.total_increase,
+                        "withholding ambiguously attributed ECN congestion signal"
+                    );
+                }
+                if validation.congestion_experienced {
+                    // Any transport-valid CE interval makes a packet-loss undo ambiguous. Run this
+                    // after an attributable controller response so even a CE-created snapshot is
+                    // ineligible, while invalid ECN feedback above does not taint anything.
+                    let controller_epoch = self.path.controller_epoch();
+                    abandon_retained_transactions_for_epoch(
+                        &mut self.spaces,
+                        controller_epoch,
+                    );
+                    self.path
+                        .congestion
+                        .on_validated_ecn_congestion_event();
+                }
             }
         }
     }
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, packet_number: u64, info: SentPacket) {
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        packet_number: u64,
+        space: SpaceId,
+        info: SentPacket,
+    ) -> Option<Instant> {
+        let time_sent = info.time_sent;
         self.remove_in_flight(&info);
-        if info.ack_eliciting && self.path.challenge.is_none() {
+        let current_controller_owned = controller_owns_packet(
+            &info,
+            self.path.controller_epoch(),
+        ) && self.path.challenge.is_none();
+        if current_controller_owned {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
             self.path.congestion.on_ack_with_packet_state(
@@ -1627,7 +1834,8 @@ impl Connection {
                 info.size.into(),
                 info.app_limited,
                 packet_number,
-                info.delivery_state,
+                space,
+                info.delivery_state(),
                 &self.path.rtt,
             );
         }
@@ -1642,6 +1850,8 @@ impl Connection {
         for frame in info.stream_frames {
             self.streams.received_ack_of(frame);
         }
+
+        current_controller_owned.then_some(time_sent)
     }
 
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceId) {
@@ -1707,6 +1917,9 @@ impl Connection {
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
         let mut size_of_lost_packets = 0u64;
+        let controller_epoch = self.path.controller_epoch();
+        let mut controller_lost_bytes = 0u64;
+        let mut controller_largest_lost = None;
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
@@ -1721,7 +1934,8 @@ impl Connection {
         space.loss_time = None;
 
         for (&packet, info) in space.sent_packets.range(0..largest_acked_packet) {
-            if prev_packet != Some(packet.wrapping_sub(1)) {
+            let current_controller_owned = info.controller_epoch == controller_epoch;
+            if !current_controller_owned || prev_packet != Some(packet.wrapping_sub(1)) {
                 // An intervening packet was acknowledged
                 persistent_congestion_start = None;
             }
@@ -1738,7 +1952,12 @@ impl Connection {
                 } else {
                     lost_packets.push(packet);
                     size_of_lost_packets += info.size as u64;
-                    if info.ack_eliciting && due_to_ack {
+                    if current_controller_owned && info.ack_eliciting {
+                        controller_lost_bytes =
+                            controller_lost_bytes.saturating_add(info.size as u64);
+                        controller_largest_lost = Some((packet, info.time_sent));
+                    }
+                    if current_controller_owned && info.ack_eliciting && due_to_ack {
                         match persistent_congestion_start {
                             // Two ACK-eliciting packets lost more than congestion_period apart, with no
                             // ACKed packets in between
@@ -1764,16 +1983,18 @@ impl Connection {
                         .loss_time
                         .map_or(next_loss_time, |x| cmp::min(x, next_loss_time)),
                 );
-                persistent_congestion_start = None;
+                if current_controller_owned {
+                    persistent_congestion_start = None;
+                }
             }
 
-            prev_packet = Some(packet);
+            prev_packet = current_controller_owned.then_some(packet);
         }
 
+        self.drain_lost_packets(now);
+
         // OnPacketsLost
-        if let Some(largest_lost) = lost_packets.last().cloned() {
-            let old_bytes_in_flight = self.path.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
+        if !lost_packets.is_empty() {
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
@@ -1784,6 +2005,14 @@ impl Connection {
 
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+                let current_controller_owned = controller_owns_packet(&info, controller_epoch);
+                let recovery_transaction = current_controller_owned
+                    .then(|| {
+                        self.path
+                            .congestion
+                            .on_packet_lost(info.size, packet, pn_space, now)
+                    })
+                    .flatten();
                 self.config.qlog_sink.emit_packet_lost(
                     packet,
                     &info,
@@ -1798,6 +2027,17 @@ impl Connection {
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
+                if current_controller_owned {
+                    self.spaces[pn_space].lost_packets.insert(
+                        packet,
+                        LostPacket {
+                            time_sent: info.time_sent,
+                            controller_epoch: info.controller_epoch,
+                            recovery_transaction,
+                            ecn_marked: info.ecn_marked,
+                        },
+                    );
+                }
             }
 
             if self.path.mtud.black_hole_detected(now) {
@@ -1810,16 +2050,18 @@ impl Connection {
                 }
             }
 
-            // Don't apply congestion penalty for lost ack-only packets
-            let lost_ack_eliciting = old_bytes_in_flight != self.path.in_flight.bytes;
-
-            if lost_ack_eliciting {
+            if let Some((controller_largest_lost, controller_largest_lost_sent)) =
+                controller_largest_lost
+            {
                 self.stats.path.congestion_events += 1;
                 self.path.congestion.on_congestion_event(
                     now,
-                    largest_lost_sent,
+                    controller_largest_lost_sent,
                     in_persistent_congestion,
-                    size_of_lost_packets,
+                    false,
+                    controller_lost_bytes,
+                    controller_largest_lost,
+                    pn_space,
                 );
             }
         }
@@ -2517,7 +2759,7 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, 0, info);
+                    self.on_packet_acked(now, 0, SpaceId::Initial, info);
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
@@ -3253,6 +3495,10 @@ impl Connection {
             sent.retransmits.get_or_create().ack_frequency = true;
 
             self.ack_frequency.ack_frequency_sent(pn, max_ack_delay);
+            self.path.congestion.on_ack_frequency_update(
+                config.ack_eliciting_threshold.into_inner(),
+                max_ack_delay,
+            );
             self.stats.frame_tx.ack_frequency += 1;
         }
 
@@ -4055,6 +4301,208 @@ const MAX_BACKOFF_EXPONENT: u32 = 16;
 /// necessarily have smaller headers, and initial packets are only ever the first packet in a
 /// datagram (because we coalesce in ascending packet space order and the only reason to split a
 /// packet is when packet space changes).
+fn controller_owns_packet(packet: &SentPacket, controller_epoch: u64) -> bool {
+    packet.ack_eliciting && packet.controller_epoch == controller_epoch
+}
+
+fn ecn_controller_ack(
+    all_newly_acked_current_controller: bool,
+    largest_current_controller_acked: Option<(u64, Instant)>,
+) -> Option<(u64, Instant)> {
+    all_newly_acked_current_controller
+        .then_some(largest_current_controller_acked)
+        .flatten()
+}
+
+fn ecn_ack_accounting(
+    retained_marked_packets: u64,
+    retained_marked_noncurrent_epoch: bool,
+    live_marked_packets: u64,
+    live_marked_noncurrent_epoch: bool,
+    largest_current_live_ack: Option<(u64, Instant)>,
+) -> (u64, Option<(u64, Instant)>) {
+    let marked_packets = retained_marked_packets.saturating_add(live_marked_packets);
+    let all_marked_current_controller =
+        !retained_marked_noncurrent_epoch && !live_marked_noncurrent_epoch;
+    (
+        marked_packets,
+        ecn_controller_ack(all_marked_current_controller, largest_current_live_ack),
+    )
+}
+
+fn ecn_congestion_controller_ack(
+    validation: EcnValidation,
+    accounted_ect0: u64,
+    current_controller_ack: Option<(u64, Instant)>,
+) -> Option<(u64, Instant)> {
+    (validation.congestion_experienced && validation.total_increase == accounted_ect0)
+        .then_some(current_controller_ack)
+        .flatten()
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct RetainedAckMatch {
+    matched_transactions: BTreeSet<RecoveryTransactionId>,
+    ecn_marked_packets: u64,
+    ecn_marked_noncurrent_epoch: bool,
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct SpuriousLossDetection {
+    matched_transactions: Vec<RecoveryTransactionId>,
+    abandoned_transactions: Vec<RecoveryTransactionId>,
+    ecn_marked_packets: u64,
+    ecn_marked_noncurrent_epoch: bool,
+}
+
+fn path_owns_rtt_sample(
+    packet: &SentPacket,
+    path_generation: u64,
+    controller_epoch: u64,
+) -> bool {
+    controller_owns_packet(packet, controller_epoch)
+        && packet.path_generation == path_generation
+}
+
+fn acknowledge_retained_losses(
+    lost_packets: &mut std::collections::BTreeMap<u64, LostPacket>,
+    ack: &frame::Ack,
+    current_controller_epoch: u64,
+) -> RetainedAckMatch {
+    if lost_packets.is_empty() {
+        return RetainedAckMatch::default();
+    }
+
+    let mut matched = RetainedAckMatch::default();
+    for range in ack.iter() {
+        let acknowledged: Vec<u64> = lost_packets
+            .range(range.clone())
+            .map(|(&packet_number, _)| packet_number)
+            .collect();
+        for packet_number in acknowledged {
+            if let Some(info) = lost_packets.remove(&packet_number) {
+                if info.controller_epoch == current_controller_epoch {
+                    if let Some(transaction) = info.recovery_transaction {
+                        matched.matched_transactions.insert(transaction);
+                    }
+                }
+                if info.ecn_marked {
+                    matched.ecn_marked_packets = matched.ecn_marked_packets.saturating_add(1);
+                    if info.controller_epoch != current_controller_epoch {
+                        matched.ecn_marked_noncurrent_epoch = true;
+                    }
+                }
+            }
+        }
+    }
+
+    matched
+}
+
+fn detect_spurious_loss_in_spaces(
+    spaces: &mut [PacketSpace; 3],
+    now: Instant,
+    retention: Duration,
+    ack: &frame::Ack,
+    space: SpaceId,
+    current_controller_epoch: u64,
+) -> SpuriousLossDetection {
+    // Expiry must precede matching in the same ACK transaction. Any expired member makes the
+    // transaction unproven, while younger records remain available for transport ECN accounting.
+    let abandoned_transactions = expire_retained_losses_in_spaces(
+        spaces,
+        now,
+        retention,
+        current_controller_epoch,
+    );
+    let acknowledged = acknowledge_retained_losses(
+        &mut spaces[space].lost_packets,
+        ack,
+        current_controller_epoch,
+    );
+
+    SpuriousLossDetection {
+        matched_transactions: acknowledged.matched_transactions.into_iter().collect(),
+        abandoned_transactions,
+        ecn_marked_packets: acknowledged.ecn_marked_packets,
+        ecn_marked_noncurrent_epoch: acknowledged.ecn_marked_noncurrent_epoch,
+    }
+}
+
+fn has_retained_loss_for_transaction(
+    spaces: &[PacketSpace; 3],
+    controller_epoch: u64,
+    transaction: RecoveryTransactionId,
+) -> bool {
+    SpaceId::iter().any(|space| {
+        spaces[space].lost_packets.values().any(|info| {
+            info.controller_epoch == controller_epoch
+                && info.recovery_transaction == Some(transaction)
+        })
+    })
+}
+
+fn abandon_retained_transactions_for_epoch(
+    spaces: &mut [PacketSpace; 3],
+    controller_epoch: u64,
+) {
+    for space in SpaceId::iter() {
+        for info in spaces[space].lost_packets.values_mut() {
+            if info.controller_epoch == controller_epoch {
+                info.recovery_transaction = None;
+            }
+        }
+    }
+}
+
+fn expire_retained_losses_in_spaces(
+    spaces: &mut [PacketSpace; 3],
+    now: Instant,
+    retention: Duration,
+    current_controller_epoch: u64,
+) -> Vec<RecoveryTransactionId> {
+    let mut abandoned = BTreeSet::new();
+    for space in SpaceId::iter() {
+        spaces[space].lost_packets.retain(|_, info| {
+            let retained = now.saturating_duration_since(info.time_sent) <= retention;
+            if !retained && info.controller_epoch == current_controller_epoch {
+                if let Some(transaction) = info.recovery_transaction {
+                    abandoned.insert(transaction);
+                }
+            }
+            retained
+        });
+    }
+
+    if !abandoned.is_empty() {
+        // Store the disqualification on the bounded retained records themselves, avoiding an
+        // ever-growing transport-side transaction set.
+        for space in SpaceId::iter() {
+            for info in spaces[space].lost_packets.values_mut() {
+                if info.controller_epoch == current_controller_epoch
+                    && info
+                        .recovery_transaction
+                        .is_some_and(|transaction| abandoned.contains(&transaction))
+                {
+                    info.recovery_transaction = None;
+                }
+            }
+        }
+    }
+
+    abandoned.into_iter().collect()
+}
+
+#[cfg(test)]
+fn has_retained_loss_for_epoch(
+    lost_packets: &std::collections::BTreeMap<u64, LostPacket>,
+    controller_epoch: u64,
+) -> bool {
+    lost_packets
+        .values()
+        .any(|info| info.controller_epoch == controller_epoch)
+}
+
 const MIN_PACKET_SPACE: usize = MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE + 32;
 
 /// Largest amount of space that could be occupied by a Handshake or 0-RTT packet's header
@@ -4109,6 +4557,493 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn single_packet_ack(packet_number: u64) -> frame::Ack {
+        frame::Ack {
+            largest: packet_number,
+            delay: 0,
+            // One QUIC ACK block with zero additional packet numbers.
+            additional: bytes::Bytes::from_static(&[0]),
+            ecn: None,
+        }
+    }
+
+    fn contiguous_packet_ack(first: u64, last: u64) -> frame::Ack {
+        assert!(first <= last);
+        let block = u8::try_from(last - first).expect("test ACK range fits one-byte varint");
+        assert!(block < 64, "test ACK range must use one-byte QUIC varint");
+        frame::Ack {
+            largest: last,
+            delay: 0,
+            additional: bytes::Bytes::from(vec![block]),
+            ecn: None,
+        }
+    }
+
+    fn retain_loss_with_transaction(
+        losses: &mut std::collections::BTreeMap<u64, LostPacket>,
+        packet_number: u64,
+        time_sent: Instant,
+        controller_epoch: u64,
+        recovery_transaction: Option<RecoveryTransactionId>,
+    ) {
+        losses.insert(
+            packet_number,
+            LostPacket {
+                time_sent,
+                controller_epoch,
+                recovery_transaction,
+                ecn_marked: true,
+            },
+        );
+    }
+
+    fn retain_loss(
+        losses: &mut std::collections::BTreeMap<u64, LostPacket>,
+        packet_number: u64,
+        time_sent: Instant,
+        controller_epoch: u64,
+    ) {
+        retain_loss_with_transaction(
+            losses,
+            packet_number,
+            time_sent,
+            controller_epoch,
+            Some(RecoveryTransactionId::new(1)),
+        );
+    }
+
+    fn packet_spaces(now: Instant) -> [PacketSpace; 3] {
+        std::array::from_fn(|_| PacketSpace::new(now))
+    }
+
+    fn completes_transaction(
+        spaces: &[PacketSpace; 3],
+        outcome: &SpuriousLossDetection,
+        controller_epoch: u64,
+    ) -> bool {
+        outcome.matched_transactions.iter().any(|&transaction| {
+            !has_retained_loss_for_transaction(spaces, controller_epoch, transaction)
+        })
+    }
+
+    fn sent_packet(
+        now: Instant,
+        path_generation: u64,
+        controller_epoch: u64,
+        ack_eliciting: bool,
+    ) -> SentPacket {
+        let (delivery_state_payload, has_delivery_state) =
+            SentPacket::store_delivery_state(now, None);
+        SentPacket {
+            path_generation,
+            controller_epoch,
+            ecn_marked: ack_eliciting,
+            time_sent: now,
+            delivery_state_payload,
+            has_delivery_state,
+            app_limited: false,
+            size: ack_eliciting.then_some(1200).unwrap_or(0),
+            ack_eliciting,
+            largest_acked: None,
+            retransmits: ThinRetransmits::default(),
+            stream_frames: StreamMetaVec::default(),
+        }
+    }
+
+    #[test]
+    fn callback_and_rtt_ownership_cover_rebind_reset_and_ack_only_packets() {
+        let now = Instant::now();
+        let old_path_same_controller = sent_packet(now, 4, 9, true);
+        assert!(controller_owns_packet(&old_path_same_controller, 9));
+        assert!(
+            !path_owns_rtt_sample(&old_path_same_controller, 5, 9),
+            "NAT-rebind ACKs may finish the cloned controller model but cannot sample the new path"
+        );
+
+        let old_controller_same_path = sent_packet(now, 5, 8, true);
+        assert!(!controller_owns_packet(&old_controller_same_path, 9));
+        assert!(!path_owns_rtt_sample(&old_controller_same_path, 5, 9));
+
+        let current = sent_packet(now, 5, 9, true);
+        assert!(controller_owns_packet(&current, 9));
+        assert!(path_owns_rtt_sample(&current, 5, 9));
+
+        let ack_only = sent_packet(now, 5, 9, false);
+        assert!(
+            !controller_owns_packet(&ack_only, 9),
+            "ACK-only loss cannot enter a controller episode or its spurious-undo evidence"
+        );
+        assert!(!path_owns_rtt_sample(&ack_only, 5, 9));
+    }
+
+    #[test]
+    fn mixed_epoch_ecn_cohort_cannot_notify_fresh_controller() {
+        let now = Instant::now();
+        let current_ack = Some((41, now));
+
+        assert_eq!(
+            ecn_ack_accounting(0, false, 1, false, current_ack),
+            (1, current_ack)
+        );
+        assert_eq!(
+            ecn_ack_accounting(1, true, 1, false, current_ack),
+            (2, None),
+            "late old-epoch loss evidence is part of the same cumulative ECN cohort"
+        );
+        assert_eq!(
+            ecn_ack_accounting(1, false, 0, false, None),
+            (1, None),
+            "retained-only ACKs have no live packet identity for BBR3"
+        );
+    }
+
+    #[test]
+    fn retained_only_ecn_advances_baseline_without_controller_callback() {
+        let now = Instant::now();
+        let mut packet_space = PacketSpace::new(now);
+        let (accounted, controller_ack) = ecn_ack_accounting(1, false, 0, false, None);
+        let ecn = frame::EcnCounts {
+            ect0: 0,
+            ect1: 0,
+            ce: 1,
+        };
+
+        let validation = packet_space.detect_ecn(accounted, ecn).unwrap();
+        assert!(validation.congestion_experienced);
+        assert_eq!(validation.total_increase, 1);
+        assert_eq!(packet_space.ecn_feedback, ecn);
+        assert_eq!(
+            ecn_congestion_controller_ack(validation, accounted, controller_ack),
+            None
+        );
+    }
+
+    #[test]
+    fn cumulative_ecn_excess_suppresses_one_interval_then_exact_delta_recovers() {
+        let now = Instant::now();
+        let current_ack = Some((41, now));
+        let mut packet_space = PacketSpace::new(now);
+
+        // One ECT packet was removed by an earlier out-of-order ACK. The next in-order ACK
+        // accounts for one current packet locally, but its cumulative counters advance by two.
+        let ambiguous = packet_space
+            .detect_ecn(
+                1,
+                frame::EcnCounts {
+                    ect0: 1,
+                    ect1: 0,
+                    ce: 1,
+                },
+            )
+            .unwrap();
+        assert!(
+            ambiguous.congestion_experienced,
+            "ambiguous ownership must not erase valid transport CE telemetry"
+        );
+        assert_eq!(ambiguous.total_increase, 2);
+        assert_eq!(
+            ecn_congestion_controller_ack(ambiguous, 1, current_ack),
+            None,
+            "an excess cumulative delta cannot be attributed to the current controller"
+        );
+
+        // Advancing the baseline makes the following exact interval attributable again.
+        let exact = packet_space
+            .detect_ecn(
+                1,
+                frame::EcnCounts {
+                    ect0: 1,
+                    ect1: 0,
+                    ce: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(exact.total_increase, 1);
+        assert_eq!(
+            ecn_congestion_controller_ack(exact, 1, current_ack),
+            current_ack
+        );
+    }
+
+    #[test]
+    fn zero_current_ect_still_advances_cumulative_ecn_baseline() {
+        let now = Instant::now();
+        let mut packet_space = PacketSpace::new(now);
+        let ecn = frame::EcnCounts {
+            ect0: 1,
+            ect1: 0,
+            ce: 0,
+        };
+
+        let validation = packet_space.detect_ecn(0, ecn).unwrap();
+        assert_eq!(validation.total_increase, 1);
+        assert_eq!(packet_space.ecn_feedback, ecn);
+        assert_eq!(
+            ecn_congestion_controller_ack(validation, 0, None),
+            None
+        );
+    }
+
+    #[test]
+    fn partial_late_ack_does_not_declare_spurious_episode() {
+        let now = Instant::now();
+        let mut spaces = packet_spaces(now);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 10, now, 3);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 12, now, 3);
+
+        let outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(10),
+            SpaceId::Data,
+            3,
+        );
+        assert!(
+            !completes_transaction(&spaces, &outcome, 3),
+            "partial evidence cannot complete a controller-wide recovery episode"
+        );
+        assert_eq!(
+            spaces[SpaceId::Data]
+                .lost_packets
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![12]
+        );
+    }
+
+    #[test]
+    fn final_late_ack_declares_spurious_episode_exactly_once() {
+        let now = Instant::now();
+        let mut spaces = packet_spaces(now);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 10, now, 3);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 12, now, 3);
+
+        let partial = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(10),
+            SpaceId::Data,
+            3,
+        );
+        assert!(!completes_transaction(&spaces, &partial, 3));
+        let final_outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(12),
+            SpaceId::Data,
+            3,
+        );
+        assert!(completes_transaction(&spaces, &final_outcome, 3));
+        let duplicate = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(12),
+            SpaceId::Data,
+            3,
+        );
+        assert!(!completes_transaction(&spaces, &duplicate, 3));
+    }
+
+    #[test]
+    fn expired_loss_evidence_cannot_trigger_spurious_callback() {
+        let sent = Instant::now();
+        let retention = Duration::from_millis(100);
+        let mut spaces = packet_spaces(sent);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 20, sent, 3);
+
+        // Production ordering expires all spaces before matching the incoming ACK.
+        let outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            sent + retention + Duration::from_nanos(1),
+            retention,
+            &single_packet_ack(20),
+            SpaceId::Data,
+            3,
+        );
+        assert!(!completes_transaction(&spaces, &outcome, 3));
+        assert_eq!(
+            outcome.abandoned_transactions,
+            vec![RecoveryTransactionId(1)]
+        );
+        assert!(spaces[SpaceId::Data].lost_packets.is_empty());
+    }
+
+    #[test]
+    fn one_expired_member_abandons_younger_evidence_from_the_same_transaction() {
+        let sent = Instant::now();
+        let retention = Duration::from_millis(100);
+        let transaction = RecoveryTransactionId::new(7);
+        let mut spaces = packet_spaces(sent);
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Data].lost_packets,
+            20,
+            sent,
+            3,
+            Some(transaction),
+        );
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Data].lost_packets,
+            21,
+            sent + Duration::from_millis(80),
+            3,
+            Some(transaction),
+        );
+
+        // Expiry runs before matching. The older missing member makes the transaction unproven,
+        // so the younger late ACK can still advance ECN accounting but cannot trigger undo.
+        let outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            sent + retention + Duration::from_nanos(1),
+            retention,
+            &single_packet_ack(21),
+            SpaceId::Data,
+            3,
+        );
+        assert_eq!(outcome.abandoned_transactions, vec![transaction]);
+        assert!(outcome.matched_transactions.is_empty());
+        assert!(!completes_transaction(&spaces, &outcome, 3));
+        assert!(spaces[SpaceId::Data].lost_packets.is_empty());
+    }
+
+    #[test]
+    fn same_ack_new_loss_defers_transaction_completion() {
+        let now = Instant::now();
+        let mut spaces = packet_spaces(now);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 10, now, 3);
+
+        let outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(10),
+            SpaceId::Data,
+            3,
+        );
+        assert!(completes_transaction(&spaces, &outcome, 3));
+
+        // Production performs live loss detection before invoking the deferred completion. A loss
+        // introduced by that same ACK and belonging to the same recovery transaction keeps the
+        // proof incomplete.
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 12, now, 3);
+        assert!(!completes_transaction(&spaces, &outcome, 3));
+
+        let final_outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(12),
+            SpaceId::Data,
+            3,
+        );
+        assert!(completes_transaction(&spaces, &final_outcome, 3));
+    }
+
+    #[test]
+    fn one_ack_can_complete_multiple_recovery_transactions() {
+        let now = Instant::now();
+        let first = RecoveryTransactionId::new(1);
+        let second = RecoveryTransactionId::new(2);
+        let mut spaces = packet_spaces(now);
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Data].lost_packets,
+            10,
+            now,
+            3,
+            Some(first),
+        );
+        retain_loss_with_transaction(
+            &mut spaces[SpaceId::Data].lost_packets,
+            11,
+            now,
+            3,
+            Some(second),
+        );
+
+        let outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &contiguous_packet_ack(10, 11),
+            SpaceId::Data,
+            3,
+        );
+        assert_eq!(outcome.matched_transactions, vec![first, second]);
+        assert!(completes_transaction(&spaces, &outcome, 3));
+    }
+
+    #[test]
+    fn retained_loss_evidence_is_isolated_by_packet_space() {
+        let now = Instant::now();
+        let mut spaces = packet_spaces(now);
+        retain_loss(&mut spaces[SpaceId::Initial].lost_packets, 7, now, 3);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 7, now, 3);
+
+        let initial_outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(7),
+            SpaceId::Initial,
+            3,
+        );
+        assert!(
+            !completes_transaction(&spaces, &initial_outcome, 3),
+            "one packet space cannot complete a controller-wide recovery episode"
+        );
+        assert!(spaces[SpaceId::Initial].lost_packets.is_empty());
+        assert_eq!(spaces[SpaceId::Data].lost_packets.len(), 1);
+
+        let data_outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(7),
+            SpaceId::Data,
+            3,
+        );
+        assert!(completes_transaction(&spaces, &data_outcome, 3));
+    }
+
+    #[test]
+    fn old_controller_evidence_retires_without_triggering_or_blocking_current_undo() {
+        let now = Instant::now();
+        let mut spaces = packet_spaces(now);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 30, now, 2);
+        retain_loss(&mut spaces[SpaceId::Data].lost_packets, 31, now, 3);
+
+        let old_outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(30),
+            SpaceId::Data,
+            3,
+        );
+        assert!(
+            !completes_transaction(&spaces, &old_outcome, 3),
+            "an old controller epoch cannot trigger the fresh model's undo"
+        );
+        assert!(has_retained_loss_for_epoch(
+            &spaces[SpaceId::Data].lost_packets,
+            3
+        ));
+
+        let current_outcome = detect_spurious_loss_in_spaces(
+            &mut spaces,
+            now,
+            Duration::from_secs(1),
+            &single_packet_ack(31),
+            SpaceId::Data,
+            3,
+        );
+        assert!(completes_transaction(&spaces, &current_outcome, 3));
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {

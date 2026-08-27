@@ -10,7 +10,10 @@ impl quinn::congestion::Controller for FixedPacingController {
         _now: Instant,
         _sent: Instant,
         _is_persistent_congestion: bool,
+        _is_ecn: bool,
         _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: quinn::congestion::SpaceId,
     ) {
     }
 
@@ -22,6 +25,129 @@ impl quinn::congestion::Controller for FixedPacingController {
 
     fn pacing_rate(&self) -> Option<u64> {
         Some(self.0)
+    }
+
+    fn metrics(&self) -> quinn::congestion::ControllerMetrics {
+        let mut metrics = quinn::congestion::ControllerMetrics::default();
+        metrics.congestion_window = self.window();
+        metrics.pacing_rate = Some(self.0);
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+#[derive(Debug, Default)]
+struct ForwardedCallbacks {
+    sent_space: Option<quinn::congestion::SpaceId>,
+    end_ack_space: Option<quinn::congestion::SpaceId>,
+    lost_space: Option<quinn::congestion::SpaceId>,
+    congestion: Vec<(bool, quinn::congestion::SpaceId)>,
+    spurious: u64,
+    abandoned: u64,
+    validated_ecn: u64,
+    cwnd_limited: u64,
+    ack_frequency: Option<(u64, Duration)>,
+}
+
+#[derive(Debug, Clone)]
+struct RecordingController(Arc<Mutex<ForwardedCallbacks>>);
+
+impl quinn::congestion::Controller for RecordingController {
+    fn on_packet_sent(
+        &mut self,
+        _now: Instant,
+        _bytes: u16,
+        _prior_in_flight: u64,
+        _packet_number: u64,
+        space: quinn::congestion::SpaceId,
+        _app_limited: bool,
+    ) -> Option<quinn::congestion::PacketDeliveryState> {
+        self.0.lock().unwrap().sent_space = Some(space);
+        None
+    }
+
+    fn on_cwnd_limited(&mut self) {
+        self.0.lock().unwrap().cwnd_limited += 1;
+    }
+
+    fn on_end_acks(
+        &mut self,
+        _now: Instant,
+        _in_flight: u64,
+        _app_limited: bool,
+        _largest_packet_num_acked: Option<u64>,
+        space: quinn::congestion::SpaceId,
+    ) {
+        self.0.lock().unwrap().end_ack_space = Some(space);
+    }
+
+    fn on_packet_lost(
+        &mut self,
+        _lost_bytes: u16,
+        packet_number: u64,
+        space: quinn::congestion::SpaceId,
+        _now: Instant,
+    ) -> Option<quinn::congestion::RecoveryTransactionId> {
+        self.0.lock().unwrap().lost_space = Some(space);
+        Some(quinn::congestion::RecoveryTransactionId::new(packet_number))
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost: u64,
+        space: quinn::congestion::SpaceId,
+    ) {
+        self.0.lock().unwrap().congestion.push((is_ecn, space));
+    }
+
+    fn on_spurious_congestion_event(
+        &mut self,
+        _transaction: quinn::congestion::RecoveryTransactionId,
+    ) -> bool {
+        self.0.lock().unwrap().spurious += 1;
+        true
+    }
+
+    fn on_recovery_transaction_abandoned(
+        &mut self,
+        _transaction: quinn::congestion::RecoveryTransactionId,
+    ) {
+        self.0.lock().unwrap().abandoned += 1;
+    }
+
+    fn on_validated_ecn_congestion_event(&mut self) {
+        self.0.lock().unwrap().validated_ecn += 1;
+    }
+
+    fn on_ack_frequency_update(
+        &mut self,
+        ack_eliciting_threshold: u64,
+        requested_max_ack_delay: Duration,
+    ) {
+        self.0.lock().unwrap().ack_frequency =
+            Some((ack_eliciting_threshold, requested_max_ack_delay));
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        12_000
     }
 
     fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
@@ -47,6 +173,126 @@ fn instrumented_controller_forwards_pacing_rate_through_clones() {
 
     assert_eq!(controller.pacing_rate(), Some(RATE));
     assert_eq!(controller.clone_box().pacing_rate(), Some(RATE));
+    assert_eq!(controller.metrics().pacing_rate, Some(RATE));
+    assert_eq!(controller.clone_box().metrics().pacing_rate, Some(RATE));
+}
+
+#[test]
+fn production_initial_and_fresh_paths_both_construct_bbr3() {
+    let now = Instant::now();
+    let controller =
+        quinn::congestion::ControllerFactory::build(Arc::new(InstrumentedBbrConfig), now, 1200)
+            .into_any()
+            .downcast::<InstrumentedController>()
+            .expect("instrumented production controller");
+    assert!(
+        controller
+            .inner
+            .clone_box()
+            .into_any()
+            .downcast::<quinn::congestion::Bbr3>()
+            .is_ok(),
+        "initial production controller must be BBR3"
+    );
+
+    let fresh = controller
+        .fresh_path_box(now + Duration::from_secs(1), 1400)
+        .expect("fresh controller")
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("fresh instrumented controller");
+    assert!(
+        fresh
+            .inner
+            .clone_box()
+            .into_any()
+            .downcast::<quinn::congestion::Bbr3>()
+            .is_ok(),
+        "fresh network path must restart with BBR3"
+    );
+}
+
+#[test]
+fn instrumented_controller_forwards_packet_space_and_recovery_callbacks_once() {
+    let now = Instant::now();
+    let recorded = Arc::new(Mutex::new(ForwardedCallbacks::default()));
+    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let mut controller =
+        InstrumentedController::new(Box::new(RecordingController(recorded.clone())), telemetry);
+    controller.on_packet_sent(now, 1200, 0, 7, quinn::congestion::SpaceId::Initial, false);
+    controller.on_end_acks(
+        now + Duration::from_millis(50),
+        0,
+        false,
+        Some(7),
+        quinn::congestion::SpaceId::Initial,
+    );
+    let transaction = controller
+        .on_packet_lost(
+            1200,
+            8,
+            quinn::congestion::SpaceId::Handshake,
+            now + Duration::from_millis(50),
+        )
+        .expect("recording controller recovery transaction");
+    assert_eq!(
+        controller.snapshot().lost_bytes,
+        0,
+        "per-packet loss forwarding must not duplicate aggregate loss telemetry"
+    );
+    controller.on_congestion_event(
+        now + Duration::from_millis(50),
+        now,
+        false,
+        false,
+        1200,
+        8,
+        quinn::congestion::SpaceId::Handshake,
+    );
+    controller.on_congestion_event(
+        now + Duration::from_millis(50),
+        now,
+        false,
+        true,
+        0,
+        9,
+        quinn::congestion::SpaceId::Data,
+    );
+    assert!(controller.on_spurious_congestion_event(transaction));
+    controller.on_recovery_transaction_abandoned(transaction);
+    controller.on_validated_ecn_congestion_event();
+    controller.on_cwnd_limited();
+    controller.on_ack_frequency_update(4, Duration::from_millis(25));
+
+    assert_eq!(controller.snapshot().lost_bytes, 1200);
+    let callbacks = recorded.lock().unwrap();
+    assert_eq!(
+        callbacks.sent_space,
+        Some(quinn::congestion::SpaceId::Initial)
+    );
+    assert_eq!(
+        callbacks.end_ack_space,
+        Some(quinn::congestion::SpaceId::Initial)
+    );
+    assert_eq!(
+        callbacks.lost_space,
+        Some(quinn::congestion::SpaceId::Handshake)
+    );
+    assert_eq!(
+        callbacks.congestion,
+        vec![
+            (false, quinn::congestion::SpaceId::Handshake),
+            (true, quinn::congestion::SpaceId::Data),
+        ]
+    );
+    assert_eq!(callbacks.spurious, 1);
+    assert_eq!(callbacks.abandoned, 1);
+    assert_eq!(callbacks.validated_ecn, 1);
+    assert_eq!(callbacks.cwnd_limited, 1);
+    assert_eq!(
+        callbacks.ack_frequency,
+        Some((4, Duration::from_millis(25)))
+    );
 }
 
 #[test]
@@ -97,7 +343,15 @@ fn fresh_network_path_keeps_owner_and_isolates_stale_callbacks() {
 
     old.accumulate_ack_telemetry(base, 1200, false);
     old.finish_ack_telemetry(base + Duration::from_millis(10), 0, false);
-    old.on_congestion_event(base + Duration::from_millis(10), base, false, 1200);
+    old.on_congestion_event(
+        base + Duration::from_millis(10),
+        base,
+        false,
+        false,
+        1200,
+        7,
+        quinn::congestion::SpaceId::Data,
+    );
 
     let before_current_ack = fresh.snapshot();
     assert_eq!(before_current_ack.path_epoch, old_epoch + 1);
@@ -126,7 +380,7 @@ fn instrumented_controller_preserves_compact_bbr_delivery_state() {
     let (mut controller, _) = test_instrumented_controller(base);
 
     let state = controller
-        .on_packet_sent(base, 1200, 0, 7, false)
+        .on_packet_sent(base, 1200, 0, 7, quinn::congestion::SpaceId::Data, false)
         .expect("BBR packet delivery state");
 
     assert_eq!(state.delivered, 0);

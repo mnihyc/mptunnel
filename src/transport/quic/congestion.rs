@@ -488,14 +488,14 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
         now: Instant,
         current_mtu: u16,
     ) -> Box<dyn quinn::congestion::Controller> {
-        // Use Quinn BBR for the QUIC carrier. mptunnel does not have an
+        // Use Quinn BBRv3 for the QUIC carrier. mptunnel does not have an
         // operator-provided per-path bandwidth contract, so a fixed-rate
         // Brutal-style controller would either underfill unknown good paths or
         // overload weaker/shared paths. BBR's delivery-rate/RTT model is the
         // stable production default for feeding the product multipath scheduler;
         // QUIC still owns packet pacing, loss recovery, and bytes in flight.
         let inner = quinn::congestion::ControllerFactory::build(
-            Arc::new(quinn::congestion::BbrConfig::default()),
+            Arc::new(quinn::congestion::Bbr3Config::default()),
             now,
             current_mtu,
         );
@@ -518,10 +518,21 @@ impl quinn::congestion::Controller for InstrumentedController {
         bytes: u16,
         prior_in_flight: u64,
         packet_number: u64,
+        space: quinn::congestion::SpaceId,
         app_limited: bool,
     ) -> Option<quinn::congestion::PacketDeliveryState> {
-        self.inner
-            .on_packet_sent(now, bytes, prior_in_flight, packet_number, app_limited)
+        self.inner.on_packet_sent(
+            now,
+            bytes,
+            prior_in_flight,
+            packet_number,
+            space,
+            app_limited,
+        )
+    }
+
+    fn on_cwnd_limited(&mut self) {
+        self.inner.on_cwnd_limited();
     }
 
     fn on_ack(
@@ -529,11 +540,14 @@ impl quinn::congestion::Controller for InstrumentedController {
         now: Instant,
         sent: Instant,
         bytes: u64,
+        packet_number: u64,
+        space: quinn::congestion::SpaceId,
         app_limited: bool,
         rtt: &quinn_proto::RttEstimator,
     ) {
         self.accumulate_ack_telemetry(sent, bytes, app_limited);
-        self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+        self.inner
+            .on_ack(now, sent, bytes, packet_number, space, app_limited, rtt);
     }
 
     fn on_ack_with_packet_state(
@@ -543,6 +557,7 @@ impl quinn::congestion::Controller for InstrumentedController {
         bytes: u64,
         app_limited: bool,
         packet_number: u64,
+        space: quinn::congestion::SpaceId,
         packet_state: Option<quinn::congestion::PacketDeliveryState>,
         rtt: &quinn_proto::RttEstimator,
     ) {
@@ -553,6 +568,7 @@ impl quinn::congestion::Controller for InstrumentedController {
             bytes,
             app_limited,
             packet_number,
+            space,
             packet_state,
             rtt,
         );
@@ -564,10 +580,11 @@ impl quinn::congestion::Controller for InstrumentedController {
         in_flight: u64,
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
+        space: quinn::congestion::SpaceId,
     ) {
         self.finish_ack_telemetry(now, in_flight, app_limited);
         self.inner
-            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked, space);
     }
 
     fn on_congestion_event(
@@ -575,15 +592,64 @@ impl quinn::congestion::Controller for InstrumentedController {
         now: Instant,
         sent: Instant,
         is_persistent_congestion: bool,
+        is_ecn: bool,
         lost_bytes: u64,
+        largest_lost: u64,
+        space: quinn::congestion::SpaceId,
     ) {
         self.path_telemetry.add_lost(lost_bytes);
+        self.inner.on_congestion_event(
+            now,
+            sent,
+            is_persistent_congestion,
+            is_ecn,
+            lost_bytes,
+            largest_lost,
+            space,
+        );
+    }
+
+    fn on_packet_lost(
+        &mut self,
+        lost_bytes: u16,
+        packet_number: u64,
+        space: quinn::congestion::SpaceId,
+        now: Instant,
+    ) -> Option<quinn::congestion::RecoveryTransactionId> {
+        // Aggregate loss telemetry is recorded once in on_congestion_event.
         self.inner
-            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+            .on_packet_lost(lost_bytes, packet_number, space, now)
+    }
+
+    fn on_spurious_congestion_event(
+        &mut self,
+        transaction: quinn::congestion::RecoveryTransactionId,
+    ) -> bool {
+        self.inner.on_spurious_congestion_event(transaction)
+    }
+
+    fn on_recovery_transaction_abandoned(
+        &mut self,
+        transaction: quinn::congestion::RecoveryTransactionId,
+    ) {
+        self.inner.on_recovery_transaction_abandoned(transaction);
+    }
+
+    fn on_validated_ecn_congestion_event(&mut self) {
+        self.inner.on_validated_ecn_congestion_event();
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
         self.inner.on_mtu_update(new_mtu);
+    }
+
+    fn on_ack_frequency_update(
+        &mut self,
+        ack_eliciting_threshold: u64,
+        requested_max_ack_delay: Duration,
+    ) {
+        self.inner
+            .on_ack_frequency_update(ack_eliciting_threshold, requested_max_ack_delay);
     }
 
     fn window(&self) -> u64 {
@@ -620,10 +686,10 @@ impl quinn::congestion::Controller for InstrumentedController {
         current_mtu: u16,
     ) -> Option<Box<dyn quinn::congestion::Controller>> {
         // InstrumentedBbrConfig is the sole production constructor for this
-        // wrapper, so a fresh path always starts a fresh BBR model. Only the
+        // wrapper, so a fresh path always starts a fresh BBRv3 model. Only the
         // connection-scoped evidence owner survives the network transition.
         let inner = quinn::congestion::ControllerFactory::build(
-            Arc::new(quinn::congestion::BbrConfig::default()),
+            Arc::new(quinn::congestion::Bbr3Config::default()),
             now,
             current_mtu,
         );

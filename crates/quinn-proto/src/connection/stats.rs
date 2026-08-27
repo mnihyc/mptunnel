@@ -138,8 +138,12 @@ pub struct PathStats {
     pub rtt: Duration,
     /// Current congestion window of the connection
     pub cwnd: u64,
+    /// Congestion controller's sustainable-bandwidth estimate, in bytes per second
+    pub bandwidth_estimate: Option<u64>,
     /// Congestion events on the connection
     pub congestion_events: u64,
+    /// Congestion episodes later proven spurious by retained-packet ACKs
+    pub spurious_congestion_events: u64,
     /// The amount of packets lost on this path
     pub lost_packets: u64,
     /// The amount of bytes lost on this path

@@ -363,7 +363,9 @@ impl Connection {
             congestion_window: metrics.congestion_window,
             bytes_in_flight: snapshot.bytes_in_flight,
             pending_bytes: self.write_backlog.load(Ordering::Relaxed),
-            pacing_rate_bps: metrics.pacing_rate,
+            pacing_rate_bps: metrics
+                .pacing_rate
+                .map(|bytes_per_second| bytes_per_second.saturating_mul(8)),
             loss_ppm: snapshot.loss_ppm,
             lost_bytes: snapshot.lost_bytes,
             ecn_ppm: None,

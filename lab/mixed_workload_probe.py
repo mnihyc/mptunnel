@@ -29,6 +29,21 @@ def browser_full_load_response_timeout_seconds(args):
     return args.timeout
 
 
+def interactive_attempt_record(
+    index, workload_started_at, attempt_started_at, attempt_ended_at, outcome
+):
+    """Retain one scheduled echo attempt without inventing unavailable latency."""
+    return {
+        "index": index,
+        "start_offset_s": attempt_started_at - workload_started_at,
+        "end_offset_s": attempt_ended_at - workload_started_at,
+        "latency_ms": (attempt_ended_at - attempt_started_at) * 1000.0
+        if outcome == "success"
+        else None,
+        "outcome": outcome,
+    }
+
+
 def parse_host_port(value):
     if value.startswith("["):
         host, rest = value[1:].split("]", 1)
@@ -670,6 +685,7 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
     payload_len = max(8, args.tcp_echo_payload_bytes)
     deadline = workload_deadline(started_at, args)
     interval_s = max(0.0, args.tcp_echo_interval_ms / 1000.0)
+    attempt_series = []
     index = 0
     sock = None
     worker_started = time.monotonic()
@@ -677,6 +693,8 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
     try:
         while time.monotonic() < deadline:
             interval_started = time.monotonic()
+            attempt_started = interval_started
+            connection_failed = False
             if sock is None and disconnected_at_s is None:
                 try:
                     connect_timeout = max(
@@ -691,10 +709,22 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
                     failures += 1
                     interactive_ready.set()
                     sock = None
+                    connection_failed = True
 
             if sock is None:
                 if disconnected_at_s is not None:
                     failures += 1
+                attempt_series.append(
+                    interactive_attempt_record(
+                        index,
+                        started_at,
+                        attempt_started,
+                        time.monotonic(),
+                        "connect_error"
+                        if connection_failed
+                        else "unavailable_after_disconnect",
+                    )
+                )
                 sleep_s = min(interval_s, max(0.0, deadline - time.monotonic()))
                 if sleep_s > 0:
                     time.sleep(sleep_s)
@@ -705,18 +735,37 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
                 struct.pack("!I", index)
                 + bytes([index % 251]) * (payload_len - 4)
             )
-            started = time.monotonic()
+            attempt_started = time.monotonic()
             try:
                 sock.sendall(payload)
                 request_bytes += len(payload)
                 response = recv_exact(sock, len(payload))
+                attempt_ended = time.monotonic()
                 if response != payload:
                     failures += 1
+                    attempt_series.append(
+                        interactive_attempt_record(
+                            index,
+                            started_at,
+                            attempt_started,
+                            attempt_ended,
+                            "response_mismatch",
+                        )
+                    )
                 else:
                     response_bytes += len(response)
-                    finished_s = time.monotonic() - started_at
-                    latency_ms = (time.monotonic() - started) * 1000.0
+                    finished_s = attempt_ended - started_at
+                    latency_ms = (attempt_ended - attempt_started) * 1000.0
                     latencies.append(latency_ms)
+                    attempt_series.append(
+                        interactive_attempt_record(
+                            index,
+                            started_at,
+                            attempt_started,
+                            attempt_ended,
+                            "success",
+                        )
+                    )
                     if len(latencies) == 1:
                         interactive_ready.set()
                     if last_success_s is not None:
@@ -732,12 +781,22 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
                             failover_gap_s = max(failover_gap_s, gap)
                     last_success_s = finished_s
             except Exception as exc:
+                attempt_ended = time.monotonic()
                 if first_error is None:
                     first_error = str(exc)
                 interactive_ready.set()
                 failures += 1
+                attempt_series.append(
+                    interactive_attempt_record(
+                        index,
+                        started_at,
+                        attempt_started,
+                        attempt_ended,
+                        "io_error",
+                    )
+                )
                 if disconnected_at_s is None:
-                    disconnected_at_s = time.monotonic() - started_at
+                    disconnected_at_s = attempt_ended - started_at
                 try:
                     sock.close()
                 except Exception:
@@ -759,6 +818,7 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
     result.update(
         {
             "interactive_connected": connected,
+            "interactive_attempt_series": attempt_series,
             "interactive_start_s": worker_started - started_at,
             "interactive_time_s": time.monotonic() - worker_started,
             "interactive_count": len(latencies) + failures,
@@ -1020,6 +1080,8 @@ def udp_worker(args, started_at, bulk_ready, result):
 def build_record(args, bulk, small, interactive, udp):
     browser_only = getattr(args, "browser_only", False)
     browser_full_load = getattr(args, "browser_full_load", False)
+    workload_mode = getattr(args, "workload_mode", "mixed")
+    bulk_interactive_only = workload_mode == "bulk-interactive"
     bulk_ok = browser_only or bulk.get("bulk_status") == "ok"
     small_attempts = small.get("small_count", 0)
     small_batch_count = small.get("small_batch_count", 0)
@@ -1029,7 +1091,7 @@ def build_record(args, bulk, small, interactive, udp):
         and len(small_batch_sizes) == small_batch_count
         and all(size == args.small_batch_size for size in small_batch_sizes)
     )
-    small_ok = (
+    small_ok = bulk_interactive_only or (
         small_attempts > 0
         and small.get("small_fail", 0) == 0
         and small_batch_shape_ok
@@ -1045,7 +1107,7 @@ def build_record(args, bulk, small, interactive, udp):
         or (interactive_expected > 0 and interactive.get("interactive_fail", 0) == 0)
     )
     udp_attempts = udp.get("udp_count", 0)
-    udp_ok = browser_only or (
+    udp_ok = browser_only or bulk_interactive_only or (
         udp_attempts > 0 and udp.get("udp_received", 0) == udp_attempts
     )
     if browser_full_load:
@@ -1071,12 +1133,18 @@ def build_record(args, bulk, small, interactive, udp):
         if browser_full_load
         else "browser"
         if browser_only
+        else "bulk-interactive"
+        if bulk_interactive_only
         else "mixed",
         "status": status,
+        "workload_mode": workload_mode,
         "mode": args.mode,
         "target": args.http_target,
         "udp_target": args.udp_target,
         "tcp_echo_target": args.tcp_echo_target,
+        "interactive_interval_ms": getattr(args, "tcp_echo_interval_ms", None),
+        "interactive_timeout_ms": getattr(args, "tcp_echo_timeout_ms", None),
+        "interactive_payload_bytes": getattr(args, "tcp_echo_payload_bytes", None),
         "failover_after_s": args.failover_after,
         "test_duration_s": args.load_duration if args.load_duration > 0 else args.timeout,
     }
@@ -1104,6 +1172,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
     parser.add_argument("--mode", choices=("socks5", "direct"), default="socks5")
+    parser.add_argument(
+        "--workload-mode",
+        choices=("mixed", "bulk-interactive"),
+        default="mixed",
+    )
     parser.add_argument("--proxy", default="127.0.0.1:1080")
     parser.add_argument("--http-target", required=True)
     parser.add_argument("--udp-target")
@@ -1130,8 +1203,18 @@ def main():
     parser.add_argument("--tcp-echo-interval-ms", type=int, default=500)
     parser.add_argument("--started-file")
     args = parser.parse_args()
-    if not args.browser_only and not args.udp_target:
+    if (
+        args.workload_mode == "mixed"
+        and not args.browser_only
+        and not args.udp_target
+    ):
         parser.error("--udp-target is required unless --browser-only is used")
+    if args.workload_mode == "bulk-interactive" and not args.tcp_echo_target:
+        parser.error("--tcp-echo-target is required for --workload-mode bulk-interactive")
+    if args.workload_mode == "bulk-interactive" and args.udp_target:
+        parser.error("--udp-target is not used by --workload-mode bulk-interactive")
+    if args.workload_mode == "bulk-interactive" and args.browser_only:
+        parser.error("--browser-only is incompatible with --workload-mode bulk-interactive")
     if args.browser_full_load and not args.browser_only:
         parser.error("--browser-full-load requires --browser-only")
     if args.small_batch_size < 1:
@@ -1160,6 +1243,19 @@ def main():
                 args=(args, started_at, bulk_ready, small),
                 daemon=True,
             )
+        ]
+    elif args.workload_mode == "bulk-interactive":
+        threads = [
+            threading.Thread(
+                target=bulk_worker,
+                args=(args, started_at, interactive_ready, bulk_ready, bulk),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=interactive_tcp_worker,
+                args=(args, started_at, interactive_ready, interactive),
+                daemon=True,
+            ),
         ]
     else:
         threads = [

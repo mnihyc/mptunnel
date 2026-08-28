@@ -2591,6 +2591,29 @@ run_baseline_download_probe_case() {
   fi
 }
 
+run_bulk_interactive_probe_case() {
+  local case_name="$1"
+  local proxy_port_arg="$2"
+  local mptunnel_row="${3:-1}"
+  local baseline_identity_json="${4:-}"
+  local out_file="/tmp/mptunnel-bulk-interactive-${case_name}.out"
+  local err_file="/tmp/mptunnel-bulk-interactive-${case_name}.err"
+  local output probe_stderr exit_code
+  local telemetry_pid
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  set +e
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --workload-mode bulk-interactive --proxy 127.0.0.1:${proxy_port_arg} --http-target 172.31.40.30:8080 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' >'${out_file}' 2>'${err_file}'"
+  exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  set -e
+  append_mixed_probe_result \
+    "$case_name" "$exit_code" "$output" "" "$probe_stderr" \
+    "$mptunnel_row" "$baseline_identity_json"
+}
+
 run_baseline_upload_probe_case() {
   local case_name="$1"
   local protocol="$2"
@@ -2672,6 +2695,7 @@ run_vmess_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
   local netem_mode="${3:-$default_netem_mode}"
+  local workload_mode="${4:-download}"
   prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
     append_skipped_result "$case_name" "vmess" "xray baseline binary unavailable"
@@ -2694,7 +2718,12 @@ run_vmess_baseline_case() {
     stop_baselines
     return 0
   fi
-  run_baseline_download_probe_case "$case_name" "vmess" "$baseline_proxy_port" "$baseline_identity_json"
+  if [[ "$workload_mode" == "bulk-interactive" ]]; then
+    run_bulk_interactive_probe_case \
+      "$case_name" "$baseline_proxy_port" 0 "$baseline_identity_json"
+  else
+    run_baseline_download_probe_case "$case_name" "vmess" "$baseline_proxy_port" "$baseline_identity_json"
+  fi
   stop_baselines
 }
 
@@ -2734,6 +2763,7 @@ run_hysteria2_baseline_case() {
   local netem_mode="${3:-$default_netem_mode}"
   local brutal_up="${4:-}"
   local brutal_down="${5:-$brutal_up}"
+  local workload_mode="${6:-download}"
   prepare_baseline_profile "$netem_mode"
   if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
     append_skipped_result "$case_name" "hysteria2" "hysteria2 baseline binary unavailable"
@@ -2759,7 +2789,12 @@ run_hysteria2_baseline_case() {
     stop_baselines
     return 0
   fi
-  run_baseline_download_probe_case "$case_name" "hysteria2" "$baseline_proxy_port" "$baseline_identity_json"
+  if [[ "$workload_mode" == "bulk-interactive" ]]; then
+    run_bulk_interactive_probe_case \
+      "$case_name" "$baseline_proxy_port" 0 "$baseline_identity_json"
+  else
+    run_baseline_download_probe_case "$case_name" "hysteria2" "$baseline_proxy_port" "$baseline_identity_json"
+  fi
   stop_baselines
 }
 
@@ -2945,6 +2980,7 @@ append_mixed_probe_result() {
   local flapping_metadata_json="${4:-}"
   local probe_stderr="${5:-}"
   local mptunnel_row="${6:-1}"
+  local baseline_identity_json="${7:-}"
   local client_log server_log
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -2964,6 +3000,7 @@ append_mixed_probe_result() {
   FLAPPING_METADATA="$flapping_metadata_json" \
   PROBE_STDERR="$probe_stderr" \
   RESULT_REPRODUCIBILITY="$result_reproducibility" \
+  BASELINE_IDENTITY="$baseline_identity_json" \
   LAB_SCRIPT_DIR="$script_dir" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -3051,6 +3088,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets_error"] = str(exc)
 from result_enrichment import enrich_reproducibility
 enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
+from result_enrichment import enrich_baseline_identity
+enrich_baseline_identity(row, os.environ.get("BASELINE_IDENTITY", ""))
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -4131,6 +4170,14 @@ if should_run_case "baseline_vmess_tcp_single_balanced"; then
   run_vmess_baseline_case "baseline_vmess_tcp_single_balanced" "172.31.15.20"
 fi
 
+if should_run_case "baseline_vmess_tcp_bulk_interactive_balanced"; then
+  run_vmess_baseline_case \
+    "baseline_vmess_tcp_bulk_interactive_balanced" \
+    "172.31.15.20" \
+    "$default_netem_mode" \
+    bulk-interactive
+fi
+
 if should_run_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth"; then
   run_vmess_baseline_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth" "172.31.20.20"
 fi
@@ -4160,6 +4207,20 @@ if should_run_case "baseline_hysteria2_udp_single_balanced"; then
     "$default_netem_mode" \
     "$hysteria_up_rate" \
     "$hysteria_down_rate"
+fi
+
+if should_run_case "baseline_hysteria2_udp_bulk_interactive_balanced"; then
+  hysteria_up_rate="$(hysteria_bandwidth_from_netem_rate \
+    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+  hysteria_down_rate="$(hysteria_bandwidth_from_netem_rate \
+    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+  run_hysteria2_baseline_case \
+    "baseline_hysteria2_udp_bulk_interactive_balanced" \
+    "172.31.15.20" \
+    "$default_netem_mode" \
+    "$hysteria_up_rate" \
+    "$hysteria_down_rate" \
+    bulk-interactive
 fi
 
 if should_run_case "baseline_hysteria2_udp_single_balanced_autonomous"; then
@@ -4289,6 +4350,25 @@ fi
 if should_run_case "mptunnel_tcp_single_balanced"; then
   start_client "tcp_single_balanced" "$tcp_balanced"
   run_tcp_download_probe_case "mptunnel_tcp_single_balanced"
+fi
+
+if should_run_case "mptunnel_tcp_bulk_interactive_balanced"; then
+  start_client "tcp_bulk_interactive_balanced" "$tcp_balanced"
+  run_bulk_interactive_probe_case \
+    "mptunnel_tcp_bulk_interactive_balanced" "$proxy_port"
+fi
+
+if should_run_case "mptunnel_quic_bulk_interactive_balanced"; then
+  start_client "quic_bulk_interactive_balanced" "$udp_balanced"
+  run_bulk_interactive_probe_case \
+    "mptunnel_quic_bulk_interactive_balanced" "$proxy_port"
+fi
+
+if should_run_case "mptunnel_tcp_quic_bulk_interactive_balanced"; then
+  start_client \
+    "tcp_quic_bulk_interactive_balanced" "$tcp_balanced $udp_balanced"
+  run_bulk_interactive_probe_case \
+    "mptunnel_tcp_quic_bulk_interactive_balanced" "$proxy_port"
 fi
 
 if should_run_case "mptunnel_tcp_single_cross_continent_high_bandwidth"; then

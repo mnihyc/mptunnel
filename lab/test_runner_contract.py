@@ -334,6 +334,67 @@ class RunnerContractTests(unittest.TestCase):
             SCRIPT,
         )
 
+    def test_bulk_interactive_latency_series_cases_share_one_exact_workload(self):
+        probe = SCRIPT.split("run_bulk_interactive_probe_case() {", 1)[1].split(
+            "\n}\n\nrun_baseline_upload_probe_case()", 1
+        )[0]
+        self.assertIn("--workload-mode bulk-interactive", probe)
+        self.assertIn("--http-target 172.31.40.30:8080", probe)
+        self.assertIn("--tcp-echo-target 172.31.40.30:10022", probe)
+        self.assertIn("--tcp-echo-interval-ms '${tcp_echo_interval_ms}'", probe)
+        self.assertNotIn("--small-path", probe)
+        self.assertNotIn("--udp-target", probe)
+        self.assertIn('local mptunnel_row="${3:-1}"', probe)
+        self.assertIn('local baseline_identity_json="${4:-}"', probe)
+        self.assertIn('"$mptunnel_row" "$baseline_identity_json"', probe)
+
+        for case_name in (
+            "baseline_vmess_tcp_bulk_interactive_balanced",
+            "baseline_hysteria2_udp_bulk_interactive_balanced",
+            "mptunnel_tcp_bulk_interactive_balanced",
+            "mptunnel_quic_bulk_interactive_balanced",
+            "mptunnel_tcp_quic_bulk_interactive_balanced",
+        ):
+            self.assertIn(f'if should_run_case "{case_name}";', SCRIPT)
+
+        self.assertIn(
+            'start_client "tcp_bulk_interactive_balanced" "$tcp_balanced"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'start_client "quic_bulk_interactive_balanced" "$udp_balanced"',
+            SCRIPT,
+        )
+        self.assertIn(
+            '"tcp_quic_bulk_interactive_balanced" "$tcp_balanced $udp_balanced"',
+            SCRIPT,
+        )
+
+        hysteria_case = SCRIPT.split(
+            'if should_run_case "baseline_hysteria2_udp_bulk_interactive_balanced";',
+            1,
+        )[1].split("\nfi", 1)[0]
+        self.assertIn("MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE", hysteria_case)
+        self.assertIn("MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE", hysteria_case)
+        self.assertIn('"$hysteria_up_rate"', hysteria_case)
+        self.assertIn('"$hysteria_down_rate"', hysteria_case)
+
+    def test_bulk_interactive_baselines_retain_verified_identity_and_mpp_scope(self):
+        vmess = SCRIPT.split("run_vmess_baseline_case() {", 1)[1].split(
+            "\n}\n\nrun_vmess_baseline_upload_case()", 1
+        )[0]
+        hysteria = SCRIPT.split("run_hysteria2_baseline_case() {", 1)[1].split(
+            "\n}\n\nrun_hysteria2_baseline_upload_case()", 1
+        )[0]
+        append = SCRIPT.split("append_mixed_probe_result() {", 1)[1].split(
+            "\n}\n\nrecord_mixed_probe_case()", 1
+        )[0]
+
+        for wrapper in (vmess, hysteria):
+            self.assertIn('"$case_name" "$baseline_proxy_port" 0 "$baseline_identity_json"', wrapper)
+        self.assertIn('BASELINE_IDENTITY="$baseline_identity_json"', append)
+        self.assertIn("enrich_baseline_identity", append)
+
     def test_flapper_cannot_be_stopped_by_background_terminal_signals(self):
         flapper = SCRIPT.split("start_random_flapping() {", 1)[1].split(
             "\n}\n\nshould_run_case()", 1

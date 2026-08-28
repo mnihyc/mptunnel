@@ -184,6 +184,15 @@ enum AckPhase {
     ProbeFeedback,
 }
 
+/// Why a completed ProbeBW_UP is waiting to advance the max-bandwidth epoch.
+/// A loss-tagged edge can be cancelled if that exact recovery transaction is
+/// proven spurious before a normal round consumes it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MaxBwAdvanceSource {
+    ProbeUp,
+    Loss(RecoveryTransactionId),
+}
+
 /// Description of a packet for the purposes of analysis through BBR3
 /// all volumes of data use bytes, all rates of data use bytes/sec
 /// equivalent to P <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-4.1.2.1.2>
@@ -285,6 +294,9 @@ pub struct Bbr3 {
     /// equivalent to BBR.cycle_count: The virtual time used by the BBR.max_bw filter window.
     /// since the BBR.max_bw_filter only needs to track samples from two time slots: the previous ProbeBW cycle and the current ProbeBW cycle.
     cycle_count: u64,
+    /// A completed ProbeBW_UP whose max-bandwidth epoch boundary has not yet been observed by a
+    /// normal, non-application-limited ProbeBW round.
+    max_bw_advance_pending: Option<MaxBwAdvanceSource>,
     /// equivalent to C.cwnd: The transport sender's congestion window. When transmitting data, the sending connection ensures that C.inflight does not exceed C.cwnd.
     cwnd: u64,
     /// equivalent to C.pacing_rate: The current pacing rate for a BBR flow, which controls inter-packet spacing.
@@ -558,6 +570,7 @@ impl Bbr3 {
             is_cwnd_limited: false,
             cwnd_limited_this_round: false,
             cycle_count: 0,
+            max_bw_advance_pending: None,
             cwnd: initial_cwnd,
             pacing_rate,
             send_quantum: 2 * smss, // we start high, but it will be adjusted in set_send_quantum <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.6.3>
@@ -918,6 +931,9 @@ impl Bbr3 {
     /// equivalent to BBREnterProbeBW <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6>
     fn enter_probe_bw(&mut self, now: Instant) {
         self.cwnd_gain = self.default_cwnd_gain;
+        // Startup samples occupy epoch zero. Open the first ProbeBW epoch explicitly; initial
+        // DOWN is not the end of a ProbeBW_UP and must not own this boundary through ack_phase.
+        self.advance_max_bw_filter();
         self.start_probe_bw_down(now);
     }
 
@@ -959,6 +975,7 @@ impl Bbr3 {
                     cwnd_limited_by_inflight_longterm,
                 ) =>
             {
+                self.arm_max_bw_advance(MaxBwAdvanceSource::ProbeUp);
                 self.prev_probe_too_high = false;
                 self.start_probe_bw_down(now);
             }
@@ -968,26 +985,23 @@ impl Bbr3 {
 
     /// equivalent to BBRAdaptLongTermModel <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-8>
     fn adapt_long_term_model(&mut self) -> bool {
+        let max_bw_advanced = self.maybe_advance_max_bw_filter();
         if self.ack_phase == AckPhase::ProbeStarting && self.round_start {
             self.ack_phase = AckPhase::ProbeFeedback;
         }
         if self.ack_phase == AckPhase::ProbeStopping && self.round_start {
             self.bw_probe_samples = false;
             self.ack_phase = AckPhase::Init;
-            if let BbrState::ProbeBw(_) = self.state {
-                if let Some(rate_sample) = self.rs {
-                    if !rate_sample.is_app_limited {
-                        self.advance_max_bw_filter();
-                    }
-                }
-            }
-            if matches!(self.state, BbrState::ProbeBw(_))
-                && self.prev_probe_precautionary
-                && !self.prev_probe_too_high
-            {
-                self.start_probe_bw_refill();
-                return true;
-            }
+        }
+        // A precautionary ProbeUP requests an accelerated replacement probe, but that request
+        // cannot bypass the completed probe's evidence boundary. Tie acceleration to the exact
+        // eligible round that consumes the pending edge, independently of ACK-phase cleanup.
+        if max_bw_advanced
+            && matches!(self.state, BbrState::ProbeBw(_))
+            && self.prev_probe_precautionary
+            && !self.prev_probe_too_high
+        {
+            return self.start_probe_bw_refill();
         }
         if !self.is_inflight_too_high() {
             if self.inflight_longterm == u64::MAX {
@@ -1010,13 +1024,45 @@ impl Bbr3 {
         self.cycle_count = self.cycle_count.saturating_add(1);
     }
 
+    fn arm_max_bw_advance(&mut self, source: MaxBwAdvanceSource) {
+        debug_assert!(
+            self.max_bw_advance_pending.is_none(),
+            "a ProbeBW_UP epoch boundary is already pending"
+        );
+        self.max_bw_advance_pending = Some(source);
+    }
+
+    fn maybe_advance_max_bw_filter(&mut self) -> bool {
+        if !self.round_start || !matches!(self.state, BbrState::ProbeBw(_)) {
+            return false;
+        }
+        let Some(rate_sample) = self.rs else {
+            return false;
+        };
+        if rate_sample.is_app_limited || self.max_bw_advance_pending.is_none() {
+            return false;
+        }
+
+        // This is the first ordinary feedback round after a genuine ProbeBW_UP exit. Once
+        // consumed, the boundary is irreversible: rolling cycle_count back after later samples
+        // would relabel or discard valid evidence.
+        self.max_bw_advance_pending = None;
+        self.advance_max_bw_filter();
+        true
+    }
+
+    fn cancel_spurious_max_bw_advance(&mut self, transaction: RecoveryTransactionId) {
+        if self.max_bw_advance_pending == Some(MaxBwAdvanceSource::Loss(transaction)) {
+            self.max_bw_advance_pending = None;
+        }
+    }
+
     /// equivalent to BBRIsTimeToProbeBW <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.5.3-6>
     fn maybe_enter_probe_bw_refill(&mut self, now: Instant) -> bool {
         if self.has_elapsed_in_phase(self.bw_probe_wait, now)
             || self.is_reno_coexistence_probe_time()
         {
-            self.start_probe_bw_refill();
-            return true;
+            return self.start_probe_bw_refill();
         }
         false
     }
@@ -1047,7 +1093,15 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRStartProbeBW_REFILL <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-4>
-    fn start_probe_bw_refill(&mut self) {
+    fn start_probe_bw_refill(&mut self) -> bool {
+        // A completed ProbeUP owns one pending max-BW epoch boundary until the first ordinary
+        // non-app-limited feedback round consumes it. Centralizing this gate prevents every
+        // time-, Reno-, precautionary-, and recovery-driven entry from starting another probe
+        // that could overwrite the first edge's recovery provenance. ProbeRTT remains free to
+        // interrupt the wait; its app-limited exit residue cannot bypass this gate either.
+        if self.max_bw_advance_pending.is_some() {
+            return false;
+        }
         self.reset_short_term_model();
         self.bw_probe_up_rounds = 0;
         self.bw_probe_up_acks = 0;
@@ -1057,6 +1111,7 @@ impl Bbr3 {
         self.cwnd_gain = self.default_cwnd_gain;
         self.pacing_gain = self.default_pacing_gain;
         self.state = BbrState::ProbeBw(ProbeBwSubstate::Refill);
+        true
     }
 
     /// equivalent to BBRIsTimeToCruise <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-8>
@@ -1585,6 +1640,11 @@ impl Bbr3 {
         }
 
         if self.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
+            let source = self
+                .undo_transaction
+                .map(MaxBwAdvanceSource::Loss)
+                .unwrap_or(MaxBwAdvanceSource::ProbeUp);
+            self.arm_max_bw_advance(source);
             self.undo_state = Some(BbrState::ProbeBw(ProbeBwSubstate::Up));
             self.start_probe_bw_down(now);
         }
@@ -1874,6 +1934,7 @@ impl Controller for Bbr3 {
         if self.undo_transaction != Some(transaction) {
             return false;
         }
+        self.cancel_spurious_max_bw_advance(transaction);
         self.restore_cwnd();
         self.loss_in_round = false;
         self.reset_full_bw();
@@ -1896,7 +1957,8 @@ impl Controller for Bbr3 {
             {
                 // Refill before probing again; jumping directly into UP would
                 // skip the draft's one-round pipe-fill transition.
-                self.start_probe_bw_refill();
+                let restarted = self.start_probe_bw_refill();
+                debug_assert!(restarted, "spurious ProbeUP loss must cancel its pending edge");
             }
             _ => {}
         }
@@ -2039,6 +2101,335 @@ mod test {
     type UndoSnapshot = (Option<BbrState>, f64, u64, u64);
     /// A loss episode: (pre-loss undo snapshot, post-loss state, post-loss inflight_longterm).
     type LossEpisode = (UndoSnapshot, BbrState, u64);
+
+    fn max_bw_epoch_sample(now: Instant, is_app_limited: bool) -> BbrRateSample {
+        let packet = BbrPacket {
+            delivered: 0,
+            delivered_time: now,
+            first_send_time: now,
+            send_time: now,
+            is_app_limited,
+            tx_in_flight: BASE_DATAGRAM_SIZE,
+            packet_number: 0,
+            space: SpaceId::Data,
+            size: BASE_DATAGRAM_SIZE as u16,
+            lost: 0,
+            acknowledged: true,
+            stale: false,
+            round_count: 0,
+        };
+        BbrRateSample {
+            delivery_rate: 1_000_000.0,
+            is_app_limited,
+            interval: Duration::from_millis(100),
+            delivered: BASE_DATAGRAM_SIZE,
+            prior_delivered: 0,
+            send_elapsed: Duration::from_millis(100),
+            ack_elapsed: Duration::from_millis(100),
+            rtt: Duration::from_millis(100),
+            tx_in_flight: BASE_DATAGRAM_SIZE,
+            newly_acked: BASE_DATAGRAM_SIZE,
+            lost: 0,
+            last_end_seq: 0,
+            last_packet: packet,
+        }
+    }
+
+    fn finish_normal_probe_up(bbr: &mut Bbr3, now: Instant) {
+        bbr.full_bw_reached = true;
+        bbr.full_bw_now = true;
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.ack_phase = AckPhase::ProbeFeedback;
+        bbr.round_start = false;
+        bbr.inflight_longterm = u64::MAX;
+        bbr.rs = Some(max_bw_epoch_sample(now, false));
+
+        bbr.update_probe_bw_cycle_phase(now);
+
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert_eq!(bbr.ack_phase, AckPhase::ProbeStopping);
+    }
+
+    #[test]
+    fn entering_probe_bw_opens_first_epoch_without_completing_a_probe_up() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.max_bw_filter.update_max(0, 10_000_000);
+        bbr.max_bw = 10_000_000.0;
+        bbr.full_bw_reached = true;
+        bbr.state = BbrState::Drain;
+
+        bbr.enter_probe_bw(now);
+
+        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert_eq!(bbr.max_bw_advance_pending, None);
+
+        // Initial DOWN is a state-machine boundary, not a completed ProbeUP.
+        // Its first normal feedback round must not open a second epoch.
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(100), false));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 1);
+    }
+
+    #[test]
+    fn genuine_probe_up_exit_advances_once_on_next_normal_round() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.cycle_count = 1;
+        finish_normal_probe_up(&mut bbr, now);
+        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(100), false));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 2);
+        assert_eq!(bbr.max_bw_advance_pending, None);
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(200), false));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 2);
+    }
+
+    #[test]
+    fn app_limited_round_preserves_probe_up_epoch_until_normal_feedback_resumes() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.cycle_count = 1;
+        finish_normal_probe_up(&mut bbr, now);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(100), true));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(200), false));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 2);
+        assert_eq!(bbr.max_bw_advance_pending, None);
+    }
+
+    #[test]
+    fn long_app_limited_pause_does_not_start_a_second_probe_before_epoch_consumption() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.cycle_count = 1;
+        finish_normal_probe_up(&mut bbr, now);
+        let pending = Some(MaxBwAdvanceSource::ProbeUp);
+        assert_eq!(bbr.max_bw_advance_pending, pending);
+
+        // Keep receiving only app-limited feedback until well after the wall-clock probe timer.
+        // It cannot consume the completed ProbeUP boundary and therefore must not start another
+        // Refill/UP cycle whose exit would overwrite that boundary's provenance.
+        let late = now + bbr.bw_probe_wait + Duration::from_secs(1);
+        for offset_ms in [0, 100] {
+            bbr.round_start = true;
+            bbr.rs = Some(max_bw_epoch_sample(
+                late + Duration::from_millis(offset_ms),
+                true,
+            ));
+            bbr.update_probe_bw_cycle_phase(late + Duration::from_millis(offset_ms));
+            assert!(matches!(
+                bbr.state,
+                BbrState::ProbeBw(ProbeBwSubstate::Down | ProbeBwSubstate::Cruise)
+            ));
+            assert_eq!(bbr.max_bw_advance_pending, pending);
+            assert_eq!(bbr.cycle_count, 1);
+        }
+
+        // The first eligible normal round consumes exactly once. Since the probe timer is already
+        // due, the same state-machine update may then begin the next Refill safely.
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(
+            late + Duration::from_millis(200),
+            false,
+        ));
+        bbr.update_probe_bw_cycle_phase(late + Duration::from_millis(200));
+        assert_eq!(bbr.cycle_count, 2);
+        assert_eq!(bbr.max_bw_advance_pending, None);
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Refill));
+    }
+
+    #[test]
+    fn precautionary_app_limited_feedback_defers_acceleration_until_epoch_consumption() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.cycle_count = 1;
+        finish_normal_probe_up(&mut bbr, now);
+        bbr.prev_probe_precautionary = true;
+        bbr.prev_probe_too_high = false;
+
+        // ProbeStopping feedback can be app-limited. Clear that ACK phase, but preserve both the
+        // pending epoch edge and the precautionary re-probe request until eligible evidence arrives.
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(100), true));
+        bbr.update_probe_bw_cycle_phase(now + Duration::from_millis(100));
+        assert!(matches!(
+            bbr.state,
+            BbrState::ProbeBw(ProbeBwSubstate::Down | ProbeBwSubstate::Cruise)
+        ));
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
+        assert!(bbr.prev_probe_precautionary);
+        assert_eq!(bbr.cycle_count, 1);
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(200), false));
+        bbr.update_probe_bw_cycle_phase(now + Duration::from_millis(200));
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Refill));
+        assert_eq!(bbr.max_bw_advance_pending, None);
+        assert!(!bbr.prev_probe_precautionary);
+        assert_eq!(bbr.cycle_count, 2);
+    }
+
+    #[test]
+    fn probe_rtt_and_exit_residue_preserve_probe_up_epoch_until_normal_feedback() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.cycle_count = 1;
+        finish_normal_probe_up(&mut bbr, now);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
+
+        bbr.probe_rtt_expired = true;
+        bbr.idle_restart = false;
+        bbr.inflight = 0;
+        bbr.check_probe_rtt(now + Duration::from_millis(10));
+        assert_eq!(bbr.state, BbrState::ProbeRtt);
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(100), true));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
+
+        bbr.exit_probe_rtt(now + Duration::from_millis(200));
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Cruise));
+
+        // Packets deliberately marked in ProbeRTT can still be acknowledged
+        // after exit. They must neither age the filter nor discard the edge.
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(300), true));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(400), false));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 2);
+        assert_eq!(bbr.max_bw_advance_pending, None);
+    }
+
+    #[test]
+    fn spurious_probe_up_loss_cancels_unconsumed_epoch_edge() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.cycle_count = 1;
+        bbr.full_bw_reached = true;
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.bw_probe_samples = true;
+        bbr.rs = Some(max_bw_epoch_sample(now, false));
+        assert!(bbr.enter_recovery(now, now - Duration::from_millis(1)));
+        bbr.save_state_upon_loss();
+        let transaction = bbr.undo_transaction.expect("loss transaction");
+
+        bbr.handle_inflight_too_high(now);
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::Loss(transaction))
+        );
+        assert!(bbr.on_spurious_congestion_event(transaction));
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Refill));
+        assert_eq!(bbr.max_bw_advance_pending, None);
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(100), false));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 1);
+    }
+
+    #[test]
+    fn late_spurious_probe_up_loss_does_not_roll_back_consumed_epoch_edge() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.cycle_count = 1;
+        bbr.full_bw_reached = true;
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.bw_probe_samples = true;
+        bbr.rs = Some(max_bw_epoch_sample(now, false));
+        assert!(bbr.enter_recovery(now, now - Duration::from_millis(1)));
+        bbr.save_state_upon_loss();
+        let transaction = bbr.undo_transaction.expect("loss transaction");
+
+        bbr.handle_inflight_too_high(now);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::Loss(transaction))
+        );
+
+        bbr.round_start = true;
+        bbr.rs = Some(max_bw_epoch_sample(now + Duration::from_millis(100), false));
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, 2);
+        assert_eq!(bbr.max_bw_advance_pending, None);
+
+        // Spurious proof after an ordinary round consumed the edge restores the congestion model,
+        // but cannot roll back cycle time: that round may already have added valid new evidence.
+        assert!(bbr.on_spurious_congestion_event(transaction));
+        assert_eq!(bbr.cycle_count, 2);
+        assert_eq!(bbr.max_bw_advance_pending, None);
+    }
 
     #[test]
     fn probe_rtt_entry_marks_the_first_reduced_rate_flight_app_limited() {
@@ -2436,7 +2827,7 @@ mod test {
     }
 
     #[test]
-    fn probe_stopping_advances_max_bw_filter_once() {
+    fn probe_stopping_without_a_completed_probe_up_does_not_advance_max_bw_filter() {
         let now = Instant::now();
         let packet = BbrPacket {
             delivered: 0,
@@ -2478,7 +2869,7 @@ mod test {
         });
 
         assert!(!bbr.adapt_long_term_model());
-        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(bbr.cycle_count, 0);
         assert_eq!(bbr.ack_phase, AckPhase::Init);
         assert!(!bbr.bw_probe_samples);
 
@@ -2486,7 +2877,7 @@ mod test {
             bbr.round_start = true;
             assert!(!bbr.adapt_long_term_model());
         }
-        assert_eq!(bbr.cycle_count, 1);
+        assert_eq!(bbr.cycle_count, 0);
     }
 
     #[test]
@@ -2956,6 +3347,10 @@ mod test {
         bbr.update_probe_bw_cycle_phase(now);
         assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
         assert_eq!(bbr.ack_phase, AckPhase::ProbeStopping);
+        assert_eq!(
+            bbr.max_bw_advance_pending,
+            Some(MaxBwAdvanceSource::ProbeUp)
+        );
         assert!(bbr.prev_probe_precautionary);
         assert!(!bbr.prev_probe_too_high);
 
@@ -2965,12 +3360,14 @@ mod test {
         bbr.rs = Some(sample(0));
         bbr.update_probe_bw_cycle_phase(now + Duration::from_millis(100));
         assert_eq!(bbr.cycle_count, cycle_before_feedback + 1);
+        assert_eq!(bbr.max_bw_advance_pending, None);
         assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Refill));
         assert_eq!(bbr.ack_phase, AckPhase::Refilling);
         assert!(!bbr.bw_probe_samples);
         assert!(!bbr.prev_probe_precautionary);
 
-        // ACKS_PROBE_STOPPING must advance the two-cycle max-BW clock once.
+        // Clearing ACKS_PROBE_STOPPING has no max-BW clock side effect; the completed ProbeUP
+        // boundary was already consumed by the first ordinary feedback round above.
         assert!(!bbr.adapt_long_term_model());
         assert_eq!(bbr.cycle_count, cycle_before_feedback + 1);
 

@@ -15,7 +15,7 @@ use crate::congestion::{
 };
 use crate::{Duration, Instant};
 
-/// equivalent to BBR.MaxBwFilterLen <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.10>
+/// equivalent to BBR.MaxBwFilterLen <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.5.6>
 const MAX_BW_FILTER_LEN: usize = 2;
 
 /// equivalent to BBR.ExtraAckedFilterLen <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.11>
@@ -596,7 +596,9 @@ impl Bbr3 {
             undo_inflight_shortterm: u64::MAX,
             bw_latest: 0.0,
             inflight_latest: 0,
-            max_bw_filter: MaxFilter::new(MAX_BW_FILTER_LEN as u64),
+            // BBR.MaxBwFilterLen counts discrete ProbeBW cycle slots (current
+            // and previous), while MaxFilter's raw window is a clock delta.
+            max_bw_filter: MaxFilter::new_discrete_slots(MAX_BW_FILTER_LEN as u64),
             extra_acked_interval_start: None,
             extra_acked_delivered: 0,
             extra_acked_filter: MaxFilter::new(EXTRA_ACKED_FILTER_LEN as u64),
@@ -1153,21 +1155,20 @@ impl Bbr3 {
         }
     }
 
-    /// equivalent to BBRCheckProbeRTT <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.4.3-4>
+    /// equivalent to BBRCheckProbeRTT <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.3.4.3>
     fn check_probe_rtt(&mut self, now: Instant) {
-        match self.state {
-            BbrState::ProbeRtt => {
-                self.handle_probe_rtt(now);
-            }
-            _ => {
-                if self.probe_rtt_expired && !self.idle_restart {
-                    self.enter_probe_rtt();
-                    self.save_cwnd();
-                    self.probe_rtt_done_stamp = None;
-                    self.ack_phase = AckPhase::ProbeStopping;
-                    self.start_round();
-                }
-            }
+        if self.state != BbrState::ProbeRtt && self.probe_rtt_expired && !self.idle_restart {
+            self.enter_probe_rtt();
+            self.save_cwnd();
+            self.probe_rtt_done_stamp = None;
+            self.ack_phase = AckPhase::ProbeStopping;
+            self.start_round();
+        }
+        // The draft deliberately uses a second independent condition here:
+        // HandleProbeRTT must run on the entry ACK so the first reduced-rate
+        // flight is marked before it is sent.
+        if self.state == BbrState::ProbeRtt {
+            self.handle_probe_rtt(now);
         }
         if let Some(rate_sample) = self.rs {
             if rate_sample.delivered > 0 {
@@ -1176,8 +1177,12 @@ impl Bbr3 {
         }
     }
 
-    /// equivalent to BBRHandleProbeRTT <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.4.3-4>
+    /// equivalent to BBRHandleProbeRTT <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.3.4.3>
     fn handle_probe_rtt(&mut self, now: Instant) {
+        // ProbeRTT intentionally reduces the delivery rate to measure min RTT.
+        // Mark packets sent in this phase so those samples cannot lower or age
+        // the ordinary max-bandwidth model.
+        self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
         if self.probe_rtt_done_stamp.is_none() && self.inflight <= self.probe_rtt_cwnd() {
             self.probe_rtt_done_stamp =
                 Some(now.checked_add(self.probe_rtt_duration).unwrap_or(now));
@@ -2032,6 +2037,117 @@ mod test {
     type UndoSnapshot = (Option<BbrState>, f64, u64, u64);
     /// A loss episode: (pre-loss undo snapshot, post-loss state, post-loss inflight_longterm).
     type LossEpisode = (UndoSnapshot, BbrState, u64);
+
+    #[test]
+    fn probe_rtt_entry_marks_the_first_reduced_rate_flight_app_limited() {
+        let now = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+
+        // Model a full, continuously backlogged ProbeBW connection whose min-RTT
+        // evidence has expired. The flight is already below the ProbeRTT cap, so
+        // the draft requires entry and HandleProbeRTT to complete on this ACK.
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr.full_bw_reached = true;
+        bbr.probe_rtt_expired = true;
+        bbr.idle_restart = false;
+        bbr.bw = 1_000_000.0;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.delivered = 24 * smss;
+        bbr.inflight = 2 * smss;
+        bbr.app_limited = 0;
+
+        bbr.check_probe_rtt(now);
+
+        assert_eq!(bbr.state, BbrState::ProbeRtt);
+        assert_eq!(
+            bbr.probe_rtt_done_stamp,
+            Some(now + bbr.probe_rtt_duration),
+            "ProbeRTT must arm its hold on the entry ACK when flight is already below the cap",
+        );
+        assert_eq!(
+            bbr.app_limited,
+            bbr.delivered + bbr.inflight,
+            "ProbeRTT must mark its deliberately reduced-rate delivery epoch",
+        );
+
+        // The first packet sent after the entry ACK must carry that marker. If
+        // HandleProbeRTT is delayed until the next ACK, this first flight can
+        // become a false low, non-application-limited max-bw sample.
+        bbr.on_packet_sent(
+            now + Duration::from_millis(1),
+            smss as u16,
+            1,
+            SpaceId::Data,
+        );
+        assert!(
+            bbr.packets[SpaceId::Data as usize]
+                .back()
+                .expect("first ProbeRTT packet")
+                .is_app_limited,
+        );
+    }
+
+    #[test]
+    fn probe_rtt_rearms_marking_and_low_samples_cannot_age_max_bw() {
+        let now = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+        let high_rate = 10_000_000u64;
+        let low_rate = high_rate / 10;
+
+        bbr.state = BbrState::ProbeRtt;
+        bbr.bw = high_rate as f64;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.delivered = 40 * smss;
+        bbr.inflight = 2 * smss;
+        bbr.app_limited = 0;
+        bbr.handle_probe_rtt(now);
+        assert_eq!(bbr.app_limited, bbr.delivered + bbr.inflight);
+
+        bbr.on_packet_sent(
+            now + Duration::from_millis(1),
+            smss as u16,
+            7,
+            SpaceId::Data,
+        );
+        let packet = *bbr.packets[SpaceId::Data as usize]
+            .back()
+            .expect("marked ProbeRTT packet");
+        assert!(packet.is_app_limited);
+
+        // Put the previous high sample just beyond the two-cycle max-filter
+        // horizon. A low unmarked update would evict it immediately.
+        bbr.max_bw_filter.update_max(0, high_rate);
+        bbr.max_bw = high_rate as f64;
+        bbr.cycle_count = MAX_BW_FILTER_LEN as u64 + 1;
+        bbr.rs = Some(BbrRateSample {
+            delivery_rate: low_rate as f64,
+            is_app_limited: packet.is_app_limited,
+            interval: Duration::from_millis(100),
+            delivered: smss,
+            prior_delivered: packet.delivered,
+            send_elapsed: Duration::from_millis(100),
+            ack_elapsed: Duration::from_millis(100),
+            rtt: Duration::from_millis(100),
+            tx_in_flight: packet.tx_in_flight,
+            newly_acked: smss,
+            lost: 0,
+            last_end_seq: packet.packet_number,
+            last_packet: packet,
+        });
+        bbr.update_max_bw(packet);
+        assert_eq!(bbr.max_bw, high_rate as f64);
+
+        // Once ProbeRTT exits, the same marked sample may complete the
+        // ProbeStopping round. It must not advance the max-bw filter clock.
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr.ack_phase = AckPhase::ProbeStopping;
+        bbr.round_start = true;
+        let cycle_before = bbr.cycle_count;
+        assert!(!bbr.adapt_long_term_model());
+        assert_eq!(bbr.cycle_count, cycle_before);
+    }
 
     #[test]
     fn stretched_ack_consumes_one_current_sample_before_model_and_controls() {

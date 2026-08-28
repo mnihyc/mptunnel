@@ -18,6 +18,18 @@ impl MaxFilter {
             samples: [Default::default(); MAX_FILTER_LEN],
         }
     }
+
+    /// Construct a filter whose integer clock contains exactly `slots` labels,
+    /// including the current label. The underlying Nichols filter represents
+    /// its window as the maximum allowed label delta, so N discrete labels map
+    /// to a delta horizon of N - 1.
+    pub(super) fn new_discrete_slots(slots: u64) -> Self {
+        assert!(
+            slots > 0,
+            "a discrete max-filter window needs at least one slot"
+        );
+        Self::new(slots - 1)
+    }
     pub(super) fn get_max(&self) -> u64 {
         self.samples[0].value.unwrap_or(0)
     }
@@ -190,5 +202,19 @@ mod test {
         assert_eq!(200, max_filter.get_max());
         max_filter.update_max_with_window(20, 15, 10);
         assert_eq!(20, max_filter.get_max());
+    }
+
+    #[test]
+    fn two_discrete_slots_expire_the_cycle_before_the_previous_cycle() {
+        let mut max_filter = MaxFilter::new_discrete_slots(2);
+
+        max_filter.update_max(1, 100);
+        max_filter.update_max(2, 10);
+        assert_eq!(100, max_filter.get_max());
+
+        // A two-slot BBR window contains the current and immediately previous
+        // ProbeBW cycles. At cycle 3, evidence from cycle 1 is no longer in it.
+        max_filter.update_max(3, 10);
+        assert_eq!(10, max_filter.get_max());
     }
 }

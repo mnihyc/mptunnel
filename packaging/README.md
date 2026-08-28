@@ -80,6 +80,11 @@ variable—resolve beside the selected TOML file. The bundled
 every TOML section, material source, DNS protocol, and carrier URI option. Run
 `./mptunnel --help` for the simple CLI surface.
 
+When upgrading from 0.4.3, rebuild the configuration from the bundled client,
+server, or complete reference example and transfer duration values in seconds.
+Version 0.4.4 intentionally rejects the earlier duration schema instead of
+guessing units; validate the rebuilt file before starting it.
+
 For an immediate connection trace, set `level = "debug"` in `[logging]` or use
 `--log-level debug`. Inbound, routing, optional balancing, and outbound records
 repeat the accepted request context; MPP ingress includes the typed opening

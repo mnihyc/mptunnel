@@ -66,7 +66,7 @@ SOCKS5 / HTTP CONNECT / mixed proxy / port forward / TUN-L4
 TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 ```
 
-![Live MPTUNNEL Overview with real connections, paths, sessions, and transfer speed](docs/assets/dashboard.png)
+![MPTUNNEL management dashboard with live charts, path health, peer paths, inbound connections, and outbound services](docs/assets/dashboard.png)
 
 ## Performance
 

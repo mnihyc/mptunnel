@@ -384,6 +384,27 @@ this provides locator-independent restart and roaming rather than deriving
 identity from a source address. See `examples/config.reference.toml` for the
 complete commented shape.
 
+### Migrating from 0.4.3 to 0.4.4
+
+Version 0.4.4 intentionally makes configuration durations seconds-only. Start
+from the current `examples/client.toml`, `examples/server.toml`, or exhaustive
+`examples/config.reference.toml`, transfer the deployment's intended values in
+seconds, and validate the rebuilt file; do not mix it with an earlier schema.
+
+- `[flow].idle_timeout_s` defaults to 300 seconds; zero disables payload-idle
+  expiry. TCP payload and accepted UDP datagrams refresh it, while transport
+  control and keep-alive traffic do not.
+- Omitted `[flow].optional_reinjection_budget_percent` is 10. It meters only
+  optional reliable-payload reinjection, not native recovery, control, probes,
+  or critical path-failure recovery.
+- Omitted `[flow].quic_loss_compensation_percent` is separately 10. It adjusts
+  sender-local QUIC delivery/loss evidence without sending bytes or consuming
+  the optional reinjection budget.
+- Omitted new-flow admission limits, local-inbound
+  connection/association/source/principal limits, and the MPP
+  pending-authentication limit default to 4,096. Explicit deployment limits
+  remain valid.
+
 ### Migrating a 0.3 configuration
 
 Version 0.4 is a clean configuration break; removed fields are rejected rather

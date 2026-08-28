@@ -25,6 +25,15 @@ const EXTRA_ACKED_FILTER_LEN: usize = 10;
 /// round so a smaller ACK in the same evidence round cannot erase an earlier aggregation peak.
 const STARTUP_EXTRA_ACKED_FILTER_LEN: usize = 1;
 
+/// Number of queue-drained packet-timed round medians retained by the
+/// experimental inflight-delay model: the current and previous robust
+/// low-flight observations.
+const INFLIGHT_RTT_FILTER_ROUNDS: usize = 2;
+
+/// Bound per-round RTT storage while retaining enough samples for a robust
+/// median. Samples are admitted only from the initial flight and ProbeRTT.
+const INFLIGHT_RTT_MEDIAN_SAMPLES: usize = 31;
+
 /// safety mechanism to flag packets as stale within our tracking VecDeque. rounds refer to <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1>.
 /// The value of 10 rounds is picked because normally after max(kTimeThreshold * max(smoothed_rtt, latest_rtt), kGranularity) <https://datatracker.ietf.org/doc/html/rfc9002#section-6.1.2>
 /// the packet should have been declared lost already, this is just to guarantee that the VecDeque doesn't grow indefinitely.
@@ -208,6 +217,9 @@ struct BbrPacket {
     send_time: Instant,
     /// equivalent to P.is_app_limited: true if C.app_limited was non-zero when the packet was sent, else false.
     is_app_limited: bool,
+    /// Whether the packet was sent while ProbeRTT deliberately held a low
+    /// flight. Ordinary application stalls must not feed the inflight floor.
+    is_probe_rtt: bool,
     /// equivalent to P.tx_in_flight: C.inflight immediately after the transmission of packet P.
     tx_in_flight: u64,
     /// packet number from the connection, unique only within `space`
@@ -426,6 +438,18 @@ pub struct Bbr3 {
     full_bw_count: u64,
     /// equivalent to BBR.min_rtt_stamp: The wall clock time at which the current BBR.min_rtt sample was obtained.
     min_rtt_stamp: Option<Instant>,
+    /// Robust queue-drained delay used only to provision one steady-state base
+    /// flight. Unlike `min_rtt`, a single fast-tail packet cannot lower it.
+    inflight_rtt: Duration,
+    /// Recent queue-drained packet-round medians.
+    inflight_rtt_filter: VecDeque<Duration>,
+    /// Packet-timed round currently accumulating eligible RTT samples.
+    inflight_rtt_sample_round: Option<u64>,
+    /// Most recent eligible round already committed. Late reordered ACKs from
+    /// this or an older round cannot reopen a one-sample median.
+    inflight_rtt_last_round: Option<u64>,
+    /// Bounded RTT samples for the current eligible round.
+    inflight_rtt_round_samples: Vec<Duration>,
     /// equivalent to BBR.ProbeRTTDuration: A constant specifying the minimum duration for which ProbeRTT state holds C.inflight to BBR.MinPipeCwnd or fewer packets: 200 ms.
     probe_rtt_duration: Duration,
     /// equivalent to BBR.ProbeRTTInterval: A constant specifying the minimum time interval between ProbeRTT states: 5 secs.
@@ -620,6 +644,11 @@ impl Bbr3 {
             full_bw: 0.0,
             full_bw_count: 0,
             min_rtt_stamp: None,
+            inflight_rtt: Duration::from_secs(u64::MAX),
+            inflight_rtt_filter: VecDeque::with_capacity(INFLIGHT_RTT_FILTER_ROUNDS),
+            inflight_rtt_sample_round: None,
+            inflight_rtt_last_round: None,
+            inflight_rtt_round_samples: Vec::with_capacity(INFLIGHT_RTT_MEDIAN_SAMPLES),
             probe_rtt_cwnd_gain,
             probe_rtt_duration: Duration::from_millis(PROBE_RTT_DURATION_MS),
             probe_rtt_interval: Duration::from_secs(PROBE_RTT_INTERVAL_SEC),
@@ -1178,6 +1207,7 @@ impl Bbr3 {
     /// as expired instead would dip every connection into ProbeRTT on its very first ack, and so
     /// into `min_pipe_cwnd`, since `bw` is still 0.
     fn update_min_rtt(&mut self, now: Instant) {
+        self.update_inflight_rtt();
         self.probe_rtt_expired = match self.probe_rtt_min_stamp {
             Some(probe_rtt_min_stamp) => {
                 now > probe_rtt_min_stamp
@@ -1208,6 +1238,87 @@ impl Bbr3 {
             self.min_rtt = self.probe_rtt_min_delay;
             self.min_rtt_stamp = self.probe_rtt_min_stamp;
         }
+    }
+
+    /// Update the experimental steady-state inflight delay from samples that
+    /// were taken while this flow was known to have a low flight: the initial
+    /// packet-timed round or ProbeRTT. Normal ProbeBW/Startup samples are
+    /// deliberately excluded so a standing queue or SRTT growth cannot inflate
+    /// the floor. Within each eligible round an upper median rejects isolated
+    /// fast-tail samples, including netem reordering that bypasses a delay queue.
+    fn update_inflight_rtt(&mut self) {
+        let Some(rate_sample) = self.rs else {
+            return;
+        };
+        let packet = rate_sample.last_packet;
+        let eligible = packet.round_count == 0 || packet.is_probe_rtt;
+
+        if let Some(active_round) = self.inflight_rtt_sample_round {
+            if packet.round_count < active_round {
+                return;
+            }
+            if packet.round_count > active_round {
+                self.finish_inflight_rtt_round();
+            }
+        }
+        let is_new_round = self
+            .inflight_rtt_last_round
+            .is_none_or(|last_round| packet.round_count > last_round);
+        if eligible && is_new_round && self.inflight_rtt_sample_round.is_none() {
+            self.inflight_rtt_sample_round = Some(packet.round_count);
+        }
+        if eligible
+            && self.inflight_rtt_sample_round == Some(packet.round_count)
+            && self.inflight_rtt_round_samples.len() < INFLIGHT_RTT_MEDIAN_SAMPLES
+        {
+            self.inflight_rtt_round_samples.push(rate_sample.rtt);
+        }
+    }
+
+    /// Commit one queue-drained packet-round median into the two-observation
+    /// min filter. Using the upper median means one early packet cannot lower a
+    /// two-packet sample set.
+    fn finish_inflight_rtt_round(&mut self) {
+        let finished_round = self.inflight_rtt_sample_round.take();
+        if self.inflight_rtt_round_samples.is_empty() {
+            return;
+        }
+        self.inflight_rtt_last_round = finished_round;
+        self.inflight_rtt_round_samples.sort_unstable();
+        let median_index = self.inflight_rtt_round_samples.len() / 2;
+        let median = self.inflight_rtt_round_samples[median_index];
+        // A low-flight burst still serializes packet by packet. If the entire
+        // median-minus-min gap fits within the serialization time of the
+        // packets up to the median, it contains no evidence of variable path
+        // delay; collapse it to the draft min_rtt so low-jitter behavior is
+        // algebraically identical. A reordered 12.49ms tail separated from a
+        // ~100ms median is far outside this model-derived budget and survives.
+        let serialization_budget = if self.max_bw > 0.0 {
+            Duration::try_from_secs_f64(
+                ((median_index as u64 + 1).saturating_mul(self.smss)) as f64 / self.max_bw,
+            )
+            .unwrap_or(Duration::MAX)
+        } else {
+            Duration::ZERO
+        };
+        let median = if self.min_rtt != Duration::from_secs(u64::MAX)
+            && median.saturating_sub(self.min_rtt) <= serialization_budget
+        {
+            self.min_rtt
+        } else {
+            median
+        };
+        self.inflight_rtt_round_samples.clear();
+        if self.inflight_rtt_filter.len() == INFLIGHT_RTT_FILTER_ROUNDS {
+            self.inflight_rtt_filter.pop_front();
+        }
+        self.inflight_rtt_filter.push_back(median);
+        self.inflight_rtt = self
+            .inflight_rtt_filter
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(Duration::from_secs(u64::MAX));
     }
 
     /// equivalent to BBRCheckProbeRTT <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.3.4.3>
@@ -1355,6 +1466,7 @@ impl Bbr3 {
 
     /// equivalent to BBRExitProbeRTT <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.4.4>
     fn exit_probe_rtt(&mut self, now: Instant) {
+        self.finish_inflight_rtt_round();
         self.reset_short_term_model();
         if self.full_bw_reached {
             self.start_probe_bw_down(now);
@@ -1406,7 +1518,23 @@ impl Bbr3 {
 
     /// equivalent to BBRUpdateMaxInflight <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.4.2-2>
     fn update_max_inflight(&mut self) {
-        let mut inflight_cap = self.bdp_multiple(self.max_bw, self.cwnd_gain);
+        let conventional_cap = self.bdp_multiple(self.max_bw, self.cwnd_gain);
+        let mut inflight_cap = conventional_cap;
+        // Preserve draft BBR exactly when both delay estimates agree. Only
+        // steady-state ProbeBW receives the robust base-flight floor; Startup,
+        // Drain, and ProbeRTT retain their existing raw-min-rtt behavior.
+        if matches!(self.state, BbrState::ProbeBw(_))
+            && self.inflight_rtt != Duration::from_secs(u64::MAX)
+            && self.inflight_rtt > self.min_rtt
+        {
+            let base_flight =
+                (self.max_bw * self.inflight_rtt.as_secs_f64()).round() as u64;
+            let probe_headroom = conventional_cap.saturating_sub(self.bdp);
+            inflight_cap = Ord::max(
+                conventional_cap,
+                base_flight.saturating_add(probe_headroom),
+            );
+        }
         inflight_cap += self.extra_acked;
         self.max_inflight = self.quantization_budget(inflight_cap);
     }
@@ -1744,6 +1872,7 @@ impl Controller for Bbr3 {
             first_send_time: self.first_send_time.unwrap_or(now),
             send_time: now,
             is_app_limited: self.app_limited != 0,
+            is_probe_rtt: self.state == BbrState::ProbeRtt,
             tx_in_flight: self.inflight,
             packet_number,
             space,
@@ -2091,6 +2220,8 @@ impl ControllerFactory for Bbr3Config {
 mod test {
     use super::*;
     use std::cell::Cell;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
     use std::ops::ControlFlow;
 
     /// Model snapshot taken before a (possibly spurious) loss:
@@ -2835,6 +2966,7 @@ mod test {
             first_send_time: now,
             send_time: now,
             is_app_limited: false,
+            is_probe_rtt: false,
             tx_in_flight: BASE_DATAGRAM_SIZE,
             packet_number: 0,
             space: SpaceId::Data,
@@ -2891,6 +3023,7 @@ mod test {
             first_send_time: now,
             send_time: now,
             is_app_limited: true,
+            is_probe_rtt: false,
             tx_in_flight: sample_inflight,
             packet_number: 0,
             space: SpaceId::Data,
@@ -2947,6 +3080,7 @@ mod test {
             first_send_time: now,
             send_time: now,
             is_app_limited: false,
+            is_probe_rtt: false,
             tx_in_flight: finite_loss_cap,
             packet_number: 0,
             space: SpaceId::Data,
@@ -3051,6 +3185,7 @@ mod test {
             first_send_time: now,
             send_time: now,
             is_app_limited: false,
+            is_probe_rtt: false,
             tx_in_flight: 100 * smss,
             packet_number: 0,
             space: SpaceId::Data,
@@ -3305,6 +3440,7 @@ mod test {
             first_send_time: now,
             send_time: now,
             is_app_limited: false,
+            is_probe_rtt: false,
             tx_in_flight: loss_derived_bound,
             packet_number: 0,
             space: SpaceId::Data,
@@ -3539,6 +3675,464 @@ mod test {
             }
             panic!("simulation exceeded {max_iters} iterations without reaching the target state");
         }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct VariableDelayPoint {
+        at_ns: u64,
+        delivered: u64,
+        min_rtt: Duration,
+        inflight_rtt: Duration,
+        max_bw: f64,
+        pacing_rate: f64,
+        cwnd: u64,
+        state: BbrState,
+    }
+
+    /// Drive one always-backlogged, lossless connection over a constant-rate
+    /// bottleneck. The data path and bottleneck are identical in both arms. In
+    /// the experimental arm exactly one ACK has a short return delay, modeling
+    /// netem's `reorder` behavior where one selected packet bypasses the normal
+    /// delay queue. All packets are eventually acknowledged; only ACK timing is
+    /// changed, so delivered capacity and loss evidence are identical.
+    fn run_scripted_fast_tail(
+        fast_tail: bool,
+        emulate_legacy_min_rtt_inflight: bool,
+    ) -> Vec<VariableDelayPoint> {
+        const MSS: u64 = 1452;
+        const BW: f64 = 6_000_000.0; // 48 Mbit/s
+        const FWD_NS: u64 = 6_000_000;
+        const NORMAL_RET_NS: u64 = 93_758_000;
+        const FAST_RET_NS: u64 = 6_248_000;
+        const FAST_TAIL_AT_NS: u64 = 8_000_000_000;
+        const END_NS: u64 = 23_000_000_000;
+        const SAMPLE_NS: u64 = 250_000_000;
+
+        let config = Bbr3Config {
+            probe_rng_seed: Some([0x5a; 16]),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        let base = Instant::now();
+        let mut rtt_est = RttEstimator::new(Duration::from_millis(100));
+        // (ACK time, packet number, send time). A heap is required because the
+        // fast-tail ACK overtakes earlier ACKs by design.
+        let mut flight: BinaryHeap<Reverse<(u64, u64, u64)>> = BinaryHeap::new();
+        let mut now_ns = 0u64;
+        let mut next_send_ns = 0u64;
+        let mut btl_free_ns = 0u64;
+        let mut inflight = 0u64;
+        let mut pn = 0u64;
+        let service_ns = (MSS as f64 / BW * 1e9).round() as u64;
+        let mut injected = false;
+        let mut next_sample_ns = SAMPLE_NS;
+        let mut trace = Vec::new();
+
+        for _ in 0..5_000_000u64 {
+            if now_ns >= END_NS {
+                break;
+            }
+            let can_send = inflight + MSS <= bbr.window();
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.peek().map(|entry| entry.0.0);
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                let arrival_ns = send_ns + FWD_NS;
+                let service_start_ns = arrival_ns.max(btl_free_ns);
+                let finish_ns = service_start_ns + service_ns;
+                btl_free_ns = finish_ns;
+                let short = fast_tail && !injected && send_ns >= FAST_TAIL_AT_NS;
+                if short {
+                    injected = true;
+                }
+                let return_ns = if short { FAST_RET_NS } else { NORMAL_RET_NS };
+                let ack_ns = finish_ns + return_ns;
+
+                bbr.on_packet_sent(
+                    base + Duration::from_nanos(send_ns),
+                    MSS as u16,
+                    pn,
+                    SpaceId::Data,
+                );
+                inflight += MSS;
+                flight.push(Reverse((ack_ns, pn, send_ns)));
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(Reverse((ack_ns, acked_pn, send_ns))) = flight.pop() {
+                now_ns = now_ns.max(ack_ns);
+                inflight -= MSS;
+                let sample_rtt = Duration::from_nanos(now_ns - send_ns);
+                rtt_est.update(Duration::ZERO, sample_rtt);
+                let now = base + Duration::from_nanos(now_ns);
+                bbr.on_ack(
+                    now,
+                    base + Duration::from_nanos(send_ns),
+                    MSS,
+                    acked_pn,
+                    SpaceId::Data,
+                    false,
+                    &rtt_est,
+                );
+                bbr.on_end_acks(now, inflight, false, Some(acked_pn), SpaceId::Data);
+                if emulate_legacy_min_rtt_inflight {
+                    // Recompute the next send opportunity with the pre-candidate
+                    // one-delay model. `on_end_acks` has already consumed and
+                    // cleared ACK byte credit, so this cannot double-count cwnd
+                    // growth; it only removes the operational-flight lift.
+                    bbr.inflight_rtt = bbr.min_rtt;
+                    bbr.update_control_parameters();
+                }
+
+                while now_ns >= next_sample_ns {
+                    trace.push(VariableDelayPoint {
+                        at_ns: now_ns,
+                        delivered: bbr.delivered,
+                        min_rtt: bbr.min_rtt,
+                        inflight_rtt: bbr.inflight_rtt,
+                        max_bw: bbr.max_bw,
+                        pacing_rate: bbr.pacing_rate,
+                        cwnd: bbr.cwnd,
+                        state: bbr.state,
+                    });
+                    next_sample_ns += SAMPLE_NS;
+                }
+            } else {
+                panic!("scripted variable-delay simulation stalled without packets in flight");
+            }
+        }
+
+        assert!(now_ns >= END_NS, "scripted simulation did not reach its deadline");
+        assert_eq!(bbr.lost, 0, "the scripted variable-delay ablation is lossless");
+        assert_eq!(injected, fast_tail, "fast-tail script did not match its arm");
+        trace
+    }
+
+    fn trace_min_rate(trace: &[VariableDelayPoint], from_s: u64, to_s: u64) -> f64 {
+        trace
+            .iter()
+            .filter(|point| {
+                point.at_ns >= from_s * 1_000_000_000
+                    && point.at_ns < to_s * 1_000_000_000
+            })
+            .map(|point| point.pacing_rate)
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    fn trace_max_rate(trace: &[VariableDelayPoint], from_s: u64, to_s: u64) -> f64 {
+        trace
+            .iter()
+            .filter(|point| {
+                point.at_ns >= from_s * 1_000_000_000
+                    && point.at_ns < to_s * 1_000_000_000
+            })
+            .map(|point| point.pacing_rate)
+            .fold(0.0, f64::max)
+    }
+
+    fn synthetic_rtt_sample(
+        base: Instant,
+        round_count: u64,
+        rtt: Duration,
+        is_probe_rtt: bool,
+    ) -> BbrRateSample {
+        let packet = BbrPacket {
+            delivered: 0,
+            delivered_time: base,
+            first_send_time: base,
+            send_time: base,
+            is_app_limited: is_probe_rtt,
+            is_probe_rtt,
+            tx_in_flight: BASE_DATAGRAM_SIZE,
+            packet_number: round_count,
+            space: SpaceId::Data,
+            size: BASE_DATAGRAM_SIZE as u16,
+            lost: 0,
+            acknowledged: true,
+            stale: false,
+            round_count,
+        };
+        BbrRateSample {
+            delivery_rate: 6_000_000.0,
+            is_app_limited: is_probe_rtt,
+            interval: rtt,
+            delivered: BASE_DATAGRAM_SIZE,
+            prior_delivered: 0,
+            send_elapsed: rtt,
+            ack_elapsed: rtt,
+            rtt,
+            tx_in_flight: BASE_DATAGRAM_SIZE,
+            newly_acked: BASE_DATAGRAM_SIZE,
+            lost: 0,
+            last_end_seq: round_count,
+            last_packet: packet,
+        }
+    }
+
+    #[test]
+    fn inflight_rtt_rejects_fast_tail_and_ignores_standing_queue_samples() {
+        let base = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.max_bw = 6_000_000.0;
+        bbr.min_rtt = Duration::from_micros(12_490);
+
+        // Initial low-flight round: one reordered packet bypasses delay, while
+        // the remaining packets see the 100ms operational path. The upper
+        // median, not the isolated minimum, sizes the base flight.
+        for rtt in std::iter::once(Duration::from_micros(12_490))
+            .chain(std::iter::repeat_n(Duration::from_millis(100), 9))
+        {
+            bbr.rs = Some(synthetic_rtt_sample(base, 0, rtt, false));
+            bbr.update_inflight_rtt();
+        }
+        bbr.rs = Some(synthetic_rtt_sample(
+            base,
+            1,
+            Duration::from_millis(300),
+            false,
+        ));
+        bbr.update_inflight_rtt();
+        assert_eq!(bbr.inflight_rtt, Duration::from_millis(100));
+
+        // A reordered ACK from the already committed initial round cannot
+        // reopen that round as a one-sample median and defeat robustness.
+        bbr.rs = Some(synthetic_rtt_sample(
+            base,
+            0,
+            Duration::from_millis(1),
+            true,
+        ));
+        bbr.update_inflight_rtt();
+        assert_eq!(bbr.inflight_rtt, Duration::from_millis(100));
+        assert!(bbr.inflight_rtt_sample_round.is_none());
+
+        // Simulate a standing queue growing normal ProbeBW RTTs to 300ms.
+        // These samples are deliberately inadmissible, so neither SRTT nor a
+        // persistent queue can create a self-reinforcing inflight floor.
+        for round in 1..20 {
+            bbr.rs = Some(synthetic_rtt_sample(
+                base,
+                round,
+                Duration::from_millis(300),
+                false,
+            ));
+            bbr.update_inflight_rtt();
+        }
+        assert_eq!(bbr.inflight_rtt, Duration::from_millis(100));
+        assert_eq!(bbr.inflight_rtt_filter.len(), 1);
+    }
+
+    #[test]
+    fn inflight_rtt_ages_up_only_after_two_queue_drained_round_medians() {
+        let base = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.max_bw = 6_000_000.0;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.inflight_rtt = Duration::from_millis(100);
+        bbr.inflight_rtt_filter
+            .push_back(Duration::from_millis(100));
+
+        for _ in 0..9 {
+            bbr.rs = Some(synthetic_rtt_sample(
+                base,
+                10,
+                Duration::from_millis(200),
+                true,
+            ));
+            bbr.update_inflight_rtt();
+        }
+        bbr.rs = Some(synthetic_rtt_sample(
+            base,
+            11,
+            Duration::from_millis(200),
+            true,
+        ));
+        bbr.update_inflight_rtt();
+        assert_eq!(
+            bbr.inflight_rtt,
+            Duration::from_millis(100),
+            "one higher ProbeRTT median must not evict the previous low-flight observation"
+        );
+        bbr.finish_inflight_rtt_round();
+        assert_eq!(bbr.inflight_rtt, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn inflight_rtt_is_low_jitter_neutral_and_probe_rtt_remains_raw() {
+        let mut conventional = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        conventional.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        conventional.max_bw = 6_000_000.0;
+        conventional.bw = conventional.max_bw;
+        conventional.min_rtt = Duration::from_millis(100);
+        conventional.inflight_rtt = Duration::from_secs(u64::MAX);
+        conventional.cwnd_gain = conventional.default_cwnd_gain;
+        conventional.extra_acked = 12_345;
+        let mut equal_delays = conventional.clone();
+        equal_delays.inflight_rtt = equal_delays.min_rtt;
+
+        conventional.update_max_inflight();
+        equal_delays.update_max_inflight();
+        assert_eq!(equal_delays.bdp, conventional.bdp);
+        assert_eq!(equal_delays.offload_budget, conventional.offload_budget);
+        assert_eq!(equal_delays.max_inflight, conventional.max_inflight);
+
+        // Even with a much larger operational flight estimate, ProbeRTT keeps
+        // the draft's raw 0.5*bw*min_rtt cap exactly.
+        conventional.state = BbrState::ProbeRtt;
+        conventional.cwnd_gain = conventional.probe_rtt_cwnd_gain;
+        conventional.min_rtt = Duration::from_micros(12_490);
+        conventional.inflight_rtt = Duration::from_secs(u64::MAX);
+        equal_delays = conventional.clone();
+        equal_delays.inflight_rtt = Duration::from_millis(100);
+        conventional.update_max_inflight();
+        equal_delays.update_max_inflight();
+        assert_eq!(equal_delays.max_inflight, conventional.max_inflight);
+        assert_eq!(equal_delays.probe_rtt_cwnd(), conventional.probe_rtt_cwnd());
+    }
+
+    #[test]
+    fn operational_flight_remains_below_existing_loss_caps() {
+        let mut bbr = Bbr3::new(
+            Arc::new(Bbr3Config::default()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.full_bw_reached = true;
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr.max_bw = 6_000_000.0;
+        bbr.bw = bbr.max_bw;
+        bbr.min_rtt = Duration::from_micros(12_490);
+        bbr.inflight_rtt = Duration::from_millis(100);
+        bbr.inflight_longterm = 300_000;
+        bbr.inflight_shortterm = 200_000;
+        bbr.cwnd = 2_000_000;
+        bbr.rs = None;
+
+        bbr.set_cwnd();
+        assert!(bbr.max_inflight > bbr.inflight_shortterm);
+        assert_eq!(bbr.cwnd, bbr.inflight_shortterm);
+    }
+
+    /// The legacy one-delay model reproduces the no-loss collapse from one
+    /// fast-tail RTT sample, while the two-delay model keeps the robust base
+    /// flight and preserves max bandwidth. Both arms retain the same raw
+    /// `min_rtt`, proving ProbeRTT/propagation semantics were not replaced.
+    #[test]
+    fn operational_inflight_rtt_prevents_fast_tail_bdp_collapse() {
+        let stable = run_scripted_fast_tail(false, false);
+        let stable_legacy = run_scripted_fast_tail(false, true);
+        let legacy_fast_tail = run_scripted_fast_tail(true, true);
+        let protected_fast_tail = run_scripted_fast_tail(true, false);
+
+        assert_eq!(
+            stable, stable_legacy,
+            "equal-delay behavior must be bit/model-identical to the one-delay model"
+        );
+
+        let stable_pre = trace_max_rate(&stable, 6, 8);
+        let fast_pre = trace_max_rate(&legacy_fast_tail, 6, 8);
+        let stable_during = trace_min_rate(&stable, 11, 18);
+        let legacy_during = trace_min_rate(&legacy_fast_tail, 11, 18);
+        let legacy_recovered = trace_max_rate(&legacy_fast_tail, 19, 23);
+        let protected_during = trace_min_rate(&protected_fast_tail, 11, 18);
+        let stable_min_rtt = stable
+            .iter()
+            .map(|point| point.min_rtt)
+            .min()
+            .expect("stable trace");
+        let legacy_min_rtt = legacy_fast_tail
+            .iter()
+            .filter(|point| point.at_ns >= 8_000_000_000)
+            .map(|point| point.min_rtt)
+            .min()
+            .expect("legacy fast-tail trace");
+        let protected_min_rtt = protected_fast_tail
+            .iter()
+            .filter(|point| point.at_ns >= 8_000_000_000)
+            .map(|point| point.min_rtt)
+            .min()
+            .expect("protected fast-tail trace");
+        let protected_inflight_rtt = protected_fast_tail
+            .iter()
+            .filter(|point| point.at_ns >= 8_000_000_000)
+            .map(|point| point.inflight_rtt)
+            .min()
+            .expect("protected inflight-rtt trace");
+        let legacy_delivered = legacy_fast_tail
+            .last()
+            .expect("legacy trace tail")
+            .delivered;
+        let protected_delivered = protected_fast_tail
+            .last()
+            .expect("protected trace tail")
+            .delivered;
+
+        eprintln!(
+            "stable pre={stable_pre:.0} during_min={stable_during:.0} min_rtt={stable_min_rtt:?}; \
+             legacy-fast pre={fast_pre:.0} during_min={legacy_during:.0} recovered={legacy_recovered:.0} \
+             min_rtt={legacy_min_rtt:?}; protected during_min={protected_during:.0} \
+             min_rtt={protected_min_rtt:?} inflight_rtt={protected_inflight_rtt:?}"
+        );
+        for point in protected_fast_tail
+            .iter()
+            .filter(|point| point.at_ns % 1_000_000_000 < 250_000_000)
+        {
+            eprintln!(
+                "t={:.3}s delivered={} min_rtt={:?} inflight_rtt={:?} \
+                 max_bw={:.0} pace={:.0} cwnd={} state={:?}",
+                point.at_ns as f64 / 1e9,
+                point.delivered,
+                point.min_rtt,
+                point.inflight_rtt,
+                point.max_bw,
+                point.pacing_rate,
+                point.cwnd,
+                point.state,
+            );
+        }
+
+        assert!(stable_min_rtt >= Duration::from_millis(95));
+        assert!(legacy_min_rtt < Duration::from_millis(20));
+        assert_eq!(protected_min_rtt, legacy_min_rtt);
+        assert!(protected_inflight_rtt >= Duration::from_millis(95));
+        assert!(
+            protected_delivered > legacy_delivered,
+            "operational flight did not improve useful delivery on the same capacity: \
+             protected {protected_delivered} vs legacy {legacy_delivered}"
+        );
+        assert!(stable_pre > 0.0 && fast_pre >= 0.9 * stable_pre);
+        assert!(
+            stable_during >= 0.75 * stable_pre,
+            "stable RTT arm unexpectedly declined: {stable_during} vs {stable_pre}"
+        );
+        assert!(
+            legacy_during <= 0.45 * fast_pre,
+            "legacy fast-tail arm did not reproduce a decisive decline: \
+             {legacy_during} vs {fast_pre}"
+        );
+        assert!(
+            legacy_recovered >= 0.75 * fast_pre,
+            "legacy fast-tail arm did not recover after the 10s min-rtt expiry: \
+             {legacy_recovered} vs {fast_pre}"
+        );
+        assert!(
+            protected_during >= stable_during,
+            "operational inflight floor did not preserve the stable-link regime: \
+             {protected_during} vs stable {stable_during}"
+        );
     }
 
     #[test]
@@ -5393,6 +5987,7 @@ mod test {
             first_send_time: now,
             send_time: now,
             is_app_limited: false,
+            is_probe_rtt: false,
             tx_in_flight: smss,
             packet_number: 0,
             space: SpaceId::Data,

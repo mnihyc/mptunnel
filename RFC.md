@@ -2194,6 +2194,53 @@ RFC 9000 and RFC 9002 govern each QUIC carrier's connection identity, network
 paths, address validation, migration, congestion control, loss recovery, RTT,
 ECN, and PMTU behavior. MPP does not redefine those mechanisms.
 
+A model-based native QUIC controller should not necessarily use one delay
+estimate for two different jobs. A raw minimum RTT is propagation evidence: it
+is appropriate for the controller's minimum-delay filter and for draining the
+queue during a ProbeRTT state. The flight needed during ordinary Startup,
+Drain, and bandwidth-probing states is instead a service-window estimate. On a
+variable-delay path, one reordered fast-tail sample can be a valid minimum RTT
+while still being far below the delay that normally bounds delivered flight.
+Using that sample for both jobs can make `gain * bandwidth * RTT` too small,
+age the bandwidth estimate down behind the resulting underflight, and create a
+self-sustaining rate collapse.
+
+The preferred model for a BBR-family implementation therefore retains raw
+minimum RTT for propagation and ProbeRTT, while ordinary flight may use a
+separate packet-qualified operational RTT. Operational evidence should come
+only from a controller-qualified low-flight observation—for example, initial
+or idle zero-flight transmission, or packets sent after a ProbeRTT hold is
+armed. These predicates qualify controller state; they do not prove that the
+network queue is empty. An implementation should admit at most the newest
+eligible packet from one real ACK event, require two independent observations
+before departing from raw RTT, and use a bounded majority filter such as the
+upper median of the latest three observations. Before that evidence exists,
+raw RTT remains the fallback.
+
+This separation is not permission to preserve a standing queue. Ordinary
+flight remains the native controller's full gain-times-bandwidth-times-delay
+calculation, and its existing loss, ECN, recovery, and upper-flight bounds
+remain authoritative. The tradeoff is deliberate: qualified operational
+delay can provision more flight than a rare fast-tail minimum, but drained
+sampling, majority admission, and native congestion caps bound that choice.
+It avoids treating an exceptional propagation sample as the normal service
+window without changing how ProbeRTT measures propagation.
+
+Feedback ordering remains a qualification limit. If the transport finalizes
+the ACK event before delivering loss or ECN feedback caused by that same ACK,
+that later feedback cannot veto the event's operational-delay vote. One vote
+cannot move an established latest-three majority, and subsequent native loss
+and ECN processing still binds flight; an implementation must not claim that
+the vote itself was loss- or ECN-free.
+
+This guidance is an implementation preference, not an MPP wire requirement.
+It records a defect in applying a one-delay form of the BBR-family model
+described by `draft-ietf-ccwg-bbr-06` to the qualified variable-delay case; it
+is not a defect in RFC 9000 or RFC 9002. CUBIC, an implementation of the
+published BBR draft, or another native QUIC controller remains permitted. In
+every case the QUIC controller—not MPP scheduling—owns its packet window,
+pacing, loss response, and recovery.
+
 The default profile uses the public RFC 9001 Initial key schedule. The optional
 shared-secret profile deliberately substitutes the private Initial input in
 Section 6.2 and is therefore not Initial-key interoperable with an endpoint
@@ -2249,6 +2296,8 @@ pools; it neither leases addresses dynamically nor installs host routes.
 
 ### 18.2 Informative
 
+- [BBR Congestion Control, Internet-Draft
+  draft-ietf-ccwg-bbr-06](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-06)
 - [RFC 6356: Coupled Congestion Control for Multipath
   Transport Protocols](https://www.rfc-editor.org/rfc/rfc6356.html)
 - [RFC 8684: TCP Extensions for Multipath Operation with Multiple

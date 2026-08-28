@@ -478,6 +478,71 @@ async fn quic_keep_alive_preserves_a_quiet_authenticated_carrier() {
 }
 
 #[tokio::test]
+async fn client_and_server_endpoints_keep_independent_local_loss_floors() {
+    fn configured_loss_ppm(connection: &Connection) -> u32 {
+        connection
+            .connection
+            .congestion_state()
+            .into_any()
+            .downcast::<InstrumentedController>()
+            .expect("instrumented QUIC controller")
+            .configured_loss_compensation()
+            .ppm()
+    }
+
+    let server_path = "quic://127.0.0.1:443?loss-compensation-percent=2.5"
+        .parse::<PathSpec>()
+        .expect("server QUIC path");
+    let mux_limits = MuxLimits::default();
+    let server = Endpoint::bind_server_for_path(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+        &server_path.metadata,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let accepted = tokio::spawn(async move { server.accept().await.expect("server connection") });
+    let client_path = format!(
+        "quic://127.0.0.1:{}?loss-compensation-percent=7.125",
+        server_addr.port()
+    )
+    .parse::<PathSpec>()
+    .expect("client QUIC path");
+    let carrier = CarrierSocket::system(CarrierSocketRequest {
+        path: &client_path,
+        identity: CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
+        remote_addr: server_addr,
+    })
+    .expect("client carrier socket");
+    let client = Endpoint::bind_client_socket_for_path(
+        carrier,
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+        &client_path.metadata,
+    )
+    .await
+    .expect("client endpoint");
+    let client_connection = timeout(Duration::from_secs(5), client.connect(server_addr))
+        .await
+        .expect("client connect timeout")
+        .expect("client connection");
+    let server_connection = timeout(Duration::from_secs(5), accepted)
+        .await
+        .expect("server accept timeout")
+        .expect("server accept task");
+
+    assert_eq!(configured_loss_ppm(&client_connection), 71_250);
+    assert_eq!(configured_loss_ppm(&server_connection), 25_000);
+}
+
+#[tokio::test]
 async fn quic_destination_port_migration_preserves_connection_and_streams() {
     let mux_limits = MuxLimits {
         quic_path_keep_alive_interval: Duration::from_millis(20),

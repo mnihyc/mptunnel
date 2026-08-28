@@ -13,8 +13,8 @@ use super::{
     QuicCandidateVerifier, QuicCarrierError, QuicCarrierTelemetry, RecvStream, SendStream,
 };
 use crate::mux::MuxLimits;
-use crate::transport::CarrierSocket;
 use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
+use crate::transport::{CarrierSocket, PathMetadata};
 use quinn::{ClientConfig, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -71,12 +71,23 @@ impl Endpoint {
         candidate_verifier: Arc<dyn QuicCandidateVerifier>,
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
+        let path_metadata = PathMetadata::default();
+        Self::bind_server_for_path(addr, tls, candidate_verifier, mux_limits, &path_metadata).await
+    }
+
+    pub(crate) async fn bind_server_for_path(
+        addr: SocketAddr,
+        tls: &TcpServerTlsConfig,
+        candidate_verifier: Arc<dyn QuicCandidateVerifier>,
+        mux_limits: MuxLimits,
+        path_metadata: &PathMetadata,
+    ) -> Result<Self, QuicCarrierError> {
         #[cfg(not(windows))]
-        let endpoint = QuinnEndpoint::server(server_config(tls, mux_limits)?, addr)?;
+        let endpoint = QuinnEndpoint::server(server_config(tls, mux_limits, path_metadata)?, addr)?;
         #[cfg(windows)]
         let endpoint = {
             let socket = bind_server_udp_socket(addr)?;
-            endpoint_from_udp_socket(socket, Some(server_config(tls, mux_limits)?))?
+            endpoint_from_udp_socket(socket, Some(server_config(tls, mux_limits, path_metadata)?))?
         };
         Ok(Self {
             endpoint,
@@ -101,7 +112,11 @@ impl Endpoint {
             let socket = bind_client_udp_socket(addr)?;
             endpoint_from_udp_socket(socket, None)?
         };
-        endpoint.set_default_client_config(client_config(tls, mux_limits)?);
+        endpoint.set_default_client_config(client_config(
+            tls,
+            mux_limits,
+            &PathMetadata::default(),
+        )?);
         Ok(Self {
             endpoint,
             role: EndpointRole::Client {
@@ -119,11 +134,29 @@ impl Endpoint {
         candidate_selector: QuicCandidateSelector,
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
+        let path_metadata = PathMetadata::default();
+        Self::bind_client_socket_for_path(
+            socket,
+            tls,
+            candidate_selector,
+            mux_limits,
+            &path_metadata,
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_client_socket_for_path(
+        socket: CarrierSocket,
+        tls: &TcpClientTlsConfig,
+        candidate_selector: QuicCandidateSelector,
+        mux_limits: MuxLimits,
+        path_metadata: &PathMetadata,
+    ) -> Result<Self, QuicCarrierError> {
         let server_name = tls
             .quic_server_name_text()
             .ok_or(QuicCarrierError::H3AuthorityRequiresDnsName)?;
         let mut endpoint = endpoint_from_udp_socket(socket.into_udp_socket()?, None)?;
-        endpoint.set_default_client_config(client_config(tls, mux_limits)?);
+        endpoint.set_default_client_config(client_config(tls, mux_limits, path_metadata)?);
         Ok(Self {
             endpoint,
             role: EndpointRole::Client {
@@ -410,32 +443,51 @@ impl Connection {
 fn server_config(
     tls: &TcpServerTlsConfig,
     mux_limits: MuxLimits,
+    path_metadata: &PathMetadata,
 ) -> Result<ServerConfig, QuicCarrierError> {
     let mut crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls.rustls_config())?;
     if let Some(secret) = tls.quic_initial_secret() {
         crypto.initial_packet_secret(secret);
     }
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport = Arc::new(quic_transport_config(mux_limits, false)?);
+    config.transport = Arc::new(quic_transport_config_for_path(
+        mux_limits,
+        false,
+        path_metadata,
+    )?);
     Ok(config)
 }
 
 fn client_config(
     tls: &TcpClientTlsConfig,
     mux_limits: MuxLimits,
+    path_metadata: &PathMetadata,
 ) -> Result<ClientConfig, QuicCarrierError> {
     let mut crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls.rustls_config())?;
     if let Some(secret) = tls.quic_initial_secret() {
         crypto.initial_packet_secret(secret);
     }
     let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(quic_transport_config(mux_limits, true)?));
+    config.transport_config(Arc::new(quic_transport_config_for_path(
+        mux_limits,
+        true,
+        path_metadata,
+    )?));
     Ok(config)
 }
 
+#[cfg(test)]
 fn quic_transport_config(
     mux_limits: MuxLimits,
     client_keep_alive: bool,
+) -> Result<TransportConfig, QuicCarrierError> {
+    quic_transport_config_for_path(mux_limits, client_keep_alive, &PathMetadata::default())
+}
+
+fn quic_transport_config_for_path(
+    mux_limits: MuxLimits,
+    client_keep_alive: bool,
+    path_metadata: &PathMetadata,
 ) -> Result<TransportConfig, QuicCarrierError> {
     let stream_receive_window = mux_limits.max_stream_window_bytes.max(1);
     let connection_receive_window = stream_receive_window
@@ -465,7 +517,7 @@ fn quic_transport_config(
         .datagram_receive_buffer_size(Some(mux_limits.max_datagram_queue_bytes))
         .datagram_send_buffer_size(mux_limits.max_datagram_queue_bytes)
         .max_idle_timeout(Some(mux_limits.quic_path_idle_timeout.try_into()?))
-        .congestion_controller_factory(Arc::new(InstrumentedBbrConfig));
+        .congestion_controller_factory(Arc::new(InstrumentedBbrConfig::for_path(path_metadata)));
     if client_keep_alive {
         let maximum = mux_limits.quic_path_keep_alive_interval;
         transport.keep_alive_interval_range(maximum - maximum / 5, maximum);

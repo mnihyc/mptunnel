@@ -17,6 +17,8 @@ secret = { from = "file", path = "mpp-credential.key" }
 [[inbounds]]
 name = "mpp-listener"
 protocol = "mpp"
+# QUIC loss compensation defaults to 10% when omitted. To state or override it,
+# append `?loss-compensation-percent=10` (or `=0` for draft BBR3 behavior).
 paths = [
   { name = "path-1", endpoint = "tcp://0.0.0.0:7443" },
   { name = "path-2", endpoint = "quic://0.0.0.0:7443" },

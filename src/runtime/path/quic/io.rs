@@ -109,11 +109,12 @@ impl UdpPathEndpoint {
         let addrs = resolve_udp_server_path_socket_addrs(path).await?;
         let mut last_error = None;
         for addr in addrs {
-            match quic_transport::Endpoint::bind_server(
+            match quic_transport::Endpoint::bind_server_for_path(
                 addr,
                 &context.tls,
                 context.credential_admission.clone(),
                 context.mux_limits,
+                &path.metadata,
             )
             .await
             {
@@ -133,11 +134,12 @@ impl UdpPathEndpoint {
         runtime: &ClientUdpPathSessionRuntime,
     ) -> Result<Self, RuntimeError> {
         Ok(Self {
-            endpoint: quic_transport::Endpoint::bind_client_socket(
+            endpoint: quic_transport::Endpoint::bind_client_socket_for_path(
                 socket,
                 runtime.tls(),
                 runtime.candidate_selector.clone(),
                 runtime.mux_limits,
+                &runtime.path().metadata,
             )
             .await?,
         })

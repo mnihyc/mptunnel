@@ -14,6 +14,7 @@ use std::time::Duration;
 pub const DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 pub const MIN_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 1_000;
 pub const DEFAULT_TCP_CARRIER_MAX: u16 = 3;
+pub const DEFAULT_QUIC_LOSS_COMPENSATION_PERCENT: u32 = 10;
 
 /// Complete public query-key vocabulary accepted by carrier path URIs.
 pub const CARRIER_PATH_QUERY_KEYS: &[&str] = &[
@@ -24,6 +25,7 @@ pub const CARRIER_PATH_QUERY_KEYS: &[&str] = &[
     "initial-rate-kbps",
     "initial-rate-mbps",
     "initial-rate",
+    "loss-compensation-percent",
     "max-datagram-payload-bytes",
     "max-tcp-carriers",
     "port-rotation-interval-ms",
@@ -329,12 +331,33 @@ pub enum RateHint {
     BitsPerSecond(u64),
 }
 
+/// Exact sender-local QUIC loss-compensation policy.
+///
+/// The fixed-point representation preserves exact path-metadata equality. One
+/// part per million is `0.0001%`; valid values are zero through 999,999 ppm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LossPolicyPercent(u32);
+
+impl LossPolicyPercent {
+    pub const fn ppm(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for LossPolicyPercent {
+    fn default() -> Self {
+        Self(DEFAULT_QUIC_LOSS_COMPENSATION_PERCENT * 10_000)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathMetadata {
     pub policy: PathPolicy,
     pub initial_srtt_ms: Option<u32>,
     pub initial_jitter_ms: Option<u32>,
     pub initial_rate: RateHint,
+    /// Expert-only local sender input. This is never peer protocol evidence.
+    pub loss_compensation: Option<LossPolicyPercent>,
     /// Optional product datagram ceiling. QUIC owns transport PMTU discovery.
     pub max_datagram_payload_bytes: Option<usize>,
     /// Explicit TCP concurrency target. Absence selects the Product default.
@@ -350,6 +373,7 @@ impl Default for PathMetadata {
             initial_srtt_ms: None,
             initial_jitter_ms: None,
             initial_rate: RateHint::Unknown,
+            loss_compensation: None,
             max_datagram_payload_bytes: None,
             tcp_carriers: None,
             port_hop_interval_ms: None,
@@ -409,6 +433,9 @@ impl FromStr for PathSpec {
         }
         if underlay != UnderlayProtocol::Udp && metadata.max_datagram_payload_bytes.is_some() {
             return Err(PathSpecParseError::MaxDatagramPayloadRequiresQuicPath);
+        }
+        if underlay != UnderlayProtocol::Udp && metadata.loss_compensation.is_some() {
+            return Err(PathSpecParseError::LossCompensationRequiresQuicPath);
         }
         if metadata.port_hop_interval_ms.is_some() && endpoint.ports().is_single() {
             return Err(PathSpecParseError::PortRotationIntervalRequiresRangedPath);
@@ -495,6 +522,9 @@ fn parse_path_options(
                         ));
                     }
                 };
+            }
+            "loss-compensation-percent" => {
+                metadata.loss_compensation = Some(parse_loss_compensation_percent(key, value)?);
             }
             "max-datagram-payload-bytes" => {
                 metadata.max_datagram_payload_bytes =
@@ -588,6 +618,62 @@ fn parse_datagram_payload_limit(
         ));
     }
     Ok(payload_limit)
+}
+
+fn parse_loss_compensation_percent(
+    key: &str,
+    value: Option<&str>,
+) -> Result<LossPolicyPercent, PathSpecParseError> {
+    const PPM_PER_PERCENT: u32 = 10_000;
+    const FRACTION_DIGITS: usize = 4;
+    const ONE_HUNDRED_PERCENT_PPM: u32 = 1_000_000;
+
+    let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
+    let (whole, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            value.to_string(),
+        ));
+    }
+    let whole = whole.parse::<u32>().map_err(|_| {
+        PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+    })?;
+    let fractional_ppm = match fraction {
+        None => 0,
+        Some(fraction)
+            if !fraction.is_empty()
+                && fraction.len() <= FRACTION_DIGITS
+                && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let padding = FRACTION_DIGITS - fraction.len();
+            let fraction = fraction.parse::<u32>().map_err(|_| {
+                PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+            })?;
+            fraction * 10_u32.pow(padding as u32)
+        }
+        Some(_) => {
+            return Err(PathSpecParseError::InvalidQueryParamValue(
+                key.to_string(),
+                value.to_string(),
+            ));
+        }
+    };
+    let ppm = whole
+        .checked_mul(PPM_PER_PERCENT)
+        .and_then(|ppm| ppm.checked_add(fractional_ppm))
+        .ok_or_else(|| {
+            PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+        })?;
+    if ppm >= ONE_HUNDRED_PERCENT_PPM {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            value.to_string(),
+        ));
+    }
+    Ok(LossPolicyPercent(ppm))
 }
 
 fn parse_port_hop_interval(key: &str, value: Option<&str>) -> Result<u32, PathSpecParseError> {
@@ -737,6 +823,7 @@ pub enum PathSpecParseError {
     QueryParamOverflow(String),
     AllowDatagramsRequiresTcpPath,
     MaxDatagramPayloadRequiresQuicPath,
+    LossCompensationRequiresQuicPath,
     MaxTcpCarriersRequiresTcpPath,
     PortRotationIntervalRequiresRangedPath,
 }
@@ -783,6 +870,10 @@ impl std::fmt::Display for PathSpecParseError {
             Self::MaxDatagramPayloadRequiresQuicPath => write!(
                 f,
                 "max-datagram-payload-bytes is valid only for quic:// carrier endpoints"
+            ),
+            Self::LossCompensationRequiresQuicPath => write!(
+                f,
+                "loss-compensation-percent is valid only for quic:// carrier endpoints"
             ),
             Self::MaxTcpCarriersRequiresTcpPath => {
                 write!(

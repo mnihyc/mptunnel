@@ -35,9 +35,23 @@ deviations from upstream 0.11.16 are:
   rate and runs the model and controls exactly once. The completed sample is
   retained until the next ACK epoch for Quinn's post-ACK or timer-driven loss
   detection;
+- Quinn's authoritative application-limited send indication is stamped before
+  the packet snapshot and idle-restart decision. ACK processing expires an old
+  application-limited interval and may re-arm the current interval in the same
+  transaction, so stale idle/control traffic cannot suppress later bandwidth
+  evidence;
 - draft-06 section 5.5.9 ACK aggregation feeds every completed ACK into one
   dynamic windowed maximum atomically: its horizon is one packet-timed round
   before `full_bw_reached` and ten rounds afterwards;
+- raw minimum RTT remains propagation and ProbeRTT evidence, while ordinary
+  flight may use the packet-qualified, two-observation operational-RTT model
+  documented in the MPTUNNEL RFC;
+- a sender-local loss-compensation policy corrects aligned delivery-rate and
+  delivered-volume evidence by at most the observed loss. It composes with,
+  but does not replace, the draft's 2% residual congestion-loss objective;
+  MPTUNNEL selects 10% by default and a path may explicitly select zero for
+  draft behavior. Unknown evidence stays conservative, and ECN and persistent
+  congestion retain their native response authority;
 - an opt-in controller hook lets a genuinely new network path start fresh
   congestion state while retaining a connection-scoped instrumentation owner;
   controllers that do not implement the hook retain Quinn's factory-reset
@@ -86,9 +100,10 @@ dependency housekeeping. Use a clean worktree and one exact candidate version:
 1. Pin one Quinn release baseline and one reviewed PR #2481 head. Diff both
    untouched sources against this directory and classify every hunk as
    upstream, BBR3 model, transport adapter, or retained MPTUNNEL extension.
-2. Port BBR3 and its configuration without tuning gains, thresholds, or
-   timers. Reconcile the complete draft-06 lifecycle and recovery-scoped undo
-   as one model rather than layering edge-case patches.
+2. Port BBR3 and its configuration without silently tuning gains, thresholds,
+   or timers. Reconcile the complete draft-06 lifecycle and recovery-scoped
+   undo as one model, then reapply only the explicitly documented MPTUNNEL
+   operational-RTT and loss-compensation policies.
 3. Port the granular controller callbacks, controller-epoch and actual-ECT
    packet provenance, recovery-transaction ownership, two-PTO late-loss
    retention, metrics-driven pacer, and send-quantum GSO bound. Then preserve
@@ -97,8 +112,9 @@ dependency housekeeping. Use a clean worktree and one exact candidate version:
 4. Run formatting and a source-diff review. The BBR3 model must pass its
    focused lifecycle, stretched/reordered ACK-epoch, invalid-rate-sample,
    Startup ACK-aggregation window-boundary, A.15, precautionary-transition,
-   packet-feasibility, and spurious-recovery tests, followed by the full BBR3
-   controller suite.
+   packet-feasibility, application-limited, aligned loss-compensation,
+   capacity-cut, policer, ECN, persistent-congestion, and spurious-recovery
+   tests, followed by the full BBR3 controller suite.
 5. Run focused connection tests for partial/final/expired and cross-space late
    ACKs, recovery-transaction completion and CE/expiry taint, controller/path
    ownership, Retry ACK closure, ACK/MTU callback serialization, ACK-only loss,

@@ -1,5 +1,6 @@
 //! Native QUIC congestion and ACK instrumentation.
 
+use crate::transport::{LossPolicyPercent, PathMetadata};
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex};
@@ -46,8 +47,44 @@ pub struct CongestionMetrics {
     pub app_limited: bool,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct InstrumentedBbrConfig;
+#[derive(Debug)]
+pub(super) struct InstrumentedBbrConfig {
+    loss_compensation: LossPolicyPercent,
+}
+
+impl InstrumentedBbrConfig {
+    pub(super) fn for_path(metadata: &PathMetadata) -> Self {
+        Self {
+            loss_compensation: metadata.loss_compensation.unwrap_or_default(),
+        }
+    }
+
+    fn bbr3_config(loss_compensation: LossPolicyPercent) -> quinn::congestion::Bbr3Config {
+        let mut config = quinn::congestion::Bbr3Config::default();
+        config.loss_compensation_floor(f64::from(loss_compensation.ppm()) / 1_000_000.0);
+        config
+    }
+
+    fn build_bbr3(
+        loss_compensation: LossPolicyPercent,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn quinn::congestion::Controller> {
+        quinn::congestion::ControllerFactory::build(
+            Arc::new(Self::bbr3_config(loss_compensation)),
+            now,
+            current_mtu,
+        )
+    }
+}
+
+impl Default for InstrumentedBbrConfig {
+    fn default() -> Self {
+        Self {
+            loss_compensation: LossPolicyPercent::default(),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct QuicCarrierTelemetry {
@@ -125,6 +162,7 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
 
 pub(super) struct InstrumentedController {
     inner: Box<dyn quinn::congestion::Controller>,
+    loss_compensation: LossPolicyPercent,
     pub(super) telemetry: Arc<QuicCarrierTelemetry>,
     path_telemetry: Arc<QuicPathTelemetry>,
     ack_batch_acked_bytes: u64,
@@ -432,21 +470,29 @@ impl QuicPathTelemetry {
     }
 }
 impl InstrumentedController {
+    #[cfg(test)]
     pub(super) fn new(
         inner: Box<dyn quinn::congestion::Controller>,
         telemetry: Arc<QuicCarrierTelemetry>,
     ) -> Self {
         let path_telemetry = telemetry.allocate_path_telemetry();
-        Self::for_path(inner, telemetry, path_telemetry)
+        Self::for_path(
+            inner,
+            LossPolicyPercent::default(),
+            telemetry,
+            path_telemetry,
+        )
     }
 
     fn for_path(
         inner: Box<dyn quinn::congestion::Controller>,
+        loss_compensation: LossPolicyPercent,
         telemetry: Arc<QuicCarrierTelemetry>,
         path_telemetry: Arc<QuicPathTelemetry>,
     ) -> Self {
         Self {
             inner,
+            loss_compensation,
             telemetry,
             path_telemetry,
             ack_batch_acked_bytes: 0,
@@ -464,6 +510,11 @@ impl InstrumentedController {
 
     pub(super) fn snapshot(&self) -> QuicCarrierTelemetrySnapshot {
         self.path_telemetry.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(super) fn configured_loss_compensation(&self) -> LossPolicyPercent {
+        self.loss_compensation
     }
 
     fn accumulate_ack_telemetry(&mut self, sent: Instant, bytes: u64, app_limited: bool) {
@@ -604,14 +655,14 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
         // overload weaker/shared paths. BBR's delivery-rate/RTT model is the
         // stable production default for feeding the product multipath scheduler;
         // QUIC still owns packet pacing, loss recovery, and bytes in flight.
-        let inner = quinn::congestion::ControllerFactory::build(
-            Arc::new(quinn::congestion::Bbr3Config::default()),
-            now,
-            current_mtu,
-        );
-        Box::new(InstrumentedController::new(
+        let inner = Self::build_bbr3(self.loss_compensation, now, current_mtu);
+        let telemetry = Arc::new(QuicCarrierTelemetry::default());
+        let path_telemetry = telemetry.allocate_path_telemetry();
+        Box::new(InstrumentedController::for_path(
             inner,
-            Arc::new(QuicCarrierTelemetry::default()),
+            self.loss_compensation,
+            telemetry,
+            path_telemetry,
         ))
     }
 }
@@ -777,6 +828,7 @@ impl quinn::congestion::Controller for InstrumentedController {
     fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
         Box::new(Self {
             inner: self.inner.clone_box(),
+            loss_compensation: self.loss_compensation,
             telemetry: self.telemetry.clone(),
             path_telemetry: self.path_telemetry.clone(),
             ack_batch_acked_bytes: self.ack_batch_acked_bytes,
@@ -800,14 +852,11 @@ impl quinn::congestion::Controller for InstrumentedController {
         // InstrumentedBbrConfig is the sole production constructor for this
         // wrapper, so a fresh path always starts a fresh BBRv3 model. Only the
         // connection-scoped evidence owner survives the network transition.
-        let inner = quinn::congestion::ControllerFactory::build(
-            Arc::new(quinn::congestion::Bbr3Config::default()),
-            now,
-            current_mtu,
-        );
+        let inner = InstrumentedBbrConfig::build_bbr3(self.loss_compensation, now, current_mtu);
         let path_telemetry = self.telemetry.allocate_path_telemetry();
         Some(Box::new(Self::for_path(
             inner,
+            self.loss_compensation,
             self.telemetry.clone(),
             path_telemetry,
         )))

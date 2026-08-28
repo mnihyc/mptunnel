@@ -2226,6 +2226,49 @@ sampling, majority admission, and native congestion caps bound that choice.
 It avoids treating an exceptional propagation sample as the normal service
 window without changing how ProbeRTT measures propagation.
 
+On a path where the operator deliberately authorizes an exogenous-loss
+allowance, the preferred BBR-family model also separates service estimation
+from its residual congestion-loss objective. Let `p0` be the sender-local
+authorized loss-compensation fraction and let `q` be the controller's ordinary
+residual loss objective. For one aligned delivery sample, the controller may
+attribute at most `min(p0, lost / (delivered + lost))` to the allowance. It may
+use that attributed fraction to correct both delivery rate and delivered
+volume by the same factor. A clean sample is never inflated, and missing or
+unalignable loss evidence remains conservative.
+
+The corresponding high-loss boundary is:
+
+```text
+1 - (1 - p0) * (1 - q)
+```
+
+Changing `q` is not a substitute for changing `p0`: `q` controls when the
+native controller reacts to the residual loss, whereas `p0` repairs the
+delivery and inflight evidence that would otherwise ratchet downward under
+sustained post-service erasure. The preferred MPTUNNEL profile uses `p0 = 10%`
+and retains the BBR draft's `q = 2%`, producing an aggregate boundary of
+11.8%. A sender may select `p0 = 0` for unmodified draft behavior. ECN,
+persistent congestion, and unknown aggregate evidence continue to require the
+controller's ordinary congestion response; the allowance does not create a
+second MPP congestion controller.
+
+This allowance is local traffic policy, not a measured path fact and not an
+MPP protocol field. Each endpoint applies its own value only to its sending
+direction; peers do not negotiate it and asymmetric values are valid.
+Overstating it can classify real drop-based congestion as authorized loss and
+can consume additional capacity. The preferred nonzero default is therefore
+an explicit performance/fairness tradeoff, not an inference that every path
+has 10% exogenous loss.
+
+The compensation value itself injects no packet. For reliable traffic under
+an actual independent 10% post-service erasure rate, native retransmission
+expands traffic by approximately `1 / (1 - 0.10) - 1 = 11.1%` relative to
+delivered Product payload. If the independent MPP optional-work budget is also
+fully spent at 10%, their rough combined expansion is
+`(1 + 0.10) / (1 - 0.10) - 1 = 22.2%`. These are directional, workload- and
+loss-dependent estimates; they exclude packet headers, control traffic, and
+the bounded startup floor.
+
 Feedback ordering remains a qualification limit. If the transport finalizes
 the ACK event before delivering loss or ECN feedback caused by that same ACK,
 that later feedback cannot veto the event's operational-delay vote. One vote

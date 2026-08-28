@@ -53,6 +53,8 @@ protocol = "mpp"
 # allow_peer_diagnostics = false
 # Replace server.example.com with the server's reachable name or address.
 # TCP and QUIC/UDP remain separate carriers under one logical MPP session.
+# QUIC loss compensation defaults to 10% when omitted. To state or override it,
+# append `?loss-compensation-percent=10` (or `=0` for draft BBR3 behavior).
 paths = [
   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
   { name = "path-2", endpoint = "quic://server.example.com:7443" },

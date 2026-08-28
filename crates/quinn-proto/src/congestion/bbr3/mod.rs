@@ -235,6 +235,17 @@ struct BbrPacket {
     round_count: u64,
 }
 
+/// Paired cumulative counters from the earliest-sent packet declared lost in the current loss
+/// round. Keeping the counters paired with one packet makes the round's final `delivered` and
+/// `lost` deltas cover one exact send-to-boundary interval, even when Quinn reports losses from
+/// different packet-number spaces in separate batches.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct LossRoundEvidenceAnchor {
+    send_time: Instant,
+    delivered: u64,
+    lost: u64,
+}
+
 /// Description of a per-ack rate sample state that will allow us to determine a short term evolution of the connection
 /// equivalent to RS <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.2>
 #[derive(Debug, Clone, Copy)]
@@ -507,6 +518,22 @@ pub struct Bbr3 {
     loss_round_delivered: u64,
     /// equivalent to BBR.loss_in_round: flag set to true when loss occurs during the round
     loss_in_round: bool,
+    /// Operator-authorized loss fraction corrected in aligned delivery and inflight evidence.
+    /// Zero restores the draft BBR3 model; the MPTUNNEL default is 10%.
+    loss_compensation_floor: f64,
+    /// Attributable ECN or persistent congestion observed in the current loss round. Such evidence
+    /// keeps congestion-control thresholds and actions raw; it does not disable the configured
+    /// delivery-estimate correction.
+    explicit_congestion_in_round: bool,
+    /// Paired cumulative evidence from the earliest-sent lost packet in the current loss round.
+    loss_round_evidence_anchor: Option<LossRoundEvidenceAnchor>,
+    /// At least one loss in the current round could not be aligned to a retained packet snapshot.
+    /// Unknown evidence always keeps the draft's conservative congestion response.
+    loss_round_evidence_unknown: bool,
+    /// Size of the loss sample most recently evaluated while ProbeUP sampling was active. QUIC
+    /// reports persistent congestion only after per-packet loss callbacks, so this preserves the
+    /// exact sample needed to re-evaluate that batch with the raw threshold.
+    pending_probe_loss_packet_size: Option<u64>,
     /// equivalent to BBR.loss_events_in_round: count of discontiguous loss events
     /// observed in the current round trip, used by the STARTUP high-loss exit
     /// (BBRStartupFullLossCnt criterion). Reset at each loss-round boundary.
@@ -680,6 +707,11 @@ impl Bbr3 {
             reno_rounds_bound: RENO_ROUNDS_BOUNDS[0],
             loss_round_delivered: 0,
             loss_in_round: false,
+            loss_compensation_floor: config.loss_compensation_floor,
+            explicit_congestion_in_round: false,
+            loss_round_evidence_anchor: None,
+            loss_round_evidence_unknown: false,
+            pending_probe_loss_packet_size: None,
             probe_rtt_done_stamp: None,
             probe_rtt_round_done: false,
             prior_cwnd: 0,
@@ -708,15 +740,125 @@ impl Bbr3 {
         self.bound_bw_for_model();
     }
 
+    /// Loss boundary for bandwidth probing under an explicit sender-local loss policy.
+    /// Compensated loss `p0` and the draft congestion objective `q` compose as
+    /// `1 - (1 - p0) * (1 - q)`. Explicit ECN or persistent congestion bypasses compensation.
+    fn effective_probe_loss_thresh(&self) -> f64 {
+        if self.loss_compensation_floor == 0.0 || self.explicit_congestion_in_round {
+            LOSS_THRESH
+        } else {
+            1.0 - (1.0 - self.loss_compensation_floor) * (1.0 - LOSS_THRESH)
+        }
+    }
+
+    /// Return the portion of this rate sample's observed loss that the configured floor can
+    /// explain. `RS.delivered` and `RS.lost` cover the same packet-send-to-ACK interval. Capping the
+    /// configured floor by that observed ratio prevents clean samples from being inflated. An
+    /// explicit congestion signal keeps control responses raw, but does not make independent
+    /// erasure consume service capacity; delivery estimates therefore retain this correction.
+    fn sample_explained_loss(&self, rate_sample: BbrRateSample) -> f64 {
+        if self.loss_compensation_floor == 0.0 || rate_sample.lost == 0 {
+            return 0.0;
+        }
+        let volume = rate_sample.delivered.saturating_add(rate_sample.lost);
+        if volume == 0 {
+            return 0.0;
+        }
+        self.loss_compensation_floor
+            .min(rate_sample.lost as f64 / volume as f64)
+    }
+
+    /// Infer the serviced rate only for bytes covered by the current sample's aligned loss
+    /// evidence. With no configured floor or no measured loss this returns the original delivery
+    /// sample bit-for-bit.
+    fn model_delivery_rate(&self, rate_sample: BbrRateSample) -> f64 {
+        let explained = self.sample_explained_loss(rate_sample);
+        if explained == 0.0 {
+            rate_sample.delivery_rate
+        } else {
+            rate_sample.delivery_rate / (1.0 - explained)
+        }
+    }
+
+    /// Infer serviced volume over the same aligned interval as `model_delivery_rate`. This keeps
+    /// the short-term inflight model from treating independently erased bytes as unserved bytes.
+    /// The zero-correction branch preserves the draft value exactly.
+    fn model_delivered(&self, rate_sample: BbrRateSample) -> u64 {
+        let explained = self.sample_explained_loss(rate_sample);
+        if explained == 0.0 {
+            rate_sample.delivered
+        } else {
+            (rate_sample.delivered as f64 / (1.0 - explained)).round() as u64
+        }
+    }
+
+    /// Retain the paired cumulative counters of the earliest-sent packet declared lost in this
+    /// loss round. Quinn orders loss callbacks within a packet-number space, but not across spaces,
+    /// so a later callback can still move the beginning of the aggregate evidence interval earlier.
+    fn record_loss_round_evidence(&mut self, packet: BbrPacket) {
+        if self.loss_compensation_floor == 0.0 {
+            return;
+        }
+        let candidate = LossRoundEvidenceAnchor {
+            send_time: packet.send_time,
+            delivered: packet.delivered,
+            lost: packet.lost,
+        };
+        let replace = self.loss_round_evidence_anchor.is_none_or(|current| {
+            candidate.send_time < current.send_time
+                || (candidate.send_time == current.send_time
+                    && (candidate.delivered, candidate.lost) < (current.delivered, current.lost))
+        });
+        if replace {
+            self.loss_round_evidence_anchor = Some(candidate);
+        }
+    }
+
+    fn clear_loss_round_evidence(&mut self) {
+        self.loss_round_evidence_anchor = None;
+        self.loss_round_evidence_unknown = false;
+    }
+
+    /// Whether the aggregate evidence interval for the current loss round requires a congestion
+    /// response. A configured floor composes with the draft objective; explicit congestion and
+    /// missing or unalignable evidence retain the conservative draft response. Both ProbeUP and
+    /// short-term adaptation consume this one classification before applying their existing
+    /// response formulas.
+    fn loss_round_requires_congestion_response(&self) -> bool {
+        if self.loss_compensation_floor == 0.0
+            || self.explicit_congestion_in_round
+            || self.loss_round_evidence_unknown
+        {
+            return true;
+        }
+        let Some(anchor) = self.loss_round_evidence_anchor else {
+            return true;
+        };
+        let Some(delivered) = self.delivered.checked_sub(anchor.delivered) else {
+            return true;
+        };
+        let Some(lost) = self.lost.checked_sub(anchor.lost) else {
+            return true;
+        };
+        let Some(volume) = delivered.checked_add(lost) else {
+            return true;
+        };
+        if lost == 0 || volume == 0 {
+            return true;
+        }
+        lost as f64 > self.effective_probe_loss_thresh() * volume as f64
+    }
+
     /// equivalent to BBRUpdateLatestDeliverySignals <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
     fn update_latest_delivery_signals(&mut self) {
         self.loss_round_start = false;
         if let Some(rate_sample) = self.rs {
-            self.bw_latest = [self.bw_latest, rate_sample.delivery_rate]
+            self.bw_latest = [self.bw_latest, self.model_delivery_rate(rate_sample)]
                 .iter()
                 .copied()
                 .fold(f64::NAN, f64::max);
-            self.inflight_latest = Ord::max(self.inflight_latest, rate_sample.delivered);
+            self.inflight_latest =
+                Ord::max(self.inflight_latest, self.model_delivered(rate_sample));
 
             if rate_sample.prior_delivered >= self.loss_round_delivered {
                 self.loss_round_delivered = self.delivered;
@@ -733,17 +875,20 @@ impl Bbr3 {
         }
         self.adapt_lower_bounds_from_congestion();
         self.loss_in_round = false;
+        self.explicit_congestion_in_round = false;
+        self.clear_loss_round_evidence();
     }
 
     /// equivalent to BBRUpdateMaxBw <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.5>
     fn update_max_bw(&mut self, p: BbrPacket) {
         self.update_round(p);
         if let Some(rate_sample) = self.rs {
-            if rate_sample.delivery_rate > 0.0
-                && (rate_sample.delivery_rate >= self.max_bw || !rate_sample.is_app_limited)
+            let model_delivery_rate = self.model_delivery_rate(rate_sample);
+            if model_delivery_rate > 0.0
+                && (model_delivery_rate >= self.max_bw || !rate_sample.is_app_limited)
             {
                 self.max_bw_filter
-                    .update_max(self.cycle_count, rate_sample.delivery_rate.round() as u64);
+                    .update_max(self.cycle_count, model_delivery_rate.round() as u64);
 
                 self.max_bw = self.max_bw_filter.get_max() as f64;
             }
@@ -773,7 +918,7 @@ impl Bbr3 {
             | BbrState::ProbeBw(ProbeBwSubstate::Up)
             | BbrState::Startup => {}
             _ => {
-                if self.loss_in_round {
+                if self.loss_in_round && self.loss_round_requires_congestion_response() {
                     self.init_lower_bounds();
                     self.loss_lower_bounds();
                 }
@@ -1679,7 +1824,11 @@ impl Bbr3 {
         if self.enter_recovery(now, p.send_time) {
             self.save_state_upon_loss();
         }
+        self.record_loss_round_evidence(p);
         self.note_loss(space, p.packet_number);
+        if self.loss_compensation_floor > 0.0 && self.bw_probe_samples {
+            self.pending_probe_loss_packet_size = Some(p.size as u64);
+        }
         if !self.bw_probe_samples {
             self.packets[space as usize].remove(packet_index);
             return self.undo_transaction;
@@ -1689,7 +1838,7 @@ impl Bbr3 {
             rate_sample.lost = self.lost.saturating_sub(p.lost);
             rate_sample.is_app_limited = p.is_app_limited;
             self.rs = Some(rate_sample);
-            if self.is_inflight_too_high() {
+            if self.loss_round_requires_congestion_response() && self.is_inflight_too_high() {
                 rate_sample.tx_in_flight = self.inflight_at_loss(p.size as u64);
                 self.rs = Some(rate_sample);
                 self.handle_inflight_too_high(now);
@@ -1738,7 +1887,8 @@ impl Bbr3 {
     /// equivalent to IsInflightTooHigh <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-1>
     fn is_inflight_too_high(&self) -> bool {
         if let Some(rate_sample) = self.rs {
-            return rate_sample.lost as f64 > rate_sample.tx_in_flight as f64 * LOSS_THRESH;
+            return rate_sample.lost as f64
+                > rate_sample.tx_in_flight as f64 * self.effective_probe_loss_thresh();
         }
         false
     }
@@ -1751,7 +1901,8 @@ impl Bbr3 {
         };
         let inflight_prev = rate_sample.tx_in_flight.saturating_sub(packet_size) as f64;
         let lost_prev = rate_sample.lost.saturating_sub(packet_size) as f64;
-        let lost_prefix = (LOSS_THRESH * inflight_prev - lost_prev) / (1.0 - LOSS_THRESH);
+        let loss_thresh = self.effective_probe_loss_thresh();
+        let lost_prefix = (loss_thresh * inflight_prev - lost_prev) / (1.0 - loss_thresh);
         (inflight_prev + lost_prefix) as u64
     }
 
@@ -1805,7 +1956,12 @@ impl Bbr3 {
 
     /// equivalent to BBRResetCongestionSignals <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
     fn reset_congestion_signals(&mut self) {
+        // A ProbeUP decision consumes this loss round. Persistence reported later may re-evaluate
+        // its retained probe sample with the raw threshold, but must not resurrect the consumed
+        // round and apply a second short-term response.
         self.loss_in_round = false;
+        self.explicit_congestion_in_round = false;
+        self.clear_loss_round_evidence();
         self.bw_latest = 0.0;
         self.inflight_latest = 0;
     }
@@ -1837,7 +1993,10 @@ impl Bbr3 {
         space: SpaceId,
     ) {
         let prior_in_flight = self.inflight;
-        let app_limited = self.app_limited != 0;
+        // The compact controller harness models an always-backlogged connection unless a test
+        // installs C.app_limited directly. Do not feed that internal delivery watermark back as a
+        // fresh Quinn signal on every send: the production hook must preserve and snapshot the
+        // installed marker, but only an external application state may extend it.
         let _ = <Self as Controller>::on_packet_sent(
             self,
             now,
@@ -1845,7 +2004,7 @@ impl Bbr3 {
             prior_in_flight,
             packet_number,
             space,
-            app_limited,
+            false,
         );
     }
 }
@@ -1857,9 +2016,19 @@ impl Controller for Bbr3 {
         prior_in_flight: u64,
         packet_number: u64,
         space: SpaceId,
-        _app_limited: bool,
+        app_limited: bool,
     ) -> Option<crate::congestion::PacketDeliveryState> {
         self.inflight = prior_in_flight;
+        // Quinn's send-time signal is authoritative for whether this packet begins or extends an
+        // application-limited epoch. Refresh the delivery watermark before idle-restart handling
+        // and before taking P.is_app_limited. A false signal must not clear an epoch whose packets
+        // are still in flight; GenerateRateSample expires that watermark after their delivery.
+        if app_limited {
+            self.app_limited = Ord::max(
+                self.app_limited,
+                Ord::max(self.delivered.saturating_add(prior_in_flight), 1),
+            );
+        }
         let is_initial_zero_flight =
             self.inflight == 0 && self.delivered == 0 && self.first_send_time.is_none();
         let is_idle_zero_flight = self.inflight == 0 && self.app_limited != 0;
@@ -1996,8 +2165,12 @@ impl Controller for Bbr3 {
         if largest_packet_num_acked.is_some() {
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
-                self.app_limited = Ord::max(self.delivered + self.inflight, 1);
+            }
+            // The current connection state wins after an old watermark expires. Keeping this
+            // independent from the expiry branch avoids one ACK-sized unmarked gap during idle
+            // control traffic, which can otherwise look like a low non-app-limited Startup round.
+            if app_limited {
+                self.app_limited = Ord::max(self.delivered.saturating_add(self.inflight), 1);
             }
             let round_count = self.round_count;
             for packets in self.packets.iter_mut() {
@@ -2048,6 +2221,18 @@ impl Controller for Bbr3 {
         largest_lost: u64,
         space: SpaceId,
     ) {
+        let pending_probe_loss_packet_size = self.pending_probe_loss_packet_size.take();
+        if self.loss_compensation_floor > 0.0 {
+            if is_ecn {
+                self.explicit_congestion_in_round = true;
+            }
+            if is_persistent_congestion {
+                // Quinn reports persistence after all per-packet callbacks. This flag makes the
+                // pending ProbeUP sample use the raw threshold and makes any still-active loss
+                // round undiscounted. It does not recreate a round already consumed by ProbeUP.
+                self.explicit_congestion_in_round = true;
+            }
+        }
         // only process ecn here, regular packet loss is detected per packet in on_packet_lost.
         if is_ecn {
             self.lost += lost_bytes;
@@ -2058,8 +2243,34 @@ impl Controller for Bbr3 {
             }
         }
         if is_persistent_congestion {
+            // QUIC learns persistence after on_packet_lost. Re-evaluate the exact retained ProbeUP
+            // sample with the raw threshold now that this batch cannot be attributed to the floor.
+            if self.loss_compensation_floor > 0.0 {
+                if let Some(packet_size) = pending_probe_loss_packet_size {
+                    if self.is_inflight_too_high() {
+                        if let Some(mut rate_sample) = self.rs {
+                            rate_sample.tx_in_flight = self.inflight_at_loss(packet_size);
+                            self.rs = Some(rate_sample);
+                        }
+                        self.handle_inflight_too_high(now);
+                    }
+                }
+            }
             self.cwnd = self.min_pipe_cwnd;
         }
+        if self.loss_compensation_floor > 0.0
+            && (is_ecn || is_persistent_congestion)
+            && !self.loss_in_round
+        {
+            // ProbeUP already consumed this round, or the explicit signal could not be aligned to
+            // a retained packet. The flag was needed only for raw processing in this callback;
+            // retaining it would taint an unrelated later loss round.
+            self.explicit_congestion_in_round = false;
+            self.clear_loss_round_evidence();
+        }
+        // Every real loss batch ends with this callback. ECN processing above may have populated a
+        // new pending sample, but ECN was already evaluated with the raw threshold.
+        self.pending_probe_loss_packet_size = None;
     }
 
     fn on_packet_lost(
@@ -2077,6 +2288,13 @@ impl Controller for Bbr3 {
         if let Ok(p_index) = p_index_result {
             return self.process_lost_packet(p_index, space, now);
         }
+        if self.loss_compensation_floor > 0.0 {
+            // The transport owns this loss callback, but BBR no longer retains the packet's paired
+            // delivery counters. Start/extend the loss round and force its conservative response;
+            // omission of the extension preserves the draft's original missing-packet behavior.
+            self.loss_round_evidence_unknown = true;
+            self.note_loss(space, packet_number);
+        }
         None
     }
 
@@ -2089,6 +2307,9 @@ impl Controller for Bbr3 {
         self.cancel_spurious_max_bw_advance(transaction);
         self.restore_cwnd();
         self.loss_in_round = false;
+        self.explicit_congestion_in_round = false;
+        self.clear_loss_round_evidence();
+        self.pending_probe_loss_packet_size = None;
         self.reset_full_bw();
         self.bw_shortterm = [self.bw_shortterm, self.undo_bw_shortterm]
             .iter()
@@ -2191,6 +2412,7 @@ impl Controller for Bbr3 {
 #[derive(Debug, Clone)]
 pub struct Bbr3Config {
     initial_window: u64,
+    loss_compensation_floor: f64,
     probe_rng_seed: Option<[u8; 16]>,
     startup_pacing_gain: Option<f64>,
     default_pacing_gain: Option<f64>,
@@ -2211,6 +2433,16 @@ impl Bbr3Config {
         self.initial_window = value;
         self
     }
+
+    /// Compensate an operator-authorized fraction of aligned packet loss in delivery and inflight
+    /// estimates. MPTUNNEL selects 10% by default as an aggressive traffic policy. Overstating
+    /// this value can conceal genuine congestion; this is policy, not an inferred path fact.
+    pub fn loss_compensation_floor(&mut self, value: f64) -> &mut Self {
+        assert!(value.is_finite() && (0.0..1.0).contains(&value));
+        self.loss_compensation_floor = value;
+        self
+    }
+
 }
 
 impl Default for Bbr3Config {
@@ -2219,6 +2451,9 @@ impl Default for Bbr3Config {
             // Bounded by the datagram size a path starts at, not [`MAX_DATAGRAM_SIZE`] (the
             // RFC 9000 ceiling), which would clamp 14720 up to 9x the intended window.
             initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            // Keep the generic Quinn controller aligned with the BBR draft. MPTUNNEL's adapter
+            // explicitly applies its sender-local policy after resolving path omission/override.
+            loss_compensation_floor: 0.0,
             probe_rng_seed: None,
             startup_pacing_gain: None,
             default_pacing_gain: None,
@@ -2584,6 +2819,214 @@ mod test {
         assert!(bbr.on_spurious_congestion_event(transaction));
         assert_eq!(bbr.cycle_count, 2);
         assert_eq!(bbr.max_bw_advance_pending, None);
+    }
+
+    #[test]
+    fn app_limited_callbacks_refresh_preserve_and_rearm_one_delivery_epoch() {
+        let now = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+
+        // A send-time application-limited signal starts the BBR delivery epoch before idle
+        // restart and before P.is_app_limited are evaluated. `prior_in_flight` is the exact
+        // pre-send flight: the packet being reported is not counted in C.app_limited yet.
+        bbr.delivered = 10 * smss;
+        let prior_in_flight = 2 * smss;
+        <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            now,
+            smss as u16,
+            prior_in_flight,
+            1,
+            SpaceId::Data,
+            true,
+        );
+        assert_eq!(bbr.app_limited, bbr.delivered + prior_in_flight);
+        let first = *bbr.packets[SpaceId::Data as usize]
+            .back()
+            .expect("application-limited packet");
+        assert!(first.is_app_limited);
+        assert_eq!(first.tx_in_flight, prior_in_flight + smss);
+
+        // A false connection signal does not erase a still-active delivery watermark. Packets
+        // sent before the watermark is delivered remain part of the same application-limited
+        // epoch.
+        <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            now + Duration::from_millis(1),
+            smss as u16,
+            prior_in_flight + smss,
+            2,
+            SpaceId::Data,
+            false,
+        );
+        assert!(
+            bbr.packets[SpaceId::Data as usize]
+                .back()
+                .expect("packet before delivery boundary")
+                .is_app_limited
+        );
+
+        // Expiry and the current connection state are independent. If an old watermark expires
+        // on an ACK while Quinn is still application-limited, the same callback must immediately
+        // re-arm it rather than leave one unmarked ACK epoch.
+        bbr.delivered = bbr.app_limited + smss;
+        bbr.rs = None;
+        bbr.ack_epoch_open = false;
+        bbr.on_end_acks(
+            now + Duration::from_millis(100),
+            smss,
+            true,
+            Some(1),
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.app_limited, bbr.delivered + smss);
+
+        // A zero-flight application-limited send also reaches idle-restart handling with the
+        // marker already installed.
+        bbr.app_limited = 0;
+        bbr.idle_restart = false;
+        <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            now + Duration::from_millis(200),
+            smss as u16,
+            0,
+            3,
+            SpaceId::Data,
+            true,
+        );
+        assert!(bbr.idle_restart);
+        assert!(
+            bbr.packets[SpaceId::Data as usize]
+                .back()
+                .expect("idle restart packet")
+                .is_app_limited
+        );
+    }
+
+    #[test]
+    fn idle_control_rounds_cannot_end_startup_before_bulk_growth() {
+        let base = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+        let rtt_est = RttEstimator::new(Duration::from_millis(100));
+        let mut cursor = base;
+        let mut packet_number = 0_u64;
+
+        let drive_round = |bbr: &mut Bbr3,
+                           cursor: &mut Instant,
+                           packet_number: &mut u64,
+                           rtt: Duration,
+                           packets: u64,
+                           send_app_limited: bool,
+                           current_app_limited: bool| {
+            let sent = *cursor;
+            let first_packet = *packet_number;
+            for packet_offset in 0..packets {
+                <Bbr3 as Controller>::on_packet_sent(
+                    bbr,
+                    sent,
+                    smss as u16,
+                    packet_offset * smss,
+                    first_packet + packet_offset,
+                    SpaceId::Data,
+                    send_app_limited,
+                );
+            }
+            let acked = sent + rtt;
+            for packet_offset in 0..packets {
+                bbr.on_ack(
+                    acked,
+                    sent,
+                    smss,
+                    first_packet + packet_offset,
+                    SpaceId::Data,
+                    send_app_limited,
+                    &rtt_est,
+                );
+            }
+            bbr.on_end_acks(
+                acked,
+                0,
+                current_app_limited,
+                Some(first_packet + packets - 1),
+                SpaceId::Data,
+            );
+            *cursor = acked + Duration::from_millis(1);
+            *packet_number += packets;
+        };
+
+        // This reproduces the sparse setup/control phase preceding the r4 bulk transfer. Seven
+        // equally slow false non-app-limited rounds are enough to satisfy Startup's plateau exit;
+        // authoritative send-time marking must keep every one out of that classifier.
+        for _ in 0..8 {
+            drive_round(
+                &mut bbr,
+                &mut cursor,
+                &mut packet_number,
+                Duration::from_millis(100),
+                1,
+                true,
+                true,
+            );
+            assert_eq!(bbr.state, BbrState::Startup);
+            assert_eq!(bbr.full_bw_count, 0);
+            assert!(!bbr.full_bw_reached);
+        }
+
+        // The first packet after the application becomes backlogged still belongs to the old
+        // delivery epoch. Its ACK crosses and expires that boundary; following packets provide
+        // ordinary non-app-limited growth evidence.
+        drive_round(
+            &mut bbr,
+            &mut cursor,
+            &mut packet_number,
+            Duration::from_millis(100),
+            1,
+            false,
+            false,
+        );
+        assert_eq!(bbr.app_limited, 0);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        for packets in [1_u64, 2, 4] {
+            drive_round(
+                &mut bbr,
+                &mut cursor,
+                &mut packet_number,
+                Duration::from_millis(100),
+                packets,
+                false,
+                false,
+            );
+            assert_eq!(bbr.state, BbrState::Startup);
+            assert_eq!(
+                bbr.full_bw_count,
+                0,
+                "bulk growth flight of {packets} packets did not reset the Startup plateau counter; full_bw={}, sample={:?}",
+                bbr.full_bw,
+                bbr.rs.map(|sample| sample.delivery_rate),
+            );
+        }
+        let grown_full_bw = bbr.full_bw;
+        assert!(grown_full_bw > 0.0);
+
+        // Three complete non-app-limited rounds without another 25% bandwidth increase are the
+        // normal draft plateau criterion and must still leave Startup.
+        for _ in 0..MAX_FULL_BW_COUNT {
+            drive_round(
+                &mut bbr,
+                &mut cursor,
+                &mut packet_number,
+                Duration::from_millis(100),
+                4,
+                false,
+                false,
+            );
+        }
+        assert!(bbr.full_bw_reached);
+        assert_ne!(bbr.state, BbrState::Startup);
+        assert_eq!(bbr.full_bw, grown_full_bw);
     }
 
     #[test]
@@ -4468,6 +4911,7 @@ mod test {
         let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let config = Bbr3Config {
             initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            loss_compensation_floor: 0.0,
             probe_rng_seed: Some(seed),
             startup_pacing_gain: None,
             default_pacing_gain: None,
@@ -4489,6 +4933,596 @@ mod test {
         assert_eq!(bbr3.rounds_since_bw_probe, 0);
         assert_eq!(bbr3.bw_probe_wait, Duration::from_millis(2461));
         assert_eq!(bbr3.reno_rounds_bound, 63);
+    }
+
+    fn loss_floor_test_controller() -> Bbr3 {
+        let mut config = Bbr3Config::default();
+        config.loss_compensation_floor(0.05);
+        Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16)
+    }
+
+    fn draft_bbr3_config() -> Bbr3Config {
+        let mut config = Bbr3Config::default();
+        config.loss_compensation_floor(0.0);
+        config
+    }
+
+    fn mptunnel_loss_profile_config() -> Bbr3Config {
+        let mut config = Bbr3Config::default();
+        config.loss_compensation_floor(0.10);
+        config
+    }
+
+    fn send_test_flight(bbr: &mut Bbr3, base: Instant, packets: u64) {
+        for packet_number in 0..packets {
+            bbr.on_packet_sent(
+                base + Duration::from_micros(packet_number),
+                BASE_DATAGRAM_SIZE as u16,
+                packet_number,
+                SpaceId::Data,
+            );
+        }
+    }
+
+    fn ack_test_packet(
+        bbr: &mut Bbr3,
+        rtt: &RttEstimator,
+        now: Instant,
+        sent: Instant,
+        packet_number: u64,
+    ) {
+        bbr.on_ack(
+            now,
+            sent,
+            BASE_DATAGRAM_SIZE,
+            packet_number,
+            SpaceId::Data,
+            false,
+            rtt,
+        );
+    }
+
+    #[test]
+    fn loss_floor_round_uses_all_paired_evidence_before_clean_boundary_ack() {
+        const PACKETS: u64 = 40;
+        let base = Instant::now();
+        let ack_at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut bbr = loss_floor_test_controller();
+        send_test_flight(&mut bbr, base, PACKETS);
+
+        // Quinn completes the ACK batch before detecting the two losses from the same flight.
+        for packet_number in 0..PACKETS {
+            if packet_number != 0 && packet_number != 20 {
+                ack_test_packet(
+                    &mut bbr,
+                    &rtt,
+                    ack_at,
+                    base + Duration::from_micros(packet_number),
+                    packet_number,
+                );
+            }
+        }
+        bbr.on_end_acks(
+            ack_at,
+            2 * BASE_DATAGRAM_SIZE,
+            false,
+            Some(PACKETS - 1),
+            SpaceId::Data,
+        );
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr.bw_probe_samples = false;
+        bbr.bw_shortterm = f64::INFINITY;
+        bbr.inflight_shortterm = u64::MAX;
+
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 20, SpaceId::Data, ack_at);
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Data, ack_at);
+        bbr.on_congestion_event(
+            ack_at,
+            base,
+            false,
+            false,
+            2 * BASE_DATAGRAM_SIZE,
+            20,
+            SpaceId::Data,
+        );
+
+        let evidence = bbr
+            .loss_round_evidence_anchor
+            .expect("paired loss-round evidence");
+        assert_eq!(evidence.send_time, base);
+        assert_eq!((evidence.delivered, evidence.lost), (0, 0));
+        assert!(!bbr.loss_round_evidence_unknown);
+
+        // This packet is sent after both losses, so its clean RS cannot describe the preceding
+        // loss round. The paired interval includes all 38 earlier deliveries, both losses, and this
+        // boundary delivery, keeping the aggregate below the composed 6.9% objective.
+        let boundary_packet = PACKETS;
+        let boundary_sent = ack_at + Duration::from_millis(1);
+        bbr.on_packet_sent(
+            boundary_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            boundary_packet,
+            SpaceId::Data,
+        );
+        ack_test_packet(
+            &mut bbr,
+            &rtt,
+            boundary_sent + Duration::from_millis(100),
+            boundary_sent,
+            boundary_packet,
+        );
+        bbr.on_end_acks(
+            boundary_sent + Duration::from_millis(100),
+            0,
+            false,
+            Some(boundary_packet),
+            SpaceId::Data,
+        );
+
+        assert_eq!(bbr.rs.expect("boundary rate sample").lost, 0);
+        assert_eq!(bbr.bw_shortterm, f64::INFINITY);
+        assert!(!bbr.loss_in_round);
+        assert_eq!(bbr.loss_round_evidence_anchor, None);
+        assert!(!bbr.loss_round_evidence_unknown);
+    }
+
+    #[test]
+    fn loss_floor_anchor_uses_earliest_send_across_packet_number_spaces() {
+        let base = Instant::now();
+        let later = base + Duration::from_millis(1);
+        let mut bbr = loss_floor_test_controller();
+        bbr.on_packet_sent(
+            base,
+            BASE_DATAGRAM_SIZE as u16,
+            0,
+            SpaceId::Initial,
+        );
+        bbr.on_packet_sent(
+            later,
+            BASE_DATAGRAM_SIZE as u16,
+            0,
+            SpaceId::Handshake,
+        );
+
+        // Packet numbers are scoped to their spaces. Quinn may report the later-sent loss first,
+        // so the aggregate anchor must be ordered by send time rather than callback order or PN.
+        bbr.on_packet_lost(
+            BASE_DATAGRAM_SIZE as u16,
+            0,
+            SpaceId::Handshake,
+            later + Duration::from_millis(100),
+        );
+        assert_eq!(
+            bbr.loss_round_evidence_anchor
+                .expect("later loss evidence")
+                .send_time,
+            later
+        );
+        bbr.on_packet_lost(
+            BASE_DATAGRAM_SIZE as u16,
+            0,
+            SpaceId::Initial,
+            later + Duration::from_millis(100),
+        );
+        assert_eq!(
+            bbr.loss_round_evidence_anchor
+                .expect("cross-space loss evidence")
+                .send_time,
+            base
+        );
+        assert!(!bbr.loss_round_evidence_unknown);
+    }
+
+    #[test]
+    fn loss_floor_probe_up_ignores_local_spike_below_aligned_round_threshold() {
+        const PACKETS: u64 = 40;
+        let base = Instant::now();
+        let ack_at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut bbr = loss_floor_test_controller();
+        send_test_flight(&mut bbr, base, PACKETS);
+
+        for packet_number in 1..PACKETS {
+            ack_test_packet(
+                &mut bbr,
+                &rtt,
+                ack_at,
+                base + Duration::from_micros(packet_number),
+                packet_number,
+            );
+        }
+        bbr.on_end_acks(
+            ack_at,
+            BASE_DATAGRAM_SIZE,
+            false,
+            Some(PACKETS - 1),
+            SpaceId::Data,
+        );
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.bw_probe_samples = true;
+        bbr.inflight_longterm = u64::MAX;
+
+        // P0's local RS sees one lost packet over one packet of tx_in_flight, but its paired
+        // loss-round interval contains the 39 delivered packets too: 1/40 is below p_eff=6.9%.
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Data, ack_at);
+        assert!(
+            bbr.is_inflight_too_high(),
+            "the local RS spike must be present"
+        );
+        assert!(!bbr.loss_round_requires_congestion_response());
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+        assert_eq!(bbr.inflight_longterm, u64::MAX);
+        assert!(!bbr.prev_probe_too_high);
+
+        bbr.on_congestion_event(
+            ack_at,
+            base,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            0,
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+    }
+
+    #[test]
+    fn loss_floor_probe_up_responds_after_aligned_round_exceeds_threshold() {
+        const PACKETS: u64 = 20;
+        let base = Instant::now();
+        let ack_at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut bbr = loss_floor_test_controller();
+        send_test_flight(&mut bbr, base, PACKETS);
+
+        for packet_number in 2..PACKETS {
+            ack_test_packet(
+                &mut bbr,
+                &rtt,
+                ack_at,
+                base + Duration::from_micros(packet_number),
+                packet_number,
+            );
+        }
+        bbr.on_end_acks(
+            ack_at,
+            2 * BASE_DATAGRAM_SIZE,
+            false,
+            Some(PACKETS - 1),
+            SpaceId::Data,
+        );
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.bw_probe_samples = true;
+        bbr.inflight_longterm = u64::MAX;
+
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Data, ack_at);
+        assert!(!bbr.loss_round_requires_congestion_response());
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+
+        // The second loss makes the aligned interval 2/20=10%, above p_eff=6.9%; only now may
+        // the existing per-P ProbeUP response derive a finite cap and leave Up.
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, ack_at);
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert!(bbr.inflight_longterm < u64::MAX);
+        assert!(bbr.prev_probe_too_high);
+
+        bbr.on_congestion_event(
+            ack_at,
+            base,
+            false,
+            false,
+            2 * BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+    }
+
+    #[test]
+    fn loss_floor_persistent_callback_marks_existing_round_undiscounted() {
+        const PACKETS: u64 = 20;
+        let base = Instant::now();
+        let ack_at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut bbr = loss_floor_test_controller();
+        send_test_flight(&mut bbr, base, PACKETS);
+
+        for packet_number in 1..PACKETS {
+            ack_test_packet(
+                &mut bbr,
+                &rtt,
+                ack_at,
+                base + Duration::from_micros(packet_number),
+                packet_number,
+            );
+        }
+        bbr.on_end_acks(
+            ack_at,
+            BASE_DATAGRAM_SIZE,
+            false,
+            Some(PACKETS - 1),
+            SpaceId::Data,
+        );
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr.bw_probe_samples = false;
+        bbr.bw_shortterm = f64::INFINITY;
+        bbr.inflight_shortterm = u64::MAX;
+
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Data, ack_at);
+        bbr.on_congestion_event(
+            ack_at,
+            base,
+            true,
+            false,
+            BASE_DATAGRAM_SIZE,
+            0,
+            SpaceId::Data,
+        );
+        assert!(bbr.loss_in_round);
+        assert!(bbr.explicit_congestion_in_round);
+
+        let boundary_packet = PACKETS;
+        let boundary_sent = ack_at + Duration::from_millis(1);
+        bbr.on_packet_sent(
+            boundary_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            boundary_packet,
+            SpaceId::Data,
+        );
+        ack_test_packet(
+            &mut bbr,
+            &rtt,
+            boundary_sent + Duration::from_millis(100),
+            boundary_sent,
+            boundary_packet,
+        );
+        bbr.on_end_acks(
+            boundary_sent + Duration::from_millis(100),
+            0,
+            false,
+            Some(boundary_packet),
+            SpaceId::Data,
+        );
+        assert!(bbr.bw_shortterm.is_finite());
+        assert!(!bbr.loss_in_round);
+        assert!(!bbr.explicit_congestion_in_round);
+        assert_eq!(bbr.loss_round_evidence_anchor, None);
+    }
+
+    #[test]
+    fn loss_floor_persistent_callback_rechecks_raw_probe_without_resurrecting_round() {
+        const PACKETS: u64 = 20;
+        let base = Instant::now();
+        let ack_at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut bbr = loss_floor_test_controller();
+        send_test_flight(&mut bbr, base, PACKETS);
+
+        for packet_number in 0..PACKETS - 1 {
+            ack_test_packet(
+                &mut bbr,
+                &rtt,
+                ack_at,
+                base + Duration::from_micros(packet_number),
+                packet_number,
+            );
+        }
+        bbr.on_end_acks(
+            ack_at,
+            BASE_DATAGRAM_SIZE,
+            false,
+            Some(PACKETS - 2),
+            SpaceId::Data,
+        );
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.bw_probe_samples = true;
+        bbr.bw_shortterm = f64::INFINITY;
+        bbr.inflight_shortterm = u64::MAX;
+
+        bbr.on_packet_lost(
+            BASE_DATAGRAM_SIZE as u16,
+            PACKETS - 1,
+            SpaceId::Data,
+            ack_at,
+        );
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+        assert!(bbr.loss_in_round);
+        assert!(!bbr.loss_round_requires_congestion_response());
+        let relaxed_inflight_at_loss = bbr.rs.expect("relaxed ProbeUP sample").tx_in_flight;
+
+        // Quinn supplies persistence only after the per-packet callbacks and batch response.
+        bbr.on_congestion_event(
+            ack_at,
+            base + Duration::from_micros(PACKETS - 1),
+            true,
+            false,
+            BASE_DATAGRAM_SIZE,
+            PACKETS - 1,
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert_eq!(bbr.cwnd, bbr.min_pipe_cwnd);
+        assert!(
+            bbr.rs.expect("raw persistent sample").tx_in_flight < relaxed_inflight_at_loss,
+            "persistence must re-evaluate the retained ProbeUP sample at the raw threshold"
+        );
+        assert!(!bbr.explicit_congestion_in_round);
+        assert!(!bbr.loss_in_round);
+        assert!(!bbr.loss_round_evidence_unknown);
+        assert_eq!(bbr.pending_probe_loss_packet_size, None);
+
+        let boundary_packet = PACKETS;
+        let boundary_sent = ack_at + Duration::from_millis(1);
+        bbr.on_packet_sent(
+            boundary_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            boundary_packet,
+            SpaceId::Data,
+        );
+        ack_test_packet(
+            &mut bbr,
+            &rtt,
+            boundary_sent + Duration::from_millis(100),
+            boundary_sent,
+            boundary_packet,
+        );
+        bbr.on_end_acks(
+            boundary_sent + Duration::from_millis(100),
+            0,
+            false,
+            Some(boundary_packet),
+            SpaceId::Data,
+        );
+        assert_eq!(
+            bbr.bw_shortterm,
+            f64::INFINITY,
+            "the consumed ProbeUP loss round must not receive a second short-term response"
+        );
+        assert!(!bbr.explicit_congestion_in_round);
+        assert!(!bbr.loss_in_round);
+        assert_eq!(bbr.loss_round_evidence_anchor, None);
+        assert!(!bbr.loss_round_evidence_unknown);
+    }
+
+    #[test]
+    fn loss_floor_explicit_control_stays_raw_while_delivery_model_stays_corrected() {
+        let now = Instant::now();
+        let mut model = loss_floor_test_controller();
+        let mut sample = max_bw_epoch_sample(now, false);
+        sample.delivered = 95 * BASE_DATAGRAM_SIZE;
+        sample.lost = 5 * BASE_DATAGRAM_SIZE;
+        model.explicit_congestion_in_round = true;
+        model.rs = Some(sample);
+
+        assert_eq!(model.effective_probe_loss_thresh(), LOSS_THRESH);
+        assert!((model.sample_explained_loss(sample) - 0.05).abs() < f64::EPSILON);
+        assert!(model.model_delivery_rate(sample) > sample.delivery_rate);
+        model.update_latest_delivery_signals();
+        assert_eq!(model.inflight_latest, 100 * BASE_DATAGRAM_SIZE);
+        assert!(model.bw_latest > sample.delivery_rate);
+
+        // Quinn reports an attributable ECN event with zero lost bytes. Loss compensation must not
+        // manufacture a packet loss or retain an exemption across that native callback. The
+        // controller's existing ECN response is deliberately unchanged by this extension.
+        let mut compensated = loss_floor_test_controller();
+        let mut draft = Bbr3::new(Arc::new(draft_bbr3_config()), BASE_DATAGRAM_SIZE as u16);
+        for controller in [&mut compensated, &mut draft] {
+            controller.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+            controller.bw_probe_samples = true;
+            controller.on_congestion_event(now, now, false, true, 0, 0, SpaceId::Data);
+            controller.on_validated_ecn_congestion_event();
+        }
+        assert_eq!(compensated.state, draft.state);
+        assert_eq!(compensated.lost, draft.lost);
+        assert_eq!(compensated.loss_in_round, draft.loss_in_round);
+        assert!(!compensated.explicit_congestion_in_round);
+    }
+
+    #[test]
+    fn loss_floor_missing_snapshot_is_conservative_without_changing_zero_default() {
+        let now = Instant::now();
+        let mut bbr = loss_floor_test_controller();
+        bbr.delivered = 100 * BASE_DATAGRAM_SIZE;
+        bbr.max_bw = 1_000_000.0;
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 999, SpaceId::Data, now);
+        assert!(bbr.loss_in_round);
+        assert!(bbr.loss_round_evidence_unknown);
+        assert_eq!(bbr.loss_round_evidence_anchor, None);
+        assert!(bbr.loss_round_requires_congestion_response());
+
+        bbr.loss_round_start = true;
+        bbr.update_congestion_signals(max_bw_epoch_sample(now, false).last_packet);
+        assert!(bbr.bw_shortterm.is_finite());
+        assert!(!bbr.loss_in_round);
+        assert!(!bbr.loss_round_evidence_unknown);
+
+        let mut unaligned_ecn = loss_floor_test_controller();
+        unaligned_ecn.on_congestion_event(now, now, false, true, 0, 999, SpaceId::Data);
+        assert!(!unaligned_ecn.loss_in_round);
+        assert!(!unaligned_ecn.explicit_congestion_in_round);
+
+        let mut zero = Bbr3::new(Arc::new(draft_bbr3_config()), BASE_DATAGRAM_SIZE as u16);
+        zero.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 999, SpaceId::Data, now);
+        assert!(!zero.loss_in_round);
+        assert!(!zero.loss_round_evidence_unknown);
+        assert_eq!(zero.loss_round_evidence_anchor, None);
+    }
+
+    #[test]
+    fn zero_loss_floor_retains_draft_threshold_rate_and_shortterm_response() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(Arc::new(draft_bbr3_config()), BASE_DATAGRAM_SIZE as u16);
+        let mut sample = max_bw_epoch_sample(now, false);
+        sample.delivered = 95 * BASE_DATAGRAM_SIZE;
+        sample.lost = 5 * BASE_DATAGRAM_SIZE;
+        sample.tx_in_flight = 100 * BASE_DATAGRAM_SIZE;
+        bbr.rs = Some(sample);
+        bbr.loss_in_round = true;
+
+        assert_eq!(bbr.effective_probe_loss_thresh(), LOSS_THRESH);
+        assert_eq!(bbr.model_delivery_rate(sample), sample.delivery_rate);
+        assert!(bbr.loss_round_requires_congestion_response());
+
+        // The extension's delayed explicit-congestion latch is unnecessary when the floor is
+        // disabled. Preserve the draft reset transition even if QUIC reports persistence after
+        // the packet-loss callbacks.
+        bbr.on_congestion_event(now, now, true, false, 0, 0, SpaceId::Data);
+        assert!(!bbr.explicit_congestion_in_round);
+        bbr.reset_congestion_signals();
+        assert!(!bbr.loss_in_round);
+    }
+
+    #[test]
+    fn generic_bbr3_default_retains_draft_zero_loss_compensation() {
+        let bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
+        assert_eq!(bbr.loss_compensation_floor, 0.0);
+        assert_eq!(bbr.effective_probe_loss_thresh(), LOSS_THRESH);
+    }
+
+    #[test]
+    fn mptunnel_loss_compensation_is_ten_percent_with_draft_residual_objective() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(mptunnel_loss_profile_config()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        let mut sample = max_bw_epoch_sample(now, false);
+        sample.delivered = 90 * BASE_DATAGRAM_SIZE;
+        sample.lost = 10 * BASE_DATAGRAM_SIZE;
+        sample.tx_in_flight = 100 * BASE_DATAGRAM_SIZE;
+        bbr.rs = Some(sample);
+        bbr.delivered = sample.delivered;
+        bbr.lost = sample.lost;
+        bbr.loss_in_round = true;
+        bbr.loss_round_evidence_anchor = Some(LossRoundEvidenceAnchor {
+            send_time: now,
+            delivered: 0,
+            lost: 0,
+        });
+
+        assert!((bbr.loss_compensation_floor - 0.10).abs() < f64::EPSILON);
+        assert!((bbr.effective_probe_loss_thresh() - 0.118).abs() < f64::EPSILON);
+        assert!((bbr.sample_explained_loss(sample) - 0.10).abs() < f64::EPSILON);
+        assert_eq!(bbr.model_delivered(sample), 100 * BASE_DATAGRAM_SIZE);
+        assert!(!bbr.loss_round_requires_congestion_response());
+
+        let mut above = Bbr3::new(
+            Arc::new(mptunnel_loss_profile_config()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        above.delivered = 88 * BASE_DATAGRAM_SIZE;
+        above.lost = 12 * BASE_DATAGRAM_SIZE;
+        above.loss_in_round = true;
+        above.loss_round_evidence_anchor = Some(LossRoundEvidenceAnchor {
+            send_time: now,
+            delivered: 0,
+            lost: 0,
+        });
+        assert!(
+            above.loss_round_requires_congestion_response(),
+            "12% aggregate loss must exceed the 11.8% production boundary"
+        );
     }
 
     /// A.1: Exiting STARTUP on a bandwidth plateau.
@@ -4594,8 +5628,9 @@ mod test {
         // bottleneck serialization time for one MSS-sized packet
         let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
 
-        // Drive the production default configuration.
-        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        // A.2 specifies the draft's raw 2% objective. The MPTUNNEL production profile applies
+        // a separate sender-local loss allowance and is covered by dedicated composition tests.
+        let mut bbr = Bbr3::new(Arc::new(draft_bbr3_config()), MSS as u16);
         assert_eq!(bbr.state, BbrState::Startup);
 
         let base = Instant::now();
@@ -5152,8 +6187,9 @@ mod test {
         // bottleneck serialization time for one MSS-sized packet
         let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
 
-        // Drive the production default configuration.
-        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        // A.6 specifies the draft's raw 2% objective. The MPTUNNEL production profile applies
+        // a separate sender-local loss allowance and is covered by dedicated composition tests.
+        let mut bbr = Bbr3::new(Arc::new(draft_bbr3_config()), MSS as u16);
         assert_eq!(bbr.state, BbrState::Startup);
 
         let base = Instant::now();
@@ -7485,6 +8521,250 @@ mod test {
         );
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ExogenousLossPattern {
+        Independent,
+        Burst,
+    }
+
+    impl ExogenousLossPattern {
+        fn drops(self, packet_number: u64, percent: u64) -> bool {
+            assert!((1..100).contains(&percent));
+            match self {
+                Self::Independent => {
+                    assert_eq!(100 % percent, 0);
+                    let period = 100 / percent;
+                    packet_number % period == period - 1
+                }
+                Self::Burst => packet_number % 100 >= 100 - percent,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct ExogenousLossPoint {
+        second: u64,
+        goodput: f64,
+        pacing_rate: f64,
+        max_bw: f64,
+        cwnd: u64,
+    }
+
+    #[derive(Debug)]
+    struct ExogenousLossRun {
+        points: Vec<ExogenousLossPoint>,
+        observed_loss: f64,
+    }
+
+    /// Drive the real controller through a constant-rate FIFO followed by a deterministic erasure
+    /// stage. Lost packets consume bottleneck service before erasure, so neither pattern changes
+    /// capacity, queue service, or RTT. Loss starts after an eight-second clean warm-up.
+    fn run_sustained_exogenous_loss(
+        mut config: Bbr3Config,
+        pattern: ExogenousLossPattern,
+        loss_percent: u64,
+    ) -> ExogenousLossRun {
+        const MSS: u64 = 1200;
+        const BW: f64 = 1_250_000.0; // 10 Mbit/s in bytes/sec; scale only reduces test runtime
+        const RTT_NS: u64 = 100_000_000;
+        const LOSS_START_NS: u64 = 8_000_000_000;
+        const TOTAL_NS: u64 = 40_000_000_000;
+        const SAMPLE_NS: u64 = 1_000_000_000;
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            event_ns: u64,
+            lost: bool,
+        }
+
+        config.probe_rng_seed = Some([0x5a; 16]);
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+        let service_ns = (MSS as f64 / BW * 1e9).round() as u64;
+        let mut btl_free_ns = 0u64;
+        let mut now_ns = 0u64;
+        let mut next_send_ns = 0u64;
+        let mut inflight = 0u64;
+        let mut pn = 0u64;
+        let mut next_sample_ns = SAMPLE_NS;
+        let mut sample_delivered = 0u64;
+        let mut lost_packets = 0u64;
+        let mut resolved_packets = 0u64;
+        let mut points = Vec::new();
+
+        for _ in 0..5_000_000u64 {
+            if now_ns >= TOTAL_NS {
+                break;
+            }
+            let can_send = inflight + MSS <= bbr.window();
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_event = flight.front().map(|packet| packet.event_ns);
+            let do_send = can_send && next_event.is_none_or(|event| next_send_ns <= event);
+            if do_send {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let arrival_ns = send_ns + RTT_NS / 2;
+                let service_start_ns = arrival_ns.max(btl_free_ns);
+                let finish_ns = service_start_ns + service_ns;
+                btl_free_ns = finish_ns;
+                let lost = send_ns >= LOSS_START_NS && pattern.drops(pn, loss_percent);
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn, SpaceId::Data);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    event_ns: finish_ns + RTT_NS / 2,
+                    lost,
+                });
+                next_send_ns =
+                    send_ns + (MSS as f64 / bbr.pacing_rate.max(1.0) * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(packet) = flight.pop_front() {
+                now_ns = now_ns.max(packet.event_ns);
+                inflight -= MSS;
+                resolved_packets += 1;
+                if packet.lost {
+                    lost_packets += 1;
+                    bbr.on_packet_lost(MSS as u16, packet.pn, SpaceId::Data, at(now_ns));
+                } else {
+                    rtt_est.update(
+                        Duration::ZERO,
+                        Duration::from_nanos(now_ns - packet.send_ns),
+                    );
+                    bbr.on_ack(
+                        at(now_ns),
+                        at(packet.send_ns),
+                        MSS,
+                        packet.pn,
+                        SpaceId::Data,
+                        false,
+                        &rtt_est,
+                    );
+                    bbr.on_end_acks(at(now_ns), inflight, false, Some(packet.pn), SpaceId::Data);
+                }
+            } else {
+                panic!("exogenous-loss simulation stalled without packets in flight");
+            }
+
+            while now_ns >= next_sample_ns {
+                let delivered = bbr.delivered;
+                points.push(ExogenousLossPoint {
+                    second: next_sample_ns / SAMPLE_NS,
+                    goodput: delivered.saturating_sub(sample_delivered) as f64,
+                    pacing_rate: bbr.pacing_rate,
+                    max_bw: bbr.max_bw,
+                    cwnd: bbr.cwnd,
+                });
+                sample_delivered = delivered;
+                next_sample_ns += SAMPLE_NS;
+            }
+        }
+        assert!(now_ns >= TOTAL_NS);
+        ExogenousLossRun {
+            points,
+            observed_loss: lost_packets as f64 / resolved_packets.max(1) as f64,
+        }
+    }
+
+    fn mean_goodput(run: &ExogenousLossRun, start_second: u64, end_second: u64) -> f64 {
+        let selected: Vec<f64> = run
+            .points
+            .iter()
+            .filter(|point| (start_second..=end_second).contains(&point.second))
+            .map(|point| point.goodput)
+            .collect();
+        assert!(!selected.is_empty());
+        selected.iter().sum::<f64>() / selected.len() as f64
+    }
+
+    #[test]
+    fn sustained_exogenous_loss_reproduces_progressive_decline_without_a_floor() {
+        for pattern in [
+            ExogenousLossPattern::Independent,
+            ExogenousLossPattern::Burst,
+        ] {
+            let run = run_sustained_exogenous_loss(draft_bbr3_config(), pattern, 5);
+            let early = mean_goodput(&run, 9, 13);
+            let late = mean_goodput(&run, 36, 40);
+            eprintln!(
+                "{pattern:?}: loss={:.4}, early={:.3}Mbps, late={:.3}Mbps, trace={:?}",
+                run.observed_loss,
+                early * 8.0 / 1e6,
+                late * 8.0 / 1e6,
+                run.points
+                    .iter()
+                    .map(|point| (
+                        point.second,
+                        point.goodput * 8.0 / 1e6,
+                        point.pacing_rate * 8.0 / 1e6,
+                        point.max_bw * 8.0 / 1e6,
+                        point.cwnd,
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            assert!(late < 0.85 * early);
+        }
+    }
+
+    #[test]
+    fn explicit_loss_floor_sustains_independent_and_burst_erasure() {
+        for pattern in [
+            ExogenousLossPattern::Independent,
+            ExogenousLossPattern::Burst,
+        ] {
+            let mut config = Bbr3Config::default();
+            config.loss_compensation_floor(0.05);
+            let run = run_sustained_exogenous_loss(config, pattern, 5);
+            let early = mean_goodput(&run, 9, 13);
+            let late = mean_goodput(&run, 36, 40);
+            eprintln!(
+                "floor/{pattern:?}: loss={:.4}, early={:.3}Mbps, late={:.3}Mbps, trace={:?}",
+                run.observed_loss,
+                early * 8.0 / 1e6,
+                late * 8.0 / 1e6,
+                run.points
+                    .iter()
+                    .map(|point| (
+                        point.second,
+                        point.goodput * 8.0 / 1e6,
+                        point.pacing_rate * 8.0 / 1e6,
+                        point.max_bw * 8.0 / 1e6,
+                        point.cwnd,
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            assert!(late >= 0.85 * early);
+            assert!(late * 8.0 >= 8_000_000.0);
+        }
+    }
+
+    #[test]
+    fn mptunnel_default_ten_percent_compensation_sustains_ten_percent_erasure() {
+        for pattern in [
+            ExogenousLossPattern::Independent,
+            ExogenousLossPattern::Burst,
+        ] {
+            let run =
+                run_sustained_exogenous_loss(mptunnel_loss_profile_config(), pattern, 10);
+            let early = mean_goodput(&run, 9, 13);
+            let late = mean_goodput(&run, 36, 40);
+            eprintln!(
+                "default/{pattern:?}: loss={:.4}, early={:.3}Mbps, late={:.3}Mbps",
+                run.observed_loss,
+                early * 8.0 / 1e6,
+                late * 8.0 / 1e6,
+            );
+            assert!(late >= 0.85 * early);
+            assert!(late * 8.0 >= 7_500_000.0);
+        }
+    }
+
     /// A.16: Decreasing bandwidth 10x and ensuring max bandwidth adapts down.
     /// Exercises the short-term loss response (`loss_lower_bounds`) and the windowed `max_bw`
     /// filter expiry (`advance_max_bw_filter`, `BBR.MaxBwFilterLen`):
@@ -7522,8 +8802,7 @@ mod test {
     ///    `BETA` step below `BW_HI`, throttling the flow within the cycle;
     ///  - `max_bw` collapses to the new `BW_LO` (within ~15%) once the filter window expires, and
     ///    does so within a small number of PROBE_BW cycles (`MAX_BW_FILTER_LEN` + headroom).
-    #[test]
-    fn max_bw_adapts_down_after_10x_decrease() {
+    fn run_max_bw_adapts_down_after_10x_decrease(loss_compensation_floor: Option<f64>) {
         /// packet size in bytes
         const MSS: u64 = 1200;
         /// simulated propagation round-trip time (100ms), matching A.1
@@ -7543,10 +8822,13 @@ mod test {
 
         // Seed the probe RNG so the PROBE_BW cycle timing is deterministic.
         let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let config = Bbr3Config {
+        let mut config = Bbr3Config {
             probe_rng_seed: Some(seed),
             ..Bbr3Config::default()
         };
+        if let Some(value) = loss_compensation_floor {
+            config.loss_compensation_floor(value);
+        }
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
         assert_eq!(bbr.state, BbrState::Startup);
 
@@ -7709,6 +8991,16 @@ mod test {
         );
     }
 
+    #[test]
+    fn max_bw_adapts_down_after_10x_decrease() {
+        run_max_bw_adapts_down_after_10x_decrease(None);
+    }
+
+    #[test]
+    fn mptunnel_loss_profile_preserves_10x_step_down_response() {
+        run_max_bw_adapts_down_after_10x_decrease(Some(0.10));
+    }
+
     /// A.17: Handling token bucket policers.
     /// Exercises the short-term loss response (`init_lower_bounds` + `loss_lower_bounds`, driven from
     /// `adapt_lower_bounds_from_congestion`) settling the flow to a token-bucket policer's token rate:
@@ -7744,8 +9036,7 @@ mod test {
     ///  - the flow settles to a stable operating point conforming to the token rate: over the late
     ///    window the delivered goodput tracks `TOKEN_RATE` and the loss rate stays low (no excessive
     ///    continuous loss).
-    #[test]
-    fn probe_bw_settles_to_token_rate_under_policer() {
+    fn run_probe_bw_settles_to_token_rate_under_policer(loss_compensation_floor: Option<f64>) {
         /// packet size in bytes
         const MSS: u64 = 1200;
         /// simulated propagation round-trip time (100ms), matching A.1
@@ -7765,10 +9056,13 @@ mod test {
 
         // Seed the probe RNG so the PROBE_BW cycle timing is deterministic.
         let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let config = Bbr3Config {
+        let mut config = Bbr3Config {
             probe_rng_seed: Some(seed),
             ..Bbr3Config::default()
         };
+        if let Some(value) = loss_compensation_floor {
+            config.loss_compensation_floor(value);
+        }
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
         assert_eq!(bbr.state, BbrState::Startup);
 
@@ -7935,6 +9229,16 @@ mod test {
             loss_rate <= 0.10,
             "policer loss should settle to a low rate, got {loss_rate}"
         );
+    }
+
+    #[test]
+    fn probe_bw_settles_to_token_rate_under_policer() {
+        run_probe_bw_settles_to_token_rate_under_policer(None);
+    }
+
+    #[test]
+    fn mptunnel_loss_profile_preserves_token_bucket_response() {
+        run_probe_bw_settles_to_token_rate_under_policer(Some(0.10));
     }
 
     /// A.18: Handling spurious Fast Recovery (the loss-undo path).

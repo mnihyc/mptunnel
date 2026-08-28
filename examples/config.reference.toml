@@ -517,6 +517,9 @@ paths = [
 #   omission means unknown.
 #
 # Transport and carrier-group controls:
+# - loss-compensation-percent=0..99.9999: sender-local QUIC policy that corrects
+#   aligned delivery/inflight evidence for that loss fraction; omission uses
+#   10%. Overstating it can hide congestion; use 0 for draft BBR3 behavior;
 # - max-datagram-payload-bytes=512..65000: QUIC client only; omission uses the
 #   smaller of `[resources].max_payload_bytes` and 65000;
 # - max-tcp-carriers=1..65535: TCP client only; omission defaults to 3;
@@ -532,13 +535,14 @@ paths = [
 # - allow-datagrams: permit application datagrams (default true); the key is
 #   accepted on TCP only because QUIC always permits datagrams.
 # MPP listener paths use one fixed port. They may use the `initial-*` and
-# scheduling boolean options; TCP listeners may also use `allow-datagrams`.
+# scheduling boolean options; QUIC listeners may use `loss-compensation-percent`,
+# and TCP listeners may use `allow-datagrams`.
 # `source-address`, `max-datagram-payload-bytes`, `max-tcp-carriers`, port
 # rotation, and port ranges are client-only and are rejected on listeners.
 #
 # Complete examples:
 # tcp://192.0.2.10:7443?source-address=192.0.2.20&initial-srtt-ms=40&initial-rttvar-ms=5&initial-rate-mbps=100&max-tcp-carriers=3&backup=false&expensive=false&allow-bulk=true&control-only=false&allow-datagrams=true
-# quic://server.example.com:7000-7999?initial-rate=unknown&max-datagram-payload-bytes=1200&port-rotation-interval-ms=300000&backup=false&expensive=false&allow-bulk=true&control-only=false
+# quic://server.example.com:7000-7999?initial-rate=unknown&loss-compensation-percent=10&max-datagram-payload-bytes=1200&port-rotation-interval-ms=300000&backup=false&expensive=false&allow-bulk=true&control-only=false
 path_probe_interval_ms = 10000
 path_probe_timeout_ms = 2000
 

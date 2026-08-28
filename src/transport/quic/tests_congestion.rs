@@ -180,11 +180,14 @@ fn instrumented_controller_forwards_pacing_rate_through_clones() {
 #[test]
 fn production_initial_and_fresh_paths_both_construct_bbr3() {
     let now = Instant::now();
-    let controller =
-        quinn::congestion::ControllerFactory::build(Arc::new(InstrumentedBbrConfig), now, 1200)
-            .into_any()
-            .downcast::<InstrumentedController>()
-            .expect("instrumented production controller");
+    let controller = quinn::congestion::ControllerFactory::build(
+        Arc::new(InstrumentedBbrConfig::default()),
+        now,
+        1200,
+    )
+    .into_any()
+    .downcast::<InstrumentedController>()
+    .expect("instrumented production controller");
     assert!(
         controller
             .inner
@@ -210,6 +213,74 @@ fn production_initial_and_fresh_paths_both_construct_bbr3() {
             .is_ok(),
         "fresh network path must restart with BBR3"
     );
+}
+
+#[test]
+fn path_loss_compensation_constructs_initial_and_fresh_bbr3_without_reusing_initial_rate() {
+    fn assert_bbr3_loss_compensation(controller: &InstrumentedController, expected: &str) {
+        let bbr3 = controller
+            .inner
+            .clone_box()
+            .into_any()
+            .downcast::<quinn::congestion::Bbr3>()
+            .expect("inner BBR3 controller");
+        assert!(
+            format!("{bbr3:?}").contains(expected),
+            "constructed BBR3 must contain {expected}"
+        );
+    }
+
+    let now = Instant::now();
+    let path = concat!(
+        "quic://example.com:443?",
+        "initial-rate-mbps=25&loss-compensation-percent=5.1234"
+    )
+    .parse::<crate::transport::PathSpec>()
+    .expect("QUIC path metadata");
+    let controller = quinn::congestion::ControllerFactory::build(
+        Arc::new(InstrumentedBbrConfig::for_path(&path.metadata)),
+        now,
+        1200,
+    )
+    .into_any()
+    .downcast::<InstrumentedController>()
+    .expect("instrumented production controller");
+    assert_eq!(controller.loss_compensation.ppm(), 51_234);
+    assert_bbr3_loss_compensation(&controller, "loss_compensation_floor: 0.051234");
+    let fresh = controller
+        .fresh_path_box(now + Duration::from_secs(1), 1400)
+        .expect("fresh controller")
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("fresh instrumented controller");
+    assert_eq!(fresh.loss_compensation.ppm(), 51_234);
+    assert_bbr3_loss_compensation(&fresh, "loss_compensation_floor: 0.051234");
+    let mut rate_only = crate::transport::PathMetadata::default();
+    rate_only.initial_rate = crate::transport::RateHint::BitsPerSecond(25_000_000);
+    let default_controller = quinn::congestion::ControllerFactory::build(
+        Arc::new(InstrumentedBbrConfig::for_path(&rate_only)),
+        now,
+        1200,
+    )
+    .into_any()
+    .downcast::<InstrumentedController>()
+    .expect("default instrumented controller");
+    assert_eq!(default_controller.loss_compensation.ppm(), 100_000);
+    assert_bbr3_loss_compensation(&default_controller, "loss_compensation_floor: 0.1");
+
+    let disabled = "quic://example.com:443?loss-compensation-percent=0"
+        .parse::<crate::transport::PathSpec>()
+        .expect("explicitly disabled QUIC loss compensation");
+    let disabled_controller = quinn::congestion::ControllerFactory::build(
+        Arc::new(InstrumentedBbrConfig::for_path(&disabled.metadata)),
+        now,
+        1200,
+    )
+    .into_any()
+    .downcast::<InstrumentedController>()
+    .expect("disabled-compensation instrumented controller");
+    assert_eq!(disabled_controller.loss_compensation.ppm(), 0);
+    assert_bbr3_loss_compensation(&disabled_controller, "loss_compensation_floor: 0.0");
 }
 
 #[test]

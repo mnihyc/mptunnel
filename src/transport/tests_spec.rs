@@ -51,6 +51,7 @@ fn canonical_path_specs_parse_tcp_and_quic() {
         "quic://[2001:db8::1]:8443?",
         "initial-rttvar-ms=0&",
         "initial-rate-bps=100000000&",
+        "loss-compensation-percent=5.1250&",
         "max-datagram-payload-bytes=1400"
     )
     .parse::<PathSpec>()
@@ -64,6 +65,13 @@ fn canonical_path_specs_parse_tcp_and_quic() {
         RateHint::BitsPerSecond(100_000_000)
     );
     assert_eq!(quic.metadata.max_datagram_payload_bytes, Some(1400));
+    assert_eq!(
+        quic.metadata
+            .loss_compensation
+            .expect("configured loss compensation")
+            .ppm(),
+        51_250
+    );
 }
 
 #[test]
@@ -147,6 +155,86 @@ fn canonical_initial_rate_forms_are_exact_and_mutually_exclusive() {
 }
 
 #[test]
+fn loss_compensation_percent_parses_exactly_to_ppm() {
+    for (value, expected_ppm) in [
+        ("0", 0),
+        ("0.0", 0),
+        ("0.0000", 0),
+        ("0.0001", 1),
+        ("1", 10_000),
+        ("1.2", 12_000),
+        ("1.23", 12_300),
+        ("1.234", 12_340),
+        ("1.2345", 12_345),
+        ("5.1200", 51_200),
+        ("99.9999", 999_999),
+    ] {
+        let path = format!("quic://example.com:443?loss-compensation-percent={value}")
+            .parse::<PathSpec>()
+            .expect("exact loss-compensation percentage");
+        assert_eq!(
+            path.metadata
+                .loss_compensation
+                .expect("configured loss estimate")
+                .ppm(),
+            expected_ppm,
+            "{value}"
+        );
+    }
+    assert_eq!(PathMetadata::default().loss_compensation, None);
+}
+
+#[test]
+fn loss_compensation_percent_rejects_non_decimal_or_out_of_range_values() {
+    const KEY: &str = "loss-compensation-percent";
+    for value in [
+        "", "0.00010", "100", "100.0000", "-1", "+1", ".1", "1.", "1.2.3", "1e0", "NaN", "inf",
+    ] {
+        assert_eq!(
+            format!("quic://example.com:443?{KEY}={value}")
+                .parse::<PathSpec>()
+                .expect_err("invalid loss compensation must be rejected"),
+            PathSpecParseError::InvalidQueryParamValue(KEY.to_string(), value.to_string()),
+            "{value}"
+        );
+    }
+    assert_eq!(
+        format!("quic://example.com:443?{KEY}")
+            .parse::<PathSpec>()
+            .expect_err("missing loss value must be rejected"),
+        PathSpecParseError::MissingQueryParamValue(KEY.to_string())
+    );
+}
+
+#[test]
+fn loss_compensation_percent_is_quic_only_and_not_an_initial_rate_alias() {
+    assert_eq!(
+        "tcp://example.com:443?loss-compensation-percent=5"
+            .parse::<PathSpec>()
+            .expect_err("TCP must reject the QUIC loss input"),
+        PathSpecParseError::LossCompensationRequiresQuicPath
+    );
+
+    let path = concat!(
+        "quic://example.com:443?",
+        "initial-rate-mbps=25&loss-compensation-percent=5"
+    )
+    .parse::<PathSpec>()
+    .expect("independent QUIC startup inputs");
+    assert_eq!(
+        path.metadata.initial_rate,
+        RateHint::BitsPerSecond(25_000_000)
+    );
+    assert_eq!(
+        path.metadata
+            .loss_compensation
+            .expect("explicit loss estimate")
+            .ppm(),
+        50_000
+    );
+}
+
+#[test]
 fn path_specs_reject_noncanonical_schemes_hosts_and_ports() {
     for invalid in [
         "example.com:443",
@@ -195,6 +283,7 @@ fn path_options_reject_missing_invalid_duplicate_and_inapplicable_values() {
         "quic://example.com:443?allow-datagrams=false",
         "quic://example.com:443?max-datagram-payload-bytes=511",
         "quic://example.com:443?max-datagram-payload-bytes=65001",
+        "tcp://example.com:443?loss-compensation-percent=5",
         "tcp://example.com:443?port-rotation-interval-ms=300000",
         "quic://example.com:443?port-rotation-interval-ms=300000",
         "quic://example.com:443-444?port-rotation-interval-ms=4999",
@@ -237,10 +326,13 @@ fn path_options_reject_missing_invalid_duplicate_and_inapplicable_values() {
         "initial-srtt-ms=1&initial-srtt-ms=2",
         "initial-rttvar-ms=1&initial-rttvar-ms=2",
         "max-datagram-payload-bytes=1200&max-datagram-payload-bytes=1300",
+        "loss-compensation-percent=1&loss-compensation-percent=2",
         "max-tcp-carriers=1&max-tcp-carriers=2",
         "port-rotation-interval-ms=5000&port-rotation-interval-ms=6000",
     ] {
-        let scheme = if duplicate.starts_with("max-datagram") {
+        let scheme = if duplicate.starts_with("max-datagram")
+            || duplicate.starts_with("loss-compensation")
+        {
             "quic"
         } else {
             "tcp"

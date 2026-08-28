@@ -4162,6 +4162,13 @@ if should_run_case "baseline_hysteria2_udp_single_balanced"; then
     "$hysteria_down_rate"
 fi
 
+if should_run_case "baseline_hysteria2_udp_single_balanced_autonomous"; then
+  run_hysteria2_baseline_case \
+    "baseline_hysteria2_udp_single_balanced_autonomous" \
+    "172.31.15.20" \
+    "$default_netem_mode"
+fi
+
 if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth"; then
   hysteria_rate="$(hysteria_bandwidth_from_netem_rate "${MPTUNNEL_LAB_FAT_RATE:-500mbit}")"
   run_hysteria2_baseline_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth" "172.31.20.20" apply "$hysteria_rate" "$hysteria_rate"

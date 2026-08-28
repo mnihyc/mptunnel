@@ -1665,11 +1665,12 @@ impl Controller for Bbr3 {
         &mut self,
         now: Instant,
         bytes: u16,
-        _prior_in_flight: u64,
+        prior_in_flight: u64,
         packet_number: u64,
         space: SpaceId,
         _app_limited: bool,
     ) -> Option<crate::congestion::PacketDeliveryState> {
+        self.inflight = prior_in_flight;
         self.handle_restart_from_idle(now);
         if self.inflight == 0 {
             self.first_send_time = Some(now);
@@ -1857,6 +1858,7 @@ impl Controller for Bbr3 {
         now: Instant,
     ) -> Option<RecoveryTransactionId> {
         let lost_bytes_64 = lost_bytes as u64;
+        self.inflight = self.inflight.saturating_sub(lost_bytes_64);
         self.lost += lost_bytes_64;
         let p_index_result =
             self.packets[space as usize].binary_search_by_key(&packet_number, |p| p.packet_number);
@@ -2371,6 +2373,66 @@ mod test {
 
         bbr.on_end_acks(next_now, 0, false, Some(3), SpaceId::Data);
         assert!(!bbr.ack_epoch_open);
+    }
+
+    #[test]
+    fn production_callbacks_keep_inflight_authoritative_across_loss_and_send() {
+        let first_sent = Instant::now();
+        let second_sent = first_sent + Duration::from_millis(1);
+        let acked_at = second_sent + Duration::from_millis(100);
+        let third_sent = acked_at + Duration::from_millis(1);
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), smss as u16);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+
+        <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            first_sent,
+            smss as u16,
+            0,
+            1,
+            SpaceId::Data,
+            false,
+        );
+        <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            second_sent,
+            smss as u16,
+            smss,
+            2,
+            SpaceId::Data,
+            false,
+        );
+        bbr.on_ack(
+            acked_at,
+            first_sent,
+            smss,
+            1,
+            SpaceId::Data,
+            false,
+            &rtt,
+        );
+        bbr.on_end_acks(acked_at, smss, false, Some(1), SpaceId::Data);
+
+        bbr.on_packet_lost(smss as u16, 2, SpaceId::Data, acked_at);
+        assert_eq!(bbr.inflight, 0);
+        <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            third_sent,
+            smss as u16,
+            0,
+            3,
+            SpaceId::Data,
+            false,
+        );
+
+        let third = bbr.packets[SpaceId::Data as usize]
+            .back()
+            .expect("third packet");
+        assert_eq!(bbr.inflight, smss);
+        assert_eq!(third.tx_in_flight, smss);
+        assert_eq!(third.first_send_time, third_sent);
+        assert_eq!(third.delivered_time, third_sent);
     }
 
     #[test]

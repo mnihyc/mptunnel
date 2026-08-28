@@ -2240,6 +2240,7 @@ mod test {
             first_send_time: now,
             send_time: now,
             is_app_limited,
+            is_probe_rtt: false,
             tx_in_flight: BASE_DATAGRAM_SIZE,
             packet_number: 0,
             space: SpaceId::Data,

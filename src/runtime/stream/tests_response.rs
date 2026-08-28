@@ -82,6 +82,53 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
 }
 
 #[tokio::test]
+async fn idle_reset_closes_attachment_admission_before_blocked_publication() {
+    let stream_id = StreamId(971);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .send_control(ReliablePathCommand::CloseStream(StreamId(999)))
+        .await
+        .expect("prefill control queue");
+    let binding = ResponseStreamBinding::new(
+        SessionId(971),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        commands,
+        TrafficClass::Throughput,
+    );
+
+    binding.retire_stream_with_reset(stream_id, ResetReason::TimedOut);
+    binding.retire_stream_with_reset(stream_id, ResetReason::TimedOut);
+    let (late_commands, _late_receivers) = reliable_path_command_channels(1);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Udp,
+            PathId(1),
+            late_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::RejectedClosedStream,
+        "local retirement commits before carrier queue publication"
+    );
+
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::ResetAndCloseStream {
+            stream_id: received,
+            reason: ResetReason::TimedOut,
+        }) if received == stream_id
+    ));
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::CloseStream(StreamId(999)))
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut receivers).is_none(),
+        "repeat retirement is idempotent"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_attach_either_joins_terminal_snapshot_or_observes_closed_stream() {
     let stream_id = StreamId(98);
     let (first_commands, mut first_receivers) = reliable_path_command_channels(8);

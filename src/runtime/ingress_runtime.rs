@@ -15,12 +15,13 @@ use crate::product::{InboundId, PrincipalId};
 use crate::protocol::TargetAddr;
 use crate::runtime::datagram::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, reap_finished_udp_edge_lane_instance,
-    remove_udp_edge_lane, udp_edge_completion_queue,
+    dispatch_udp_edge_request_with_idle_timeout, finish_udp_edge_completion,
+    reap_finished_udp_edge_lane_instance, remove_udp_edge_lane, udp_edge_completion_queue,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::outbound_registry::relay_opened_tcp;
 use crate::runtime::path::ClientPathContext;
+use crate::runtime::product_lifecycle::ProductFlowActivity;
 use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 use crate::runtime::readiness::RequiredServiceReadiness;
 use std::cmp::Reverse;
@@ -40,6 +41,7 @@ const ROUTE_DROP_READ_BUFFER_BYTES: usize = 4 * 1024;
 #[derive(Clone)]
 struct LocalIngressAdmission {
     limits: LocalIngressAdmissionConfig,
+    flow_idle_timeout: Option<Duration>,
     state: Arc<Mutex<LocalIngressAdmissionState>>,
 }
 
@@ -60,15 +62,19 @@ pub(in crate::runtime) struct LocalIngressAdmissionPermit {
 pub(in crate::runtime) fn local_admission_permit_for_test(
     source: IpAddr,
 ) -> LocalIngressAdmissionPermit {
-    LocalIngressAdmission::new(LocalIngressAdmissionConfig::default())
-        .try_admit_source(source)
-        .expect("default test local admission")
+    LocalIngressAdmission::new(
+        LocalIngressAdmissionConfig::default(),
+        crate::config::ProductFlowConfig::default().idle_timeout,
+    )
+    .try_admit_source(source)
+    .expect("default test local admission")
 }
 
 impl LocalIngressAdmission {
-    fn new(limits: LocalIngressAdmissionConfig) -> Self {
+    fn new(limits: LocalIngressAdmissionConfig, flow_idle_timeout: Option<Duration>) -> Self {
         Self {
             limits,
+            flow_idle_timeout,
             state: Arc::new(Mutex::new(LocalIngressAdmissionState::default())),
         }
     }
@@ -150,6 +156,7 @@ pub(super) async fn spawn_socks5_client_ingress(
     inbound: InboundId,
     proxy_auth: ProxyAuthConfig,
     admission: LocalIngressAdmissionConfig,
+    flow_idle_timeout: Option<Duration>,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
@@ -162,7 +169,7 @@ pub(super) async fn spawn_socks5_client_ingress(
             "SOCKS5 ingress has no listener tasks",
         ));
     }
-    let admission = LocalIngressAdmission::new(admission);
+    let admission = LocalIngressAdmission::new(admission, flow_idle_timeout);
     for listener in bound {
         let local_address = listener.local_addr()?;
         crate::observability::emit_lifecycle(
@@ -257,6 +264,7 @@ pub(super) async fn spawn_mixed_client_ingress(
     inbound: InboundId,
     proxy_auth: ProxyAuthConfig,
     admission: LocalIngressAdmissionConfig,
+    flow_idle_timeout: Option<Duration>,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
@@ -269,7 +277,7 @@ pub(super) async fn spawn_mixed_client_ingress(
             "mixed proxy ingress has no listener tasks",
         ));
     }
-    let admission = LocalIngressAdmission::new(admission);
+    let admission = LocalIngressAdmission::new(admission, flow_idle_timeout);
     for listener in bound {
         let local_address = listener.local_addr()?;
         crate::observability::emit_lifecycle(
@@ -397,7 +405,10 @@ pub(in crate::runtime) async fn run_mixed_client_listener_for_test(
         router,
         inbound,
         proxy_auth,
-        LocalIngressAdmission::new(admission),
+        LocalIngressAdmission::new(
+            admission,
+            crate::config::ProductFlowConfig::default().idle_timeout,
+        ),
     )
     .await
 }
@@ -451,6 +462,7 @@ pub(super) async fn spawn_http_connect_client_ingress(
     inbound: InboundId,
     proxy_auth: ProxyAuthConfig,
     admission: LocalIngressAdmissionConfig,
+    flow_idle_timeout: Option<Duration>,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
@@ -463,7 +475,7 @@ pub(super) async fn spawn_http_connect_client_ingress(
             "HTTP CONNECT ingress has no listener tasks",
         ));
     }
-    let admission = LocalIngressAdmission::new(admission);
+    let admission = LocalIngressAdmission::new(admission, flow_idle_timeout);
     for listener in bound {
         let local_address = listener.local_addr()?;
         crate::observability::emit_lifecycle(
@@ -546,6 +558,7 @@ pub(super) async fn spawn_tcp_forward_client_ingress(
     config: TcpForwardConfig,
     router: ClientIngressRouter,
     inbound: InboundId,
+    flow_idle_timeout: Option<Duration>,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
@@ -576,6 +589,7 @@ pub(super) async fn spawn_tcp_forward_client_ingress(
             router.clone(),
             inbound.clone(),
             connection_slots.clone(),
+            flow_idle_timeout,
         ));
     }
     readiness.ready();
@@ -588,6 +602,7 @@ pub(super) async fn run_tcp_forward_client_listener(
     router: ClientIngressRouter,
     inbound: InboundId,
     connection_slots: Arc<Semaphore>,
+    flow_idle_timeout: Option<Duration>,
 ) -> Result<(), RuntimeError> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -613,7 +628,14 @@ pub(super) async fn run_tcp_forward_client_listener(
                 connections.spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        handle_tcp_forward_client_stream(stream, target, router, inbound, source)
+                        handle_tcp_forward_client_stream(
+                            stream,
+                            target,
+                            router,
+                            inbound,
+                            source,
+                            flow_idle_timeout,
+                        )
                             .await
                     {
                         crate::observability::process_event!(
@@ -645,6 +667,7 @@ pub(super) async fn handle_tcp_forward_client_stream<S>(
     router: ClientIngressRouter,
     inbound: InboundId,
     source: SocketAddr,
+    flow_idle_timeout: Option<Duration>,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -671,7 +694,7 @@ where
         Err(RuntimeError::OutboundUnavailable(_)) => return Ok(()),
         Err(error) => return Err(error),
     };
-    relay_opened_tcp(stream, opened).await
+    relay_opened_tcp(stream, opened, flow_idle_timeout).await
 }
 
 pub(super) async fn spawn_udp_forward_client_ingress(
@@ -679,6 +702,7 @@ pub(super) async fn spawn_udp_forward_client_ingress(
     mux_limits: MuxLimits,
     router: ClientIngressRouter,
     inbound: InboundId,
+    flow_idle_timeout: Option<Duration>,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
@@ -712,6 +736,7 @@ pub(super) async fn spawn_udp_forward_client_ingress(
             association_slots.clone(),
             idle_timeout,
             datagram_ttl_ms,
+            flow_idle_timeout,
         ));
     }
     readiness.ready();
@@ -742,6 +767,7 @@ pub(super) async fn run_udp_forward_client_socket(
     association_slots: Arc<Semaphore>,
     idle_timeout: Duration,
     datagram_ttl_ms: u32,
+    flow_idle_timeout: Option<Duration>,
 ) -> Result<(), RuntimeError> {
     const UDP_PACKET_BUFFER_BYTES: usize = u16::MAX as usize;
 
@@ -833,11 +859,12 @@ pub(super) async fn run_udp_forward_client_socket(
                     peer,
                     generation: association.generation,
                 };
-                let _ = dispatch_udp_edge_request(
+                let _ = dispatch_udp_edge_request_with_idle_timeout(
                     &mut lanes,
                     &mut next_lane_id,
                     plan,
                     mux_limits,
+                    flow_idle_timeout,
                     &completion_tx,
                     UdpEdgeRequest {
                         target: target.as_ref().clone(),
@@ -857,9 +884,13 @@ pub(super) async fn run_udp_forward_client_socket(
                 match completion {
                     UdpEdgeCompletion::Received { target: received_target, metadata, payload } => {
                         let is_current = associations
-                            .get(&metadata.peer)
+                            .get_mut(&metadata.peer)
                             .is_some_and(|association| {
-                                association.generation == metadata.generation
+                                let current = association.generation == metadata.generation;
+                                if current && received_target == *target {
+                                    association.last_activity = tokio::time::Instant::now();
+                                }
+                                current
                             });
                         if is_current
                             && received_target == *target
@@ -1098,7 +1129,7 @@ where
                     ))
                     .await?;
                 stream.flush().await?;
-                relay_opened_tcp(stream, opened).await
+                relay_opened_tcp(stream, opened, admission_permit.admission.flow_idle_timeout).await
             }
             .await;
             result.map(|_| ())
@@ -1109,6 +1140,7 @@ where
                 inbound,
                 source,
                 principal,
+                idle_timeout: admission_permit.admission.flow_idle_timeout,
             };
             handle_socks5_udp_associate(
                 &mut stream,
@@ -1242,7 +1274,7 @@ where
     let result = async {
         stream.write_all(http_connect::success_response()).await?;
         stream.flush().await?;
-        relay_opened_tcp(stream, opened).await
+        relay_opened_tcp(stream, opened, admission_permit.admission.flow_idle_timeout).await
     }
     .await;
     result.map(|_| ())
@@ -1329,6 +1361,7 @@ struct SocksUdpAssociationPolicy {
     inbound: InboundId,
     source: SocketAddr,
     principal: PrincipalId,
+    idle_timeout: Option<Duration>,
 }
 
 fn resolve_socks_udp_target_route(
@@ -1405,6 +1438,9 @@ where
         .min(crate::runtime::datagram::udp_edge_queue_slots(mux_limits))
         .max(1);
     let mut routes = Vec::<SocksUdpTargetRoute>::new();
+    let activity = ProductFlowActivity::new();
+    let idle = activity.wait_until_idle(policy.idle_timeout);
+    tokio::pin!(idle);
     let result = loop {
         tokio::select! {
             read = stream.read(&mut control_probe) => {
@@ -1436,6 +1472,7 @@ where
                 if consumed != len {
                     break Err(RuntimeError::Protocol("trailing SOCKS5 UDP datagram bytes"));
                 }
+                activity.record();
                 let socks5::UdpDatagram { target, payload } = datagram;
                 let route_position = match resolve_socks_udp_target_route(
                     &mut routes,
@@ -1463,11 +1500,12 @@ where
                     peer,
                     target_slot: route_position,
                 };
-                if dispatch_udp_edge_request(
+                if dispatch_udp_edge_request_with_idle_timeout(
                     &mut lanes,
                     &mut next_lane_id,
                     &binding.plan,
                     mux_limits,
+                    policy.idle_timeout,
                     &completion_tx,
                     UdpEdgeRequest {
                         target,
@@ -1493,6 +1531,7 @@ where
                 finish_udp_edge_completion(&mut lanes, &completion);
                 match completion {
                     UdpEdgeCompletion::Received { target, metadata, payload } => {
+                        activity.record();
                         let response_packet = match socks5::udp_datagram(&target, &payload) {
                             Ok(packet) => packet,
                             Err(err) => break Err(RuntimeError::Socks5(err)),
@@ -1525,6 +1564,7 @@ where
                     UdpEdgeCompletion::Discarded { .. } => {}
                 }
             }
+            () = &mut idle => break Ok(()),
         }
     };
     drop(completion_tx);

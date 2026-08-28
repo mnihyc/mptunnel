@@ -5,11 +5,11 @@ fn canonical_path_specs_parse_tcp_and_quic() {
     let tcp = concat!(
         "tcp://example.com:5000-5010?",
         "source-address=192.0.2.10&",
-        "initial-srtt-ms=20&",
-        "initial-rttvar-ms=5&",
+        "initial-srtt-s=0.02&",
+        "initial-rttvar-s=0.005&",
         "initial-rate-mbps=30&",
         "max-tcp-carriers=5&",
-        "port-rotation-interval-ms=45000&",
+        "port-rotation-interval-s=45&",
         "backup=true&",
         "expensive=false&",
         "allow-bulk=false&",
@@ -49,7 +49,7 @@ fn canonical_path_specs_parse_tcp_and_quic() {
 
     let quic = concat!(
         "quic://[2001:db8::1]:8443?",
-        "initial-rttvar-ms=0&",
+        "initial-rttvar-s=0&",
         "initial-rate-bps=100000000&",
         "loss-compensation-percent=5.1250&",
         "max-datagram-payload-bytes=1400"
@@ -273,7 +273,8 @@ fn path_options_reject_missing_invalid_duplicate_and_inapplicable_values() {
         "tcp://example.com:443?&backup=true",
         "tcp://example.com:443?unknown=true",
         "tcp://example.com:443?source-address=not-an-ip",
-        "tcp://example.com:443?initial-srtt-ms=0",
+        "tcp://example.com:443?initial-srtt-s=0",
+        "tcp://example.com:443?initial-srtt-s=0.0005",
         "tcp://example.com:443?max-tcp-carriers=0",
         "tcp://example.com:443?max-tcp-carriers=65536",
         "tcp://example.com:443?max-tcp-carriers=1-3",
@@ -284,9 +285,9 @@ fn path_options_reject_missing_invalid_duplicate_and_inapplicable_values() {
         "quic://example.com:443?max-datagram-payload-bytes=511",
         "quic://example.com:443?max-datagram-payload-bytes=65001",
         "tcp://example.com:443?loss-compensation-percent=5",
-        "tcp://example.com:443?port-rotation-interval-ms=300000",
-        "quic://example.com:443?port-rotation-interval-ms=300000",
-        "quic://example.com:443-444?port-rotation-interval-ms=4999",
+        "tcp://example.com:443?port-rotation-interval-s=300",
+        "quic://example.com:443?port-rotation-interval-s=300",
+        "quic://example.com:443-444?port-rotation-interval-s=4.999",
     ] {
         assert!(
             invalid.parse::<PathSpec>().is_err(),
@@ -323,12 +324,12 @@ fn path_options_reject_missing_invalid_duplicate_and_inapplicable_values() {
 
     for duplicate in [
         "source-address=192.0.2.1&source-address=192.0.2.2",
-        "initial-srtt-ms=1&initial-srtt-ms=2",
-        "initial-rttvar-ms=1&initial-rttvar-ms=2",
+        "initial-srtt-s=0.001&initial-srtt-s=0.002",
+        "initial-rttvar-s=0.001&initial-rttvar-s=0.002",
         "max-datagram-payload-bytes=1200&max-datagram-payload-bytes=1300",
         "loss-compensation-percent=1&loss-compensation-percent=2",
         "max-tcp-carriers=1&max-tcp-carriers=2",
-        "port-rotation-interval-ms=5000&port-rotation-interval-ms=6000",
+        "port-rotation-interval-s=5&port-rotation-interval-s=6",
     ] {
         let scheme = if duplicate.starts_with("max-datagram")
             || duplicate.starts_with("loss-compensation")
@@ -355,6 +356,9 @@ fn path_options_reject_missing_invalid_duplicate_and_inapplicable_values() {
 fn legacy_path_grammar_is_rejected() {
     for legacy in [
         "source-ip=192.0.2.1",
+        "initial-srtt-ms=20",
+        "initial-rttvar-ms=5",
+        "port-rotation-interval-ms=5000",
         "srtt-ms=20",
         "jitter-ms=5",
         "rate-bps=1000",

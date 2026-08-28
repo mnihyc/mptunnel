@@ -19,7 +19,7 @@ use crate::lab_diagnostics::{
     lab_server_response_stream_data,
 };
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
-use crate::model::multipath::ExtraTrafficLedger;
+use crate::model::multipath::OptionalReinjectionLedger;
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::ReliableWorkClass;
@@ -37,7 +37,8 @@ use crate::runtime::sender::{
     CarrierEmitMode, RelaySendCause, ReliableRelayQueuedWork, ReliableRelayQueuedWorkKind,
     ReliableRelaySenderQueue, ServerReinjectionOutputIdentity,
     reliable_relay_can_read_product_source, reliable_relay_sender_queue_read_budget,
-    sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
+    sender_optional_reinjection_startup_floor_bytes,
+    sender_reinjection_minimum_useful_attempt_bytes,
 };
 use crate::runtime::stream::response::ResponseSenderPathTarget;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
@@ -100,7 +101,7 @@ pub(in crate::runtime) struct ServerResponseSenderService {
     pub(in crate::runtime::sender) stream_id: StreamId,
     pub(in crate::runtime::sender) queue: ReliableRelaySenderQueue,
     pub(in crate::runtime::sender) performance: MppPerformanceConfig,
-    pub(in crate::runtime::sender) extra_traffic: ExtraTrafficLedger,
+    pub(in crate::runtime::sender) optional_reinjection: OptionalReinjectionLedger,
     stale_response_recovery_generation: u64,
 }
 
@@ -142,7 +143,7 @@ impl ServerResponseSenderService {
             stream_id,
             queue: ReliableRelaySenderQueue::default(),
             performance,
-            extra_traffic: ExtraTrafficLedger::default(),
+            optional_reinjection: OptionalReinjectionLedger::default(),
             stale_response_recovery_generation: 0,
         }
     }
@@ -283,13 +284,13 @@ impl ServerResponseSenderService {
         self.queue.persistent_ack_gap_reinjection_deadline()
     }
 
-    pub(in crate::runtime) fn extra_traffic_budget_remaining(
+    pub(in crate::runtime) fn optional_reinjection_budget_remaining(
         &self,
         mux_limits: MuxLimits,
     ) -> usize {
-        self.extra_traffic
+        self.optional_reinjection
             .budget(
-                sender_extra_traffic_startup_floor_bytes(mux_limits),
+                sender_optional_reinjection_startup_floor_bytes(mux_limits),
                 self.performance,
             )
             .remaining_bytes()
@@ -299,7 +300,7 @@ impl ServerResponseSenderService {
         &self,
         mux_limits: MuxLimits,
     ) -> usize {
-        self.extra_traffic_budget_remaining(mux_limits)
+        self.optional_reinjection_budget_remaining(mux_limits)
     }
 
     pub(in crate::runtime) fn reinjection_extra_event_budget_remaining(
@@ -315,7 +316,7 @@ impl ServerResponseSenderService {
     }
 
     pub(in crate::runtime) fn record_delivered_data(&mut self, bytes: usize) {
-        self.extra_traffic.record_delivered_data(bytes);
+        self.optional_reinjection.record_delivered_data(bytes);
     }
 
     pub(in crate::runtime) fn publish_queue_bytes(&self, path_stream: &ReliablePathStream) {
@@ -421,14 +422,14 @@ impl ServerResponseSenderService {
         critical_priority: bool,
     ) -> Option<u64> {
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        let budget = self.extra_traffic.budget(
-            sender_extra_traffic_startup_floor_bytes(mux_limits),
+        let budget = self.optional_reinjection.budget(
+            sender_optional_reinjection_startup_floor_bytes(mux_limits),
             self.performance,
         );
         if !budget.can_spend(payload_bytes) {
             return None;
         }
-        self.extra_traffic.record_reinjection(payload_bytes);
+        self.optional_reinjection.record_reinjection(payload_bytes);
         Some(if critical_priority {
             self.queue
                 .push_critical_reinjection_with_cause(frame, RelaySendCause::AckGapReinjection)
@@ -457,7 +458,7 @@ impl ServerResponseSenderService {
     ) -> u64 {
         debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        self.extra_traffic.record_reinjection(payload_bytes);
+        self.optional_reinjection.record_reinjection(payload_bytes);
         self.queue
             .push_critical_reinjection_with_cause(frame, cause)
     }

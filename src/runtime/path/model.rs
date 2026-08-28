@@ -1281,6 +1281,7 @@ impl PathDeliveryStats {
         self.last_payload_at = Some(now);
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn rate_sample(self) -> Option<PathRateSample> {
         let first = self.first_payload_at?;
         let last = self.last_payload_at.unwrap_or(first);

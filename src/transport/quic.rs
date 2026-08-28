@@ -131,6 +131,21 @@ pub enum QuicCarrierError {
 }
 
 impl QuicCarrierError {
+    /// Whether the peer abandoned only this HTTP/3 request-stream direction
+    /// without an application error.
+    ///
+    /// Dropping an unread Quinn receive half emits `STOP_SENDING(0)`, which
+    /// h3-quinn reports as `RemoteTerminate`. The signal has request-stream
+    /// scope: it is not evidence that the shared QUIC connection or sibling
+    /// MPP streams failed.
+    pub(crate) fn is_peer_stream_abandonment_without_error(&self) -> bool {
+        matches!(
+            self,
+            Self::H3Stream(h3::error::StreamError::RemoteTerminate { code })
+                if code.value() == 0
+        )
+    }
+
     /// Whether an established QUIC/H3 carrier instance ended without proving
     /// a Product-stream failure. The relay may retire that exact instance and
     /// preserve its logical stream on other authenticated carriers.

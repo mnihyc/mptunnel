@@ -58,6 +58,7 @@ use crate::protocol::{Frame, OffsetRange, ResetReason, SessionId, StreamId, Unde
 use crate::runtime::RuntimeError;
 use crate::runtime::outbound_registry::{OpenedTcpOutbound, finish_gateway_flow};
 use crate::runtime::path::PathDeliveryStats;
+use crate::runtime::product_lifecycle::{ProductFlowActivity, ProductFlowActivityIo};
 use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 use crate::runtime::sender::{
     RelaySendCause, ServerReinjectionOutputIdentity, ServerResponseSenderService,
@@ -87,6 +88,7 @@ pub(in crate::runtime) struct ServerReliableRelayContext {
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) max_paths_per_session: usize,
     pub(in crate::runtime) session_retention_timeout: Duration,
+    pub(in crate::runtime) flow_idle_timeout: Option<Duration>,
     pub(in crate::runtime) telemetry: RuntimeTelemetry,
 }
 
@@ -1343,7 +1345,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
     lab_diagnostic(
         "tail_stall_reinjection",
         format_args!(
-            "stream_id={} lane={:?} ack_frontier={} sent_offset={} reinjection_bytes={} reinjection_frames={} blocked_frontier_offset={:?} base_reinjection_limit={} reinjection_limit={} extra_traffic_hint_percent={} reinjection_kind={}",
+            "stream_id={} lane={:?} ack_frontier={} sent_offset={} reinjection_bytes={} reinjection_frames={} blocked_frontier_offset={:?} base_reinjection_limit={} reinjection_limit={} optional_reinjection_budget_percent={} reinjection_kind={}",
             stream_id.0,
             relay_lane,
             last_send_ack_frontier,
@@ -1353,7 +1355,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             blocked_frontier_offset,
             base_reinjection_limit,
             reinjection_limit,
-            performance.extra_traffic_hint_percent,
+            performance.optional_reinjection_budget_percent,
             reinjection_kind,
         ),
     );
@@ -1549,15 +1551,25 @@ where
         sent: false,
         lane: path_stream.current_lane(),
     };
-    let result = relay_reliable_stream_body(
-        local,
-        &mut path_stream,
-        context,
-        session_id,
-        session_send_buffer,
-        &mut close,
-    )
-    .await;
+    let activity = ProductFlowActivity::new();
+    let local = ProductFlowActivityIo::new(local, activity.clone());
+    let result = {
+        let body = relay_reliable_stream_body(
+            local,
+            &mut path_stream,
+            context,
+            session_id,
+            session_send_buffer,
+            &mut close,
+        );
+        let idle = activity.wait_until_idle(context.flow_idle_timeout);
+        tokio::pin!(body);
+        tokio::pin!(idle);
+        tokio::select! {
+            result = &mut body => result,
+            () = &mut idle => Err(RuntimeError::ProductIdleTimeout),
+        }
+    };
     // This wrapper is the single ordinary-return close path. The admission
     // supervisor handles cancellation and panic outside this future.
     match &result {
@@ -1569,6 +1581,9 @@ where
                 .reset_and_close_ordered(ResetReason::RemoteClosed, close.lane)
                 .await;
         }
+        Err(RuntimeError::ProductIdleTimeout) => {
+            path_stream.retire_with_reset(ResetReason::TimedOut);
+        }
         _ if close.sent => path_stream.close_ordered(close.lane).await,
         _ => path_stream.close().await,
     }
@@ -1576,7 +1591,10 @@ where
     lab_perf_flush("stream_close");
     #[cfg(feature = "lab-diagnostics")]
     lab_assert_server_sender_service_balanced(session_id.0, stream_id.0);
-    result
+    match result {
+        Err(RuntimeError::ProductIdleTimeout) => Ok(PathDeliveryStats::default()),
+        result => result,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2505,7 +2523,7 @@ where
                     lab_diagnostic(
                         "stream_ack_received",
                         format_args!(
-                            "stream_id={} complete={} ranges={} incoming_frontier={} stored_frontier={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={} base_reinjection_limit={} reinjection_limit={} extra_traffic_hint_percent={}",
+                            "stream_id={} complete={} ranges={} incoming_frontier={} stored_frontier={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={} base_reinjection_limit={} reinjection_limit={} optional_reinjection_budget_percent={}",
                             stream_id.0,
                             complete,
                             normalized_ranges.len(),
@@ -2523,7 +2541,7 @@ where
                             reinjection.persistent_ready,
                             base_reinjection_limit,
                             reinjection_limit,
-                            performance.extra_traffic_hint_percent,
+                            performance.optional_reinjection_budget_percent,
                         ),
                     );
                     let live_reinjection_retry_after =
@@ -2779,7 +2797,7 @@ where
                 lab_diagnostic(
                     "tail_stall_reinjection",
                     format_args!(
-                        "stream_id={} lane={:?} ack_frontier={} sent_offset={} reinjection_bytes={} reinjection_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_reinjection_limit={} reinjection_limit={} extra_traffic_hint_percent={} reinjection_kind=fin_tail",
+                        "stream_id={} lane={:?} ack_frontier={} sent_offset={} reinjection_bytes={} reinjection_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_reinjection_limit={} reinjection_limit={} optional_reinjection_budget_percent={} reinjection_kind=fin_tail",
                         stream_id.0,
                         response_lane,
                         last_send_ack_frontier,
@@ -2790,7 +2808,7 @@ where
                         same_output_frontier_retransmit,
                         reinjection_limit,
                         reinjection_limit,
-                        performance.extra_traffic_hint_percent,
+                        performance.optional_reinjection_budget_percent,
                     ),
                 );
                 if reinjection_count > 0 {

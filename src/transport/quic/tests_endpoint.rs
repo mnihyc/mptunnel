@@ -543,7 +543,7 @@ async fn client_and_server_endpoints_keep_independent_local_loss_floors() {
 }
 
 #[tokio::test]
-async fn quic_destination_port_migration_preserves_connection_and_streams() {
+async fn quic_destination_port_migration_preserves_connection_streams_and_native_epoch() {
     let mux_limits = MuxLimits {
         quic_path_keep_alive_interval: Duration::from_millis(20),
         quic_path_idle_timeout: Duration::from_secs(2),
@@ -579,6 +579,9 @@ async fn quic_destination_port_migration_preserves_connection_and_streams() {
         .expect("server accept timeout")
         .expect("server accept task");
     assert_quic_ping_round_trip(&client_connection, &server_connection, 90).await;
+    let before_migration = client_connection.congestion_metrics();
+    let server_before_migration = server_connection.congestion_metrics();
+    let before_stats = client_connection.stats();
 
     let first = first_port.port().min(second_port.port());
     let last = first_port.port().max(second_port.port());
@@ -601,6 +604,21 @@ async fn quic_destination_port_migration_preserves_connection_and_streams() {
         .await
         .expect("destination-port migration confirmation");
     assert_quic_ping_round_trip(&client_connection, &server_connection, 91).await;
+    let after_first_migration = client_connection.congestion_metrics();
+    let server_after_first_migration = server_connection.congestion_metrics();
+    let after_first_stats = client_connection.stats();
+    assert_eq!(
+        after_first_migration.path_epoch, before_migration.path_epoch,
+        "locator-only port migration must not cold-start the retained QUIC connection"
+    );
+    assert_eq!(
+        server_after_first_migration.path_epoch, server_before_migration.path_epoch,
+        "same-IP client rebinding must retain the server's QUIC congestion epoch"
+    );
+    assert!(
+        after_first_stats.path.sent_packets > before_stats.path.sent_packets,
+        "the retained native path counters must continue across the new external port"
+    );
 
     let carrier = CarrierSocket::system(CarrierSocketRequest {
         path: &path,
@@ -618,6 +636,21 @@ async fn quic_destination_port_migration_preserves_connection_and_streams() {
         .await
         .expect("second destination-port migration confirmation");
     assert_quic_ping_round_trip(&client_connection, &server_connection, 92).await;
+    let after_second_migration = client_connection.congestion_metrics();
+    let server_after_second_migration = server_connection.congestion_metrics();
+    let after_second_stats = client_connection.stats();
+    assert_eq!(
+        after_second_migration.path_epoch, before_migration.path_epoch,
+        "returning to another port of the same service must retain the native path epoch"
+    );
+    assert_eq!(
+        server_after_second_migration.path_epoch, server_before_migration.path_epoch,
+        "repeated same-IP rebinding must keep the server's native epoch warm"
+    );
+    assert!(
+        after_second_stats.path.sent_packets > after_first_stats.path.sent_packets,
+        "native counters must remain monotonic across repeated locator rotation"
+    );
 
     assert!(!client_connection.is_closed());
     first_forwarder.abort();

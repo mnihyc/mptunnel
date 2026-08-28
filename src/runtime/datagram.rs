@@ -29,8 +29,9 @@ pub(super) use association::DatagramClientAssociation;
 pub(super) use association::DatagramClientReceive;
 pub(super) use edge::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, reap_finished_udp_edge_lane_instance,
-    remove_udp_edge_lane, udp_edge_completion_queue, udp_edge_queue_slots,
+    dispatch_udp_edge_request_with_idle_timeout, finish_udp_edge_completion,
+    reap_finished_udp_edge_lane_instance, remove_udp_edge_lane, udp_edge_completion_queue,
+    udp_edge_queue_slots,
 };
 #[cfg(test)]
 pub(super) use quic_session::UdpDatagramClientSession;

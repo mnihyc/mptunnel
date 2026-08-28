@@ -234,8 +234,17 @@ same host-network protection boundary, and the preceding socket remains
 available until traffic returns through the selected port. Quinn remains the
 only owner of connection IDs, migration, path validation, recovery, and native
 path state. No scheduler, attachment, MPP authentication, or wire state changes.
-A ranged TCP path chooses a port only when creating a new TCP connection, which
-always creates a new physical carrier instance.
+The locator change therefore does not cold-start the QUIC carrier or create a
+new MPP evidence owner. A full QUIC reconnect does: it retains configured path
+hints but never predecessor measurements, queues, flight, ACK ownership, or
+sample authority. A ranged TCP path chooses a port only when creating a new TCP
+connection, which always creates a new physical carrier instance. One TCP group
+may own one transient authenticated successor beyond its configured
+current-member count.
+Publication swaps the member's current exact instance before predecessor drain;
+the predecessor's existing attachments then use ordinary retirement recovery.
+The overlap grants no exception to the receiver's session/global path caps and
+ends before another member in that group may rotate.
 
 Stream membership adds a separate incarnation. Request-side scheduling and
 flight ownership carry `(path_instance_id, attachment_id)`. Response new-data

@@ -47,14 +47,14 @@ fn reinjection_frame(offset: u64, payload_bytes: usize) -> Frame {
 }
 
 #[test]
-fn extra_traffic_budget_is_cumulative_and_data_ack_funded() {
+fn optional_reinjection_budget_is_cumulative_and_data_ack_funded() {
     let limits = MuxLimits::default();
     let performance = MppPerformanceConfig {
-        extra_traffic_hint_percent: 1,
+        optional_reinjection_budget_percent: 1,
     };
     let mut sender =
         ServerResponseSenderService::new_with_performance(SessionId(31), StreamId(31), performance);
-    let startup_floor = sender_extra_traffic_startup_floor_bytes(limits);
+    let startup_floor = sender_optional_reinjection_startup_floor_bytes(limits);
 
     assert!(
         sender

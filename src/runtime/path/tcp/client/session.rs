@@ -1390,6 +1390,21 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
     ))
 }
 
+/// Warms only the connection-local timing prior from this exact carrier's
+/// authenticated readiness exchange. Immutable configured jitter/rate hints
+/// remain intact; no predecessor or native TCP state enters the successor.
+pub(super) fn apply_authenticated_readiness_to_startup_evidence(
+    snapshot: &mut crate::scheduler::PathSnapshot,
+    metrics: &mut crate::protocol::PathMetrics,
+    readiness_rtt: Duration,
+) {
+    let srtt_us = u32::try_from(readiness_rtt.as_micros())
+        .unwrap_or(u32::MAX)
+        .max(1);
+    snapshot.srtt_ms = f64::from(srtt_us) / 1_000.0;
+    metrics.srtt_us = srtt_us;
+}
+
 fn publish_client_tcp_connection(
     runtime: &ClientTcpPathSessionRuntime,
     state: &mut ClientTcpPathSessionState,
@@ -1456,9 +1471,9 @@ pub(in crate::runtime::path::tcp) fn publish_client_tcp_connection_committed(
     );
 }
 
-/// Publishes a provisional successor only if the predecessor still owns an
-/// exact Product-quiescent member. The shared path-state transaction also
-/// serializes every Product load reservation.
+/// Publishes an authenticated successor only if the predecessor still owns
+/// the exact member. The shared path-state transaction serializes the swap
+/// with every Product load reservation.
 pub(in crate::runtime::path::tcp) fn publish_client_tcp_replacement_connection_committed(
     runtime: &ClientTcpPathSessionRuntime,
     connection: &mut ClientTcpPathConnection,
@@ -1469,7 +1484,7 @@ pub(in crate::runtime::path::tcp) fn publish_client_tcp_replacement_connection_c
     let path_instance_id = connection.path_instance_id;
     let remote_port = connection.carrier.remote_port;
     let mut authenticated_carrier = None;
-    let published = runtime.state.publish_tcp_replacement_if_product_quiescent(
+    let published = runtime.state.publish_tcp_replacement_if_current(
         predecessor_instance_id,
         ClientTcpCarrierPublication {
             path_index: runtime.path_index,
@@ -1514,5 +1529,43 @@ async fn wait_for_endpoint_policy_change(
             .changed()
             .await
             .expect("endpoint policy lives with its TCP carrier actor");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_readiness_warms_only_successor_timing_startup_evidence() {
+        let path = "tcp://127.0.0.1:12940?initial-srtt-s=0.75&initial-rttvar-s=0.125&initial-rate-mbps=420"
+            .parse::<crate::transport::PathSpec>()
+            .expect("TCP path with configured startup priors");
+        let path_id = crate::protocol::PathId(37);
+        let mut snapshot = path_startup_snapshot(&path, path_id);
+        let mut metrics = path_startup_metrics(&path, path_id, PathMetricDirection::ClientToServer);
+
+        apply_authenticated_readiness_to_startup_evidence(
+            &mut snapshot,
+            &mut metrics,
+            Duration::from_millis(42),
+        );
+
+        assert_eq!(snapshot.srtt_ms, 42.0);
+        assert_eq!(snapshot.jitter_ms, 125.0);
+        assert_eq!(snapshot.delivery_rate_bps, 420_000_000.0);
+        assert_eq!(metrics.srtt_us, 42_000);
+        assert_eq!(metrics.rttvar_us, 125_000);
+        assert_eq!(metrics.delivery_rate_bps, 420_000_000);
+        assert!(!metrics.rate_observed);
+        assert_eq!(metrics.rate_valid_for_us, 0);
+        assert!(!metrics.pacing_rate_observed);
+        assert!(!metrics.has_ack_derived_data_sample);
+        assert!(!metrics.bytes_in_flight_observed);
+        assert!(!metrics.queue_observed);
+        assert_eq!(metrics.bytes_in_flight, 0);
+        assert_eq!(metrics.queue_bytes, 0);
+        assert_eq!(metrics.inflight_limit_bytes, 0);
+        assert_eq!(metrics.confidence_ppm, 0);
     }
 }

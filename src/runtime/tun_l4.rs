@@ -6,12 +6,13 @@ use crate::product::{InboundId, PrincipalId};
 use crate::protocol::TargetAddr;
 use crate::runtime::datagram::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, reap_finished_udp_edge_lane_instance,
-    udp_edge_completion_queue,
+    dispatch_udp_edge_request_with_idle_timeout, finish_udp_edge_completion,
+    reap_finished_udp_edge_lane_instance, udp_edge_completion_queue,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::ingress_runtime::{DEFAULT_SOCKS5_UDP_TTL_MS, hold_silent_route_drop};
 use crate::runtime::outbound_registry::relay_opened_tcp;
+use crate::runtime::product_lifecycle::ProductFlowActivity;
 use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 use crate::runtime::readiness::RequiredServiceReadiness;
 use bytes::{Bytes, BytesMut};
@@ -25,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tun_rs::async_framed::{BytesCodec, DeviceFramed};
 
-const TUN_UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TUN_UDP_INACTIVE_CACHE_TIMEOUT: Duration = Duration::from_secs(60);
 const TUN_DNS_TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const TUN_DNS_TCP_MAX_QUERIES: usize = 64;
 const TUN_DNS_UDP_RESPONSE_LIMIT: usize = 1_232;
@@ -37,6 +38,7 @@ pub(super) async fn run_tun_l4_client(
     router: ClientIngressRouter,
     inbound: InboundId,
     device: PacketDevice,
+    flow_idle_timeout: Option<Duration>,
     readiness: RequiredServiceReadiness,
 ) -> Result<(), RuntimeError> {
     let tun = Arc::new(tun);
@@ -103,8 +105,17 @@ pub(super) async fn run_tun_l4_client(
             principal.clone(),
             tun.clone(),
             tun_tcp_flow_limit(mux_limits),
+            flow_idle_timeout,
         ),
-        run_tun_udp_socket(udp_socket, mux_limits, router, inbound, principal, tun)
+        run_tun_udp_socket(
+            udp_socket,
+            mux_limits,
+            router,
+            inbound,
+            principal,
+            tun,
+            flow_idle_timeout,
+        )
     )?;
     Ok(())
 }
@@ -116,6 +127,7 @@ pub(super) async fn run_tun_tcp_listener(
     principal: PrincipalId,
     tun: Arc<TunL4Config>,
     flow_limit: usize,
+    flow_idle_timeout: Option<Duration>,
 ) -> Result<(), RuntimeError> {
     let flow_limit = flow_limit.max(1);
     let mut flows = tokio::task::JoinSet::new();
@@ -133,6 +145,7 @@ pub(super) async fn run_tun_tcp_listener(
                     if let Err(err) =
                         handle_tun_tcp_stream(
                             stream, local, remote, router, inbound, principal, tun,
+                            flow_idle_timeout,
                         )
                         .await
                     {
@@ -174,6 +187,7 @@ pub(super) async fn handle_tun_tcp_stream<S>(
     inbound: InboundId,
     principal: PrincipalId,
     tun: Arc<TunL4Config>,
+    flow_idle_timeout: Option<Duration>,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -214,7 +228,7 @@ where
         Err(RuntimeError::OutboundUnavailable(_)) => return Ok(()),
         Err(error) => return Err(error),
     };
-    relay_opened_tcp(stream, opened).await?;
+    relay_opened_tcp(stream, opened, flow_idle_timeout).await?;
     Ok(())
 }
 
@@ -310,6 +324,7 @@ struct TunUdpFlowTask {
     binding: TunUdpFlowBinding,
     mux_limits: crate::mux::MuxLimits,
     ttl_ms: u32,
+    idle_timeout: Option<Duration>,
 }
 
 pub(super) async fn run_tun_udp_socket(
@@ -319,6 +334,7 @@ pub(super) async fn run_tun_udp_socket(
     inbound: InboundId,
     principal: PrincipalId,
     tun: Arc<TunL4Config>,
+    flow_idle_timeout: Option<Duration>,
 ) -> Result<(), RuntimeError> {
     let (mut read_half, mut write_half) = udp_socket.split();
     let mut flows = HashMap::<TunUdpFlowKey, TunUdpFlowState>::new();
@@ -394,6 +410,7 @@ pub(super) async fn run_tun_udp_socket(
                                     binding,
                                     mux_limits,
                                     ttl_ms,
+                                    idle_timeout: flow_idle_timeout,
                                 },
                                 rx,
                                 flow_responses,
@@ -546,23 +563,29 @@ async fn handle_tun_udp_flow(
         binding: TunUdpFlowBinding { target, plan },
         mux_limits,
         ttl_ms,
+        idle_timeout,
     } = task;
     let (completion_tx, mut completion_rx) =
         mpsc::channel::<UdpEdgeCompletion<TunUdpFlowKey>>(udp_edge_completion_queue(mux_limits));
     let mut lanes = Vec::<UdpEdgeLane<TunUdpFlowKey>>::new();
     let mut next_lane_id = 0usize;
+    let activity = ProductFlowActivity::new();
+    let idle = activity.wait_until_idle(idle_timeout);
+    tokio::pin!(idle);
     let result = loop {
         tokio::select! {
-            payload = tokio::time::timeout(TUN_UDP_FLOW_IDLE_TIMEOUT, datagrams.recv()) => {
+            payload = datagrams.recv() => {
                 let payload = match payload {
-                    Ok(Some(payload)) => payload,
-                    Ok(None) | Err(_) => break Ok(()),
+                    Some(payload) => payload,
+                    None => break Ok(()),
                 };
-                if dispatch_udp_edge_request(
+                activity.record();
+                if dispatch_udp_edge_request_with_idle_timeout(
                     &mut lanes,
                     &mut next_lane_id,
                     &plan,
                     mux_limits,
+                    idle_timeout,
                     &completion_tx,
                     UdpEdgeRequest {
                         target: target.clone(),
@@ -590,6 +613,7 @@ async fn handle_tun_udp_flow(
                 finish_udp_edge_completion(&mut lanes, &completion);
                 match completion {
                     UdpEdgeCompletion::Received { payload, .. } => {
+                        activity.record();
                         responses
                             .send(TunUdpResponse::Flow {
                                 key,
@@ -623,6 +647,7 @@ async fn handle_tun_udp_flow(
                     UdpEdgeCompletion::Discarded { .. } => {}
                 }
             }
+            () = &mut idle => break Ok(()),
             else => break Ok(()),
         }
     };
@@ -658,7 +683,7 @@ fn evict_expired_inactive_tun_udp_flow(
     }
     let expired = flows.iter().find_map(|(key, state)| match state {
         TunUdpFlowState::Denied { last_seen } | TunUdpFlowState::LocalDns { last_seen }
-            if last_seen.elapsed() >= TUN_UDP_FLOW_IDLE_TIMEOUT =>
+            if last_seen.elapsed() >= TUN_UDP_INACTIVE_CACHE_TIMEOUT =>
         {
             Some(*key)
         }

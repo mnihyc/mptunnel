@@ -37,10 +37,10 @@ fn mixed_bulk_striping_includes_unmeasured_endpoint_only_udp() {
 
 #[test]
 fn measured_udp_delivery_rate_updates_next_datagram_order() {
-    let hinted_slow_path = "quic://127.0.0.1:10019?initial-srtt-ms=20&initial-rate-mbps=10"
+    let hinted_slow_path = "quic://127.0.0.1:10019?initial-srtt-s=0.02&initial-rate-mbps=10"
         .parse::<PathSpec>()
         .expect("hinted slow path");
-    let hinted_fast_path = "quic://127.0.0.1:10020?initial-srtt-ms=20&initial-rate-mbps=100"
+    let hinted_fast_path = "quic://127.0.0.1:10020?initial-srtt-s=0.02&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("hinted fast path");
     let context = ClientPathContext::new(
@@ -88,10 +88,10 @@ fn measured_udp_delivery_rate_updates_next_datagram_order() {
 
 #[test]
 fn udp_datagram_feedback_updates_scheduler_health() {
-    let lagging_path = "quic://127.0.0.1:10021?initial-srtt-ms=250&initial-rate-mbps=1"
+    let lagging_path = "quic://127.0.0.1:10021?initial-srtt-s=0.25&initial-rate-mbps=1"
         .parse::<PathSpec>()
         .expect("lagging path");
-    let observed_path = "quic://127.0.0.1:10022?initial-srtt-ms=250&initial-rate-mbps=1"
+    let observed_path = "quic://127.0.0.1:10022?initial-srtt-s=0.25&initial-rate-mbps=1"
         .parse::<PathSpec>()
         .expect("observed path");
     let context = ClientPathContext::new(
@@ -227,11 +227,11 @@ fn endpoint_only_udp_datagram_uses_measured_eta_after_feedback() {
 
 #[test]
 fn mixed_datagram_underlay_uses_tcp_when_tcp_eta_is_better() {
-    let slow_udp = "quic://127.0.0.1:10148?initial-srtt-ms=90&initial-rate-mbps=20"
+    let slow_udp = "quic://127.0.0.1:10148?initial-srtt-s=0.09&initial-rate-mbps=20"
         .parse::<PathSpec>()
         .expect("udp path");
     let fast_tcp =
-        "tcp://127.0.0.1:10149?initial-srtt-ms=15&initial-rate-mbps=100&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10149?initial-srtt-s=0.015&initial-rate-mbps=100&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("tcp path");
     let context = ClientPathContext::new(
@@ -250,11 +250,11 @@ fn mixed_datagram_underlay_uses_tcp_when_tcp_eta_is_better() {
 
 #[test]
 fn mixed_datagram_underlay_uses_udp_when_udp_eta_is_better() {
-    let fast_udp = "quic://127.0.0.1:10150?initial-srtt-ms=15&initial-rate-mbps=100"
+    let fast_udp = "quic://127.0.0.1:10150?initial-srtt-s=0.015&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("udp path");
     let slow_tcp =
-        "tcp://127.0.0.1:10151?initial-srtt-ms=90&initial-rate-mbps=20&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10151?initial-srtt-s=0.09&initial-rate-mbps=20&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("tcp path");
     let context = ClientPathContext::new(
@@ -272,11 +272,11 @@ fn mixed_datagram_underlay_uses_udp_when_udp_eta_is_better() {
 
 #[test]
 fn realtime_underlay_scoring_uses_the_actual_datagram_size() {
-    let low_latency_udp = "quic://127.0.0.1:10152?initial-srtt-ms=20&initial-rate-mbps=1"
+    let low_latency_udp = "quic://127.0.0.1:10152?initial-srtt-s=0.02&initial-rate-mbps=1"
         .parse::<PathSpec>()
         .expect("udp path");
     let bulk_capacity_tcp =
-        "tcp://127.0.0.1:10153?initial-srtt-ms=80&initial-rate-mbps=100&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10153?initial-srtt-s=0.08&initial-rate-mbps=100&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("tcp path");
     let context = ClientPathContext::new(
@@ -295,7 +295,7 @@ fn realtime_underlay_scoring_uses_the_actual_datagram_size() {
 
 #[test]
 fn udp_freshness_filter_rejects_paths_that_cannot_fit_ttl() {
-    let high_latency_path = "quic://127.0.0.1:10023?initial-srtt-ms=1000&initial-rate-mbps=1"
+    let high_latency_path = "quic://127.0.0.1:10023?initial-srtt-s=1&initial-rate-mbps=1"
         .parse::<PathSpec>()
         .expect("high latency path");
     let context = ClientPathContext::new(
@@ -338,10 +338,10 @@ fn realtime_udp_prefers_measured_model_before_unmeasured_startup_paths() {
 
 #[test]
 fn udp_association_suppression_prefers_survivor_without_dead_ending() {
-    let blackhole_path = "quic://127.0.0.1:10026?initial-srtt-ms=5&initial-rate-mbps=100"
+    let blackhole_path = "quic://127.0.0.1:10026?initial-srtt-s=0.005&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("blackhole path");
-    let survivor_path = "quic://127.0.0.1:10027?initial-srtt-ms=20&initial-rate-mbps=100"
+    let survivor_path = "quic://127.0.0.1:10027?initial-srtt-s=0.02&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("survivor path");
     let context = ClientPathContext::new(
@@ -382,10 +382,10 @@ fn udp_association_suppression_prefers_survivor_without_dead_ending() {
 
 #[test]
 fn udp_association_keeps_successful_path_within_hysteresis_until_suppressed() {
-    let steady_path = "quic://127.0.0.1:10031?initial-srtt-ms=20&initial-rate-mbps=100"
+    let steady_path = "quic://127.0.0.1:10031?initial-srtt-s=0.02&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("steady path");
-    let peer_path = "quic://127.0.0.1:10032?initial-srtt-ms=20&initial-rate-mbps=100"
+    let peer_path = "quic://127.0.0.1:10032?initial-srtt-s=0.02&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("peer path");
     let context = ClientPathContext::new(
@@ -421,10 +421,10 @@ fn udp_association_keeps_successful_path_within_hysteresis_until_suppressed() {
 
 #[test]
 fn udp_association_last_successful_path_is_only_hysteresis_hint() {
-    let stale_path = "quic://127.0.0.1:10033?initial-srtt-ms=20&initial-rate-mbps=100"
+    let stale_path = "quic://127.0.0.1:10033?initial-srtt-s=0.02&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("stale path");
-    let better_path = "quic://127.0.0.1:10034?initial-srtt-ms=20&initial-rate-mbps=100"
+    let better_path = "quic://127.0.0.1:10034?initial-srtt-s=0.02&initial-rate-mbps=100"
         .parse::<PathSpec>()
         .expect("better path");
     let context = ClientPathContext::new(
@@ -516,7 +516,7 @@ fn tcp_datagram_open_budget_is_ttl_bounded_and_reserves_an_alternative() {
 
 #[test]
 fn fresh_tcp_datagram_carrier_keeps_initial_pto_floor_after_live_probe() {
-    let path = "tcp://127.0.0.1:10130?initial-srtt-ms=20&initial-rttvar-ms=1&initial-rate-mbps=100&max-tcp-carriers=1"
+    let path = "tcp://127.0.0.1:10130?initial-srtt-s=0.02&initial-rttvar-s=0.001&initial-rate-mbps=100&max-tcp-carriers=1"
         .parse::<PathSpec>()
         .expect("TCP path");
     let context =
@@ -616,7 +616,7 @@ fn udp_runtime_model_backs_off_response_timeout_after_loss() {
 
 #[test]
 fn udp_response_budget_tracks_live_loss_model() {
-    let path = "quic://127.0.0.1:10036?initial-srtt-ms=80&initial-rate-mbps=30"
+    let path = "quic://127.0.0.1:10036?initial-srtt-s=0.08&initial-rate-mbps=30"
         .parse::<PathSpec>()
         .expect("path");
     let context =
@@ -710,11 +710,11 @@ fn udp_edge_association_queue_is_bounded_by_resource_bytes() {
 #[test]
 fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
     let first_path =
-        "tcp://127.0.0.1:10021?initial-srtt-ms=10&initial-rate-mbps=10&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10021?initial-srtt-s=0.01&initial-rate-mbps=10&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("first path");
     let second_path =
-        "tcp://127.0.0.1:10022?initial-srtt-ms=10&initial-rate-mbps=10&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10022?initial-srtt-s=0.01&initial-rate-mbps=10&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("second path");
     let context = ClientPathContext::new(
@@ -749,11 +749,11 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
 #[test]
 fn active_interactive_tcp_flow_pushes_bulk_to_other_path() {
     let low_latency_path =
-        "tcp://127.0.0.1:10123?initial-srtt-ms=20&initial-rate-mbps=100&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10123?initial-srtt-s=0.02&initial-rate-mbps=100&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("low latency path");
     let bulk_candidate_path =
-        "tcp://127.0.0.1:10124?initial-srtt-ms=180&initial-rate-mbps=100&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10124?initial-srtt-s=0.18&initial-rate-mbps=100&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("bulk candidate path");
     let context = ClientPathContext::new(
@@ -1092,11 +1092,11 @@ fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_late
 #[test]
 fn hinted_tcp_startup_uses_configured_metrics_before_order() {
     let high_latency_path =
-        "tcp://127.0.0.1:10127?initial-srtt-ms=200&initial-rate-mbps=100&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10127?initial-srtt-s=0.2&initial-rate-mbps=100&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("high latency path");
     let low_latency_path =
-        "tcp://127.0.0.1:10128?initial-srtt-ms=10&initial-rate-mbps=100&max-tcp-carriers=1"
+        "tcp://127.0.0.1:10128?initial-srtt-s=0.01&initial-rate-mbps=100&max-tcp-carriers=1"
             .parse::<PathSpec>()
             .expect("low latency path");
     let context = ClientPathContext::new(
@@ -1211,10 +1211,10 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
 
 #[test]
 fn active_udp_load_spreads_new_associations_and_releases_on_close() {
-    let first_path = "quic://127.0.0.1:10031?initial-srtt-ms=10&initial-rate-mbps=10"
+    let first_path = "quic://127.0.0.1:10031?initial-srtt-s=0.01&initial-rate-mbps=10"
         .parse::<PathSpec>()
         .expect("first path");
-    let second_path = "quic://127.0.0.1:10032?initial-srtt-ms=10&initial-rate-mbps=10"
+    let second_path = "quic://127.0.0.1:10032?initial-srtt-s=0.01&initial-rate-mbps=10"
         .parse::<PathSpec>()
         .expect("second path");
     let context = ClientPathContext::new(

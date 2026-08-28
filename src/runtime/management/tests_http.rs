@@ -529,6 +529,20 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("identityDetail.join(\" · \")"));
     assert!(DASHBOARD_JS.contains("\"Usage direction: \" + directionLabel(path.usage_direction)"));
     assert!(DASHBOARD_JS.contains("\"Metric direction: \" + directionLabel(path.direction)"));
+    assert_eq!(
+        DASHBOARD_JS
+            .matches("\"Sample direction: \" + directionLabel(path.direction)")
+            .count(),
+        2,
+        "both local and peer Evidence tooltips must expose sender direction"
+    );
+    assert_eq!(
+        DASHBOARD_HTML
+            .matches("Sender-direction confidence")
+            .count(),
+        4,
+        "both local and peer Evidence headers must describe directional samples"
+    );
     assert!(!local_row.contains("path.direction ? directionLabel(path.direction) : \"-\""));
     assert!(!peer_row.contains("path.direction ? directionLabel(path.direction) : \"-\""));
     assert!(DASHBOARD_JS.contains("titleCase(path.delivery_rate_source)"));

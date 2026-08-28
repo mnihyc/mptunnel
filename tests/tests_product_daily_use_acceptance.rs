@@ -129,8 +129,8 @@ protocol = "udp-forward"
 listen = ["{udp_forward}"]
 target = "{direct_udp_target}"
 max_associations = 4
-idle_timeout_ms = 5000
-datagram_ttl_ms = 3000
+idle_timeout_s = 5
+datagram_ttl_s = 3
 
 [[outbounds]]
 name = "direct-egress"
@@ -140,7 +140,7 @@ protocol = "direct"
 name = "http-egress"
 protocol = "http-connect"
 endpoint = "{http_proxy}"
-connect_timeout_ms = 2000
+connect_timeout_s = 2
 
 [routing]
 
@@ -994,20 +994,20 @@ listen = ["{socks}"]
 name = "failed-proxy"
 protocol = "socks5"
 endpoint = "{failing_proxy}"
-connect_timeout_ms = 500
+connect_timeout_s = 0.5
 
 [[outbounds]]
 name = "working-proxy"
 protocol = "socks5"
 endpoint = "{working_proxy}"
-connect_timeout_ms = 500
+connect_timeout_s = 0.5
 
 [[outbounds]]
 name = "edge-mpp"
 protocol = "mpp"
 paths = [{{ name = "path-1", endpoint = "tcp://{mpp}" }}]
-path_probe_interval_ms = 100
-path_probe_timeout_ms = 1000
+path_probe_interval_s = 0.1
+path_probe_timeout_s = 1
 
 [outbounds.security]
 credential_id = "daily-use"
@@ -1031,8 +1031,8 @@ members = [
 [routing.balancers.health]
 failure_threshold = 1
 recovery_threshold = 1
-initial_backoff_ms = 100
-maximum_backoff_ms = 100
+initial_backoff_s = 0.1
+maximum_backoff_s = 0.1
 
 [[routing.rules]]
 name = "reject-blocked"
@@ -1600,14 +1600,14 @@ name = "corp"
 servers = ["corp-dot"]
 family = "ipv4-only"
 security = "require-encrypted"
-query = { timeout_ms = 750 }
+query = { timeout_s = 0.75 }
 
 [[dns.policies]]
 name = "public"
 servers = ["public-dot"]
 family = "ipv4-only"
 security = "require-encrypted"
-query = { timeout_ms = 750 }
+query = { timeout_s = 0.75 }
 
 [[dns.rules]]
 name = "corp-split"

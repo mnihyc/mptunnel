@@ -1102,7 +1102,8 @@ fn spawn_client_udp_port_migration(
                 return;
             }
 
-            let selected_port = match runtime.path().endpoint.ports().select_other(current_port) {
+            let previous_port = current_port;
+            let selected_port = match runtime.path().endpoint.ports().select_other(previous_port) {
                 Ok(port) => port,
                 Err(err) => {
                     crate::observability::process_event!(
@@ -1162,13 +1163,15 @@ fn spawn_client_udp_port_migration(
             current_port = selected_port;
             let _ = path_metadata.set_active_port(selected_port);
             crate::observability::process_event!(
-                Info,
+                Debug,
                 "quic",
                 "carrier_port_migrated",
                 "QUIC carrier changed destination port without changing carrier identity; \
-                 group={}, path={}",
+                 group={}, path={}, old_port={}, new_port={}",
                 runtime.carrier_identity.group_ordinal,
-                runtime.carrier_identity.path_ordinal
+                runtime.carrier_identity.path_ordinal,
+                previous_port,
+                selected_port,
             );
         }
     })

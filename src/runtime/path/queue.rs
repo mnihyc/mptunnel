@@ -6,13 +6,14 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-use crate::protocol::{Frame, ResetReason, StreamId};
+use crate::protocol::{DatagramFlowId, Frame, ResetReason, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::scheduler::TrafficClass;
+use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 #[cfg(feature = "lab-diagnostics")]
@@ -158,14 +159,50 @@ impl ReliablePathCommandQueueSnapshot {
     }
 }
 
-/// A carrier-owned terminal transaction for an accepted stream whose product
-/// attachment never committed. It is intentionally separate from bounded work:
-/// queue pressure must not leak a peer binding or its local actor entry. The
-/// carrier's accepted-stream limit bounds outstanding retirements.
-#[derive(Debug, Clone, Copy)]
+/// A carrier-owned terminal transaction for accepted Product state. It is
+/// intentionally separate from bounded work: queue pressure must not leak a
+/// peer binding or its local actor entry. The carrier's accepted stream and
+/// datagram-flow limits bound outstanding retirements.
+#[derive(Debug, Clone)]
 enum ReliablePathRetirementCommand {
     RetireAcceptedStream(StreamId),
+    ResetAcceptedStream {
+        stream_id: StreamId,
+        reason: ResetReason,
+    },
     RetireDatagramAttachment(u64),
+    RetireServerDatagramFlow {
+        flow_id: DatagramFlowId,
+        _fence: Arc<ReliablePathDatagramRetirementFence>,
+    },
+}
+
+/// Per-flow admission fence shared by queue reservations and the authoritative
+/// server-side retirement command. The registry retains only weak entries, so
+/// its size is bounded by outstanding queue reservations and retirement work.
+#[derive(Debug)]
+struct ReliablePathDatagramRetirementFence {
+    flow_id: DatagramFlowId,
+    owner: Weak<ReliablePathCommandQueueMetrics>,
+    retired: AtomicBool,
+}
+
+impl Drop for ReliablePathDatagramRetirementFence {
+    fn drop(&mut self) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let mut retirements = owner
+            .datagram_retirements
+            .lock()
+            .expect("reliable path datagram retirement lock");
+        if retirements
+            .get(&self.flow_id)
+            .is_some_and(|retirement| retirement.upgrade().is_none())
+        {
+            retirements.remove(&self.flow_id);
+        }
+    }
 }
 
 /// Holds queue capacity without publishing a frame. Response transactions use
@@ -173,6 +210,7 @@ enum ReliablePathRetirementCommand {
 pub(in crate::runtime) struct ReliablePathFrameReservation<'a> {
     permit: Option<mpsc::Permit<'a, QueuedReliablePathCommand>>,
     frame: Option<Frame>,
+    datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
     bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     #[cfg(feature = "lab-diagnostics")]
@@ -197,13 +235,16 @@ impl ReliablePathFrameReservation<'_> {
         self.permit
             .take()
             .expect("reserved reliable path queue permit")
-            .send(QueuedReliablePathCommand::new(
-                ReliablePathCommand::SendFrame(
-                    self.frame.take().expect("reserved reliable path frame"),
-                ),
-                self.bytes,
-                self.metrics.clone(),
-            ));
+            .send(
+                QueuedReliablePathCommand::new(
+                    ReliablePathCommand::SendFrame(
+                        self.frame.take().expect("reserved reliable path frame"),
+                    ),
+                    self.bytes,
+                    self.metrics.clone(),
+                )
+                .with_datagram_retirement(self.datagram_retirement.take()),
+            );
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
             "path_command_queue_send",
@@ -229,6 +270,7 @@ struct ReliablePathCommandQueueMetrics {
     capacity_released: Arc<Notify>,
     tcp_capacity_probe: TcpCapacityProbeLeaseState,
     lifecycle: ReliablePathCarrierLifecycle,
+    datagram_retirements: Mutex<HashMap<DatagramFlowId, Weak<ReliablePathDatagramRetirementFence>>>,
     #[cfg(test)]
     last_accepted_open_stream: AtomicU64,
 }
@@ -431,6 +473,7 @@ struct QueuedReliablePathCommand {
     command: Option<ReliablePathCommand>,
     accounted_bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
+    datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
 }
 
 impl QueuedReliablePathCommand {
@@ -443,7 +486,22 @@ impl QueuedReliablePathCommand {
             command: Some(command),
             accounted_bytes,
             metrics,
+            datagram_retirement: None,
         }
+    }
+
+    fn with_datagram_retirement(
+        mut self,
+        retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
+    ) -> Self {
+        self.datagram_retirement = retirement;
+        self
+    }
+
+    fn retired_server_datagram_work(&self) -> bool {
+        self.datagram_retirement
+            .as_ref()
+            .is_some_and(|retirement| retirement.retired.load(Ordering::Acquire))
     }
 
     fn into_parts(mut self) -> (ReliablePathCommand, usize) {
@@ -481,6 +539,49 @@ impl Drop for QueuedReliablePathCommand {
 }
 
 impl ReliablePathCommandQueueMetrics {
+    fn datagram_retirement_fence(
+        self: &Arc<Self>,
+        flow_id: DatagramFlowId,
+    ) -> Arc<ReliablePathDatagramRetirementFence> {
+        let mut retirements = self
+            .datagram_retirements
+            .lock()
+            .expect("reliable path datagram retirement lock");
+        if let Some(retirement) = retirements.get(&flow_id).and_then(Weak::upgrade) {
+            return retirement;
+        }
+        let retirement = Arc::new(ReliablePathDatagramRetirementFence {
+            flow_id,
+            owner: Arc::downgrade(self),
+            retired: AtomicBool::new(false),
+        });
+        retirements.insert(flow_id, Arc::downgrade(&retirement));
+        retirement
+    }
+
+    fn admit_datagram_frame(
+        self: &Arc<Self>,
+        frame: &Frame,
+    ) -> Result<Option<Arc<ReliablePathDatagramRetirementFence>>, RuntimeError> {
+        let Some(flow_id) = reliable_path_retirable_datagram_flow_id(frame) else {
+            return Ok(None);
+        };
+        let retirement = self.datagram_retirement_fence(flow_id);
+        if retirement.retired.load(Ordering::Acquire) {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
+        Ok(Some(retirement))
+    }
+
+    fn retire_datagram_flow(
+        self: &Arc<Self>,
+        flow_id: DatagramFlowId,
+    ) -> Arc<ReliablePathDatagramRetirementFence> {
+        let retirement = self.datagram_retirement_fence(flow_id);
+        retirement.retired.store(true, Ordering::Release);
+        retirement
+    }
+
     fn update_flow_counts(&self, update: impl Fn(u32, u32) -> (u32, u32)) {
         let _ = self
             .flow_counts
@@ -640,6 +741,12 @@ impl ReliablePathCommandReceivers {
         &mut self,
         queued: QueuedReliablePathCommand,
     ) -> Option<ReliablePathCommand> {
+        if queued.retired_server_datagram_work() {
+            // The flow-scoped retirement command overtakes bounded work. Drop
+            // only older work carrying its exact fence; the envelope returns
+            // its queue-byte charge and unrelated Product work remains live.
+            return None;
+        }
         if reliable_path_command_stream_id(queued.command())
             .is_some_and(|stream_id| self.closed_streams.contains(&stream_id))
         {
@@ -774,6 +881,18 @@ impl ReliablePathCommandSender {
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
 
+    /// Transfers an accepted stream's terminal reset to the carrier-owned
+    /// retirement lane without waiting for bounded Product queue capacity.
+    pub(in crate::runtime) fn reset_accepted_stream(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+    ) -> Result<(), RuntimeError> {
+        self.retirement
+            .send(ReliablePathRetirementCommand::ResetAcceptedStream { stream_id, reason })
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
+    }
+
     pub(in crate::runtime) fn retire_datagram_attachment(
         &self,
         attachment_id: u64,
@@ -782,6 +901,19 @@ impl ReliablePathCommandSender {
             .send(ReliablePathRetirementCommand::RetireDatagramAttachment(
                 attachment_id,
             ))
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
+    }
+
+    pub(in crate::runtime) fn retire_server_datagram_flow(
+        &self,
+        flow_id: DatagramFlowId,
+    ) -> Result<(), RuntimeError> {
+        let retirement = self.metrics.retire_datagram_flow(flow_id);
+        self.retirement
+            .send(ReliablePathRetirementCommand::RetireServerDatagramFlow {
+                flow_id,
+                _fence: retirement,
+            })
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
 
@@ -1188,9 +1320,17 @@ impl ReliablePathCommandSender {
             drop(permit);
             return Err(RuntimeError::ReliablePathSessionClosed);
         }
+        let datagram_retirement = match self.metrics.admit_datagram_frame(&frame) {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                drop(permit);
+                return Err(error);
+            }
+        };
         Ok(ReliablePathFrameReservation {
             permit: Some(permit),
             frame: Some(frame),
+            datagram_retirement,
             bytes,
             metrics: self.metrics.clone(),
             #[cfg(feature = "lab-diagnostics")]
@@ -1337,6 +1477,15 @@ fn reliable_path_frame_requires_product_admission(frame: &Frame) -> bool {
             | Frame::PathCapacityFinish { .. }
             | Frame::PathCapacityReceipt { .. }
     )
+}
+
+fn reliable_path_retirable_datagram_flow_id(frame: &Frame) -> Option<DatagramFlowId> {
+    match frame {
+        Frame::DatagramData { flow_id, .. } | Frame::DatagramFeedback { flow_id, .. } => {
+            Some(*flow_id)
+        }
+        _ => None,
+    }
 }
 
 fn reliable_path_command_requires_product_admission(command: &ReliablePathCommand) -> bool {
@@ -1725,11 +1874,14 @@ fn begin_reliable_path_retirement(
     receivers: &mut ReliablePathCommandReceivers,
     command: ReliablePathRetirementCommand,
 ) -> ReliablePathCommand {
-    match command {
+    let command = match command {
         ReliablePathRetirementCommand::RetireAcceptedStream(stream_id) => {
             debug_assert!(receivers.pending_retirement_close.is_none());
             receivers.pending_retirement_close = Some(stream_id);
             ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id })
+        }
+        ReliablePathRetirementCommand::ResetAcceptedStream { stream_id, reason } => {
+            ReliablePathCommand::ResetAndCloseStream { stream_id, reason }
         }
         ReliablePathRetirementCommand::RetireDatagramAttachment(attachment_id) => {
             ReliablePathCommand::CloseDatagramAttachment {
@@ -1737,7 +1889,12 @@ fn begin_reliable_path_retirement(
                 response: None,
             }
         }
-    }
+        ReliablePathRetirementCommand::RetireServerDatagramFlow { flow_id, _fence: _ } => {
+            ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id })
+        }
+    };
+    receivers.record_terminal_command(&command);
+    command
 }
 
 pub(in crate::runtime) fn reliable_path_command_pending_bytes(

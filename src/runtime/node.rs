@@ -509,6 +509,7 @@ async fn run_with_generation_and_host_providers(
             resources: config.resources,
             admission: config.admission,
             session: config.session,
+            flow: config.flow,
             management: config.management,
             packet_devices,
             carrier_network,

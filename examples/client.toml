@@ -11,6 +11,24 @@
 [logging]
 level = "info" # all levels are good
 
+[flow]
+# TCP streams and UDP associations idle on application payload; 0 disables.
+idle_timeout_s = 300
+# Optional reliable MPP payload reinjection; control/probes/native recovery are outside it.
+optional_reinjection_budget_percent = 10
+# Sender-side QUIC loss correction; a path URI value has highest precedence.
+quic_loss_compensation_percent = 10
+
+[admission]
+max_live_flows = 4096
+max_concurrent_work = 4096
+max_live_flows_per_principal = 4096
+max_live_flows_per_outbound = 4096
+max_connects_per_outbound = 4096
+max_live_flows_per_target = 4096
+max_connects_per_target = 4096
+max_dns_work = 4096
+
 [management]
 # Local authenticated API and embedded diagnostics dashboard.
 listen = ["127.0.0.1:7600"]
@@ -28,6 +46,12 @@ secret = { from = "file", path = "mpp-credential.key" }
 name = "local-mixed"
 protocol = "mixed"
 listen = ["127.0.0.1:1080"]
+
+[inbounds.admission]
+max_connections = 4096
+max_connections_per_source = 4096
+max_connections_per_principal = 4096
+handshake_timeout_s = 10
 
 # Optional fixed-target TCP+UDP forwarding on one local address and port.
 # [[inbounds]]
@@ -53,12 +77,13 @@ protocol = "mpp"
 # allow_peer_diagnostics = false
 # Replace server.example.com with the server's reachable name or address.
 # TCP and QUIC/UDP remain separate carriers under one logical MPP session.
-# QUIC loss compensation defaults to 10% when omitted. To state or override it,
+# QUIC loss compensation inherits performance/[flow]. A path URI overrides it:
 # append `?loss-compensation-percent=10` (or `=0` for draft BBR3 behavior).
 paths = [
   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
   { name = "path-2", endpoint = "quic://server.example.com:7443" },
 ]
+# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss
 
 [outbounds.security]
 credential_id = "home-client"

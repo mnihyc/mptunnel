@@ -23,8 +23,8 @@ struct TcpCapacityFixture {
 impl TcpCapacityFixture {
     fn new(stream_id: StreamId) -> Self {
         let context = client_test_context_with_paths(&[
-            "quic://127.0.0.1:10330?initial-srtt-ms=20&initial-rate-mbps=500",
-            "tcp://127.0.0.1:10331?initial-srtt-ms=80&initial-rate-mbps=500",
+            "quic://127.0.0.1:10330?initial-srtt-s=0.02&initial-rate-mbps=500",
+            "tcp://127.0.0.1:10331?initial-srtt-s=0.08&initial-rate-mbps=500",
         ]);
         let (reference_commands, mut reference_rx) = reliable_path_command_channels(8);
         let mut remotes = ReliableRelayRemoteSet::new(

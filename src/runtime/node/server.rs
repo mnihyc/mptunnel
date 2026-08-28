@@ -4,7 +4,7 @@ use crate::config::{
     ForwardingMode, NamedPathConfig, PeerDiagnosticsPrincipalPolicy, ServerSecurityConfig,
 };
 #[cfg(test)]
-use crate::config::{ManagementConfig, ProductPolicyConfig, SessionConfig};
+use crate::config::{ManagementConfig, ProductFlowConfig, ProductPolicyConfig, SessionConfig};
 use crate::outbound;
 #[cfg(test)]
 use crate::outbound::OutboundConfig;
@@ -101,6 +101,7 @@ pub(in crate::runtime) async fn run(
         resources,
         RuntimeTelemetry::generation_owner(active_flow_detail_capacity(resources.max_streams)),
         session.retention_timeout,
+        ProductFlowConfig::default().idle_timeout,
         management.peer_diagnostics_enabled(),
         PeerDiagnosticsPrincipalPolicy::Deny,
         ForwardingMode::L4,
@@ -202,6 +203,7 @@ pub(in crate::runtime) fn new_identity_runtime(
         resources,
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         SessionConfig::default().retention_timeout,
+        ProductFlowConfig::default().idle_timeout,
         false,
         PeerDiagnosticsPrincipalPolicy::Deny,
         ForwardingMode::L4,
@@ -222,6 +224,7 @@ pub(super) fn new_identity_runtime_with_metadata(
     resources: ResourceLimits,
     telemetry: RuntimeTelemetry,
     session_retention_timeout: Duration,
+    flow_idle_timeout: Option<Duration>,
     global_allow_peer_diagnostics: bool,
     peer_diagnostics_principals: PeerDiagnosticsPrincipalPolicy,
     forwarding_mode: ForwardingMode,
@@ -244,6 +247,7 @@ pub(super) fn new_identity_runtime_with_metadata(
                     mux_limits,
                     max_paths_per_session: resources.max_paths,
                     session_retention_timeout,
+                    flow_idle_timeout,
                     telemetry: telemetry.clone(),
                 });
             let admission_router = router.clone();
@@ -271,6 +275,7 @@ pub(super) fn new_identity_runtime_with_metadata(
                 router,
                 inbound,
                 session_retention_timeout,
+                flow_idle_timeout,
                 mux_limits,
                 reliable_streams: reliable_stream_port.clone(),
                 telemetry: telemetry.clone(),
@@ -417,6 +422,7 @@ fn l3_identity_runtime_builds_packet_service_without_l4_relay() {
         resources,
         RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         SessionConfig::default().retention_timeout,
+        ProductFlowConfig::default().idle_timeout,
         false,
         PeerDiagnosticsPrincipalPolicy::Deny,
         ForwardingMode::L3,

@@ -464,8 +464,25 @@ fn udp_runtime_error_is_expected_shutdown(err: &RuntimeError) -> bool {
     )
 }
 
+fn udp_operation_error_is_expected_shutdown(err: &RuntimeError) -> bool {
+    udp_runtime_error_is_expected_shutdown(err)
+        || matches!(
+            err,
+            RuntimeError::QuicCarrier(error)
+                if error.is_peer_stream_abandonment_without_error()
+        )
+}
+
 pub(super) fn warn_unexpected_udp_runtime_error(message: &str, err: &RuntimeError) {
     if !udp_runtime_error_is_expected_shutdown(err) {
+        crate::observability::process_event!(Warn, "quic", "runtime_error", "{message}: {err}");
+    }
+}
+
+/// Reports one operation-scoped request-stream failure without mistaking the
+/// peer's error-free abandonment of that exact direction for carrier failure.
+pub(super) fn warn_unexpected_udp_operation_error(message: &str, err: &RuntimeError) {
+    if !udp_operation_error_is_expected_shutdown(err) {
         crate::observability::process_event!(Warn, "quic", "runtime_error", "{message}: {err}");
     }
 }

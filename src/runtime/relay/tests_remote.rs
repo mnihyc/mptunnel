@@ -338,6 +338,57 @@ async fn close_depublishes_load_before_carrier_cleanup_waits() {
 }
 
 #[tokio::test]
+async fn idle_reset_retires_membership_before_blocked_carrier_publication() {
+    let stream_id = StreamId(951);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands.clone(),
+                mux_limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    if let Some(setup) = try_recv_reliable_path_priority_command(&mut receivers) {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&setup));
+    }
+    commands
+        .send_control(ReliablePathCommand::CloseStream(StreamId(999)))
+        .await
+        .expect("prefill control queue");
+
+    remotes.retire_all_with_reset(ResetReason::TimedOut);
+    assert!(
+        remotes.is_empty(),
+        "Product membership retires without waiting for carrier queue space"
+    );
+
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::ResetAndCloseStream {
+            stream_id: received,
+            reason: ResetReason::TimedOut,
+        }) if received == stream_id
+    ));
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::CloseStream(StreamId(999)))
+    ));
+}
+
+#[tokio::test]
 async fn successful_close_preserves_fin_detach_close_order() {
     let stream_id = StreamId(96);
     let mux_limits = MuxLimits::default();
@@ -506,9 +557,9 @@ fn inflight_open_claim_remains_excluded_from_last_resort_recovery() {
 #[tokio::test]
 async fn additional_paths_are_ranked_by_metrics_across_carriers() {
     let context = context(&[
-        "quic://127.0.0.1:10179?initial-srtt-ms=100&initial-rate-mbps=20",
-        "tcp://127.0.0.1:10180?initial-srtt-ms=10&initial-rate-mbps=500",
-        "quic://127.0.0.1:10181?initial-srtt-ms=20&initial-rate-mbps=200",
+        "quic://127.0.0.1:10179?initial-srtt-s=0.1&initial-rate-mbps=20",
+        "tcp://127.0.0.1:10180?initial-srtt-s=0.01&initial-rate-mbps=500",
+        "quic://127.0.0.1:10181?initial-srtt-s=0.02&initial-rate-mbps=200",
     ]);
     let (slow, _receivers, _frames) = opened_stream(StreamId(160), UnderlayProtocol::Udp, 0);
     let remotes = ReliableRelayRemoteSet::new(slow, 4);
@@ -532,9 +583,9 @@ async fn additional_paths_are_ranked_by_metrics_across_carriers() {
 #[tokio::test]
 async fn available_path_precedes_faster_locally_configured_backup() {
     let context = context(&[
-        "tcp://127.0.0.1:10182?initial-srtt-ms=80&initial-rate-mbps=100",
-        "tcp://127.0.0.1:10183?initial-srtt-ms=5&initial-rate-mbps=1000&backup=true",
-        "quic://127.0.0.1:10184?initial-srtt-ms=100&initial-rate-mbps=20",
+        "tcp://127.0.0.1:10182?initial-srtt-s=0.08&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10183?initial-srtt-s=0.005&initial-rate-mbps=1000&backup=true",
+        "quic://127.0.0.1:10184?initial-srtt-s=0.1&initial-rate-mbps=20",
     ]);
     let (attached, _receivers, _frames) = opened_stream(StreamId(161), UnderlayProtocol::Udp, 0);
     let remotes = ReliableRelayRemoteSet::new(attached, 4);
@@ -557,8 +608,8 @@ async fn available_path_precedes_faster_locally_configured_backup() {
 #[tokio::test]
 async fn reinjection_candidate_uses_distinct_metric_ranked_carrier() {
     let context = context(&[
-        "tcp://127.0.0.1:11168?initial-srtt-ms=20&initial-rate-mbps=500",
-        "quic://127.0.0.1:11169?initial-srtt-ms=180&initial-rate-mbps=40",
+        "tcp://127.0.0.1:11168?initial-srtt-s=0.02&initial-rate-mbps=500",
+        "quic://127.0.0.1:11169?initial-srtt-s=0.18&initial-rate-mbps=40",
     ]);
     let (slow, _receivers, _frames) = opened_stream(StreamId(151), UnderlayProtocol::Udp, 0);
     let remotes = ReliableRelayRemoteSet::new(slow, 4);

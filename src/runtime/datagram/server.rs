@@ -12,6 +12,7 @@ use crate::runtime::path::{
     ServerDatagramPort, ServerDatagramPortBackend, ServerDatagramSendOutcome,
     ServerDatagramWorkerMessage, ServerStreamPort,
 };
+use crate::runtime::product_lifecycle::ProductFlowActivity;
 use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 use crate::runtime::telemetry::{ProductFlowLease, RuntimeTelemetry};
 use crate::scheduler::TrafficClass;
@@ -40,6 +41,7 @@ pub(in crate::runtime) struct ServerDatagramService {
     router: ClientIngressRouter,
     inbound: InboundId,
     session_retention_timeout: Duration,
+    flow_idle_timeout: Option<Duration>,
     mux_limits: MuxLimits,
     reliable_streams: ServerStreamPort,
     telemetry: RuntimeTelemetry,
@@ -50,27 +52,79 @@ struct ServerDatagramFlowSlot {
     target: TargetAddr,
     worker: OnceCell<mpsc::Sender<ServerDatagramWorkerMessage>>,
     attachments: Arc<AtomicUsize>,
+    attachment_routes: Arc<Mutex<Vec<Weak<ServerDatagramAttachmentRoute>>>>,
     attachment_changes: Arc<tokio::sync::Notify>,
     retired: Arc<AtomicBool>,
 }
 
+struct ServerDatagramAttachmentRoute {
+    commands: ReliablePathCommandSender,
+}
+
 struct ServerDatagramAttachment {
     count: Arc<AtomicUsize>,
+    routes: Arc<Mutex<Vec<Weak<ServerDatagramAttachmentRoute>>>>,
     changes: Arc<tokio::sync::Notify>,
+    route: Option<Arc<ServerDatagramAttachmentRoute>>,
 }
 
 impl ServerDatagramAttachment {
-    fn new(count: Arc<AtomicUsize>, changes: Arc<tokio::sync::Notify>) -> Self {
-        count.fetch_add(1, Ordering::AcqRel);
-        changes.notify_one();
-        Self { count, changes }
+    fn new(
+        flow_id: DatagramFlowId,
+        commands: ReliablePathCommandSender,
+        count: Arc<AtomicUsize>,
+        routes: Arc<Mutex<Vec<Weak<ServerDatagramAttachmentRoute>>>>,
+        changes: Arc<tokio::sync::Notify>,
+        retired: &AtomicBool,
+    ) -> Self {
+        let route = Arc::new(ServerDatagramAttachmentRoute {
+            commands: commands.clone(),
+        });
+        let registered = {
+            let mut routes = routes
+                .lock()
+                .expect("server datagram attachment routes lock");
+            routes.retain(|route| route.strong_count() > 0);
+            if retired.load(Ordering::Acquire) {
+                false
+            } else {
+                routes.push(Arc::downgrade(&route));
+                count.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+        };
+        if registered {
+            changes.notify_one();
+        } else {
+            let _ = commands.retire_server_datagram_flow(flow_id);
+        }
+        Self {
+            count,
+            routes,
+            changes,
+            route: registered.then_some(route),
+        }
+    }
+
+    fn is_registered(&self) -> bool {
+        self.route.is_some()
     }
 }
 
 impl Drop for ServerDatagramAttachment {
     fn drop(&mut self) {
+        if self.route.is_none() {
+            return;
+        }
+        let mut routes = self
+            .routes
+            .lock()
+            .expect("server datagram attachment routes lock");
+        self.route.take();
         let previous = self.count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "datagram attachment count underflow");
+        routes.retain(|route| route.strong_count() > 0);
+        drop(routes);
         self.changes.notify_one();
     }
 }
@@ -79,6 +133,7 @@ pub(in crate::runtime) struct ServerDatagramServiceConfig {
     pub(in crate::runtime) router: ClientIngressRouter,
     pub(in crate::runtime) inbound: InboundId,
     pub(in crate::runtime) session_retention_timeout: Duration,
+    pub(in crate::runtime) flow_idle_timeout: Option<Duration>,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) reliable_streams: ServerStreamPort,
     pub(in crate::runtime) telemetry: RuntimeTelemetry,
@@ -90,6 +145,7 @@ impl ServerDatagramService {
             router,
             inbound,
             session_retention_timeout,
+            flow_idle_timeout,
             mux_limits,
             reliable_streams,
             telemetry,
@@ -98,6 +154,7 @@ impl ServerDatagramService {
             router,
             inbound,
             session_retention_timeout,
+            flow_idle_timeout,
             mux_limits,
             reliable_streams,
             telemetry,
@@ -132,6 +189,7 @@ impl ServerDatagramService {
             target,
             worker: OnceCell::new(),
             attachments: Arc::new(AtomicUsize::new(0)),
+            attachment_routes: Arc::new(Mutex::new(Vec::new())),
             attachment_changes: Arc::new(tokio::sync::Notify::new()),
             retired: Arc::new(AtomicBool::new(false)),
         });
@@ -221,6 +279,7 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                         _product_flow,
                         self.mux_limits,
                         self.session_retention_timeout,
+                        self.flow_idle_timeout,
                         telemetry_flow,
                         realtime_registration,
                         self.flows.clone(),
@@ -236,28 +295,23 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                 }
             };
             let attachment = ServerDatagramAttachment::new(
+                flow_id,
+                commands.clone(),
                 slot.attachments.clone(),
+                slot.attachment_routes.clone(),
                 slot.attachment_changes.clone(),
+                &slot.retired,
             );
             let route_lifetime = Arc::new(());
-            let (attached, attachment_ready) = tokio::sync::oneshot::channel();
-            worker
-                .send(ServerDatagramWorkerMessage::Attach {
-                    commands: commands.clone(),
-                    attachment: Arc::downgrade(&route_lifetime),
-                    attached,
-                })
-                .await
-                .map_err(|_| {
-                    ServerDatagramOpenError::new(RuntimeError::Protocol(
-                        "server datagram worker closed during attachment",
-                    ))
-                })?;
-            attachment_ready.await.map_err(|_| {
-                ServerDatagramOpenError::new(RuntimeError::Protocol(
-                    "server datagram worker closed during attachment",
-                ))
-            })?;
+            attach_server_datagram_route(
+                &worker,
+                commands.clone(),
+                Arc::downgrade(&route_lifetime),
+                &attachment,
+                &slot.retired,
+            )
+            .await
+            .map_err(ServerDatagramOpenError::new)?;
             let session_retirement = self
                 .reliable_streams
                 .session_retirement(session_id)
@@ -298,6 +352,45 @@ impl ServerDatagramPortBackend for ServerDatagramService {
             slot.attachment_changes.notify_waiters();
         }
     }
+}
+
+async fn attach_server_datagram_route(
+    worker: &mpsc::Sender<ServerDatagramWorkerMessage>,
+    commands: ReliablePathCommandSender,
+    route_lifetime: Weak<()>,
+    attachment: &ServerDatagramAttachment,
+    retired: &AtomicBool,
+) -> Result<(), RuntimeError> {
+    // Retirement owns the wire close. Returning an already-retired Accepted
+    // handle keeps this a flow-local outcome in both TCP and QUIC carrier
+    // actors instead of escalating a normal expiry into carrier failure.
+    if !attachment.is_registered() {
+        return Ok(());
+    }
+    let (attached, attachment_ready) = tokio::sync::oneshot::channel();
+    if worker
+        .send(ServerDatagramWorkerMessage::Attach {
+            commands,
+            attachment: route_lifetime,
+            attached,
+        })
+        .await
+        .is_err()
+    {
+        return if retired.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(RuntimeError::Protocol(
+                "server datagram worker closed during attachment",
+            ))
+        };
+    }
+    if attachment_ready.await.is_err() && !retired.load(Ordering::Acquire) {
+        return Err(RuntimeError::Protocol(
+            "server datagram worker closed during attachment",
+        ));
+    }
+    Ok(())
 }
 
 fn server_datagram_request_queue_len(mux_limits: MuxLimits) -> usize {
@@ -349,6 +442,7 @@ fn spawn_server_datagram_flow_worker(
     product_flow: crate::runtime::outbound_registry::OpenedProductFlow,
     mux_limits: MuxLimits,
     session_retention_timeout: Duration,
+    flow_idle_timeout: Option<Duration>,
     telemetry_flow: ProductFlowLease,
     realtime_registration: crate::runtime::path::ServerRealtimeFlowLease,
     registry: ServerDatagramFlowRegistry,
@@ -365,11 +459,31 @@ fn spawn_server_datagram_flow_worker(
             .min(OUTBOUND_UDP_RECV_BUFFER_BYTES);
         let mut response_buffer = bytes::BytesMut::zeroed(response_buffer_len);
         let mut state = ServerDatagramFlowState::new(mux_limits);
-        let mut idle_deadline = Instant::now() + session_retention_timeout;
+        let activity = ProductFlowActivity::new();
+        let product_idle = activity.wait_until_idle(flow_idle_timeout);
+        tokio::pin!(product_idle);
+        let mut detached_deadline = Some(Instant::now() + session_retention_timeout);
         let session_retirement = realtime_registration.retirement().wait();
         tokio::pin!(session_retirement);
         loop {
-            prune_server_datagram_state(&mut state, mux_limits, Instant::now());
+            let now = Instant::now();
+            let attachment_count = slot
+                .upgrade()
+                .map(|slot| slot.attachments.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if attachment_count == 0 {
+                let deadline =
+                    detached_deadline.get_or_insert_with(|| now + session_retention_timeout);
+                if now >= *deadline {
+                    if retire_detached_server_datagram_attachments(key.1, &slot) {
+                        break;
+                    }
+                    detached_deadline = None;
+                }
+            } else {
+                detached_deadline = None;
+            }
+            prune_server_datagram_state(&mut state, mux_limits, now);
             queue_server_datagram_responses(key.1, &mut state);
             let pending_capacity = server_datagram_pending_capacity_wait(key.1, &state);
             let has_pending_capacity = pending_capacity.is_some();
@@ -384,7 +498,6 @@ fn spawn_server_datagram_flow_worker(
                     let Some(message) = message else {
                         break;
                     };
-                    idle_deadline = Instant::now() + session_retention_timeout;
                     match message {
                         ServerDatagramWorkerMessage::Attach { commands, attachment, attached } => {
                             update_server_datagram_route(
@@ -392,6 +505,7 @@ fn spawn_server_datagram_flow_worker(
                                 commands,
                                 attachment,
                             );
+                            detached_deadline = None;
                             queue_server_datagram_responses(key.1, &mut state);
                             let _ = attached.send(());
                         }
@@ -402,6 +516,10 @@ fn spawn_server_datagram_flow_worker(
                             admission,
                         } => {
                             if admission.is_closed() {
+                                if activity.is_idle(flow_idle_timeout) {
+                                    retire_server_datagram_attachments(key.1, &slot);
+                                    break;
+                                }
                                 continue;
                             }
                             let result = admit_server_datagram_request(
@@ -415,6 +533,10 @@ fn spawn_server_datagram_flow_worker(
                                 &product_counter,
                             )
                             .await;
+                            if result.as_ref().is_ok_and(|(_, fresh)| *fresh) {
+                                activity.record();
+                            }
+                            let result = result.map(|(outcome, _)| outcome);
                             if let Err(error) = result.as_ref()
                                 && let Some(lease) = gateway_lease.as_mut()
                                 && let Err(feedback) =
@@ -451,7 +573,7 @@ fn spawn_server_datagram_flow_worker(
                                 "receive_failed",
                                 "UDP outbound receive failed: {err}"
                             );
-                            send_server_datagram_close_to_routes(key.1, &state.routes);
+                            retire_server_datagram_attachments(key.1, &slot);
                             break;
                         }
                     };
@@ -461,7 +583,7 @@ fn spawn_server_datagram_flow_worker(
                         Some(next) => next,
                         None => {
                             failure = Some("server UDP response ID exhausted".to_string());
-                            send_server_datagram_close_to_routes(key.1, &state.routes);
+                            retire_server_datagram_attachments(key.1, &slot);
                             break;
                         }
                     };
@@ -488,34 +610,44 @@ fn spawn_server_datagram_flow_worker(
                         mux_limits,
                     );
                     product_counter.record_datagram_to_peer(len as u64);
+                    activity.record();
                     queue_server_datagram_responses(key.1, &mut state);
                 }
                 _ = wait_for_server_datagram_route_capacity(pending_capacity), if has_pending_capacity => {
                     queue_server_datagram_responses(key.1, &mut state);
                 }
                 _ = wait_for_server_datagram_attachment_change(attachment_changes), if has_attachment_changes => {
-                    let attachment_count = slot
-                        .upgrade()
-                        .map(|slot| slot.attachments.load(Ordering::Acquire))
-                        .unwrap_or(0);
-                    if attachment_count == 0 {
-                        idle_deadline = Instant::now() + session_retention_timeout;
-                    }
+                    // Wake only. The next loop iteration reconciles ownership
+                    // before any biased, always-ready traffic branch can win.
                 }
-                _ = tokio::time::sleep_until(idle_deadline) => {
-                    let attachment_count = slot
-                        .upgrade()
-                        .map(|slot| slot.attachments.load(Ordering::Acquire))
-                        .unwrap_or(0);
-                    if attachment_count > 0 {
-                        idle_deadline = Instant::now() + session_retention_timeout;
+                _ = async {
+                    match detached_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if !retire_detached_server_datagram_attachments(key.1, &slot) {
+                        detached_deadline = None;
                         continue;
                     }
                     break;
                 }
+                () = &mut product_idle => {
+                    retire_server_datagram_attachments(key.1, &slot);
+                    break;
+                }
+            }
+            // Attachment, feedback, retry-capacity, and duplicate traffic are
+            // deliberately ahead of the timer for ownership consistency. An
+            // explicit post-event check prevents those non-payload branches
+            // from indefinitely starving Product-idle reclamation.
+            if activity.is_idle(flow_idle_timeout) {
+                retire_server_datagram_attachments(key.1, &slot);
+                break;
             }
         }
         if let Some(slot) = slot.upgrade() {
+            slot.retired.store(true, Ordering::Release);
             ServerDatagramService::remove_flow_slot_if_current(&registry, key, &slot);
         }
         drop(realtime_registration);
@@ -546,11 +678,11 @@ async fn admit_server_datagram_request(
     attachment: Weak<()>,
     mux_limits: MuxLimits,
     product_counter: &crate::runtime::telemetry::ProductFlowCounter,
-) -> Result<ServerDatagramSendOutcome, RuntimeError> {
+) -> Result<(ServerDatagramSendOutcome, bool), RuntimeError> {
     let now = Instant::now();
     prune_server_datagram_state(state, mux_limits, now);
     if request.ttl_ms == 0 {
-        return Ok(ServerDatagramSendOutcome::Full);
+        return Ok((ServerDatagramSendOutcome::Full, false));
     }
     update_server_datagram_route(state, commands, attachment);
 
@@ -566,7 +698,7 @@ async fn admit_server_datagram_request(
     {
         Ok(DatagramAdmission::Duplicate) => {
             queue_server_datagram_responses(flow_id, state);
-            return Ok(ServerDatagramSendOutcome::Accepted);
+            return Ok((ServerDatagramSendOutcome::Accepted, false));
         }
         Ok(DatagramAdmission::Fresh) => {}
         Err(()) => {
@@ -594,7 +726,7 @@ async fn admit_server_datagram_request(
     state
         .received_requests
         .record_fresh(request.datagram_id.0, payload);
-    Ok(ServerDatagramSendOutcome::Accepted)
+    Ok((ServerDatagramSendOutcome::Accepted, true))
 }
 
 fn prune_server_datagram_state(
@@ -828,21 +960,50 @@ fn server_datagram_remaining_ttl_ms(deadline: Instant) -> u32 {
     remaining.as_millis().max(1).min(u128::from(u32::MAX)) as u32
 }
 
-fn send_server_datagram_close_to_routes(
+fn retire_server_datagram_attachments(
     flow_id: DatagramFlowId,
-    routes: &VecDeque<ServerDatagramRoute>,
+    slot: &Weak<ServerDatagramFlowSlot>,
 ) {
-    for route in routes.iter().rev() {
-        if route.attachment.upgrade().is_some()
-            && try_send_server_datagram_realtime_frame(
-                &route.commands,
-                Frame::DatagramClose { flow_id },
-            )
-            .is_ok()
-        {
-            return;
+    let _ = retire_server_datagram_attachments_inner(flow_id, slot, false);
+}
+
+fn retire_detached_server_datagram_attachments(
+    flow_id: DatagramFlowId,
+    slot: &Weak<ServerDatagramFlowSlot>,
+) -> bool {
+    retire_server_datagram_attachments_inner(flow_id, slot, true)
+}
+
+fn retire_server_datagram_attachments_inner(
+    flow_id: DatagramFlowId,
+    slot: &Weak<ServerDatagramFlowSlot>,
+    require_detached: bool,
+) -> bool {
+    let Some(slot) = slot.upgrade() else {
+        return true;
+    };
+    let routes = {
+        let mut routes = slot
+            .attachment_routes
+            .lock()
+            .expect("server datagram attachment routes lock");
+        if require_detached && slot.attachments.load(Ordering::Acquire) > 0 {
+            return false;
         }
+        if slot.retired.load(Ordering::Acquire) {
+            return true;
+        }
+        // Registration checks this flag while holding the same lock. Thus an
+        // attachment either enters this close fanout or observes retirement
+        // and publishes its own flow-local close; it cannot fall between them.
+        slot.retired.store(true, Ordering::Release);
+        routes.retain(|route| route.strong_count() > 0);
+        routes.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+    };
+    for route in routes {
+        let _ = route.commands.retire_server_datagram_flow(flow_id);
     }
+    true
 }
 
 pub(in crate::runtime) fn try_send_server_datagram_realtime_frame(

@@ -11,15 +11,15 @@ use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathMetrics, PathUsage, SessionId,
-    TargetAddr, UnderlayProtocol,
+    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathMetricDirection, PathMetrics,
+    PathUsage, SessionId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
 #[cfg(test)]
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::commands::reliable_stream_frame_queue;
-use crate::runtime::path::model::{PathDeliveryStats, UdpDatagramPathObservation};
+use crate::runtime::path::model::UdpDatagramPathObservation;
 use crate::runtime::path::quic::client::{
     ClientUdpDatagramStream, ClientUdpPathSessionHandle, ClientUdpPathSessionRuntime,
 };
@@ -45,7 +45,6 @@ pub(in crate::runtime) struct UdpDatagramClientSession {
     mux_limits: MuxLimits,
     pub(in crate::runtime) path_index: usize,
     path_id: PathId,
-    stats: PathDeliveryStats,
     sent_datagrams: SentDatagramEvidence,
     last_datagram_rtt: Option<Duration>,
     last_feedback_observation: Option<UdpDatagramPathObservation>,
@@ -174,7 +173,6 @@ impl UdpDatagramClientSession {
             mux_limits,
             path_index,
             path_id,
-            stats: PathDeliveryStats::default(),
             sent_datagrams: SentDatagramEvidence::new(mux_limits),
             last_datagram_rtt: None,
             last_feedback_observation: None,
@@ -281,12 +279,14 @@ impl UdpDatagramClientSession {
                 ttl_ms,
                 payload,
             } => {
+                // This is server-to-client response delivery. The caller owns
+                // logical-flow accounting; it cannot update this client's
+                // client-to-server sender evidence.
                 if ttl_ms == 0 {
                     return Err(RuntimeError::Protocol(
                         "expired QUIC response datagram received",
                     ));
                 }
-                self.stats.record_payload_bytes(payload.len());
                 Ok(DatagramSessionEvent::Received(ReceivedDatagram {
                     flow_id,
                     datagram_id,
@@ -454,10 +454,6 @@ impl UdpDatagramClientSession {
         Ok(())
     }
 
-    pub(in crate::runtime) fn delivery_stats(&self) -> PathDeliveryStats {
-        self.stats
-    }
-
     pub(in crate::runtime) fn take_feedback_observation(
         &mut self,
     ) -> Option<UdpDatagramPathObservation> {
@@ -489,7 +485,7 @@ impl UdpDatagramClientSession {
     }
 
     fn observe_remote_path_metrics(&mut self, metrics: PathMetrics) {
-        self.last_feedback_observation = Some(remote_path_metrics_observation(metrics));
+        self.last_feedback_observation = remote_path_metrics_observation(metrics);
     }
 
     fn expire_datagrams_without_feedback(&mut self, now: Instant) -> u64 {
@@ -515,14 +511,22 @@ impl UdpDatagramClientSession {
     }
 }
 
-fn remote_path_metrics_observation(metrics: PathMetrics) -> UdpDatagramPathObservation {
+fn remote_path_metrics_observation(metrics: PathMetrics) -> Option<UdpDatagramPathObservation> {
     remote_path_metrics_observation_at(metrics, Instant::now())
 }
 
 fn remote_path_metrics_observation_at(
     metrics: PathMetrics,
     received_at: Instant,
-) -> UdpDatagramPathObservation {
+) -> Option<UdpDatagramPathObservation> {
+    // A peer's server-to-client sender sample describes the response
+    // direction. It cannot become local client-to-server path evidence merely
+    // because it arrived on this association. Peer diagnostics retain that
+    // independent direction; only a same-direction advisory can supplement
+    // local request feedback here.
+    if metrics.direction != PathMetricDirection::ClientToServer {
+        return None;
+    }
     let srtt = Duration::from_micros(u64::from(metrics.srtt_us.max(1)));
     let rate_sample = (metrics.rate_observed
         && metrics.has_ack_derived_data_sample
@@ -536,7 +540,7 @@ fn remote_path_metrics_observation_at(
             .checked_add(Duration::from_micros(metrics.rate_valid_for_us))
             .unwrap_or(received_at)
     });
-    UdpDatagramPathObservation {
+    Some(UdpDatagramPathObservation {
         rtt: srtt,
         jitter: Duration::from_micros(u64::from(metrics.jitter_us)),
         loss_rate: metrics
@@ -544,7 +548,7 @@ fn remote_path_metrics_observation_at(
             .then(|| (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0)),
         rate_sample,
         rate_sample_expires_at,
-    }
+    })
 }
 
 fn apply_client_udp_datagram_path_status(

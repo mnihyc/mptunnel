@@ -15,6 +15,7 @@ mod node;
 mod outbound_registry;
 mod path;
 mod peer_status;
+mod product_lifecycle;
 mod product_policy;
 mod readiness;
 mod recent_ids;

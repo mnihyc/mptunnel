@@ -7,14 +7,14 @@
 use crate::performance::MppPerformanceConfig;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ExtraTrafficBudget {
+pub(crate) struct OptionalReinjectionBudget {
     delivered_data_bytes: u64,
     reinjected_bytes: u64,
     startup_floor_bytes: u64,
     percent_budget: u16,
 }
 
-impl ExtraTrafficBudget {
+impl OptionalReinjectionBudget {
     pub(crate) fn new(
         delivered_data_bytes: u64,
         reinjected_bytes: u64,
@@ -25,7 +25,7 @@ impl ExtraTrafficBudget {
             delivered_data_bytes,
             reinjected_bytes,
             startup_floor_bytes: startup_floor_bytes as u64,
-            percent_budget: performance.extra_traffic_hint_percent,
+            percent_budget: performance.optional_reinjection_budget_percent,
         }
     }
 
@@ -49,12 +49,12 @@ impl ExtraTrafficBudget {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ExtraTrafficLedger {
+pub(crate) struct OptionalReinjectionLedger {
     delivered_data_bytes: u64,
     reinjected_bytes: u64,
 }
 
-impl ExtraTrafficLedger {
+impl OptionalReinjectionLedger {
     #[cfg(test)]
     pub(crate) fn delivered_data_bytes(self) -> u64 {
         self.delivered_data_bytes
@@ -76,8 +76,8 @@ impl ExtraTrafficLedger {
         self,
         startup_floor_bytes: usize,
         performance: MppPerformanceConfig,
-    ) -> ExtraTrafficBudget {
-        ExtraTrafficBudget::new(
+    ) -> OptionalReinjectionBudget {
+        OptionalReinjectionBudget::new(
             self.delivered_data_bytes,
             self.reinjected_bytes(),
             startup_floor_bytes,

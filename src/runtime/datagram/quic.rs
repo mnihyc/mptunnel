@@ -179,11 +179,6 @@ impl UdpDatagramClientAssociation {
         let mut close_error = None;
         while let Some(mut path) = self.paths.pop() {
             let close_result = path.session.close().await;
-            self.context.mark_udp_datagram_path_delivery_for_instance(
-                path.session.path_index,
-                path.session.path_instance_id(),
-                path.session.delivery_stats(),
-            );
             if close_error.is_none()
                 && let Err(err) = close_result
             {
@@ -572,11 +567,6 @@ impl UdpDatagramClientAssociation {
             .position(|path| path.session.path_index == path_index)?;
         let path = self.paths.swap_remove(position);
         let path_instance_id = path.session.path_instance_id();
-        self.context.mark_udp_datagram_path_delivery_for_instance(
-            path.session.path_index,
-            path_instance_id,
-            path.session.delivery_stats(),
-        );
         Some(path_instance_id)
     }
 }

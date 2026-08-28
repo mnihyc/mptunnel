@@ -144,10 +144,30 @@ fn node_rejects_multiple_managed_tun_owners() {
 }
 
 #[test]
-fn extra_traffic_hint_default_is_five_percent() {
+fn optional_reinjection_hint_default_is_ten_percent() {
     assert_eq!(
-        MppPerformanceConfig::default().extra_traffic_hint_percent,
-        5
+        MppPerformanceConfig::default().optional_reinjection_budget_percent,
+        10
+    );
+}
+
+#[test]
+fn authentication_freshness_rejects_subsecond_windows_at_the_shared_model_boundary() {
+    let secret = || {
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("test shared secret")
+    };
+    let client = ClientSecurityConfig::for_test(secret())
+        .with_auth_freshness_window(Duration::from_millis(500));
+    let server = ServerSecurityConfig::for_test(secret())
+        .with_auth_freshness_window(Duration::from_millis(500));
+
+    assert_eq!(
+        validate_client_security_config(&client),
+        Err(ConfigError::AuthFreshnessWindowSubsecond)
+    );
+    assert_eq!(
+        validate_server_security_config(&server),
+        Err(ConfigError::AuthFreshnessWindowSubsecond)
     );
 }
 
@@ -250,7 +270,7 @@ fn server_paths_reject_client_only_endpoint_options() {
         Err(ConfigError::ServerPathMaxDatagramPayload)
     );
 
-    server.paths[0].spec = "tcp://127.0.0.1:443-445?port-rotation-interval-ms=5000"
+    server.paths[0].spec = "tcp://127.0.0.1:443-445?port-rotation-interval-s=5"
         .parse()
         .expect("client port rotation policy");
     assert_eq!(

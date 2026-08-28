@@ -807,6 +807,15 @@ impl ReliableRelayRemoteSet {
         .await;
     }
 
+    /// Removes every path from Product scheduling and synchronously transfers
+    /// its reset to the carrier-owned retirement lane. Carrier publication can
+    /// remain pending without retaining this Product lifetime.
+    pub(in crate::runtime) fn retire_all_with_reset(&mut self, reason: ResetReason) {
+        for path in self.take_paths_for_close() {
+            path.stream.retire_with_reset(reason);
+        }
+    }
+
     /// Successful retirement follows ordered FIN work on every carrier.
     pub(in crate::runtime) async fn close_all_ordered(&mut self) {
         for path in self.take_paths_for_close() {

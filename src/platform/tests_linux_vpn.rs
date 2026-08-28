@@ -401,6 +401,7 @@ fn app_with_node(node: NodeConfig) -> AppConfig {
         check_config: false,
         service: ServiceConfig::default(),
         session: SessionConfig::default(),
+        flow: crate::config::ProductFlowConfig::default(),
         resources: ResourceLimits::default(),
         admission: crate::product::ProductAdmissionConfig::default(),
         management: ManagementConfig::default(),

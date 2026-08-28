@@ -181,10 +181,10 @@ fn dropping_pending_attachment_releases_load_before_stream_cleanup() {
 fn initial_open_retry_uses_fresh_stream_id() {
     let context = ClientPathContext::new(
         vec![
-            "tcp://127.0.0.1:10132?initial-srtt-ms=20&initial-rate-mbps=100"
+            "tcp://127.0.0.1:10132?initial-srtt-s=0.02&initial-rate-mbps=100"
                 .parse()
                 .expect("first path"),
-            "tcp://127.0.0.1:10133?initial-srtt-ms=80&initial-rate-mbps=200"
+            "tcp://127.0.0.1:10133?initial-srtt-s=0.08&initial-rate-mbps=200"
                 .parse()
                 .expect("second path"),
         ],

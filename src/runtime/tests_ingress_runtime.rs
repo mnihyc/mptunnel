@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn default_local_admission_accepts_4096_rejects_4097_and_reuses_release() {
+    let admission = LocalIngressAdmission::new(LocalIngressAdmissionConfig::default(), None);
+    let source = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let principal = PrincipalId::parse("browser").expect("principal");
+    let mut permits = Vec::with_capacity(4_096);
+
+    for _ in 0..4_096 {
+        let mut permit = admission
+            .try_admit_source(source)
+            .expect("default admission below boundary");
+        permit
+            .admit_principal(&principal)
+            .expect("default principal admission below boundary");
+        permits.push(permit);
+    }
+    assert!(admission.try_admit_source(source).is_err());
+
+    drop(permits.pop());
+    let mut replacement = admission
+        .try_admit_source(source)
+        .expect("released slot is reusable");
+    replacement
+        .admit_principal(&principal)
+        .expect("released principal slot is reusable");
+}
+
+#[test]
 fn mixed_ingress_classification_is_strict_and_non_consuming_by_design() {
     assert_eq!(
         classify_mixed_ingress_byte(0x05).expect("SOCKS5 byte"),
@@ -107,6 +134,7 @@ fn socks_udp_classifies_once_per_cached_target() {
         inbound: InboundId::parse("local-socks").expect("inbound"),
         source: "198.51.100.4:41000".parse().expect("source"),
         principal: PrincipalId::parse("anonymous").expect("principal"),
+        idle_timeout: None,
     };
     let first_target = TargetAddr::Domain {
         host: "first.example".to_string(),

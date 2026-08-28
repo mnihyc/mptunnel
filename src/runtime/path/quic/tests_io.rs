@@ -164,6 +164,33 @@ fn quic_clean_stream_finish_is_distinct_from_truncated_frame() {
     assert!(!udp_path_frame_finished(&truncated));
 }
 
+#[test]
+fn quic_h3_zero_code_peer_abandonment_is_operation_scoped() {
+    let abandoned = RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::H3Stream(
+        h3::error::StreamError::RemoteTerminate {
+            code: h3::error::Code::from(0_u64),
+        },
+    ));
+
+    assert!(!udp_runtime_error_is_expected_shutdown(&abandoned));
+    assert!(udp_operation_error_is_expected_shutdown(&abandoned));
+}
+
+#[test]
+fn quic_h3_application_cancel_and_other_failures_remain_unexpected() {
+    let cancelled = RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::H3Stream(
+        h3::error::StreamError::RemoteTerminate {
+            code: h3::error::Code::H3_REQUEST_CANCELLED,
+        },
+    ));
+    let malformed = RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::UnexpectedEnd);
+
+    for error in [&cancelled, &malformed] {
+        assert!(!udp_runtime_error_is_expected_shutdown(error));
+        assert!(!udp_operation_error_is_expected_shutdown(error));
+    }
+}
+
 #[tokio::test]
 async fn quic_write_wait_routes_stream_feedback_before_an_ordering_barrier() {
     let (input_tx, mut input_rx) = mpsc::channel(4);

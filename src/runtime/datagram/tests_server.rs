@@ -7,7 +7,7 @@ use crate::product::{
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
-    reliable_path_command_pending_bytes,
+    reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
 use crate::runtime::path::{
     ServerDatagramOpenFailure, ServerDatagramOpenRequest, ServerDatagramRequest,
@@ -78,12 +78,21 @@ fn test_server_datagram_port_with_retention(
     telemetry: RuntimeTelemetry,
     retention: Duration,
 ) -> TestServerDatagramPort {
-    test_server_datagram_port_with_limits(telemetry, retention, MuxLimits::default())
+    test_server_datagram_port_with_lifetimes(telemetry, retention, None, MuxLimits::default())
 }
 
 fn test_server_datagram_port_with_limits(
     telemetry: RuntimeTelemetry,
     retention: Duration,
+    mux_limits: MuxLimits,
+) -> TestServerDatagramPort {
+    test_server_datagram_port_with_lifetimes(telemetry, retention, None, mux_limits)
+}
+
+fn test_server_datagram_port_with_lifetimes(
+    telemetry: RuntimeTelemetry,
+    retention: Duration,
+    flow_idle_timeout: Option<Duration>,
     mux_limits: MuxLimits,
 ) -> TestServerDatagramPort {
     let outbound = OutboundConfig::Direct;
@@ -120,6 +129,7 @@ fn test_server_datagram_port_with_limits(
         router,
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         session_retention_timeout: retention,
+        flow_idle_timeout,
         mux_limits,
         reliable_streams: reliable_streams.clone(),
         telemetry,
@@ -129,6 +139,211 @@ fn test_server_datagram_port_with_limits(
         reliable_streams,
         carriers: Mutex::new(HashMap::new()),
     }
+}
+
+#[tokio::test]
+async fn product_idle_retirement_bypasses_full_route_queue_and_releases_flow() {
+    let telemetry = RuntimeTelemetry::new(4);
+    let datagrams = test_server_datagram_port_with_lifetimes(
+        telemetry.clone(),
+        Duration::from_secs(60),
+        Some(Duration::from_millis(100)),
+        MuxLimits::default(),
+    );
+    let session_id = SessionId(70);
+    let flow_id = DatagramFlowId(71);
+    let mut attachments = Vec::new();
+    for route_index in 0..3_u64 {
+        let (commands, command_rx) = reliable_path_command_channels(1);
+        let filler_id = DatagramId(72 + route_index);
+        commands
+            .try_enqueue_admitted_frame(
+                Frame::DatagramData {
+                    flow_id: DatagramFlowId(700 + route_index),
+                    datagram_id: filler_id,
+                    ttl_ms: 1_000,
+                    payload: Bytes::from_static(b"queue-filler"),
+                },
+                TrafficClass::RealtimeDatagram,
+            )
+            .expect("fill an attachment's bounded queue before Product expiry");
+        let flow = datagrams
+            .open(ServerDatagramOpenRequest {
+                principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
+                session_id,
+                flow_id,
+                target: TargetAddr::Ip("127.0.0.1:9".parse().expect("target")),
+                commands,
+                ingress: test_ingress(session_id),
+            })
+            .await
+            .expect("attach a carrier route to the logical UDP flow");
+        attachments.push((flow, command_rx, filler_id));
+    }
+
+    await_active_datagram_flows(&telemetry, 0, "Product-idle flow remained active").await;
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.flows.completed, 1);
+    assert_eq!(snapshot.datagram.flows.failed, 0);
+
+    for (route_index, (flow, command_rx, _)) in attachments.iter_mut().enumerate() {
+        assert_eq!(
+            flow.send(ServerDatagramRequest {
+                datagram_id: DatagramId(80 + route_index as u64),
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"after-expiry"),
+            })
+            .await
+            .expect("retired flow outcome"),
+            ServerDatagramSendOutcome::Closed,
+        );
+        let close = tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(command_rx),
+        )
+        .await
+        .expect("authoritative Product-idle retirement timeout")
+        .expect("authoritative Product-idle retirement command");
+        assert!(matches!(
+            close,
+            ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id: closed })
+                if closed == flow_id
+        ));
+    }
+
+    for (flow, mut command_rx, expected_id) in attachments {
+        drop(flow);
+        let filler = recv_reliable_path_command(&mut command_rx)
+            .await
+            .expect("preexisting bounded route work");
+        assert!(matches!(
+            &filler,
+            ReliablePathCommand::SendFrame(Frame::DatagramData {
+                datagram_id,
+                payload,
+                ..
+            }) if *datagram_id == expected_id && payload == &Bytes::from_static(b"queue-filler")
+        ));
+        command_rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&filler));
+    }
+
+    let (replacement_commands, _replacement_rx) = reliable_path_command_channels(1);
+    let _replacement = datagrams
+        .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
+            session_id,
+            flow_id,
+            target: TargetAddr::Ip("127.0.0.1:9".parse().expect("replacement target")),
+            commands: replacement_commands,
+            ingress: test_ingress(session_id),
+        })
+        .await
+        .expect("expired logical flow and attachment ownership must be reusable");
+    let replacement = telemetry.snapshot();
+    assert_eq!(replacement.datagram.flows.opened, 2);
+    assert_eq!(replacement.datagram.flows.active, 1);
+}
+
+#[tokio::test]
+async fn detached_retirement_linearizes_with_registration_and_late_attach_is_flow_local() {
+    let flow_id = DatagramFlowId(75);
+    let slot = Arc::new(ServerDatagramFlowSlot {
+        target: TargetAddr::Ip("127.0.0.1:9".parse().expect("target")),
+        worker: OnceCell::new(),
+        attachments: Arc::new(AtomicUsize::new(0)),
+        attachment_routes: Arc::new(Mutex::new(Vec::new())),
+        attachment_changes: Arc::new(tokio::sync::Notify::new()),
+        retired: Arc::new(AtomicBool::new(false)),
+    });
+    let weak_slot = Arc::downgrade(&slot);
+    let (first_commands, _first_rx) = reliable_path_command_channels(1);
+    let first = ServerDatagramAttachment::new(
+        flow_id,
+        first_commands,
+        slot.attachments.clone(),
+        slot.attachment_routes.clone(),
+        slot.attachment_changes.clone(),
+        &slot.retired,
+    );
+    assert!(first.is_registered());
+    assert!(
+        !retire_detached_server_datagram_attachments(flow_id, &weak_slot),
+        "registration that owns the route lock first prevents detached expiry"
+    );
+    assert!(!slot.retired.load(Ordering::Acquire));
+
+    drop(first);
+    assert!(retire_detached_server_datagram_attachments(
+        flow_id, &weak_slot
+    ));
+    assert!(slot.retired.load(Ordering::Acquire));
+
+    let (late_commands, mut late_rx) = reliable_path_command_channels(1);
+    let late = ServerDatagramAttachment::new(
+        flow_id,
+        late_commands.clone(),
+        slot.attachments.clone(),
+        slot.attachment_routes.clone(),
+        slot.attachment_changes.clone(),
+        &slot.retired,
+    );
+    assert!(!late.is_registered());
+    let (worker, worker_rx) = mpsc::channel(1);
+    drop(worker_rx);
+    let route_lifetime = Arc::new(());
+    attach_server_datagram_route(
+        &worker,
+        late_commands,
+        Arc::downgrade(&route_lifetime),
+        &late,
+        &slot.retired,
+    )
+    .await
+    .expect("late attachment is an accepted flow-local close, not carrier failure");
+    let close = recv_reliable_path_command(&mut late_rx)
+        .await
+        .expect("late attachment close");
+    assert!(matches!(
+        close,
+        ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id: closed })
+            if closed == flow_id
+    ));
+}
+
+#[tokio::test]
+async fn repeated_server_datagram_retirement_emits_one_close_per_attachment() {
+    let flow_id = DatagramFlowId(76);
+    let slot = Arc::new(ServerDatagramFlowSlot {
+        target: TargetAddr::Ip("127.0.0.1:9".parse().expect("target")),
+        worker: OnceCell::new(),
+        attachments: Arc::new(AtomicUsize::new(0)),
+        attachment_routes: Arc::new(Mutex::new(Vec::new())),
+        attachment_changes: Arc::new(tokio::sync::Notify::new()),
+        retired: Arc::new(AtomicBool::new(false)),
+    });
+    let (commands, mut receiver) = reliable_path_command_channels(1);
+    let _attachment = ServerDatagramAttachment::new(
+        flow_id,
+        commands,
+        slot.attachments.clone(),
+        slot.attachment_routes.clone(),
+        slot.attachment_changes.clone(),
+        &slot.retired,
+    );
+    let weak = Arc::downgrade(&slot);
+
+    retire_server_datagram_attachments(flow_id, &weak);
+    retire_server_datagram_attachments(flow_id, &weak);
+
+    assert!(matches!(
+        recv_reliable_path_command(&mut receiver).await,
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id: closed }))
+            if closed == flow_id
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut receiver).is_none(),
+        "the first retirement transition owns the only terminal intent"
+    );
 }
 
 #[tokio::test]
@@ -1002,22 +1217,34 @@ async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_exten
         ServerDatagramSendOutcome::Accepted,
     );
     tokio::time::sleep(Duration::from_millis(120)).await;
+    let flood_running = Arc::new(AtomicBool::new(true));
+    let flood_packets = Arc::new(AtomicUsize::new(0));
+    let flood_socket = target.clone();
+    let flood_running_task = flood_running.clone();
+    let flood_packets_task = flood_packets.clone();
+    let (flood_started_tx, flood_started_rx) = oneshot::channel();
+    let flood_task = tokio::spawn(async move {
+        let mut flood_started_tx = Some(flood_started_tx);
+        while flood_running_task.load(Ordering::Acquire) {
+            if flood_socket
+                .send_to(b"sustained-detached-target-traffic", peer)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            flood_packets_task.fetch_add(1, Ordering::AcqRel);
+            if let Some(started) = flood_started_tx.take() {
+                let _ = started.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), flood_started_rx)
+        .await
+        .expect("target flood start timeout")
+        .expect("target flood start signal");
     let dropped_at = tokio::time::Instant::now();
     drop(flow);
-
-    tokio::time::sleep_until(dropped_at + Duration::from_millis(30)).await;
-    target
-        .send_to(b"detached-target-traffic-one", peer)
-        .await
-        .expect("first detached target datagram");
-    await_datagram_to_peer_packets(&telemetry, 1, "first detached target datagram timeout").await;
-
-    tokio::time::sleep_until(dropped_at + Duration::from_millis(100)).await;
-    target
-        .send_to(b"detached-target-traffic-two", peer)
-        .await
-        .expect("second detached target datagram");
-    await_datagram_to_peer_packets(&telemetry, 2, "second detached target datagram timeout").await;
 
     tokio::time::sleep_until(dropped_at + Duration::from_millis(140)).await;
     let retained = telemetry.snapshot();
@@ -1029,6 +1256,15 @@ async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_exten
     let expired = telemetry.snapshot();
     assert_eq!(expired.datagram.flows.opened, 1);
     assert_eq!(expired.datagram.flows.completed, 1);
+    flood_running.store(false, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(1), flood_task)
+        .await
+        .expect("target flood stop timeout")
+        .expect("target flood task");
+    assert!(
+        flood_packets.load(Ordering::Acquire) > 2,
+        "test must keep target input continuously readable, not sample two packets"
+    );
 
     let (replacement_commands, _replacement_command_rx) = reliable_path_command_channels(8);
     let _replacement = datagrams

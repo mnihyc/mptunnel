@@ -45,6 +45,7 @@ use crate::protocol::{Frame, ResetReason};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
+use crate::runtime::product_lifecycle::{ProductFlowActivity, ProductFlowActivityIo};
 use crate::runtime::sender::{
     ClientQueuedDispatch, RelayRecvProgressSend, RelaySendCause, ReliableRelaySenderQueue,
     RequestSenderService, reliable_relay_can_read_product_source,
@@ -250,12 +251,14 @@ pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
     performance: MppPerformanceConfig,
     spec: ReliableRelayOpenSpec,
     remote: OpenedRemoteStream,
+    idle_timeout: Option<std::time::Duration>,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let retirement = context.session_retirement().wait();
-    let active = relay_migrating_tcp_stream_active(local, context, performance, spec, remote);
+    let active =
+        relay_migrating_tcp_stream_active(local, context, performance, spec, remote, idle_timeout);
     tokio::pin!(retirement);
     tokio::pin!(active);
     tokio::select! {
@@ -271,6 +274,7 @@ async fn relay_migrating_tcp_stream_active<S>(
     performance: MppPerformanceConfig,
     spec: ReliableRelayOpenSpec,
     remote: OpenedRemoteStream,
+    idle_timeout: Option<std::time::Duration>,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -296,7 +300,13 @@ where
         stream_id,
         spec.target.clone(),
     );
-    let mut local = ObservedProductIo::new(local, telemetry_flow.counter());
+    let activity = ProductFlowActivity::new();
+    let mut local = ObservedProductIo::new(
+        ProductFlowActivityIo::new(local, activity.clone()),
+        telemetry_flow.counter(),
+    );
+    let idle = activity.wait_until_idle(idle_timeout);
+    tokio::pin!(idle);
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, context.mux_limits, 0);
     send_stream.update_max_offset(remotes.max_offset());
@@ -328,7 +338,7 @@ where
     let mut last_reported_budget: Option<(TrafficClass, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_read_block: Option<(usize, usize, usize, usize, usize)> = None;
-    let result = loop {
+    let mut result = loop {
         if client_relay_finished(&state, &send_stream, &recv_stream, &sender_queue, &remotes) {
             break Ok(state.delivery.total);
         }
@@ -377,6 +387,7 @@ where
                     _ = wait_for_optional_deadline(retention_deadline) => {
                         break Err(RuntimeError::SessionRetentionTimeout);
                     }
+                    () = &mut idle => break Err(RuntimeError::ProductIdleTimeout),
                 }
             }
 
@@ -468,6 +479,7 @@ where
                 _ = wait_for_optional_deadline(retention_deadline) => {
                     break Err(RuntimeError::SessionRetentionTimeout);
                 }
+                () = &mut idle => break Err(RuntimeError::ProductIdleTimeout),
             }
         } else {
             state.recovery.disconnected = None;
@@ -2018,7 +2030,6 @@ where
                                 debug_assert_eq!(received_stream_id, stream_id);
                                 let (effect, outcome) = apply_client_stream_data_state(
                                     &mut state,
-                                    context,
                                     recv_stream,
                                     stream_id,
                                     instance,
@@ -2301,6 +2312,7 @@ where
                     }
                 }
             }
+            () = &mut idle => break Err(RuntimeError::ProductIdleTimeout),
             else => break Ok(state.delivery.total),
         }
     };
@@ -2321,18 +2333,19 @@ where
         &mut state.recovery.pending_additional_path_opens,
     );
 
-    if result.is_ok() {
-        for (instance, path_stats) in std::mem::take(&mut state.delivery.by_path) {
-            context.mark_relay_path_delivery(instance, path_stats);
-        }
-    }
     // Successful teardown stays behind ordered FIN work. A failed local
     // product socket is terminal, while carrier failures retain detach-only
     // semantics so the logical stream can survive path recovery.
     match &result {
         Ok(_) => remotes.close_all_ordered().await,
         Err(RuntimeError::Io(_)) => remotes.reset_all(ResetReason::RemoteClosed).await,
+        Err(RuntimeError::ProductIdleTimeout) => {
+            remotes.retire_all_with_reset(ResetReason::TimedOut);
+        }
         Err(_) => remotes.close_all().await,
+    }
+    if matches!(result, Err(RuntimeError::ProductIdleTimeout)) {
+        result = Ok(state.delivery.total);
     }
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(

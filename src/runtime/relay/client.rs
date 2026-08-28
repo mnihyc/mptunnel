@@ -10,7 +10,7 @@ use super::io::{
     stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
     update_reinjection_authoritative_ack_snapshot,
 };
-use super::lifecycle::{RelayAdditionalPathOpenTask, maybe_mark_live_relay_path_delivery};
+use super::lifecycle::RelayAdditionalPathOpenTask;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
@@ -102,29 +102,18 @@ impl ClientRelayDisconnectedState {
 
 #[derive(Default)]
 pub(super) struct ClientRelayDeliveryState {
+    // Logical response progress is useful for stream lifecycle/accounting, but
+    // it is receiver-owned. It must never become client-to-server path-rate
+    // evidence; only the directional sender owns that attribution.
     pub(super) total: PathDeliveryStats,
-    pub(super) by_path: HashMap<RelayPathInstance, PathDeliveryStats>,
-    next_live_sample_bytes: HashMap<RelayPathInstance, u64>,
 }
 
 impl ClientRelayDeliveryState {
-    fn record_response(
-        &mut self,
-        instance: RelayPathInstance,
-        delivered: &[Bytes],
-        path_scoped_received_bytes: usize,
-    ) -> usize {
+    fn record_response(&mut self, delivered: &[Bytes]) -> usize {
         let mut delivered_payload_bytes = 0usize;
         for chunk in delivered {
             self.total.record_payload_bytes(chunk.len());
             delivered_payload_bytes = delivered_payload_bytes.saturating_add(chunk.len());
-        }
-        let path_scoped_delivered_bytes = path_scoped_received_bytes.min(delivered_payload_bytes);
-        if path_scoped_delivered_bytes > 0 {
-            self.by_path
-                .entry(instance)
-                .or_default()
-                .record_payload_bytes(path_scoped_delivered_bytes);
         }
         delivered_payload_bytes
     }
@@ -236,25 +225,8 @@ impl ClientRelayState {
         }
     }
 
-    fn record_delivery(
-        &mut self,
-        context: &ClientPathContext,
-        instance: RelayPathInstance,
-        delivered: &[Bytes],
-        path_scoped_received_bytes: usize,
-    ) -> usize {
-        let delivered_payload_bytes =
-            self.delivery
-                .record_response(instance, delivered, path_scoped_received_bytes);
-        if let Some(path_stats) = self.delivery.by_path.get(&instance).copied() {
-            maybe_mark_live_relay_path_delivery(
-                context,
-                instance,
-                path_stats,
-                &mut self.delivery.next_live_sample_bytes,
-            );
-        }
-        delivered_payload_bytes
+    fn record_delivery(&mut self, delivered: &[Bytes]) -> usize {
+        self.delivery.record_response(delivered)
     }
 }
 
@@ -272,7 +244,6 @@ pub(super) struct ClientStreamDataEffect {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_client_stream_data_state(
     state: &mut ClientRelayState,
-    context: &ClientPathContext,
     recv_stream: &mut ReliableRecvStream,
     stream_id: StreamId,
     instance: RelayPathInstance,
@@ -336,12 +307,7 @@ pub(super) fn apply_client_stream_data_state(
         state.progress.interactive_response_pending = false;
     }
     let delivered = &outcome.delivered;
-    let delivered_payload_bytes = state.record_delivery(
-        context,
-        instance,
-        delivered.as_slice(),
-        if delivered_progress { payload_len } else { 0 },
-    );
+    let delivered_payload_bytes = state.record_delivery(delivered.as_slice());
 
     Ok((
         ClientStreamDataEffect {

@@ -61,6 +61,7 @@ fn tun_host_runtime_config(host: TunHostConfig) -> AppConfig {
         check_config: false,
         service: ServiceConfig::default(),
         session: SessionConfig::default(),
+        flow: crate::config::ProductFlowConfig::default(),
         resources: ResourceLimits::default(),
         admission: ProductAdmissionConfig::default(),
         management: ManagementConfig::default(),

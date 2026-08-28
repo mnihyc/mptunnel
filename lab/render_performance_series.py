@@ -361,15 +361,24 @@ def _format_coordinate(value):
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
-def _metric_extent(dataset, metric):
+def _metric_display_extent(dataset, metric):
+    """Keep isolated buffering spikes from flattening the useful trajectory.
+
+    The raw low/median/high values remain in the dataset and hover text. The
+    display domain follows the 97.5th percentile of measured medians; points
+    above it receive an explicit overflow marker instead of silently changing
+    the scale for every implementation.
+    """
     values = [
-        sample["high"]
+        sample["median"]
         for entry in dataset["series"]
         for sample in entry[metric]
-        if sample["high"] is not None
+        if sample["median"] is not None
     ]
     _require(values, f"{metric} has no available values")
-    return max(values)
+    values.sort()
+    rank = max(1, math.ceil(len(values) * 0.975))
+    return values[rank - 1]
 
 
 def _time_extent(dataset):
@@ -568,12 +577,13 @@ def _draw_metric(root, dataset, metric, top, bottom, y_max, x_max, clip_id):
 
         for sample in entry[metric]:
             if sample["median"] is not None:
+                marker_y = y_position(min(sample["median"], y_max))
                 hit = _svg(
                     group,
                     "circle",
                     {
                         "cx": _format_coordinate(x_position(sample["time_s"])),
-                        "cy": _format_coordinate(y_position(sample["median"])),
+                        "cy": _format_coordinate(marker_y),
                         "r": "6",
                         "class": "hit-target",
                     },
@@ -589,6 +599,31 @@ def _draw_metric(root, dataset, metric, top, bottom, y_max, x_max, clip_id):
                         f"{sample['repetitions']} repetitions available"
                     ),
                 )
+                if sample["median"] > y_max:
+                    x = x_position(sample["time_s"])
+                    overflow = _svg(
+                        group,
+                        "path",
+                        {
+                            "d": (
+                                f"M{_format_coordinate(x)},{top + 2} "
+                                f"L{_format_coordinate(x + 4)},{top + 8} "
+                                f"L{_format_coordinate(x - 4)},{top + 8} Z"
+                            ),
+                            "fill": color,
+                            "class": "overflow-marker",
+                        },
+                    )
+                    _svg(
+                        overflow,
+                        "title",
+                        text=(
+                            f"{entry['label']}: {sample['median']:g} "
+                            f"({'Mbps' if metric == 'goodput' else 'ms'}) at "
+                            f"{sample['time_s']:g} s exceeds the {y_max:g} "
+                            "display domain"
+                        ),
+                    )
 
             if metric == "latency" and sample["available"] < sample["repetitions"]:
                 x = x_position(sample["time_s"])
@@ -667,8 +702,8 @@ def _draw_legend(root, dataset):
 def render_svg(dataset):
     validate_dataset(dataset)
     x_max = _nice_ceiling(_time_extent(dataset))
-    goodput_max = _nice_ceiling(_metric_extent(dataset, "goodput") * 1.04)
-    latency_max = _nice_ceiling(_metric_extent(dataset, "latency") * 1.04)
+    goodput_max = _nice_ceiling(_metric_display_extent(dataset, "goodput") * 1.04)
+    latency_max = _nice_ceiling(_metric_display_extent(dataset, "latency") * 1.04)
 
     root = ET.Element(
         f"{{{SVG_NS}}}svg",
@@ -717,6 +752,7 @@ def render_svg(dataset):
             .hit-target { fill: transparent; stroke: none; pointer-events: all; }
             .availability-marker { stroke-width: 1.6; stroke-linecap: round;
                                    stroke-linejoin: round; }
+            .overflow-marker { stroke: #ffffff; stroke-width: 0.8; }
             .footer { fill: #667085; font-size: 10.5px; }
             .footer-strong { fill: #344054; font-weight: 650; }
         """,
@@ -806,7 +842,7 @@ def render_svg(dataset):
         root,
         "text",
         {"x": str(PLOT_LEFT), "y": "769", "class": "footer"},
-        "Echo gaps and × denote zero available attempts; △ denotes partial availability. Markers use compact legend-order lanes; missing values are never zero.",
+        "Echo gaps and × denote zero available attempts; △ denotes partial availability; ▲ marks a median above the display domain. Hover reports exact values.",
     )
     ET.indent(root, space="  ")
     return (

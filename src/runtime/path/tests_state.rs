@@ -376,7 +376,7 @@ fn relay_path_load_lease_releases_the_reclassified_lane() {
 }
 
 #[test]
-fn session_product_ownership_fences_tcp_replacement_across_attachment_changes() {
+fn tcp_replacement_publication_is_exact_instance_atomic_during_product_work() {
     let paths = vec![
         "tcp://127.0.0.1:12720"
             .parse::<PathSpec>()
@@ -399,29 +399,33 @@ fn session_product_ownership_fences_tcp_replacement_across_attachment_changes() 
         0,
         PathUsage::Available,
     );
-    assert!(
-        context
-            .state
-            .tcp_path_is_product_quiescent_for_instance(0, tcp_instance)
-    );
-
-    let mut carrier_changes = context.tcp_carrier_groups.subscribe();
+    {
+        let now = Instant::now();
+        let mut health = context.health().lock().expect("path health");
+        let predecessor = &mut health.tcp[0];
+        predecessor.measured_rate_bps = Some(900_000_000.0);
+        predecessor.delivery_samples = 7;
+        predecessor.product_delivery_rate_bps = Some(850_000_000.0);
+        predecessor.product_delivery_sample_bytes = 512 * 1024;
+        predecessor.last_delivery_at = Some(now);
+        predecessor.delivery_rate_expires_at = Some(now + Duration::from_secs(1));
+        predecessor.carrier_srtt_ms = Some(18.0);
+        predecessor.carrier_rttvar_ms = Some(3.0);
+        predecessor.carrier_delivery_rate_bps = Some(920_000_000.0);
+        predecessor.carrier_pacing_rate_bps = Some(940_000_000.0);
+        predecessor.carrier_bytes_in_flight = 128 * 1024;
+        predecessor.carrier_bytes_in_flight_observed = true;
+        predecessor.carrier_queue_bytes = 64 * 1024;
+        predecessor.carrier_queue_bytes_observed = true;
+        predecessor.carrier_inflight_limit_bytes = 256 * 1024;
+        predecessor.carrier_delivery_samples = 9;
+        predecessor.carrier_delivery_sample_bytes = 768 * 1024;
+        predecessor.carrier_last_delivery_at = Some(now);
+        predecessor.carrier_bulk_proof_expires_at = Some(now + Duration::from_secs(1));
+        predecessor.carrier_ack_derived_data_seen = true;
+        predecessor.path_proof_success = true;
+    }
     let product_flow = context.reserve_session_product_flow();
-    assert!(
-        !context
-            .state
-            .tcp_path_is_product_quiescent_for_instance(0, tcp_instance),
-        "a logical Product flow must fence replacement even without path load"
-    );
-    drop(product_flow);
-    assert!(
-        carrier_changes
-            .has_changed()
-            .expect("carrier change sender"),
-        "the final logical Product owner must wake overdue maintenance"
-    );
-    carrier_changes.borrow_and_update();
-
     let udp_load = context
         .reserve_relay_path_load(
             RelayPathKey {
@@ -431,19 +435,68 @@ fn session_product_ownership_fences_tcp_replacement_across_attachment_changes() 
             TrafficClass::RealtimeDatagram,
         )
         .expect("cross-underlay Product load");
+    let replacement_instance = next_carrier_path_instance_id();
+    let mut published = false;
     assert!(
-        !context
-            .state
-            .tcp_path_is_product_quiescent_for_instance(0, tcp_instance),
-        "replacement quiescence is session-wide, not one TCP record"
+        context.state.publish_tcp_replacement_if_current(
+            tcp_instance,
+            ClientTcpCarrierPublication {
+                path_index: 0,
+                path_id: PathId(8),
+                path_instance_id: replacement_instance,
+                peer_usage_sequence: 0,
+                peer_usage: PathUsage::Available,
+                readiness_rtt: None,
+            },
+            || published = true,
+        ),
+        "active logical and cross-underlay work precedes the atomic instance swap; it does not invalidate the exact predecessor"
     );
+    assert!(published);
+    {
+        let health = context.health().lock().expect("path health");
+        let successor = &health.tcp[0];
+        assert_eq!(successor.path_instance_id(), Some(replacement_instance));
+        assert_eq!(successor.measured_rate_bps, None);
+        assert_eq!(successor.delivery_samples, 0);
+        assert_eq!(successor.product_delivery_rate_bps, None);
+        assert_eq!(successor.product_delivery_sample_bytes, 0);
+        assert_eq!(successor.last_delivery_at, None);
+        assert_eq!(successor.delivery_rate_expires_at, None);
+        assert_eq!(successor.carrier_srtt_ms, None);
+        assert_eq!(successor.carrier_rttvar_ms, None);
+        assert_eq!(successor.carrier_delivery_rate_bps, None);
+        assert_eq!(successor.carrier_pacing_rate_bps, None);
+        assert_eq!(successor.carrier_bytes_in_flight, 0);
+        assert!(!successor.carrier_bytes_in_flight_observed);
+        assert_eq!(successor.carrier_queue_bytes, 0);
+        assert!(!successor.carrier_queue_bytes_observed);
+        assert_eq!(successor.carrier_inflight_limit_bytes, 0);
+        assert_eq!(successor.carrier_delivery_samples, 0);
+        assert_eq!(successor.carrier_delivery_sample_bytes, 0);
+        assert_eq!(successor.carrier_last_delivery_at, None);
+        assert_eq!(successor.carrier_bulk_proof_expires_at, None);
+        assert!(!successor.carrier_ack_derived_data_seen);
+        assert!(!successor.path_proof_success);
+    }
+    assert!(
+        !context.state.publish_tcp_replacement_if_current(
+            tcp_instance,
+            ClientTcpCarrierPublication {
+                path_index: 0,
+                path_id: PathId(9),
+                path_instance_id: next_carrier_path_instance_id(),
+                peer_usage_sequence: 0,
+                peer_usage: PathUsage::Available,
+                readiness_rtt: None,
+            },
+            || panic!("stale predecessor must not publish another successor"),
+        ),
+        "a stale predecessor cannot replace the current exact instance"
+    );
+
+    drop(product_flow);
     drop(udp_load);
-    assert!(
-        carrier_changes
-            .has_changed()
-            .expect("carrier change sender"),
-        "the final cross-underlay load owner must wake TCP maintenance"
-    );
 }
 
 #[test]

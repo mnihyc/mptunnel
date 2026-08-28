@@ -4,12 +4,14 @@ use super::{
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_AUTHENTICATION_TIMEOUT_MS,
     DEFAULT_MAX_PENDING_AUTHENTICATIONS, DEFAULT_MPP_TLS_SERVER_NAME,
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_PRODUCT_FLOW_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
     DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, ForwardingMode, GatewayBalancerConfig,
     LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
     MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NamedTunL3Config, NodeConfig,
-    OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits,
-    SecurityPolicyError, ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret,
+    OutboundLeafConfig, ProductAdmissionConfig, ProductFlowConfig, ProductPolicyConfig,
+    ResourceLimits, SecurityPolicyError, ServerSecurityConfig, ServiceConfig, SessionConfig,
+    SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -44,9 +46,10 @@ use crate::product::{
     TargetResolutionMode, TunL3AddressPlan, TunL3AllocationSpec, TunL3ServerSpec, VerifiedRuleSet,
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
-use crate::transport::{EndpointParseError, PathSpecParseError};
+use crate::transport::{EndpointParseError, LossPolicyPercent, PathSpecParseError};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use serde::Deserialize;
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -60,6 +63,78 @@ pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 // Runtime generations are internal identities rather than operator policy.
 // One non-zero identity is shared by every component compiled from a document.
 static NEXT_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// A user-facing duration written as a non-negative number of seconds.
+///
+/// TOML integers preserve ordinary whole-second configuration while TOML
+/// decimals preserve the sub-second behavior previously expressed by `_ms`
+/// fields. Keeping this conversion at the file boundary lets the runtime
+/// continue to use `Duration` without carrying configuration units inward.
+#[derive(Debug, Clone, Copy)]
+struct ConfigSeconds(Duration);
+
+impl ConfigSeconds {
+    const fn duration(self) -> Duration {
+        self.0
+    }
+
+    fn milliseconds_u64(self) -> Result<u64, ConfigFileError> {
+        let milliseconds =
+            u64::try_from(self.0.as_millis()).map_err(|_| ConfigFileError::DurationOutOfRange)?;
+        if Duration::from_millis(milliseconds) != self.0 {
+            return Err(ConfigFileError::DurationPrecision);
+        }
+        Ok(milliseconds)
+    }
+
+    fn milliseconds_u32(self) -> Result<u32, ConfigFileError> {
+        u32::try_from(self.milliseconds_u64()?).map_err(|_| ConfigFileError::DurationOutOfRange)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigSeconds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SecondsVisitor;
+
+        impl Visitor<'_> for SecondsVisitor {
+            type Value = ConfigSeconds;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a finite, non-negative number of seconds")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(ConfigSeconds(Duration::from_secs(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let value =
+                    u64::try_from(value).map_err(|_| E::custom("seconds cannot be negative"))?;
+                self.visit_u64(value)
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Duration::try_from_secs_f64(value)
+                    .map(ConfigSeconds)
+                    .map_err(|_| E::custom("seconds must be finite, non-negative, and in range"))
+            }
+        }
+
+        deserializer.deserialize_any(SecondsVisitor)
+    }
+}
 
 fn next_config_generation() -> Result<u64, ConfigFileError> {
     NEXT_CONFIG_GENERATION
@@ -164,6 +239,8 @@ struct FileConfig {
     #[serde(default)]
     session: SessionFileConfig,
     #[serde(default)]
+    flow: ProductFlowFileConfig,
+    #[serde(default)]
     resources: ResourceFileConfig,
     #[serde(default)]
     admission: ProductAdmissionFileConfig,
@@ -192,8 +269,13 @@ impl FileConfig {
         self.admission.validate_for_mode(forwarding_mode)?;
         let credential_catalog = parse_credential_catalog(self.credentials, material_base)?;
         let local_user_catalog = LocalUserCatalog::compile(self.local_users, material_base)?;
-        let mut parsed_outbounds =
-            parse_outbounds(self.outbounds, material_base, &credential_catalog)?;
+        let default_mpp_performance = self.flow.mpp_defaults();
+        let mut parsed_outbounds = parse_outbounds(
+            self.outbounds,
+            material_base,
+            &credential_catalog,
+            default_mpp_performance,
+        )?;
         let dns_policy = self.dns.into_config(generation, &parsed_outbounds)?;
         let product_policy = match (forwarding_mode, self.routing) {
             (ForwardingMode::L4, Some(routing)) => {
@@ -232,12 +314,14 @@ impl FileConfig {
                 material_base,
                 &credential_catalog,
                 &local_user_catalog,
+                default_mpp_performance,
             )?;
         let config = AppConfig {
             logging: self.logging.into_config(material_base)?,
             check_config: self.check_config,
             service: self.service.into_config(),
             session: self.session.into_config(),
+            flow: self.flow.into_config(),
             resources: self.resources.into_limits(),
             admission: self.admission.into_config(forwarding_mode),
             management: self.management.into_config(material_base)?,
@@ -330,15 +414,123 @@ impl LocalUserCatalog {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionFileConfig {
-    retention_timeout_ms: Option<u64>,
+    retention_timeout_s: Option<ConfigSeconds>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductFlowFileConfig {
+    idle_timeout_s: Option<ConfigSeconds>,
+    optional_reinjection_budget_percent: Option<u16>,
+    quic_loss_compensation_percent: Option<ConfigLossCompensationPercent>,
+}
+
+impl ProductFlowFileConfig {
+    fn mpp_defaults(self) -> MppFilePerformance {
+        MppFilePerformance {
+            runtime: MppPerformanceConfig {
+                optional_reinjection_budget_percent: self
+                    .optional_reinjection_budget_percent
+                    .unwrap_or(MppPerformanceConfig::default().optional_reinjection_budget_percent),
+            },
+            quic_loss_compensation: self
+                .quic_loss_compensation_percent
+                .map_or_else(LossPolicyPercent::default, |value| value.0),
+        }
+    }
+
+    fn into_config(self) -> ProductFlowConfig {
+        ProductFlowConfig {
+            idle_timeout: match self.idle_timeout_s.map(ConfigSeconds::duration) {
+                Some(timeout) if timeout.is_zero() => None,
+                Some(timeout) => Some(timeout),
+                None => Some(Duration::from_secs(
+                    DEFAULT_PRODUCT_FLOW_IDLE_TIMEOUT_SECONDS,
+                )),
+            },
+        }
+    }
+}
+
+/// Exact TOML percentage used only while compiling file configuration.
+///
+/// Integers and decimals are accepted, but the runtime representation remains
+/// integer ppm so inheritance and explicit zero do not acquire float drift.
+#[derive(Debug, Clone, Copy)]
+struct ConfigLossCompensationPercent(LossPolicyPercent);
+
+impl<'de> Deserialize<'de> for ConfigLossCompensationPercent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PercentVisitor;
+
+        impl<'de> Visitor<'de> for PercentVisitor {
+            type Value = ConfigLossCompensationPercent;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .write_str("a numeric percentage in 0..100 with at most four decimal places")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let ppm = value
+                    .checked_mul(10_000)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .and_then(LossPolicyPercent::from_ppm)
+                    .ok_or_else(|| E::custom("percentage must be in 0..100"))?;
+                Ok(ConfigLossCompensationPercent(ppm))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                u64::try_from(value)
+                    .map_err(|_| E::custom("percentage must be in 0..100"))
+                    .and_then(|value| self.visit_u64(value))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if !value.is_finite() || !(0.0..100.0).contains(&value) {
+                    return Err(E::custom("percentage must be in 0..100"));
+                }
+                let scaled = value * 10_000.0;
+                let rounded = scaled.round();
+                if (scaled - rounded).abs() > 1e-7 {
+                    return Err(E::custom(
+                        "percentage must have at most four decimal places",
+                    ));
+                }
+                let ppm = LossPolicyPercent::from_ppm(rounded as u32)
+                    .ok_or_else(|| E::custom("percentage must be in 0..100"))?;
+                Ok(ConfigLossCompensationPercent(ppm))
+            }
+        }
+
+        deserializer.deserialize_any(PercentVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MppFilePerformance {
+    runtime: MppPerformanceConfig,
+    quic_loss_compensation: LossPolicyPercent,
 }
 
 impl SessionFileConfig {
     fn into_config(self) -> SessionConfig {
         SessionConfig {
-            retention_timeout: Duration::from_millis(
-                self.retention_timeout_ms
-                    .unwrap_or(DEFAULT_SESSION_RETENTION_TIMEOUT_MS),
+            retention_timeout: self.retention_timeout_s.map_or(
+                Duration::from_millis(DEFAULT_SESSION_RETENTION_TIMEOUT_MS),
+                ConfigSeconds::duration,
             ),
         }
     }
@@ -432,8 +624,8 @@ impl LoggingFileConfig {
 struct ServiceFileConfig {
     #[serde(default)]
     supervise: bool,
-    restart_backoff_ms: Option<u64>,
-    restart_max_backoff_ms: Option<u64>,
+    restart_backoff_s: Option<ConfigSeconds>,
+    restart_max_backoff_s: Option<ConfigSeconds>,
     max_restarts: Option<u32>,
 }
 
@@ -441,13 +633,13 @@ impl ServiceFileConfig {
     fn into_config(self) -> ServiceConfig {
         ServiceConfig {
             supervise: self.supervise,
-            restart_backoff: Duration::from_millis(
-                self.restart_backoff_ms
-                    .unwrap_or(DEFAULT_RESTART_BACKOFF_MS),
+            restart_backoff: self.restart_backoff_s.map_or(
+                Duration::from_millis(DEFAULT_RESTART_BACKOFF_MS),
+                ConfigSeconds::duration,
             ),
-            restart_max_backoff: Duration::from_millis(
-                self.restart_max_backoff_ms
-                    .unwrap_or(DEFAULT_RESTART_MAX_BACKOFF_MS),
+            restart_max_backoff: self.restart_max_backoff_s.map_or(
+                Duration::from_millis(DEFAULT_RESTART_MAX_BACKOFF_MS),
+                ConfigSeconds::duration,
             ),
             max_restarts: self.max_restarts,
         }
@@ -503,10 +695,10 @@ struct ResourceFileConfig {
     max_datagram_queue_bytes: Option<usize>,
     max_path_flight_bytes: Option<usize>,
     max_reliable_relay_chunk_bytes: Option<usize>,
-    tcp_path_heartbeat_interval_ms: Option<u64>,
-    tcp_path_heartbeat_timeout_ms: Option<u64>,
-    quic_path_keep_alive_interval_ms: Option<u64>,
-    quic_path_idle_timeout_ms: Option<u64>,
+    tcp_path_heartbeat_interval_s: Option<ConfigSeconds>,
+    tcp_path_heartbeat_timeout_s: Option<ConfigSeconds>,
+    quic_path_keep_alive_interval_s: Option<ConfigSeconds>,
+    quic_path_idle_timeout_s: Option<ConfigSeconds>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -656,22 +848,20 @@ impl ResourceFileConfig {
             max_datagram_queue_bytes,
             max_path_flight_bytes,
             max_reliable_relay_chunk_bytes,
-            tcp_path_heartbeat_interval: Duration::from_millis(
-                self.tcp_path_heartbeat_interval_ms
-                    .unwrap_or(defaults.tcp_path_heartbeat_interval.as_millis() as u64),
+            tcp_path_heartbeat_interval: self.tcp_path_heartbeat_interval_s.map_or(
+                defaults.tcp_path_heartbeat_interval,
+                ConfigSeconds::duration,
             ),
-            tcp_path_heartbeat_timeout: Duration::from_millis(
-                self.tcp_path_heartbeat_timeout_ms
-                    .unwrap_or(defaults.tcp_path_heartbeat_timeout.as_millis() as u64),
+            tcp_path_heartbeat_timeout: self
+                .tcp_path_heartbeat_timeout_s
+                .map_or(defaults.tcp_path_heartbeat_timeout, ConfigSeconds::duration),
+            quic_path_keep_alive_interval: self.quic_path_keep_alive_interval_s.map_or(
+                defaults.quic_path_keep_alive_interval,
+                ConfigSeconds::duration,
             ),
-            quic_path_keep_alive_interval: Duration::from_millis(
-                self.quic_path_keep_alive_interval_ms
-                    .unwrap_or(defaults.quic_path_keep_alive_interval.as_millis() as u64),
-            ),
-            quic_path_idle_timeout: Duration::from_millis(
-                self.quic_path_idle_timeout_ms
-                    .unwrap_or(defaults.quic_path_idle_timeout.as_millis() as u64),
-            ),
+            quic_path_idle_timeout: self
+                .quic_path_idle_timeout_s
+                .map_or(defaults.quic_path_idle_timeout, ConfigSeconds::duration),
         }
     }
 }
@@ -682,11 +872,11 @@ struct CredentialFileConfig {
     credential_id: String,
     principal_id: String,
     secret: MaterialSource,
-    expires_at_unix_secs: Option<u64>,
+    expires_at_unix_s: Option<u64>,
     #[serde(default)]
     revoked: bool,
     #[serde(default)]
-    revocation_grace_seconds: u64,
+    revocation_grace_s: u64,
 }
 
 impl std::fmt::Debug for CredentialFileConfig {
@@ -696,9 +886,9 @@ impl std::fmt::Debug for CredentialFileConfig {
             .field("credential_id", &self.credential_id)
             .field("principal_id", &self.principal_id)
             .field("secret", &self.secret)
-            .field("expires_at_unix_secs", &self.expires_at_unix_secs)
+            .field("expires_at_unix_s", &self.expires_at_unix_s)
             .field("revoked", &self.revoked)
-            .field("revocation_grace_seconds", &self.revocation_grace_seconds)
+            .field("revocation_grace_s", &self.revocation_grace_s)
             .finish()
     }
 }
@@ -723,9 +913,9 @@ fn parse_credential_catalog(
                 id,
                 principal,
                 SharedSecret::new(secret)?,
-                value.expires_at_unix_secs,
+                value.expires_at_unix_s,
                 value.revoked,
-                value.revocation_grace_seconds,
+                value.revocation_grace_s,
             )
             .map_err(|error| ConfigFileError::Credential(error.to_string()))
         })
@@ -740,8 +930,8 @@ struct SecurityFileConfig {
     credential_id: Option<String>,
     #[serde(default)]
     credential_ids: Vec<String>,
-    auth_freshness_window_seconds: Option<u64>,
-    authentication_timeout_ms: Option<u64>,
+    auth_freshness_window_s: Option<ConfigSeconds>,
+    authentication_timeout_s: Option<ConfigSeconds>,
     max_pending_authentications: Option<usize>,
     tls_server_name: Option<String>,
     tls_pinned_certificate: Option<MaterialSource>,
@@ -755,9 +945,9 @@ impl SecurityFileConfig {
         &self,
         catalog: &CredentialCatalog,
     ) -> Result<ClientSecurityConfig, ConfigFileError> {
-        if self.authentication_timeout_ms.is_some() || self.max_pending_authentications.is_some() {
+        if self.authentication_timeout_s.is_some() || self.max_pending_authentications.is_some() {
             return Err(ConfigFileError::Credential(
-                "MPP outbound security cannot set inbound-only authentication_timeout_ms or max_pending_authentications"
+                "MPP outbound security cannot set inbound-only authentication_timeout_s or max_pending_authentications"
                     .to_string(),
             ));
         }
@@ -792,9 +982,9 @@ impl SecurityFileConfig {
                 "MPP outbound credential {id} is expired"
             )));
         }
-        let auth_freshness_window = Duration::from_secs(
-            self.auth_freshness_window_seconds
-                .unwrap_or(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS),
+        let auth_freshness_window = self.auth_freshness_window_s.map_or(
+            Duration::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS),
+            ConfigSeconds::duration,
         );
         Ok(ClientSecurityConfig::new(credential).with_auth_freshness_window(auth_freshness_window))
     }
@@ -836,13 +1026,13 @@ impl SecurityFileConfig {
             ));
         }
         Ok(ServerSecurityConfig::new(authority)
-            .with_auth_freshness_window(Duration::from_secs(
-                self.auth_freshness_window_seconds
-                    .unwrap_or(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS),
+            .with_auth_freshness_window(self.auth_freshness_window_s.map_or(
+                Duration::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS),
+                ConfigSeconds::duration,
             ))
-            .with_authentication_timeout(Duration::from_millis(
-                self.authentication_timeout_ms
-                    .unwrap_or(DEFAULT_AUTHENTICATION_TIMEOUT_MS),
+            .with_authentication_timeout(self.authentication_timeout_s.map_or(
+                Duration::from_millis(DEFAULT_AUTHENTICATION_TIMEOUT_MS),
+                ConfigSeconds::duration,
             ))
             .with_max_pending_authentications(
                 self.max_pending_authentications
@@ -1047,15 +1237,21 @@ fn parse_private_key(
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MppPerformanceFileConfig {
-    extra_traffic_hint_percent: Option<u16>,
+    optional_reinjection_budget_percent: Option<u16>,
+    quic_loss_compensation_percent: Option<ConfigLossCompensationPercent>,
 }
 
 impl MppPerformanceFileConfig {
-    fn into_config(self) -> MppPerformanceConfig {
-        MppPerformanceConfig {
-            extra_traffic_hint_percent: self
-                .extra_traffic_hint_percent
-                .unwrap_or(MppPerformanceConfig::default().extra_traffic_hint_percent),
+    fn into_config(self, fallback: MppFilePerformance) -> MppFilePerformance {
+        MppFilePerformance {
+            runtime: MppPerformanceConfig {
+                optional_reinjection_budget_percent: self
+                    .optional_reinjection_budget_percent
+                    .unwrap_or(fallback.runtime.optional_reinjection_budget_percent),
+            },
+            quic_loss_compensation: self
+                .quic_loss_compensation_percent
+                .map_or(fallback.quic_loss_compensation, |value| value.0),
         }
     }
 }
@@ -1101,8 +1297,8 @@ enum InboundFileConfig {
         listen: Vec<SocketAddr>,
         target: String,
         max_associations: Option<u32>,
-        idle_timeout_ms: Option<u64>,
-        datagram_ttl_ms: Option<u64>,
+        idle_timeout_s: Option<ConfigSeconds>,
+        datagram_ttl_s: Option<ConfigSeconds>,
     },
     MixedForward {
         name: String,
@@ -1110,8 +1306,8 @@ enum InboundFileConfig {
         target: String,
         max_connections: Option<u32>,
         max_associations: Option<u32>,
-        idle_timeout_ms: Option<u64>,
-        datagram_ttl_ms: Option<u64>,
+        idle_timeout_s: Option<ConfigSeconds>,
+        datagram_ttl_s: Option<ConfigSeconds>,
     },
     Tun {
         name: String,
@@ -1128,7 +1324,7 @@ enum InboundFileConfig {
         disable_icmp: bool,
         #[serde(default)]
         dns_redirects: Vec<SocketAddr>,
-        dns_ttl_ms: Option<u32>,
+        dns_ttl_s: Option<ConfigSeconds>,
         #[serde(default)]
         host: TunHostFileConfig,
     },
@@ -1370,7 +1566,7 @@ struct LocalIngressAdmissionFileConfig {
     max_connections: Option<usize>,
     max_connections_per_source: Option<usize>,
     max_connections_per_principal: Option<usize>,
-    handshake_timeout_ms: Option<u64>,
+    handshake_timeout_s: Option<ConfigSeconds>,
 }
 
 impl LocalIngressAdmissionFileConfig {
@@ -1382,10 +1578,8 @@ impl LocalIngressAdmissionFileConfig {
                 .unwrap_or(defaults.max_connections_per_source()),
             self.max_connections_per_principal
                 .unwrap_or(defaults.max_connections_per_principal()),
-            Duration::from_millis(
-                self.handshake_timeout_ms
-                    .unwrap_or(defaults.handshake_timeout().as_millis() as u64),
-            ),
+            self.handshake_timeout_s
+                .map_or(defaults.handshake_timeout(), ConfigSeconds::duration),
         )
         .map_err(ConfigFileError::LocalAdmission)
     }
@@ -1442,7 +1636,7 @@ struct TunFileConfig {
     disable_icmp: bool,
     #[serde(default)]
     dns_redirects: Vec<SocketAddr>,
-    dns_ttl_ms: Option<u32>,
+    dns_ttl_s: Option<ConfigSeconds>,
     #[serde(default)]
     host: TunHostFileConfig,
 }
@@ -1467,7 +1661,11 @@ impl TunFileConfig {
             mtu: self.mtu.unwrap_or(DEFAULT_TUN_MTU),
             enable_icmp: !self.disable_icmp,
             dns_resolvers: self.dns_redirects,
-            dns_ttl_ms: self.dns_ttl_ms.unwrap_or(DEFAULT_TUN_DNS_TTL_MS),
+            dns_ttl_ms: self
+                .dns_ttl_s
+                .map(ConfigSeconds::milliseconds_u32)
+                .transpose()?
+                .unwrap_or(DEFAULT_TUN_DNS_TTL_MS),
             host: self.host.into_config()?,
         })
     }
@@ -1597,13 +1795,21 @@ struct MppPathFileConfig {
 
 fn parse_named_path_specs(
     values: Vec<MppPathFileConfig>,
+    quic_loss_compensation: LossPolicyPercent,
 ) -> Result<Vec<NamedPathConfig>, ConfigFileError> {
     values
         .into_iter()
         .map(|value| {
+            let mut spec: crate::transport::PathSpec =
+                value.endpoint.parse().map_err(ConfigFileError::PathSpec)?;
+            if spec.underlay == crate::protocol::UnderlayProtocol::Udp
+                && spec.metadata.loss_compensation.is_none()
+            {
+                spec.metadata.loss_compensation = Some(quic_loss_compensation);
+            }
             Ok(NamedPathConfig {
                 name: canonical_config_name(&value.name)?,
-                spec: value.endpoint.parse().map_err(ConfigFileError::PathSpec)?,
+                spec,
             })
         })
         .collect()
@@ -1620,27 +1826,27 @@ enum OutboundFileConfig {
         performance: Option<MppPerformanceFileConfig>,
         #[serde(default)]
         paths: Vec<MppPathFileConfig>,
-        path_probe_interval_ms: Option<u64>,
-        path_probe_timeout_ms: Option<u64>,
+        path_probe_interval_s: Option<ConfigSeconds>,
+        path_probe_timeout_s: Option<ConfigSeconds>,
     },
     Direct {
         name: String,
         bind_ip: Option<IpAddr>,
         bind_ipv4: Option<Ipv4Addr>,
         bind_ipv6: Option<Ipv6Addr>,
-        connect_timeout_ms: Option<u64>,
+        connect_timeout_s: Option<ConfigSeconds>,
     },
     Socks5 {
         name: String,
         endpoint: Option<String>,
         auth: Option<OutboundProxyAuthFileConfig>,
-        connect_timeout_ms: Option<u64>,
+        connect_timeout_s: Option<ConfigSeconds>,
     },
     HttpConnect {
         name: String,
         endpoint: Option<String>,
         auth: Option<OutboundProxyAuthFileConfig>,
-        connect_timeout_ms: Option<u64>,
+        connect_timeout_s: Option<ConfigSeconds>,
     },
     HttpsConnect {
         name: String,
@@ -1648,7 +1854,7 @@ enum OutboundFileConfig {
         auth: Option<OutboundProxyAuthFileConfig>,
         tls_server_name: Option<String>,
         tls_ca_certificate: Option<MaterialSource>,
-        connect_timeout_ms: Option<u64>,
+        connect_timeout_s: Option<ConfigSeconds>,
     },
 }
 
@@ -1698,7 +1904,7 @@ struct RoutingBalancerFileConfig {
     stickiness: Option<RoutingBalancerStickinessFileConfig>,
     manual_outbound: Option<String>,
     probe: Option<RoutingBalancerProbeFileConfig>,
-    freshness_ttl_ms: Option<u64>,
+    freshness_ttl_s: Option<ConfigSeconds>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1720,8 +1926,8 @@ const fn default_gateway_member_weight() -> u32 {
 struct RoutingBalancerHealthFileConfig {
     failure_threshold: Option<u32>,
     recovery_threshold: Option<u32>,
-    initial_backoff_ms: Option<u64>,
-    maximum_backoff_ms: Option<u64>,
+    initial_backoff_s: Option<ConfigSeconds>,
+    maximum_backoff_s: Option<ConfigSeconds>,
 }
 
 impl RoutingBalancerHealthFileConfig {
@@ -1732,14 +1938,12 @@ impl RoutingBalancerHealthFileConfig {
             recovery_threshold: self
                 .recovery_threshold
                 .unwrap_or(default.recovery_threshold),
-            initial_backoff: Duration::from_millis(
-                self.initial_backoff_ms
-                    .unwrap_or(default.initial_backoff.as_millis() as u64),
-            ),
-            maximum_backoff: Duration::from_millis(
-                self.maximum_backoff_ms
-                    .unwrap_or(default.maximum_backoff.as_millis() as u64),
-            ),
+            initial_backoff: self
+                .initial_backoff_s
+                .map_or(default.initial_backoff, ConfigSeconds::duration),
+            maximum_backoff: self
+                .maximum_backoff_s
+                .map_or(default.maximum_backoff, ConfigSeconds::duration),
         }
     }
 }
@@ -1748,7 +1952,7 @@ impl RoutingBalancerHealthFileConfig {
 #[serde(deny_unknown_fields)]
 struct RoutingBalancerStickinessFileConfig {
     key: RoutingBalancerStickinessKeyFileValue,
-    ttl_ms: u64,
+    ttl_s: ConfigSeconds,
     capacity: usize,
 }
 
@@ -1756,7 +1960,7 @@ impl RoutingBalancerStickinessFileConfig {
     fn into_config(self) -> (GatewayStickinessPolicy, GatewayStickinessKey) {
         (
             GatewayStickinessPolicy {
-                ttl: Duration::from_millis(self.ttl_ms),
+                ttl: self.ttl_s.duration(),
                 capacity: self.capacity,
             },
             match self.key {
@@ -1773,8 +1977,8 @@ impl RoutingBalancerStickinessFileConfig {
 #[serde(deny_unknown_fields)]
 struct RoutingBalancerProbeFileConfig {
     target: String,
-    interval_ms: u64,
-    timeout_ms: u64,
+    interval_s: ConfigSeconds,
+    timeout_s: ConfigSeconds,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1944,6 +2148,7 @@ fn parse_outbounds(
     values: Vec<OutboundFileConfig>,
     material_base: &Path,
     credential_catalog: &CredentialCatalog,
+    default_mpp_performance: MppFilePerformance,
 ) -> Result<ParsedOutbounds, ConfigFileError> {
     let mut parsed = ParsedOutbounds {
         leaves: HashMap::new(),
@@ -1960,13 +2165,17 @@ fn parse_outbounds(
                 allow_peer_diagnostics,
                 performance,
                 paths,
-                path_probe_interval_ms,
-                path_probe_timeout_ms,
+                path_probe_interval_s,
+                path_probe_timeout_s,
             } => {
                 let name = canonical_config_name(&name)?;
                 insert_outbound_name(&parsed, &name)?;
                 let explicit_performance = performance.is_some();
-                let named_paths = parse_named_path_specs(paths)?;
+                let performance = performance
+                    .unwrap_or_default()
+                    .into_config(default_mpp_performance);
+                let named_paths =
+                    parse_named_path_specs(paths, performance.quic_loss_compensation)?;
                 if named_paths.is_empty() {
                     return Err(ConfigFileError::MppOutboundRequiresPath(name));
                 }
@@ -1994,14 +2203,16 @@ fn parse_outbounds(
                         config: Box::new(MppOutboundConfig {
                             security: security_config,
                             paths,
-                            path_probe_interval: Duration::from_millis(
-                                path_probe_interval_ms.unwrap_or(DEFAULT_PATH_PROBE_INTERVAL_MS),
+                            path_probe_interval: path_probe_interval_s.map_or(
+                                Duration::from_millis(DEFAULT_PATH_PROBE_INTERVAL_MS),
+                                ConfigSeconds::duration,
                             ),
-                            path_probe_timeout: Duration::from_millis(
-                                path_probe_timeout_ms.unwrap_or(DEFAULT_PATH_PROBE_TIMEOUT_MS),
+                            path_probe_timeout: path_probe_timeout_s.map_or(
+                                Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS),
+                                ConfigSeconds::duration,
                             ),
                             allow_peer_diagnostics,
-                            performance: performance.unwrap_or_default().into_config(),
+                            performance: performance.runtime,
                         }),
                     },
                 );
@@ -2011,7 +2222,7 @@ fn parse_outbounds(
                 bind_ip,
                 bind_ipv4,
                 bind_ipv6,
-                connect_timeout_ms,
+                connect_timeout_s,
             } => {
                 let name = canonical_config_name(&name)?;
                 insert_outbound_name(&parsed, &name)?;
@@ -2031,7 +2242,7 @@ fn parse_outbounds(
                     OutboundLeafConfig::Local {
                         id,
                         config,
-                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_s),
                     },
                 );
             }
@@ -2039,7 +2250,7 @@ fn parse_outbounds(
                 name,
                 endpoint,
                 auth,
-                connect_timeout_ms,
+                connect_timeout_s,
             } => {
                 let name = canonical_config_name(&name)?;
                 insert_outbound_name(&parsed, &name)?;
@@ -2058,7 +2269,7 @@ fn parse_outbounds(
                             auth.map(|auth| auth.into_outbound_credentials(material_base))
                                 .transpose()?,
                         )),
-                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_s),
                     },
                 );
             }
@@ -2066,7 +2277,7 @@ fn parse_outbounds(
                 name,
                 endpoint,
                 auth,
-                connect_timeout_ms,
+                connect_timeout_s,
             } => {
                 let name = canonical_config_name(&name)?;
                 insert_outbound_name(&parsed, &name)?;
@@ -2085,7 +2296,7 @@ fn parse_outbounds(
                             auth.map(|auth| auth.into_outbound_credentials(material_base))
                                 .transpose()?,
                         )),
-                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_s),
                     },
                 );
             }
@@ -2095,7 +2306,7 @@ fn parse_outbounds(
                 auth,
                 tls_server_name,
                 tls_ca_certificate,
-                connect_timeout_ms,
+                connect_timeout_s,
             } => {
                 let name = canonical_config_name(&name)?;
                 insert_outbound_name(&parsed, &name)?;
@@ -2129,7 +2340,7 @@ fn parse_outbounds(
                             HttpsProxyConfig::new(proxy, tls_server_name, root_certificates)
                                 .map_err(ConfigFileError::Outbound)?,
                         )),
-                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_s),
                     },
                 );
             }
@@ -2198,13 +2409,13 @@ fn apply_routing(
                 Ok::<_, ConfigFileError>(GatewayProbePolicy {
                     target: ProtocolTarget::parse_authority(&probe.target)
                         .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?,
-                    interval: Duration::from_millis(probe.interval_ms),
-                    timeout: Duration::from_millis(probe.timeout_ms),
+                    interval: probe.interval_s.duration(),
+                    timeout: probe.timeout_s.duration(),
                 })
             })
             .transpose()?;
-        if let Some(freshness_ttl_ms) = balancer.freshness_ttl_ms {
-            spec.freshness_ttl = Duration::from_millis(freshness_ttl_ms);
+        if let Some(freshness_ttl_s) = balancer.freshness_ttl_s {
+            spec.freshness_ttl = freshness_ttl_s.duration();
         }
         GatewayBalancer::compile(generation, spec.clone())
             .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
@@ -2665,6 +2876,7 @@ fn build_node_services(
     material_base: &Path,
     credential_catalog: &CredentialCatalog,
     local_user_catalog: &LocalUserCatalog,
+    default_mpp_performance: MppFilePerformance,
 ) -> Result<BuiltNodeServices, ConfigFileError> {
     let mut inbound_names = HashSet::new();
     let mut local_ingresses = Vec::new();
@@ -2749,8 +2961,8 @@ fn build_node_services(
                 listen,
                 target,
                 max_associations,
-                idle_timeout_ms,
-                datagram_ttl_ms,
+                idle_timeout_s,
+                datagram_ttl_s,
             } => {
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
@@ -2759,11 +2971,13 @@ fn build_node_services(
                 let max_associations = max_associations
                     .map(|limit| limit as usize)
                     .unwrap_or(DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS);
-                let idle_timeout = Duration::from_millis(
-                    idle_timeout_ms.unwrap_or(DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS),
+                let idle_timeout = idle_timeout_s.map_or(
+                    Duration::from_millis(DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS),
+                    ConfigSeconds::duration,
                 );
-                let datagram_ttl = Duration::from_millis(
-                    datagram_ttl_ms.unwrap_or(DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS),
+                let datagram_ttl = datagram_ttl_s.map_or(
+                    Duration::from_millis(DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS),
+                    ConfigSeconds::duration,
                 );
                 let config = UdpForwardConfig::new(
                     listen,
@@ -2784,8 +2998,8 @@ fn build_node_services(
                 target,
                 max_connections,
                 max_associations,
-                idle_timeout_ms,
-                datagram_ttl_ms,
+                idle_timeout_s,
+                datagram_ttl_s,
             } => {
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
@@ -2797,11 +3011,13 @@ fn build_node_services(
                 let max_associations = max_associations
                     .map(|limit| limit as usize)
                     .unwrap_or(DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS);
-                let idle_timeout = Duration::from_millis(
-                    idle_timeout_ms.unwrap_or(DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS),
+                let idle_timeout = idle_timeout_s.map_or(
+                    Duration::from_millis(DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS),
+                    ConfigSeconds::duration,
                 );
-                let datagram_ttl = Duration::from_millis(
-                    datagram_ttl_ms.unwrap_or(DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS),
+                let datagram_ttl = datagram_ttl_s.map_or(
+                    Duration::from_millis(DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS),
+                    ConfigSeconds::duration,
                 );
                 let config = MixedForwardConfig::new(
                     listen,
@@ -2829,7 +3045,7 @@ fn build_node_services(
                 mtu,
                 disable_icmp,
                 dns_redirects,
-                dns_ttl_ms,
+                dns_ttl_s,
                 host,
             } => {
                 let name = canonical_config_name(&name)?;
@@ -2848,7 +3064,7 @@ fn build_node_services(
                             mtu,
                             disable_icmp,
                             dns_redirects,
-                            dns_ttl_ms,
+                            dns_ttl_s,
                             host,
                         }
                         .into_config()?,
@@ -2885,7 +3101,8 @@ fn build_node_services(
             } => {
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
-                let paths = parse_named_path_specs(paths)?;
+                let performance = performance.into_config(default_mpp_performance);
+                let paths = parse_named_path_specs(paths, performance.quic_loss_compensation)?;
                 if paths.is_empty() {
                     return Err(ConfigFileError::MppInboundRequiresPath);
                 }
@@ -2898,7 +3115,7 @@ fn build_node_services(
                     paths,
                     security: server_security,
                     tls,
-                    performance: performance.into_config(),
+                    performance: performance.runtime,
                     peer_diagnostics_principals,
                     tun_l3: None,
                 });
@@ -2912,7 +3129,8 @@ fn build_node_services(
             } => {
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
-                let paths = parse_named_path_specs(paths)?;
+                let paths =
+                    parse_named_path_specs(paths, default_mpp_performance.quic_loss_compensation)?;
                 if paths.is_empty() {
                     return Err(ConfigFileError::MppInboundRequiresPath);
                 }
@@ -2926,7 +3144,7 @@ fn build_node_services(
                     paths,
                     security: server_security,
                     tls,
-                    performance: MppPerformanceConfig::default(),
+                    performance: default_mpp_performance.runtime,
                     peer_diagnostics_principals,
                     tun_l3: Some(tun_l3),
                 });
@@ -2979,8 +3197,11 @@ fn validate_unique_inbound_name(
     Ok(())
 }
 
-fn outbound_connect_timeout(value: Option<u64>) -> Duration {
-    Duration::from_millis(value.unwrap_or(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS))
+fn outbound_connect_timeout(value: Option<ConfigSeconds>) -> Duration {
+    value.map_or(
+        Duration::from_millis(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS),
+        ConfigSeconds::duration,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -3035,7 +3256,7 @@ fn default_dns_policies() -> Vec<DnsPolicyFileConfig> {
         family: DnsFamilyFileValue::default(),
         security: DnsSecurityFileValue::default(),
         strategy: DnsServerStrategyFileValue::default(),
-        fallback_ms: None,
+        fallback_s: None,
         answer_cidrs: Vec::new(),
         query: DnsQueryFileConfig::default(),
         cache: DnsCacheFileConfig::default(),
@@ -3144,8 +3365,8 @@ struct DnsSyntheticCaptureFileConfig {
     ipv4_pool: Option<ipnet::Ipv4Net>,
     ipv6_pool: Option<ipnet::Ipv6Net>,
     capacity: usize,
-    answer_ttl_seconds: u64,
-    recovery_ttl_seconds: u64,
+    answer_ttl_s: ConfigSeconds,
+    recovery_ttl_s: ConfigSeconds,
 }
 
 impl DnsSyntheticCaptureFileConfig {
@@ -3157,8 +3378,8 @@ impl DnsSyntheticCaptureFileConfig {
             ipv4_pool: self.ipv4_pool,
             ipv6_pool: self.ipv6_pool,
             max_entries: self.capacity,
-            answer_ttl: Duration::from_secs(self.answer_ttl_seconds),
-            recovery_ttl: Duration::from_secs(self.recovery_ttl_seconds),
+            answer_ttl: self.answer_ttl_s.duration(),
+            recovery_ttl: self.recovery_ttl_s.duration(),
         })
     }
 }
@@ -3307,7 +3528,7 @@ struct DnsPolicyFileConfig {
     security: DnsSecurityFileValue,
     #[serde(default)]
     strategy: DnsServerStrategyFileValue,
-    fallback_ms: Option<u64>,
+    fallback_s: Option<ConfigSeconds>,
     #[serde(default)]
     answer_cidrs: Vec<String>,
     #[serde(default)]
@@ -3322,7 +3543,7 @@ struct DnsPolicyFileConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsQueryFileConfig {
-    timeout_ms: Option<u64>,
+    timeout_s: Option<ConfigSeconds>,
     inflight: Option<usize>,
     answers: Option<usize>,
 }
@@ -3331,10 +3552,10 @@ struct DnsQueryFileConfig {
 #[serde(deny_unknown_fields)]
 struct DnsCacheFileConfig {
     entries: Option<usize>,
-    positive_ttl_ms: Option<u64>,
-    negative_ttl_ms: Option<u64>,
-    stale_ms: Option<u64>,
-    prefetch_ms: Option<u64>,
+    positive_ttl_s: Option<ConfigSeconds>,
+    negative_ttl_s: Option<ConfigSeconds>,
+    stale_s: Option<ConfigSeconds>,
+    prefetch_s: Option<ConfigSeconds>,
 }
 
 impl DnsPolicyFileConfig {
@@ -3343,20 +3564,20 @@ impl DnsPolicyFileConfig {
         let id = crate::product::DnsPlanId::parse(&name)
             .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?;
         let defaults = DnsPlanLimits::default();
-        let upstream_strategy = match (self.strategy, self.fallback_ms) {
+        let upstream_strategy = match (self.strategy, self.fallback_s) {
             (DnsServerStrategyFileValue::Ordered, None) => DnsUpstreamStrategy::Ordered,
             (DnsServerStrategyFileValue::Ordered, Some(_)) => {
                 return Err(ConfigFileError::DnsValue(format!(
-                    "ordered DNS policy {} cannot set fallback_ms",
+                    "ordered DNS policy {} cannot set fallback_s",
                     id.as_str()
                 )));
             }
-            (DnsServerStrategyFileValue::Race, Some(delay_ms)) => DnsUpstreamStrategy::Race {
-                fallback_delay: Duration::from_millis(delay_ms),
+            (DnsServerStrategyFileValue::Race, Some(delay_s)) => DnsUpstreamStrategy::Race {
+                fallback_delay: delay_s.duration(),
             },
             (DnsServerStrategyFileValue::Race, None) => {
                 return Err(ConfigFileError::DnsValue(format!(
-                    "racing DNS policy {} requires fallback_ms",
+                    "racing DNS policy {} requires fallback_s",
                     id.as_str()
                 )));
             }
@@ -3405,34 +3626,29 @@ impl DnsPolicyFileConfig {
                 })
                 .transpose()?,
             limits: DnsPlanLimits {
-                lookup_timeout: Duration::from_millis(
-                    self.query
-                        .timeout_ms
-                        .unwrap_or(defaults.lookup_timeout.as_millis() as u64),
-                ),
+                lookup_timeout: self
+                    .query
+                    .timeout_s
+                    .map_or(defaults.lookup_timeout, ConfigSeconds::duration),
                 cache_capacity: self.cache.entries.unwrap_or(defaults.cache_capacity),
                 max_inflight: self.query.inflight.unwrap_or(defaults.max_inflight),
                 max_answers: self.query.answers.unwrap_or(defaults.max_answers),
-                positive_ttl_cap: Duration::from_millis(
-                    self.cache
-                        .positive_ttl_ms
-                        .unwrap_or(defaults.positive_ttl_cap.as_millis() as u64),
-                ),
-                negative_ttl_cap: Duration::from_millis(
-                    self.cache
-                        .negative_ttl_ms
-                        .unwrap_or(defaults.negative_ttl_cap.as_millis() as u64),
-                ),
-                stale_if_error: Duration::from_millis(
-                    self.cache
-                        .stale_ms
-                        .unwrap_or(defaults.stale_if_error.as_millis() as u64),
-                ),
-                prefetch_max: Duration::from_millis(
-                    self.cache
-                        .prefetch_ms
-                        .unwrap_or(defaults.prefetch_max.as_millis() as u64),
-                ),
+                positive_ttl_cap: self
+                    .cache
+                    .positive_ttl_s
+                    .map_or(defaults.positive_ttl_cap, ConfigSeconds::duration),
+                negative_ttl_cap: self
+                    .cache
+                    .negative_ttl_s
+                    .map_or(defaults.negative_ttl_cap, ConfigSeconds::duration),
+                stale_if_error: self
+                    .cache
+                    .stale_s
+                    .map_or(defaults.stale_if_error, ConfigSeconds::duration),
+                prefetch_max: self
+                    .cache
+                    .prefetch_s
+                    .map_or(defaults.prefetch_max, ConfigSeconds::duration),
             },
         })
     }
@@ -3565,6 +3781,8 @@ pub enum ConfigFileError {
     PathSpec(PathSpecParseError),
     NoRuntimeServices,
     GenerationExhausted,
+    DurationOutOfRange,
+    DurationPrecision,
     MixedForwardingFamilies,
     EmptyName,
     NonCanonicalName(String),
@@ -3636,6 +3854,13 @@ impl std::fmt::Display for ConfigFileError {
             Self::GenerationExhausted => {
                 write!(f, "runtime configuration generation space is exhausted")
             }
+            Self::DurationOutOfRange => {
+                write!(f, "configured duration is outside the supported range")
+            }
+            Self::DurationPrecision => write!(
+                f,
+                "configured duration requires finer than millisecond precision for this field"
+            ),
             Self::MixedForwardingFamilies => write!(
                 f,
                 "one config cannot mix L4 inbounds with tun-l3 or mpp-l3 inbounds"
@@ -3755,6 +3980,8 @@ impl std::error::Error for ConfigFileError {
             Self::PathSpec(err) => Some(err),
             Self::NoRuntimeServices
             | Self::GenerationExhausted
+            | Self::DurationOutOfRange
+            | Self::DurationPrecision
             | Self::MixedForwardingFamilies
             | Self::EmptyName
             | Self::NonCanonicalName(_)

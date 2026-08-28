@@ -53,6 +53,51 @@ fn mpp_leaf(id: &str, context: ClientPathContext) -> RuntimeOutboundLeaf {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn direct_tcp_payload_idle_rearms_both_directions_and_preserves_half_close() {
+    let (local, mut application) = tokio::io::duplex(64);
+    let (mut remote, mut target) = tokio::io::duplex(64);
+    let relay = tokio::spawn(async move {
+        relay_with_product_idle_timeout(
+            local,
+            Some(Duration::from_secs(5)),
+            |mut local| async move {
+                tokio::io::copy_bidirectional(&mut local, &mut remote)
+                    .await
+                    .map(|_| ())
+                    .map_err(RuntimeError::from)
+            },
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    application.write_all(b"a").await.expect("client payload");
+    let mut byte = [0_u8; 1];
+    target.read_exact(&mut byte).await.expect("target payload");
+
+    application.shutdown().await.expect("client half-close");
+    tokio::time::advance(Duration::from_secs(4)).await;
+    target.write_all(b"b").await.expect("target response");
+    application
+        .read_exact(&mut byte)
+        .await
+        .expect("response after half-close");
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !relay.is_finished(),
+        "surviving half remained payload-active"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        relay.await.expect("relay task"),
+        Err(RuntimeError::ProductIdleTimeout)
+    ));
+}
+
 struct TestDestinationPolicy {
     policy: ProductPolicyGeneration,
     principal: PrincipalId,

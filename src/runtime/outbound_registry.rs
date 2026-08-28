@@ -26,6 +26,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::gateway::{ClientGatewayRuntime, GatewayFlowLease, GatewayRuntimeSnapshot};
 use crate::runtime::path::AuthenticatedCarrierAvailability;
 use crate::runtime::path::ClientPathContext;
+use crate::runtime::product_lifecycle::{ProductFlowActivity, ProductFlowActivityIo};
 use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream};
 use crate::runtime::stream::OpenedRemoteStream;
 use crate::runtime::telemetry::{
@@ -142,6 +143,7 @@ impl DnsTcpConnector for MppOutboundDnsTcpConnector {
                         performance,
                         ReliableRelayOpenSpec::new(target, TrafficClass::Latency),
                         remote,
+                        None,
                     )
                     .await;
                 }
@@ -611,9 +613,32 @@ impl OpenedUdpOutbound {
     }
 }
 
+async fn relay_with_product_idle_timeout<S, T, F, Fut>(
+    local: S,
+    idle_timeout: Option<Duration>,
+    relay: F,
+) -> Result<T, RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(ProductFlowActivityIo<S>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, RuntimeError>>,
+{
+    let activity = ProductFlowActivity::new();
+    let relay = relay(ProductFlowActivityIo::new(local, activity.clone()));
+    tokio::pin!(relay);
+    let idle = activity.wait_until_idle(idle_timeout);
+    tokio::pin!(idle);
+    tokio::select! {
+        biased;
+        result = &mut relay => result,
+        () = &mut idle => Err(RuntimeError::ProductIdleTimeout),
+    }
+}
+
 pub(in crate::runtime) async fn relay_opened_tcp<S>(
     local: S,
     opened: OpenedTcpOutbound,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -633,9 +658,14 @@ where
                 performance,
                 spec,
                 remote,
+                idle_timeout,
             )
             .await
             .map(|_| ());
+            let result = match result {
+                Err(RuntimeError::ProductIdleTimeout) => Ok(()),
+                result => result,
+            };
             finish_gateway_flow(&mut _gateway_lease, &result);
             result?;
         }
@@ -649,20 +679,31 @@ where
                 .ok_or(RuntimeError::Protocol(
                     "local Product TCP flow is missing its runtime observer",
                 ))?;
-            let mut local = ObservedProductIo::new(local, counter);
             let result = match stream {
                 OutboundTcpStream::Plain(mut remote) => {
-                    tokio::io::copy_bidirectional(&mut local, &mut remote)
-                        .await
-                        .map(|_| ())
-                        .map_err(RuntimeError::from)
+                    relay_with_product_idle_timeout(local, idle_timeout, |local| async move {
+                        let mut local = ObservedProductIo::new(local, counter);
+                        tokio::io::copy_bidirectional(&mut local, &mut remote)
+                            .await
+                            .map(|_| ())
+                            .map_err(RuntimeError::from)
+                    })
+                    .await
                 }
                 OutboundTcpStream::Tls(mut remote) => {
-                    tokio::io::copy_bidirectional(&mut local, remote.as_mut())
-                        .await
-                        .map(|_| ())
-                        .map_err(RuntimeError::from)
+                    relay_with_product_idle_timeout(local, idle_timeout, |local| async move {
+                        let mut local = ObservedProductIo::new(local, counter);
+                        tokio::io::copy_bidirectional(&mut local, remote.as_mut())
+                            .await
+                            .map(|_| ())
+                            .map_err(RuntimeError::from)
+                    })
+                    .await
                 }
+            };
+            let result = match result {
+                Err(RuntimeError::ProductIdleTimeout) => Ok(()),
+                result => result,
             };
             finish_gateway_flow(&mut _gateway_lease, &result);
             if result.is_ok() {

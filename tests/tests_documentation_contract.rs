@@ -54,8 +54,50 @@ fn reference_documents_complete_dns_and_carrier_vocabularies() {
     assert!(REFERENCE.contains("[[dns.synthetic_capture]]"));
     assert!(REFERENCE.contains("override_records ="));
     assert!(REFERENCE.contains("synthetic_capture ="));
-    assert!(REFERENCE.contains("query = { timeout_ms"));
+    assert!(REFERENCE.contains("query = { timeout_s"));
     assert!(REFERENCE.contains("cache = { entries"));
+}
+
+#[test]
+fn reference_documents_current_product_duration_names() {
+    for key in [
+        "restart_backoff_s",
+        "restart_max_backoff_s",
+        "retention_timeout_s",
+        "idle_timeout_s",
+        "tcp_path_heartbeat_interval_s",
+        "tcp_path_heartbeat_timeout_s",
+        "quic_path_keep_alive_interval_s",
+        "quic_path_idle_timeout_s",
+        "expires_at_unix_s",
+        "revocation_grace_s",
+        "auth_freshness_window_s",
+        "authentication_timeout_s",
+        "datagram_ttl_s",
+        "dns_ttl_s",
+        "handshake_timeout_s",
+        "path_probe_interval_s",
+        "path_probe_timeout_s",
+        "connect_timeout_s",
+        "freshness_ttl_s",
+        "initial_backoff_s",
+        "maximum_backoff_s",
+        "ttl_s",
+        "interval_s",
+        "timeout_s",
+        "answer_ttl_s",
+        "recovery_ttl_s",
+        "fallback_s",
+        "positive_ttl_s",
+        "negative_ttl_s",
+        "stale_s",
+        "prefetch_s",
+    ] {
+        assert!(
+            REFERENCE.contains(&format!("{key} =")),
+            "configuration reference omits Product duration key {key}"
+        );
+    }
 }
 
 #[test]
@@ -88,7 +130,42 @@ fn current_documents_do_not_publish_superseded_configuration_names() {
         "&srtt-ms=",
         "?jitter-ms=",
         "&jitter-ms=",
+        "initial-srtt-ms",
+        "initial-rttvar-ms",
         "port-hop-interval-ms",
+        "port-rotation-interval-ms",
+        "auth_freshness_window_seconds",
+        "revocation_grace_seconds",
+        "answer_ttl_seconds",
+        "recovery_ttl_seconds",
+        "restart_backoff_ms",
+        "restart_max_backoff_ms",
+        "retention_timeout_ms",
+        "idle_timeout_ms",
+        "datagram_ttl_ms",
+        "tcp_path_heartbeat_interval_ms",
+        "tcp_path_heartbeat_timeout_ms",
+        "quic_path_keep_alive_interval_ms",
+        "quic_path_idle_timeout_ms",
+        "authentication_timeout_ms",
+        "handshake_timeout_ms",
+        "dns_ttl_ms",
+        "path_probe_interval_ms",
+        "path_probe_timeout_ms",
+        "connect_timeout_ms",
+        "freshness_ttl_ms",
+        "initial_backoff_ms",
+        "maximum_backoff_ms",
+        "fallback_ms",
+        "query.timeout_ms",
+        "positive_ttl_ms",
+        "negative_ttl_ms",
+        "stale_ms",
+        "prefetch_ms",
+        "session-retention-timeout-ms",
+        "udp-forward-idle-timeout-ms",
+        "udp-forward-datagram-ttl-ms",
+        "outbound-dns-timeout-ms",
         "bulk-allowed",
         "probe-only",
         "no-udp",

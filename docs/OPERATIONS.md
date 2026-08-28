@@ -251,6 +251,17 @@ attachments apply only when that policy is selected.
 MPP security and named carrier paths belong to each MPP inbound/outbound
 rather than to a global path role.
 
+Every TOML duration key ends in `_s` and uses seconds. Whole seconds may be
+written as TOML integers and sub-second values as decimals, such as
+`fallback_s = 0.05`. The one security exception is
+`auth_freshness_window_s`: authentication carries a Unix-seconds timestamp, so
+that window must be a positive whole number of seconds. Legacy millisecond and
+long-form unit keys are rejected; there is no compatibility alias or implicit
+conversion of their old values.
+When converting an earlier file, use the current `_s` or `-s` name and convert
+the old value to seconds. Apply the same conversion to duration options inside
+inline tables and carrier URI query strings.
+
 When `initial_demand` is omitted or set to `"automatic"`, reliable streams
 begin latency-oriented and datagrams begin realtime-oriented. Live reliable
 demand can move between latency and throughput scheduling without reopening the
@@ -335,8 +346,8 @@ over reject.
 explicit non-zero listeners and one canonical `target`; `mixed-forward` binds
 both transports on every listed address. TCP overload is closed immediately at
 `max_connections`; UDP silently drops new sources at `max_associations`,
-expires source associations at `idle_timeout_ms`, and bounds each datagram by
-`datagram_ttl_ms`. All three use the ordinary route/DNS/outbound/balancer
+expires source associations at `idle_timeout_s`, and bounds each datagram by
+`datagram_ttl_s`. All three use the ordinary route/DNS/outbound/balancer
 path; they do not dial around configured outbounds.
 
 The inbound protocols determine the forwarding family. SOCKS5, HTTP CONNECT,
@@ -456,12 +467,13 @@ A `[[dns.policies]]` entry names its ordered `servers`, address `family`,
 `security`, server-selection `strategy`, optional answer allowlist
 `answer_cidrs`, and grouped `query` and `cache` limits. `ordered` advances on a
 transport/server failure but treats a negative DNS response as authoritative.
-`race` requires at least two servers and `fallback_ms`; zero starts all servers
-immediately, and the delay cannot exceed `query.timeout_ms`. `ipv4-only` and
+`race` requires at least two servers and `fallback_s`; zero starts all servers
+immediately, and the delay cannot exceed `query.timeout_s`. Decimal seconds
+preserve sub-second races. `ipv4-only` and
 `ipv6-only` query and return only that family. A `*-then-*` policy queries its
 second family only when the preferred query returns no addresses and is not
 NXDOMAIN; a `*-and-*` policy queries both and returns the preferred family
-first. `query.timeout_ms` is the complete deadline for each A or AAAA lookup
+first. `query.timeout_s` is the complete deadline for each A or AAAA lookup
 across that policy's servers. Exact DNS
 rules win before the longest suffix rule, and an unmatched query uses
 `[dns].default`. Omitting the entire `[dns]` section creates a system server and
@@ -490,7 +502,7 @@ socket and the second is the authenticated DNS name, with matching
 `MPTUNNEL_TUN_DNS_DOT_ADDRESS` and `MPTUNNEL_TUN_DNS_DOT_TLS_NAME` variables.
 The simple server profile uses repeatable `--outbound-dns-server`,
 `--outbound-dns-protocol system|udp-tcp`, `--outbound-dns-family`, and
-`--outbound-dns-timeout-ms` (with the matching `MPTUNNEL_OUTBOUND_DNS_*`
+`--outbound-dns-timeout-s` (with the matching `MPTUNNEL_OUTBOUND_DNS_*`
 variables); use TOML for the complete seven-protocol model.
 
 External `dns_redirects` only forward UDP port 53 to the listed resolver
@@ -498,17 +510,44 @@ sockets; they do not serve local override or synthetic answers. Managed mode
 requires every active DNS policy to be encrypted and non-system. Full mode also
 requires at least one `dns_listeners` address; at most one managed TUN inbound
 is allowed. Listener IPs must be usable, use a configured TUN address family,
-and remain outside `exclude_cidrs`. In managed mode `dns_ttl_ms` caps returned
+and remain outside `exclude_cidrs`. In managed mode `dns_ttl_s` caps returned
 DNS TTLs; in external mode it bounds redirected UDP associations.
 `local_lan = true` bypasses directly connected LAN prefixes outside the tunnel.
 
-`[session].retention_timeout_ms` and
-`--session-retention-timeout-ms` set the absolute time an established logical
+`[session].retention_timeout_s` and
+`--session-retention-timeout-s` set the absolute time an established logical
 stream may remain without any authenticated carrier and the absolute ceiling
-for graceful TCP carrier retirement. The default is 300,000 ms. Retries and
+for graceful TCP carrier retirement. The default is 300 seconds. Retries and
 retirement progress never extend a deadline. Healthy idle streams with a live
 carrier do not consume it; TCP heartbeat and native QUIC idle timers remain
 separate.
+
+`[flow].idle_timeout_s` is the independent established Product-flow lifetime;
+the default is 300 seconds and zero explicitly disables it. Positive TCP
+payload or an accepted UDP datagram in either direction refreshes activity.
+TCP FIN, acknowledgements, MPP/QUIC control traffic, carrier heartbeats, and
+keep-alives do not. A half-closed TCP stream can therefore continue delivering
+payload in its remaining direction, but it does not become immortal when that
+payload stops. Payload accepted at the deadline rearms the lifetime before
+retirement; a late producer cannot revive an incarnation after retirement has
+committed. Cancellation still transfers cleanup to the owning actor and
+releases the exact admission, attachment, and route state rather than aborting
+cleanup halfway. Expiry closes only that logical flow and releases its
+admission, telemetry, and datagram-route ownership; it does not mark an MPP
+carrier or session failed. Direct and MPP egress use the same Product lifecycle.
+
+`[flow]` also supplies global MPP sender defaults. Omission uses 10 for both
+`optional_reinjection_budget_percent` and
+`quic_loss_compensation_percent`. The former meters only optional reliable MPP
+payload reinjection; native TCP/QUIC recovery, MPP control and probes, and
+critical path-failure recovery are outside that optional allowance. The latter
+changes sender-local QUIC delivery/loss evidence and does not itself send or
+budget bytes. A matching MPP inbound/outbound `performance` table overrides
+its `[flow]` value. For QUIC loss compensation only, an explicit
+`loss-compensation-percent` path URI value has highest precedence. The complete
+loss-policy order is therefore path URI, node performance, `[flow]`, then the
+built-in 10; optional reinjection uses node performance, `[flow]`, then the
+built-in 10. Each endpoint resolves its local sending direction independently.
 
 Use `mptunnel --help` and subcommand help as the complete option and environment
 variable reference. Validate configs in the target binary whenever possible;
@@ -540,15 +579,26 @@ probing one concrete port cannot validate an externally published range, and
 runtime carrier selection remains authoritative.
 
 Every port in an outbound carrier range must forward or redirect to the same
-fixed server listener. `port-rotation-interval-ms` is accepted on ranged TCP
-and QUIC paths, defaults to five minutes, and has a 5000 ms minimum. QUIC uses a
+fixed server listener. `port-rotation-interval-s` is accepted on ranged TCP and
+QUIC paths, defaults to five minutes, and has a 5-second minimum. QUIC uses a
 fresh protected socket while retaining the authenticated native connection;
-native QUIC migration and validation remain authoritative. TCP waits for an
-exact active-work quiescent boundary and replaces only that member ordinal.
-With a
-spare physical reservation it may establish the successor before draining the
-predecessor; at the full envelope it retires the predecessor first. It never
-transfers native transport state or closes active work to meet the interval.
+native QUIC migration and validation remain authoritative. A successful QUIC
+port rotation is therefore warm rather than a reconnect: configured hints and
+the retained connection identity remain, and Quinn alone decides how its live
+native state responds. A later full QUIC reconnect receives the configured
+hints but never inherits the predecessor's measurements, queue, flight, ACK, or
+sample authority. TCP authenticates one group-scoped transient successor,
+atomically publishes its fresh wire and instance identities, and then drains
+the predecessor. Existing logical work uses ordinary detachment and recovery;
+native TCP state is never transferred. Configured startup hints remain
+available to the logical member, while the successor's own readiness RTT warms
+its local timing hint. Live predecessor rate/sample authority is not inherited.
+The server's ordinary session path limit counts the overlap and is never
+relaxed by a client replacement claim. Normal successful QUIC and TCP rotations
+are debug events; `quic.carrier_port_migrated` records the group/path and old/new
+ports, while `tcp.carrier_port_replaced` records the logical group/member plus
+the old and new wire IDs, instance IDs, and selected ports. Rotation failures
+remain warnings.
 `max-tcp-carriers=N` applies only to TCP client paths, accepts 1..=65535, and
 defaults to `3`.
 With one configured TCP endpoint, every member is regular capacity. With
@@ -611,11 +661,11 @@ Carrier endpoints use `tcp://HOST:PORT[-END]` or
 unknown, duplicate, empty, or inapplicable options fail configuration load.
 `backup`, `expensive`, `allow-bulk`, `control-only`, and `allow-datagrams` are
 operator constraints that remain in force until configuration or management
-policy changes them. `initial-srtt-ms`, `initial-rttvar-ms`, and the
+policy changes them. `initial-srtt-s`, `initial-rttvar-s`, and the
 `initial-rate-*` forms are startup measurement priors that live evidence may
 replace; the initial rate defaults to unknown. `source-address` selects a TCP or
 QUIC client source IP; `max-datagram-payload-bytes` is QUIC-client-only;
-`max-tcp-carriers` is TCP-client-only; and `port-rotation-interval-ms` requires
+`max-tcp-carriers` is TCP-client-only; and `port-rotation-interval-s` requires
 a ranged client endpoint. MPP listener paths use one fixed port. They may use
 the `initial-*` and scheduling boolean options; TCP listeners may also use
 `allow-datagrams`. Source binding, datagram-payload limits, TCP carrier counts,
@@ -798,12 +848,15 @@ and pacing values remain visible after their shared three-PTO freshness window,
 prefixed with `~`; effective sample age includes time the management snapshot
 has resided in the browser. RTT, loss, queue, flight, and other instantaneous
 snapshot fields use API-result residence instead of the age of the most recent
-delivery sample. Path usage direction and metric direction are displayed
-independently. For a port-hopping client path, the dashboard shows only the
-remote port observed on the current live carrier and never substitutes a
-configured range endpoint. A peer diagnostic may retain the exact last port of
-a retired authenticated carrier for correlation, but marks that historical port
-with `~`. Numeric identifiers and
+delivery sample. Evidence sample counts and bytes belong to that same sender
+direction and rate epoch; they are not bidirectional forwarding totals. A
+download therefore contributes server-to-client sender evidence, not the
+client's client-to-server path record. Path usage direction and metric
+direction are displayed independently. For a port-hopping client path, the
+dashboard shows only the remote port observed on the current live carrier and
+never substitutes a configured range endpoint. A peer diagnostic may retain
+the exact last port of a retired authenticated carrier for correlation, but
+marks that historical port with `~`. Numeric identifiers and
 monotonic byte totals are decimal strings so browser clients do not lose 64-bit
 precision.
 The dashboard renders Session IDs as lowercase, fixed-width 16-digit
@@ -897,10 +950,10 @@ transmission modes and not desired memory occupancy.
 | `max_datagram_queue_bytes` | 16 MiB |
 | `max_path_flight_bytes` | 64 MiB |
 | `max_reliable_relay_chunk_bytes` | 512 KiB |
-| `tcp_path_heartbeat_interval_ms` | 10,000 ms |
-| `tcp_path_heartbeat_timeout_ms` | 30,000 ms |
-| `quic_path_keep_alive_interval_ms` | 10,000 ms |
-| `quic_path_idle_timeout_ms` | 30,000 ms |
+| `tcp_path_heartbeat_interval_s` | 10 s |
+| `tcp_path_heartbeat_timeout_s` | 30 s |
+| `quic_path_keep_alive_interval_s` | 10 s |
+| `quic_path_idle_timeout_s` | 30 s |
 
 Each heartbeat/keep-alive interval is a maximum idle delay. The client renews
 the next idle probe within 80%--100% of that interval; authenticated activity
@@ -925,7 +978,7 @@ at 10 Gbps. They are configurable local bounds, not protocol constants. At
 window/RTT ceiling and must be raised for line rate. Frame, payload, chunk, and
 sparse-range limits are separate safeguards and do not need to grow with BDP.
 
-Each proxy outbound has its own `connect_timeout_ms`; the default is 10,000 ms.
+Each proxy outbound has its own `connect_timeout_s`; the default is 10 seconds.
 Its required `endpoint` is `HOST:PORT`, with brackets around IPv6. When
 `[outbounds.auth]` is present, both username and password are required; the
 username is 1..=255 UTF-8 bytes with no colon or ASCII control characters.
@@ -939,13 +992,13 @@ connects, or other flow-opening I/O. Defaults are finite:
 | Field | Default |
 | --- | ---: |
 | `max_live_flows` | 4,096 |
-| `max_concurrent_work` | 512 |
-| `max_live_flows_per_principal` | 1,024 |
-| `max_live_flows_per_outbound` | 3,072 |
-| `max_connects_per_outbound` | 256 |
-| `max_live_flows_per_target` | 256 |
-| `max_connects_per_target` | 32 |
-| `max_dns_work` | 128 |
+| `max_concurrent_work` | 4,096 |
+| `max_live_flows_per_principal` | 4,096 |
+| `max_live_flows_per_outbound` | 4,096 |
+| `max_connects_per_outbound` | 4,096 |
+| `max_live_flows_per_target` | 4,096 |
+| `max_connects_per_target` | 4,096 |
+| `max_dns_work` | 4,096 |
 
 SOCKS5, HTTP CONNECT, mixed proxy, fixed forwarding, TUN-L4, and authenticated
 MPP server opens share one L4 admission budget. Their listener/source/association
@@ -1143,6 +1196,13 @@ secret. QUIC path groups require a DNS TLS identity because IP identities do
 not produce SNI; carrier endpoints may still be literal IP addresses. MPP
 carrier 0-RTT is disabled.
 
+A peer reset or stop of one HTTP/3 request stream with application code zero is
+normal operation-local abandonment. It closes that request operation without a
+carrier-failure warning; the QUIC connection and sibling request streams remain
+authoritative. Nonzero application errors, malformed or truncated records, and
+terminal carrier-control loss keep their ordinary smallest-safe-scope failure
+handling.
+
 The selector removes an unauthenticated MPP-parser oracle; it does not make the
 endpoint indistinguishable. Source-aware clients and observers can still
 fingerprint QUIC packet shape and version, Noise ephemeral keys, timing, and
@@ -1173,7 +1233,8 @@ An inbound with `protocol = "mixed"` accepts SOCKS5 and HTTP CONNECT on one TCP
 listener while retaining the same local-user and admission policy.
 Local proxy inbounds separately bound total connections, connections per
 source IP, connections per principal, and their authentication/header deadline
-under `[inbounds.admission]`; these limits never derive from MPP capacity.
+under `[inbounds.admission]`; the defaults are 4,096 for every count and 10
+seconds for `handshake_timeout_s`. These limits never derive from MPP capacity.
 
 ## Installed files
 

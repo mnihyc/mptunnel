@@ -175,7 +175,7 @@ async fn packet_service_enforces_ownership_and_preserves_packets() {
         context.session_retention_timeout,
     );
     let local_path: crate::transport::PathSpec =
-        "tcp://127.0.0.1:9000?initial-srtt-ms=20&initial-rate-mbps=500"
+        "tcp://127.0.0.1:9000?initial-srtt-s=0.02&initial-rate-mbps=500"
             .parse()
             .expect("path");
     let local = ServerLocalPath::new(0, local_path);
@@ -960,7 +960,7 @@ fn retired_inflight_opener_cannot_displace_same_principal_successor() {
 #[test]
 fn server_packet_ranking_requires_delivered_capacity_evidence() {
     let path: crate::transport::PathSpec =
-        "quic://127.0.0.1:9000?initial-srtt-ms=20&initial-rate-mbps=100"
+        "quic://127.0.0.1:9000?initial-srtt-s=0.02&initial-rate-mbps=100"
             .parse()
             .expect("path");
     let local = ServerLocalPath::new(0, path);

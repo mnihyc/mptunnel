@@ -114,9 +114,16 @@ pub(in crate::runtime) struct ClientTcpCarrierGroups {
 
 #[derive(Debug)]
 struct ClientTcpCarrierResourceState {
-    occupied_by_group: Box<[u16]>,
+    occupied_by_group: Box<[usize]>,
+    replacement_overlap_by_group: Box<[Option<ClientTcpReplacementOverlap>]>,
     occupied_path_ids: BTreeSet<u16>,
     next_path_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientTcpReplacementOverlap {
+    predecessor_path_id: PathId,
+    successor_path_id: PathId,
 }
 
 /// Exact physical-carrier reservation.
@@ -144,13 +151,24 @@ impl Drop for ClientTcpCarrierReservation {
         };
         {
             let mut resources = owner.resources.lock().expect("TCP carrier resource lock");
-            let occupied = resources
-                .occupied_by_group
-                .get_mut(self.config_index)
-                .expect("TCP carrier reservation group");
-            *occupied = occupied
-                .checked_sub(1)
-                .expect("TCP carrier group reservation released once");
+            {
+                let occupied = resources
+                    .occupied_by_group
+                    .get_mut(self.config_index)
+                    .expect("TCP carrier reservation group");
+                *occupied = occupied
+                    .checked_sub(1)
+                    .expect("TCP carrier group reservation released once");
+            }
+            let overlap = resources.replacement_overlap_by_group[self.config_index];
+            if overlap.is_some_and(|overlap| {
+                overlap.predecessor_path_id == self.path_id
+                    || overlap.successor_path_id == self.path_id
+            }) {
+                // Only an exact endpoint of the overlap can end it. An
+                // unrelated member failure cannot admit a second successor.
+                resources.replacement_overlap_by_group[self.config_index] = None;
+            }
             assert!(
                 resources.occupied_path_ids.remove(&self.path_id.0),
                 "TCP wire PathId reservation released once"
@@ -166,7 +184,6 @@ pub(in crate::runtime) struct ClientTcpMemberRetry {
     not_before: tokio::time::Instant,
     hop_instance: Option<CarrierPathInstanceId>,
     hop_not_before: Option<tokio::time::Instant>,
-    replacement_port: Option<u16>,
 }
 
 impl ClientTcpMemberRetry {
@@ -176,12 +193,15 @@ impl ClientTcpMemberRetry {
             not_before: now,
             hop_instance: None,
             hop_not_before: None,
-            replacement_port: None,
         }
     }
 
     pub(in crate::runtime) fn next_maintenance_at(&self) -> Option<tokio::time::Instant> {
         self.hop_not_before
+    }
+
+    fn defer_maintenance(&mut self, now: tokio::time::Instant, interval: Duration) {
+        self.hop_not_before = Some(now + interval);
     }
 }
 
@@ -189,10 +209,12 @@ impl ClientTcpCarrierGroups {
     pub(in crate::runtime) fn new(groups: Vec<ClientTcpCarrierGroup>) -> Arc<Self> {
         let (changes, _) = watch::channel(());
         let occupied_by_group = vec![0; groups.len()].into_boxed_slice();
+        let replacement_overlap_by_group = vec![None; groups.len()].into_boxed_slice();
         Arc::new(Self {
             groups: groups.into_boxed_slice(),
             resources: Mutex::new(ClientTcpCarrierResourceState {
                 occupied_by_group,
+                replacement_overlap_by_group,
                 occupied_path_ids: BTreeSet::new(),
                 next_path_id: 0,
             }),
@@ -208,10 +230,43 @@ impl ClientTcpCarrierGroups {
         self: &Arc<Self>,
         config_index: usize,
     ) -> Option<ClientTcpCarrierReservation> {
+        self.reserve_with_role(config_index, None)
+    }
+
+    /// Reserves the sole transient successor permitted for one TCP group.
+    ///
+    /// The configured maximum remains the number of current carrier members.
+    /// Planned maintenance may overlap one authenticated successor with one
+    /// retiring predecessor, but a second member in the same group cannot
+    /// independently expand that overlap.
+    pub(in crate::runtime) fn reserve_planned_replacement(
+        self: &Arc<Self>,
+        config_index: usize,
+        predecessor_path_id: PathId,
+    ) -> Option<ClientTcpCarrierReservation> {
+        self.reserve_with_role(config_index, Some(predecessor_path_id))
+    }
+
+    fn reserve_with_role(
+        self: &Arc<Self>,
+        config_index: usize,
+        planned_replacement: Option<PathId>,
+    ) -> Option<ClientTcpCarrierReservation> {
         let group = self.get(config_index)?;
         let mut resources = self.resources.lock().expect("TCP carrier resource lock");
         let occupied = *resources.occupied_by_group.get(config_index)?;
-        if occupied >= group.range.max() {
+        let configured_max = usize::from(group.range.max());
+        if planned_replacement.is_some() {
+            let replacement_overlap = resources.replacement_overlap_by_group.get(config_index)?;
+            if replacement_overlap.is_some()
+                || occupied != configured_max
+                || !resources
+                    .occupied_path_ids
+                    .contains(&planned_replacement?.0)
+            {
+                return None;
+            }
+        } else if occupied >= configured_max {
             return None;
         }
 
@@ -222,9 +277,17 @@ impl ClientTcpCarrierGroups {
             candidate = candidate.wrapping_add(1);
             selected
         })?;
+        let next_occupied = occupied.checked_add(1)?;
         resources.next_path_id = candidate;
         resources.occupied_path_ids.insert(path_id);
-        resources.occupied_by_group[config_index] = occupied + 1;
+        if let Some(predecessor_path_id) = planned_replacement {
+            resources.replacement_overlap_by_group[config_index] =
+                Some(ClientTcpReplacementOverlap {
+                    predecessor_path_id,
+                    successor_path_id: PathId(path_id),
+                });
+        }
+        resources.occupied_by_group[config_index] = next_occupied;
         drop(resources);
 
         Some(ClientTcpCarrierReservation {
@@ -234,13 +297,22 @@ impl ClientTcpCarrierGroups {
         })
     }
 
-    pub(in crate::runtime) fn occupied(&self, config_index: usize) -> Option<u16> {
+    pub(in crate::runtime) fn occupied(&self, config_index: usize) -> Option<usize> {
         self.resources
             .lock()
             .expect("TCP carrier resource lock")
             .occupied_by_group
             .get(config_index)
             .copied()
+    }
+
+    fn has_planned_replacement_overlap(&self, config_index: usize) -> bool {
+        self.resources
+            .lock()
+            .expect("TCP carrier resource lock")
+            .replacement_overlap_by_group
+            .get(config_index)
+            .is_some_and(Option::is_some)
     }
 
     pub(in crate::runtime) fn iter(&self) -> std::slice::Iter<'_, ClientTcpCarrierGroup> {
@@ -277,7 +349,8 @@ impl ClientTcpCarrierGroups {
     ) -> Option<tokio::time::Instant> {
         self.iter()
             .filter(|group| {
-                group.policy.snapshot().enabled
+                !self.has_planned_replacement_overlap(group.config_index)
+                    && group.policy.snapshot().enabled
                     && group.members.iter().all(|path_index| {
                         context
                             .tcp_sessions
@@ -290,9 +363,7 @@ impl ClientTcpCarrierGroups {
                 context
                     .tcp_sessions
                     .get(*path_index)
-                    .is_some_and(|session| {
-                        session.can_plan_replacement() && session.is_product_quiescent()
-                    })
+                    .is_some_and(|session| session.can_plan_replacement())
             })
             .filter_map(|path_index| retry.get(path_index)?.next_maintenance_at())
             .min()
@@ -336,7 +407,6 @@ impl ClientTcpCarrierGroups {
                     retry.not_before = now;
                     retry.hop_instance = None;
                     retry.hop_not_before = None;
-                    retry.replacement_port = None;
                 }
                 let ready_instance = session.connection_instance_id();
                 if retry.hop_instance != ready_instance {
@@ -357,7 +427,9 @@ impl ClientTcpCarrierGroups {
                 if !session.can_establish() {
                     continue;
                 }
-                if self.occupied(group.config_index).unwrap_or_default() >= group.range.max() {
+                if self.occupied(group.config_index).unwrap_or_default()
+                    >= usize::from(group.range.max())
+                {
                     continue;
                 }
                 if retry.not_before > now {
@@ -369,7 +441,6 @@ impl ClientTcpCarrierGroups {
                 // spin.
                 retry.not_before = now + retry_interval;
                 let session = session.clone();
-                let replacement_port = retry.replacement_port.take();
                 let connect_timeout = tcp_carrier_establishment_timeout(context, path_index);
                 establishment_attempts.spawn(async move {
                     let deadline = tokio::time::Instant::now() + connect_timeout;
@@ -377,7 +448,7 @@ impl ClientTcpCarrierGroups {
                         .prepare_connection_for_endpoint_generation_on_port(
                             deadline,
                             policy_snapshot.generation,
-                            replacement_port,
+                            None,
                         )
                         .await
                 });
@@ -406,6 +477,7 @@ impl ClientTcpCarrierGroups {
         for group in self.iter() {
             let policy_snapshot = group.policy.snapshot();
             if !policy_snapshot.enabled
+                || self.has_planned_replacement_overlap(group.config_index)
                 || !group.members.iter().all(|path_index| {
                     context
                         .tcp_sessions
@@ -462,10 +534,7 @@ impl ClientTcpCarrierGroups {
                 let Some(hop_not_before) = retry.hop_not_before else {
                     continue;
                 };
-                if hop_not_before > now
-                    || !session.can_plan_replacement()
-                    || !session.is_product_quiescent()
-                {
+                if hop_not_before > now || !session.can_plan_replacement() {
                     continue;
                 }
                 let Some(current_port) = session.connection_remote_port() else {
@@ -480,7 +549,7 @@ impl ClientTcpCarrierGroups {
                 let remote_port = match path.endpoint.ports().select_other(current_port) {
                     Ok(remote_port) => remote_port,
                     Err(error) => {
-                        retry.hop_not_before = Some(now + interval);
+                        retry.defer_maintenance(now, interval);
                         crate::observability::process_event!(
                             Warn,
                             "tcp",
@@ -490,58 +559,57 @@ impl ClientTcpCarrierGroups {
                         continue;
                     }
                 };
-                if self.occupied(group.config_index).unwrap_or_default() < group.range.max() {
-                    let session = session.clone();
-                    let connect_timeout = tcp_carrier_establishment_timeout(context, path_index);
-                    replacement_attempts.spawn(async move {
-                        let deadline = tokio::time::Instant::now() + connect_timeout;
-                        (
-                            path_index,
-                            interval,
-                            session
-                                .replace_connection_for_endpoint_generation(
-                                    deadline,
-                                    policy_snapshot.generation,
-                                    remote_port,
-                                )
-                                .await
-                                .map(|_| ()),
-                        )
-                    });
-                } else {
-                    match session.begin_connection_replacement_if_product_quiescent(
-                        policy_snapshot.generation,
-                    ) {
-                        Ok(true) => {
-                            retry.replacement_port = Some(remote_port);
-                            retry.hop_not_before = None;
-                            retry.not_before = now;
-                        }
-                        Ok(false) | Err(RuntimeError::NoSchedulableTcpPath) => {}
-                        Err(error) => {
-                            retry.hop_not_before = Some(now + interval);
-                            crate::observability::process_event!(
-                                Warn,
-                                "tcp",
-                                "port_replacement_failed",
-                                "planned TCP carrier replacement failed: {error}"
-                            );
-                        }
-                    }
-                }
+                let session = session.clone();
+                let member_ordinal = group
+                    .members
+                    .iter()
+                    .position(|member| *member == path_index)
+                    .expect("TCP group contains selected member");
+                let connect_timeout = tcp_carrier_establishment_timeout(context, path_index);
+                replacement_attempts.spawn(async move {
+                    let deadline = tokio::time::Instant::now() + connect_timeout;
+                    (
+                        path_index,
+                        member_ordinal,
+                        interval,
+                        session
+                            .replace_connection_for_endpoint_generation(
+                                deadline,
+                                policy_snapshot.generation,
+                                remote_port,
+                            )
+                            .await,
+                    )
+                });
                 break;
             }
         }
 
         while let Some(attempt) = replacement_attempts.join_next().await {
             match attempt {
-                Ok((path_index, _, Ok(())))
-                | Ok((path_index, _, Err(RuntimeError::NoSchedulableTcpPath))) => {
+                Ok((_, member_ordinal, _, Ok(replacement))) => {
+                    crate::observability::process_event!(
+                        Debug,
+                        "tcp",
+                        "carrier_port_replaced",
+                        "TCP carrier changed destination port by publishing a fresh carrier before draining its predecessor; \
+                         group={} member={} old_path_id={} new_path_id={} old_instance_id={} new_instance_id={} old_port={} new_port={}",
+                        replacement.group_index,
+                        member_ordinal,
+                        replacement.predecessor_path_id.0,
+                        replacement.successor_path_id.0,
+                        replacement.predecessor_instance_id.as_u64(),
+                        replacement.successor_instance_id.as_u64(),
+                        replacement.predecessor_port,
+                        replacement.successor_port,
+                    );
+                }
+                Ok((path_index, _, _, Err(RuntimeError::NoSchedulableTcpPath))) => {
                     let _ = path_index;
                 }
-                Ok((path_index, interval, Err(error))) => {
+                Ok((path_index, _, interval, Err(error))) => {
                     if let Some(retry) = retry.get_mut(path_index) {
-                        retry.hop_not_before = Some(tokio::time::Instant::now() + interval);
+                        retry.defer_maintenance(tokio::time::Instant::now(), interval);
                     }
                     crate::observability::process_event!(
                         Warn,
@@ -562,6 +630,10 @@ impl ClientTcpCarrierGroups {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests_group.rs"]
+mod tests;
 
 /// Prices a complete cold TCP carrier transaction from the same RFC timing
 /// model used by demand-driven stream attachment. A health-probe deadline owns

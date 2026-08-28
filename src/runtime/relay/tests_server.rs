@@ -104,6 +104,7 @@ async fn assert_post_resolution_denial_is_logical_stream_local(
         mux_limits: limits,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(1),
+        flow_idle_timeout: None,
         telemetry: RuntimeTelemetry::new(4),
     });
     let (registry, mut accepted_rx) = ServerReliableStreamRegistry::new_accepting_with_limits(
@@ -255,6 +256,7 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
         mux_limits: limits,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_millis(100),
+        flow_idle_timeout: None,
         telemetry: RuntimeTelemetry::new(1),
     };
     let (application, relay_side) = tokio::io::duplex(4096);
@@ -697,7 +699,7 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         SessionId(118),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(128);
@@ -713,7 +715,7 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         TrafficClass::Latency,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         128,
@@ -832,7 +834,7 @@ fn sparse_authoritative_ack_reinjects_the_lowest_live_path_gap() {
         SessionId(119),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     let outcome = enqueue_reliable_tail_reinjection(
@@ -846,7 +848,7 @@ fn sparse_authoritative_ack_reinjects_the_lowest_live_path_gap() {
         TrafficClass::Latency,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         64,
@@ -920,7 +922,7 @@ async fn sparse_ack_failed_original_reinjection_starts_at_lowest_hole() {
         SessionId(120),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     let outcome = enqueue_reliable_tail_reinjection(
@@ -934,7 +936,7 @@ async fn sparse_ack_failed_original_reinjection_starts_at_lowest_hole() {
         TrafficClass::Latency,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         64,
@@ -1418,7 +1420,7 @@ fn live_tail_stall_reinjection_is_not_queued_even_with_optional_budget() {
         SessionId(98),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 1,
+            optional_reinjection_budget_percent: 1,
         },
     );
     let initial_budget = response_sender.reinjection_extra_budget_remaining(limits);
@@ -1456,7 +1458,7 @@ fn live_tail_stall_reinjection_is_not_queued_even_with_optional_budget() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 1,
+            optional_reinjection_budget_percent: 1,
         },
         path_stream.max_frame_payload_bytes,
         ack_frontier,
@@ -1533,7 +1535,7 @@ fn failed_original_tail_reinjection_uses_remaining_output_after_persistent_stall
         SessionId(99),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -1549,7 +1551,7 @@ fn failed_original_tail_reinjection_uses_remaining_output_after_persistent_stall
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -1625,7 +1627,7 @@ fn failed_original_tail_reinjection_queues_one_bounded_target_flight() {
         SessionId(121),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -1641,7 +1643,7 @@ fn failed_original_tail_reinjection_queues_one_bounded_target_flight() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -1718,7 +1720,7 @@ fn unknown_original_tail_reinjection_uses_remaining_output_after_persistent_stal
         SessionId(119),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -1734,7 +1736,7 @@ fn unknown_original_tail_reinjection_uses_remaining_output_after_persistent_stal
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -1807,7 +1809,7 @@ async fn unknown_original_tail_reinjection_dispatches_as_path_failure_reinjectio
         SessionId(120),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -1823,7 +1825,7 @@ async fn unknown_original_tail_reinjection_dispatches_as_path_failure_reinjectio
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -1905,7 +1907,7 @@ fn live_original_without_data_ack_waits_for_authoritative_gap() {
         SessionId(121),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     let outcome = enqueue_reliable_tail_reinjection(
@@ -1919,7 +1921,7 @@ fn live_original_without_data_ack_waits_for_authoritative_gap() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         0,
@@ -1993,7 +1995,7 @@ fn live_original_without_data_ack_does_not_probe_prefix() {
         SessionId(122),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     let outcome = enqueue_reliable_tail_reinjection(
@@ -2007,7 +2009,7 @@ fn live_original_without_data_ack_does_not_probe_prefix() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         0,
@@ -2076,7 +2078,7 @@ fn unknown_original_tail_reinjection_without_ack_frontier_waits() {
         SessionId(120),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
 
@@ -2091,7 +2093,7 @@ fn unknown_original_tail_reinjection_without_ack_frontier_waits() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         0,
@@ -2165,12 +2167,12 @@ fn failed_original_tail_reinjection_does_not_duplicate_queued_reinjection_range(
         SessionId(109),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
     let performance = MppPerformanceConfig {
-        extra_traffic_hint_percent: 5,
+        optional_reinjection_budget_percent: 5,
     };
 
     let first = enqueue_reliable_tail_reinjection(
@@ -2282,7 +2284,7 @@ fn tail_reinjection_treats_live_inflight_reinjection_as_pending() {
         SessionId(127),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -2298,7 +2300,7 @@ fn tail_reinjection_treats_live_inflight_reinjection_as_pending() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -2376,7 +2378,7 @@ fn persistent_tail_reinjection_waits_when_live_reinjection_copy_is_in_flight() {
         SessionId(105),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -2392,7 +2394,7 @@ fn persistent_tail_reinjection_waits_when_live_reinjection_copy_is_in_flight() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -2478,7 +2480,7 @@ fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
         SessionId(106),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -2494,7 +2496,7 @@ fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -2584,7 +2586,7 @@ async fn live_tail_reinjection_uses_repair_headroom_before_new_data() {
         SessionId(127),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -2604,7 +2606,7 @@ async fn live_tail_reinjection_uses_repair_headroom_before_new_data() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -2712,7 +2714,7 @@ async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_repair_
         SessionId(124),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -2728,7 +2730,7 @@ async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_repair_
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -2830,7 +2832,7 @@ async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit()
         SessionId(125),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(128);
@@ -2930,7 +2932,7 @@ async fn final_tail_reinjection_uses_only_available_path() {
         SessionId(126),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(128);
@@ -3032,7 +3034,7 @@ async fn failed_original_reinjection_without_ack_frontier_starts_at_zero() {
         SessionId(103),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
 
@@ -3047,7 +3049,7 @@ async fn failed_original_reinjection_without_ack_frontier_starts_at_zero() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         0,
@@ -3134,7 +3136,7 @@ fn live_original_tail_without_ack_frontier_does_not_reinjection_on_alternate() {
         SessionId(104),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
 
@@ -3149,7 +3151,7 @@ fn live_original_tail_without_ack_frontier_does_not_reinjection_on_alternate() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         0,
@@ -3223,7 +3225,7 @@ fn failed_original_tail_reinjection_is_not_blocked_by_optional_budget() {
         SessionId(101),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     let optional_budget = response_sender.reinjection_extra_budget_remaining(limits);
@@ -3257,7 +3259,7 @@ fn failed_original_tail_reinjection_is_not_blocked_by_optional_budget() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,
@@ -3337,7 +3339,7 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
         SessionId(102),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     let optional_budget = response_sender.reinjection_extra_budget_remaining(limits);
@@ -3371,7 +3373,7 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         4096,
@@ -3478,7 +3480,7 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
         SessionId(103),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     let mut progress = ReliableAckGapReinjectionProgress::default();
@@ -3600,7 +3602,7 @@ fn persistent_tail_reinjection_preserves_original_flight_attribution() {
         SessionId(100),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
     response_sender.record_delivered_data(1024);
@@ -3616,7 +3618,7 @@ fn persistent_tail_reinjection_preserves_original_flight_attribution() {
         TrafficClass::Throughput,
         limits,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
         1024,

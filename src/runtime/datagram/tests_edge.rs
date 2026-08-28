@@ -7,8 +7,47 @@ use crate::runtime::product_policy::{ClientIngressRouter, ClientRoute};
 use crate::runtime::telemetry::{
     ProductFlowOriginKind, ProductFlowScope, ProductFlowSource, RuntimeTelemetry,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use tokio::sync::oneshot;
+
+#[tokio::test(start_paused = true)]
+async fn idle_close_publication_wait_is_bounded() {
+    let close = std::future::pending::<Result<(), RuntimeError>>();
+    let publication = tokio::spawn(bounded_idle_close_publication(
+        Duration::from_millis(50),
+        close,
+    ));
+    tokio::task::yield_now().await;
+    assert!(!publication.is_finished());
+
+    tokio::time::advance(Duration::from_millis(49)).await;
+    tokio::task::yield_now().await;
+    assert!(!publication.is_finished());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(matches!(
+        publication.await.expect("bounded publication task"),
+        Err(IdleClosePublicationError::TimedOut)
+    ));
+}
+
+#[tokio::test]
+async fn idle_close_transport_failure_is_diagnostic_not_a_flow_outcome() {
+    let result = bounded_idle_close_publication(Duration::from_secs(1), async {
+        Err(RuntimeError::Protocol(
+            "deterministic idle close publication failure",
+        ))
+    })
+    .await;
+    assert!(matches!(
+        result,
+        Err(IdleClosePublicationError::Failed(RuntimeError::Protocol(
+            "deterministic idle close publication failure"
+        )))
+    ));
+}
 
 async fn offline_edge_test_plan(
     target: &TargetAddr,
@@ -64,6 +103,77 @@ fn edge_test_request(target: &TargetAddr, payload: &'static [u8]) -> UdpEdgeRequ
     }
 }
 
+fn edge_test_retirement_gate() -> Arc<std::sync::Mutex<UdpEdgeRetirementGate>> {
+    Arc::new(std::sync::Mutex::new(UdpEdgeRetirementGate {
+        accepting: true,
+        activity: ProductFlowActivity::new(),
+    }))
+}
+
+#[tokio::test(start_paused = true)]
+async fn admitted_boundary_payload_rearms_before_the_idle_fence() {
+    let target = TargetAddr::Ip("203.0.113.20:443".parse().expect("edge test target"));
+    let timeout = Some(Duration::from_secs(5));
+    let (requests, mut receiver) = mpsc::channel(1);
+    let retirement = edge_test_retirement_gate();
+    let activity = retirement.lock().expect("retirement gate").activity.clone();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(activity.is_idle(timeout));
+
+    try_send_udp_edge_request(&requests, &retirement, edge_test_request(&target, b""))
+        .expect("pre-fence payload is accepted");
+    assert!(matches!(
+        fence_udp_edge_idle(timeout, &mut receiver, &retirement),
+        UdpEdgeIdleFence::Active
+    ));
+    let request = receiver.try_recv().expect("accepted payload remains owned");
+
+    assert!(
+        request.payload.is_empty(),
+        "empty application datagrams are activity"
+    );
+    assert!(
+        !activity.is_idle(timeout),
+        "claimed payload must rearm idleness"
+    );
+    assert!(!requests.is_closed());
+    assert!(retirement.lock().expect("retirement gate").accepting);
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_fence_rejects_postfence_payload_intact_for_a_successor() {
+    let target = TargetAddr::Ip("203.0.113.21:443".parse().expect("edge test target"));
+    let timeout = Some(Duration::from_secs(5));
+    let (retired_sender, mut retired_receiver) = mpsc::channel(1);
+    let retired_gate = edge_test_retirement_gate();
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    assert!(matches!(
+        fence_udp_edge_idle(timeout, &mut retired_receiver, &retired_gate,),
+        UdpEdgeIdleFence::Retired
+    ));
+    let request = match try_send_udp_edge_request(
+        &retired_sender,
+        &retired_gate,
+        edge_test_request(&target, b"successor"),
+    ) {
+        Err(mpsc::error::TrySendError::Closed(request)) => request,
+        Err(mpsc::error::TrySendError::Full(_)) => panic!("retired lane reported queue pressure"),
+        Ok(()) => panic!("post-fence payload entered the retired lane"),
+    };
+
+    let (successor_sender, mut successor_receiver) = mpsc::channel(1);
+    let successor_gate = edge_test_retirement_gate();
+    try_send_udp_edge_request(&successor_sender, &successor_gate, request)
+        .expect("exact rejected payload is accepted by successor");
+    let accepted = successor_receiver
+        .try_recv()
+        .expect("successor owns the exact payload");
+    assert_eq!(accepted.payload, Bytes::from_static(b"successor"));
+    assert_eq!(accepted.metadata, 9);
+    assert!(retired_sender.is_closed());
+}
+
 fn native_udp_edge_test_product_flow(target: &TargetAddr) -> OpenedProductFlow {
     let flow = FlowContext::without_source(
         Network::Udp,
@@ -85,6 +195,27 @@ fn native_udp_edge_test_product_flow(target: &TargetAddr) -> OpenedProductFlow {
 struct BlockingTerminalNativeUdpIo {
     recv_entered: Option<oneshot::Sender<()>>,
     recv_release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+struct CountingNativeUdpIo {
+    first_send_entered: Option<oneshot::Sender<()>>,
+    sends: Arc<AtomicUsize>,
+}
+
+impl NativeUdpIo for CountingNativeUdpIo {
+    async fn send_payload(&mut self, payload: &[u8]) -> Result<usize, RuntimeError> {
+        let previous = self.sends.fetch_add(1, Ordering::AcqRel);
+        if previous == 0
+            && let Some(entered) = self.first_send_entered.take()
+        {
+            let _ = entered.send(());
+        }
+        Ok(payload.len())
+    }
+
+    async fn recv_payload(&mut self, _buffer: &mut [u8]) -> Result<usize, RuntimeError> {
+        std::future::pending().await
+    }
 }
 
 impl NativeUdpIo for BlockingTerminalNativeUdpIo {
@@ -179,6 +310,8 @@ async fn native_receive_failure_settles_request_admitted_while_receive_is_in_fli
     };
     let lane_id = 44;
     let initial = edge_test_request(&target, b"initial");
+    let retirement = edge_test_retirement_gate();
+    let activity = retirement.lock().expect("retirement gate").activity.clone();
     let handle = tokio::spawn(run_native_udp_edge_lane(
         lane_id,
         9,
@@ -190,12 +323,16 @@ async fn native_receive_failure_settles_request_admitted_while_receive_is_in_fli
         initial,
         None,
         native_udp_edge_test_product_flow(&target),
+        None,
+        activity,
+        retirement.clone(),
     ));
     let mut lanes = vec![UdpEdgeLane {
         lane_id,
         metadata: 9,
         pending: 1,
         requests: request_tx,
+        retirement,
         cancel,
         handle: Some(handle),
     }];
@@ -273,6 +410,80 @@ async fn native_receive_failure_settles_request_admitted_while_receive_is_in_fli
         Err(mpsc::error::TryRecvError::Empty)
     ));
     close_udp_edge_lanes(lanes).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_fence_fails_stale_queued_payload_without_sending_it() {
+    let target = TargetAddr::Ip("203.0.113.16:443".parse().expect("native edge test target"));
+    let limits = edge_test_mux_limits(1);
+    let (completion_tx, mut completion_rx) = mpsc::channel(1);
+    completion_tx
+        .try_send(UdpEdgeCompletion::Discarded { lane_id: 90 })
+        .expect("hold initial completion publication");
+    let (request_tx, request_rx) = mpsc::channel(1);
+    let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+    let (first_send_entered, first_send_observed) = oneshot::channel();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let retirement = edge_test_retirement_gate();
+    let activity = retirement.lock().expect("retirement gate").activity.clone();
+    let handle = tokio::spawn(run_native_udp_edge_lane(
+        45,
+        9,
+        CountingNativeUdpIo {
+            first_send_entered: Some(first_send_entered),
+            sends: sends.clone(),
+        },
+        limits,
+        request_rx,
+        completion_tx,
+        cancelled,
+        edge_test_request(&target, b"initial"),
+        None,
+        native_udp_edge_test_product_flow(&target),
+        Some(Duration::from_secs(5)),
+        activity,
+        retirement.clone(),
+    ));
+
+    first_send_observed.await.expect("initial send started");
+    try_send_udp_edge_request(
+        &request_tx,
+        &retirement,
+        edge_test_request(&target, b"stale"),
+    )
+    .expect("source queue accepts the second payload before retirement");
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    assert!(matches!(
+        completion_rx.recv().await,
+        Some(UdpEdgeCompletion::Discarded { lane_id: 90 })
+    ));
+    assert!(matches!(
+        completion_rx.recv().await,
+        Some(UdpEdgeCompletion::Sent {
+            lane_id: 45,
+            result: Ok(()),
+            ..
+        })
+    ));
+    let terminal = completion_rx
+        .recv()
+        .await
+        .expect("stale accepted payload terminal completion");
+    assert!(matches!(
+        terminal,
+        UdpEdgeCompletion::Sent {
+            lane_id: 45,
+            result: Err(error),
+            ..
+        } if matches!(error.as_ref(), RuntimeError::ProductIdleTimeout)
+    ));
+    assert_eq!(
+        sends.load(Ordering::Acquire),
+        1,
+        "an expired queued payload must fail exactly once, not reach the socket"
+    );
+    handle.await.expect("idle-retired native UDP lane");
 }
 
 #[tokio::test]
@@ -618,6 +829,63 @@ async fn external_expiry_removes_all_overlapping_lanes_for_its_exact_metadata() 
 }
 
 #[tokio::test]
+async fn external_expiry_transfers_cleanup_to_lane_actor_instead_of_aborting_it() {
+    let (requests, _requests_rx) = mpsc::channel(1);
+    let retirement = edge_test_retirement_gate();
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+    let (cleanup_tx, cleanup_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        cancelled.changed().await.expect("retirement signal");
+        assert!(*cancelled.borrow());
+        let _ = cleanup_tx.send(());
+    });
+    let mut lanes = vec![UdpEdgeLane {
+        lane_id: 77,
+        metadata: 9_u8,
+        pending: 0,
+        requests,
+        retirement,
+        cancel,
+        handle: Some(handle),
+    }];
+
+    assert!(remove_udp_edge_lane(&mut lanes, &9));
+    assert!(lanes.is_empty());
+    tokio::time::timeout(Duration::from_secs(1), cleanup_rx)
+        .await
+        .expect("lane cleanup deadline")
+        .expect("lane cleanup ran to completion");
+}
+
+#[tokio::test]
+async fn owner_cancellation_leaves_the_udp_lane_actor_to_finish_cleanup() {
+    let (requests, _requests_rx) = mpsc::channel(1);
+    let retirement = edge_test_retirement_gate();
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+    let (cleanup_tx, cleanup_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        cancelled.changed().await.expect("retirement signal");
+        assert!(*cancelled.borrow());
+        let _ = cleanup_tx.send(());
+    });
+    let lane = UdpEdgeLane {
+        lane_id: 78,
+        metadata: 9_u8,
+        pending: 0,
+        requests,
+        retirement,
+        cancel,
+        handle: Some(handle),
+    };
+
+    drop(lane);
+    tokio::time::timeout(Duration::from_secs(1), cleanup_rx)
+        .await
+        .expect("detached cleanup deadline")
+        .expect("lane actor was not aborted with its owner");
+}
+
+#[tokio::test]
 async fn terminal_udp_denial_remains_silent_for_the_association_lifetime() {
     let (request_tx, request_rx) = mpsc::channel(2);
     let (completion_tx, mut completion_rx) = mpsc::channel(2);
@@ -632,6 +900,8 @@ async fn terminal_udp_denial_remains_silent_for_the_association_lifetime() {
         ttl_ms: 1_000,
         metadata: 9_u8,
     };
+    let retirement = edge_test_retirement_gate();
+    let activity = retirement.lock().expect("retirement gate").activity.clone();
     let lane = tokio::spawn(run_silent_udp_denial_lane(
         7,
         9_u8,
@@ -639,6 +909,9 @@ async fn terminal_udp_denial_remains_silent_for_the_association_lifetime() {
         completion_tx,
         cancelled,
         initial,
+        None,
+        activity,
+        retirement,
     ));
     request_tx
         .send(UdpEdgeRequest {

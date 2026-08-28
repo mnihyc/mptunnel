@@ -38,13 +38,17 @@ pub const DEFAULT_AUTH_FRESHNESS_WINDOW: Duration =
 pub const DEFAULT_AUTHENTICATION_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_AUTHENTICATION_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_AUTHENTICATION_TIMEOUT_MS);
-pub const DEFAULT_MAX_PENDING_AUTHENTICATIONS: usize = 128;
+pub const DEFAULT_MAX_PENDING_AUTHENTICATIONS: usize = 4_096;
 pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS);
 pub const DEFAULT_SESSION_RETENTION_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_SESSION_RETENTION_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_SESSION_RETENTION_TIMEOUT_MS);
+pub const DEFAULT_PRODUCT_FLOW_IDLE_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_PRODUCT_FLOW_IDLE_TIMEOUT: Option<Duration> = Some(Duration::from_secs(
+    DEFAULT_PRODUCT_FLOW_IDLE_TIMEOUT_SECONDS,
+));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -131,6 +135,8 @@ pub struct AppConfig {
     pub service: ServiceConfig,
     /// Logical MPP session lifetime across a break-before-make handover.
     pub session: SessionConfig,
+    /// Product TCP/UDP lifetime policy, independent of carrier/session liveness.
+    pub flow: ProductFlowConfig,
     /// Runtime envelopes shared by product streams, datagram flows, and carriers.
     pub resources: ResourceLimits,
     /// Product flow/open/DNS admission, independent of Core transport budgets.
@@ -146,6 +152,7 @@ impl AppConfig {
         self.logging.validate()?;
         self.service.validate()?;
         self.session.validate()?;
+        self.flow.validate()?;
         self.resources.validate()?;
         self.admission.validate()?;
         self.management.validate()?;
@@ -612,6 +619,30 @@ pub struct SessionConfig {
     /// retention and graceful TCP carrier retirement. Healthy idle streams do
     /// not consume it.
     pub retention_timeout: Duration,
+}
+
+/// Established Product flow lifetime, independent of carrier and session
+/// liveness. `None` explicitly disables payload-idle retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductFlowConfig {
+    pub idle_timeout: Option<Duration>,
+}
+
+impl Default for ProductFlowConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout: DEFAULT_PRODUCT_FLOW_IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl ProductFlowConfig {
+    pub fn validate(self) -> Result<(), ConfigError> {
+        if self.idle_timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(ConfigError::ProductFlowIdleTimeoutZero);
+        }
+        Ok(())
+    }
 }
 
 impl Default for SessionConfig {
@@ -1422,12 +1453,18 @@ fn validate_client_security_config(security: &ClientSecurityConfig) -> Result<()
     if security.auth_freshness_window.is_zero() {
         return Err(ConfigError::AuthFreshnessWindowZero);
     }
+    if security.auth_freshness_window.subsec_nanos() != 0 {
+        return Err(ConfigError::AuthFreshnessWindowSubsecond);
+    }
     Ok(())
 }
 
 fn validate_server_security_config(security: &ServerSecurityConfig) -> Result<(), ConfigError> {
     if security.auth_freshness_window.is_zero() {
         return Err(ConfigError::AuthFreshnessWindowZero);
+    }
+    if security.auth_freshness_window.subsec_nanos() != 0 {
+        return Err(ConfigError::AuthFreshnessWindowSubsecond);
     }
     if security.authentication_timeout.is_zero() {
         return Err(ConfigError::AuthenticationTimeoutZero);
@@ -1506,6 +1543,7 @@ pub enum ConfigError {
     LoggingSinkRequired,
     FlowEventsRequireInfo,
     AuthFreshnessWindowZero,
+    AuthFreshnessWindowSubsecond,
     AuthenticationTimeoutZero,
     MaxPendingAuthenticationsZero,
     NoPaths,
@@ -1539,6 +1577,7 @@ pub enum ConfigError {
     RestartMaxBackoffTooSmall,
     RestartLimitZero,
     SessionRetentionTimeoutZero,
+    ProductFlowIdleTimeoutZero,
     NoIngresses,
     NoListenAddresses,
     TooManyPaths { actual: usize, limit: usize },
@@ -1661,6 +1700,10 @@ impl std::fmt::Display for ConfigError {
             Self::AuthFreshnessWindowZero => {
                 write!(f, "auth freshness window must be greater than zero")
             }
+            Self::AuthFreshnessWindowSubsecond => write!(
+                f,
+                "auth freshness window must use whole seconds because authentication timestamps use Unix seconds"
+            ),
             Self::AuthenticationTimeoutZero => {
                 write!(f, "authentication timeout must be greater than zero")
             }
@@ -1771,6 +1814,12 @@ impl std::fmt::Display for ConfigError {
             Self::SessionRetentionTimeoutZero => {
                 write!(f, "session retention timeout must be greater than zero")
             }
+            Self::ProductFlowIdleTimeoutZero => {
+                write!(
+                    f,
+                    "Product flow idle timeout must be disabled or greater than zero"
+                )
+            }
             Self::NoIngresses => write!(f, "at least one client ingress is required"),
             Self::NoListenAddresses => {
                 write!(f, "proxy ingress requires at least one listen address")
@@ -1803,7 +1852,7 @@ impl std::fmt::Display for ConfigError {
             ),
             Self::ServerPathPortRotation => write!(
                 f,
-                "port-rotation-interval-ms is valid only for client carrier paths"
+                "port-rotation-interval-s is valid only for client carrier paths"
             ),
             Self::ServerPathPortRange => write!(
                 f,

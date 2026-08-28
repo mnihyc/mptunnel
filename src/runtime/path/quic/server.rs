@@ -7,7 +7,7 @@ use super::datagram::{ServerUdpDatagramStreamContext, handle_server_udp_datagram
 use super::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
     udp_path_finish_stream, udp_path_read_frame, udp_path_reject_stream, udp_path_write_frame,
-    warn_unexpected_udp_runtime_error,
+    warn_unexpected_udp_operation_error, warn_unexpected_udp_runtime_error,
 };
 use super::ip_tunnel::handle_server_udp_ip_tunnel;
 use super::metrics::run_server_quic_path_metrics;
@@ -203,7 +203,7 @@ async fn handle_server_udp_connection(
                     )
                     .await
                     {
-                        warn_unexpected_udp_runtime_error(
+                        warn_unexpected_udp_operation_error(
                             "server QUIC UDP path stream failed",
                             &err,
                         );

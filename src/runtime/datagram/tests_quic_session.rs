@@ -35,9 +35,21 @@ fn remote_metrics() -> PathMetrics {
     }
 }
 
+fn request_direction_remote_metrics() -> PathMetrics {
+    PathMetrics {
+        direction: crate::protocol::PathMetricDirection::ClientToServer,
+        ..remote_metrics()
+    }
+}
+
+#[test]
+fn remote_response_sender_metrics_do_not_become_client_request_evidence() {
+    assert!(remote_path_metrics_observation(remote_metrics()).is_none());
+}
+
 #[test]
 fn remote_path_metrics_rate_expires_at_advertised_remaining_budget_boundary() {
-    let metrics = remote_metrics();
+    let metrics = request_direction_remote_metrics();
 
     let received_at = Instant::now();
     let near_boundary = remote_path_metrics_observation_at(
@@ -47,7 +59,8 @@ fn remote_path_metrics_rate_expires_at_advertised_remaining_budget_boundary() {
             ..metrics
         },
         received_at,
-    );
+    )
+    .expect("same-direction peer advisory");
     assert!(near_boundary.rate_sample.is_some());
     assert_eq!(
         near_boundary.rate_sample_expires_at,
@@ -77,6 +90,7 @@ fn remote_path_metrics_rate_expires_at_advertised_remaining_budget_boundary() {
             },
             received_at,
         )
+        .expect("same-direction peer advisory")
         .rate_sample
         .is_none(),
         "an incoming stale advisory rate cannot be reborn as a fresh local one-second sample"
@@ -85,14 +99,20 @@ fn remote_path_metrics_rate_expires_at_advertised_remaining_budget_boundary() {
 
 #[test]
 fn remote_path_metrics_missing_loss_is_unknown_not_observed_zero() {
-    let metrics = remote_metrics();
-    assert_eq!(remote_path_metrics_observation(metrics).loss_rate, None);
+    let metrics = request_direction_remote_metrics();
+    assert_eq!(
+        remote_path_metrics_observation(metrics)
+            .expect("same-direction peer advisory")
+            .loss_rate,
+        None
+    );
     assert_eq!(
         remote_path_metrics_observation(PathMetrics {
             loss_observed: true,
             loss_ppm: 0,
             ..metrics
         })
+        .expect("same-direction peer advisory")
         .loss_rate,
         Some(0.0),
         "canonical observed zero remains distinct from absent loss"
@@ -101,12 +121,13 @@ fn remote_path_metrics_missing_loss_is_unknown_not_observed_zero() {
 
 #[test]
 fn remote_ack_reachability_without_sample_volume_is_not_rate_capacity() {
-    let metrics = remote_metrics();
+    let metrics = request_direction_remote_metrics();
     let observation = remote_path_metrics_observation(PathMetrics {
         data_sample_count: 0,
         data_sample_bytes: 0,
         ..metrics
-    });
+    })
+    .expect("same-direction peer advisory");
     assert_eq!(observation.rtt, Duration::from_millis(20));
     assert!(observation.rate_sample.is_none());
     assert_eq!(observation.rate_sample_expires_at, None);

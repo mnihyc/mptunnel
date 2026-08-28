@@ -19,8 +19,8 @@ pub const DEFAULT_QUIC_LOSS_COMPENSATION_PERCENT: u32 = 10;
 /// Complete public query-key vocabulary accepted by carrier path URIs.
 pub const CARRIER_PATH_QUERY_KEYS: &[&str] = &[
     "source-address",
-    "initial-srtt-ms",
-    "initial-rttvar-ms",
+    "initial-srtt-s",
+    "initial-rttvar-s",
     "initial-rate-bps",
     "initial-rate-kbps",
     "initial-rate-mbps",
@@ -28,7 +28,7 @@ pub const CARRIER_PATH_QUERY_KEYS: &[&str] = &[
     "loss-compensation-percent",
     "max-datagram-payload-bytes",
     "max-tcp-carriers",
-    "port-rotation-interval-ms",
+    "port-rotation-interval-s",
     "backup",
     "expensive",
     "allow-bulk",
@@ -339,6 +339,14 @@ pub enum RateHint {
 pub struct LossPolicyPercent(u32);
 
 impl LossPolicyPercent {
+    pub const fn from_ppm(ppm: u32) -> Option<Self> {
+        if ppm < 1_000_000 {
+            Some(Self(ppm))
+        } else {
+            None
+        }
+    }
+
     pub const fn ppm(self) -> u32 {
         self.0
     }
@@ -387,9 +395,8 @@ impl PathSpec {
             .then_some(self.metadata.tcp_carriers.unwrap_or_default())
     }
 
-    /// A ranged QUIC carrier migrates in place. A ranged TCP carrier uses this
-    /// interval to schedule bounded quiescent replacement; make-before-break
-    /// is possible only when the physical group envelope has spare capacity.
+    /// A ranged QUIC carrier migrates in place. A ranged TCP group uses this
+    /// interval to schedule one transient make-before-break replacement.
     pub fn port_hop_interval(&self) -> Option<Duration> {
         (!self.endpoint.ports().is_single()).then(|| {
             Duration::from_millis(u64::from(
@@ -477,11 +484,18 @@ fn parse_path_options(
             "source-address" => {
                 binding.source_ip = Some(parse_ip_param(key, value)?);
             }
-            "initial-srtt-ms" => {
-                metadata.initial_srtt_ms = Some(parse_nonzero_u32_param(key, value)?);
+            "initial-srtt-s" => {
+                let milliseconds = parse_millisecond_seconds_param(key, value)?;
+                if milliseconds == 0 {
+                    return Err(PathSpecParseError::InvalidQueryParamValue(
+                        key.to_string(),
+                        value.unwrap_or_default().to_string(),
+                    ));
+                }
+                metadata.initial_srtt_ms = Some(milliseconds);
             }
-            "initial-rttvar-ms" => {
-                metadata.initial_jitter_ms = Some(parse_u32_param(key, value)?);
+            "initial-rttvar-s" => {
+                metadata.initial_jitter_ms = Some(parse_millisecond_seconds_param(key, value)?);
             }
             "initial-rate-bps" => {
                 reject_duplicate(rate_set, key)?;
@@ -533,7 +547,7 @@ fn parse_path_options(
             "max-tcp-carriers" => {
                 metadata.tcp_carriers = Some(parse_tcp_carrier_limit(key, value)?);
             }
-            "port-rotation-interval-ms" => {
+            "port-rotation-interval-s" => {
                 metadata.port_hop_interval_ms = Some(parse_port_hop_interval(key, value)?);
             }
             "backup" => metadata.policy.backup = parse_bool_param(key, value)?,
@@ -558,13 +572,6 @@ fn reject_duplicate(seen: bool, key: &str) -> Result<(), PathSpecParseError> {
     }
 }
 
-fn parse_u32_param(key: &str, value: Option<&str>) -> Result<u32, PathSpecParseError> {
-    let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
-    value
-        .parse::<u32>()
-        .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
-}
-
 fn parse_ip_param(key: &str, value: Option<&str>) -> Result<IpAddr, PathSpecParseError> {
     let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
     value
@@ -577,17 +584,6 @@ fn parse_u64_param(key: &str, value: Option<&str>) -> Result<u64, PathSpecParseE
     value
         .parse::<u64>()
         .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
-}
-
-fn parse_nonzero_u32_param(key: &str, value: Option<&str>) -> Result<u32, PathSpecParseError> {
-    let parsed = parse_u32_param(key, value)?;
-    if parsed == 0 {
-        return Err(PathSpecParseError::InvalidQueryParamValue(
-            key.to_string(),
-            parsed.to_string(),
-        ));
-    }
-    Ok(parsed)
 }
 
 fn parse_nonzero_u64_param(key: &str, value: Option<&str>) -> Result<u64, PathSpecParseError> {
@@ -677,7 +673,7 @@ fn parse_loss_compensation_percent(
 }
 
 fn parse_port_hop_interval(key: &str, value: Option<&str>) -> Result<u32, PathSpecParseError> {
-    let interval = parse_u32_param(key, value)?;
+    let interval = parse_millisecond_seconds_param(key, value)?;
     if interval < MIN_CARRIER_PORT_HOP_INTERVAL_MS {
         return Err(PathSpecParseError::InvalidQueryParamValue(
             key.to_string(),
@@ -685,6 +681,28 @@ fn parse_port_hop_interval(key: &str, value: Option<&str>) -> Result<u32, PathSp
         ));
     }
     Ok(interval)
+}
+
+fn parse_millisecond_seconds_param(
+    key: &str,
+    value: Option<&str>,
+) -> Result<u32, PathSpecParseError> {
+    let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
+    let seconds = value.parse::<f64>().map_err(|_| {
+        PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+    })?;
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|_| {
+        PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+    })?;
+    let milliseconds = u32::try_from(duration.as_millis())
+        .map_err(|_| PathSpecParseError::QueryParamOverflow(key.to_string()))?;
+    if Duration::from_millis(u64::from(milliseconds)) != duration {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            value.to_string(),
+        ));
+    }
+    Ok(milliseconds)
 }
 
 fn parse_tcp_carrier_limit(
@@ -884,7 +902,7 @@ impl std::fmt::Display for PathSpecParseError {
             Self::PortRotationIntervalRequiresRangedPath => {
                 write!(
                     f,
-                    "port-rotation-interval-ms requires a ranged carrier endpoint"
+                    "port-rotation-interval-s requires a ranged carrier endpoint"
                 )
             }
         }

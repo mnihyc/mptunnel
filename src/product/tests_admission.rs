@@ -27,6 +27,24 @@ fn small_limits() -> ProductAdmissionConfig {
 }
 
 #[test]
+fn every_default_product_admission_boundary_is_4096() {
+    let limits = ProductAdmissionConfig::default();
+    assert_eq!(
+        [
+            limits.max_live_flows,
+            limits.max_concurrent_work,
+            limits.max_live_flows_per_principal,
+            limits.max_live_flows_per_outbound,
+            limits.max_connects_per_outbound,
+            limits.max_live_flows_per_target,
+            limits.max_connects_per_target,
+            limits.max_dns_work,
+        ],
+        [4_096; 8]
+    );
+}
+
+#[test]
 fn limits_are_strict_and_independent_dimensions_recover_exactly() {
     let admission = ProductAdmission::new(small_limits()).expect("admission");
     let first = admission

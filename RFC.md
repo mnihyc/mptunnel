@@ -273,10 +273,10 @@ the identity and roaming rules above.
 
 When a configured endpoint contains more than one destination port, each
 initial carrier selects a port uniformly with process-local cryptographic
-randomness. `port_hop_interval_ms` is an earliest maintenance interval, not a
-failure detector, validation deadline, or capacity signal. Its Product default
-is `300000` ms and values below `5000` ms are rejected, matching the established
-minimum used by deployed QUIC port-hopping practice while avoiding
+randomness. `port-rotation-interval-s` is an earliest maintenance interval,
+not a failure detector, validation deadline, or capacity signal. Its Product
+default is `300` seconds and values below `5` seconds are rejected, matching the
+established minimum used by deployed QUIC port-hopping practice while avoiding
 connection/socket churn. A hop selects a different configured port when one
 exists; missed intervals coalesce into one action and never trigger catch-up
 bursts.
@@ -289,10 +289,46 @@ and it MUST retain the preceding socket until traffic is observed through the
 new locator. QUIC retains sole authority over connection migration, path
 validation, recovery, and path-dependent transport state; `PathId`, the carrier
 instance, its attachments, and all MPP state remain unchanged. This operation
-adds no MPP wire field. Changing a TCP destination port requires a new TCP
-connection and therefore a new carrier instance. TCP hopping follows the
-bounded pool replacement rules in Section 7.2; the maintenance interval never
-authorizes state transfer or aggressive retirement.
+adds no MPP wire field. The port is a locator, not an evidence epoch: MPP MUST
+NOT cold-start, copy, or relabel carrier evidence merely because that locator
+changed. Configured startup hints remain properties of the logical path, while
+the retained connection's live native state remains exclusively under QUIC's
+validation and recovery rules. If QUIC instead establishes a replacement
+connection, it creates a new carrier instance; only configured hints survive,
+and predecessor measurements, queues, flight, ACK ownership, and sample
+authority MUST NOT cross into it. Changing a TCP destination port likewise
+requires a new TCP connection and therefore a new carrier instance. TCP hopping
+follows the bounded pool replacement rules in Section 7.2; the maintenance
+interval never authorizes state transfer or aggressive retirement.
+
+### 4.4 Product payload-idle lifetime
+
+An L4 endpoint MAY configure one Product payload-idle lifetime through
+`[flow].idle_timeout_s`. The Core Profile default is 300 seconds; zero disables
+this lifetime. It applies equally to reliable streams and application-datagram
+associations, independently of the selected direct, proxy, or MPP egress.
+
+One or more reliable-stream bytes, or one fresh application datagram including
+a zero-length datagram, accepted in either direction refreshes the local
+lifetime. TCP FIN, zero-length stream I/O, acknowledgements, MPP or QUIC
+control traffic, carrier heartbeats, keep-alives, probes, retransmission, and
+recovery MUST NOT refresh it. A half-closed reliable stream MAY continue
+carrying payload in its remaining direction; the half-close alone neither
+retires nor keeps the stream alive.
+
+Deadline handling MUST linearize accepted payload with retirement. Payload
+recorded before the retirement commit refreshes the lifetime; once retirement
+commits, a late producer cannot revive that incarnation. Cancellation of an
+owner task MUST NOT strand its admission, attachment, route, or cleanup state;
+terminal cleanup remains exact and idempotent.
+
+Expiry terminates that exact Product flow and releases its admission,
+telemetry, attachment, and datagram-route ownership. On MPP egress the endpoint
+uses the ordinary stream reset or datagram close path. Expiry MUST NOT by itself
+mark a carrier or session failed, transfer authority, or restart a carrierless
+retention epoch. Product payload-idle lifetime, carrier liveness, and
+`[session].retention_timeout_s` are independent local clocks and endpoints MUST
+NOT assume that peer values or deadlines are equal.
 
 ## 5. Session and Carrier Establishment
 
@@ -608,7 +644,7 @@ Native failure before that boundary uses ordinary retained-state recovery.
 The client starts a local absolute graceful-retirement ceiling when it closes
 new carrier admission and begins local drain; the server starts its own when
 it receives `PATH_DRAIN`. Each uses the configured
-`[session].retention_timeout_ms`, never restarts or extends it, and does not
+`[session].retention_timeout_s`, never restarts or extends it, and does not
 assume that the peer's deadline is equal or synchronized. Expiry closes that
 exact native TCP carrier and enters ordinary exact-failure recovery; it does
 not synthesize `PATH_CLOSE`.
@@ -896,15 +932,30 @@ One physical carrier consumes one group reservation and one session-unique TCP
 `PathId` from connection initiation. Pre-readiness connection,
 authentication, or policy-generation failure releases both. After readiness,
 only the exact ordered `PATH_CLOSE` or exact native failure releases them.
-The occupied set MUST NOT exceed the configured maximum.
+The configured maximum bounds current carrier members. Planned maintenance may
+add exactly one transient successor reservation per group; it is not a fourth
+schedulable member of a three-member group and a second member cannot create a
+second overlap. The endpoint's ordinary session path limit still counts that
+successor, and the receiver MUST NOT relax its authenticated per-session or
+global carrier admission limits for a claimed replacement.
 
 A member ordinal names durable configured pool capacity, not a physical
 connection. It normally owns one current exact carrier instance. A planned
-replacement may temporarily own a successor or retiring predecessor only while
-the total group envelope remains within the configured maximum. Successor
-publication and predecessor drain are exact-instance transitions; no
-attachment, queue, flight, transport evidence, or scheduling state transfers
-between them.
+replacement may temporarily own an authenticated successor and a retiring
+predecessor under that sole group-scoped transient reservation. The client
+publishes the fresh `PathId` and carrier instance only if the predecessor is
+still current, then fences the predecessor from new placement and begins its
+ordered drain. Product work committed before that atomic publication remains
+fenced to the predecessor and follows ordinary detachment, recovery, and
+reattachment; later work observes only the successor. No attachment, queue,
+flight, native transport evidence, or scheduling state transfers between the
+two instances.
+
+Immutable configured startup RTT, jitter, and rate hints remain properties of
+the logical member. The successor's own authenticated readiness exchange MAY
+replace the configured RTT in its connection-local startup hint. Live
+predecessor measurements, sample authority, and native TCP state MUST NOT be
+carried into the successor.
 
 Exact native failure removes only the failed instance and immediately wakes
 pool reconciliation. Restoration never waits for a throughput observation,
@@ -939,11 +990,12 @@ three-carrier pool.
 
 Planned maintenance selects the earliest-due healthy member and rotates at most
 one member per group at a time. A successful replacement receives a fresh
-deadline, so no ordinal is systematically retained. With spare envelope
-capacity, replacement MAY be make-before-break. At the configured maximum,
-replacement waits for exact Product quiescence, fences that member from new
-placement, drains it, and re-establishes it without exceeding the bound.
-Failure handling remains immediate and is not delayed by planned retirement.
+deadline, so no ordinal is systematically retained. Replacement authenticates
+the sole transient successor before publishing it and before draining the
+predecessor. A failed or stale successor is discarded, leaves the predecessor
+authoritative, releases the transient reservation, and defers another planned
+attempt by the complete maintenance interval. Failure handling remains
+immediate and is not delayed by planned retirement.
 
 A maximum change MUST preserve exact live-instance identity. Increasing it
 creates fresh member ordinals. Decreasing it drains surplus members in
@@ -1161,7 +1213,8 @@ application bytes when doing so would exceed the MPP resource envelope.
 A newly authenticated carrier may attach to that retained stream. Attempts to
 restore attachment MUST NOT extend the original no-attachment deadline.
 Expiry retires the stream and its application connection. Ordinary application
-idle on a live attachment is not attachment loss.
+idle on a live attachment is not attachment loss; it may independently reach
+the Product payload-idle lifetime in Section 4.4.
 
 Loss of the last carrier is not `SESSION_CLOSE`. While the MPP session or any
 retained stream or datagram state remains within its original configured
@@ -1305,7 +1358,7 @@ packet-payload queue pressure.
 
 When the attachment set makes a true non-empty-to-empty transition, an endpoint
 that retains the carrierless logical tunnel starts one absolute retention epoch
-using `[session].retention_timeout_ms`. A successful empty-to-non-empty
+using `[session].retention_timeout_s`. A successful empty-to-non-empty
 reattachment cancels that epoch. A failed, refused, duplicate, superseded, or
 stale open or close does not start, restart, or extend it. If the deadline is
 reached while the same principal, session, tunnel incarnation, retention epoch,
@@ -1780,6 +1833,13 @@ ranges on surviving authenticated attachments. Frame-codec, authentication,
 configuration, and Product protocol failures do not acquire that recovery
 authority merely because they were observed through a QUIC carrier.
 
+Peer abandonment of one operation-scoped HTTP/3 request-stream direction with
+application code zero is an operation-local, error-free shutdown signal. It
+MUST NOT alone publish carrier failure or warn as a carrier runtime error; the
+connection and sibling request streams remain authoritative. A nonzero
+application error, malformed/truncated frame, or terminal loss of a carrier
+control stream keeps its ordinary smallest-safe-scope failure semantics.
+
 ## 14. Security and Privacy
 
 ### 14.1 Authentication and replay
@@ -1818,9 +1878,11 @@ NOT:
 - transfer state to another carrier instance.
 
 A peer cannot select the client's TCP pool size or member identity. The client
-MUST bound every carrier group by its configured maximum and the session
-resource envelope independently of peer input. Input for a stale physical
-instance has no authority over a current member.
+MUST bound every carrier group to its configured current members plus the sole
+exact planned-replacement overlap in Section 7.2, all within the local session
+resource envelope and independently of peer input. The server applies its
+ordinary authenticated session/global carrier caps to both instances. Input
+for a stale physical instance has no authority over a current member.
 
 Datagram replay windows, response caches, pending native datagrams,
 reassemblies, and target forwarding are bounded. Reused IDs with conflicting
@@ -1952,6 +2014,12 @@ use the gradual lifecycle in Section 7.2.
 
 Ordinary reinjection is limited by cumulative extra-traffic credit funded by a
 bounded startup allowance and unique bytes acknowledged by MPP Data ACK.
+The Product default is 10 percent. `[flow].optional_reinjection_budget_percent`
+sets the local sender default and an MPP inbound/outbound performance value may
+override it for that node. The value is directional and peers do not negotiate
+it. It meters optional reliable MPP payload reinjection, not native transport
+retransmission, MPP control or probe traffic, or the cause-bounded critical
+recovery authority defined below.
 
 Exact carrier-instance failure permits immediate bounded reinjection on an
 eligible live alternative. A measured survivor is preferred, but liveness is
@@ -2259,6 +2327,12 @@ Overstating it can classify real drop-based congestion as authorized loss and
 can consume additional capacity. The preferred nonzero default is therefore
 an explicit performance/fairness tradeoff, not an inference that every path
 has 10% exogenous loss.
+
+Product configuration names this sender policy
+`quic_loss_compensation_percent`. A matching MPP inbound/outbound performance
+value overrides `[flow]`; an explicit `loss-compensation-percent` on one QUIC
+path URI overrides both. The complete resolution order is path URI, node
+performance, `[flow]`, then the built-in preferred value of 10 percent.
 
 The compensation value itself injects no packet. For reliable traffic under
 an actual independent 10% post-service erasure rate, native retransmission

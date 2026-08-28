@@ -4410,10 +4410,10 @@ fn observed_udp_datagram_loss_prefers_alternative_for_next_realtime_packet() {
     let resources = ResourceLimits::default();
     let context = ClientPathContext::new(
         vec![
-            "quic://127.0.0.1:10000?initial-srtt-ms=20&initial-rate-mbps=200"
+            "quic://127.0.0.1:10000?initial-srtt-s=0.02&initial-rate-mbps=200"
                 .parse()
                 .expect("path"),
-            "quic://127.0.0.1:10001?initial-srtt-ms=30&initial-rate-mbps=200"
+            "quic://127.0.0.1:10001?initial-srtt-s=0.03&initial-rate-mbps=200"
                 .parse()
                 .expect("path"),
         ],
@@ -4552,7 +4552,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         ResourceLimits::default().max_streams,
     ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let path = "tcp://127.0.0.1:10000?initial-srtt-ms=20&initial-rate-mbps=500"
+    let path = "tcp://127.0.0.1:10000?initial-srtt-s=0.02&initial-rate-mbps=500"
         .parse::<PathSpec>()
         .expect("path spec");
     let initial_metrics =

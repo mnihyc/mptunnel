@@ -44,8 +44,9 @@ const MANAGED_CREDENTIAL_ID: &str = "credential";
 const MANAGED_PINNED_CERTIFICATE_ID: &str = "pinned-certificate";
 const MANAGED_TRANSPORT_SECRET_ID: &str = "transport-secret";
 const ANDROID_LOCAL_USER_ID: &str = "v2rayng-local";
+const EDITOR_PROJECTION_SCHEMA_VERSION: u8 = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditorProjection {
     schema_version: u8,
@@ -74,18 +75,18 @@ struct EditorPath {
     endpoint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditorAdvanced {
-    path_probe_interval_ms: i64,
-    path_probe_timeout_ms: i64,
-    extra_traffic_hint_percent: i64,
-    auth_freshness_window_seconds: i64,
-    session_retention_timeout_ms: i64,
-    tcp_heartbeat_interval_ms: i64,
-    tcp_heartbeat_timeout_ms: i64,
-    quic_keep_alive_interval_ms: i64,
-    quic_idle_timeout_ms: i64,
+    path_probe_interval_s: f64,
+    path_probe_timeout_s: f64,
+    optional_reinjection_budget_percent: i64,
+    auth_freshness_window_s: f64,
+    session_retention_timeout_s: f64,
+    tcp_heartbeat_interval_s: f64,
+    tcp_heartbeat_timeout_s: f64,
+    quic_keep_alive_interval_s: f64,
+    quic_idle_timeout_s: f64,
 }
 
 #[derive(Deserialize)]
@@ -530,7 +531,7 @@ fn project_editor(contents: &str) -> Result<EditorProjection, AndroidBridgeError
     let paths = project_paths(outbound)?;
     let advanced = project_advanced(&document, outbound, security)?;
     Ok(EditorProjection {
-        schema_version: 1,
+        schema_version: EDITOR_PROJECTION_SCHEMA_VERSION,
         log_level,
         target_resolution: Some(target_resolution),
         paths,
@@ -651,15 +652,15 @@ fn project_advanced(
     let session = document.get("session").and_then(Item::as_table);
     let resources = document.get("resources").and_then(Item::as_table);
     let any_present = [
-        outbound.get("path_probe_interval_ms"),
-        outbound.get("path_probe_timeout_ms"),
-        performance.and_then(|table| table.get("extra_traffic_hint_percent")),
-        security.get("auth_freshness_window_seconds"),
-        session.and_then(|table| table.get("retention_timeout_ms")),
-        resources.and_then(|table| table.get("tcp_path_heartbeat_interval_ms")),
-        resources.and_then(|table| table.get("tcp_path_heartbeat_timeout_ms")),
-        resources.and_then(|table| table.get("quic_path_keep_alive_interval_ms")),
-        resources.and_then(|table| table.get("quic_path_idle_timeout_ms")),
+        outbound.get("path_probe_interval_s"),
+        outbound.get("path_probe_timeout_s"),
+        performance.and_then(|table| table.get("optional_reinjection_budget_percent")),
+        security.get("auth_freshness_window_s"),
+        session.and_then(|table| table.get("retention_timeout_s")),
+        resources.and_then(|table| table.get("tcp_path_heartbeat_interval_s")),
+        resources.and_then(|table| table.get("tcp_path_heartbeat_timeout_s")),
+        resources.and_then(|table| table.get("quic_path_keep_alive_interval_s")),
+        resources.and_then(|table| table.get("quic_path_idle_timeout_s")),
     ]
     .into_iter()
     .any(|item| item.is_some());
@@ -667,52 +668,75 @@ fn project_advanced(
         return Ok(None);
     }
     Ok(Some(EditorAdvanced {
-        path_probe_interval_ms: optional_integer(
+        path_probe_interval_s: optional_number(
             outbound,
-            "path_probe_interval_ms",
-            crate::config::DEFAULT_PATH_PROBE_INTERVAL_MS as i64,
+            "path_probe_interval_s",
+            crate::config::DEFAULT_PATH_PROBE_INTERVAL.as_secs_f64(),
         )?,
-        path_probe_timeout_ms: optional_integer(
+        path_probe_timeout_s: optional_number(
             outbound,
-            "path_probe_timeout_ms",
-            crate::config::DEFAULT_PATH_PROBE_TIMEOUT_MS as i64,
+            "path_probe_timeout_s",
+            crate::config::DEFAULT_PATH_PROBE_TIMEOUT.as_secs_f64(),
         )?,
-        extra_traffic_hint_percent: optional_child_integer(
+        optional_reinjection_budget_percent: optional_child_integer(
             performance,
-            "extra_traffic_hint_percent",
-            crate::config::DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT as i64,
+            "optional_reinjection_budget_percent",
+            crate::config::DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT as i64,
         )?,
-        auth_freshness_window_seconds: optional_integer(
+        auth_freshness_window_s: optional_number(
             security,
-            "auth_freshness_window_seconds",
-            crate::config::DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS as i64,
+            "auth_freshness_window_s",
+            crate::config::DEFAULT_AUTH_FRESHNESS_WINDOW.as_secs_f64(),
         )?,
-        session_retention_timeout_ms: optional_child_integer(
+        session_retention_timeout_s: optional_child_number(
             session,
-            "retention_timeout_ms",
-            crate::config::DEFAULT_SESSION_RETENTION_TIMEOUT_MS as i64,
+            "retention_timeout_s",
+            crate::config::DEFAULT_SESSION_RETENTION_TIMEOUT.as_secs_f64(),
         )?,
-        tcp_heartbeat_interval_ms: optional_child_integer(
+        tcp_heartbeat_interval_s: optional_child_number(
             resources,
-            "tcp_path_heartbeat_interval_ms",
-            crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS as i64,
+            "tcp_path_heartbeat_interval_s",
+            crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL.as_secs_f64(),
         )?,
-        tcp_heartbeat_timeout_ms: optional_child_integer(
+        tcp_heartbeat_timeout_s: optional_child_number(
             resources,
-            "tcp_path_heartbeat_timeout_ms",
-            crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS as i64,
+            "tcp_path_heartbeat_timeout_s",
+            crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT.as_secs_f64(),
         )?,
-        quic_keep_alive_interval_ms: optional_child_integer(
+        quic_keep_alive_interval_s: optional_child_number(
             resources,
-            "quic_path_keep_alive_interval_ms",
-            crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS as i64,
+            "quic_path_keep_alive_interval_s",
+            crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL.as_secs_f64(),
         )?,
-        quic_idle_timeout_ms: optional_child_integer(
+        quic_idle_timeout_s: optional_child_number(
             resources,
-            "quic_path_idle_timeout_ms",
-            crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS as i64,
+            "quic_path_idle_timeout_s",
+            crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT.as_secs_f64(),
         )?,
     }))
+}
+
+fn optional_child_number(
+    table: Option<&Table>,
+    key: &str,
+    default: f64,
+) -> Result<f64, AndroidBridgeError> {
+    table.map_or(Ok(default), |table| optional_number(table, key, default))
+}
+
+fn optional_number(table: &Table, key: &str, default: f64) -> Result<f64, AndroidBridgeError> {
+    table.get(key).map_or(Ok(default), |item| {
+        let value = item
+            .as_float()
+            .or_else(|| item.as_integer().map(|value| value as f64))
+            .ok_or_else(|| bridge_error(format!("editable field {key:?} must be a number")))?;
+        if !value.is_finite() {
+            return Err(bridge_error(format!(
+                "editable field {key:?} must be finite"
+            )));
+        }
+        Ok(value)
+    })
 }
 
 fn optional_child_integer(
@@ -733,7 +757,7 @@ fn optional_integer(table: &Table, key: &str, default: i64) -> Result<i64, Andro
 fn parse_projection_json(contents: &str) -> Result<EditorProjection, AndroidBridgeError> {
     let projection = serde_json::from_str::<EditorProjection>(contents)
         .map_err(|_| bridge_error("editor projection JSON is invalid"))?;
-    if projection.schema_version != 1 {
+    if projection.schema_version != EDITOR_PROJECTION_SCHEMA_VERSION {
         return Err(bridge_error("unsupported editor projection schema version"));
     }
     validate_editor_log_level(&projection.log_level)?;
@@ -751,6 +775,15 @@ fn set_table_value(table: &mut Table, key: &str, mut value: Value) {
         *item = Item::Value(value);
     } else {
         table.insert(key, Item::Value(value));
+    }
+}
+
+fn editor_number_value(value: f64) -> Value {
+    let integer = value as i64;
+    if value.is_finite() && integer != i64::MAX && integer as f64 == value {
+        Value::from(integer)
+    } else {
+        Value::from(value)
     }
 }
 
@@ -1317,37 +1350,37 @@ fn patch_advanced(
             Some(advanced) => {
                 set_table_value(
                     outbound,
-                    "path_probe_interval_ms",
-                    Value::from(advanced.path_probe_interval_ms),
+                    "path_probe_interval_s",
+                    editor_number_value(advanced.path_probe_interval_s),
                 );
                 set_table_value(
                     outbound,
-                    "path_probe_timeout_ms",
-                    Value::from(advanced.path_probe_timeout_ms),
+                    "path_probe_timeout_s",
+                    editor_number_value(advanced.path_probe_timeout_s),
                 );
                 let performance = ensure_child_table(outbound, "performance")?;
                 set_table_value(
                     performance,
-                    "extra_traffic_hint_percent",
-                    Value::from(advanced.extra_traffic_hint_percent),
+                    "optional_reinjection_budget_percent",
+                    Value::from(advanced.optional_reinjection_budget_percent),
                 );
                 let security = ensure_child_table(outbound, "security")?;
                 set_table_value(
                     security,
-                    "auth_freshness_window_seconds",
-                    Value::from(advanced.auth_freshness_window_seconds),
+                    "auth_freshness_window_s",
+                    editor_number_value(advanced.auth_freshness_window_s),
                 );
             }
             None => {
-                outbound.remove("path_probe_interval_ms");
-                outbound.remove("path_probe_timeout_ms");
+                outbound.remove("path_probe_interval_s");
+                outbound.remove("path_probe_timeout_s");
                 if let Some(performance) =
                     outbound.get_mut("performance").and_then(Item::as_table_mut)
                 {
-                    performance.remove("extra_traffic_hint_percent");
+                    performance.remove("optional_reinjection_budget_percent");
                 }
                 if let Some(security) = outbound.get_mut("security").and_then(Item::as_table_mut) {
-                    security.remove("auth_freshness_window_seconds");
+                    security.remove("auth_freshness_window_s");
                 }
             }
         }
@@ -1358,41 +1391,41 @@ fn patch_advanced(
             let session = ensure_child_table(document.as_table_mut(), "session")?;
             set_table_value(
                 session,
-                "retention_timeout_ms",
-                Value::from(advanced.session_retention_timeout_ms),
+                "retention_timeout_s",
+                editor_number_value(advanced.session_retention_timeout_s),
             );
             let resources = ensure_child_table(document.as_table_mut(), "resources")?;
             set_table_value(
                 resources,
-                "tcp_path_heartbeat_interval_ms",
-                Value::from(advanced.tcp_heartbeat_interval_ms),
+                "tcp_path_heartbeat_interval_s",
+                editor_number_value(advanced.tcp_heartbeat_interval_s),
             );
             set_table_value(
                 resources,
-                "tcp_path_heartbeat_timeout_ms",
-                Value::from(advanced.tcp_heartbeat_timeout_ms),
+                "tcp_path_heartbeat_timeout_s",
+                editor_number_value(advanced.tcp_heartbeat_timeout_s),
             );
             set_table_value(
                 resources,
-                "quic_path_keep_alive_interval_ms",
-                Value::from(advanced.quic_keep_alive_interval_ms),
+                "quic_path_keep_alive_interval_s",
+                editor_number_value(advanced.quic_keep_alive_interval_s),
             );
             set_table_value(
                 resources,
-                "quic_path_idle_timeout_ms",
-                Value::from(advanced.quic_idle_timeout_ms),
+                "quic_path_idle_timeout_s",
+                editor_number_value(advanced.quic_idle_timeout_s),
             );
         }
         None => {
             if let Some(session) = document.get_mut("session").and_then(Item::as_table_mut) {
-                session.remove("retention_timeout_ms");
+                session.remove("retention_timeout_s");
             }
             if let Some(resources) = document.get_mut("resources").and_then(Item::as_table_mut) {
                 for key in [
-                    "tcp_path_heartbeat_interval_ms",
-                    "tcp_path_heartbeat_timeout_ms",
-                    "quic_path_keep_alive_interval_ms",
-                    "quic_path_idle_timeout_ms",
+                    "tcp_path_heartbeat_interval_s",
+                    "tcp_path_heartbeat_timeout_s",
+                    "quic_path_keep_alive_interval_s",
+                    "quic_path_idle_timeout_s",
                 ] {
                     resources.remove(key);
                 }
@@ -2442,7 +2475,7 @@ protocol = "mpp"
 # preserve this path comment
 paths = [{ name = "primary", endpoint = "tcp://127.0.0.1:7443", custom_path = "keep" }]
 custom_outbound = "keep"
-path_probe_interval_ms = 1234
+path_probe_interval_s = 1.234
 
 [outbounds.security]
 credential_id = "profile"
@@ -2851,16 +2884,17 @@ name = "remote""#,
     fn projection_fills_partial_advanced_defaults_and_accepts_transient_values() {
         let projection = project_editor(EDITABLE_CONFIG).expect("editor projection");
         assert_eq!(projection.log_level, "info");
+        assert_eq!(projection.schema_version, 2);
         let advanced = projection.advanced.expect("partial advanced projection");
-        assert_eq!(advanced.path_probe_interval_ms, 1234);
+        assert_eq!(advanced.path_probe_interval_s, 1.234);
         assert_eq!(
-            advanced.path_probe_timeout_ms,
-            crate::config::DEFAULT_PATH_PROBE_TIMEOUT_MS as i64
+            advanced.path_probe_timeout_s,
+            crate::config::DEFAULT_PATH_PROBE_TIMEOUT.as_secs_f64()
         );
         assert_eq!(projection.paths[0].name, "primary");
 
         let transient = EditorProjection {
-            schema_version: 1,
+            schema_version: 2,
             log_level: "debug".to_string(),
             target_resolution: Some(None),
             paths: vec![
@@ -2874,15 +2908,15 @@ name = "remote""#,
                 },
             ],
             advanced: Some(EditorAdvanced {
-                path_probe_interval_ms: -1,
-                path_probe_timeout_ms: 0,
-                extra_traffic_hint_percent: -2,
-                auth_freshness_window_seconds: -3,
-                session_retention_timeout_ms: -4,
-                tcp_heartbeat_interval_ms: -5,
-                tcp_heartbeat_timeout_ms: -6,
-                quic_keep_alive_interval_ms: -7,
-                quic_idle_timeout_ms: -8,
+                path_probe_interval_s: -1.25,
+                path_probe_timeout_s: 0.125,
+                optional_reinjection_budget_percent: -2,
+                auth_freshness_window_s: -3.5,
+                session_retention_timeout_s: -4.25,
+                tcp_heartbeat_interval_s: -5.125,
+                tcp_heartbeat_timeout_s: -6.75,
+                quic_keep_alive_interval_s: -7.5,
+                quic_idle_timeout_s: -8.875,
             }),
             credential_id: String::new(),
             principal_id: String::new(),
@@ -2895,6 +2929,47 @@ name = "remote""#,
         .expect("transient structural patch");
         let projected = project_editor(&patched).expect("reproject transient document");
         assert_eq!(projected, transient);
+
+        let patched_document = parse_editor_document(&patched).expect("patched TOML");
+        let outbound = mpp_outbound(
+            &patched_document,
+            mpp_outbound_index(&patched_document).expect("MPP outbound"),
+        )
+        .expect("MPP outbound");
+        assert_eq!(
+            outbound
+                .get("path_probe_timeout_s")
+                .and_then(Item::as_float),
+            Some(0.125)
+        );
+
+        let mut obsolete = serde_json::to_value(&transient).expect("projection JSON");
+        obsolete["schema_version"] = serde_json::Value::from(1);
+        assert!(parse_projection_json(&obsolete.to_string()).is_err());
+
+        let mut legacy_name = serde_json::to_value(&transient).expect("projection JSON");
+        let legacy_advanced = legacy_name["advanced"]
+            .as_object_mut()
+            .expect("advanced projection");
+        let interval = legacy_advanced
+            .remove("path_probe_interval_s")
+            .expect("seconds interval");
+        legacy_advanced.insert("path_probe_interval_ms".to_string(), interval);
+        assert!(parse_projection_json(&legacy_name.to_string()).is_err());
+
+        let mut omitted = transient.clone();
+        omitted.advanced = None;
+        let without_advanced = patch_editor(
+            &patched,
+            &serde_json::to_string(&omitted).expect("projection JSON"),
+        )
+        .expect("remove advanced fields");
+        assert_eq!(
+            project_editor(&without_advanced)
+                .expect("reproject without advanced fields")
+                .advanced,
+            None
+        );
     }
 
     #[test]
@@ -2933,7 +3008,7 @@ name = "remote""#,
             .remove("log_level");
         assert_eq!(
             parse_projection_json(&legacy_projection.to_string())
-                .expect("schema-1 projection without additive field")
+                .expect("schema-2 projection without additive field")
                 .log_level,
             "info"
         );
@@ -2981,7 +3056,7 @@ name = "remote""#,
                 .expect("projection object")
                 .remove("target_resolution");
             let legacy_projection = parse_projection_json(&legacy_json.to_string())
-                .expect("schema-1 projection without additive field");
+                .expect("schema-2 projection without additive field");
             assert_eq!(legacy_projection.target_resolution, None);
             let legacy_patched = patch_editor(&configured, &legacy_json.to_string())
                 .expect("legacy projection patch");

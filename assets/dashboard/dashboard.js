@@ -1684,7 +1684,8 @@
         " / " + formatOptionalBit(path.app_limited)
     ));
     evidence.title = [
-      "Confidence / delivery samples and bytes / effective age and app-limited",
+      "Sender-direction confidence / delivery samples and bytes / effective age and app-limited",
+      "Sample direction: " + directionLabel(path.direction),
       "Freshness window: " + formatOptionalMetric(path.freshness_horizon_ms, formatDuration, false),
       "Metric age scope: " + (path.metric_age_scope ? titleCase(path.metric_age_scope) : "-"),
       "Native delivery observed: " + formatOptionalFlag(path.native_delivery_observed),
@@ -2005,7 +2006,8 @@
         " / " + formatOptionalBit(path.app_limited)
     ));
     samples.title = [
-      "Confidence / samples and bytes / effective age and app-limited",
+      "Sender-direction confidence / samples and bytes / effective age and app-limited",
+      "Sample direction: " + directionLabel(path.direction),
       "Freshness window: " + formatOptionalMetric(path.freshness_horizon_ms, formatDuration, false),
       "Metric age scope: " + (path.metric_age_scope ? titleCase(path.metric_age_scope) : "-"),
       "ACK-derived data observed: " + formatOptionalFlag(path.ack_derived_data_observed),

@@ -1,11 +1,11 @@
 use crate::config::{
     AppConfig, ClientPathConfig, ClientSecurityConfig, CommandConfig,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_DATAGRAM_QUEUE_BYTES,
-    DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT, DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
-    DEFAULT_MAX_REINJECTION_CACHE_CHUNKS, DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
-    DEFAULT_MAX_REORDER_BUFFER_CHUNKS, DEFAULT_MAX_RETAINED_RECEIVE_RANGES,
-    DEFAULT_MPP_TLS_SERVER_NAME, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_FLIGHT_BYTES,
-    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
+    DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS, DEFAULT_MAX_REINJECTION_CACHE_CHUNKS,
+    DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES, DEFAULT_MAX_REORDER_BUFFER_CHUNKS,
+    DEFAULT_MAX_RETAINED_RECEIVE_RANGES, DEFAULT_MPP_TLS_SERVER_NAME,
+    DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
+    DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
     DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS, DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS,
     DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
     DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS,
@@ -40,9 +40,58 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 const DEFAULT_SIMPLE_DNS_TIMEOUT_MS: u64 = 5_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecondsArg(Duration);
+
+impl SecondsArg {
+    const fn from_millis(milliseconds: u64) -> Self {
+        Self(Duration::from_millis(milliseconds))
+    }
+
+    const fn from_secs(seconds: u64) -> Self {
+        Self(Duration::from_secs(seconds))
+    }
+
+    const fn duration(self) -> Duration {
+        self.0
+    }
+
+    fn milliseconds_u32(self, field: &'static str) -> Result<u32, CliConfigError> {
+        let milliseconds = u32::try_from(self.0.as_millis()).map_err(|_| {
+            CliConfigError::Duration(format!("{field} is outside the supported range"))
+        })?;
+        if Duration::from_millis(u64::from(milliseconds)) != self.0 {
+            return Err(CliConfigError::Duration(format!(
+                "{field} requires millisecond precision"
+            )));
+        }
+        Ok(milliseconds)
+    }
+}
+
+impl FromStr for SecondsArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let seconds = value
+            .parse::<f64>()
+            .map_err(|_| "expected a finite, non-negative number of seconds".to_string())?;
+        Duration::try_from_secs_f64(seconds)
+            .map(Self)
+            .map_err(|_| "expected a finite, non-negative number of seconds".to_string())
+    }
+}
+
+impl std::fmt::Display for SecondsArg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0.as_secs_f64())
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "mptunnel")]
@@ -145,10 +194,10 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_AUTH_FRESHNESS_WINDOW_SECONDS",
-        default_value_t = DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS
+        env = "MPTUNNEL_AUTH_FRESHNESS_WINDOW_S",
+        default_value_t = SecondsArg::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS)
     )]
-    pub auth_freshness_window_seconds: u64,
+    pub auth_freshness_window_s: SecondsArg,
 
     #[arg(
         long,
@@ -207,9 +256,7 @@ impl Cli {
                         .credential(&credential_id)
                         .map_err(|error| CliConfigError::Credential(error.to_string()))?,
                 )
-                .with_auth_freshness_window(Duration::from_secs(
-                    self.auth_freshness_window_seconds,
-                ));
+                .with_auth_freshness_window(self.auth_freshness_window_s.duration());
                 CommandConfig::Node((*args).into_config(security)?)
             }
             Command::Server(args) => {
@@ -218,9 +265,7 @@ impl Cli {
                         .authority(std::slice::from_ref(&credential_id))
                         .map_err(|error| CliConfigError::Credential(error.to_string()))?,
                 )
-                .with_auth_freshness_window(Duration::from_secs(
-                    self.auth_freshness_window_seconds,
-                ));
+                .with_auth_freshness_window(self.auth_freshness_window_s.duration());
                 CommandConfig::Node((*args).into_config(security)?)
             }
             Command::Platform(_)
@@ -236,6 +281,7 @@ impl Cli {
             check_config: self.check_config,
             service: self.service.into_config(),
             session: self.session.into_config(),
+            flow: crate::config::ProductFlowConfig::default(),
             resources: self.resources.into_limits(),
             admission: crate::product::ProductAdmissionConfig::default(),
             management: self.management.into_config()?,
@@ -326,18 +372,18 @@ fn secret_utf8(bytes: Vec<u8>, purpose: &'static str) -> Result<String, CliConfi
 pub struct SessionArgs {
     /// Bound carrierless stream retention and graceful TCP carrier retirement.
     #[arg(
-        long = "session-retention-timeout-ms",
+        long = "session-retention-timeout-s",
         global = true,
-        env = "MPTUNNEL_SESSION_RETENTION_TIMEOUT_MS",
-        default_value_t = DEFAULT_SESSION_RETENTION_TIMEOUT_MS
+        env = "MPTUNNEL_SESSION_RETENTION_TIMEOUT_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_SESSION_RETENTION_TIMEOUT_MS)
     )]
-    pub retention_timeout_ms: u64,
+    pub retention_timeout_s: SecondsArg,
 }
 
 impl SessionArgs {
     fn into_config(self) -> SessionConfig {
         SessionConfig {
-            retention_timeout: Duration::from_millis(self.retention_timeout_ms),
+            retention_timeout: self.retention_timeout_s.duration(),
         }
     }
 }
@@ -433,18 +479,18 @@ pub struct ServiceArgs {
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_RESTART_BACKOFF_MS",
-        default_value_t = DEFAULT_RESTART_BACKOFF_MS
+        env = "MPTUNNEL_RESTART_BACKOFF_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_RESTART_BACKOFF_MS)
     )]
-    pub restart_backoff_ms: u64,
+    pub restart_backoff_s: SecondsArg,
 
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_RESTART_MAX_BACKOFF_MS",
-        default_value_t = DEFAULT_RESTART_MAX_BACKOFF_MS
+        env = "MPTUNNEL_RESTART_MAX_BACKOFF_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_RESTART_MAX_BACKOFF_MS)
     )]
-    pub restart_max_backoff_ms: u64,
+    pub restart_max_backoff_s: SecondsArg,
 
     #[arg(long, global = true, env = "MPTUNNEL_MAX_RESTARTS")]
     pub max_restarts: Option<u32>,
@@ -454,8 +500,8 @@ impl ServiceArgs {
     fn into_config(self) -> ServiceConfig {
         ServiceConfig {
             supervise: self.supervise,
-            restart_backoff: Duration::from_millis(self.restart_backoff_ms),
-            restart_max_backoff: Duration::from_millis(self.restart_max_backoff_ms),
+            restart_backoff: self.restart_backoff_s.duration(),
+            restart_max_backoff: self.restart_max_backoff_s.duration(),
             max_restarts: self.max_restarts,
         }
     }
@@ -581,34 +627,34 @@ pub struct ResourceArgs {
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS",
-        default_value_t = DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS
+        env = "MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS)
     )]
-    pub tcp_path_heartbeat_interval_ms: u64,
+    pub tcp_path_heartbeat_interval_s: SecondsArg,
 
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS",
-        default_value_t = DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS
+        env = "MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS)
     )]
-    pub tcp_path_heartbeat_timeout_ms: u64,
+    pub tcp_path_heartbeat_timeout_s: SecondsArg,
 
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS",
-        default_value_t = DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS
+        env = "MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS)
     )]
-    pub quic_path_keep_alive_interval_ms: u64,
+    pub quic_path_keep_alive_interval_s: SecondsArg,
 
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS",
-        default_value_t = DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS
+        env = "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS)
     )]
-    pub quic_path_idle_timeout_ms: u64,
+    pub quic_path_idle_timeout_s: SecondsArg,
 }
 
 impl ResourceArgs {
@@ -629,12 +675,10 @@ impl ResourceArgs {
             max_datagram_queue_bytes: self.max_datagram_queue_bytes,
             max_path_flight_bytes: self.max_path_flight_bytes,
             max_reliable_relay_chunk_bytes: self.max_reliable_relay_chunk_bytes,
-            tcp_path_heartbeat_interval: Duration::from_millis(self.tcp_path_heartbeat_interval_ms),
-            tcp_path_heartbeat_timeout: Duration::from_millis(self.tcp_path_heartbeat_timeout_ms),
-            quic_path_keep_alive_interval: Duration::from_millis(
-                self.quic_path_keep_alive_interval_ms,
-            ),
-            quic_path_idle_timeout: Duration::from_millis(self.quic_path_idle_timeout_ms),
+            tcp_path_heartbeat_interval: self.tcp_path_heartbeat_interval_s.duration(),
+            tcp_path_heartbeat_timeout: self.tcp_path_heartbeat_timeout_s.duration(),
+            quic_path_keep_alive_interval: self.quic_path_keep_alive_interval_s.duration(),
+            quic_path_idle_timeout: self.quic_path_idle_timeout_s.duration(),
         }
     }
 }
@@ -824,16 +868,16 @@ pub struct ClientArgs {
     pub udp_forward_max_associations: Option<usize>,
 
     #[arg(
-        long = "udp-forward-idle-timeout-ms",
-        env = "MPTUNNEL_UDP_FORWARD_IDLE_TIMEOUT_MS"
+        long = "udp-forward-idle-timeout-s",
+        env = "MPTUNNEL_UDP_FORWARD_IDLE_TIMEOUT_S"
     )]
-    pub udp_forward_idle_timeout_ms: Option<u64>,
+    pub udp_forward_idle_timeout_s: Option<SecondsArg>,
 
     #[arg(
-        long = "udp-forward-datagram-ttl-ms",
-        env = "MPTUNNEL_UDP_FORWARD_DATAGRAM_TTL_MS"
+        long = "udp-forward-datagram-ttl-s",
+        env = "MPTUNNEL_UDP_FORWARD_DATAGRAM_TTL_S"
     )]
-    pub udp_forward_datagram_ttl_ms: Option<u64>,
+    pub udp_forward_datagram_ttl_s: Option<SecondsArg>,
 
     #[arg(long, env = "MPTUNNEL_PROXY_USERNAME")]
     pub proxy_username: Option<String>,
@@ -891,8 +935,12 @@ pub struct ClientArgs {
     )]
     pub tun_dns_redirects: Vec<SocketAddr>,
 
-    #[arg(long, env = "MPTUNNEL_TUN_DNS_TTL_MS", default_value_t = DEFAULT_TUN_DNS_TTL_MS)]
-    pub tun_dns_ttl_ms: u32,
+    #[arg(
+        long,
+        env = "MPTUNNEL_TUN_DNS_TTL_S",
+        default_value_t = SecondsArg::from_millis(u64::from(DEFAULT_TUN_DNS_TTL_MS))
+    )]
+    pub tun_dns_ttl_s: SecondsArg,
 
     /// Let MPTUNNEL own VPN routes and DNS on a supported host.
     ///
@@ -986,24 +1034,24 @@ pub struct ClientArgs {
 
     #[arg(
         long,
-        env = "MPTUNNEL_PATH_PROBE_INTERVAL_MS",
-        default_value_t = DEFAULT_PATH_PROBE_INTERVAL_MS
+        env = "MPTUNNEL_PATH_PROBE_INTERVAL_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_PATH_PROBE_INTERVAL_MS)
     )]
-    pub path_probe_interval_ms: u64,
+    pub path_probe_interval_s: SecondsArg,
 
     #[arg(
         long,
-        env = "MPTUNNEL_PATH_PROBE_TIMEOUT_MS",
-        default_value_t = DEFAULT_PATH_PROBE_TIMEOUT_MS
+        env = "MPTUNNEL_PATH_PROBE_TIMEOUT_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS)
     )]
-    pub path_probe_timeout_ms: u64,
+    pub path_probe_timeout_s: SecondsArg,
 
     #[arg(
-        long = "extra-traffic-hint-percent",
-        env = "MPTUNNEL_EXTRA_TRAFFIC_HINT_PERCENT",
-        default_value_t = DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT
+        long = "optional-reinjection-budget-percent",
+        env = "MPTUNNEL_OPTIONAL_REINJECTION_BUDGET_PERCENT",
+        default_value_t = DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT
     )]
-    pub extra_traffic_hint_percent: u16,
+    pub optional_reinjection_budget_percent: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1023,8 +1071,8 @@ impl ClientArgs {
         let udp_forward_requested = self.udp_forward_listen.is_some()
             || self.udp_forward_target.is_some()
             || self.udp_forward_max_associations.is_some()
-            || self.udp_forward_idle_timeout_ms.is_some()
-            || self.udp_forward_datagram_ttl_ms.is_some();
+            || self.udp_forward_idle_timeout_s.is_some()
+            || self.udp_forward_datagram_ttl_s.is_some();
         if tcp_forward_requested
             && (self.tcp_forward_listen.is_none() || self.tcp_forward_target.is_none())
         {
@@ -1127,13 +1175,13 @@ impl ClientArgs {
                 target,
                 self.udp_forward_max_associations
                     .unwrap_or(DEFAULT_UDP_FORWARD_MAX_ASSOCIATIONS),
-                Duration::from_millis(
-                    self.udp_forward_idle_timeout_ms
-                        .unwrap_or(DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS),
+                self.udp_forward_idle_timeout_s.map_or(
+                    Duration::from_millis(DEFAULT_UDP_FORWARD_IDLE_TIMEOUT_MS),
+                    SecondsArg::duration,
                 ),
-                Duration::from_millis(
-                    self.udp_forward_datagram_ttl_ms
-                        .unwrap_or(DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS),
+                self.udp_forward_datagram_ttl_s.map_or(
+                    Duration::from_millis(DEFAULT_UDP_FORWARD_DATAGRAM_TTL_MS),
+                    SecondsArg::duration,
                 ),
             )
             .map_err(|error| CliConfigError::PortForward(error.to_string()))?;
@@ -1191,7 +1239,7 @@ impl ClientArgs {
                     mtu: self.tun_mtu,
                     enable_icmp: !self.tun_disable_icmp,
                     dns_resolvers: self.tun_dns_redirects.clone(),
-                    dns_ttl_ms: self.tun_dns_ttl_ms,
+                    dns_ttl_ms: self.tun_dns_ttl_s.milliseconds_u32("--tun-dns-ttl-s")?,
                     host,
                 }),
             });
@@ -1211,11 +1259,11 @@ impl ClientArgs {
                 })
                 .collect(),
             security,
-            path_probe_interval: Duration::from_millis(self.path_probe_interval_ms),
-            path_probe_timeout: Duration::from_millis(self.path_probe_timeout_ms),
+            path_probe_interval: self.path_probe_interval_s.duration(),
+            path_probe_timeout: self.path_probe_timeout_s.duration(),
             allow_peer_diagnostics: false,
             performance: MppPerformanceConfig {
-                extra_traffic_hint_percent: self.extra_traffic_hint_percent,
+                optional_reinjection_budget_percent: self.optional_reinjection_budget_percent,
             },
         };
         let policy = ProductPolicyConfig {
@@ -1310,7 +1358,7 @@ fn tun_requested(args: &ClientArgs) -> bool {
         || args.tun_mtu != DEFAULT_TUN_MTU
         || args.tun_disable_icmp
         || !args.tun_dns_redirects.is_empty()
-        || args.tun_dns_ttl_ms != DEFAULT_TUN_DNS_TTL_MS
+        || args.tun_dns_ttl_s != SecondsArg::from_millis(u64::from(DEFAULT_TUN_DNS_TTL_MS))
         || args.tun_vpn_mode.is_some()
         || !args.tun_include_cidrs.is_empty()
         || !args.tun_exclude_cidrs.is_empty()
@@ -1418,24 +1466,24 @@ pub struct ServerArgs {
 
     #[arg(
         long,
-        env = "MPTUNNEL_OUTBOUND_DNS_TIMEOUT_MS",
-        default_value_t = DEFAULT_SIMPLE_DNS_TIMEOUT_MS
+        env = "MPTUNNEL_OUTBOUND_DNS_TIMEOUT_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_SIMPLE_DNS_TIMEOUT_MS)
     )]
-    pub outbound_dns_timeout_ms: u64,
+    pub outbound_dns_timeout_s: SecondsArg,
 
     #[arg(
         long,
-        env = "MPTUNNEL_OUTBOUND_CONNECT_TIMEOUT_MS",
-        default_value_t = DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS
+        env = "MPTUNNEL_OUTBOUND_CONNECT_TIMEOUT_S",
+        default_value_t = SecondsArg::from_millis(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS)
     )]
-    pub outbound_connect_timeout_ms: u64,
+    pub outbound_connect_timeout_s: SecondsArg,
 
     #[arg(
-        long = "extra-traffic-hint-percent",
-        env = "MPTUNNEL_EXTRA_TRAFFIC_HINT_PERCENT",
-        default_value_t = DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT
+        long = "optional-reinjection-budget-percent",
+        env = "MPTUNNEL_OPTIONAL_REINJECTION_BUDGET_PERCENT",
+        default_value_t = DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT
     )]
-    pub extra_traffic_hint_percent: u16,
+    pub optional_reinjection_budget_percent: u16,
 }
 
 impl ServerArgs {
@@ -1534,7 +1582,7 @@ impl ServerArgs {
             self.outbound_dns_protocol,
             self.outbound_dns_servers,
             self.outbound_dns_family.into(),
-            Duration::from_millis(self.outbound_dns_timeout_ms),
+            self.outbound_dns_timeout_s.duration(),
         )?;
         let server = MppInboundConfig {
             name: "cli-mpp-inbound".to_string(),
@@ -1550,7 +1598,7 @@ impl ServerArgs {
             security,
             tls,
             performance: MppPerformanceConfig {
-                extra_traffic_hint_percent: self.extra_traffic_hint_percent,
+                optional_reinjection_budget_percent: self.optional_reinjection_budget_percent,
             },
             peer_diagnostics_principals: crate::config::PeerDiagnosticsPrincipalPolicy::Deny,
             tun_l3: None,
@@ -1560,7 +1608,7 @@ impl ServerArgs {
             outbounds: vec![OutboundLeafConfig::Local {
                 id: id.clone(),
                 config: outbound,
-                connect_timeout: Duration::from_millis(self.outbound_connect_timeout_ms),
+                connect_timeout: self.outbound_connect_timeout_s.duration(),
             }],
             gateway_balancers: Vec::new(),
             local_ingresses: Vec::new(),
@@ -1851,6 +1899,7 @@ pub enum CliConfigError {
     ProxyPasswordRequired,
     MppTls(String),
     MppTransportSecret(String),
+    Duration(String),
     PortForward(String),
     ProductPolicy(String),
     Dns(String),
@@ -1958,6 +2007,7 @@ impl std::fmt::Display for CliConfigError {
             }
             Self::MppTls(message) => write!(f, "{message}"),
             Self::MppTransportSecret(message) => write!(f, "{message}"),
+            Self::Duration(message) => write!(f, "invalid duration: {message}"),
             Self::PortForward(message) => write!(f, "invalid port-forward inbound: {message}"),
             Self::ProductPolicy(message) => write!(f, "{message}"),
             Self::Dns(message) => write!(f, "invalid DNS configuration: {message}"),

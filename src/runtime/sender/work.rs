@@ -41,7 +41,9 @@ impl CarrierEmitMode {
     }
 }
 
-pub(in crate::runtime) fn sender_extra_traffic_startup_floor_bytes(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn sender_optional_reinjection_startup_floor_bytes(
+    mux_limits: MuxLimits,
+) -> usize {
     reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
         .max(PATH_OPEN_SCORE_BYTES)
         .min(mux_limits.max_repair_bytes)

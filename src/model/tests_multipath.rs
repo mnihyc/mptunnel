@@ -11,13 +11,13 @@ fn only_original_connection_data_owns_a_sequence_range() {
 }
 
 #[test]
-fn extra_traffic_budget_is_hard_percent_plus_startup_floor() {
-    let budget = ExtraTrafficBudget::new(
+fn optional_reinjection_budget_is_hard_percent_plus_startup_floor() {
+    let budget = OptionalReinjectionBudget::new(
         1_000_000,
         49_999,
         1024,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 5,
+            optional_reinjection_budget_percent: 5,
         },
     );
 
@@ -28,8 +28,8 @@ fn extra_traffic_budget_is_hard_percent_plus_startup_floor() {
 }
 
 #[test]
-fn extra_traffic_ledger_keeps_original_and_duplicate_bytes_separate() {
-    let mut ledger = ExtraTrafficLedger::default();
+fn optional_reinjection_ledger_keeps_original_and_duplicate_bytes_separate() {
+    let mut ledger = OptionalReinjectionLedger::default();
     ledger.record_delivered_data(1_000_000);
     ledger.record_reinjection(300);
 
@@ -40,7 +40,7 @@ fn extra_traffic_ledger_keeps_original_and_duplicate_bytes_separate() {
             .budget(
                 1024,
                 MppPerformanceConfig {
-                    extra_traffic_hint_percent: 5
+                    optional_reinjection_budget_percent: 5
                 }
             )
             .limit_bytes(),

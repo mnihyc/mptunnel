@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_MAX_PRODUCT_LIVE_FLOWS: usize = 4_096;
-pub const DEFAULT_MAX_PRODUCT_CONCURRENT_WORK: usize = 512;
-pub const DEFAULT_MAX_PRODUCT_LIVE_FLOWS_PER_PRINCIPAL: usize = 1_024;
-pub const DEFAULT_MAX_PRODUCT_LIVE_FLOWS_PER_OUTBOUND: usize = 3_072;
-pub const DEFAULT_MAX_PRODUCT_CONNECTS_PER_OUTBOUND: usize = 256;
-pub const DEFAULT_MAX_PRODUCT_LIVE_FLOWS_PER_TARGET: usize = 256;
-pub const DEFAULT_MAX_PRODUCT_CONNECTS_PER_TARGET: usize = 32;
-pub const DEFAULT_MAX_PRODUCT_DNS_WORK: usize = 128;
+pub const DEFAULT_MAX_PRODUCT_CONCURRENT_WORK: usize = 4_096;
+pub const DEFAULT_MAX_PRODUCT_LIVE_FLOWS_PER_PRINCIPAL: usize = 4_096;
+pub const DEFAULT_MAX_PRODUCT_LIVE_FLOWS_PER_OUTBOUND: usize = 4_096;
+pub const DEFAULT_MAX_PRODUCT_CONNECTS_PER_OUTBOUND: usize = 4_096;
+pub const DEFAULT_MAX_PRODUCT_LIVE_FLOWS_PER_TARGET: usize = 4_096;
+pub const DEFAULT_MAX_PRODUCT_CONNECTS_PER_TARGET: usize = 4_096;
+pub const DEFAULT_MAX_PRODUCT_DNS_WORK: usize = 4_096;
 pub const MAX_PRODUCT_ADMISSION_LIMIT: usize = 1_000_000;
 
 /// Process-wide Product resource limits for one immutable runtime generation.

@@ -31,6 +31,13 @@ pub(in crate::runtime) struct DatagramClientAssociation {
     pending_bytes: usize,
 }
 
+/// Transport-only terminal owner produced before a Product datagram lifetime
+/// releases admission or telemetry. Dropping this owner still drops QUIC
+/// request streams and invokes the TCP attachment's carrier retirement lane.
+pub(in crate::runtime) struct RetiringDatagramClientAssociation {
+    association: DatagramClientAssociation,
+}
+
 struct DatagramClientProductFlow {
     target: TargetAddr,
     flow_id: DatagramFlowId,
@@ -960,6 +967,53 @@ impl DatagramClientAssociation {
         }
     }
 
+    /// Retire the logical Product lifetime independently of transport close
+    /// publication.
+    ///
+    /// Idle expiry is authoritative even when a carrier cannot accept its
+    /// best-effort `DGRAM_CLOSE` publication. Pending reinjection state and
+    /// session ownership therefore leave with the Product flow, while the
+    /// underlay-local flow identities remain available to `close()` long
+    /// enough to publish the close when capacity permits.
+    pub(in crate::runtime) fn complete_product_lifetime(&mut self) {
+        self.pending.clear();
+        self.pending_bytes = 0;
+        for flow in self.product_flows.drain(..) {
+            flow.telemetry_flow.complete();
+        }
+    }
+
+    /// Converts the live association into one typed terminal intent. No
+    /// Product owner remains inside the returned value, while every exact
+    /// transport attachment remains owned until close or Drop settles it.
+    pub(in crate::runtime) fn begin_product_retirement(
+        mut self,
+    ) -> RetiringDatagramClientAssociation {
+        self.complete_product_lifetime();
+        RetiringDatagramClientAssociation { association: self }
+    }
+
+    /// One carrier-liveness horizon bounds best-effort close publication after
+    /// authoritative Product idle expiry. Ordinary (non-idle) close keeps its
+    /// existing transport-specific settlement and error semantics.
+    pub(in crate::runtime) fn idle_close_publication_timeout(&self) -> Option<Duration> {
+        let tcp = self
+            .tcp
+            .as_ref()
+            .is_some_and(|tcp| tcp.has_open_path())
+            .then_some(self.context.mux_limits.tcp_path_heartbeat_timeout);
+        let udp = self
+            .udp
+            .as_ref()
+            .is_some_and(|udp| udp.has_open_path())
+            .then_some(self.context.mux_limits.quic_path_idle_timeout);
+        match (tcp, udp) {
+            (Some(tcp), Some(udp)) => Some(tcp.max(udp)),
+            (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+            (None, None) => None,
+        }
+    }
+
     pub(in crate::runtime) async fn close(&mut self) -> Result<(), RuntimeError> {
         let udp_result = if let Some(udp) = &mut self.udp {
             udp.close().await
@@ -973,11 +1027,19 @@ impl DatagramClientAssociation {
         };
         let result = udp_result.and(tcp_result);
         if result.is_ok() {
-            for flow in self.product_flows.drain(..) {
-                flow.telemetry_flow.complete();
-            }
+            self.complete_product_lifetime();
         }
         result
+    }
+}
+
+impl RetiringDatagramClientAssociation {
+    pub(in crate::runtime) fn publication_timeout(&self) -> Option<Duration> {
+        self.association.idle_close_publication_timeout()
+    }
+
+    pub(in crate::runtime) async fn close(&mut self) -> Result<(), RuntimeError> {
+        self.association.close().await
     }
 }
 
@@ -1102,4 +1164,53 @@ pub(in crate::runtime) fn datagram_underlay_error_is_retryable(err: &RuntimeErro
 
 pub(in crate::runtime) fn runtime_error_is_datagram_response_timeout(err: &RuntimeError) -> bool {
     matches!(err, RuntimeError::DatagramResponseTimedOut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ClientSecurityConfig, SharedSecret};
+    use crate::performance::ResourceLimits;
+
+    #[tokio::test]
+    async fn product_completion_is_authoritative_before_transport_close() {
+        let security = ClientSecurityConfig::for_test(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+                .expect("association test secret"),
+        );
+        let context = ClientPathContext::new(
+            vec![
+                "quic://127.0.0.1:16191"
+                    .parse()
+                    .expect("association test path"),
+            ],
+            security,
+            ResourceLimits::default(),
+        )
+        .expect("association test context");
+        let telemetry = context.telemetry.clone();
+        let mut association = DatagramClientAssociation::new(context)
+            .await
+            .expect("association");
+        association
+            .allocate_product_datagram(TargetAddr::Ip(
+                "203.0.113.19:443".parse().expect("association target"),
+            ))
+            .expect("logical datagram flow");
+
+        let active = telemetry.snapshot();
+        assert_eq!(active.datagram.flows.opened, 1);
+        assert_eq!(active.datagram.flows.active, 1);
+        assert_eq!(association.product_flows.len(), 1);
+
+        let retirement = association.begin_product_retirement();
+
+        let retired = telemetry.snapshot();
+        assert_eq!(retired.datagram.flows.active, 0);
+        assert_eq!(retired.datagram.flows.completed, 1);
+        assert_eq!(retired.datagram.flows.failed, 0);
+        assert!(retirement.association.product_flows.is_empty());
+        assert!(retirement.association.pending.is_empty());
+        assert_eq!(retirement.association.pending_bytes, 0);
+    }
 }

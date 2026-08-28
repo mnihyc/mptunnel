@@ -632,6 +632,12 @@ impl ReliablePathStream {
             .await;
     }
 
+    /// Transfers timeout reset ownership to the carrier retirement lane before
+    /// the Product owner is released. This never waits for bounded queues.
+    pub(in crate::runtime) fn retire_with_reset(&self, reason: ResetReason) {
+        self.output.retire_stream_with_reset(self.stream_id, reason);
+    }
+
     /// Retires a client-opened stream that never transferred into product
     /// ownership. The carrier mailbox makes this cancellation-safe for Drop.
     pub(in crate::runtime) fn retire_uncommitted(self) -> Result<(), RuntimeError> {
@@ -719,6 +725,12 @@ impl ReliablePathStreamHandle {
         self.output
             .reset_and_close_stream(self.stream_id, reason)
             .await;
+    }
+
+    /// Transfers timeout reset ownership without waiting for a bounded carrier
+    /// queue; the caller may release Product membership immediately afterward.
+    pub(in crate::runtime) fn retire_with_reset(&self, reason: ResetReason) {
+        self.output.retire_stream_with_reset(self.stream_id, reason);
     }
 
     pub(in crate::runtime) fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
@@ -1149,6 +1161,21 @@ impl ReliablePathStreamOutput {
             }
             Self::Switchable(binding) => {
                 binding.reset_and_close_stream(stream_id, reason).await;
+            }
+        }
+    }
+
+    pub(in crate::runtime) fn retire_stream_with_reset(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+    ) {
+        match self {
+            Self::Fixed(fixed) => {
+                let _ = fixed.commands().reset_accepted_stream(stream_id, reason);
+            }
+            Self::Switchable(binding) => {
+                binding.retire_stream_with_reset(stream_id, reason);
             }
         }
     }

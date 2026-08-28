@@ -431,6 +431,7 @@ async fn closed_output_relay(
             MppPerformanceConfig::default(),
             ReliableRelayOpenSpec::new(TargetAddr::Ip(unused_addr), TrafficClass::Latency),
             opened,
+            None,
         )
         .await
     });
@@ -494,6 +495,7 @@ async fn blocked_feedback_relay(
             MppPerformanceConfig::default(),
             ReliableRelayOpenSpec::new(TargetAddr::Ip(unused_addr), TrafficClass::Latency),
             opened,
+            None,
         )
         .await
     });
@@ -551,6 +553,7 @@ async fn sticky_session_terminal_at_relay_entry_preempts_without_polling_a_satur
         MppPerformanceConfig::default(),
         ReliableRelayOpenSpec::new(TargetAddr::Ip(unused_addr), TrafficClass::Latency),
         opened,
+        None,
     )
     .await;
     assert!(matches!(

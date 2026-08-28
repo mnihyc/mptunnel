@@ -29,10 +29,10 @@ fn budgeted_critical_reinjection_preempts_original_data_and_debits_budget() {
         SessionId(79),
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 1,
+            optional_reinjection_budget_percent: 1,
         },
     );
-    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
 
     sender.enqueue_data_for_lane(Bytes::from_static(b"owner"), TrafficClass::Throughput);
     assert!(
@@ -325,9 +325,9 @@ async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent()
 async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output() {
     let stream_id = StreamId(90);
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10260?initial-srtt-ms=500&initial-rate-mbps=400",
-        "quic://127.0.0.1:10261?initial-srtt-ms=40&initial-rate-mbps=200",
-        "quic://127.0.0.1:10262?initial-srtt-ms=5&initial-rate-mbps=500",
+        "tcp://127.0.0.1:10260?initial-srtt-s=0.5&initial-rate-mbps=400",
+        "quic://127.0.0.1:10261?initial-srtt-s=0.04&initial-rate-mbps=200",
+        "quic://127.0.0.1:10262?initial-srtt-s=0.005&initial-rate-mbps=500",
     ]);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(1);
@@ -1091,8 +1091,8 @@ async fn client_path_failure_releases_path_load_before_cleanup_waits() {
 async fn client_path_failure_releases_optional_load_before_cleanup_waits() {
     let stream_id = StreamId(125);
     let context = Arc::new(client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10331?initial-srtt-ms=20&initial-rate-mbps=500",
-        "tcp://127.0.0.1:10332?initial-srtt-ms=20&initial-rate-mbps=500",
+        "tcp://127.0.0.1:10331?initial-srtt-s=0.02&initial-rate-mbps=500",
+        "tcp://127.0.0.1:10332?initial-srtt-s=0.02&initial-rate-mbps=500",
     ]));
     let (service_commands, _service_rx) = reliable_path_command_channels(1);
     let mut remotes =
@@ -1160,11 +1160,11 @@ fn client_reinjection_extra_budget_is_cumulative_not_per_event() {
     let mut sender = RequestSenderService::new_with_performance(
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 1,
+            optional_reinjection_budget_percent: 1,
         },
     );
     let mut sender_queue = ReliableRelaySenderQueue::default();
-    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
     let reinjection_payload = Bytes::from(vec![0x33; startup_floor]);
 
     assert!(sender.enqueue_reinjection_frame_with_priority(
@@ -1211,11 +1211,11 @@ fn client_critical_reinjection_closes_tail_after_optional_budget_exhaustion() {
     let mut sender = RequestSenderService::new_with_performance(
         stream_id,
         MppPerformanceConfig {
-            extra_traffic_hint_percent: 1,
+            optional_reinjection_budget_percent: 1,
         },
     );
     let mut sender_queue = ReliableRelaySenderQueue::default();
-    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
     let frame = Frame::StreamData {
         stream_id,
         offset: 0,
@@ -1247,5 +1247,5 @@ fn client_critical_reinjection_closes_tail_after_optional_budget_exhaustion() {
         closure_frame,
         RelaySendCause::AckGapReinjection,
     );
-    assert_eq!(sender.extra_traffic_budget_remaining(mux_limits), 0);
+    assert_eq!(sender.optional_reinjection_budget_remaining(mux_limits), 0);
 }

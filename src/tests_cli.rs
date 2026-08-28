@@ -354,10 +354,10 @@ fn client_cli_builds_simple_bounded_tcp_and_udp_port_forwards() {
         "[2001:db8::53]:53",
         "--udp-forward-max-associations",
         "12",
-        "--udp-forward-idle-timeout-ms",
-        "5000",
-        "--udp-forward-datagram-ttl-ms",
-        "1500",
+        "--udp-forward-idle-timeout-s",
+        "5",
+        "--udp-forward-datagram-ttl-s",
+        "1.5",
         "--path",
         "tcp://127.0.0.1:443",
     ])
@@ -501,10 +501,10 @@ fn service_supervisor_cli_is_parsed_and_validated() {
     let cli = parse_cli([
         "mptunnel",
         "--supervise",
-        "--restart-backoff-ms",
-        "500",
-        "--restart-max-backoff-ms",
-        "5000",
+        "--restart-backoff-s",
+        "0.5",
+        "--restart-max-backoff-s",
+        "5",
         "--max-restarts",
         "3",
         "client",
@@ -524,10 +524,10 @@ fn service_supervisor_cli_is_parsed_and_validated() {
 
     let cli = parse_cli([
         "mptunnel",
-        "--restart-backoff-ms",
-        "5000",
-        "--restart-max-backoff-ms",
-        "500",
+        "--restart-backoff-s",
+        "5",
+        "--restart-max-backoff-s",
+        "0.5",
         "client",
         "--path",
         "tcp://127.0.0.1:443",
@@ -853,8 +853,8 @@ fn server_outbound_dns_is_parsed() {
         "udp-tcp",
         "--outbound-dns-family",
         "ipv6-then-ipv4",
-        "--outbound-dns-timeout-ms",
-        "1500",
+        "--outbound-dns-timeout-s",
+        "1.5",
     ])
     .expect("parse cli");
     let config = cli.into_config().expect("config");
@@ -1482,7 +1482,7 @@ fn mux_memory_limits_are_validated() {
 fn tcp_path_heartbeat_timing_is_validated() {
     let cli = parse_cli([
         "mptunnel",
-        "--tcp-path-heartbeat-interval-ms",
+        "--tcp-path-heartbeat-interval-s",
         "0",
         "client",
         "--path",
@@ -1499,7 +1499,7 @@ fn tcp_path_heartbeat_timing_is_validated() {
 
     let cli = parse_cli([
         "mptunnel",
-        "--tcp-path-heartbeat-timeout-ms",
+        "--tcp-path-heartbeat-timeout-s",
         "0",
         "client",
         "--path",
@@ -1516,10 +1516,10 @@ fn tcp_path_heartbeat_timing_is_validated() {
 
     let cli = parse_cli([
         "mptunnel",
-        "--tcp-path-heartbeat-interval-ms",
-        "2000",
-        "--tcp-path-heartbeat-timeout-ms",
-        "1000",
+        "--tcp-path-heartbeat-interval-s",
+        "2",
+        "--tcp-path-heartbeat-timeout-s",
+        "1",
         "client",
         "--path",
         "tcp://127.0.0.1:443",
@@ -1538,12 +1538,12 @@ fn tcp_path_heartbeat_timing_is_validated() {
 fn logical_session_retention_and_quic_liveness_are_independently_configurable() {
     let cli = parse_cli([
         "mptunnel",
-        "--session-retention-timeout-ms",
-        "45000",
-        "--quic-path-keep-alive-interval-ms",
-        "3000",
-        "--quic-path-idle-timeout-ms",
-        "12000",
+        "--session-retention-timeout-s",
+        "45",
+        "--quic-path-keep-alive-interval-s",
+        "3",
+        "--quic-path-idle-timeout-s",
+        "12",
         "client",
         "--path",
         "quic://127.0.0.1:443",
@@ -1566,15 +1566,15 @@ fn logical_session_retention_and_quic_liveness_are_independently_configurable() 
 fn logical_session_and_quic_liveness_timing_is_validated() {
     for (args, expected) in [
         (
-            vec!["--session-retention-timeout-ms", "0"],
+            vec!["--session-retention-timeout-s", "0"],
             crate::config::ConfigError::SessionRetentionTimeoutZero,
         ),
         (
-            vec!["--quic-path-keep-alive-interval-ms", "0"],
+            vec!["--quic-path-keep-alive-interval-s", "0"],
             crate::config::ConfigError::QuicPathKeepAliveIntervalZero,
         ),
         (
-            vec!["--quic-path-idle-timeout-ms", "0"],
+            vec!["--quic-path-idle-timeout-s", "0"],
             crate::config::ConfigError::QuicPathIdleTimeoutZero,
         ),
     ] {
@@ -1590,10 +1590,10 @@ fn logical_session_and_quic_liveness_timing_is_validated() {
 
     let cli = parse_cli([
         "mptunnel",
-        "--quic-path-keep-alive-interval-ms",
-        "10000",
-        "--quic-path-idle-timeout-ms",
-        "10000",
+        "--quic-path-keep-alive-interval-s",
+        "10",
+        "--quic-path-idle-timeout-s",
+        "10",
         "client",
         "--path",
         "quic://127.0.0.1:443",
@@ -1612,7 +1612,7 @@ fn path_probe_timing_is_validated() {
     let cli = parse_cli([
         "mptunnel",
         "client",
-        "--path-probe-interval-ms",
+        "--path-probe-interval-s",
         "0",
         "--path",
         "tcp://127.0.0.1:443",
@@ -1629,7 +1629,7 @@ fn path_probe_timing_is_validated() {
     let cli = parse_cli([
         "mptunnel",
         "client",
-        "--path-probe-timeout-ms",
+        "--path-probe-timeout-s",
         "0",
         "--path",
         "tcp://127.0.0.1:443",

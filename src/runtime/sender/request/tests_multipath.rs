@@ -112,8 +112,8 @@ async fn bounded_ack_gap_uses_an_active_unmeasured_alternate() {
 #[tokio::test]
 async fn ordinary_data_does_not_borrow_a_successor_carriers_health() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10258?initial-srtt-ms=5",
-        "quic://127.0.0.1:10259?initial-srtt-ms=80",
+        "tcp://127.0.0.1:10258?initial-srtt-s=0.005",
+        "quic://127.0.0.1:10259?initial-srtt-s=0.08",
     ]);
     let stream_id = StreamId(172);
     let (predecessor_commands, _predecessor_receivers) = reliable_path_command_channels(8);
@@ -202,8 +202,8 @@ async fn exact_current_unmeasured_attachment_keeps_startup_admission() {
 #[tokio::test]
 async fn request_plan_revalidates_exact_health_after_same_key_replacement() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10261?initial-srtt-ms=5",
-        "quic://127.0.0.1:10262?initial-srtt-ms=80",
+        "tcp://127.0.0.1:10261?initial-srtt-s=0.005",
+        "quic://127.0.0.1:10262?initial-srtt-s=0.08",
     ]);
     let stream_id = StreamId(174);
     let (selected_commands, mut selected_receivers) = reliable_path_command_channels(8);
@@ -411,7 +411,7 @@ fn request_apply_eligibility_preserves_only_schedulable_regular_backup_classes()
 
 #[tokio::test]
 async fn request_plan_revalidates_same_instance_health_transitions() {
-    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10263?initial-srtt-ms=5"]);
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10263?initial-srtt-s=0.005"]);
     let stream_id = StreamId(175);
     let (commands, _receivers) = reliable_path_command_channels(8);
     let mut remotes =
@@ -466,8 +466,8 @@ async fn request_plan_revalidates_same_instance_health_transitions() {
 #[tokio::test]
 async fn request_plan_revalidates_regular_backup_set_changes() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10264?initial-srtt-ms=5",
-        "quic://127.0.0.1:10265?initial-srtt-ms=80",
+        "tcp://127.0.0.1:10264?initial-srtt-s=0.005",
+        "quic://127.0.0.1:10265?initial-srtt-s=0.08",
     ]);
     let stream_id = StreamId(176);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
@@ -516,9 +516,9 @@ async fn request_plan_revalidates_regular_backup_set_changes() {
 #[tokio::test]
 async fn persistent_ack_gap_does_not_borrow_a_successor_carriers_rate_model() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10253?initial-srtt-ms=40",
-        "quic://127.0.0.1:10254?initial-srtt-ms=5",
-        "quic://127.0.0.1:10255?initial-srtt-ms=80",
+        "tcp://127.0.0.1:10253?initial-srtt-s=0.04",
+        "quic://127.0.0.1:10254?initial-srtt-s=0.005",
+        "quic://127.0.0.1:10255?initial-srtt-s=0.08",
     ]);
     let stream_id = StreamId(170);
     let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
@@ -598,8 +598,8 @@ async fn persistent_ack_gap_does_not_borrow_a_successor_carriers_rate_model() {
 #[tokio::test]
 async fn persistent_ack_gap_does_not_time_a_predecessor_with_successor_evidence() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10256?initial-srtt-ms=5",
-        "quic://127.0.0.1:10257?initial-srtt-ms=40",
+        "tcp://127.0.0.1:10256?initial-srtt-s=0.005",
+        "quic://127.0.0.1:10257?initial-srtt-s=0.04",
     ]);
     let stream_id = StreamId(171);
     let (predecessor_commands, _predecessor_receivers) = reliable_path_command_channels(8);
@@ -670,9 +670,9 @@ async fn persistent_ack_gap_does_not_time_a_predecessor_with_successor_evidence(
 #[tokio::test]
 async fn retained_tail_uses_only_a_measured_earlier_completion() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10253?initial-srtt-ms=20",
-        "quic://127.0.0.1:10254?initial-srtt-ms=20",
-        "quic://127.0.0.1:10255?initial-srtt-ms=20",
+        "tcp://127.0.0.1:10253?initial-srtt-s=0.02",
+        "quic://127.0.0.1:10254?initial-srtt-s=0.02",
+        "quic://127.0.0.1:10255?initial-srtt-s=0.02",
     ]);
     let stream_id = StreamId(18);
     let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
@@ -787,7 +787,7 @@ async fn retained_tail_uses_only_a_measured_earlier_completion() {
 #[tokio::test]
 async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
+        "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
     ]);
     let stream_id = StreamId(32);
     let (old_commands, _old_receivers) = reliable_path_command_channels(8);
@@ -832,9 +832,9 @@ async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
 #[tokio::test]
 async fn ack_gap_repair_history_does_not_exhaust_non_original_outputs() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
-        "quic://127.0.0.1:10252?initial-srtt-ms=15&initial-rate-mbps=250",
-        "quic://127.0.0.1:10253?initial-srtt-ms=10&initial-rate-mbps=300",
+        "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
+        "quic://127.0.0.1:10252?initial-srtt-s=0.015&initial-rate-mbps=250",
+        "quic://127.0.0.1:10253?initial-srtt-s=0.01&initial-rate-mbps=300",
     ]);
     let stream_id = StreamId(33);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -938,8 +938,8 @@ async fn ack_gap_repair_history_does_not_exhaust_non_original_outputs() {
 #[tokio::test]
 async fn portable_quic_repair_waits_for_exact_stream_flight_but_failure_recovery_does_not() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
-        "quic://127.0.0.1:10252?initial-srtt-ms=10&initial-rate-mbps=300",
+        "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
+        "quic://127.0.0.1:10252?initial-srtt-s=0.01&initial-rate-mbps=300",
     ]);
     let stream_id = StreamId(35);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -1013,8 +1013,8 @@ async fn portable_quic_repair_waits_for_exact_stream_flight_but_failure_recovery
 #[tokio::test]
 async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
     let context = client_test_context_with_paths(&[
-        "tcp://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
-        "quic://127.0.0.1:10252?initial-srtt-ms=10&initial-rate-mbps=300",
+        "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
+        "quic://127.0.0.1:10252?initial-srtt-s=0.01&initial-rate-mbps=300",
     ]);
     let stream_id = StreamId(36);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
@@ -1078,9 +1078,9 @@ async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
 #[tokio::test]
 async fn unbound_reinjection_requires_idle_but_measured_recovery_may_use_busy() {
     let context = client_test_context_with_paths(&[
-        "quic://127.0.0.1:10251?initial-srtt-ms=20&initial-rate-mbps=200",
-        "tcp://127.0.0.1:10252?initial-srtt-ms=2&initial-rate-mbps=1000",
-        "tcp://127.0.0.1:10253?initial-srtt-ms=30&initial-rate-mbps=100",
+        "quic://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
+        "tcp://127.0.0.1:10252?initial-srtt-s=0.002&initial-rate-mbps=1000",
+        "tcp://127.0.0.1:10253?initial-srtt-s=0.03&initial-rate-mbps=100",
     ]);
     let stream_id = StreamId(34);
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);

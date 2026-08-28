@@ -315,6 +315,21 @@ outbound = "direct"
 }
 
 #[test]
+fn auth_freshness_file_value_uses_wire_timestamp_precision() {
+    for document in [
+        mpp_outbound_security_document("auth_freshness_window_s = 0.5"),
+        mpp_inbound_security_document("auth_freshness_window_s = 0.5"),
+    ] {
+        assert!(matches!(
+            load_config_toml_str(&document),
+            Err(ConfigFileError::Config(
+                ConfigError::AuthFreshnessWindowSubsecond
+            ))
+        ));
+    }
+}
+
+#[test]
 fn shared_transport_secret_is_optional_distinct_and_strict() {
     let default_name =
         load_config_toml_str(&mpp_outbound_security_document("")).expect("default MPP TLS name");
@@ -750,8 +765,8 @@ default = "secure"
 name = "vpn-capture"
 ipv4_pool = "198.18.0.0/16"
 capacity = 4096
-answer_ttl_seconds = 30
-recovery_ttl_seconds = 120
+answer_ttl_s = 30
+recovery_ttl_s = 120
 
 [[dns.servers]]
 name = "dot"
@@ -784,15 +799,15 @@ protocol = "system"
 name = "capture-a"
 ipv4_pool = "198.18.0.0/24"
 capacity = 128
-answer_ttl_seconds = 30
-recovery_ttl_seconds = 120
+answer_ttl_s = 30
+recovery_ttl_s = 120
 
 [[dns.synthetic_capture]]
 name = "capture-b"
 ipv4_pool = "198.18.1.0/24"
 capacity = 128
-answer_ttl_seconds = 30
-recovery_ttl_seconds = 120
+answer_ttl_s = 30
+recovery_ttl_s = 120
 
 [[dns.policies]]
 name = "capture-a-policy"
@@ -1073,10 +1088,10 @@ servers = ["v4", "v6"]
 override_records = ["router-home"]
 family = "ipv6-and-ipv4"
 strategy = "race"
-fallback_ms = 50
+fallback_s = 0.05
 answer_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
-query = { timeout_ms = 1500, inflight = 32, answers = 24 }
-cache = { entries = 2048, positive_ttl_ms = 120000, negative_ttl_ms = 15000, stale_ms = 45000, prefetch_ms = 12000 }
+query = { timeout_s = 1.5, inflight = 32, answers = 24 }
+cache = { entries = 2048, positive_ttl_s = 120, negative_ttl_s = 15, stale_s = 45, prefetch_s = 12 }
 
 [[override_records]]
 name = "router-home"
@@ -1320,8 +1335,8 @@ name = "vpn-capture"
 ipv4_pool = "198.18.0.0/16"
 ipv6_pool = "fd00:4d50::/112"
 capacity = 4096
-answer_ttl_seconds = 30
-recovery_ttl_seconds = 120
+answer_ttl_s = 30
+recovery_ttl_s = 120
 
 [[servers]]
 name = "doq"
@@ -1373,8 +1388,8 @@ default = "default"
 name = "bad-pool"
 ipv4_pool = "203.0.113.0/24"
 capacity = 32
-answer_ttl_seconds = 30
-recovery_ttl_seconds = 120
+answer_ttl_s = 30
+recovery_ttl_s = 120
 [[servers]]
 name = "system"
 protocol = "system"
@@ -1634,7 +1649,7 @@ local_users = ["phone-login"]
 max_connections = 40
 max_connections_per_source = 20
 max_connections_per_principal = 10
-handshake_timeout_ms = 5000
+handshake_timeout_s = 5
 
 [[outbounds]]
 name = "edge"
@@ -1725,6 +1740,10 @@ fn tun_l3_toml_compiles_client_binding_and_server_address_plan() {
     let document = format!(
         "{TEST_CREDENTIAL_CATALOG}\n{}",
         r#"
+[flow]
+optional_reinjection_budget_percent = 17
+quic_loss_compensation_percent = 6.25
+
 [[inbounds]]
 name = "packet-client"
 protocol = "tun-l3"
@@ -1734,7 +1753,7 @@ interface_name = "mptun-client"
 [[inbounds]]
 name = "packet-server"
 protocol = "mpp-l3"
-paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:7443" }, { name = "path-2", endpoint = "quic://127.0.0.1:7443" }]
 
 [inbounds.security]
 credential_ids = ["test-default"]
@@ -1755,7 +1774,7 @@ allowed_ips = ["192.168.50.0/24"]
 [[outbounds]]
 name = "edge"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "quic://127.0.0.1:443" }]
 
 [outbounds.security]
 credential_id = "test-default"
@@ -1784,6 +1803,31 @@ protocol = "direct"
     let [server] = node.servers.as_slice() else {
         panic!("expected one MPP server inbound");
     };
+    assert_eq!(server.performance.optional_reinjection_budget_percent, 17);
+    assert_eq!(
+        server.paths[1]
+            .spec
+            .metadata
+            .loss_compensation
+            .expect("MPP-L3 inbound inherits flow QUIC loss policy")
+            .ppm(),
+        62_500
+    );
+    assert_eq!(
+        mpp_outbounds(&node)[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        17
+    );
+    assert_eq!(
+        mpp_outbounds(&node)[0].paths[1]
+            .spec
+            .metadata
+            .loss_compensation
+            .expect("TUN-L3 outbound inherits flow QUIC loss policy")
+            .ppm(),
+        62_500
+    );
     let plan = server.tun_l3.as_ref().expect("server TUN-L3 plan");
     assert_eq!(plan.interface_name(), Some("mptun-server"));
     assert_eq!(
@@ -1878,7 +1922,7 @@ tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" 
 tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [inbounds.performance]
-extra_traffic_hint_percent = 1
+optional_reinjection_budget_percent = 1
 
 [inbounds.tun_l3]
 ipv4_pool = "10.88.0.0/24"
@@ -2114,16 +2158,16 @@ fn toml_separates_logical_session_retention_from_carrier_liveness() {
     let config = load_config_toml_str(
         r#"
 [session]
-retention_timeout_ms = 45000
+retention_timeout_s = 45
 
 [resources]
 max_reinjection_cache_chunks = 101
 max_reorder_buffer_chunks = 102
 max_retained_receive_ranges = 103
-tcp_path_heartbeat_interval_ms = 2000
-tcp_path_heartbeat_timeout_ms = 7000
-quic_path_keep_alive_interval_ms = 3000
-quic_path_idle_timeout_ms = 12000
+tcp_path_heartbeat_interval_s = 2
+tcp_path_heartbeat_timeout_s = 7
+quic_path_keep_alive_interval_s = 3
+quic_path_idle_timeout_s = 12
 
 [[inbounds]]
 name = "local-socks"
@@ -2165,6 +2209,55 @@ outbound = "mpp"
     assert_eq!(config.resources.max_reinjection_cache_chunks, 101);
     assert_eq!(config.resources.max_reorder_buffer_chunks, 102);
     assert_eq!(config.resources.max_retained_receive_ranges, 103);
+}
+
+#[test]
+fn product_flow_idle_uses_decimal_seconds_zero_disables_and_legacy_units_fail() {
+    let document = |flow: &str| {
+        format!(
+            r#"
+{flow}
+
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+
+[[outbounds]]
+name = "direct"
+protocol = "direct"
+
+[routing]
+[[routing.rules]]
+name = "default"
+decision = "allow"
+outbound = "direct"
+"#
+        )
+    };
+
+    let default = load_config_toml_str(&document("")).expect("default flow policy");
+    assert_eq!(default.flow.idle_timeout, Some(Duration::from_secs(300)));
+
+    let fractional = load_config_toml_str(&document("[flow]\nidle_timeout_s = 2.5"))
+        .expect("fractional seconds");
+    assert_eq!(
+        fractional.flow.idle_timeout,
+        Some(Duration::from_millis(2_500))
+    );
+
+    let disabled = load_config_toml_str(&document("[flow]\nidle_timeout_s = 0"))
+        .expect("disabled idle timeout");
+    assert_eq!(disabled.flow.idle_timeout, None);
+
+    for legacy in ["idle_timeout_ms = 2500", "idle_timeout_seconds = 2"] {
+        assert!(
+            matches!(
+                load_config_toml_str(&document(&format!("[flow]\n{legacy}"))),
+                Err(ConfigFileError::Toml(_))
+            ),
+            "legacy duration field unexpectedly parsed: {legacy}"
+        );
+    }
 }
 
 fn uncomment_documented_block(document: &str, start: &str, end: &str) -> String {
@@ -2221,6 +2314,12 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     assert_eq!(reference.local_ingresses.len(), 2);
     assert!(reference.tun_l3_ingresses.is_empty());
     assert_eq!(mpp_outbounds(&reference)[0].paths.len(), 2);
+    assert_eq!(
+        mpp_outbounds(&reference)[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        10
+    );
     assert!(
         mpp_outbounds(&reference)[0].paths[0]
             .tls
@@ -2335,6 +2434,12 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     assert_eq!(client.local_ingresses.len(), 1);
     assert!(client.tun_l3_ingresses.is_empty());
     assert_eq!(mpp_outbounds(&client)[0].paths.len(), 2);
+    assert_eq!(
+        mpp_outbounds(&client)[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        10
+    );
     assert!(
         mpp_outbounds(&client)[0].paths[0]
             .tls
@@ -2452,6 +2557,12 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
     assert!(server.local_ingresses.is_empty());
     assert!(server.tun_l3_ingresses.is_empty());
     assert_eq!(server.servers.len(), 1);
+    assert_eq!(
+        server.servers[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        10
+    );
     assert!(server.servers[0].tun_l3.is_none());
     assert_eq!(server.servers[0].paths.len(), 2);
     assert!(server.servers[0].tls.shared_transport_secret_configured());
@@ -2466,6 +2577,177 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
             .target_resolution(),
         TargetResolutionMode::FullResolve,
     );
+}
+
+#[test]
+fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
+    let load = |contents: &str| {
+        let contents = contents
+            .replace("REPLACE_ME", "0123456789abcdef0123456789abcdef")
+            .replace("server.example.com", "mptunnel.test")
+            .replace("REPLACE_WITH_SERVER_CERT.pem", TEST_CERTIFICATE_FILE)
+            .replace("server-cert.pem", TEST_CERTIFICATE_FILE)
+            .replace("server-key.pem", TEST_PRIVATE_KEY_FILE)
+            .replace("mpp-transport.key", TEST_TRANSPORT_SECRET_FILE);
+        load_config_toml_str(&contents).expect("performance inheritance config")
+    };
+    let inherited = |document: &str| {
+        document
+            .replacen(
+                "optional_reinjection_budget_percent = 10",
+                "optional_reinjection_budget_percent = 17",
+                1,
+            )
+            .replacen(
+                "quic_loss_compensation_percent = 10",
+                "quic_loss_compensation_percent = 12.3456",
+                1,
+            )
+    };
+
+    let client_document = inherited(include_str!("../../examples/client.toml"));
+    let client = load(&client_document);
+    let CommandConfig::Node(client) = client.command;
+    assert_eq!(
+        mpp_outbounds(&client)[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        17
+    );
+    assert_eq!(
+        mpp_outbounds(&client)[0].paths[1]
+            .spec
+            .metadata
+            .loss_compensation
+            .expect("global QUIC loss policy resolved at load")
+            .ppm(),
+        123_456
+    );
+    assert!(
+        mpp_outbounds(&client)[0].paths[0]
+            .spec
+            .metadata
+            .loss_compensation
+            .is_none()
+    );
+
+    let client_override = client_document.replacen(
+        "# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss",
+        "performance = { optional_reinjection_budget_percent = 23, quic_loss_compensation_percent = 7.5 }",
+        1,
+    )
+    .replace(
+        "quic://server.example.com:7443",
+        "quic://server.example.com:7443?loss-compensation-percent=3.25",
+    );
+    let client = load(&client_override);
+    let CommandConfig::Node(client) = client.command;
+    assert_eq!(
+        mpp_outbounds(&client)[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        23
+    );
+    assert_eq!(
+        mpp_outbounds(&client)[0].paths[1]
+            .spec
+            .metadata
+            .loss_compensation
+            .expect("path QUIC loss policy overrides node and flow")
+            .ppm(),
+        32_500
+    );
+
+    let client_zero = client_document.replacen(
+        "# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss",
+        "performance = { optional_reinjection_budget_percent = 0, quic_loss_compensation_percent = 0 }",
+        1,
+    );
+    let client = load(&client_zero);
+    let CommandConfig::Node(client) = client.command;
+    assert_eq!(
+        mpp_outbounds(&client)[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        0
+    );
+    assert_eq!(
+        mpp_outbounds(&client)[0].paths[1]
+            .spec
+            .metadata
+            .loss_compensation
+            .expect("explicit zero QUIC loss policy")
+            .ppm(),
+        0
+    );
+
+    let server_document = inherited(include_str!("../../examples/server.toml"));
+    let server = load(&server_document);
+    let CommandConfig::Node(server) = server.command;
+    assert_eq!(
+        server.servers[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        17
+    );
+
+    let server_override = server_document.replacen(
+        "# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss",
+        "performance = { optional_reinjection_budget_percent = 29, quic_loss_compensation_percent = 8.125 }",
+        1,
+    );
+    let server = load(&server_override);
+    let CommandConfig::Node(server) = server.command;
+    assert_eq!(
+        server.servers[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        29
+    );
+    assert_eq!(
+        server.servers[0].paths[1]
+            .spec
+            .metadata
+            .loss_compensation
+            .expect("inbound QUIC loss policy resolved at load")
+            .ppm(),
+        81_250
+    );
+}
+
+#[test]
+fn quic_loss_compensation_file_percent_rejects_invalid_values_and_removed_name() {
+    let omitted = load_config_toml_str(&mpp_outbound_security_document(""))
+        .expect("omitted QUIC loss compensation");
+    let CommandConfig::Node(omitted) = omitted.command;
+    assert_eq!(
+        mpp_outbounds(&omitted)[0].paths[0]
+            .spec
+            .metadata
+            .loss_compensation
+            .expect("built-in QUIC loss policy resolved at load")
+            .ppm(),
+        100_000
+    );
+
+    for value in ["-1", "100", "1.23456", "\"10\""] {
+        let document = format!(
+            "[flow]\nquic_loss_compensation_percent = {value}\n{}",
+            mpp_outbound_security_document("")
+        );
+        assert!(matches!(
+            load_config_toml_str(&document),
+            Err(ConfigFileError::Toml(_))
+        ));
+    }
+    let removed = format!(
+        "[flow]\nextra_traffic_hint_percent = 10\n{}",
+        mpp_outbound_security_document("")
+    );
+    assert!(matches!(
+        load_config_toml_str(&removed),
+        Err(ConfigFileError::Toml(_))
+    ));
 }
 
 #[test]
@@ -2488,7 +2770,7 @@ protocol = "mpp"
 paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "quic://127.0.0.1:8443-8450" }]
 
 [outbounds.performance]
-extra_traffic_hint_percent = 25
+optional_reinjection_budget_percent = 25
 
 [outbounds.security]
 credential_id = "test-default"
@@ -2519,7 +2801,10 @@ outbound = "mpp-main"
     assert_eq!(clients[0].paths.len(), 2);
     assert_eq!(clients[0].paths[1].spec.endpoint.ports().first(), 8443);
     assert_eq!(clients[0].paths[1].spec.endpoint.ports().last(), 8450);
-    assert_eq!(clients[0].performance.extra_traffic_hint_percent, 25);
+    assert_eq!(
+        clients[0].performance.optional_reinjection_budget_percent,
+        25
+    );
     assert_eq!(node.local_ingresses[0].name, "local-socks");
     assert_eq!(
         ingress_configs(&node.local_ingresses),
@@ -2550,7 +2835,7 @@ local_users = ["phone-login"]
 max_connections = 40
 max_connections_per_source = 20
 max_connections_per_principal = 10
-handshake_timeout_ms = 5000
+handshake_timeout_s = 5
 
 [[outbounds]]
 name = "direct"
@@ -2656,8 +2941,8 @@ protocol = "udp-forward"
 listen = ["127.0.0.1:5353"]
 target = "[2001:db8::53]:53"
 max_associations = 16
-idle_timeout_ms = 5000
-datagram_ttl_ms = 1500
+idle_timeout_s = 5
+datagram_ttl_s = 1.5
 
 [[inbounds]]
 name = "local-mixed-forward"
@@ -2666,8 +2951,8 @@ listen = ["127.0.0.1:9443"]
 target = "service.example:443"
 max_connections = 24
 max_associations = 12
-idle_timeout_ms = 4000
-datagram_ttl_ms = 1200
+idle_timeout_s = 4
+datagram_ttl_s = 1.2
 
 [[outbounds]]
 name = "mpp-main"
@@ -2786,8 +3071,8 @@ address = "[2606:4700:4700::1111]:53"
 name = "egress"
 servers = ["v4", "v6"]
 family = "ipv4-and-ipv6"
-query = { timeout_ms = 1500, inflight = 32 }
-cache = { entries = 2048, positive_ttl_ms = 120000, negative_ttl_ms = 15000 }
+query = { timeout_s = 1.5, inflight = 32 }
+cache = { entries = 2048, positive_ttl_s = 120, negative_ttl_s = 15 }
 
 [[inbounds]]
 name = "local-http"
@@ -2805,7 +3090,7 @@ tls_certificate_chain = { from = "file", path = "mptunnel-test-certificate.pem" 
 tls_private_key = { from = "file", path = "mptunnel-test-private-key.pem" }
 
 [inbounds.performance]
-extra_traffic_hint_percent = 200
+optional_reinjection_budget_percent = 200
 
 [[outbounds]]
 name = "mpp-main"
@@ -2849,7 +3134,7 @@ decision = "reject"
     assert_eq!(node.servers.len(), 1);
     let server = &node.servers[0];
     assert_eq!(server.name, "edge-mpp");
-    assert_eq!(server.performance.extra_traffic_hint_percent, 200);
+    assert_eq!(server.performance.optional_reinjection_budget_percent, 200);
     assert_eq!(server.paths.len(), 2);
     let policy = node.product_policy.as_ref().expect("routing policy");
     let server_route = policy
@@ -3092,13 +3377,13 @@ protocol = "direct"
 name = "manual-edge"
 strategy = "manual"
 manual_outbound = "edge-a"
-freshness_ttl_ms = 30000
+freshness_ttl_s = 30
 members = [
   { outbound = "edge-a", weight = 3 },
   { outbound = "edge-b", mode = "draining" },
 ]
-stickiness = { key = "principal", ttl_ms = 60000, capacity = 1024 }
-probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }
+stickiness = { key = "principal", ttl_s = 60, capacity = 1024 }
+probe = { target = "192.0.2.1:443", interval_s = 10, timeout_s = 2 }
 
 [[routing.balancers]]
 name = "random-edge"

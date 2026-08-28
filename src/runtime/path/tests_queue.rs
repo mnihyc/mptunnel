@@ -19,8 +19,12 @@ fn stream_data_frame(stream_id: u64, bytes: usize) -> Frame {
 }
 
 fn datagram_data_frame(datagram_id: u64, bytes: usize) -> Frame {
+    datagram_data_frame_for_flow(1, datagram_id, bytes)
+}
+
+fn datagram_data_frame_for_flow(flow_id: u64, datagram_id: u64, bytes: usize) -> Frame {
     Frame::DatagramData {
-        flow_id: DatagramFlowId(1),
+        flow_id: DatagramFlowId(flow_id),
         datagram_id: crate::protocol::DatagramId(datagram_id),
         ttl_ms: 1_000,
         payload: Bytes::from(vec![0; bytes]),
@@ -314,6 +318,57 @@ async fn control_close_discards_stale_stream_data_and_releases_queue_bytes() {
     );
     receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&live));
     assert_eq!(commands.pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn server_datagram_retirement_discards_only_preaccepted_same_flow_work() {
+    let retired_flow = DatagramFlowId(30);
+    let sibling_flow = DatagramFlowId(31);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+
+    // Keep one reservation uncommitted across the retirement boundary to
+    // prove the fence follows admission ownership rather than send timing.
+    let crossing = commands
+        .try_reserve_admitted_frame(
+            datagram_data_frame_for_flow(retired_flow.0, 1, 4096),
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("reserve same-flow work before retirement");
+    commands
+        .try_enqueue_admitted_frame(
+            datagram_data_frame_for_flow(sibling_flow.0, 2, 2048),
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("queue unrelated flow work");
+    commands
+        .retire_server_datagram_flow(retired_flow)
+        .expect("publish queue-independent retirement");
+
+    let close = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("retirement close");
+    assert!(matches!(
+        close,
+        ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id })
+            if flow_id == retired_flow
+    ));
+
+    crossing.commit();
+    let sibling = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("unrelated queued work survives the flow fence");
+    assert!(matches!(
+        &sibling,
+        ReliablePathCommand::SendFrame(Frame::DatagramData { flow_id, .. })
+            if *flow_id == sibling_flow
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&sibling));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(
+        commands.pending_bytes(),
+        0,
+        "discarding retired work returns its queue-byte charge"
+    );
 }
 
 #[tokio::test]

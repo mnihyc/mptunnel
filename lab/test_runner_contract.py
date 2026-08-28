@@ -89,8 +89,8 @@ class RunnerContractTests(unittest.TestCase):
             "MPTUNNEL_MAX_REINJECTION_CACHE_CHUNKS",
             "MPTUNNEL_MAX_REORDER_BUFFER_CHUNKS",
             "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES",
-            "MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS",
-            "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS",
+            "MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_S",
+            "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_S",
         ):
             self.assertIn(name, resources)
 
@@ -105,6 +105,14 @@ class RunnerContractTests(unittest.TestCase):
 
         self.assertIn('if flag_enabled "$lab_diagnostics"; then', build_function)
         self.assertIn("--features lab-diagnostics", build_function)
+
+    def test_configured_build_root_controls_cargo_output(self):
+        build_function = SCRIPT.split("build_mptunnel_binary() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertEqual(
+            build_function.count('CARGO_TARGET_DIR="$host_build_root"'),
+            2,
+        )
 
     def test_wine_runtime_is_opt_in_and_client_only(self):
         build_function = SCRIPT.split("build_mptunnel_binary() {", 1)[1].split(

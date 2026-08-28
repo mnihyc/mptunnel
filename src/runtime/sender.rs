@@ -24,7 +24,8 @@ pub(in crate::runtime) use response::ServerResponseSenderService;
 #[cfg(not(test))]
 pub(in crate::runtime) use work::{
     CarrierEmitMode, RelaySendCause, ServerReinjectionOutputIdentity,
-    sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
+    sender_optional_reinjection_startup_floor_bytes,
+    sender_reinjection_minimum_useful_attempt_bytes,
 };
 
 #[cfg(test)]

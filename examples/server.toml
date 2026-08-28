@@ -9,6 +9,24 @@
 [logging]
 level = "info" # all levels are good
 
+[flow]
+# TCP streams and UDP associations idle on application payload; 0 disables.
+idle_timeout_s = 300
+# Optional reliable MPP payload reinjection; control/probes/native recovery are outside it.
+optional_reinjection_budget_percent = 10
+# Sender-side QUIC loss correction; a path URI value has highest precedence.
+quic_loss_compensation_percent = 10
+
+[admission]
+max_live_flows = 4096
+max_concurrent_work = 4096
+max_live_flows_per_principal = 4096
+max_live_flows_per_outbound = 4096
+max_connects_per_outbound = 4096
+max_live_flows_per_target = 4096
+max_connects_per_target = 4096
+max_dns_work = 4096
+
 [[credentials]]
 credential_id = "home-client"
 principal_id = "home"
@@ -17,12 +35,13 @@ secret = { from = "file", path = "mpp-credential.key" }
 [[inbounds]]
 name = "mpp-listener"
 protocol = "mpp"
-# QUIC loss compensation defaults to 10% when omitted. To state or override it,
+# QUIC loss compensation inherits performance/[flow]. A path URI overrides it:
 # append `?loss-compensation-percent=10` (or `=0` for draft BBR3 behavior).
 paths = [
   { name = "path-1", endpoint = "tcp://0.0.0.0:7443" },
   { name = "path-2", endpoint = "quic://0.0.0.0:7443" },
 ]
+# performance = { optional_reinjection_budget_percent = 20, quic_loss_compensation_percent = 5 } # overrides [flow]; path URI wins for loss
 # Omission denies incoming peer diagnostics. Use a concrete list of accepted
 # principal IDs, or the scalar "*" for every authenticated principal.
 # peer_diagnostics_principal_ids = ["home"]
@@ -79,7 +98,7 @@ protocol = "direct"
 # name = "socks5-egress"
 # protocol = "socks5"
 # endpoint = "127.0.0.1:1080"
-# connect_timeout_ms = 10000
+# connect_timeout_s = 10
 # With `full-resolve` below, SOCKS5 receives an authorized literal IP. Use
 # `route-only` to retain the canonical hostname after local routing evidence,
 # or `as-is` to skip routing DNS entirely.
@@ -90,7 +109,7 @@ protocol = "direct"
 # name = "http-egress"
 # protocol = "http-connect"
 # endpoint = "127.0.0.1:8080"
-# connect_timeout_ms = 10000
+# connect_timeout_s = 10
 
 [routing]
 target_resolution = "full-resolve"
@@ -118,5 +137,5 @@ outbound = "direct-egress"
 # name = "egress-fallback"
 # strategy = "ordered-failover"
 # members = [{ outbound = "direct-egress" }, { outbound = "socks5-egress" }]
-# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_ms = 1000, maximum_backoff_ms = 60000 }
-# probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }
+# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_s = 1, maximum_backoff_s = 60 }
+# probe = { target = "192.0.2.1:443", interval_s = 10, timeout_s = 2 }

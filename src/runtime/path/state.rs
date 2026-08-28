@@ -6,9 +6,11 @@
 use super::client_session::{ClientSessionLifecycle, ClientSessionRetirement};
 use super::commands::CapacityProbeCommandTicket;
 use super::health::{ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView};
+#[cfg(test)]
+use super::model::PathDeliveryStats;
 use super::model::{
-    ClientPathObservation, PathDeliveryStats, UdpDatagramPathObservation,
-    path_observation_is_idle_for_probe, path_records_have_schedulable_alternative,
+    ClientPathObservation, UdpDatagramPathObservation, path_observation_is_idle_for_probe,
+    path_records_have_schedulable_alternative,
 };
 #[cfg(test)]
 use super::proof::PathProofObservation;
@@ -257,10 +259,13 @@ impl ClientPathState {
         }
     }
 
-    /// Commits a provisional TCP successor only while the predecessor still
-    /// owns the stable member and has no Product ownership. Product admission
-    /// uses this same health lock, so no open can cross the instance swap.
-    pub(in crate::runtime) fn publish_tcp_replacement_if_product_quiescent(
+    /// Commits an authenticated TCP successor only while the expected
+    /// predecessor still owns the stable member.
+    ///
+    /// Product admission uses this same health lock. Work committed before
+    /// the swap remains fenced to the predecessor and follows ordinary ordered
+    /// retirement; work committed after it observes only the successor.
+    pub(in crate::runtime) fn publish_tcp_replacement_if_current(
         &self,
         predecessor_instance_id: CarrierPathInstanceId,
         publication: ClientTcpCarrierPublication,
@@ -272,16 +277,11 @@ impl ClientPathState {
                 .lock()
                 .expect("client carrier lifecycle lock");
             let mut health = self.health.lock().expect("client path health lock");
-            if self.active_product_flows.load(Ordering::Relaxed) != 0
-                || !health.is_product_quiescent()
-            {
-                return false;
-            }
             let record = health
                 .tcp
                 .get_mut(publication.path_index)
                 .expect("TCP carrier actor must have one health record");
-            if !record.is_product_quiescent_for_instance(predecessor_instance_id) {
+            if record.path_instance_id() != Some(predecessor_instance_id) {
                 return false;
             }
             record.install_tcp_peer_usage(
@@ -303,46 +303,6 @@ impl ClientPathState {
                 },
             );
         }
-        true
-    }
-
-    pub(in crate::runtime) fn tcp_path_is_product_quiescent_for_instance(
-        &self,
-        index: usize,
-        path_instance_id: CarrierPathInstanceId,
-    ) -> bool {
-        let health = self.health.lock().expect("client path health lock");
-        self.active_product_flows.load(Ordering::Relaxed) == 0
-            && health.is_product_quiescent()
-            && health
-                .tcp_record(index)
-                .is_some_and(|record| record.is_product_quiescent_for_instance(path_instance_id))
-    }
-
-    /// Fences a no-spare replacement at the same exact Product-admission
-    /// boundary. Marking the record draining makes all later load reservations
-    /// fail before the physical actor receives its ordered drain request.
-    pub(in crate::runtime) fn begin_tcp_replacement_if_product_quiescent(
-        &self,
-        index: usize,
-        path_instance_id: CarrierPathInstanceId,
-    ) -> bool {
-        let _lifecycle = self
-            .carrier_lifecycle
-            .lock()
-            .expect("client carrier lifecycle lock");
-        let mut health = self.health.lock().expect("client path health lock");
-        if self.active_product_flows.load(Ordering::Relaxed) != 0 || !health.is_product_quiescent()
-        {
-            return false;
-        }
-        let Some(record) = health.tcp.get_mut(index) else {
-            return false;
-        };
-        if !record.is_product_quiescent_for_instance(path_instance_id) {
-            return false;
-        }
-        record.begin_planned_retirement();
         true
     }
 
@@ -1120,28 +1080,6 @@ impl ClientPathContext {
         }
     }
 
-    pub(in crate::runtime) fn mark_relay_path_delivery(
-        &self,
-        instance: RelayPathInstance,
-        stats: PathDeliveryStats,
-    ) {
-        match instance.key.underlay {
-            UnderlayProtocol::Tcp => self.mark_tcp_path_delivery_for_instance(
-                instance.key.index,
-                instance.path_instance_id,
-                stats,
-            ),
-            UnderlayProtocol::Udp => {
-                let Some(sample) = stats.rate_sample() else {
-                    return;
-                };
-                let _ = self.state.mutate_path_eligibility(instance.key, |current| {
-                    current.mark_product_delivery_for_instance(instance.path_instance_id, sample);
-                });
-            }
-        }
-    }
-
     pub(in crate::runtime) fn mark_relay_path_rate_sample(
         &self,
         instance: RelayPathInstance,
@@ -1222,26 +1160,6 @@ impl ClientPathContext {
         {
             current.mark_product_delivery(sample);
         }
-    }
-
-    pub(in crate::runtime) fn mark_tcp_path_delivery_for_instance(
-        &self,
-        index: usize,
-        path_instance_id: CarrierPathInstanceId,
-        stats: PathDeliveryStats,
-    ) {
-        let Some(sample) = stats.rate_sample() else {
-            return;
-        };
-        let _ = self.state.mutate_path_eligibility(
-            RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index,
-            },
-            |current| {
-                current.mark_product_delivery_for_instance(path_instance_id, sample);
-            },
-        );
     }
 
     #[cfg(test)]
@@ -1352,30 +1270,6 @@ impl ClientPathContext {
         {
             current.release_load(TrafficClass::RealtimeDatagram);
         }
-    }
-
-    pub(in crate::runtime) fn mark_udp_datagram_path_delivery_for_instance(
-        &self,
-        index: usize,
-        path_instance_id: CarrierPathInstanceId,
-        stats: PathDeliveryStats,
-    ) -> bool {
-        let Some(sample) = stats.rate_sample() else {
-            return false;
-        };
-        self.state
-            .mutate_path_eligibility(
-                RelayPathKey {
-                    underlay: UnderlayProtocol::Udp,
-                    index,
-                },
-                |current| {
-                    // Datagram goodput ranks datagram paths but never proves reliable
-                    // product ownership or unlocks ordered-stream overlap.
-                    current.mark_delivery_for_instance(path_instance_id, sample)
-                },
-            )
-            .unwrap_or(false)
     }
 
     #[cfg(test)]

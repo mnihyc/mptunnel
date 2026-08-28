@@ -20,8 +20,8 @@ fn defaults_preserve_the_deployed_resource_envelope() {
 #[test]
 fn performance_default_preserves_the_deployed_overhead_hint() {
     assert_eq!(
-        MppPerformanceConfig::default().extra_traffic_hint_percent,
-        5
+        MppPerformanceConfig::default().optional_reinjection_budget_percent,
+        10
     );
 }
 

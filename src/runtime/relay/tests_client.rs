@@ -1,8 +1,7 @@
 use super::{ClientRelayDeliveryState, ClientRelayDisconnectedState, ClientRelayState};
-use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::protocol::{OffsetRange, StreamId, UnderlayProtocol};
+use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::sender::ReliableRelaySenderQueue;
 use bytes::Bytes;
 use std::time::{Duration, Instant};
@@ -24,35 +23,17 @@ fn disconnected_retries_never_extend_the_absolute_retention_deadline() {
 }
 
 #[test]
-fn delivery_attribution_credits_current_frame_not_released_buffer() {
-    let path_key = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 1,
-    };
-    let instance = RelayPathInstance {
-        key: path_key,
-        path_instance_id: CarrierPathInstanceId::from_raw(7),
-        attachment_id: 11,
-    };
+fn response_delivery_accounting_is_logical_not_sender_path_evidence() {
     let delivered = [
         Bytes::from_static(&[0; 1024]),
         Bytes::from_static(&[1; 4096]),
     ];
     let mut delivery = ClientRelayDeliveryState::default();
 
-    let delivered_bytes = delivery.record_response(instance, &delivered, 1024);
+    let delivered_bytes = delivery.record_response(&delivered);
 
     assert_eq!(delivered_bytes, 5120);
     assert_eq!(delivery.total.payload_bytes, 5120);
-    assert_eq!(
-        delivery
-            .by_path
-            .get(&instance)
-            .expect("path stat")
-            .payload_bytes,
-        1024,
-        "hole-closing carrier must not inherit buffered bytes released from other paths"
-    );
 }
 
 #[test]

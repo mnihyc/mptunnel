@@ -45,6 +45,7 @@ pub enum RuntimeError {
     ReliablePathAttachmentRefused,
     ReliablePathRetired,
     SessionRetentionTimeout,
+    ProductIdleTimeout,
     ProductPolicy(String),
     GatewayStatePoisoned,
     GatewayUnavailable(String),
@@ -229,6 +230,9 @@ impl std::fmt::Display for RuntimeError {
                     "session retention timeout expired without an available path"
                 )
             }
+            Self::ProductIdleTimeout => {
+                write!(f, "logical Product flow idle timeout expired")
+            }
             Self::ProductPolicy(error) => write!(f, "product policy error: {error}"),
             Self::GatewayStatePoisoned => write!(f, "product balancer state lock is poisoned"),
             Self::GatewayUnavailable(error) => write!(f, "product balancer unavailable: {error}"),
@@ -292,6 +296,7 @@ impl std::error::Error for RuntimeError {
             | Self::ReliablePathAttachmentRefused
             | Self::ReliablePathRetired
             | Self::SessionRetentionTimeout
+            | Self::ProductIdleTimeout
             | Self::ProductPolicy(_)
             | Self::GatewayStatePoisoned
             | Self::GatewayUnavailable(_)

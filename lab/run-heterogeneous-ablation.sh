@@ -500,9 +500,11 @@ build_mptunnel_binary() {
   if flag_enabled "$lab_diagnostics"; then
     feature_args=(--features lab-diagnostics)
   fi
-  cargo build --release --locked --bin mptunnel "${feature_args[@]}"
+  CARGO_TARGET_DIR="$host_build_root" \
+    cargo build --release --locked --bin mptunnel "${feature_args[@]}"
   if [[ "$client_runtime" == "wine" ]]; then
-    cargo build --release --locked --target "$client_target" --bin mptunnel "${feature_args[@]}"
+    CARGO_TARGET_DIR="$host_build_root" \
+      cargo build --release --locked --target "$client_target" --bin mptunnel "${feature_args[@]}"
   fi
 }
 
@@ -735,17 +737,22 @@ resource_config_toml() {
     MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES:max_datagram_queue_bytes
     MPTUNNEL_MAX_PATH_FLIGHT_BYTES:max_path_flight_bytes
     MPTUNNEL_MAX_RELIABLE_RELAY_CHUNK_BYTES:max_reliable_relay_chunk_bytes
-    MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS:tcp_path_heartbeat_interval_ms
-    MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS:tcp_path_heartbeat_timeout_ms
-    MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS:quic_path_keep_alive_interval_ms
-    MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS:quic_path_idle_timeout_ms
+    MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_S:tcp_path_heartbeat_interval_s
+    MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_S:tcp_path_heartbeat_timeout_s
+    MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_S:quic_path_keep_alive_interval_s
+    MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_S:quic_path_idle_timeout_s
   )
   for mapping in "${mappings[@]}"; do
     env_name="${mapping%%:*}"
     key="${mapping#*:}"
     value="${!env_name:-}"
     if [[ -n "$value" ]]; then
-      if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+      if [[ "$key" == *_s ]]; then
+        if [[ ! "$value" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+          echo "$env_name must be non-negative decimal seconds when passed into lab config" >&2
+          return 2
+        fi
+      elif [[ ! "$value" =~ ^[0-9]+$ ]]; then
         echo "$env_name must be an unsigned integer when passed into lab config" >&2
         return 2
       fi
@@ -758,19 +765,19 @@ resource_config_toml() {
 }
 
 probe_config_toml() {
-  if [[ -n "${PATH_PROBE_INTERVAL_MS:-}" ]]; then
-    if [[ ! "${PATH_PROBE_INTERVAL_MS}" =~ ^[0-9]+$ ]]; then
-      echo "PATH_PROBE_INTERVAL_MS must be an unsigned integer" >&2
+  if [[ -n "${PATH_PROBE_INTERVAL_S:-}" ]]; then
+    if [[ ! "${PATH_PROBE_INTERVAL_S}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+      echo "PATH_PROBE_INTERVAL_S must be non-negative decimal seconds" >&2
       return 2
     fi
-    printf 'path_probe_interval_ms = %s\n' "$PATH_PROBE_INTERVAL_MS"
+    printf 'path_probe_interval_s = %s\n' "$PATH_PROBE_INTERVAL_S"
   fi
-  if [[ -n "${PATH_PROBE_TIMEOUT_MS:-}" ]]; then
-    if [[ ! "${PATH_PROBE_TIMEOUT_MS}" =~ ^[0-9]+$ ]]; then
-      echo "PATH_PROBE_TIMEOUT_MS must be an unsigned integer" >&2
+  if [[ -n "${PATH_PROBE_TIMEOUT_S:-}" ]]; then
+    if [[ ! "${PATH_PROBE_TIMEOUT_S}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+      echo "PATH_PROBE_TIMEOUT_S must be non-negative decimal seconds" >&2
       return 2
     fi
-    printf 'path_probe_timeout_ms = %s\n' "$PATH_PROBE_TIMEOUT_MS"
+    printf 'path_probe_timeout_s = %s\n' "$PATH_PROBE_TIMEOUT_S"
   fi
 }
 
@@ -3765,7 +3772,7 @@ finish_quic_port_hop_case() {
 
 run_quic_port_hop_download_case() {
   local case_name="mptunnel_udp_stream_single_unconstrained_port_hopping"
-  local endpoint="--path 'quic://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-rotation-interval-ms=5000'"
+  local endpoint="--path 'quic://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-rotation-interval-s=5'"
   start_quic_port_hop_client "$case_name" "$endpoint"
   run_tcp_download_probe_case "$case_name"
   finish_quic_port_hop_case
@@ -3773,7 +3780,7 @@ run_quic_port_hop_download_case() {
 
 run_quic_port_hop_upload_case() {
   local case_name="mptunnel_udp_stream_single_unconstrained_port_hopping_upload"
-  local endpoint="--path 'quic://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-rotation-interval-ms=5000'"
+  local endpoint="--path 'quic://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-rotation-interval-s=5'"
   start_quic_port_hop_client "$case_name" "$endpoint"
   run_tcp_upload_probe_case "$case_name"
   finish_quic_port_hop_case
@@ -4051,16 +4058,16 @@ udp_endpoint_fat="--path 'quic://172.31.20.20:${server_port}'"
 udp_endpoint_poor="--path 'quic://172.31.30.20:${server_port}'"
 
 if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]]; then
-  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?initial-srtt-ms=20&initial-rate-mbps=80${tcp_carrier_hint_query}'"
-  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?initial-srtt-ms=80&initial-rate-mbps=200${tcp_carrier_hint_query}'"
-  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}?initial-srtt-ms=160&initial-rate-mbps=100${tcp_carrier_hint_query}'"
-  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?initial-srtt-ms=180&initial-rate-mbps=500${tcp_carrier_hint_query}'"
-  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?initial-srtt-ms=420&initial-rttvar-ms=120&initial-rate-mbps=50&expensive=true${tcp_carrier_hint_query}'"
-  udp_lowlat="--path 'quic://172.31.10.20:${server_port}?initial-srtt-ms=20&initial-rate-mbps=80'"
-  udp_balanced="--path 'quic://172.31.15.20:${server_port}?initial-srtt-ms=80&initial-rate-mbps=200'"
-  udp_mildloss="--path 'quic://172.31.16.20:${server_port}?initial-srtt-ms=160&initial-rate-mbps=100'"
-  udp_fat="--path 'quic://172.31.20.20:${server_port}?initial-srtt-ms=180&initial-rate-mbps=500'"
-  udp_poor="--path 'quic://172.31.30.20:${server_port}?initial-srtt-ms=420&initial-rttvar-ms=120&initial-rate-mbps=50&expensive=true'"
+  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?initial-srtt-s=0.02&initial-rate-mbps=80${tcp_carrier_hint_query}'"
+  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?initial-srtt-s=0.08&initial-rate-mbps=200${tcp_carrier_hint_query}'"
+  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}?initial-srtt-s=0.16&initial-rate-mbps=100${tcp_carrier_hint_query}'"
+  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?initial-srtt-s=0.18&initial-rate-mbps=500${tcp_carrier_hint_query}'"
+  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?initial-srtt-s=0.42&initial-rttvar-s=0.12&initial-rate-mbps=50&expensive=true${tcp_carrier_hint_query}'"
+  udp_lowlat="--path 'quic://172.31.10.20:${server_port}?initial-srtt-s=0.02&initial-rate-mbps=80'"
+  udp_balanced="--path 'quic://172.31.15.20:${server_port}?initial-srtt-s=0.08&initial-rate-mbps=200'"
+  udp_mildloss="--path 'quic://172.31.16.20:${server_port}?initial-srtt-s=0.16&initial-rate-mbps=100'"
+  udp_fat="--path 'quic://172.31.20.20:${server_port}?initial-srtt-s=0.18&initial-rate-mbps=500'"
+  udp_poor="--path 'quic://172.31.30.20:${server_port}?initial-srtt-s=0.42&initial-rttvar-s=0.12&initial-rate-mbps=50&expensive=true'"
 else
   tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}${tcp_carrier_query}'"
   tcp_balanced="--path 'tcp://172.31.15.20:${server_port}${tcp_carrier_query}'"

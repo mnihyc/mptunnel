@@ -16,13 +16,13 @@ use super::remote::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{QUIC_PERSISTENT_CONGESTION_THRESHOLD, reliable_relay_buffer_len};
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::path::RelayPathKey;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
+use crate::runtime::path::ClientPathContext;
 use crate::runtime::sender::{ReliableRelaySenderQueue, RequestSenderService};
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteSet,
@@ -97,40 +97,6 @@ pub(super) async fn switch_reliable_relay_to_best_path(
         return Ok(false);
     }
     Ok(true)
-}
-
-pub(super) fn maybe_mark_live_relay_path_delivery(
-    context: &ClientPathContext,
-    instance: RelayPathInstance,
-    stats: PathDeliveryStats,
-    next_sample_bytes: &mut HashMap<RelayPathInstance, u64>,
-) {
-    let sample_step = reliable_relay_live_delivery_sample_bytes(context.mux_limits);
-    let next = next_sample_bytes.entry(instance).or_insert(sample_step);
-    if stats.payload_bytes < *next {
-        return;
-    }
-    let Some(sample) = stats.rate_sample() else {
-        return;
-    };
-    context.mark_relay_path_rate_sample(instance, sample);
-    *next = stats.payload_bytes.saturating_add(sample_step);
-    #[cfg(feature = "lab-diagnostics")]
-    lab_diagnostic(
-        "path_model",
-        format_args!(
-            "path_underlay={:?} path_index={} delivered_bytes={} elapsed_ms={:.3} cause=live_delivery",
-            instance.key.underlay,
-            instance.key.index,
-            stats.payload_bytes,
-            stats
-                .last_payload_at
-                .unwrap_or_else(Instant::now)
-                .saturating_duration_since(stats.first_payload_at.unwrap_or_else(Instant::now))
-                .as_secs_f64()
-                * 1000.0,
-        ),
-    );
 }
 
 pub(super) fn reliable_relay_can_send_pending_fin(
@@ -331,10 +297,6 @@ pub(super) fn cancel_pending_additional_path_opens(
             ),
         );
     }
-}
-
-fn reliable_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {
-    reliable_relay_buffer_len(mux_limits) as u64
 }
 
 pub(super) struct RelayAdditionalPathOpenResult {

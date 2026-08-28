@@ -128,6 +128,7 @@ async fn fixed_tcp_forward_streams_through_the_product_outbound_pipeline() {
         router,
         port_forward_inbound(),
         Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
     ));
 
     let mut client = TcpStream::connect(forward_address)
@@ -260,6 +261,7 @@ async fn fixed_udp_forward_preserves_two_source_response_mappings() {
         Arc::new(tokio::sync::Semaphore::new(2)),
         Duration::from_secs(5),
         30_000,
+        None,
     ));
     let first_client = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -337,6 +339,7 @@ async fn fixed_udp_forward_bounds_associations_and_reclaims_idle_sources() {
         Arc::new(tokio::sync::Semaphore::new(1)),
         Duration::from_millis(120),
         30_000,
+        None,
     ));
     let first_client = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -624,13 +627,14 @@ impl RangedTcpCarrierServer {
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id() {
     let tcp_path =
-        reserve_tcp_path_with_query("initial-srtt-ms=20&initial-rate-mbps=100&max-tcp-carriers=1")
+        reserve_tcp_path_with_query("initial-srtt-s=0.02&initial-rate-mbps=100&max-tcp-carriers=1")
             .await;
     let udp_port = reserve_process_unique_udp_port().await;
-    let udp_path =
-        format!("quic://127.0.0.1:{udp_port}?initial-srtt-ms=90&initial-rate-mbps=400&backup=true")
-            .parse::<PathSpec>()
-            .expect("UDP backup path");
+    let udp_path = format!(
+        "quic://127.0.0.1:{udp_port}?initial-srtt-s=0.09&initial-rate-mbps=400&backup=true"
+    )
+    .parse::<PathSpec>()
+    .expect("UDP backup path");
     let server = tokio::spawn(run_server(
         vec![tcp_path.clone(), udp_path.clone()],
         OutboundConfig::Direct,
@@ -1082,12 +1086,112 @@ async fn fenced_tcp_data_plane_instance_is_replaced_by_pool_reconciliation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescence() {
+async fn failed_tcp_successor_leaves_predecessor_authoritative_and_retriable() {
     let carrier_server = RangedTcpCarrierServer::spawn().await;
     let first_port = carrier_server.first_port;
     let second_port = first_port + 1;
     let client_path = format!(
-        "tcp://127.0.0.1:{first_port}-{second_port}?max-tcp-carriers=3&port-rotation-interval-ms=5000"
+        "tcp://127.0.0.1:{first_port}-{second_port}?max-tcp-carriers=1&port-rotation-interval-s=5"
+    )
+    .parse::<PathSpec>()
+    .expect("ranged client TCP path");
+    let context = ClientPathContext::new_with_carrier_network(
+        vec![ClientPathConfig {
+            name: "failed-successor".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: client_path,
+            security: security(),
+        }],
+        ResourceLimits::default(),
+        None,
+        0,
+        Arc::new(SystemCarrierNetworkProvider),
+    )
+    .expect("failed-successor client context");
+    context.tcp_sessions[0]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .expect("initial predecessor connection");
+    let predecessor_instance = context.tcp_sessions[0]
+        .connection_instance_id()
+        .expect("initial predecessor instance");
+    let predecessor_port = context.tcp_sessions[0]
+        .connection_remote_port()
+        .expect("initial predecessor port");
+    let endpoint_generation = context
+        .tcp_carrier_groups
+        .endpoint_policy(0)
+        .expect("TCP endpoint policy")
+        .snapshot()
+        .generation;
+    let unavailable_port = loop {
+        let candidate = reserve_process_unique_tcp_port().await;
+        if candidate != first_port && candidate != second_port {
+            break candidate;
+        }
+    };
+
+    let failed = context.tcp_sessions[0]
+        .replace_connection_for_endpoint_generation(
+            tokio::time::Instant::now() + Duration::from_millis(500),
+            endpoint_generation,
+            unavailable_port,
+        )
+        .await;
+    assert!(failed.is_err(), "unreachable successor must fail");
+    assert_eq!(
+        context.tcp_sessions[0].connection_instance_id(),
+        Some(predecessor_instance),
+        "failed successor must not withdraw predecessor authority"
+    );
+    assert_eq!(
+        context.tcp_sessions[0].connection_remote_port(),
+        Some(predecessor_port)
+    );
+    assert_eq!(context.tcp_carrier_groups.occupied(0), Some(1));
+
+    let successor_port = if predecessor_port == first_port {
+        second_port
+    } else {
+        first_port
+    };
+    let replacement = context.tcp_sessions[0]
+        .replace_connection_for_endpoint_generation(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            endpoint_generation,
+            successor_port,
+        )
+        .await
+        .expect("replacement retry after failed successor");
+    assert_eq!(replacement.predecessor_instance_id, predecessor_instance);
+    assert_ne!(replacement.successor_instance_id, predecessor_instance);
+    assert_ne!(
+        replacement.successor_path_id,
+        replacement.predecessor_path_id
+    );
+    assert_eq!(replacement.predecessor_port, predecessor_port);
+    assert_eq!(replacement.successor_port, successor_port);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if context.tcp_carrier_groups.occupied(0) == Some(1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retried predecessor drain");
+    carrier_server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ranged_tcp_bounded_pool_rotates_active_members_one_successor_at_a_time() {
+    let carrier_server = RangedTcpCarrierServer::spawn().await;
+    let first_port = carrier_server.first_port;
+    let second_port = first_port + 1;
+    let client_path = format!(
+        "tcp://127.0.0.1:{first_port}-{second_port}?max-tcp-carriers=3&port-rotation-interval-s=5"
     )
     .parse::<PathSpec>()
     .expect("ranged client TCP path");
@@ -1179,8 +1283,9 @@ async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescen
         );
     }
 
-    // The hop interval makes replacement eligible; it never permits an active
-    // Product attachment to be moved between physical TCP instances.
+    // The hop interval makes replacement eligible. Ordered retirement may
+    // detach and recover an active Product attachment, but the logical stream
+    // must remain continuous.
     for sequence in 0_u32..6 {
         let payload = sequence.to_be_bytes();
         product_client
@@ -1198,18 +1303,24 @@ async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescen
         assert_eq!(echoed, payload);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    for (index, (initial_instance, initial_port)) in initial_members.iter().copied().enumerate() {
-        assert_eq!(
-            context.tcp_sessions[index].connection_instance_id(),
-            Some(initial_instance),
-            "planned rotation must preserve every carrier while Product ownership exists"
-        );
-        assert_eq!(
-            context.tcp_sessions[index].connection_remote_port(),
-            Some(initial_port),
-            "planned rotation must preserve every destination while Product ownership exists"
-        );
-    }
+    assert!(
+        context
+            .tcp_sessions
+            .iter()
+            .zip(&initial_members)
+            .any(|(session, (instance, port))| {
+                session.connection_instance_id() != Some(*instance)
+                    && session.connection_remote_port() != Some(*port)
+            }),
+        "persistent Product ownership must not postpone every group member rotation"
+    );
+    assert_eq!(
+        carrier_server
+            .maximum_active
+            .load(std::sync::atomic::Ordering::Acquire),
+        4,
+        "a three-member group permits exactly one transient successor"
+    );
 
     product_client
         .shutdown()
@@ -1221,9 +1332,9 @@ async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescen
         .expect("Product relay");
     target.await.expect("target join");
 
-    // Releasing the exact Product owner publishes a lifecycle event. An
-    // already-overdue member rotates without waiting for the unrelated
-    // 60-second probe interval.
+    // The remaining overdue members rotate without waiting for the unrelated
+    // 60-second probe interval. The first may already have completed while the
+    // Product stream was active.
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let any_changed = context.tcp_sessions.iter().zip(&initial_members).any(
@@ -1312,12 +1423,12 @@ async fn ranged_tcp_bounded_pool_rotates_every_due_member_after_product_quiescen
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ranged_tcp_maximum_one_reconnects_only_after_product_quiescence() {
+async fn ranged_tcp_maximum_one_replaces_before_drain_without_breaking_active_product() {
     let carrier_server = RangedTcpCarrierServer::spawn().await;
     let first_port = carrier_server.first_port;
     let second_port = first_port + 1;
     let client_path = format!(
-        "tcp://127.0.0.1:{first_port}-{second_port}?max-tcp-carriers=1&port-rotation-interval-ms=5000"
+        "tcp://127.0.0.1:{first_port}-{second_port}?max-tcp-carriers=1&port-rotation-interval-s=5"
     )
     .parse::<PathSpec>()
     .expect("maximum-one ranged client TCP path");
@@ -1346,6 +1457,17 @@ async fn ranged_tcp_maximum_one_reconnects_only_after_product_quiescence() {
     let initial_port = context.tcp_sessions[0]
         .connection_remote_port()
         .expect("initial maximum-one port");
+    let initial_server_path = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = carrier_server.paths.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 1 {
+                break snapshot.paths[0].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial maximum-one server path");
 
     let target_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1373,32 +1495,74 @@ async fn ranged_tcp_maximum_one_reconnects_only_after_product_quiescence() {
     let (mut product_client, product_server) = duplex(4096);
     let product = tokio::spawn(handle_socks5_client_stream(product_server, context.clone()));
     open_socks5_tcp_tunnel(&mut product_client, target_addr).await;
-    product_client
-        .write_all(b"live")
+    let mut observed_replacement = false;
+    for sequence in 0_u32..8 {
+        let payload = sequence.to_be_bytes();
+        product_client
+            .write_all(&payload)
+            .await
+            .expect("maximum-one live payload");
+        let mut echoed = [0_u8; 4];
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            product_client.read_exact(&mut echoed),
+        )
         .await
-        .expect("maximum-one live payload");
-    let mut echoed = [0_u8; 4];
-    product_client
-        .read_exact(&mut echoed)
-        .await
+        .expect("active Product response stalled across TCP replacement")
         .expect("maximum-one live response");
-    assert_eq!(&echoed, b"live");
-
-    tokio::time::sleep(Duration::from_secs(6)).await;
-    assert_eq!(
+        assert_eq!(echoed, payload);
+        observed_replacement |= context.tcp_sessions[0]
+            .connection_instance_id()
+            .is_some_and(|instance| instance != initial_instance);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        observed_replacement,
+        "a persistent Product flow must not postpone ranged TCP maintenance indefinitely"
+    );
+    assert_ne!(
         context.tcp_sessions[0].connection_instance_id(),
         Some(initial_instance),
-        "maximum-one hopping must not drain an active Product carrier"
+        "TCP hopping must publish a fresh physical instance"
     );
-    assert_eq!(
+    assert_ne!(
         context.tcp_sessions[0].connection_remote_port(),
         Some(initial_port),
-        "maximum-one hopping must retain the active destination port"
+        "TCP hopping must select the other configured destination port"
     );
-    assert_eq!(
-        context.tcp_carrier_groups.occupied(0),
-        Some(1),
-        "maximum-one replacement must remain inside its resource envelope"
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if context.tcp_carrier_groups.occupied(0) == Some(1)
+                && carrier_server
+                    .active
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retiring predecessor did not release the transient overlap");
+
+    let replacement_server_path = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = carrier_server.paths.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 1
+                && snapshot.paths[0].path_instance_id != initial_server_path.path_instance_id
+            {
+                break snapshot.paths[0].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement server path inventory");
+    assert_ne!(
+        replacement_server_path.path_id, initial_server_path.path_id,
+        "a TCP replacement must use a fresh wire PathId"
     );
 
     product_client
@@ -1411,36 +1575,17 @@ async fn ranged_tcp_maximum_one_reconnects_only_after_product_quiescence() {
         .expect("maximum-one Product relay");
     target.await.expect("maximum-one target join");
 
-    // The ordinary probe/retry interval is 60 seconds. Convergence here proves
-    // the exact Product release and predecessor terminal events drive the
-    // break-before-make transaction without inheriting that deadline.
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if context.tcp_sessions[0]
-                .connection_instance_id()
-                .is_some_and(|instance| {
-                    instance != initial_instance
-                        && context.tcp_sessions[0].connection_remote_port() != Some(initial_port)
-                })
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("maximum-one Product-quiescent replacement did not converge");
     assert_eq!(
         context.tcp_carrier_groups.occupied(0),
         Some(1),
-        "terminal predecessor release must precede maximum-one successor reservation"
+        "terminal predecessor release must restore the configured current-member count"
     );
     assert_eq!(
         carrier_server
             .maximum_active
             .load(std::sync::atomic::Ordering::Acquire),
-        1,
-        "maximum-one replacement must never overlap physical TCP carriers"
+        2,
+        "maximum-one replacement must authenticate its successor before predecessor drain"
     );
     assert_eq!(
         carrier_server
@@ -1876,10 +2021,10 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     });
 
     let low_latency_path =
-        reserve_tcp_path_with_query("initial-srtt-ms=10&initial-rate-mbps=20&max-tcp-carriers=1")
+        reserve_tcp_path_with_query("initial-srtt-s=0.01&initial-rate-mbps=20&max-tcp-carriers=1")
             .await;
     let high_bandwidth_path =
-        reserve_tcp_path_with_query("initial-srtt-ms=120&initial-rate-mbps=300&max-tcp-carriers=1")
+        reserve_tcp_path_with_query("initial-srtt-s=0.12&initial-rate-mbps=300&max-tcp-carriers=1")
             .await;
     let low_latency_listener = bind_listener(&low_latency_path)
         .await
@@ -2251,10 +2396,10 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
     });
 
     let tcp_path =
-        reserve_tcp_path_with_query("initial-srtt-ms=10&initial-rate-mbps=100&max-tcp-carriers=1")
+        reserve_tcp_path_with_query("initial-srtt-s=0.01&initial-rate-mbps=100&max-tcp-carriers=1")
             .await;
     let udp_port = reserve_process_unique_udp_port().await;
-    let udp_path = format!("quic://127.0.0.1:{udp_port}?initial-srtt-ms=120&initial-rate-mbps=100")
+    let udp_path = format!("quic://127.0.0.1:{udp_port}?initial-srtt-s=0.12&initial-rate-mbps=100")
         .parse::<PathSpec>()
         .expect("QUIC recovery path");
     let tcp_listener = bind_listener(&tcp_path).await.expect("TCP path bind");
@@ -2515,12 +2660,11 @@ fn tcp_path_activity_does_not_extend_pending_heartbeat_deadline() {
 #[tokio::test]
 async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     let (target_addr, target) = spawn_echo_target().await;
-    let high_latency_path = reserve_tcp_path_with_query(
-        "initial-srtt-ms=200&initial-rate-mbps=1000&max-tcp-carriers=1",
-    )
-    .await;
+    let high_latency_path =
+        reserve_tcp_path_with_query("initial-srtt-s=0.2&initial-rate-mbps=1000&max-tcp-carriers=1")
+            .await;
     let low_latency_path =
-        reserve_tcp_path_with_query("initial-srtt-ms=10&initial-rate-mbps=50&max-tcp-carriers=1")
+        reserve_tcp_path_with_query("initial-srtt-s=0.01&initial-rate-mbps=50&max-tcp-carriers=1")
             .await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let high_latency_server = spawn_notified_server_path(
@@ -2624,11 +2768,11 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
 async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let (target_addr, target) = spawn_echo_target().await;
     let no_bulk_low_latency_path = reserve_tcp_path_with_query(
-        "initial-srtt-ms=10&initial-rate-mbps=1000&allow-bulk=false&max-tcp-carriers=1",
+        "initial-srtt-s=0.01&initial-rate-mbps=1000&allow-bulk=false&max-tcp-carriers=1",
     )
     .await;
     let bulk_allowed_path =
-        reserve_tcp_path_with_query("initial-srtt-ms=120&initial-rate-mbps=100&max-tcp-carriers=1")
+        reserve_tcp_path_with_query("initial-srtt-s=0.12&initial-rate-mbps=100&max-tcp-carriers=1")
             .await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let low_latency_server = spawn_notified_server_path(

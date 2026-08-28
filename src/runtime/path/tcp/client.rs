@@ -21,8 +21,9 @@ pub(in crate::runtime) use self::datagram::{
     ClientTcpDatagramAttachment, ClientTcpDatagramInbound,
 };
 use self::session::{
-    connect_client_tcp_path, publish_client_tcp_replacement_connection_committed,
-    run_client_tcp_path_session, run_client_tcp_path_session_with_connection,
+    apply_authenticated_readiness_to_startup_evidence, connect_client_tcp_path,
+    publish_client_tcp_replacement_connection_committed, run_client_tcp_path_session,
+    run_client_tcp_path_session_with_connection,
 };
 pub(in crate::runtime) use self::state::ClientTcpPathSessionRuntime;
 use self::stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
@@ -185,8 +186,13 @@ impl Drop for ClientTcpSuccessorClaim {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct ClientTcpCarrierReplacement {
+    pub(in crate::runtime) group_index: usize,
     pub(in crate::runtime) predecessor_path_id: PathId,
     pub(in crate::runtime) successor_path_id: PathId,
+    pub(in crate::runtime) predecessor_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) successor_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) predecessor_port: u16,
+    pub(in crate::runtime) successor_port: u16,
     pub(in crate::runtime) readiness_rtt: Duration,
 }
 
@@ -573,13 +579,9 @@ impl ClientTcpPathSessionHandle {
         let expected_instance = self
             .connection_instance_id()
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-        if !self
-            .runtime
-            .state
-            .tcp_path_is_product_quiescent_for_instance(self.runtime.path_index, expected_instance)
-        {
-            return Err(RuntimeError::NoSchedulableTcpPath);
-        }
+        let predecessor_port = self
+            .connection_remote_port()
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
         let (predecessor, mut successor_claim) = {
             let mut member = self.member.lock().expect("TCP carrier member lock");
             clear_terminal_tcp_predecessor(&mut member);
@@ -605,7 +607,7 @@ impl ClientTcpPathSessionHandle {
         let Some(reservation) = self
             .runtime
             .carrier_groups
-            .reserve(self.runtime.config_index)
+            .reserve_planned_replacement(self.runtime.config_index, predecessor.path_id)
         else {
             return Err(RuntimeError::NoSchedulableTcpPath);
         };
@@ -618,6 +620,13 @@ impl ClientTcpPathSessionHandle {
                 Err(error) => return Err(error),
             };
         let readiness_rtt = connection.carrier.readiness_rtt;
+        apply_authenticated_readiness_to_startup_evidence(
+            &mut connection.startup_snapshot,
+            &mut connection.startup_metrics,
+            readiness_rtt,
+        );
+        let successor_instance_id = connection.path_instance_id;
+        let successor_port = connection.carrier.remote_port;
         let (commands, receivers) = reliable_path_command_channels(runtime.command_queue);
         let terminal = Arc::new(AtomicBool::new(false));
         let successor = ClientTcpPathSessionSlot {
@@ -685,8 +694,13 @@ impl ClientTcpPathSessionHandle {
         ));
         predecessor.commands.begin_path_drain();
         Ok(ClientTcpCarrierReplacement {
+            group_index: self.runtime.config_index,
             predecessor_path_id: predecessor.path_id,
             successor_path_id: successor.path_id,
+            predecessor_instance_id: expected_instance,
+            successor_instance_id,
+            predecessor_port,
+            successor_port,
             readiness_rtt,
         })
     }
@@ -793,69 +807,6 @@ impl ClientTcpPathSessionHandle {
             .as_ref()
             .is_none_or(|slot| slot.terminal.load(Ordering::Acquire))
             && !member.successor_establishing
-    }
-
-    pub(in crate::runtime) fn is_product_quiescent(&self) -> bool {
-        self.connection_instance_id()
-            .is_some_and(|path_instance_id| {
-                self.runtime
-                    .state
-                    .tcp_path_is_product_quiescent_for_instance(
-                        self.runtime.path_index,
-                        path_instance_id,
-                    )
-            })
-    }
-
-    /// Starts a no-spare planned replacement only at the exact Product
-    /// ownership boundary. The path-state transition fences later admission
-    /// before the actor receives the ordered drain request.
-    pub(in crate::runtime) fn begin_connection_replacement_if_product_quiescent(
-        &self,
-        endpoint_generation: u64,
-    ) -> Result<bool, RuntimeError> {
-        self.runtime
-            .state
-            .session_lifecycle()
-            .commit_if_active(|| {
-                self.runtime
-                    .endpoint_policy
-                    .with_current(endpoint_generation, || {
-                        let mut member = self.member.lock().expect("TCP carrier member lock");
-                        clear_terminal_tcp_predecessor(&mut member);
-                        let Some(current) = member
-                            .current
-                            .as_ref()
-                            .filter(|slot| !slot.terminal.load(Ordering::Acquire))
-                            .cloned()
-                        else {
-                            return false;
-                        };
-                        if member.successor_establishing || member.retiring_predecessor.is_some() {
-                            return false;
-                        }
-                        let Some(path_instance_id) = self.connection_instance_id() else {
-                            return false;
-                        };
-                        if !self
-                            .runtime
-                            .state
-                            .begin_tcp_replacement_if_product_quiescent(
-                                self.runtime.path_index,
-                                path_instance_id,
-                            )
-                        {
-                            return false;
-                        }
-                        self.ready_carrier_instance.store(0, Ordering::Release);
-                        self.ready_remote_port.store(0, Ordering::Release);
-                        self.runtime.carrier_groups.publish_change();
-                        current.commands.begin_path_drain();
-                        true
-                    })
-            })
-            .map_err(RuntimeError::RemoteClosed)?
-            .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 
     async fn wait_for_ready_session_slot(

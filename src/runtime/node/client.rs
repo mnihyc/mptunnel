@@ -1,6 +1,6 @@
 //! Client process lifecycle and background path liveness probes.
 
-use crate::config::{LocalIngressConfig, MppOutboundConfig};
+use crate::config::{LocalIngressConfig, MppOutboundConfig, ProductFlowConfig};
 use crate::ingress::IngressConfig;
 use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
@@ -45,6 +45,7 @@ pub(super) async fn spawn_ingresses(
     mux_limits: MuxLimits,
     router: ClientIngressRouter,
     packet_devices: Arc<dyn PacketDeviceProvider>,
+    flow: ProductFlowConfig,
     readiness: &RuntimeReadinessBarrier,
     tasks: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
@@ -66,6 +67,7 @@ pub(super) async fn spawn_ingresses(
                     inbound,
                     proxy_auth,
                     admission,
+                    flow.idle_timeout,
                     ingress_readiness,
                     tasks,
                 )
@@ -83,6 +85,7 @@ pub(super) async fn spawn_ingresses(
                     inbound,
                     proxy_auth,
                     admission,
+                    flow.idle_timeout,
                     ingress_readiness,
                     tasks,
                 )
@@ -101,6 +104,7 @@ pub(super) async fn spawn_ingresses(
                     inbound,
                     proxy_auth,
                     admission,
+                    flow.idle_timeout,
                     ingress_readiness,
                     tasks,
                 )
@@ -108,8 +112,15 @@ pub(super) async fn spawn_ingresses(
             }
             IngressConfig::TcpForward(config) => {
                 let ingress_readiness = readiness.require("TCP port-forward ingress listeners");
-                spawn_tcp_forward_client_ingress(config, router, inbound, ingress_readiness, tasks)
-                    .await?;
+                spawn_tcp_forward_client_ingress(
+                    config,
+                    router,
+                    inbound,
+                    flow.idle_timeout,
+                    ingress_readiness,
+                    tasks,
+                )
+                .await?;
             }
             IngressConfig::UdpForward(config) => {
                 let ingress_readiness = readiness.require("UDP port-forward ingress listeners");
@@ -118,6 +129,7 @@ pub(super) async fn spawn_ingresses(
                     mux_limits,
                     router,
                     inbound,
+                    flow.idle_timeout,
                     ingress_readiness,
                     tasks,
                 )
@@ -131,6 +143,7 @@ pub(super) async fn spawn_ingresses(
                     tcp,
                     router.clone(),
                     inbound.clone(),
+                    flow.idle_timeout,
                     tcp_readiness,
                     tasks,
                 )
@@ -140,6 +153,7 @@ pub(super) async fn spawn_ingresses(
                     mux_limits,
                     router,
                     inbound,
+                    flow.idle_timeout,
                     udp_readiness,
                     tasks,
                 )
@@ -160,8 +174,16 @@ pub(super) async fn spawn_ingresses(
                             mtu: tun.mtu,
                         })
                         .map_err(RuntimeError::TunDevice)?;
-                    run_tun_l4_client(tun, mux_limits, router, inbound, device, ingress_readiness)
-                        .await
+                    run_tun_l4_client(
+                        tun,
+                        mux_limits,
+                        router,
+                        inbound,
+                        device,
+                        flow.idle_timeout,
+                        ingress_readiness,
+                    )
+                    .await
                 });
             }
         }

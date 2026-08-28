@@ -8,7 +8,8 @@ use self::multipath::{RequestMultipathController, RequestMultipathPlanError};
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
     CarrierEmitMode, ClientReinjectionOutputIdentity, RelaySendCause, RelaySendOutcome,
-    sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
+    sender_optional_reinjection_startup_floor_bytes,
+    sender_reinjection_minimum_useful_attempt_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record, lab_sender_service_decision};
@@ -16,7 +17,7 @@ use crate::model::capacity::{
     QUIC_PERSISTENT_CONGESTION_THRESHOLD, adaptive_reliable_relay_reinjection_bytes,
     reliable_stream_advertised_window_bytes,
 };
-use crate::model::multipath::ExtraTrafficLedger;
+use crate::model::multipath::OptionalReinjectionLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::timing::{
     reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
@@ -115,7 +116,7 @@ pub(in crate::runtime) struct RequestDataAckGapObservation {
 pub(in crate::runtime) struct RequestSenderService {
     multipath: RequestMultipathController,
     performance: MppPerformanceConfig,
-    extra_traffic: ExtraTrafficLedger,
+    optional_reinjection: OptionalReinjectionLedger,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,7 +179,7 @@ impl RequestSenderService {
         Self {
             multipath: RequestMultipathController::new(stream_id),
             performance,
-            extra_traffic: ExtraTrafficLedger::default(),
+            optional_reinjection: OptionalReinjectionLedger::default(),
         }
     }
 
@@ -191,10 +192,10 @@ impl RequestSenderService {
         remotes.fail_path_instance(context, instance).await
     }
 
-    fn extra_traffic_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
-        self.extra_traffic
+    fn optional_reinjection_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
+        self.optional_reinjection
             .budget(
-                sender_extra_traffic_startup_floor_bytes(mux_limits),
+                sender_optional_reinjection_startup_floor_bytes(mux_limits),
                 self.performance,
             )
             .remaining_bytes()
@@ -204,7 +205,7 @@ impl RequestSenderService {
         &self,
         mux_limits: MuxLimits,
     ) -> usize {
-        let remaining = self.extra_traffic_budget_remaining(mux_limits);
+        let remaining = self.optional_reinjection_budget_remaining(mux_limits);
         if remaining < sender_reinjection_minimum_useful_attempt_bytes(mux_limits) {
             0
         } else {
@@ -222,14 +223,14 @@ impl RequestSenderService {
     ) -> bool {
         debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        let budget = self.extra_traffic.budget(
-            sender_extra_traffic_startup_floor_bytes(mux_limits),
+        let budget = self.optional_reinjection.budget(
+            sender_optional_reinjection_startup_floor_bytes(mux_limits),
             self.performance,
         );
         if !budget.can_spend(payload_bytes) {
             return false;
         }
-        self.extra_traffic.record_reinjection(payload_bytes);
+        self.optional_reinjection.record_reinjection(payload_bytes);
         if critical_priority {
             sender_queue.push_critical_reinjection_with_cause(frame, cause);
         } else {
@@ -246,7 +247,7 @@ impl RequestSenderService {
     ) {
         debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        self.extra_traffic.record_reinjection(payload_bytes);
+        self.optional_reinjection.record_reinjection(payload_bytes);
         sender_queue.push_critical_reinjection_with_cause(frame, cause);
     }
 
@@ -256,7 +257,7 @@ impl RequestSenderService {
     }
 
     pub(in crate::runtime) fn record_delivered_data(&mut self, bytes: usize) {
-        self.extra_traffic.record_delivered_data(bytes);
+        self.optional_reinjection.record_delivered_data(bytes);
     }
 
     /// Advances the complete request product-ACK transaction once.

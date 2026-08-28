@@ -351,7 +351,7 @@ class ResultEnrichmentTests(unittest.TestCase):
             "MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE": "23456kbit",
             "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS": "4096",
             "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES": "2048",
-            "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS": "45000",
+            "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_S": "45",
             "MPTUNNEL_LAB_FAT_LOSS_API_KEY": "must-not-leak-either",
             "MPTUNNEL_LAB_SECRET": "must-not-leak",
         }
@@ -417,7 +417,7 @@ class ResultEnrichmentTests(unittest.TestCase):
                     "MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE": "200mbit",
                     "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS": "4096",
                     "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES": "2048",
-                    "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS": "45000",
+                    "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_S": "45",
                 },
             )
             self.assertNotIn("must-not-leak", path.read_text(encoding="utf-8"))

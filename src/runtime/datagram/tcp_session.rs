@@ -12,7 +12,7 @@ use crate::mux::MuxLimits;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::tcp::client::{ClientTcpDatagramAttachment, ClientTcpDatagramInbound};
-use crate::runtime::path::{ClientPathContext, PathDeliveryStats, RelayPathLoadLease};
+use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::scheduler::PathSnapshot;
 use bytes::Bytes;
 use std::time::{Duration, Instant};
@@ -26,7 +26,6 @@ pub(in crate::runtime) struct TcpDatagramClientSession {
     mux_limits: MuxLimits,
     pub(in crate::runtime) path_index: usize,
     path_snapshot: PathSnapshot,
-    stats: PathDeliveryStats,
     sent_datagrams: SentDatagramEvidence,
     last_datagram_rtt: Option<Duration>,
     response_rttvar: Option<Duration>,
@@ -61,7 +60,6 @@ impl TcpDatagramClientSession {
             mux_limits: context.mux_limits,
             path_index,
             path_snapshot,
-            stats: PathDeliveryStats::default(),
             sent_datagrams: SentDatagramEvidence::new(context.mux_limits),
             last_datagram_rtt: None,
             response_rttvar: None,
@@ -182,6 +180,9 @@ impl TcpDatagramClientSession {
                 ttl_ms,
                 payload,
             } => {
+                // This is server-to-client response delivery. The caller owns
+                // logical-flow accounting; it cannot update this client's
+                // client-to-server sender evidence.
                 if ttl_ms == 0 {
                     return Err(RuntimeError::Protocol(
                         "expired TCP response datagram received",
@@ -190,7 +191,6 @@ impl TcpDatagramClientSession {
                 let Some(expires_at) = received_tcp_datagram_expires_at(received_at, ttl_ms) else {
                     return Ok(DatagramSessionEvent::Control);
                 };
-                self.stats.record_payload_bytes(payload.len());
                 Ok(DatagramSessionEvent::Received(ReceivedDatagram {
                     flow_id,
                     datagram_id,
@@ -267,10 +267,6 @@ impl TcpDatagramClientSession {
             self.response_rttvar,
             ttl_ms,
         )
-    }
-
-    pub(in crate::runtime) fn delivery_stats(&self) -> PathDeliveryStats {
-        self.stats
     }
 
     fn handle_datagram_feedback(

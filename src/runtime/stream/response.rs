@@ -261,6 +261,28 @@ impl ResponseStreamBinding {
         }
     }
 
+    /// Commits the one cancellation-safe terminal handoff. Unlike the
+    /// awaitable ordinary close path, this transition cannot be interrupted
+    /// between closing attachment admission and transferring every reset to
+    /// the carrier retirement lanes.
+    fn begin_terminal_handoff(&self) -> Vec<ReliablePathCommandSender> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if !self.response_stream_open.swap(false, Ordering::AcqRel) {
+            return Vec::new();
+        }
+        for entry in outputs.entries.iter().chain(&outputs.detaching) {
+            entry.load_registration.deactivate();
+        }
+        outputs
+            .entries
+            .iter()
+            .map(|entry| entry.commands.clone())
+            .collect()
+    }
+
     pub(in crate::runtime) async fn close_stream(&self, stream_id: StreamId) {
         let outputs = self.begin_close();
         for commands in outputs {
@@ -282,6 +304,19 @@ impl ResponseStreamBinding {
                 .await;
         }))
         .await;
+    }
+
+    /// Closes Product attachment admission and synchronously transfers one
+    /// timeout reset per exact live output to its carrier-owned retirement
+    /// lane. Repeated retirement is an idempotent no-op.
+    pub(in crate::runtime) fn retire_stream_with_reset(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+    ) {
+        for commands in self.begin_terminal_handoff() {
+            let _ = commands.reset_accepted_stream(stream_id, reason);
+        }
     }
 
     pub(in crate::runtime) async fn close_stream_ordered(

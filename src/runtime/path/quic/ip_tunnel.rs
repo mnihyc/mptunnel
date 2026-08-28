@@ -273,7 +273,7 @@ async fn run_client_udp_ip_tunnel(
     }
     .await;
     if let Err(error) = result {
-        super::io::warn_unexpected_udp_runtime_error(
+        super::io::warn_unexpected_udp_operation_error(
             "client QUIC IP tunnel attachment failed",
             &error,
         );

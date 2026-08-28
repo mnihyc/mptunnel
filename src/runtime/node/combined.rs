@@ -3,7 +3,7 @@
 use super::{client, server};
 use crate::config::{
     ActiveNodeGraph, ForwardingMode, ManagementConfig, NodeConfig, OutboundLeafConfig,
-    SessionConfig,
+    ProductFlowConfig, SessionConfig,
 };
 use crate::performance::ResourceLimits;
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
@@ -26,6 +26,7 @@ pub(super) struct NodeRuntimeEnvironment {
     pub(super) resources: ResourceLimits,
     pub(super) admission: ProductAdmissionConfig,
     pub(super) session: SessionConfig,
+    pub(super) flow: ProductFlowConfig,
     pub(super) management: ManagementConfig,
     pub(super) packet_devices: Arc<dyn PacketDeviceProvider>,
     pub(super) carrier_network: super::GenerationCarrierNetwork,
@@ -43,6 +44,7 @@ pub(super) async fn run(
         resources,
         admission,
         session,
+        flow,
         management,
         packet_devices,
         carrier_network,
@@ -182,6 +184,7 @@ pub(super) async fn run(
                 .clone()
                 .expect("local L4 inbounds require the shared router"),
             packet_devices.clone(),
+            flow,
             &readiness,
             &mut services,
         )
@@ -226,6 +229,7 @@ pub(super) async fn run(
             resources,
             product_telemetry.clone(),
             session.retention_timeout,
+            flow.idle_timeout,
             management.peer_diagnostics_enabled(),
             server_config.peer_diagnostics_principals,
             forwarding_mode,

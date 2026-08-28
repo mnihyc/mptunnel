@@ -484,6 +484,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert_eq!(status.paths[0].path, "path-1");
     assert_eq!(status.paths[0].tcp_carrier_ordinal, Some(1));
     assert_eq!(status.paths[0].max_tcp_carriers, Some(1));
+    assert_eq!(status.paths[0].direction, Some("client_to_server"));
     assert!(status.paths[0].port_hopping);
     assert_eq!(status.paths[0].active_port, None);
     assert_eq!(
@@ -597,6 +598,7 @@ fn client_status_retains_stale_raw_rate_with_provenance_without_reentering_sched
     assert_eq!(path.pacing_rate_source, Some("native_carrier"));
     assert_eq!(path.delivery_samples, Some(2));
     assert_eq!(path.data_sample_bytes.as_deref(), Some("4096"));
+    assert_eq!(path.direction, Some("client_to_server"));
     assert!(path.last_delivery_age_ms.is_some_and(|age| age >= 1_000));
     assert!(path.pacing_age_ms.is_some_and(|age| age >= 1_000));
     assert_eq!(path.pacing_age_ms, path.last_delivery_age_ms);
@@ -779,6 +781,9 @@ fn server_tcp_app_limited_refresh_preserves_frozen_rate_and_pacing_provenance() 
     assert_eq!(carrier.pacing_rate_bps.as_deref(), Some("200000000"));
     assert_eq!(carrier.delivery_rate_source, Some("native_carrier"));
     assert_eq!(carrier.pacing_rate_source, Some("native_carrier"));
+    assert_eq!(carrier.direction, Some("server_to_client"));
+    assert_eq!(carrier.delivery_samples, Some(8));
+    assert_eq!(carrier.data_sample_bytes.as_deref(), Some("524288"));
     assert!(
         carrier
             .last_delivery_age_ms

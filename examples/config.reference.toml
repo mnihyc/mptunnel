@@ -21,6 +21,11 @@
 # - DNS synthetic capture: one named bounded address pool that can recover the
 #   original queried domain when a captured flow opens;
 # - outbound: a named connector used for application traffic or routed DNS.
+# Every user-configured duration key ends in `_s` and its value is seconds.
+# TOML integers express whole seconds; TOML decimals preserve sub-second
+# precision except `auth_freshness_window_s`, whose signed wire timestamp uses
+# Unix seconds and therefore requires a whole number. Legacy millisecond and
+# long-form unit keys are intentionally not accepted.
 
 check_config = false
 # Prefer the `--check-config` command-line flag for one-time validation. This
@@ -77,9 +82,9 @@ flow_events = false     # opt-in destination-bearing flow open/close records
 credential_id = "home-client"
 principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
-# expires_at_unix_secs = 1798761600
+# expires_at_unix_s = 1798761600
 # revoked = false
-# revocation_grace_seconds = 30
+# revocation_grace_s = 30
 # Expiration or revocation rejects new authentication. Revocation grace delays
 # retirement only for sessions already admitted by that credential; it never
 # permits new authentication.
@@ -98,8 +103,8 @@ secret = { from = "file", path = "mpp-credential.key" }
 [service]
 # Supervision owns process generations, never MPP session state.
 supervise = false
-restart_backoff_ms = 1000
-restart_max_backoff_ms = 30000
+restart_backoff_s = 1
+restart_max_backoff_s = 30
 # Omit max_restarts for unlimited in-process restart attempts.
 max_restarts = 10
 
@@ -107,7 +112,35 @@ max_restarts = 10
 # Established streams survive a complete carrier outage for five minutes.
 # The same absolute ceiling bounds graceful TCP carrier retirement.
 # Healthy idle streams with an authenticated carrier do not consume it.
-retention_timeout_ms = 300000
+retention_timeout_s = 300
+
+[flow]
+# Product TCP streams and UDP associations retire after this many seconds with
+# no reliable-stream bytes or fresh application datagram in either direction;
+# an accepted zero-length datagram is still activity. TCP FIN, zero-length
+# stream I/O, MPP/QUIC control traffic, acknowledgements, carrier heartbeats,
+# and keep-alives do not refresh activity. Half-close therefore retains the
+# other direction only while payload remains active. Accepted boundary payload
+# rearms before retirement; cancellation completes exact owner cleanup. Expiry
+# closes that logical flow and releases its admission/telemetry state without
+# declaring a carrier or session failure. Set zero to disable retirement.
+idle_timeout_s = 300
+# Default optional reliable MPP payload-reinjection budget for every local
+# sender. Each MPP inbound/outbound performance table may override it. The
+# budget is applied independently in each sending direction: 10 permits
+# reinjected payload up to 10% of acknowledged original payload, plus a bounded
+# startup floor. Path-failure recovery, native TCP/QUIC retransmission, MPP
+# control frames, carrier probes, and liveness traffic are outside this budget.
+# optional_reinjection_budget_percent = 10
+# Default sender-local QUIC delivery/loss correction. This is congestion-model
+# evidence policy, not an MPP reinjection or byte budget. Each MPP performance
+# table may override it; an explicit `loss-compensation-percent` on a QUIC path
+# URI overrides the node and `[flow]` values. Values are numeric 0..99.9999 with
+# at most four decimal places. Zero selects draft BBR3 behavior. TCP paths
+# ignore this setting.
+# Client/outbound values govern C-to-S; server/inbound values govern S-to-C.
+# MPP-L3 inherits these `[flow]` defaults because it has no per-node table.
+# quic_loss_compensation_percent = 10
 
 [management]
 # The API is disabled while listen is empty. To enable it, replace listen with
@@ -152,23 +185,28 @@ max_reliable_relay_chunk_bytes = 524288
 # TCP record heartbeats and native QUIC liveness are separate carrier
 # mechanisms. The interval is the maximum idle delay; clients renew each idle
 # probe within 80%-100% of it. Both remain below logical session retention.
-tcp_path_heartbeat_interval_ms = 10000
-tcp_path_heartbeat_timeout_ms = 30000
-quic_path_keep_alive_interval_ms = 10000
-quic_path_idle_timeout_ms = 30000
+tcp_path_heartbeat_interval_s = 10
+tcp_path_heartbeat_timeout_s = 30
+quic_path_keep_alive_interval_s = 10
+quic_path_idle_timeout_s = 30
 
 # New-flow admission is a separate limit applied while a flow opens. These
 # limits do not derive from, resize, or feed MPP path/session/stream/queue budgets.
-# Established permits do no per-byte or per-packet accounting.
+# Established permits do no per-byte or per-packet accounting. `max_live_flows`
+# is generation-wide; principal, outbound, and target values are independent
+# subsets and cannot exceed it. `max_concurrent_work` bounds active opening/DNS
+# work; outbound connects, target connects, and DNS work are independent
+# subsets and cannot exceed it. A connecting flow also holds its applicable
+# live-flow permits. Every value is 1..=1000000.
 [admission]
 max_live_flows = 4096
-max_concurrent_work = 512
-max_live_flows_per_principal = 1024
-max_live_flows_per_outbound = 3072
-max_connects_per_outbound = 256
-max_live_flows_per_target = 256
-max_connects_per_target = 32
-max_dns_work = 128
+max_concurrent_work = 4096
+max_live_flows_per_principal = 4096
+max_live_flows_per_outbound = 4096
+max_connects_per_outbound = 4096
+max_live_flows_per_target = 4096
+max_connects_per_target = 4096
+max_dns_work = 4096
 
 # DNS consists of named servers, policies, override records, and synthetic
 # captures. Records and captures have no effect until attached to a selected
@@ -266,16 +304,16 @@ protocol = "system"
 # pools in fc00::/7. Managed split-VPN includes must cover every active pool and
 # excludes cannot overlap one. Distinct active captures have disjoint pools;
 # pools cannot contain an active DNS-server or attached override address.
-# `capacity` is 1..=262144, `answer_ttl_seconds` is 1..=3600, and
-# `recovery_ttl_seconds` is at least the answer TTL and at most 86400. Every
+# `capacity` is 1..=262144, `answer_ttl_s` is 1..=3600, and
+# `recovery_ttl_s` is at least the answer TTL and at most 86400. Every
 # configured pool must contain at least `capacity` usable addresses.
 # [[dns.synthetic_capture]]
 # name = "vpn-capture"
 # ipv4_pool = "198.18.0.0/16"
 # ipv6_pool = "fd00:4d50::/112"
 # capacity = 4096
-# answer_ttl_seconds = 30
-# recovery_ttl_seconds = 120
+# answer_ttl_s = 30
+# recovery_ttl_s = 120
 
 # A policy lists 1..=16 unique DNS servers in order. `family` controls requested
 # and returned A/AAAA families: ipv4-only, ipv6-only, ipv4-then-ipv6,
@@ -286,8 +324,8 @@ protocol = "system"
 # `security = "require-encrypted"` rejects any
 # server other than DoT, DoH, or DoQ. Ordered strategy advances only after a
 # transport/server failure; a DNS negative response is authoritative. Racing
-# requires at least two servers and `fallback_ms`, which cannot exceed
-# `query.timeout_ms`; zero starts all at once. A nonempty `answer_cidrs` accepts
+# requires at least two servers and `fallback_s`, which cannot exceed
+# `query.timeout_s`; zero starts all at once. A nonempty `answer_cidrs` accepts
 # a response only when every A/AAAA address is inside at least one of at most
 # 256 unique listed networks.
 [[dns.policies]]
@@ -299,14 +337,15 @@ strategy = "ordered"
 answer_cidrs = []
 override_records = []
 # synthetic_capture = "vpn-capture"
-query = { timeout_ms = 5000, inflight = 64, answers = 64 }
-cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, stale_ms = 30000, prefetch_ms = 30000 }
-# `query.timeout_ms` is the complete deadline for each A or AAAA lookup across
-# that policy's servers. Its range is 1..=60000 ms; `query.inflight` is
+query = { timeout_s = 5, inflight = 64, answers = 64 }
+cache = { entries = 4096, positive_ttl_s = 300, negative_ttl_s = 30, stale_s = 30, prefetch_s = 30 }
+# `query.timeout_s` is the complete deadline for each A or AAAA lookup across
+# that policy's servers. Its range is 0.001..=60 seconds; `query.inflight` is
 # 1..=1024 and `query.answers` is 1..=64. `cache.entries` is 0..=65536.
-# Positive and negative TTL caps are 1..=86400000 ms; stale and prefetch caps
-# are 0..=86400000 ms. `stale_ms = 0` disables stale-on-error and
-# `prefetch_ms = 0` disables refresh-ahead.
+# Positive and negative TTL caps are 0.001..=86400 seconds; stale and prefetch
+# caps are 0..=86400 seconds. `stale_s = 0` disables stale-on-error and
+# `prefetch_s = 0` disables refresh-ahead. Decimal seconds preserve sub-second
+# racing and lookup deadlines without changing the configured unit.
 #
 # [[dns.policies]]
 # name = "secure"
@@ -314,12 +353,12 @@ cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, sta
 # family = "ipv4-and-ipv6"
 # security = "require-encrypted"
 # strategy = "race"
-# fallback_ms = 50
+# fallback_s = 0.05
 # answer_cidrs = ["0.0.0.0/0", "::/0"]
 # override_records = ["router-home"]
 # synthetic_capture = "vpn-capture"
-# query = { timeout_ms = 5000, inflight = 64, answers = 64 }
-# cache = { entries = 4096, positive_ttl_ms = 300000, negative_ttl_ms = 30000, stale_ms = 30000, prefetch_ms = 30000 }
+# query = { timeout_s = 5, inflight = 64, answers = 64 }
+# cache = { entries = 4096, positive_ttl_s = 300, negative_ttl_s = 30, stale_s = 30, prefetch_s = 30 }
 #
 # DNS selection rules name policies, not records or captures. Exact selection
 # wins over the longest suffix, then `[dns].default`; each named attachment is
@@ -356,11 +395,17 @@ listen = ["127.0.0.1:1080"]
 # local_users = ["phone-login"]
 
 [inbounds.admission]
-# Connection-open limits; these do not derive from MPP resource limits.
-max_connections = 1024
-max_connections_per_source = 256
-max_connections_per_principal = 512
-handshake_timeout_ms = 10000
+# Listener admission precedes Product routing/admission and does not derive
+# from MPP resource limits. `max_connections` is the listener-wide accepted
+# socket count. The source and principal ceilings are independent dimensions;
+# unauthenticated loopback applications normally share both one source address
+# and the `anonymous` principal, so their defaults match the listener ceiling.
+# The handshake deadline covers proxy negotiation/authentication only. Once a
+# Product flow opens, `[flow].idle_timeout_s` owns its payload-idle lifetime.
+max_connections = 4096
+max_connections_per_source = 4096
+max_connections_per_principal = 4096
+handshake_timeout_s = 10
 
 [[inbounds]]
 name = "local-http"
@@ -378,16 +423,16 @@ listen = ["127.0.0.1:8080"]
 # protocol = "tcp-forward"
 # listen = ["127.0.0.1:8443"]
 # target = "service.example:443"
-# max_connections = 1024
+# max_connections = 4096
 #
 # [[inbounds]]
 # name = "local-udp-forward"
 # protocol = "udp-forward"
 # listen = ["127.0.0.1:5353"]
 # target = "resolver.example:53"
-# max_associations = 1024
-# idle_timeout_ms = 60000
-# datagram_ttl_ms = 30000
+# max_associations = 4096
+# idle_timeout_s = 60
+# datagram_ttl_s = 30
 #
 # One `mixed-forward` inbound binds TCP and UDP on every listed address/port
 # and forwards both transports to the same fixed target. TCP connection and
@@ -397,10 +442,10 @@ listen = ["127.0.0.1:8080"]
 # protocol = "mixed-forward"
 # listen = ["127.0.0.1:853"]
 # target = "resolver.example:853"
-# max_connections = 1024
-# max_associations = 1024
-# idle_timeout_ms = 60000
-# datagram_ttl_ms = 30000
+# max_connections = 4096
+# max_associations = 4096
+# idle_timeout_s = 60
+# datagram_ttl_s = 30
 
 # Experimental TUN-L4 ingress. It uses the same routing policy as local proxy
 # inbounds. Omitting `host` is explicit external/manual mode: MPTUNNEL opens
@@ -420,9 +465,9 @@ listen = ["127.0.0.1:8080"]
 # External/manual mode rewrites captured UDP port-53 destinations to a listed
 # `dns_redirects` socket, preferring an address of the original IP family.
 # dns_redirects = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
-# `dns_ttl_ms` bounds external DNS datagram associations and caps TTLs returned
+# `dns_ttl_s` bounds external DNS datagram associations and caps TTLs returned
 # by the managed local DNS listener.
-# dns_ttl_ms = 5000
+# dns_ttl_s = 5
 #
 # To run IPv6-only, set disable_ipv4 = true and remove ipv4 and ipv4_gateway.
 # At least one IP family is required; IPv6 requires an MTU of at least 1280.
@@ -450,7 +495,7 @@ listen = ["127.0.0.1:8080"]
 # Managed mode publishes these local addresses as system-facing DNS listeners;
 # queries captured there are answered through the selected `[dns]` policy.
 # Listener IPs must be usable, belong to a configured TUN address family, and
-# must not be covered by `exclude_cidrs`. In managed mode `dns_ttl_ms` also caps
+# must not be covered by `exclude_cidrs`. In managed mode `dns_ttl_s` also caps
 # TTLs returned by these listeners.
 # dns_listeners = ["10.88.0.53", "fd00:88::53"]
 #
@@ -508,23 +553,25 @@ paths = [
 # Startup hints are replaced by live evidence:
 # - source-address=<IP>: bind this TCP/QUIC client carrier to one literal source
 #   address; omission lets the operating system select it;
-# - initial-srtt-ms=<1..4294967295>: initial smoothed RTT in milliseconds;
-#   omission uses the 333 ms runtime startup model until live evidence exists;
-# - initial-rttvar-ms=<0..4294967295>: initial RTT variation in milliseconds;
-#   omission uses 0 ms until live evidence exists;
+# - initial-srtt-s=<0.001..4294967.295>: initial smoothed RTT in seconds;
+#   omission uses the 0.333 s runtime startup model until live evidence exists;
+# - initial-rttvar-s=<0..4294967.295>: initial RTT variation in seconds;
+#   omission uses 0 s until live evidence exists. Decimal seconds preserve
+#   millisecond-granular startup evidence;
 # - exactly one initial-rate-bps|initial-rate-kbps|initial-rate-mbps=<nonzero-u64>,
 #   or initial-rate=unknown|unlimited; scaled values must fit in u64 bits/second;
 #   omission means unknown.
 #
 # Transport and carrier-group controls:
 # - loss-compensation-percent=0..99.9999: sender-local QUIC policy that corrects
-#   aligned delivery/inflight evidence for that loss fraction; omission uses
-#   10%. Overstating it can hide congestion; use 0 for draft BBR3 behavior;
+#   aligned delivery/inflight evidence for that loss fraction; omission
+#   inherits the node performance value, then `[flow]`, then built-in 10%.
+#   Overstating it can hide congestion; use 0 for draft BBR3 behavior;
 # - max-datagram-payload-bytes=512..65000: QUIC client only; omission uses the
 #   smaller of `[resources].max_payload_bytes` and 65000;
 # - max-tcp-carriers=1..65535: TCP client only; omission defaults to 3;
-# - port-rotation-interval-ms=5000..4294967295: ranged TCP/QUIC client paths
-#   only; omission on a ranged path defaults to 300000 ms.
+# - port-rotation-interval-s=5..4294967.295: ranged TCP/QUIC client paths only;
+#   omission on a ranged path defaults to 300 s.
 #
 # Scheduling constraints are explicit `true` or `false`:
 # - backup: use only after schedulable regular paths (default false);
@@ -541,15 +588,20 @@ paths = [
 # rotation, and port ranges are client-only and are rejected on listeners.
 #
 # Complete examples:
-# tcp://192.0.2.10:7443?source-address=192.0.2.20&initial-srtt-ms=40&initial-rttvar-ms=5&initial-rate-mbps=100&max-tcp-carriers=3&backup=false&expensive=false&allow-bulk=true&control-only=false&allow-datagrams=true
-# quic://server.example.com:7000-7999?initial-rate=unknown&loss-compensation-percent=10&max-datagram-payload-bytes=1200&port-rotation-interval-ms=300000&backup=false&expensive=false&allow-bulk=true&control-only=false
-path_probe_interval_ms = 10000
-path_probe_timeout_ms = 2000
+# tcp://192.0.2.10:7443?source-address=192.0.2.20&initial-srtt-s=0.04&initial-rttvar-s=0.005&initial-rate-mbps=100&max-tcp-carriers=3&backup=false&expensive=false&allow-bulk=true&control-only=false&allow-datagrams=true
+# quic://server.example.com:7000-7999?initial-rate=unknown&loss-compensation-percent=10&max-datagram-payload-bytes=1200&port-rotation-interval-s=300&backup=false&expensive=false&allow-bulk=true&control-only=false
+path_probe_interval_s = 10
+path_probe_timeout_s = 2
 
-# Optional L4 MPP repair traffic is evidence-gated and capped by this operator
-# budget. Omit this table when the outbound is selected by `tun-l3`.
+# Optional L4 MPP payload reinjection is evidence-gated and capped by this
+# operator budget. QUIC loss compensation separately corrects transport
+# delivery/loss evidence; it neither sends MPP duplicates nor meters bytes.
+# Either omission inherits the corresponding `[flow]` value. An explicit path
+# URI loss value wins over this table. Omit the table when the outbound is
+# selected by `tun-l3`; MPP-L3 inherits `[flow]` directly.
 # [outbounds.performance]
-# extra_traffic_hint_percent = 5
+# optional_reinjection_budget_percent = 10
+# quic_loss_compensation_percent = 10
 
 [outbounds.security]
 credential_id = "home-client"
@@ -564,7 +616,7 @@ tls_pinned_certificate = { from = "file", path = "REPLACE_WITH_SERVER_CERT.pem" 
 transport_secret = { from = "file", path = "mpp-transport.key" }
 # Direct-paste alternative (`openssl rand -hex 32`); Base64/raw use the same schema:
 # transport_secret = { from = "hex", value = "REPLACE_WITH_64_HEX_DIGITS" }
-auth_freshness_window_seconds = 300
+auth_freshness_window_s = 300
 
 [routing]
 
@@ -704,18 +756,19 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 #   { name = "path-1", endpoint = "tcp://secondary.example.com:7443?backup=true&expensive=true" },
 #   { name = "path-2", endpoint = "quic://secondary.example.com:7443?backup=true&expensive=true" },
 # ]
-# path_probe_interval_ms = 10000
-# path_probe_timeout_ms = 2000
+# path_probe_interval_s = 10
+# path_probe_timeout_s = 2
 #
 # [outbounds.performance]
-# extra_traffic_hint_percent = 5
+# optional_reinjection_budget_percent = 10
+# quic_loss_compensation_percent = 10
 #
 # [outbounds.security]
 # credential_id = "secondary-client"
 # tls_server_name = "secondary.example.com"
 # tls_pinned_certificate = { from = "file", path = "secondary-server-cert.pem" }
 # transport_secret = { from = "file", path = "secondary-mpp-transport.key" }
-# auth_freshness_window_seconds = 300
+# auth_freshness_window_s = 300
 
 # Optional server-side MPP inbound
 #
@@ -736,17 +789,18 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # peer_diagnostics_principal_ids = ["home"]
 #
 # [inbounds.performance]
-# extra_traffic_hint_percent = 5
+# optional_reinjection_budget_percent = 10
+# quic_loss_compensation_percent = 10
 #
 # [inbounds.security]
 # credential_ids = ["home-client"]
 # tls_certificate_chain = { from = "file", path = "server-cert.pem" }
 # tls_private_key = { from = "file", path = "server-key.pem" }
 # transport_secret = { from = "file", path = "mpp-transport.key" }
-# auth_freshness_window_seconds = 300
-# authentication_timeout_ms = 5000
+# auth_freshness_window_s = 300
+# authentication_timeout_s = 5
 # Independently caps authentication work and silent Noise-rejection retention.
-# max_pending_authentications = 1024
+# max_pending_authentications = 4096
 #
 # [[routing.rules]]
 # name = "mpp-direct-egress"
@@ -817,7 +871,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # Preferred explicit-family form (one or both):
 # bind_ipv4 = "192.0.2.10"
 # bind_ipv6 = "2001:db8::10"
-# connect_timeout_ms = 10000
+# connect_timeout_s = 10
 #
 # Proxy `endpoint` is required `HOST:PORT`; bracket IPv6. If `[outbounds.auth]`
 # is present, both username and password are required. Usernames are 1..=255
@@ -831,7 +885,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # name = "socks5-egress"
 # protocol = "socks5"
 # endpoint = "127.0.0.1:1080"
-# connect_timeout_ms = 10000
+# connect_timeout_s = 10
 #
 # [outbounds.auth]
 # username = "proxy-user"
@@ -844,7 +898,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # name = "http-egress"
 # protocol = "http-connect"
 # endpoint = "127.0.0.1:8080"
-# connect_timeout_ms = 10000
+# connect_timeout_s = 10
 #
 # HTTPS CONNECT authenticates the proxy with WebPKI. `tls_server_name` defaults
 # to the endpoint host. Optional `tls_ca_certificate` material adds private
@@ -855,7 +909,7 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # endpoint = "127.0.0.1:8443"
 # tls_server_name = "proxy.example.com"
 # tls_ca_certificate = { from = "file", path = "private-proxy-ca.pem" }
-# connect_timeout_ms = 10000
+# connect_timeout_s = 10
 #
 # [outbounds.auth]
 # username = "proxy-user"
@@ -877,15 +931,15 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # strategy = "least-latency"
 # manual_outbound = "edge-mpp"
 # Old latency remains observable but stops ranking after this age.
-# freshness_ttl_ms = 30000
+# freshness_ttl_s = 30
 # members = [
 #   { outbound = "edge-mpp", weight = 3, mode = "enabled" },
 #   { outbound = "edge-mpp-secondary", weight = 1, mode = "enabled" },
 # ]
-# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_ms = 1000,
-#            maximum_backoff_ms = 60000 }
-# stickiness = { key = "destination", ttl_ms = 60000, capacity = 4096 }
-# probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }
+# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_s = 1,
+#            maximum_backoff_s = 60 }
+# stickiness = { key = "destination", ttl_s = 60, capacity = 4096 }
+# probe = { target = "192.0.2.1:443", interval_s = 10, timeout_s = 2 }
 #
 # `ordered-failover` tries enabled members in configured order. Retry occurs
 # only before flow commit. Each attempted TCP/native UDP member retains its own

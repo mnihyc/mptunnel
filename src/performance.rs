@@ -30,7 +30,7 @@ pub const DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL: Duration =
     Duration::from_millis(DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS);
 pub const DEFAULT_QUIC_PATH_IDLE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS);
-pub const DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT: u16 = 5;
+pub const DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT: u16 = 10;
 
 // QUIC variable integers are limited to 62 bits. Keeping the wire limit here
 // avoids coupling carrier-neutral resource policy to one QUIC implementation.
@@ -38,21 +38,21 @@ const MAX_QUIC_VARINT: u128 = (1_u128 << 62) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MppPerformanceConfig {
-    /// Operator hint for adaptive duplicate/probe/reinjection overhead, in percent.
+    /// Budget for optional reliable MPP payload reinjection, in percent.
     ///
-    /// 5 means the sender may spend roughly 5% extra transport traffic when
-    /// runtime evidence shows that duplicate, reinjection, or probe work can reduce
-    /// stalls. The sender enforces this as a hard optional-work budget plus a
-    /// small startup floor; it is not a product-data throttle. 100 permits full
-    /// duplication in pathological cases, and values above 100 bias toward
-    /// redundant reinjection under severe instability.
-    pub extra_traffic_hint_percent: u16,
+    /// 10 permits optional reinjected payload bytes up to 10% of acknowledged
+    /// original payload, plus a bounded startup floor. Path-failure recovery,
+    /// native TCP/QUIC retransmission, MPP control frames, carrier probes, and
+    /// liveness traffic remain outside this optional-work budget. It is not a
+    /// product-data throttle. 100 permits one optional duplicate of the
+    /// acknowledged payload; values above 100 permit more redundancy.
+    pub optional_reinjection_budget_percent: u16,
 }
 
 impl Default for MppPerformanceConfig {
     fn default() -> Self {
         Self {
-            extra_traffic_hint_percent: DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT,
+            optional_reinjection_budget_percent: DEFAULT_OPTIONAL_REINJECTION_BUDGET_PERCENT,
         }
     }
 }

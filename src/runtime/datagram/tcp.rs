@@ -136,13 +136,7 @@ impl TcpDatagramClientAssociation {
     pub(in crate::runtime) async fn close(&mut self) -> Result<(), RuntimeError> {
         let mut close_error = None;
         while let Some(mut session) = self.paths.pop() {
-            let path_index = session.path_index;
             let result = session.close().await;
-            self.context.mark_tcp_path_delivery_for_instance(
-                path_index,
-                session.path_instance_id(),
-                session.delivery_stats(),
-            );
             if close_error.is_none() {
                 close_error = result.err();
             }
@@ -228,12 +222,7 @@ impl TcpDatagramClientAssociation {
         else {
             return;
         };
-        let session = self.paths.swap_remove(position);
-        self.context.mark_tcp_path_delivery_for_instance(
-            path_index,
-            session.path_instance_id(),
-            session.delivery_stats(),
-        );
+        self.paths.swap_remove(position);
     }
 }
 

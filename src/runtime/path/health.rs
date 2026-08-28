@@ -930,6 +930,7 @@ impl ClientPathHealthRecord {
         });
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_delivery(&mut self, sample: PathRateSample) {
         if self.manual_disabled {
             return;
@@ -937,18 +938,6 @@ impl ClientPathHealthRecord {
         let now = Instant::now();
         self.prepare_delivery_rate_sample(now);
         self.mark_delivery_at(sample, now);
-    }
-
-    pub(in crate::runtime) fn mark_delivery_for_instance(
-        &mut self,
-        path_instance_id: CarrierPathInstanceId,
-        sample: PathRateSample,
-    ) -> bool {
-        if !self.accepts_liveness_sample(path_instance_id) {
-            return false;
-        }
-        self.mark_delivery(sample);
-        true
     }
 
     pub(in crate::runtime) fn mark_product_delivery(&mut self, sample: PathRateSample) {

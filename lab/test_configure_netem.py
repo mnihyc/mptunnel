@@ -170,6 +170,48 @@ print(os.environ["FAKE_SCHEDULE_TSV"], end="")
             all(call.startswith("qdisc replace dev ") for call in tc_calls[1:])
         )
 
+    def test_optional_load_coupled_mode_keeps_schedule_and_adds_finite_bottleneck(self):
+        completed, tc_calls, generator_args = self.run_mode(
+            "internet-five-path-load-coupled-epoch-0-client"
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            generator_args[0:6],
+            ["render", "--seed", "unit-seed", "--epoch", "0", "--direction"],
+        )
+        self.assertEqual(tc_calls[0], "qdisc add dev if10 root netem help")
+        low_latency = tc_calls[1:5]
+        self.assertEqual(low_latency[0], "qdisc del dev if10 root")
+        self.assertEqual(
+            low_latency[1], "qdisc add dev if10 root handle 1: htb default 10"
+        )
+        self.assertIn(
+            "class add dev if10 parent 1: classid 1:10 htb rate 80mbit ceil 80mbit",
+            low_latency[2],
+        )
+        self.assertIn("burst 20000b cburst 20000b quantum 1514", low_latency[2])
+        self.assertIn(
+            "qdisc add dev if10 parent 1:10 handle 10: netem limit 840",
+            low_latency[3],
+        )
+        self.assertNotIn(" rate ", f" {low_latency[3]} ")
+        self.assertIn("delay 20ms 2ms 10% distribution normal", low_latency[3])
+        self.assertIn("loss random 1% 20%", low_latency[3])
+        self.assertIn("seed 101", low_latency[3])
+        self.assertEqual(len(tc_calls), 21)
+
+    def test_load_coupled_queue_horizon_must_be_positive_before_mutation(self):
+        completed, tc_calls, generator_args = self.run_mode(
+            "internet-five-path-load-coupled-epoch-0-client",
+            extra_env={"MPTUNNEL_LAB_INTERNET_LOAD_QUEUE_DELAY": "0ms"},
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("must be a positive duration", completed.stderr)
+        self.assertEqual(generator_args, [])
+        self.assertEqual(tc_calls, [])
+
     def test_zero_jitter_omits_the_tc_distribution_clause(self):
         rows = list(BASE_ROWS)
         fields = rows[0].split("\t")

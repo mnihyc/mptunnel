@@ -24,7 +24,7 @@ PY
 }
 
 netem_limit_packets() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  python3 - "$@" <<'PY'
 import math
 import re
 import sys
@@ -57,12 +57,47 @@ def parse_seconds(value):
 rate_bps = parse_rate_bps(sys.argv[1])
 delay_seconds = parse_seconds(sys.argv[2])
 jitter_seconds = parse_seconds(sys.argv[3])
+if len(sys.argv) == 5:
+    # In load-coupled mode the child must hold the fixed propagation process
+    # plus one explicit full-size-packet queue horizon behind its HTB parent.
+    queue_seconds = parse_seconds(sys.argv[4])
+    horizon_seconds = delay_seconds + 3.0 * jitter_seconds + queue_seconds
+    bdp_packets = math.ceil(rate_bps * horizon_seconds / 8.0 / 1500.0)
+    print(max(1, bdp_packets))
+    raise SystemExit(0)
 # Netem's packet limit must hold the emulated delay-rate product. Include a
 # three-sigma jitter horizon and two BDPs of headroom so queue overflow does
 # not become an undocumented loss model.
 horizon_seconds = delay_seconds + 3.0 * jitter_seconds
 bdp_packets = math.ceil(rate_bps * horizon_seconds / 8.0 / 1500.0)
 print(max(1000, 2 * bdp_packets + 256))
+PY
+}
+
+internet_load_burst_bytes() {
+  python3 - "$1" <<'PY'
+import math
+import re
+import sys
+
+value = sys.argv[1]
+match = re.fullmatch(
+    r"([0-9]+(?:\.[0-9]+)?)([kmgt]?)(?:bit|bps)?", value.lower()
+)
+if match is None:
+    raise SystemExit(f"unsupported Internet load-coupled rate: {value}")
+scale = {
+    "": 1,
+    "k": 1_000,
+    "m": 1_000_000,
+    "g": 1_000_000_000,
+    "t": 1_000_000_000_000,
+}
+rate_bps = float(match.group(1)) * scale[match.group(2)]
+# A two-millisecond token reservoir prevents HTB timer granularity from
+# becoming an accidental low-rate bottleneck.  It changes only the first two
+# milliseconds of a burst; sustained capacity remains the schedule's rate.
+print(max(1514, math.ceil(rate_bps * 0.002 / 8.0)))
 PY
 }
 
@@ -106,6 +141,7 @@ internet_include_outages="${MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES:-0}"
 internet_schedule_script="${MPTUNNEL_LAB_INTERNET_SCHEDULE_SCRIPT:-/workspace/lab/internet_condition_schedule.py}"
 internet_schedule_file="${MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE:-}"
 internet_schedule_sha256="${MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256:-}"
+internet_load_queue_delay="${MPTUNNEL_LAB_INTERNET_LOAD_QUEUE_DELAY:-100ms}"
 
 scale_subnet_prefixes=(
   172.31.10 172.31.15 172.31.16 172.31.20 172.31.30
@@ -304,6 +340,12 @@ internet_duration_is_valid() {
     && "$token" =~ ^[0-9]+([.][0-9]+)?(ns|us|ms|s)$ ]]
 }
 
+internet_positive_duration_is_valid() {
+  local token="$1"
+  internet_duration_is_valid "$token" || return 1
+  [[ "${BASH_REMATCH[0]}" =~ [1-9] ]]
+}
+
 internet_netem_seed_is_valid() {
   local token="$1"
   [[ "$token" =~ ^[0-9]+$ && ${#token} -le 10 ]] || return 1
@@ -376,25 +418,105 @@ apply_internet_profile_to_interface() {
   fi
 }
 
+apply_load_coupled_internet_profile_to_interface() {
+  local iface="$1"
+  local rate="$2"
+  local delay="$3"
+  local jitter="$4"
+  local delay_correlation="$5"
+  local loss="$6"
+  local loss_correlation="$7"
+  local reorder="$8"
+  local reorder_correlation="$9"
+  local duplicate="${10}"
+  local corrupt="${11}"
+  local netem_seed="${12}"
+  local outage="${13}"
+  local limit_packets="${14}"
+  local burst_bytes="${15}"
+  local effective_loss="$loss"
+  local -a netem_args
+
+  if [[ "$outage" == "1" ]]; then
+    effective_loss="100%"
+  fi
+
+  # HTB owns only the aggregate scheduled rate.  The netem child retains the
+  # seeded propagation/jitter/loss process and is deliberately finite.  At
+  # offered load below the class rate there is no token backlog.  Sustained
+  # excess load makes packets wait behind the class, increasing observed
+  # delay variation until the child limit produces queue-overflow loss.
+  # Recreate the hierarchy so each paired subject starts with empty tokens,
+  # an empty queue, and the same seeded netem packet process.
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root handle 1: htb default 10
+  tc class add dev "$iface" parent 1: classid 1:10 htb \
+    rate "$rate" ceil "$rate" \
+    burst "${burst_bytes}b" cburst "${burst_bytes}b" quantum 1514
+
+  netem_args=(
+    tc qdisc add dev "$iface" parent 1:10 handle 10: netem
+    limit "$limit_packets"
+  )
+  case "$jitter" in
+    0|0ms|0us|0ns|0s)
+      netem_args+=(delay "$delay")
+      ;;
+    *)
+      netem_args+=(
+        delay "$delay" "$jitter" "$delay_correlation" distribution normal
+      )
+      ;;
+  esac
+  netem_args+=(
+    loss random "$effective_loss" "$loss_correlation"
+    reorder "$reorder" "$reorder_correlation"
+    duplicate "$duplicate"
+    corrupt "$corrupt"
+    seed "$netem_seed"
+  )
+  if ! "${netem_args[@]}"; then
+    echo "failed to apply load-coupled seeded tc profile on $iface" >&2
+    return 2
+  fi
+}
+
 apply_internet_five_path_epoch() {
   local epoch="$1"
   local direction="$2"
+  local queue_model="${3:-static}"
   local operation="replace" schedule_tsv line subnet_prefix iface limit_packets
+  local burst_bytes
   local -a fields=()
   local -a outage_args=()
   local -a schedule_args=()
   local -a subnets=() rates=() delays=() jitters=()
   local -a delay_correlations=() losses=() loss_correlations=()
   local -a reorders=() reorder_correlations=() duplicates=() corruptions=()
-  local -a netem_seeds=() outages=() ifaces=() limits=()
+  local -a netem_seeds=() outages=() ifaces=() limits=() bursts=()
   local -A seen_subnets=()
   local row_count=0 index
 
-  # Every matrix subject is an independent static replay. The runner tears its
-  # containers down between epochs, and reapplying a subject must reset both
-  # the queue and netem's seeded packet process. Epoch number is therefore not
-  # qdisc lifecycle state. Dynamic in-flight transitions use the separate
-  # flapping lab rather than this static comparison mode.
+  case "$queue_model" in
+    static) ;;
+    load-coupled)
+      if ! internet_positive_duration_is_valid "$internet_load_queue_delay"; then
+        internet_contract_error \
+          "MPTUNNEL_LAB_INTERNET_LOAD_QUEUE_DELAY must be a positive duration"
+        return
+      fi
+      ;;
+    *)
+      internet_contract_error "unsupported Internet queue model"
+      return
+      ;;
+  esac
+
+  # Every matrix subject is an independent schedule replay. The runner tears
+  # its containers down between epochs, and reapplying a subject must reset
+  # both the queue and netem's seeded packet process. Epoch number is therefore
+  # not qdisc lifecycle state. Dynamic in-flight transitions use the separate
+  # flapping lab; load-coupled queue occupancy is local to one subject.
 
   case "$internet_include_outages" in
     0) ;;
@@ -528,28 +650,49 @@ apply_internet_five_path_epoch() {
         "five-path topology is missing subnet ${subnets[$index]}.0/24"
       return
     fi
-    limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
-      netem_limit_packets \
-        "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}"
-    )}"
+    if [[ "$queue_model" == "load-coupled" ]]; then
+      limit_packets="$(netem_limit_packets \
+        "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}" \
+        "$internet_load_queue_delay")"
+      burst_bytes="$(internet_load_burst_bytes "${rates[$index]}")"
+    else
+      limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
+        netem_limit_packets \
+          "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}"
+      )}"
+      burst_bytes=""
+    fi
     if [[ ! "$limit_packets" =~ ^[1-9][0-9]*$ ]]; then
       echo "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS must be a positive integer" >&2
       return 2
     fi
     ifaces+=("$iface")
     limits+=("$limit_packets")
+    bursts+=("$burst_bytes")
   done
 
   require_netem_seed_support "${ifaces[0]}"
   for ((index = 0; index < row_count; index += 1)); do
-    apply_internet_profile_to_interface \
-      "$operation" "${ifaces[$index]}" \
-      "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}" \
-      "${delay_correlations[$index]}" \
-      "${losses[$index]}" "${loss_correlations[$index]}" \
-      "${reorders[$index]}" "${reorder_correlations[$index]}" \
-      "${duplicates[$index]}" "${corruptions[$index]}" \
-      "${netem_seeds[$index]}" "${outages[$index]}" "${limits[$index]}"
+    if [[ "$queue_model" == "load-coupled" ]]; then
+      apply_load_coupled_internet_profile_to_interface \
+        "${ifaces[$index]}" \
+        "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}" \
+        "${delay_correlations[$index]}" \
+        "${losses[$index]}" "${loss_correlations[$index]}" \
+        "${reorders[$index]}" "${reorder_correlations[$index]}" \
+        "${duplicates[$index]}" "${corruptions[$index]}" \
+        "${netem_seeds[$index]}" "${outages[$index]}" \
+        "${limits[$index]}" "${bursts[$index]}"
+    else
+      apply_internet_profile_to_interface \
+        "$operation" "${ifaces[$index]}" \
+        "${rates[$index]}" "${delays[$index]}" "${jitters[$index]}" \
+        "${delay_correlations[$index]}" \
+        "${losses[$index]}" "${loss_correlations[$index]}" \
+        "${reorders[$index]}" "${reorder_correlations[$index]}" \
+        "${duplicates[$index]}" "${corruptions[$index]}" \
+        "${netem_seeds[$index]}" "${outages[$index]}" "${limits[$index]}"
+    fi
   done
 }
 
@@ -652,6 +795,7 @@ show_profile() {
       172.31.4[1-5].*|172.31.5[1-9].*|172.31.60.*)
         echo "$iface $addr"
         tc -s -d qdisc show dev "$iface"
+        tc -s -d class show dev "$iface"
         ;;
     esac
   done
@@ -747,6 +891,15 @@ case "$mode" in
       exit 2
     fi
     ;;
+  internet-five-path-load-coupled-epoch-*-client|internet-five-path-load-coupled-epoch-*-server)
+    if [[ "$mode" =~ ^internet-five-path-load-coupled-epoch-([0-9]+)-(client|server)$ ]]; then
+      apply_internet_five_path_epoch \
+        "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" load-coupled
+    else
+      echo "invalid load-coupled Internet-condition epoch mode: $mode" >&2
+      exit 2
+    fi
+    ;;
   matrix-b*)
     bits="${mode#matrix-}"
     if [[ "$bits" != b[01][01][01] ]]; then
@@ -808,7 +961,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|internet-five-path-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|internet-five-path-epoch-N-{client,server}|internet-five-path-load-coupled-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

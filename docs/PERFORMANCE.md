@@ -25,6 +25,17 @@ client bandwidth equal to the shaped directional capacity. The measured
 MPTUNNEL releases used their default shared-transport-key profile unless a
 transport is named explicitly.
 
+The optional `internet-five-path-load-coupled-epoch-N` diagnostic reuses the
+same seeded five-path schedule but separates the link into a one-class HTB
+rate limiter and a finite seeded-netem child. Netem supplies the scheduled
+propagation, jitter floor, and exogenous packet effects. Below the scheduled
+rate, packets see that floor. Sustained excess offered load consumes the
+finite queue, so queue residence adds delay variation and overflow adds loss.
+`MPTUNNEL_LAB_INTERNET_LOAD_QUEUE_DELAY` selects the additional full-size
+packet queue horizon (default `100ms`); it is an input to diagnosis, not a
+product threshold or a result pass/fail cap. The original static profile is
+unchanged and remains the default.
+
 ### Matched proxy conditions
 
 Every path was shaped to 500 Mbps. Delay and jitter were applied once in each

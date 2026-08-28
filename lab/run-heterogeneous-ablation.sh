@@ -203,11 +203,13 @@ default_netem_mode="${MPTUNNEL_LAB_NETEM_MODE:-apply}"
 internet_seed="${MPTUNNEL_LAB_INTERNET_SEED:-mptunnel-random-internet-v1}"
 internet_schedule_file="${MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE:-}"
 internet_schedule_sha256="${MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256:-}"
+internet_load_queue_delay="${MPTUNNEL_LAB_INTERNET_LOAD_QUEUE_DELAY:-100ms}"
 case "$default_netem_mode" in
   apply) ;;
   *)
-    if [[ ! "$default_netem_mode" =~ ^internet-five-path-epoch-[0-9]+$ ]]; then
-      echo "MPTUNNEL_LAB_NETEM_MODE must be apply or internet-five-path-epoch-N" >&2
+    if [[ ! "$default_netem_mode" =~ ^internet-five-path-epoch-[0-9]+$ \
+      && ! "$default_netem_mode" =~ ^internet-five-path-load-coupled-epoch-[0-9]+$ ]]; then
+      echo "MPTUNNEL_LAB_NETEM_MODE must be apply, internet-five-path-epoch-N, or internet-five-path-load-coupled-epoch-N" >&2
       exit 2
     fi
     ;;
@@ -475,6 +477,7 @@ exec_netem() {
     -e MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES="$internet_include_outages" \
     -e MPTUNNEL_LAB_INTERNET_SCHEDULE_FILE="$internet_schedule_file" \
     -e MPTUNNEL_LAB_INTERNET_SCHEDULE_SHA256="$internet_schedule_sha256" \
+    -e MPTUNNEL_LAB_INTERNET_LOAD_QUEUE_DELAY="$internet_load_queue_delay" \
     -e MPTUNNEL_LAB_BLACKHOLE_LOSS="${MPTUNNEL_LAB_BLACKHOLE_LOSS:-100%}" \
     -e MPTUNNEL_LAB_SPIKE_FAT_RATE="${MPTUNNEL_LAB_SPIKE_FAT_RATE:-20mbit}" \
     -e MPTUNNEL_LAB_SPIKE_FAT_DELAY="${MPTUNNEL_LAB_SPIKE_FAT_DELAY:-900ms}" \
@@ -2057,6 +2060,10 @@ apply_netem() {
     exec_netem client "${mode}-client"
     exec_netem server "${mode}-server"
     exec_netem target "${mode}-server"
+  elif [[ "$mode" =~ ^internet-five-path-load-coupled-epoch-([0-9]+)$ ]]; then
+    exec_netem client "${mode}-client"
+    exec_netem server "${mode}-server"
+    exec_netem target "${mode}-server"
   elif [[ "$mode" =~ ^scale-(access|gigabit|multi-gigabit)-epoch-0$ ]]; then
     prepare_path_variation_initial_epoch "${BASH_REMATCH[1]}"
     exec_netem target clear >/dev/null
@@ -3151,7 +3158,8 @@ prepare_seeded_direct_case() {
   # process. Seeded netem is part of a paired experiment, so every direct
   # subject must start from the same empty queue and PRNG state as proxies and
   # mptunnel subjects.
-  if [[ "$default_netem_mode" =~ ^internet-five-path-epoch-[0-9]+$ ]]; then
+  if [[ "$default_netem_mode" =~ ^internet-five-path-epoch-[0-9]+$ \
+    || "$default_netem_mode" =~ ^internet-five-path-load-coupled-epoch-[0-9]+$ ]]; then
     prepare_baseline_case "$default_netem_mode"
   fi
 }

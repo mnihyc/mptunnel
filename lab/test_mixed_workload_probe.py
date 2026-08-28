@@ -13,12 +13,28 @@ from mixed_workload_probe import (
     browser_full_load_response_timeout_seconds,
     build_record,
     interactive_attempt_record,
+    interval_metric_fields,
     small_http_response_budget_seconds,
     write_started_file,
 )
 
 
 class MixedWorkloadProbeTests(unittest.TestCase):
+    def test_interval_series_preserves_observed_trailing_zero_goodput(self):
+        fields = interval_metric_fields(
+            {0: 25_000, 1: 25_000, 20: 25_000},
+            0.2,
+            prefix="bulk",
+            observation_seconds=4.0,
+        )
+
+        raw = fields["bulk_interval_goodput_raw_mbps"]
+        self.assertEqual(len(raw), 20)
+        self.assertEqual(raw[:2], [1.0, 1.0])
+        self.assertEqual(raw[2:], [0.0] * 18)
+        self.assertEqual(len(fields["bulk_interval_goodput_mbps"]), 14)
+        self.assertEqual(fields["bulk_interval_goodput_mbps"][-1], 0.0)
+
     def test_interactive_attempt_series_uses_monotonic_offsets_and_null_failure_latency(self):
         success = interactive_attempt_record(3, 100.0, 101.25, 101.375, "success")
         failure = interactive_attempt_record(

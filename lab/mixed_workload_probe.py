@@ -3,6 +3,7 @@ import argparse
 import concurrent.futures
 import ipaddress
 import json
+import math
 import os
 import socket
 import struct
@@ -150,13 +151,22 @@ def percentile(values, rank):
     return ordered[index]
 
 
-def interval_metric_fields(interval_bytes, interval_seconds, prefix):
-    if interval_seconds <= 0 or not interval_bytes:
+def interval_metric_fields(
+    interval_bytes, interval_seconds, prefix, observation_seconds
+):
+    if interval_seconds <= 0:
         raw = []
     else:
+        observation_intervals = max(
+            0,
+            math.ceil(
+                max(0.0, observation_seconds - FLOAT_TIME_EPSILON_SECONDS)
+                / interval_seconds
+            ),
+        )
         raw = [
             round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
-            for index in range(max(interval_bytes) + 1)
+            for index in range(observation_intervals)
         ]
     trimmed = (
         raw[INTERVAL_TRIM_DISCARD_EACH_END:-INTERVAL_TRIM_DISCARD_EACH_END]
@@ -195,8 +205,12 @@ def write_started_file(path):
 
 
 def workload_deadline(started_at, args):
+    return started_at + workload_duration_seconds(args)
+
+
+def workload_duration_seconds(args):
     duration = args.load_duration if args.load_duration > 0 else args.timeout
-    return started_at + min(duration, args.timeout)
+    return min(duration, args.timeout)
 
 
 def parse_http_headers(buffer):
@@ -406,7 +420,7 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                 "bulk_content_length": last_content_length,
                 "bulk_bytes": bytes_read,
                 "bulk_time_s": elapsed,
-                "bulk_load_duration_s": args.load_duration,
+                "bulk_load_duration_s": workload_duration_seconds(args),
                 "bulk_requests": requests,
                 "bulk_complete_requests": complete_requests,
                 "bulk_partial_requests": partial_requests,
@@ -432,6 +446,7 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                 interval_bytes,
                 args.interval_seconds,
                 prefix="bulk",
+                observation_seconds=workload_duration_seconds(args),
             )
         )
     except Exception as exc:
@@ -1146,7 +1161,7 @@ def build_record(args, bulk, small, interactive, udp):
         "interactive_timeout_ms": getattr(args, "tcp_echo_timeout_ms", None),
         "interactive_payload_bytes": getattr(args, "tcp_echo_payload_bytes", None),
         "failover_after_s": args.failover_after,
-        "test_duration_s": args.load_duration if args.load_duration > 0 else args.timeout,
+        "test_duration_s": workload_duration_seconds(args),
     }
     record.update(bulk)
     record.update(small)

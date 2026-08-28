@@ -1,12 +1,20 @@
 use super::super::ResponseStreamBinding;
-use super::super::ack_clock::ResponseAckClockRateEvidence;
-use super::super::attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
+use super::super::ack_clock::{
+    ResponseAckClockRateEvidence, apply_response_ack_clock_release_samples,
+};
+use super::super::attachment::{
+    ResponseProductRateEpoch, ResponseStreamOutputEntry, ResponseStreamOutputs,
+};
 use super::super::evidence::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_output_has_bulk_rate_evidence,
+    server_output_has_bulk_rate_evidence_at,
 };
 use super::super::next_server_carrier_path_instance_id;
 use super::super::test_support::{stream_data_frame, stream_data_frame_at};
-use super::{server_bulk_output_snapshot, server_output_confidence};
+use super::{
+    confidence_sample_denominator, server_bulk_output_snapshot, server_bulk_output_snapshot_at,
+    server_output_confidence, server_output_confidence_at,
+};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
     reliable_bulk_carrier_feed_quantum_bytes, reliable_path_startup_sample_limit_bytes,
@@ -39,9 +47,7 @@ fn output_entry(
         original_data_in_flight_bytes: 0,
         stale_for_original_data: false,
         bytes_in_flight: 0,
-        product_progress_rate_bps: None,
-        delivery_rate_bps: None,
-        tcp_ack_clock_rate_bps: None,
+        product_rate_epoch: None,
         tcp_product_rate_evidence: None,
         srtt_ms: None,
         delivery_samples: 0,
@@ -54,6 +60,57 @@ fn output_entry(
         peer_usage_sequence: None,
         path_proof: None,
     }
+}
+
+fn install_product_rate(entry: &mut ResponseStreamOutputEntry, rate_bps: f64) {
+    entry.product_rate_epoch = ResponseProductRateEpoch::new(
+        rate_bps,
+        1,
+        reliable_path_startup_sample_limit_bytes(MuxLimits::default()),
+        Instant::now(),
+        Duration::from_secs(60),
+    );
+}
+
+#[test]
+fn product_epoch_snapshot_and_bulk_authority_share_the_exact_deadline() {
+    let mux_limits = MuxLimits::default();
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(17),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    let observed_at = Instant::now();
+    let expires_at = observed_at + Duration::from_millis(100);
+    entry.product_rate_epoch = Some(ResponseProductRateEpoch {
+        rate_bps: 90_000_000.0,
+        sample_count: 1,
+        sample_bytes: reliable_path_startup_sample_limit_bytes(mux_limits),
+        observed_at,
+        expires_at,
+    });
+    entry.original_data_acked_bytes = reliable_path_startup_sample_limit_bytes(mux_limits);
+
+    let fresh_at = expires_at - Duration::from_nanos(1);
+    let fresh =
+        server_bulk_output_snapshot_at(&entry, 0, TrafficClass::Throughput, mux_limits, fresh_at);
+    assert_eq!(fresh.delivery_rate_bps, 90_000_000.0);
+    assert_eq!(fresh.product_progress_rate_bps, Some(90_000_000.0));
+    assert!(server_output_has_bulk_rate_evidence_at(
+        &entry, mux_limits, fresh_at,
+    ));
+
+    let expired =
+        server_bulk_output_snapshot_at(&entry, 0, TrafficClass::Throughput, mux_limits, expires_at);
+    assert_eq!(
+        expired.delivery_rate_bps,
+        crate::runtime::path::model::default_path_rate_bps()
+    );
+    assert_eq!(expired.product_progress_rate_bps, None);
+    assert!(!server_output_has_bulk_rate_evidence_at(
+        &entry, mux_limits, expires_at,
+    ));
 }
 
 fn path_metrics(
@@ -74,15 +131,20 @@ fn path_metrics(
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: 1,
             metric_age_us: 0,
+            rate_valid_for_us: 1_000_000,
+            rate_observed: true,
             srtt_us,
             rttvar_us: srtt_us / 4,
             jitter_us: srtt_us / 10,
             delivery_rate_bps,
             pacing_rate_bps,
+            pacing_rate_observed: true,
             loss_ppm: 0,
             ecn_ppm: 0,
             loss_observed: false,
             ecn_observed: false,
+            bytes_in_flight_observed: true,
+            queue_observed: true,
             bytes_in_flight: PATH_OPEN_SCORE_BYTES as u64,
             queue_bytes: 0,
             inflight_limit_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
@@ -206,14 +268,13 @@ fn tcp_qualified_native_capacity_precedes_product_goodput() {
     };
     let (commands, _receivers) = reliable_path_command_channels(8);
     let mut entry = output_entry(key, commands);
-    entry.product_progress_rate_bps = Some(80_000_000.0);
-    entry.delivery_rate_bps = Some(70_000_000.0);
+    install_product_rate(&mut entry, 80_000_000.0);
     let mut local_metrics = path_metrics(
         key,
         ServerPathMetricsSource::LocalSender,
         12_000,
         6_000_000,
-        600_000_000,
+        7_000_000,
     );
     local_metrics.metrics.app_limited = true;
     local_metrics.metrics.has_ack_derived_data_sample = false;
@@ -221,9 +282,12 @@ fn tcp_qualified_native_capacity_precedes_product_goodput() {
     local_metrics.metrics.data_sample_bytes = 0;
     local_metrics.carrier_delivery_rate_sample = Some(CarrierDeliveryRateSample {
         delivery_rate_bps: 500_000_000,
+        pacing_rate_bps: Some(600_000_000),
         sample_count: 8,
         sample_bytes: 512 * 1024,
         delivery_window_covered: true,
+        observed_at: Instant::now(),
+        expires_at: Instant::now() + Duration::from_secs(1),
     });
     entry.local_path_metrics = Some(local_metrics);
 
@@ -234,6 +298,115 @@ fn tcp_qualified_native_capacity_precedes_product_goodput() {
     assert_eq!(snapshot.carrier_delivery_rate_bps, Some(500_000_000.0));
     assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
     assert_eq!(snapshot.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
+}
+
+#[test]
+fn expired_tcp_sample_cannot_reenter_rate_pacing_confidence_or_absent_native_debt() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    let now = Instant::now();
+    let mut metrics = path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        2_000_000,
+        900_000_000,
+        950_000_000,
+    );
+    // A later app-limited shape refresh may keep the registry record fresh and
+    // retain old numeric fields, but the frozen ACK epoch remains authoritative.
+    metrics.metrics.app_limited = true;
+    metrics.metrics.bytes_in_flight_observed = false;
+    metrics.metrics.queue_observed = false;
+    metrics.metrics.bytes_in_flight = 8 * 1024 * 1024;
+    metrics.metrics.queue_bytes = 4 * 1024 * 1024;
+    metrics.carrier_delivery_rate_sample = Some(CarrierDeliveryRateSample {
+        delivery_rate_bps: 800_000_000,
+        pacing_rate_bps: Some(850_000_000),
+        sample_count: 8,
+        sample_bytes: 512 * 1024,
+        delivery_window_covered: true,
+        observed_at: now - Duration::from_secs(2),
+        expires_at: now - Duration::from_secs(1),
+    });
+    entry.local_path_metrics = Some(metrics);
+
+    assert!(!server_output_has_bulk_rate_evidence(
+        &entry,
+        MuxLimits::default()
+    ));
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    let default_rate = crate::runtime::path::model::default_path_rate_bps();
+    assert_eq!(snapshot.delivery_rate_bps, default_rate);
+    assert_eq!(snapshot.pacing_rate_bps, default_rate);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+    assert_eq!(snapshot.bytes_in_flight, 0);
+    assert_eq!(snapshot.queue_bytes, 0);
+    assert_eq!(
+        snapshot.carrier_inflight_limit_bytes,
+        (PATH_OPEN_SCORE_BYTES * 4) as u64,
+        "a current independently observed carrier window survives unavailable exact flight"
+    );
+    assert_eq!(server_output_confidence(&entry), 0.0);
+}
+
+#[test]
+fn fresh_post_expiry_tcp_epoch_rebuilds_confidence_from_its_own_acks() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    let now = Instant::now();
+    let mut metrics = path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        20_000,
+        900_000_000,
+        1_000_000_000,
+    );
+    metrics.metrics.has_ack_derived_data_sample = false;
+    metrics.metrics.confidence_ppm = 1_000_000;
+    metrics.carrier_delivery_rate_sample = Some(CarrierDeliveryRateSample {
+        delivery_rate_bps: 40_000_000,
+        pacing_rate_bps: Some(50_000_000),
+        sample_count: 1,
+        sample_bytes: 512 * 1024,
+        delivery_window_covered: true,
+        observed_at: now,
+        expires_at: now + Duration::from_secs(1),
+    });
+    entry.local_path_metrics = Some(metrics);
+
+    let one_ack_confidence = server_output_confidence_at(&entry, now);
+    assert_eq!(
+        one_ack_confidence,
+        1.0 / confidence_sample_denominator(),
+        "cumulative socket-epoch PathMetrics confidence cannot restore a fresh sidecar epoch to 1.0"
+    );
+    entry
+        .local_path_metrics
+        .as_mut()
+        .expect("local metrics")
+        .carrier_delivery_rate_sample
+        .as_mut()
+        .expect("fresh sidecar")
+        .sample_count = 2;
+    assert_eq!(
+        server_output_confidence_at(&entry, now),
+        2.0 / confidence_sample_denominator(),
+        "confidence grows only with ACKs in the new frozen sidecar epoch"
+    );
+    assert_eq!(
+        server_output_confidence_at(&entry, now + Duration::from_secs(1)),
+        0.0,
+        "the exact frozen deadline revokes sidecar confidence"
+    );
 }
 
 #[test]
@@ -253,8 +426,7 @@ fn tcp_recent_product_goodput_is_a_native_capacity_floor() {
         .goodput_sample()
         .expect("qualified product ACK sample")
         .rate_bps();
-    entry.product_progress_rate_bps = Some(product_rate);
-    entry.delivery_rate_bps = Some(product_rate);
+    install_product_rate(&mut entry, product_rate);
     entry.tcp_product_rate_evidence = Some(evidence);
     entry.original_data_acked_bytes =
         reliable_path_startup_sample_limit_bytes(MuxLimits::default());
@@ -281,8 +453,7 @@ fn quic_native_path_capacity_precedes_product_goodput() {
     };
     let (commands, _receivers) = reliable_path_command_channels(8);
     let mut entry = output_entry(key, commands);
-    entry.product_progress_rate_bps = Some(80_000_000.0);
-    entry.delivery_rate_bps = Some(70_000_000.0);
+    install_product_rate(&mut entry, 80_000_000.0);
     entry.local_path_metrics = Some(path_metrics(
         key,
         ServerPathMetricsSource::LocalSender,
@@ -307,12 +478,12 @@ fn unqualified_native_sample_uses_pacing_only_for_startup_ranking() {
     };
     let (commands, _receivers) = reliable_path_command_channels(8);
     let mut entry = output_entry(key, commands);
-    entry.product_progress_rate_bps = Some(80_000_000.0);
+    install_product_rate(&mut entry, 80_000_000.0);
     let mut metrics = path_metrics(
         key,
         ServerPathMetricsSource::LocalSender,
         180_000,
-        5_548_000,
+        500_000_000,
         280_458_000,
     );
     metrics.metrics.inflight_limit_bytes = 2_012_844;
@@ -328,6 +499,46 @@ fn unqualified_native_sample_uses_pacing_only_for_startup_ranking() {
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(snapshot.delivery_rate_bps, 280_458_000.0);
     assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+}
+
+#[test]
+fn unqualified_sidecar_without_same_epoch_pacing_grants_no_startup_rate() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(2),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    install_product_rate(&mut entry, 80_000_000.0);
+    let now = Instant::now();
+    let mut metrics = path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        180_000,
+        900_000_000,
+        950_000_000,
+    );
+    metrics.carrier_delivery_rate_sample = Some(CarrierDeliveryRateSample {
+        delivery_rate_bps: 700_000_000,
+        pacing_rate_bps: None,
+        sample_count: 1,
+        sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
+        delivery_window_covered: false,
+        observed_at: now,
+        expires_at: now + Duration::from_secs(1),
+    });
+    entry.local_path_metrics = Some(metrics);
+
+    assert!(!server_output_has_bulk_rate_evidence(
+        &entry,
+        MuxLimits::default()
+    ));
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(snapshot.delivery_rate_bps, 80_000_000.0);
+    assert_eq!(snapshot.pacing_rate_bps, 80_000_000.0);
+    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, None);
 }
 
 #[test]
@@ -362,6 +573,154 @@ fn quic_app_limited_snapshot_retains_native_feed_window() {
 }
 
 #[test]
+fn sole_quic_output_retains_live_cwnd_source_admission_after_rate_expiry() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(22),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    install_product_rate(&mut entry, 2_000_000.0);
+    let now = Instant::now();
+    let live_cwnd = 4 * 1024 * 1024_u64;
+    let mut metrics = path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        100_000,
+        100_000_000,
+        150_000_000,
+    );
+    metrics.metrics.rate_valid_for_us = 0;
+    metrics.metrics.inflight_limit_bytes = live_cwnd;
+    metrics.metrics.inflight_hi_bytes = live_cwnd;
+    metrics.carrier_delivery_rate_sample = Some(CarrierDeliveryRateSample {
+        delivery_rate_bps: 100_000_000,
+        pacing_rate_bps: Some(150_000_000),
+        sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        sample_bytes: 256 * 1024,
+        delivery_window_covered: true,
+        observed_at: now - Duration::from_secs(1),
+        expires_at: now - Duration::from_nanos(1),
+    });
+    entry.local_path_metrics = Some(metrics);
+    let mux_limits = MuxLimits::default();
+    let outputs = ResponseStreamOutputs {
+        detaching: Vec::new(),
+        entries: vec![entry],
+        data_level_queue_bytes: 0,
+        desired_max_data_offset: 0,
+    };
+
+    let admission =
+        outputs.source_admission(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES, mux_limits);
+    let snapshot = admission.selected_path.expect("sole live QUIC output");
+    let expected_native_feed = usize::try_from(live_cwnd)
+        .expect("test cwnd fits usize")
+        .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+        .min(mux_limits.max_path_flight_bytes);
+    assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+    assert_eq!(snapshot.delivery_rate_bps, 2_000_000.0);
+    assert_eq!(admission.window_bytes, expected_native_feed);
+    assert_eq!(snapshot.data_level_limit_bytes, expected_native_feed as u64);
+}
+
+#[test]
+fn continuous_udp_product_acks_cross_native_expiry_without_shrinking_live_cwnd_feed() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(23),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    let mux_limits = MuxLimits::default();
+    let now = Instant::now();
+    let base = now - Duration::from_millis(500);
+    let native_expires_at = base + Duration::from_millis(250);
+    let live_cwnd = 4 * 1024 * 1024_u64;
+    let native_rate_bps = 100_000_000_u64;
+    let product_rate_bps = 2_000_000_u64;
+    let product_ack_bytes = product_rate_bps / 8 / 10;
+    let mut metrics = path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        100_000,
+        native_rate_bps,
+        150_000_000,
+    );
+    metrics.recorded_at = base;
+    metrics.metrics.rate_valid_for_us = 250_000;
+    metrics.metrics.inflight_limit_bytes = live_cwnd;
+    metrics.metrics.inflight_hi_bytes = live_cwnd;
+    metrics.carrier_delivery_rate_sample = Some(CarrierDeliveryRateSample {
+        delivery_rate_bps: native_rate_bps,
+        pacing_rate_bps: Some(150_000_000),
+        sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        sample_bytes: 256 * 1024,
+        delivery_window_covered: true,
+        observed_at: base,
+        expires_at: native_expires_at,
+    });
+    entry.local_path_metrics = Some(metrics);
+    let incarnation = entry.incarnation;
+    let mut outputs = ResponseStreamOutputs {
+        detaching: Vec::new(),
+        entries: vec![entry],
+        data_level_queue_bytes: 0,
+        desired_max_data_offset: 0,
+    };
+
+    for offset_ms in [100_u64, 200, 300, 400] {
+        let acked_at = base + Duration::from_millis(offset_ms);
+        let first_sent_at = acked_at - Duration::from_millis(100);
+        apply_response_ack_clock_release_samples(
+            &mut outputs,
+            std::collections::HashMap::from([(
+                (key, incarnation),
+                (
+                    product_ack_bytes,
+                    product_ack_bytes,
+                    first_sent_at,
+                    first_sent_at,
+                ),
+            )]),
+            acked_at,
+        );
+    }
+
+    let before_expiry = server_bulk_output_snapshot_at(
+        &outputs.entries[0],
+        0,
+        TrafficClass::Throughput,
+        mux_limits,
+        native_expires_at - Duration::from_nanos(1),
+    );
+    assert_eq!(before_expiry.delivery_rate_bps, native_rate_bps as f64);
+
+    let product_epoch = outputs.entries[0]
+        .product_rate_epoch
+        .expect("continuous UDP Product ACK epoch");
+    assert_eq!(product_epoch.sample_count, 4);
+    assert_eq!(product_epoch.sample_bytes, product_ack_bytes * 4);
+    assert_eq!(product_epoch.rate_bps, product_rate_bps as f64);
+    assert!(product_epoch.fresh_rate_at(now).is_some());
+
+    let admission =
+        outputs.source_admission(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES, mux_limits);
+    let after_expiry = admission.selected_path.expect("sole live QUIC output");
+    let expected_native_feed = usize::try_from(live_cwnd)
+        .expect("test cwnd fits usize")
+        .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+        .min(mux_limits.max_path_flight_bytes);
+    assert_eq!(after_expiry.carrier_delivery_rate_bps, None);
+    assert_eq!(after_expiry.delivery_rate_bps, product_rate_bps as f64);
+    assert_eq!(admission.window_bytes, expected_native_feed);
+    assert_eq!(
+        after_expiry.data_level_limit_bytes,
+        expected_native_feed as u64
+    );
+}
+
+#[test]
 fn peer_hint_is_used_only_until_local_evidence_arrives() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Udp,
@@ -382,6 +741,19 @@ fn peer_hint_is_used_only_until_local_evidence_arrives() {
     assert_eq!(hinted.srtt_ms, 9.0);
     assert_eq!(hinted.delivery_rate_bps, 330_000_000.0);
 
+    entry
+        .peer_path_metrics
+        .as_mut()
+        .expect("peer metrics")
+        .recorded_at = Instant::now() - Duration::from_secs(2);
+    let stale_hint =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(
+        stale_hint.delivery_rate_bps,
+        crate::runtime::path::model::default_path_rate_bps(),
+        "expired peer advisory rate has no placement authority",
+    );
+
     entry.local_path_metrics = Some(path_metrics(
         key,
         ServerPathMetricsSource::LocalSender,
@@ -396,7 +768,7 @@ fn peer_hint_is_used_only_until_local_evidence_arrives() {
 
     entry.local_path_metrics = None;
     entry.delivery_samples = 1;
-    entry.product_progress_rate_bps = Some(77_000_000.0);
+    install_product_rate(&mut entry, 77_000_000.0);
     entry.srtt_ms = Some(55.0);
     let learned =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
@@ -468,7 +840,7 @@ fn best_live_path_uses_completion_score_including_command_queue() {
     let (queued_commands, _queued_receivers) = reliable_path_command_channels(8);
     let (clear_commands, _clear_receivers) = reliable_path_command_channels(8);
     let mut queued = output_entry(queued_key, queued_commands.clone());
-    queued.product_progress_rate_bps = Some(400_000_000.0);
+    install_product_rate(&mut queued, 400_000_000.0);
     queued.srtt_ms = Some(5.0);
     queued.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
     queued_commands
@@ -478,7 +850,7 @@ fn best_live_path_uses_completion_score_including_command_queue() {
         )
         .expect("test carrier queue accepts data");
     let mut clear = output_entry(clear_key, clear_commands);
-    clear.product_progress_rate_bps = Some(100_000_000.0);
+    install_product_rate(&mut clear, 100_000_000.0);
     clear.srtt_ms = Some(25.0);
     clear.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
     let outputs = ResponseStreamOutputs {
@@ -511,10 +883,10 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
     let (available_commands, _available_receivers) = reliable_path_command_channels(8);
     let (backup_commands, _backup_receivers) = reliable_path_command_channels(8);
     let mut available = output_entry(available_key, available_commands);
-    available.product_progress_rate_bps = Some(10_000_000.0);
+    install_product_rate(&mut available, 10_000_000.0);
     available.srtt_ms = Some(100.0);
     let mut backup = output_entry(backup_key, backup_commands);
-    backup.product_progress_rate_bps = Some(1_000_000_000.0);
+    install_product_rate(&mut backup, 1_000_000_000.0);
     backup.srtt_ms = Some(1.0);
     backup.peer_usage = Some(PathUsage::Backup);
     let outputs = ResponseStreamOutputs {
@@ -543,7 +915,7 @@ fn confidence_and_durable_progress_use_explicit_sample_thresholds() {
     };
     let (commands, _receivers) = reliable_path_command_channels(8);
     let mut entry = output_entry(key, commands);
-    entry.product_progress_rate_bps = Some(100_000_000.0);
+    install_product_rate(&mut entry, 100_000_000.0);
     entry.delivery_samples = (RELIABLE_INITIAL_WINDOW_PACKETS as u32).saturating_sub(1);
     assert!(server_output_confidence(&entry) < 1.0);
     entry.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
@@ -581,13 +953,13 @@ fn closed_and_draining_outputs_are_excluded_from_new_product_selection() {
     let (live_commands, _live_receivers) = reliable_path_command_channels(8);
     let (draining_commands, _draining_receivers) = reliable_path_command_channels(8);
     let mut closed = output_entry(closed_key, closed_commands);
-    closed.product_progress_rate_bps = Some(1_000_000_000.0);
+    install_product_rate(&mut closed, 1_000_000_000.0);
     closed.srtt_ms = Some(1.0);
     let mut live = output_entry(live_key, live_commands);
-    live.product_progress_rate_bps = Some(10_000_000.0);
+    install_product_rate(&mut live, 10_000_000.0);
     live.srtt_ms = Some(100.0);
     let mut draining = output_entry(draining_key, draining_commands.clone());
-    draining.product_progress_rate_bps = Some(2_000_000_000.0);
+    install_product_rate(&mut draining, 2_000_000_000.0);
     draining.srtt_ms = Some(1.0);
     draining_commands.begin_path_drain();
     drop(closed_receivers);

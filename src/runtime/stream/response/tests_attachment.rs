@@ -2,7 +2,7 @@ use super::super::next_server_carrier_path_instance_id;
 use super::super::test_support::{binding_for_underlay, output_entry_for_key, stream_data_frame};
 use super::{
     ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
-    ResponseStreamAttachOutcome,
+    ResponseProductRateEpoch, ResponseStreamAttachOutcome,
 };
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::protocol::{Frame, OffsetRange, PathId, PathUsage, StreamId, UnderlayProtocol};
@@ -11,6 +11,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::TrafficClass;
+use std::time::{Duration, Instant};
 
 fn alternate_key(underlay: UnderlayProtocol) -> CarrierPathKey {
     CarrierPathKey {
@@ -510,7 +511,23 @@ fn closed_output_replacement_resets_evidence_and_cannot_credit_old_flights() {
     );
     let frame = stream_data_frame(4096);
     binding.record_original_flight(key, &frame);
+    {
+        let mut outputs = binding.outputs.lock().expect("response outputs lock");
+        outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .expect("attached response output")
+            .product_rate_epoch = ResponseProductRateEpoch::new(
+            100_000_000.0,
+            1,
+            64 * 1024,
+            Instant::now(),
+            Duration::from_secs(60),
+        );
+    }
     let before = output_entry_for_key(&binding, key);
+    assert!(before.product_rate_epoch.is_some());
     drop(receivers);
 
     let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
@@ -528,6 +545,8 @@ fn closed_output_replacement_resets_evidence_and_cannot_credit_old_flights() {
     assert_ne!(replacement.incarnation, before.incarnation);
     assert_eq!(replacement.bytes_in_flight, 0);
     assert_eq!(replacement.original_data_in_flight_bytes, 0);
+    assert!(replacement.product_rate_epoch.is_none());
+    assert!(replacement.tcp_product_rate_evidence.is_none());
     assert!(replacement.local_path_metrics.is_none());
     assert!(replacement.peer_path_metrics.is_none());
     assert!(replacement.peer_usage.is_none());

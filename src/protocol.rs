@@ -11,7 +11,7 @@ mod types;
 
 pub use types::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IpPacketId, IpTunnelId,
-    OffsetRange, PathId, PathMetricDirection, PathMetrics, PathUsage, PeerPathState,
-    PeerPathStatus, PeerStatusCode, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
-    UnderlayProtocol,
+    OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics,
+    PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode, ResetReason, SessionId,
+    StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };

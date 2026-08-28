@@ -43,7 +43,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 /// Session-wide registry for server-side product reliable streams.
@@ -766,30 +766,27 @@ impl ServerReliableStreamRegistry {
             .map(
                 |((session_id, underlay, path_id, path_instance_id), registered)| {
                     let identity = (session_id, underlay, path_id, path_instance_id);
-                    let (metrics, source) = path_metrics.get(&identity).map_or_else(
-                        || {
-                            (
-                                registered.local.initial_metrics,
-                                registered.local.initial_metrics.map(|_| "startup"),
-                            )
-                        },
-                        |entry| {
-                            let residence_us =
-                                now.saturating_duration_since(entry.recorded_at).as_micros();
-                            (
-                                Some(PathMetrics {
-                                    metric_age_us: entry.metrics.metric_age_us.saturating_add(
-                                        u32::try_from(residence_us).unwrap_or(u32::MAX),
-                                    ),
-                                    ..entry.metrics
-                                }),
-                                Some(match entry.source {
-                                    ServerPathMetricsSource::PeerHint => "peer_hint",
-                                    ServerPathMetricsSource::LocalSender => "local_sender",
-                                }),
-                            )
-                        },
-                    );
+                    let (metrics, source, carrier_delivery_rate_sample) =
+                        path_metrics.get(&identity).map_or_else(
+                            || {
+                                (
+                                    registered.local.initial_metrics,
+                                    registered.local.initial_metrics.map(|_| "startup"),
+                                    None,
+                                )
+                            },
+                            |entry| {
+                                let residence = now.saturating_duration_since(entry.recorded_at);
+                                (
+                                    Some(path_metrics_after_residence(entry.metrics, residence)),
+                                    Some(match entry.source {
+                                        ServerPathMetricsSource::PeerHint => "peer_hint",
+                                        ServerPathMetricsSource::LocalSender => "local_sender",
+                                    }),
+                                    entry.carrier_delivery_rate_sample,
+                                )
+                            },
+                        );
                     ServerCarrierPathStatusSnapshot {
                         session_id,
                         underlay,
@@ -800,6 +797,7 @@ impl ServerReliableStreamRegistry {
                         state: registered.state,
                         usage: path_usage.get(&identity).map(|entry| entry.usage),
                         metrics,
+                        carrier_delivery_rate_sample,
                         source,
                     }
                 },
@@ -854,14 +852,10 @@ impl ServerReliableStreamRegistry {
                 .get(&instance_key)
                 .filter(|entry| entry.source == ServerPathMetricsSource::LocalSender)
                 .map(|entry| {
-                    let residence_us = now.saturating_duration_since(entry.recorded_at).as_micros();
-                    PathMetrics {
-                        metric_age_us: entry
-                            .metrics
-                            .metric_age_us
-                            .saturating_add(u32::try_from(residence_us).unwrap_or(u32::MAX)),
-                        ..entry.metrics
-                    }
+                    path_metrics_after_residence(
+                        entry.metrics,
+                        now.saturating_duration_since(entry.recorded_at),
+                    )
                 })
                 .or(registered_path.local.initial_metrics);
             let Some(metrics) = current else {
@@ -2168,6 +2162,15 @@ impl Default for ServerReliableStreamRegistry {
     fn default() -> Self {
         Self::new(ResourceLimits::default().max_streams)
     }
+}
+
+fn path_metrics_after_residence(mut metrics: PathMetrics, residence: Duration) -> PathMetrics {
+    let residence_us = u64::try_from(residence.as_micros()).unwrap_or(u64::MAX);
+    metrics.metric_age_us = metrics
+        .metric_age_us
+        .saturating_add(u32::try_from(residence_us).unwrap_or(u32::MAX));
+    metrics.rate_valid_for_us = metrics.rate_valid_for_us.saturating_sub(residence_us);
+    metrics
 }
 
 #[cfg(test)]

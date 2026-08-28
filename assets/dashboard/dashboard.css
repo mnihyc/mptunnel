@@ -948,8 +948,19 @@ tbody tr:hover td {
 }
 
 .records-table--peer {
-  min-width: 1280px;
+  min-width: 1050px;
+  table-layout: fixed;
 }
+
+.records-table--peer .peer-col--state { width: 7%; }
+.records-table--peer .peer-col--path { width: 18%; }
+.records-table--peer .peer-col--carrier { width: 7%; }
+.records-table--peer .peer-col--use { width: 10%; }
+.records-table--peer .peer-col--latency { width: 10%; }
+.records-table--peer .peer-col--rate { width: 15%; }
+.records-table--peer .peer-col--loss { width: 8%; }
+.records-table--peer .peer-col--flight { width: 10%; }
+.records-table--peer .peer-col--evidence { width: 15%; }
 
 .cell-primary,
 .cell-secondary,

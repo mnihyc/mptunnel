@@ -156,6 +156,9 @@ impl TcpNativeObservation {
 
     /// Applies only capabilities this snapshot actually contains.
     pub(in crate::runtime) fn apply_transport_shape(self, metrics: &mut PathMetrics) {
+        metrics.bytes_in_flight_observed = self.bytes_in_flight.is_some();
+        metrics.queue_observed = self.queue_bytes.is_some();
+        metrics.loss_observed = self.loss_ppm.is_some() && self.loss_observed.unwrap_or(false);
         if let Some(srtt_us) = self.srtt_us {
             metrics.srtt_us = srtt_us.max(1);
         }
@@ -177,7 +180,6 @@ impl TcpNativeObservation {
         }
         if let Some(loss_ppm) = self.loss_ppm {
             metrics.loss_ppm = loss_ppm;
-            metrics.loss_observed = self.loss_observed.unwrap_or(false);
         }
         if let Some(app_limited) = self.app_limited {
             metrics.app_limited = app_limited;
@@ -202,6 +204,8 @@ impl TcpNativeObservation {
             direction: self.direction,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
+            rate_valid_for_us: 0,
+            rate_observed: false,
             srtt_us: srtt_us.max(1),
             rttvar_us,
             jitter_us: rttvar_us,
@@ -211,10 +215,13 @@ impl TcpNativeObservation {
                 .filter(|rate| *rate > 0)
                 .or_else(|| self.delivery_rate_bps())
                 .unwrap_or(1),
+            pacing_rate_observed: false,
             loss_ppm,
             ecn_ppm: 0,
             loss_observed,
             ecn_observed: false,
+            bytes_in_flight_observed: true,
+            queue_observed: true,
             bytes_in_flight,
             queue_bytes,
             inflight_limit_bytes,

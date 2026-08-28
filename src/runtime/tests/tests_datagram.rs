@@ -106,8 +106,9 @@ fn udp_datagram_feedback_updates_scheduler_health() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(8),
             jitter: Duration::from_millis(1),
-            loss_rate: 0.02,
+            loss_rate: Some(0.02),
             rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(20)),
+            rate_sample_expires_at: None,
         },
     );
 
@@ -145,8 +146,9 @@ fn realtime_udp_datagram_feedback_beats_probe_only_paths() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(40),
             jitter: Duration::from_millis(4),
-            loss_rate: 0.0,
+            loss_rate: Some(0.0),
             rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(10)),
+            rate_sample_expires_at: None,
         },
     );
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
@@ -193,8 +195,9 @@ fn endpoint_only_udp_datagram_uses_measured_eta_after_feedback() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(80),
             jitter: Duration::from_millis(4),
-            loss_rate: 0.0,
+            loss_rate: Some(0.0),
             rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(20)),
+            rate_sample_expires_at: None,
         },
     );
     context.mark_udp_path_feedback(
@@ -202,8 +205,9 @@ fn endpoint_only_udp_datagram_uses_measured_eta_after_feedback() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(20),
             jitter: Duration::from_millis(2),
-            loss_rate: 0.0,
+            loss_rate: Some(0.0),
             rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(10)),
+            rate_sample_expires_at: None,
         },
     );
 
@@ -436,8 +440,9 @@ fn udp_association_last_successful_path_is_only_hysteresis_hint() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(180),
             jitter: Duration::from_millis(5),
-            loss_rate: 0.25,
+            loss_rate: Some(0.25),
             rate_sample: PathRateSample::new(512, Duration::from_millis(180)),
+            rate_sample_expires_at: None,
         },
     );
     context.mark_udp_path_feedback(
@@ -445,8 +450,9 @@ fn udp_association_last_successful_path_is_only_hysteresis_hint() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(25),
             jitter: Duration::from_millis(2),
-            loss_rate: 0.0,
+            loss_rate: Some(0.0),
             rate_sample: PathRateSample::new(512, Duration::from_millis(25)),
+            rate_sample_expires_at: None,
         },
     );
 
@@ -630,8 +636,9 @@ fn udp_response_budget_tracks_live_loss_model() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(120),
             jitter: Duration::from_millis(0),
-            loss_rate: 1.0,
+            loss_rate: Some(1.0),
             rate_sample: None,
+            rate_sample_expires_at: None,
         },
     );
 

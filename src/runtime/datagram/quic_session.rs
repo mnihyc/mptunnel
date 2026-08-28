@@ -489,19 +489,7 @@ impl UdpDatagramClientSession {
     }
 
     fn observe_remote_path_metrics(&mut self, metrics: PathMetrics) {
-        self.last_feedback_observation = Some(UdpDatagramPathObservation {
-            rtt: Duration::from_micros(u64::from(metrics.srtt_us)),
-            jitter: Duration::from_micros(u64::from(metrics.jitter_us)),
-            loss_rate: if metrics.loss_observed {
-                (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0)
-            } else {
-                0.0
-            },
-            rate_sample: PathRateSample::new(
-                metrics.delivery_rate_bps.max(8) / 8,
-                Duration::from_secs(1),
-            ),
-        });
+        self.last_feedback_observation = Some(remote_path_metrics_observation(metrics));
     }
 
     fn expire_datagrams_without_feedback(&mut self, now: Instant) -> u64 {
@@ -520,9 +508,42 @@ impl UdpDatagramClientSession {
         self.last_feedback_observation = Some(UdpDatagramPathObservation {
             rtt,
             jitter,
-            loss_rate: lost as f64 / total as f64,
+            loss_rate: Some(lost as f64 / total as f64),
             rate_sample: PathRateSample::new(sent.bytes as u64, rtt),
+            rate_sample_expires_at: None,
         });
+    }
+}
+
+fn remote_path_metrics_observation(metrics: PathMetrics) -> UdpDatagramPathObservation {
+    remote_path_metrics_observation_at(metrics, Instant::now())
+}
+
+fn remote_path_metrics_observation_at(
+    metrics: PathMetrics,
+    received_at: Instant,
+) -> UdpDatagramPathObservation {
+    let srtt = Duration::from_micros(u64::from(metrics.srtt_us.max(1)));
+    let rate_sample = (metrics.rate_observed
+        && metrics.has_ack_derived_data_sample
+        && metrics.data_sample_count > 0
+        && metrics.data_sample_bytes > 0
+        && metrics.rate_valid_for_us > 0)
+        .then(|| PathRateSample::new(metrics.delivery_rate_bps.max(8) / 8, Duration::from_secs(1)))
+        .flatten();
+    let rate_sample_expires_at = rate_sample.map(|_| {
+        received_at
+            .checked_add(Duration::from_micros(metrics.rate_valid_for_us))
+            .unwrap_or(received_at)
+    });
+    UdpDatagramPathObservation {
+        rtt: srtt,
+        jitter: Duration::from_micros(u64::from(metrics.jitter_us)),
+        loss_rate: metrics
+            .loss_observed
+            .then(|| (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0)),
+        rate_sample,
+        rate_sample_expires_at,
     }
 }
 

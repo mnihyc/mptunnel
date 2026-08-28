@@ -29,7 +29,8 @@ pub(in crate::runtime) use carrier_inventory::{
 };
 pub(in crate::runtime) use commands::{CapacityProbeCommandTicket, RequestTcpCapacityProbeRequest};
 pub(in crate::runtime) use health::{
-    ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView,
+    ClientPathHealth, ClientPathHealthRecord, ClientPathRateDiagnostics,
+    RequestCapacityReconciliationView,
 };
 pub(in crate::runtime) use model::{
     PacketPathAttachment, PacketPathSelectionInput, PathDeliveryStats, UdpPathCandidate,

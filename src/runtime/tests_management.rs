@@ -386,7 +386,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
         vec![ClientPathConfig {
             name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443?max-tcp-carriers=1"
+            spec: "tcp://127.0.0.1:443-445?max-tcp-carriers=1"
                 .parse()
                 .expect("path"),
             security,
@@ -396,6 +396,15 @@ fn client_status_exposes_named_inventory_without_credentials() {
         Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
+    {
+        let health = context.health();
+        let mut health = health.lock().expect("health");
+        // Model a partial macOS-like snapshot: RTT/window shape is native, but
+        // exact flight and unsent queue are independently unavailable.
+        health.tcp[0].carrier_srtt_ms = Some(20.0);
+        health.tcp[0].carrier_rttvar_ms = Some(5.0);
+        health.tcp[0].carrier_inflight_limit_bytes = 512 * 1024;
+    }
     let product_admission = ProductAdmission::default();
     let _private_flow = product_admission
         .try_admit_flow(
@@ -475,6 +484,24 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert_eq!(status.paths[0].path, "path-1");
     assert_eq!(status.paths[0].tcp_carrier_ordinal, Some(1));
     assert_eq!(status.paths[0].max_tcp_carriers, Some(1));
+    assert!(status.paths[0].port_hopping);
+    assert_eq!(status.paths[0].active_port, None);
+    assert_eq!(
+        status.paths[0].delivery_rate_source,
+        Some("scheduler_default")
+    );
+    assert_eq!(status.paths[0].delivery_rate_scope, Some("path_capacity"));
+    assert_eq!(status.paths[0].pacing_rate_bps, None);
+    assert_eq!(status.paths[0].queue_bytes, None);
+    assert_eq!(status.paths[0].bytes_in_flight, None);
+    assert_eq!(status.paths[0].loss_ppm, None);
+    assert_eq!(status.paths[0].loss_observed, Some(false));
+    assert_eq!(status.paths[0].delivery_samples, None);
+    assert_eq!(status.paths[0].data_sample_bytes, None);
+    assert_eq!(status.paths[0].last_delivery_age_ms, None);
+    assert_eq!(status.paths[0].pacing_age_ms, None);
+    assert_eq!(status.paths[0].freshness_horizon_ms, None);
+    assert_eq!(status.summary.path_pacing_rate_bps, None);
     assert_eq!(status.outbounds[0].name, "daily-direct");
     assert_eq!(status.outbounds[0].protocol, "direct");
     assert_eq!(status.outbounds[0].networks, ["tcp", "udp"]);
@@ -483,6 +510,10 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert_eq!(status.admission.tracked_targets, 1);
     let encoded = serde_json::to_string(&*status).expect("serialize snapshot");
     assert!(encoded.contains("\"max_tcp_carriers\":1"));
+    assert!(encoded.contains("\"active_port\":null"));
+    assert!(encoded.contains("\"pacing_rate_bps\":null"));
+    assert!(encoded.contains("\"loss_ppm\":null"));
+    assert!(encoded.contains("\"delivery_samples\":null"));
     assert!(!encoded.contains("tcp_carriers_max"));
     assert!(encoded.contains("\"allow_bulk\":true"));
     assert!(encoded.contains("\"control_only\":false"));
@@ -494,6 +525,328 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert!(!encoded.contains("secret"));
     assert!(!encoded.contains("private-principal"));
     assert!(!encoded.contains("private-target.example"));
+
+    {
+        let health = target.clients[0].health();
+        let mut health = health.lock().expect("health");
+        health.tcp[0].carrier_bytes_in_flight_observed = true;
+        health.tcp[0].carrier_queue_bytes_observed = true;
+    }
+    target.refresh_sample_snapshot();
+    let observed_zero = target.snapshot();
+    assert_eq!(observed_zero.paths[0].bytes_in_flight.as_deref(), Some("0"));
+    assert_eq!(observed_zero.paths[0].queue_bytes.as_deref(), Some("0"));
+}
+
+#[test]
+fn client_status_retains_stale_raw_rate_with_provenance_without_reentering_scheduler() {
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    );
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![ClientPathConfig {
+            name: "measured-quic".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: "quic://127.0.0.1:7443-7445".parse().expect("path"),
+            security,
+        }],
+        ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
+    )
+    .expect("context");
+    let sample_at = std::time::Instant::now() - Duration::from_secs(10);
+    let sample_deadline = sample_at + Duration::from_secs(3);
+    {
+        let mut health = context.health().lock().expect("health");
+        let record = &mut health.udp[0];
+        record.carrier_srtt_ms = Some(10.0);
+        record.carrier_rttvar_ms = Some(1.0);
+        record.carrier_loss_rate = Some(0.0);
+        record.carrier_delivery_rate_bps = Some(123_000.0);
+        record.carrier_pacing_rate_bps = Some(200_000.0);
+        record.carrier_delivery_samples = 2;
+        record.carrier_delivery_sample_bytes = 4_096;
+        record.carrier_delivery_window_covered = true;
+        record.carrier_last_delivery_at = Some(sample_at);
+        record.carrier_bulk_proof_expires_at = Some(sample_deadline);
+        record.carrier_app_limited = false;
+        record.carrier_ack_derived_data_seen = true;
+    }
+    let target = ManagementTarget {
+        clients: vec![context],
+        servers: Vec::new(),
+        inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
+        product_telemetry: RuntimeTelemetry::new(8),
+        state: ManagementState::new("node"),
+        config_control: None,
+        gateway_control: None,
+        dns: None,
+        product_admission: ProductAdmission::default(),
+        generation: RuntimeGenerationControl::new(),
+    };
+
+    target.refresh_sample_snapshot();
+    let status = target.snapshot();
+    let path = &status.paths[0];
+    assert_eq!(path.delivery_rate_bps.as_deref(), Some("123000"));
+    assert_eq!(path.delivery_rate_source, Some("native_carrier"));
+    assert_eq!(path.delivery_rate_scope, Some("path_capacity"));
+    assert_eq!(path.pacing_rate_bps.as_deref(), Some("200000"));
+    assert_eq!(path.pacing_rate_source, Some("native_carrier"));
+    assert_eq!(path.delivery_samples, Some(2));
+    assert_eq!(path.data_sample_bytes.as_deref(), Some("4096"));
+    assert!(path.last_delivery_age_ms.is_some_and(|age| age >= 1_000));
+    assert!(path.pacing_age_ms.is_some_and(|age| age >= 1_000));
+    assert_eq!(path.pacing_age_ms, path.last_delivery_age_ms);
+    assert_eq!(
+        path.freshness_horizon_ms,
+        Some(3_000),
+        "QUIC diagnostics must retain the sample-time proof horizon, not recompute it from current RTT"
+    );
+    assert_eq!(path.metric_age_scope, Some("delivery"));
+    assert_eq!(path.loss_ppm, Some(0));
+    assert_eq!(path.loss_source, Some("native_carrier"));
+    assert_eq!(path.native_delivery_observed, Some(true));
+    assert_eq!(path.ack_derived_data_observed, Some(true));
+    assert_ne!(status.summary.path_delivery_rate_bps, "123000");
+    assert_eq!(status.summary.path_pacing_rate_bps, None);
+    assert!(path.port_hopping);
+    assert_eq!(path.active_port, None);
+}
+
+#[test]
+fn client_status_does_not_mix_native_pacing_with_newer_product_delivery_epoch() {
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    );
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![ClientPathConfig {
+            name: "mixed-evidence-quic".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: "quic://127.0.0.1:7443".parse().expect("path"),
+            security,
+        }],
+        ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
+    )
+    .expect("context");
+    let now = std::time::Instant::now();
+    let carrier_at = now - Duration::from_millis(200);
+    let product_at = now - Duration::from_millis(100);
+    {
+        let mut health = context.health().lock().expect("health");
+        let record = &mut health.udp[0];
+        record.carrier_delivery_rate_bps = Some(120_000_000.0);
+        record.carrier_pacing_rate_bps = Some(180_000_000.0);
+        record.carrier_delivery_samples = 4;
+        record.carrier_delivery_sample_bytes = 256 * 1024;
+        record.carrier_last_delivery_at = Some(carrier_at);
+        record.carrier_bulk_proof_expires_at = Some(carrier_at + Duration::from_secs(2));
+        record.carrier_app_limited = false;
+        record.measured_rate_bps = Some(80_000_000.0);
+        record.product_delivery_rate_bps = Some(80_000_000.0);
+        record.delivery_samples = 1;
+        record.product_delivery_sample_bytes = 64 * 1024;
+        record.last_delivery_at = Some(product_at);
+        record.delivery_rate_expires_at = Some(product_at + Duration::from_secs(1));
+    }
+    let target = ManagementTarget {
+        clients: vec![context],
+        servers: Vec::new(),
+        inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
+        product_telemetry: RuntimeTelemetry::new(8),
+        state: ManagementState::new("node"),
+        config_control: None,
+        gateway_control: None,
+        dns: None,
+        product_admission: ProductAdmission::default(),
+        generation: RuntimeGenerationControl::new(),
+    };
+
+    target.refresh_sample_snapshot();
+    let status = target.snapshot();
+    let path = &status.paths[0];
+    assert_eq!(path.delivery_rate_bps.as_deref(), Some("80000000"));
+    assert_eq!(path.delivery_rate_source, Some("product_goodput"));
+    assert_eq!(path.delivery_rate_scope, Some("per_flow_goodput"));
+    assert_eq!(path.freshness_horizon_ms, Some(1_000));
+    assert_eq!(path.pacing_rate_bps, None);
+    assert_eq!(path.pacing_rate_source, None);
+    assert_eq!(path.pacing_age_ms, None);
+    assert_eq!(status.summary.path_pacing_rate_bps, None);
+}
+
+#[test]
+fn server_tcp_app_limited_refresh_preserves_frozen_rate_and_pacing_provenance() {
+    let path: crate::transport::PathSpec = "tcp://127.0.0.1:7443".parse().expect("server path");
+    let crate::runtime::node::server::ServerIdentityRuntime {
+        paths: context,
+        reliable_relay: _,
+    } = crate::runtime::node::server::new_identity_runtime(
+        vec![path],
+        OutboundConfig::Direct,
+        crate::config::DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        crate::config::ServerSecurityConfig::for_test(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+        ),
+        crate::config::MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+    );
+    let session_id = crate::protocol::SessionId(91);
+    let path_id = crate::protocol::PathId(0);
+    let registration = context.reliable_streams.register_test_carrier_path(
+        session_id,
+        crate::protocol::UnderlayProtocol::Tcp,
+        path_id,
+        crate::runtime::path::ServerLocalPathProperties {
+            config_ordinal: 0,
+            ..crate::runtime::path::ServerLocalPathProperties::default()
+        },
+    );
+    let observed_at = std::time::Instant::now() - Duration::from_secs(10);
+    let expires_at = observed_at + Duration::from_secs(3);
+    context
+        .reliable_streams
+        .record_local_path_metrics_with_delivery_rate_sample(
+            &registration,
+            crate::protocol::PathMetrics {
+                path_id,
+                underlay: crate::protocol::UnderlayProtocol::Tcp,
+                direction: crate::protocol::PathMetricDirection::ServerToClient,
+                metric_epoch: 1,
+                metric_age_us: 0,
+                rate_valid_for_us: 0,
+                rate_observed: false,
+                srtt_us: 2_000_000,
+                rttvar_us: 500_000,
+                jitter_us: 500_000,
+                delivery_rate_bps: 1_000_000,
+                pacing_rate_bps: 2_000_000,
+                pacing_rate_observed: false,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight_observed: false,
+                queue_observed: false,
+                bytes_in_flight: 64 * 1024,
+                queue_bytes: 32 * 1024,
+                inflight_limit_bytes: 512 * 1024,
+                inflight_hi_bytes: 512 * 1024,
+                confidence_ppm: 1_000_000,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+            },
+            false,
+            Some(crate::runtime::path::CarrierDeliveryRateSample {
+                delivery_rate_bps: 123_000_000,
+                pacing_rate_bps: Some(200_000_000),
+                sample_count: 8,
+                sample_bytes: 512 * 1024,
+                delivery_window_covered: true,
+                observed_at,
+                expires_at,
+            }),
+        );
+    let target = ManagementTarget {
+        clients: Vec::new(),
+        servers: vec![context.clone()],
+        inventory: ProductRuntimeInventory::default(),
+        tun_l3_inventory: TunL3RuntimeInventory::default(),
+        product_telemetry: RuntimeTelemetry::new(8),
+        state: ManagementState::new("node"),
+        config_control: None,
+        gateway_control: None,
+        dns: None,
+        product_admission: ProductAdmission::default(),
+        generation: RuntimeGenerationControl::new(),
+    };
+
+    target.refresh_sample_snapshot();
+    let status = target.snapshot();
+    let carrier = status
+        .paths
+        .iter()
+        .find(|path| path.session_id.as_deref() == Some("91"))
+        .expect("server carrier row");
+    assert_eq!(carrier.delivery_rate_bps.as_deref(), Some("123000000"));
+    assert_eq!(carrier.pacing_rate_bps.as_deref(), Some("200000000"));
+    assert_eq!(carrier.delivery_rate_source, Some("native_carrier"));
+    assert_eq!(carrier.pacing_rate_source, Some("native_carrier"));
+    assert!(
+        carrier
+            .last_delivery_age_ms
+            .is_some_and(|age| age >= 10_000)
+    );
+    assert_eq!(carrier.pacing_age_ms, carrier.last_delivery_age_ms);
+    assert_eq!(carrier.freshness_horizon_ms, Some(3_000));
+    assert_eq!(carrier.metric_age_scope, Some("delivery"));
+    assert_eq!(carrier.bytes_in_flight, None);
+    assert_eq!(carrier.queue_bytes, None);
+    assert_ne!(
+        status.summary.path_delivery_rate_bps, "123000000",
+        "stale raw server diagnostics cannot inflate the live aggregate"
+    );
+
+    context
+        .reliable_streams
+        .record_local_path_metrics_with_delivery_rate_sample(
+            &registration,
+            context
+                .reliable_streams
+                .management_snapshot()
+                .paths
+                .into_iter()
+                .find(|path| path.path_instance_id == registration.path_instance_id())
+                .and_then(|path| path.metrics)
+                .expect("retained metrics"),
+            false,
+            Some(crate::runtime::path::CarrierDeliveryRateSample {
+                delivery_rate_bps: 123_000_000,
+                pacing_rate_bps: None,
+                sample_count: 8,
+                sample_bytes: 512 * 1024,
+                delivery_window_covered: true,
+                observed_at,
+                expires_at,
+            }),
+        );
+    target.refresh_sample_snapshot();
+    let no_pacing = target.snapshot();
+    let carrier = no_pacing
+        .paths
+        .iter()
+        .find(|path| path.session_id.as_deref() == Some("91"))
+        .expect("server carrier row");
+    assert_eq!(carrier.pacing_rate_bps, None);
+    assert_eq!(carrier.pacing_rate_source, None);
+    assert_eq!(carrier.pacing_age_ms, None);
+}
+
+#[test]
+fn management_rate_freshness_uses_the_runtime_three_pto_inputs() {
+    assert_eq!(
+        super::projection::client_metric_freshness_horizon_ms(
+            crate::runtime::path::model::ClientPathObservation::default()
+        ),
+        1_573
+    );
+    assert_eq!(
+        super::projection::client_metric_freshness_horizon_ms(
+            crate::runtime::path::model::ClientPathObservation {
+                carrier_srtt_ms: Some(10.0),
+                carrier_rttvar_ms: Some(1.0),
+                ..crate::runtime::path::model::ClientPathObservation::default()
+            }
+        ),
+        120
+    );
 }
 
 #[test]
@@ -528,12 +881,14 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
         crate::protocol::UnderlayProtocol::Tcp,
         crate::protocol::PathId(47),
         2,
+        Some(7444),
     );
     let _keeper = context.peer_status.register_path(
         context.session_id,
         crate::protocol::UnderlayProtocol::Udp,
         crate::protocol::PathId(0),
         0,
+        Some(7444),
     );
     let result = crate::runtime::peer_status::PeerStatusResult {
         session_id: context.session_id,
@@ -548,15 +903,20 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
                 direction: crate::protocol::PathMetricDirection::ServerToClient,
                 metric_epoch: 1,
                 metric_age_us: 0,
+                rate_valid_for_us: 0,
+                rate_observed: false,
                 srtt_us: 10_000,
-                rttvar_us: 1_000,
-                jitter_us: 1_000,
+                rttvar_us: 0,
+                jitter_us: 0,
                 delivery_rate_bps: 10_000_000,
                 pacing_rate_bps: 10_000_000,
+                pacing_rate_observed: false,
                 loss_ppm: 0,
                 ecn_ppm: 0,
                 loss_observed: false,
                 ecn_observed: false,
+                bytes_in_flight_observed: true,
+                queue_observed: true,
                 bytes_in_flight: 0,
                 queue_bytes: 0,
                 inflight_limit_bytes: 0,
@@ -568,16 +928,30 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
                 data_sample_bytes: 0,
             },
         }],
-        local_path_indices: std::collections::BTreeMap::from([(
+        local_paths: std::collections::BTreeMap::from([(
             (
                 crate::protocol::UnderlayProtocol::Tcp,
                 crate::protocol::PathId(47),
             ),
-            2,
+            crate::runtime::peer_status::PeerStatusLocalPathSnapshot {
+                local_path_index: 2,
+                active_port: Some(7444),
+                retired: false,
+            },
         )]),
         received_at: std::time::SystemTime::now(),
     };
     drop(draining);
+    let mut absent_result = result.clone();
+    absent_result.paths[0].metrics.bytes_in_flight_observed = false;
+    absent_result.paths[0].metrics.queue_observed = false;
+    absent_result.paths[0].metrics.has_ack_derived_data_sample = true;
+    absent_result.paths[0].metrics.data_sample_count = 1;
+    absent_result.paths[0].metrics.data_sample_bytes = 1_024;
+    absent_result.paths[0].metrics.metric_age_us = 1_500;
+    absent_result.paths[0].metrics.rate_valid_for_us = 2_001;
+    absent_result.paths[0].metrics.rate_observed = true;
+    absent_result.paths[0].metrics.pacing_rate_observed = true;
     let projected = super::projection::peer_status_result(
         result,
         "mpp_outbound",
@@ -595,6 +969,44 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
     let encoded = serde_json::to_value(projected).expect("peer status JSON");
     assert_eq!(encoded["paths"][0]["path"], "primary-tcp");
     assert_eq!(encoded["paths"][0]["endpoint"], "tcp://127.0.0.1:7443-7445");
+    assert_eq!(encoded["paths"][0]["port_hopping"], true);
+    assert_eq!(encoded["paths"][0]["active_port"], 7444);
+    assert_eq!(encoded["paths"][0]["active_port_retired"], false);
+    assert_eq!(encoded["paths"][0]["srtt_us"], 10_000);
+    assert_eq!(encoded["paths"][0]["rttvar_us"], 0);
+    assert_eq!(encoded["paths"][0]["jitter_us"], 0);
+    assert_eq!(encoded["paths"][0]["usage_direction"], "client_to_server");
+    assert_eq!(encoded["paths"][0]["direction"], "server_to_client");
+    assert_eq!(encoded["paths"][0]["delivery_rate_source"], "peer_advisory");
+    assert_eq!(encoded["paths"][0]["delivery_rate_scope"], "advisory");
+    assert!(encoded["paths"][0]["pacing_rate_bps"].is_null());
+    assert!(encoded["paths"][0]["pacing_rate_source"].is_null());
+    assert!(encoded["paths"][0]["freshness_horizon_ms"].is_null());
+    assert_eq!(encoded["paths"][0]["metric_age_scope"], "path_metrics");
+    assert!(encoded["paths"][0]["loss_ppm"].is_null());
+    assert!(encoded["paths"][0]["ecn_ppm"].is_null());
+    assert!(encoded["paths"][0]["inflight_limit_bytes"].is_null());
+    assert!(encoded["paths"][0]["data_sample_count"].is_null());
+    assert!(encoded["paths"][0]["data_sample_bytes"].is_null());
+    assert_eq!(encoded["paths"][0]["loss_observed"], false);
+    assert_eq!(encoded["paths"][0]["ecn_observed"], false);
+    assert_eq!(encoded["paths"][0]["ack_derived_data_observed"], false);
+    assert_eq!(encoded["paths"][0]["bytes_in_flight"], "0");
+    assert_eq!(encoded["paths"][0]["queue_bytes"], "0");
+
+    let absent = super::projection::peer_status_result(
+        absent_result,
+        "mpp_outbound",
+        0,
+        Some("edge-mpp".to_string()),
+        super::projection::PeerPathIdentitySource::Client(&context),
+    );
+    let absent = serde_json::to_value(absent).expect("partial peer status JSON");
+    assert!(absent["paths"][0]["bytes_in_flight"].is_null());
+    assert!(absent["paths"][0]["queue_bytes"].is_null());
+    assert_eq!(absent["paths"][0]["pacing_rate_bps"], "10000000");
+    assert_eq!(absent["paths"][0]["pacing_rate_source"], "peer_advisory");
+    assert_eq!(absent["paths"][0]["freshness_horizon_ms"], 4);
 }
 
 #[test]

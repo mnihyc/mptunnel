@@ -9,9 +9,11 @@ use super::attachment::{
     ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
 };
 use super::evidence::{
-    server_output_has_bulk_rate_evidence, server_output_has_durable_product_ack_progress,
-    server_output_local_path_metrics, server_path_metrics_estimate_rate_bps,
-    server_path_metrics_has_bulk_rate_evidence,
+    server_output_has_bulk_rate_evidence_at, server_output_has_durable_product_ack_progress,
+    server_output_local_path_metrics, server_output_product_rate_epoch_has_bulk_evidence_at,
+    server_path_metrics_estimate_rate_bps, server_path_metrics_has_bulk_rate_evidence_at,
+    server_path_metrics_has_qualified_delivery_history,
+    server_path_metrics_rate_evidence_is_fresh_at, server_path_metrics_snapshot_is_fresh_at,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, ReliableOriginalDataOutput,
@@ -20,7 +22,6 @@ use crate::model::capacity::{
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
-use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::mux::MuxLimits;
 use crate::protocol::{SessionId, UnderlayProtocol};
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
@@ -119,11 +120,13 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| !entry.commands.is_closed())
             .map(|entry| {
-                let snapshot = server_bulk_output_snapshot(
+                let now = Instant::now();
+                let snapshot = server_bulk_output_snapshot_at(
                     entry,
                     outputs.data_level_queue_bytes,
                     lane,
                     self.mux_limits,
+                    now,
                 );
                 ResponseSenderPathTarget {
                     observation: ResponsePathObservation {
@@ -143,9 +146,10 @@ impl ResponseStreamBinding {
                         stale_for_original_data: entry.stale_for_original_data,
                         #[cfg(test)]
                         has_path_proof_evidence: entry.path_proof.is_some(),
-                        has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(
+                        has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(
                             entry,
                             self.mux_limits,
+                            now,
                         ),
                     },
                     product_admission_active: entry.commands.product_admission_active(),
@@ -172,7 +176,9 @@ impl ResponseStreamBinding {
 }
 
 fn server_output_native_queue_bytes(entry: &ResponseStreamOutputEntry) -> u64 {
-    server_output_local_path_metrics(entry).map_or(0, |metrics| metrics.metrics.queue_bytes)
+    server_output_local_path_metrics(entry)
+        .filter(|metrics| metrics.metrics.queue_observed)
+        .map_or(0, |metrics| metrics.metrics.queue_bytes)
 }
 
 impl ResponseStreamOutputs {
@@ -214,16 +220,18 @@ impl ResponseStreamOutputs {
         payload_bytes: usize,
         mux_limits: MuxLimits,
     ) -> ReliableStreamSourceAdmission {
+        let now = Instant::now();
         reliable_stream_source_admission(
             self.entries
                 .iter()
                 .filter(|entry| entry.commands.product_admission_active())
                 .map(|entry| ReliableOriginalDataOutput {
-                    snapshot: server_bulk_output_snapshot(
+                    snapshot: server_bulk_output_snapshot_at(
                         entry,
                         self.data_level_queue_bytes,
                         lane,
                         mux_limits,
+                        now,
                     ),
                     stale: entry.stale_for_original_data,
                 }),
@@ -239,16 +247,18 @@ impl ResponseStreamOutputs {
         payload_bytes: usize,
         mux_limits: MuxLimits,
     ) -> Option<PathSnapshot> {
+        let now = Instant::now();
         reliable_stream_source_path(
             self.entries
                 .iter()
                 .filter(|entry| entry.commands.product_admission_active())
                 .map(|entry| ReliableOriginalDataOutput {
-                    snapshot: server_bulk_output_snapshot(
+                    snapshot: server_bulk_output_snapshot_at(
                         entry,
                         self.data_level_queue_bytes,
                         lane,
                         mux_limits,
+                        now,
                     ),
                     stale: entry.stale_for_original_data,
                 }),
@@ -264,6 +274,22 @@ pub(super) fn server_bulk_output_snapshot(
     data_level_queue_bytes: u64,
     lane: TrafficClass,
     mux_limits: MuxLimits,
+) -> PathSnapshot {
+    server_bulk_output_snapshot_at(
+        entry,
+        data_level_queue_bytes,
+        lane,
+        mux_limits,
+        Instant::now(),
+    )
+}
+
+fn server_bulk_output_snapshot_at(
+    entry: &ResponseStreamOutputEntry,
+    data_level_queue_bytes: u64,
+    lane: TrafficClass,
+    mux_limits: MuxLimits,
+    now: Instant,
 ) -> PathSnapshot {
     let local_metrics = server_output_local_path_metrics(entry);
     let peer_hint = (entry.delivery_samples == 0)
@@ -303,16 +329,19 @@ pub(super) fn server_bulk_output_snapshot(
         .clamp(0.0, 1.0);
 
     let product_rate = entry
-        .product_progress_rate_bps
-        .or(entry.delivery_rate_bps)
-        .filter(|rate| rate.is_finite() && *rate > 0.0);
+        .product_rate_epoch
+        .and_then(|epoch| epoch.fresh_rate_at(now));
     // Startup configuration is a prior, not measured carrier capacity. Only
     // ACK-derived evidence may turn local metrics into a scheduling rate.
     let native_rate = local_metrics
-        .filter(|metrics| server_path_metrics_has_bulk_rate_evidence(*metrics))
+        .filter(|metrics| server_path_metrics_has_bulk_rate_evidence_at(*metrics, now))
         .map(server_path_metrics_estimate_rate_bps);
     let native_startup_rate = local_metrics
-        .filter(|metrics| !server_path_metrics_has_bulk_rate_evidence(*metrics))
+        .filter(|metrics| !server_path_metrics_has_bulk_rate_evidence_at(*metrics, now))
+        .filter(|metrics| {
+            !server_path_metrics_has_qualified_delivery_history(*metrics)
+                || server_path_metrics_rate_evidence_is_fresh_at(*metrics, now)
+        })
         .filter(|metrics| {
             metrics
                 .metrics
@@ -320,31 +349,45 @@ pub(super) fn server_bulk_output_snapshot(
                 .max(metrics.metrics.inflight_hi_bytes)
                 > 0
         })
-        .map(|metrics| {
-            metrics
-                .metrics
-                .pacing_rate_bps
-                .max(metrics.metrics.delivery_rate_bps)
-                .max(1) as f64
+        .and_then(|metrics| {
+            metrics.carrier_delivery_rate_sample.map_or_else(
+                || {
+                    metrics
+                        .metrics
+                        .pacing_rate_observed
+                        .then_some(metrics.metrics.pacing_rate_bps.max(1) as f64)
+                },
+                |sample| {
+                    sample
+                        .pacing_rate_bps
+                        .map(|pacing_rate_bps| pacing_rate_bps.max(1) as f64)
+                },
+            )
         });
+    let native_pacing_rate = native_rate
+        .and_then(|_| {
+            local_metrics.and_then(|metrics| {
+                metrics.carrier_delivery_rate_sample.map_or_else(
+                    || {
+                        Some(if metrics.metrics.pacing_rate_observed {
+                            metrics.metrics.pacing_rate_bps
+                        } else {
+                            metrics.metrics.delivery_rate_bps
+                        })
+                    },
+                    |sample| Some(sample.pacing_rate_bps.unwrap_or(sample.delivery_rate_bps)),
+                )
+            })
+        })
+        .map(|rate| rate.max(1) as f64)
+        .or(native_startup_rate);
     let peer_rate = peer_hint
+        .filter(|metrics| server_path_metrics_snapshot_is_fresh_at(*metrics, now))
         .filter(|metrics| !metrics.metrics.app_limited)
         .map(server_path_metrics_estimate_rate_bps);
     let fresh_tcp_product_rate = (entry.key.underlay == UnderlayProtocol::Tcp
-        && server_output_has_durable_product_ack_progress(entry, mux_limits))
-    .then(|| {
-        let rttvar_ms = liveness_metrics.map_or(srtt_ms / 8.0, |metrics| {
-            f64::from(metrics.metrics.rttvar_us) / 1000.0
-        });
-        let freshness_horizon = transport_rate_sample_freshness_horizon(
-            Duration::from_secs_f64(srtt_ms.max(0.001) / 1000.0),
-            Duration::from_secs_f64(rttvar_ms.max(0.0) / 1000.0),
-        );
-        entry
-            .tcp_product_rate_evidence
-            .and_then(|evidence| evidence.fresh_goodput_sample(Instant::now(), freshness_horizon))
-            .map(|sample| sample.rate_bps())
-    })
+        && server_output_product_rate_epoch_has_bulk_evidence_at(entry, mux_limits, now))
+    .then_some(product_rate)
     .flatten();
     let (rate_bps, rate_scope) = match entry.key.underlay {
         UnderlayProtocol::Tcp if native_rate.is_some() => (
@@ -392,27 +435,41 @@ pub(super) fn server_bulk_output_snapshot(
     let (active_flows, active_latency_sensitive_flows) = entry.commands.active_flow_counts();
     snapshot.active_flows = active_flows;
     snapshot.active_latency_sensitive_flows = active_latency_sensitive_flows;
-    snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
+    snapshot.product_progress_rate_bps = product_rate;
     snapshot.has_durable_product_progress =
         server_output_has_durable_product_ack_progress(entry, mux_limits);
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
     if let Some(metrics) = local_metrics {
-        snapshot.pacing_rate_bps =
-            (metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
-        snapshot.app_limited = metrics.metrics.app_limited;
-        snapshot.queue_bytes = metrics.metrics.queue_bytes;
-        // Native flight ranks carrier completion; exact queue/send-credit checks
-        // remain the separate admission authority at command publication.
-        snapshot.bytes_in_flight = metrics.metrics.bytes_in_flight;
-        snapshot.carrier_inflight_limit_bytes = metrics.metrics.inflight_limit_bytes;
+        if let Some(pacing_rate_bps) = native_pacing_rate {
+            snapshot.pacing_rate_bps = pacing_rate_bps.max(1.0).max(snapshot.delivery_rate_bps);
+        }
+        if native_rate.is_some() || native_startup_rate.is_some() {
+            snapshot.app_limited = metrics
+                .carrier_delivery_rate_sample
+                .map_or(metrics.metrics.app_limited, |_| false);
+        }
+        if metrics.metrics.queue_observed {
+            snapshot.queue_bytes = metrics.metrics.queue_bytes;
+        }
+        if metrics.metrics.bytes_in_flight_observed {
+            // Native flight ranks carrier completion; exact queue/send-credit
+            // checks remain the separate admission authority at publication.
+            snapshot.bytes_in_flight = metrics.metrics.bytes_in_flight;
+        }
+        // The carrier window is an independent TCP capability: a platform can
+        // expose cwnd/send credit even when it cannot report exact current
+        // flight. Do not erase that useful bound with the flight presence bit.
+        if metrics.metrics.inflight_limit_bytes > 0 {
+            snapshot.carrier_inflight_limit_bytes = metrics.metrics.inflight_limit_bytes;
+        }
     }
     snapshot.queue_bytes = snapshot
         .queue_bytes
         .saturating_add(entry.commands.pending_bytes());
     snapshot.data_level_queue_bytes = data_level_queue_bytes;
     snapshot.data_level_bytes_in_flight = entry.bytes_in_flight;
-    snapshot.confidence = server_output_confidence(entry);
+    snapshot.confidence = server_output_confidence_at(entry, now);
     snapshot.data_level_limit_bytes = u64::try_from(adaptive_reliable_relay_inflight_bytes(
         Some(snapshot),
         lane,
@@ -426,12 +483,35 @@ fn confidence_sample_denominator() -> f64 {
     f64::from(RELIABLE_INITIAL_WINDOW_PACKETS as u32)
 }
 
+#[cfg(test)]
+#[cfg(test)]
 pub(super) fn server_output_confidence(entry: &ResponseStreamOutputEntry) -> f64 {
+    server_output_confidence_at(entry, Instant::now())
+}
+
+fn server_output_confidence_at(entry: &ResponseStreamOutputEntry, now: Instant) -> f64 {
     let delivery_confidence =
         (f64::from(entry.delivery_samples) / confidence_sample_denominator()).clamp(0.0, 1.0);
     let Some(metrics) = server_output_local_path_metrics(entry) else {
         return delivery_confidence;
     };
+    if let Some(sample) = metrics.carrier_delivery_rate_sample {
+        if sample.observed_at > now || now >= sample.expires_at {
+            return delivery_confidence;
+        }
+        let byte_confidence =
+            (sample.sample_bytes as f64 / PATH_OPEN_SCORE_BYTES.max(1) as f64).clamp(0.0, 1.0);
+        let count_confidence =
+            (f64::from(sample.sample_count) / confidence_sample_denominator()).clamp(0.0, 1.0);
+        return delivery_confidence
+            .max(byte_confidence.min(count_confidence))
+            .clamp(0.0, 1.0);
+    }
+    if server_path_metrics_has_qualified_delivery_history(metrics)
+        && !server_path_metrics_rate_evidence_is_fresh_at(metrics, now)
+    {
+        return delivery_confidence;
+    }
 
     let source_confidence =
         f64::from(metrics.metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;

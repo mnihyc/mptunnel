@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 7
+# MPTunnel Multipath Proxy Protocol (MPP) Version 8
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 7: its wire format, carrier profiles,
+This document specifies MPP version 8: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 7 is identified by the frame header in Section 12. A peer MUST
+Wire version 8 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -348,7 +348,7 @@ two frames before `PATH_JOIN`.
 The `SESSION_AUTH` transcript is:
 
 ```text
-"mptunnel session auth v7" ||
+"mptunnel session auth v8" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 nonce:16B ||
@@ -371,7 +371,7 @@ issued_at_unix_secs:u64
 The common `PATH_JOIN` transcript is:
 
 ```text
-"mptunnel path join v7" ||
+"mptunnel path join v8" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 path_id:u16 || underlay:u8 ||
@@ -1420,6 +1420,36 @@ while the target demand, ordinary carrier membership and eligibility,
 concurrent Product workload, and local admission and resource policy remain
 unchanged. A configured rate is a startup prior, not measurement.
 
+The transport-rate freshness deadline is fixed when the qualifying sample is
+completed, using the RTT and RTT-variation evidence from that same sample
+epoch. Later transport-shape or application-limited polls MUST NOT extend or
+shorten that deadline. At or after the fixed deadline, the retained value MAY
+be shown as stale diagnostic provenance but MUST NOT grant placement, pacing,
+confidence, queue, window, or aggregate-rate authority. The first qualifying
+sample completed at or after expiry starts a new published evidence epoch and
+MUST NOT inherit the prior published epoch's sample count or bytes.
+
+An unpublished native-delivery acquisition is not published authority and
+grants none of those rights. Its publish and durable-volume floors are frozen
+when its first qualified tuple is observed. A qualified tuple binds Product
+bytes, sample count, and delivery-clock elapsed time from the same timed,
+non-application-limited carrier observation; an implementation MAY omit an
+ambiguously mixed application-limited observation but MUST NOT guess its
+Product attribution. Tuples MAY aggregate only while both the network-path
+epoch and the native non-application-limited delivery-clock epoch remain
+unchanged. Aggregation MUST be invariant to management or scheduler polling and
+to an instantaneous zero outstanding-byte snapshot. A network-path or native
+delivery-clock epoch change terminates the unpublished acquisition.
+
+Expiry clears the prior published deadline, committed confidence, and committed
+byte coverage. It does not terminate a separate unpublished acquisition that
+remains in the same path and native delivery-clock epochs. Such an acquisition
+MAY begin before and complete after the old published deadline because it
+inherits no count, bytes, freshness, or authority from the expired publication.
+Only its qualifying completion starts a new freshness deadline. An
+implementation MUST NOT reuse the expired publication's deadline as a hidden
+acquisition timeout.
+
 Fresh qualified native delivery evidence ranks carrier capacity. Product
 per-flow completion evidence is the fallback when qualified native capacity is
 unavailable; a Product sample that may itself have been limited by placement
@@ -1486,17 +1516,66 @@ connection.
 
 ```text
 path_id:u16, underlay:u8, direction:u8, metric_epoch:u64,
-metric_age_us:u32, srtt_us:u32, rttvar_us:u32, jitter_us:u32,
-delivery_rate_bps:u64, pacing_rate_bps:u64, loss_ppm:u32, ecn_ppm:u32,
-loss_observed:u8, ecn_observed:u8, bytes_in_flight:u64, queue_bytes:u64,
+metric_age_us:u32, rate_valid_for_us:u64, rate_observed:u8,
+srtt_us:u32, rttvar_us:u32, jitter_us:u32,
+delivery_rate_bps:u64, pacing_rate_bps:u64, pacing_rate_observed:u8,
+loss_ppm:u32, ecn_ppm:u32,
+loss_observed:u8, ecn_observed:u8, bytes_in_flight_observed:u8,
+queue_observed:u8, bytes_in_flight:u64, queue_bytes:u64,
 inflight_limit_bytes:u64, inflight_hi_bytes:u64, confidence_ppm:u32,
 app_limited:u8, has_ack_derived_data_sample:u8, data_sample_count:u32,
 data_sample_bytes:u64
 ```
 
+The fixed `PATH_METRICS` record is 116 bytes. Offsets 24, 53, 64, and 65 from
+the record start are respectively `rate_observed`, `pacing_rate_observed`,
+`bytes_in_flight_observed`, and `queue_observed`; the corresponding flight and
+queue 64-bit values begin at offsets 66 and 74. A peer-status path entry adds
+one state byte and one usage byte and is therefore 118 bytes.
+
 Metrics are advisory and scoped to the authenticated carrier instance and
-direction. They grant no stream offset, flight ownership, usage, health, or
-capacity.
+direction. `bytes_in_flight_observed` and `queue_observed` independently state
+whether their corresponding numeric field is an actual observation; a true
+flag with numeric zero means observed zero, while a false flag means unknown.
+An endpoint MUST NOT interpret a queue or flight value whose corresponding
+flag is false as measured zero, native debt, native credit, or scheduling
+authority.
+`metric_age_us` is the saturating diagnostic age of the selected rate sample.
+`rate_valid_for_us` is the remaining receiver-relative rate-authority budget
+advertised with this record. A producer MUST derive it from the selected
+sample's immutable freshness deadline, and every retained or forwarded copy
+MUST only reduce it by local residence; it MUST NOT reconstruct or refresh the
+budget from later RTT, RTT-variation, pacing, or application-limited shape.
+A canonical value is at most `64,424,584,425` microseconds, the three-PTO
+freshness budget obtained from the largest representable `srtt_us` and
+`rttvar_us`; a decoder MUST reject a larger value and a local producer MUST cap
+its value at this bound.
+A zero budget grants no rate, pacing, or confidence authority while the raw
+numeric values may remain diagnostic. Because endpoints do not share a
+monotonic clock, this field is a remaining-duration grant beginning at receipt,
+not a cross-host absolute deadline; transport time cannot increase the
+advertised duration.
+
+`rate_observed` is true when `delivery_rate_bps` belongs to a measured native,
+Product, or generic delivery epoch and remains true after that epoch expires;
+it is false for an unmeasured startup prior. Rate authority requires both
+`rate_observed = true` and a nonzero remaining budget. A nonzero
+`rate_valid_for_us` with `rate_observed = false` is noncanonical and MUST be
+rejected. Product `has_ack_derived_data_sample`, `data_sample_count`, and
+`data_sample_bytes` retain their stronger meanings and MUST NOT be synthesized
+merely to mark a native TCP rate as observed. Native-carrier rate, pacing,
+sample count, sample bytes, confidence, and application-limited qualification
+MUST be projected from one retained immutable epoch rather than combining an
+older delivery timestamp with a later shape poll.
+
+`pacing_rate_observed` is true only when `pacing_rate_bps` is a native pacing
+observation belonging to the same qualified carrier-rate epoch. When false,
+the numeric field is only an internal delivery-rate fallback and MUST be shown
+as unavailable and MUST NOT be attributed to native pacing.
+`pacing_rate_observed = true` with `rate_observed = false` is noncanonical and
+MUST be rejected. All observation flags are canonical one-byte booleans: only
+zero and one are valid encodings.
+They grant no stream offset, flight ownership, usage, health, or capacity.
 
 ### 11.2 Reachability and capacity
 
@@ -1561,7 +1640,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        7
+4      version        8
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```

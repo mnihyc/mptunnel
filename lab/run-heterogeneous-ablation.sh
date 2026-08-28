@@ -162,17 +162,18 @@ build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 client_runtime="${MPTUNNEL_LAB_CLIENT_RUNTIME:-native}"
 wine_prefix="${MPTUNNEL_LAB_WINE_PREFIX:-.tmp/lab/wine}"
+host_build_root="${MPTUNNEL_LAB_BUILD_ROOT:-target}"
 printf -v wine_prefix_shell '%q' "$wine_prefix"
 case "$client_runtime" in
   native)
     client_target="$(rustc -vV | sed -n 's/^host: //p')"
-    client_binary_host="target/release/mptunnel"
+    client_binary_host="${host_build_root}/release/mptunnel"
     client_binary_container="/workspace/target/release/mptunnel"
     ;;
   wine)
     client_target="x86_64-pc-windows-gnu"
-    client_binary_host="target/${client_target}/release/mptunnel.exe"
-    client_binary_container="/workspace/${client_binary_host}"
+    client_binary_host="${host_build_root}/${client_target}/release/mptunnel.exe"
+    client_binary_container="/workspace/target/${client_target}/release/mptunnel.exe"
     ;;
   *)
     echo "MPTUNNEL_LAB_CLIENT_RUNTIME must be native or wine" >&2
@@ -545,7 +546,7 @@ capture_host_snapshot() {
 refresh_result_reproducibility() {
   local server_target server_sha256 client_sha256 runtime_version
   server_target="$(rustc -vV | sed -n 's/^host: //p')"
-  server_sha256="$(sha256sum target/release/mptunnel | awk '{print $1}')"
+  server_sha256="$(sha256sum "${host_build_root}/release/mptunnel" | awk '{print $1}')"
   client_sha256="$(sha256sum "$client_binary_host" | awk '{print $1}')"
   runtime_version="$client_runtime"
   if [[ "$client_runtime" == "wine" ]]; then

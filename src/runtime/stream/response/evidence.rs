@@ -2,6 +2,8 @@
 //! Writers preserve attachment identity; admission and scheduling only consume facts.
 
 use super::ResponseStreamBinding;
+#[cfg(test)]
+use super::attachment::ResponseProductRateEpoch;
 use super::attachment::ResponseStreamOutputEntry;
 #[cfg(all(test, feature = "lab-diagnostics"))]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -10,11 +12,14 @@ use crate::model::capacity::{
     reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+#[cfg(test)]
 use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::CarrierDeliveryRateSample;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum ServerPathMetricsSource {
@@ -28,8 +33,8 @@ pub(in crate::runtime) struct ServerPathMetricsEntry {
     pub(in crate::runtime::stream) source: ServerPathMetricsSource,
     pub(in crate::runtime::stream) native_drain_observed: bool,
     pub(in crate::runtime::stream) carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
-    // Metric age is measured at the source; residence time closes the gap when
-    // the local idle publisher is delayed after this snapshot is installed.
+    // The wire budget is remaining authority at receipt. Residence is measured
+    // from this instant and never recomputed from mutable RTT.
     pub(in crate::runtime::stream) recorded_at: Instant,
 }
 
@@ -44,9 +49,10 @@ pub(super) fn server_output_local_path_metrics(
     })
 }
 pub(super) fn server_path_metrics_estimate_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
-    if server_carrier_delivery_rate_sample_has_bulk_evidence(path_metrics)
-        && let Some(sample) = path_metrics.carrier_delivery_rate_sample
-    {
+    // Eligibility and value are separate facts. The caller evaluates the
+    // sample's frozen deadline once; this accessor must not perform a second
+    // clock read and fall back to retained PathMetrics at the expiry boundary.
+    if let Some(sample) = path_metrics.carrier_delivery_rate_sample {
         return sample.delivery_rate_bps.max(1) as f64;
     }
     path_metrics.metrics.delivery_rate_bps.max(1) as f64
@@ -62,28 +68,32 @@ pub(super) fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) 
         .max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
+#[cfg(test)]
+#[cfg(test)]
 pub(super) fn server_path_metrics_has_bulk_rate_evidence(
     path_metrics: ServerPathMetricsEntry,
 ) -> bool {
-    if server_carrier_delivery_rate_sample_has_bulk_evidence(path_metrics) {
-        return true;
+    server_path_metrics_has_bulk_rate_evidence_at(path_metrics, Instant::now())
+}
+
+pub(super) fn server_path_metrics_has_bulk_rate_evidence_at(
+    path_metrics: ServerPathMetricsEntry,
+    now: Instant,
+) -> bool {
+    if path_metrics.carrier_delivery_rate_sample.is_some() {
+        // The local TCP sidecar owns the qualified ACK epoch. Refreshed merged
+        // PathMetrics may retain old ACK counters, but cannot extend it.
+        return server_carrier_delivery_rate_sample_has_bulk_evidence_at(path_metrics, now);
     }
     let sample_floor = server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics);
     let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
-    let effective_metric_age = Duration::from_micros(u64::from(path_metrics.metrics.metric_age_us))
-        .saturating_add(Instant::now().saturating_duration_since(path_metrics.recorded_at));
     // `app_limited` describes the current carrier instant. The sample timestamp
     // and accumulated non-app-limited ACK evidence own the lifetime of the last
     // qualified delivery rate, so a later idle instant must not invalidate it.
-    let native_bulk_proof_is_eligible = effective_metric_age
-        < transport_rate_sample_freshness_horizon(
-            Duration::from_micros(u64::from(path_metrics.metrics.srtt_us.max(1))),
-            Duration::from_micros(u64::from(path_metrics.metrics.rttvar_us)),
-        );
     path_metrics.source == ServerPathMetricsSource::LocalSender
         // Source expiry is authoritative; age is defense in depth if an idle
         // refresh is delayed or reordered before response scheduling observes it.
-        && native_bulk_proof_is_eligible
+        && server_path_metrics_snapshot_is_fresh_at(path_metrics, now)
         && path_metrics.metrics.has_ack_derived_data_sample
         && path_metrics.metrics.data_sample_count > 0
         && path_metrics
@@ -93,8 +103,37 @@ pub(super) fn server_path_metrics_has_bulk_rate_evidence(
             >= sample_floor
 }
 
-fn server_carrier_delivery_rate_sample_has_bulk_evidence(
+pub(super) fn server_path_metrics_rate_evidence_is_fresh_at(
     path_metrics: ServerPathMetricsEntry,
+    now: Instant,
+) -> bool {
+    path_metrics.carrier_delivery_rate_sample.map_or_else(
+        || server_path_metrics_snapshot_is_fresh_at(path_metrics, now),
+        |sample| sample.observed_at <= now && now < sample.expires_at,
+    )
+}
+
+pub(super) fn server_path_metrics_snapshot_is_fresh_at(
+    path_metrics: ServerPathMetricsEntry,
+    now: Instant,
+) -> bool {
+    path_metrics.metrics.rate_observed
+        && path_metrics.metrics.rate_valid_for_us > 0
+        && now.saturating_duration_since(path_metrics.recorded_at)
+            < std::time::Duration::from_micros(path_metrics.metrics.rate_valid_for_us)
+}
+
+/// Distinguishes a genuine never-qualified startup prior from retained
+/// measured evidence whose placement lifetime has expired.
+pub(super) fn server_path_metrics_has_qualified_delivery_history(
+    path_metrics: ServerPathMetricsEntry,
+) -> bool {
+    path_metrics.carrier_delivery_rate_sample.is_some() || path_metrics.metrics.rate_observed
+}
+
+fn server_carrier_delivery_rate_sample_has_bulk_evidence_at(
+    path_metrics: ServerPathMetricsEntry,
+    now: Instant,
 ) -> bool {
     let Some(sample) = path_metrics.carrier_delivery_rate_sample else {
         return false;
@@ -108,6 +147,8 @@ fn server_carrier_delivery_rate_sample_has_bulk_evidence(
         && sample.sample_count > 0
         && sample.delivery_window_covered
         && sample.sample_bytes >= sample_floor
+        && sample.observed_at <= now
+        && now < sample.expires_at
 }
 
 pub(super) fn server_output_has_durable_product_ack_progress(
@@ -122,18 +163,39 @@ pub(super) fn server_output_has_durable_product_ack_progress(
         >= sample_floor
 }
 
+#[cfg(test)]
 pub(super) fn server_output_has_bulk_rate_evidence(
     entry: &ResponseStreamOutputEntry,
     mux_limits: crate::mux::MuxLimits,
 ) -> bool {
+    server_output_has_bulk_rate_evidence_at(entry, mux_limits, Instant::now())
+}
+
+pub(super) fn server_output_product_rate_epoch_has_bulk_evidence_at(
+    entry: &ResponseStreamOutputEntry,
+    mux_limits: crate::mux::MuxLimits,
+    now: Instant,
+) -> bool {
+    let sample_floor = reliable_path_startup_sample_limit_bytes(mux_limits);
+    entry.product_rate_epoch.is_some_and(|epoch| {
+        epoch.fresh_rate_at(now).is_some()
+            && epoch.sample_count > 0
+            && epoch.sample_bytes >= sample_floor
+    }) && server_output_has_durable_product_ack_progress(entry, mux_limits)
+}
+
+pub(super) fn server_output_has_bulk_rate_evidence_at(
+    entry: &ResponseStreamOutputEntry,
+    mux_limits: crate::mux::MuxLimits,
+    now: Instant,
+) -> bool {
     let has_local_carrier_sample = server_output_local_path_metrics(entry)
-        .is_some_and(server_path_metrics_has_bulk_rate_evidence);
+        .is_some_and(|metrics| server_path_metrics_has_bulk_rate_evidence_at(metrics, now));
     match entry.key.underlay {
         UnderlayProtocol::Udp => has_local_carrier_sample,
         UnderlayProtocol::Tcp => {
             has_local_carrier_sample
-                || (entry.product_progress_rate_bps.is_some()
-                    && server_output_has_durable_product_ack_progress(entry, mux_limits))
+                || server_output_product_rate_epoch_has_bulk_evidence_at(entry, mux_limits, now)
         }
     }
 }
@@ -169,8 +231,14 @@ impl ResponseStreamBinding {
             .iter_mut()
             .find(|entry| entry.key == key)
             .expect("test modeled output");
-        entry.product_progress_rate_bps = Some(rate_bps.max(1.0));
-        entry.delivery_rate_bps = Some(rate_bps.max(1.0));
+        let srtt = Duration::from_secs_f64(srtt_ms.max(1.0) / 1000.0);
+        entry.product_rate_epoch = ResponseProductRateEpoch::new(
+            rate_bps.max(1.0),
+            1,
+            reliable_path_startup_sample_limit_bytes(self.mux_limits),
+            Instant::now(),
+            transport_rate_sample_freshness_horizon(srtt, srtt / 8),
+        );
         entry.srtt_ms = Some(srtt_ms.max(1.0));
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
@@ -311,8 +379,10 @@ fn server_path_metrics_scheduling_equivalent(
     // response stream on each idle QUIC metrics poll.
     left.metric_epoch = 0;
     left.metric_age_us = 0;
+    left.rate_valid_for_us = 0;
     right.metric_epoch = 0;
     right.metric_age_us = 0;
+    right.rate_valid_for_us = 0;
     left == right
 }
 

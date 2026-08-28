@@ -28,7 +28,9 @@ use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::path_startup_snapshot;
 use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
-use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
+use crate::runtime::peer_status::{
+    PeerStatusBroker, PeerStatusCarrier, PeerStatusPathMetadataHandle, PeerStatusSnapshotSource,
+};
 use crate::scheduler::TrafficClass;
 use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::quic::{QuicCandidateSelector, QuicCarrierError};
@@ -773,7 +775,11 @@ impl ClientUdpPathConnection {
             UnderlayProtocol::Udp,
             PathId(runtime.path_index as u16),
             runtime.config_index,
+            Some(connection.remote_address().port()),
         );
+        let path_metadata = peer_status
+            .path_metadata_handle()
+            .expect("QUIC peer-status registration has path metadata");
         let control_connection = connection.clone();
         let control_runtime = runtime.clone();
         self.control_task = Some(tokio::spawn(async move {
@@ -796,6 +802,7 @@ impl ClientUdpPathConnection {
                 connection,
                 canonical_remote,
                 interval,
+                path_metadata,
             )
         });
     }
@@ -1082,6 +1089,7 @@ fn spawn_client_udp_port_migration(
     connection: UdpPathConnection,
     canonical_remote: std::net::SocketAddr,
     interval: Duration,
+    path_metadata: PeerStatusPathMetadataHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut current_port = canonical_remote.port();
@@ -1152,6 +1160,7 @@ fn spawn_client_udp_port_migration(
                 _ = connection.wait_closed() => return,
             }
             current_port = selected_port;
+            let _ = path_metadata.set_active_port(selected_port);
             crate::observability::process_event!(
                 Info,
                 "quic",

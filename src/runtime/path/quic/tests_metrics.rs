@@ -71,7 +71,7 @@ fn quic_product_data_accepted_by_quinn_counts_as_queue_until_ack() {
     );
     assert_eq!(queued.bytes_in_flight, 0);
     assert_eq!(queued.pending_bytes, 8 * 1024 * 1024);
-    let product_metrics = path_metrics_from_quic_path(PathId(7), queued);
+    let product_metrics = path_metrics_from_quic_path(PathId(7), queued, None);
     assert_eq!(product_metrics.queue_bytes, 8 * 1024 * 1024);
 
     let partially_acked = tracker.observe(
@@ -114,7 +114,7 @@ fn quic_loss_unknown_is_not_reported_as_observed_zero() {
         ack_poll: QuicAckPollDiagnostics::default(),
     };
 
-    let path_metrics = path_metrics_from_quic_path(PathId(7), metrics);
+    let path_metrics = path_metrics_from_quic_path(PathId(7), metrics, None);
 
     assert_eq!(path_metrics.loss_ppm, 0);
     assert!(!path_metrics.loss_observed);
@@ -153,8 +153,109 @@ fn quic_server_metrics_publish_ack_data_seen_even_when_app_limited() {
     };
 
     assert!(quic_path_metrics_should_publish_local_sender(metrics));
-    let product_metrics = path_metrics_from_quic_path(PathId(7), metrics);
+    let product_metrics = path_metrics_from_quic_path(PathId(7), metrics, None);
     assert!(product_metrics.has_ack_derived_data_sample);
     assert_eq!(product_metrics.data_sample_count, 0);
     assert!(product_metrics.app_limited);
+}
+
+#[test]
+fn server_quic_sidecar_freezes_expiry_and_survives_expired_rtt_refreshes_until_epoch_reset() {
+    let observed_at = Instant::now();
+    let expires_at = observed_at + Duration::from_millis(300);
+    let mut metrics = quic_metrics_for_polling();
+    metrics.delivery_rate_bps = 80_000_000.0;
+    metrics.pacing_rate_bps = 100_000_000.0;
+    metrics.delivery_sample_count = 4;
+    metrics.delivery_sample_bytes = 512 * 1024;
+    metrics.last_delivery_sample_at = Some(observed_at);
+    metrics.bulk_proof_expires_at = Some(expires_at);
+    let frozen = retained_quic_delivery_rate_sample(None, metrics).expect("fresh sidecar");
+    assert_eq!(frozen.observed_at, observed_at);
+    assert_eq!(frozen.expires_at, expires_at);
+    assert_eq!(frozen.delivery_rate_bps, 80_000_000);
+    assert_eq!(frozen.pacing_rate_bps, Some(100_000_000));
+
+    let projected = path_metrics_from_quic_path(
+        PathId(7),
+        UdpPathMetrics {
+            delivery_rate_bps: 7_000_000.0,
+            pacing_rate_bps: 9_000_000.0,
+            delivery_sample_count: 999,
+            delivery_sample_bytes: 999 * 1024 * 1024,
+            app_limited: true,
+            ack_derived_data_seen: false,
+            ..metrics
+        },
+        Some(frozen),
+    );
+    assert_eq!(projected.delivery_rate_bps, 80_000_000);
+    assert_eq!(projected.pacing_rate_bps, 100_000_000);
+    assert!(projected.rate_observed);
+    assert!(projected.pacing_rate_observed);
+    assert!(projected.rate_valid_for_us > 0);
+    assert_eq!(projected.data_sample_count, 4);
+    assert_eq!(projected.data_sample_bytes, 512 * 1024);
+    assert_eq!(
+        projected.confidence_ppm,
+        ratio_to_ppm((4.0 / QUIC_INITIAL_WINDOW_PACKETS as f64).clamp(0.0, 1.0))
+    );
+    assert!(!projected.app_limited);
+    assert!(projected.has_ack_derived_data_sample);
+
+    let stale = path_metrics_from_quic_path(
+        PathId(7),
+        metrics,
+        Some(CarrierDeliveryRateSample {
+            expires_at: Instant::now() - Duration::from_micros(1),
+            ..frozen
+        }),
+    );
+    assert_eq!(stale.rate_valid_for_us, 0);
+    assert!(stale.rate_observed);
+    assert!(stale.pacing_rate_observed);
+    assert_eq!(stale.delivery_rate_bps, 80_000_000);
+    assert_eq!(stale.pacing_rate_bps, 100_000_000);
+
+    assert_eq!(
+        retained_quic_delivery_rate_sample(
+            Some(frozen),
+            UdpPathMetrics {
+                delivery_rate_bps: 7_000_000.0,
+                pacing_rate_bps: 9_000_000.0,
+                ..metrics
+            },
+        ),
+        Some(frozen),
+        "an ACK-less shape refresh cannot rewrite values in the same sample epoch"
+    );
+
+    for later_rtt in [Duration::from_millis(1), Duration::from_secs(10)] {
+        let expired_refresh = UdpPathMetrics {
+            srtt: later_rtt,
+            rttvar: later_rtt / 2,
+            delivery_rate_bps: 7_000_000.0,
+            pacing_rate_bps: 9_000_000.0,
+            bulk_proof_expires_at: None,
+            ..metrics
+        };
+        assert_eq!(
+            retained_quic_delivery_rate_sample(Some(frozen), expired_refresh),
+            Some(frozen),
+            "later RTT growth or shrink cannot move or erase the expired immutable sample"
+        );
+    }
+
+    assert_eq!(
+        retained_quic_delivery_rate_sample(
+            Some(frozen),
+            UdpPathMetrics {
+                last_delivery_sample_at: None,
+                bulk_proof_expires_at: None,
+                ..metrics
+            },
+        ),
+        None,
+        "only an explicit tracker epoch reset clears the retained sidecar"
+    );
 }

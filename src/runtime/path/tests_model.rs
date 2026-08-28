@@ -69,16 +69,30 @@ fn path_snapshot_preserves_rate_provenance() {
     let tcp = "tcp://127.0.0.1:10000?initial-rate-mbps=400"
         .parse::<PathSpec>()
         .expect("TCP path");
+    let now = Instant::now();
     let product = ClientPathObservation {
         measured_rate_bps: Some(100_000_000.0),
         product_delivery_rate_bps: Some(120_000_000.0),
         product_delivery_sample_bytes: 1024 * 1024,
         delivery_samples: 1,
+        last_delivery_at: Some(now),
+        delivery_rate_expires_at: Some(now + Duration::from_secs(1)),
         ..ClientPathObservation::default()
     };
     let provisional_snapshot = path_snapshot(&tcp, 0, product);
     assert_eq!(provisional_snapshot.delivery_rate_bps, 400_000_000.0);
     assert_eq!(provisional_snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(
+        path_metrics_from_snapshot_at(
+            provisional_snapshot,
+            product,
+            PathMetricDirection::ClientToServer,
+            now,
+        )
+        .rate_valid_for_us,
+        0,
+        "a provisional Product sample must not lend its deadline to the selected startup prior"
+    );
 
     let mature_product = ClientPathObservation {
         delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
@@ -87,6 +101,16 @@ fn path_snapshot_preserves_rate_provenance() {
     let product_snapshot = path_snapshot(&tcp, 0, mature_product);
     assert_eq!(product_snapshot.delivery_rate_bps, 120_000_000.0);
     assert_eq!(product_snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(
+        path_metrics_from_snapshot_at(
+            product_snapshot,
+            mature_product,
+            PathMetricDirection::ClientToServer,
+            now,
+        )
+        .rate_valid_for_us,
+        1_000_000
+    );
 
     let carrier = ClientPathObservation {
         carrier_delivery_rate_bps: Some(500_000_000.0),
@@ -94,20 +118,44 @@ fn path_snapshot_preserves_rate_provenance() {
         carrier_delivery_samples: 1,
         carrier_delivery_sample_bytes: 512 * 1024,
         carrier_delivery_window_covered: true,
+        carrier_last_delivery_at: Some(now),
+        carrier_bulk_proof_expires_at: Some(now + Duration::from_secs(2)),
         carrier_app_limited: false,
         ..mature_product
     };
     let carrier_snapshot = path_snapshot(&tcp, 0, carrier);
     assert_eq!(carrier_snapshot.delivery_rate_bps, 500_000_000.0);
     assert_eq!(carrier_snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(
+        path_metrics_from_snapshot_at(
+            carrier_snapshot,
+            carrier,
+            PathMetricDirection::ClientToServer,
+            now,
+        )
+        .rate_valid_for_us,
+        2_000_000
+    );
 
     let generic = ClientPathObservation {
         measured_rate_bps: Some(90_000_000.0),
+        last_delivery_at: Some(now),
+        delivery_rate_expires_at: Some(now + Duration::from_secs(3)),
         ..ClientPathObservation::default()
     };
     assert_eq!(
         path_snapshot(&tcp, 0, generic).rate_scope,
         PathRateScope::PathCapacity
+    );
+    assert_eq!(
+        path_metrics_from_snapshot_at(
+            path_snapshot(&tcp, 0, generic),
+            generic,
+            PathMetricDirection::ClientToServer,
+            now,
+        )
+        .rate_valid_for_us,
+        3_000_000
     );
     assert_eq!(
         path_snapshot(&tcp, 0, ClientPathObservation::default()).rate_scope,
@@ -203,6 +251,7 @@ fn passive_tcp_carrier_rate_never_claims_mpp_data_ack_evidence() {
     let tcp = "tcp://127.0.0.1:10000"
         .parse::<PathSpec>()
         .expect("TCP path");
+    let now = Instant::now();
     let observation = ClientPathObservation {
         state: SchedulerPathState::Active,
         carrier_srtt_ms: Some(180.0),
@@ -213,7 +262,8 @@ fn passive_tcp_carrier_rate_never_claims_mpp_data_ack_evidence() {
         carrier_delivery_samples: 2,
         carrier_delivery_sample_bytes: 1024 * 1024,
         carrier_delivery_window_covered: true,
-        carrier_last_delivery_at: Some(Instant::now()),
+        carrier_last_delivery_at: Some(now),
+        carrier_bulk_proof_expires_at: Some(now + Duration::from_secs(1)),
         carrier_app_limited: false,
         carrier_ack_derived_data_seen: false,
         ..ClientPathObservation::default()
@@ -234,6 +284,8 @@ fn passive_tcp_carrier_rate_never_claims_mpp_data_ack_evidence() {
     assert_eq!(metrics.data_sample_bytes, 0);
     assert_eq!(metrics.delivery_rate_bps, 200_000_000);
     assert_eq!(metrics.pacing_rate_bps, 250_000_000);
+    assert!(metrics.pacing_rate_observed);
+    assert!(metrics.rate_valid_for_us > 0);
 
     let preliminary = ClientPathObservation {
         carrier_delivery_window_covered: false,
@@ -246,6 +298,74 @@ fn passive_tcp_carrier_rate_never_claims_mpp_data_ack_evidence() {
     assert_ne!(
         path_snapshot(&tcp, 0, preliminary).delivery_rate_bps,
         200_000_000.0
+    );
+}
+
+#[test]
+fn tcp_native_peer_metrics_preserve_fresh_and_stale_rate_provenance_without_product_ack() {
+    let tcp = "tcp://127.0.0.1:10000"
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let now = Instant::now();
+    let observation = ClientPathObservation {
+        carrier_delivery_rate_bps: Some(200_000_000.0),
+        carrier_pacing_rate_bps: Some(250_000_000.0),
+        carrier_delivery_samples: 1,
+        carrier_delivery_sample_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
+        carrier_delivery_window_covered: true,
+        carrier_last_delivery_at: Some(now - Duration::from_micros(7)),
+        carrier_bulk_proof_expires_at: Some(now + Duration::from_micros(1)),
+        carrier_app_limited: false,
+        ..ClientPathObservation::default()
+    };
+    let snapshot = path_snapshot(&tcp, 0, observation);
+    let near_expiry = path_metrics_from_snapshot_at(
+        snapshot,
+        observation,
+        PathMetricDirection::ClientToServer,
+        now,
+    );
+    assert_eq!(near_expiry.metric_age_us, 7);
+    assert_eq!(near_expiry.rate_valid_for_us, 1);
+    assert!(near_expiry.rate_observed);
+    assert!(near_expiry.pacing_rate_observed);
+    assert_eq!(near_expiry.pacing_rate_bps, 250_000_000);
+    assert!(!near_expiry.has_ack_derived_data_sample);
+    assert_eq!(near_expiry.data_sample_count, 0);
+    assert_eq!(near_expiry.data_sample_bytes, 0);
+
+    let expired = path_metrics_from_snapshot_at(
+        snapshot,
+        observation,
+        PathMetricDirection::ClientToServer,
+        now + Duration::from_micros(1),
+    );
+    assert_eq!(expired.rate_valid_for_us, 0);
+    assert!(expired.rate_observed);
+    assert!(expired.pacing_rate_observed);
+    assert_eq!(expired.pacing_rate_bps, 250_000_000);
+    assert!(!expired.has_ack_derived_data_sample);
+
+    let startup = path_startup_metrics(&tcp, PathId(0), PathMetricDirection::ClientToServer);
+    assert_eq!(startup.rate_valid_for_us, 0);
+    assert!(!startup.rate_observed);
+    assert!(!startup.pacing_rate_observed);
+
+    let overlong = ClientPathObservation {
+        carrier_bulk_proof_expires_at: now.checked_add(Duration::from_micros(
+            crate::protocol::PATH_METRICS_MAX_RATE_VALID_FOR_US + 1,
+        )),
+        ..observation
+    };
+    let capped = path_metrics_from_snapshot_at(
+        path_snapshot(&tcp, 0, overlong),
+        overlong,
+        PathMetricDirection::ClientToServer,
+        now,
+    );
+    assert_eq!(
+        capped.rate_valid_for_us,
+        crate::protocol::PATH_METRICS_MAX_RATE_VALID_FOR_US
     );
 }
 
@@ -301,4 +421,70 @@ fn product_delivery_evidence_does_not_chase_a_growing_tcp_cwnd() {
 
     assert!(bulk_candidate_has_bulk_rate_evidence(&tcp, product));
     assert!(path_snapshot(&tcp, 0, product).has_durable_product_progress);
+}
+
+#[test]
+fn stale_rate_evidence_cannot_win_scheduler_or_capacity_selection() {
+    let paths = [
+        "tcp://127.0.0.1:10000".parse::<PathSpec>().expect("path"),
+        "tcp://127.0.0.1:10001".parse::<PathSpec>().expect("path"),
+    ];
+    let now = Instant::now();
+    let stale_at = now - Duration::from_secs(60);
+    let mut stale_record = ClientPathHealthRecord::default();
+    stale_record.measured_srtt_ms = Some(20.0);
+    stale_record.measured_jitter_ms = Some(5.0);
+    stale_record.measured_rate_bps = Some(1_000_000_000.0);
+    stale_record.delivery_samples = 100;
+    stale_record.product_delivery_rate_bps = Some(900_000_000.0);
+    stale_record.product_delivery_sample_bytes = 8 * 1024 * 1024;
+    stale_record.last_delivery_at = Some(stale_at);
+    stale_record.delivery_rate_expires_at = Some(stale_at + Duration::from_secs(1));
+    stale_record.carrier_srtt_ms = Some(20.0);
+    stale_record.carrier_rttvar_ms = Some(5.0);
+    stale_record.carrier_delivery_rate_bps = Some(1_100_000_000.0);
+    stale_record.carrier_delivery_samples = 100;
+    stale_record.carrier_delivery_sample_bytes = 8 * 1024 * 1024;
+    stale_record.carrier_delivery_window_covered = true;
+    stale_record.carrier_last_delivery_at = Some(stale_at);
+    stale_record.carrier_app_limited = false;
+
+    let mut fresh_record = ClientPathHealthRecord::default();
+    fresh_record.measured_srtt_ms = Some(20.0);
+    fresh_record.measured_jitter_ms = Some(5.0);
+    fresh_record.measured_rate_bps = Some(10_000_000.0);
+    fresh_record.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
+    fresh_record.product_delivery_rate_bps = Some(10_000_000.0);
+    fresh_record.product_delivery_sample_bytes = 1024 * 1024;
+    fresh_record.last_delivery_at = Some(now - Duration::from_millis(1));
+    fresh_record.delivery_rate_expires_at = Some(now + Duration::from_secs(1));
+    let observations = [
+        stale_record.observation_at(now),
+        fresh_record.observation_at(now),
+    ];
+
+    assert_eq!(observations[0].measured_rate_bps, None);
+    assert_eq!(observations[0].product_delivery_rate_bps, None);
+    assert_eq!(observations[0].carrier_delivery_rate_bps, None);
+    assert!(!bulk_candidate_has_bulk_rate_evidence(
+        &paths[0],
+        observations[0]
+    ));
+    assert!(bulk_candidate_has_bulk_rate_evidence(
+        &paths[1],
+        observations[1]
+    ));
+    assert_eq!(
+        path_snapshot(&paths[0], 0, observations[0]).delivery_rate_bps,
+        default_path_rate_bps()
+    );
+    assert_eq!(
+        path_snapshot(&paths[1], 1, observations[1]).delivery_rate_bps,
+        10_000_000.0
+    );
+    assert_eq!(
+        ordered_path_scores(&paths, &observations, TrafficClass::Throughput, 64 * 1024,)[0].0,
+        1,
+        "expired gigabit evidence must not outrank current measured delivery"
+    );
 }

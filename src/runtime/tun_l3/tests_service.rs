@@ -977,6 +977,11 @@ fn server_packet_ranking_requires_delivered_capacity_evidence() {
     );
 
     live.has_ack_derived_data_sample = true;
+    live.data_sample_count = 1;
+    live.data_sample_bytes = 64 * 1024;
+    live.rate_observed = true;
+    live.rate_valid_for_us = 1_000_000;
+    live.pacing_rate_observed = true;
     assert_eq!(
         server_packet_delivery_rate(Some(live), Some(startup)),
         700_000_000.0

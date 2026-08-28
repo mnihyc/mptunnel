@@ -19,15 +19,20 @@ fn peer_status_metrics(
         direction,
         metric_epoch: 1_735_689_600,
         metric_age_us: 5_000,
+        rate_valid_for_us: 100_000,
+        rate_observed: true,
         srtt_us: 25_000,
         rttvar_us: 3_000,
         jitter_us: 1_200,
         delivery_rate_bps: 125_000_000,
         pacing_rate_bps: 150_000_000,
+        pacing_rate_observed: true,
         loss_ppm: 1_500,
         ecn_ppm: 25,
         loss_observed: true,
         ecn_observed: true,
+        bytes_in_flight_observed: true,
+        queue_observed: true,
         bytes_in_flight: 64 * 1024,
         queue_bytes: 16 * 1024,
         inflight_limit_bytes: 512 * 1024,
@@ -85,7 +90,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v7_has_no_attachment_role_field() {
+fn open_stream_v8_has_no_attachment_role_field() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -96,7 +101,7 @@ fn open_stream_v7_has_no_attachment_role_field() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 7, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 8, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2,
         ]
     );
@@ -138,15 +143,146 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_v6_frames_after_v7_wire_cut() {
+fn decoder_rejects_v7_frames_after_v8_wire_cut() {
     let mut encoded =
         encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
-    encoded[4] = 6;
+    encoded[4] = 7;
 
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
-        Err(CodecError::UnsupportedVersion(6))
+        Err(CodecError::UnsupportedVersion(7))
     );
+}
+
+#[test]
+fn path_metrics_v8_presence_bits_distinguish_absence_from_observed_zero() {
+    let mut absent = peer_status_metrics(
+        7,
+        UnderlayProtocol::Tcp,
+        PathMetricDirection::ServerToClient,
+    );
+    absent.bytes_in_flight = 0;
+    absent.queue_bytes = 0;
+    absent.bytes_in_flight_observed = false;
+    absent.queue_observed = false;
+
+    let absent_wire = encode_frame(
+        &Frame::PathMetrics { metrics: absent },
+        CodecLimits::default(),
+    )
+    .expect("encode absent native counters");
+    assert_eq!(
+        absent_wire.len(),
+        FRAME_HEADER_LEN + PATH_METRICS_ENCODED_LEN
+    );
+    assert_eq!(absent_wire[4], 8);
+    assert_eq!(
+        &absent_wire[FRAME_HEADER_LEN + 64..FRAME_HEADER_LEN + 66],
+        &[0, 0]
+    );
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(absent_wire), CodecLimits::default()).expect("decode"),
+        Frame::PathMetrics { metrics: absent }
+    );
+
+    let observed_zero = PathMetrics {
+        bytes_in_flight_observed: true,
+        queue_observed: true,
+        ..absent
+    };
+    let observed_wire = encode_frame(
+        &Frame::PathMetrics {
+            metrics: observed_zero,
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode observed zero native counters");
+    assert_eq!(
+        &observed_wire[FRAME_HEADER_LEN + 64..FRAME_HEADER_LEN + 66],
+        &[1, 1]
+    );
+    for presence_offset in [24, 53, 62, 63, 64, 65] {
+        let mut invalid = observed_wire.clone();
+        invalid[FRAME_HEADER_LEN + presence_offset] = 2;
+        assert_eq!(
+            decode_frame_bytes(Bytes::from(invalid), CodecLimits::default()),
+            Err(CodecError::InvalidEnum),
+            "presence byte at fixed offset {presence_offset} must be canonical boolean"
+        );
+    }
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(observed_wire), CodecLimits::default()).expect("decode"),
+        Frame::PathMetrics {
+            metrics: observed_zero
+        }
+    );
+}
+
+#[test]
+fn path_metrics_v8_rate_authority_budget_is_bounded_canonically() {
+    let mut metrics = peer_status_metrics(
+        7,
+        UnderlayProtocol::Udp,
+        PathMetricDirection::ServerToClient,
+    );
+    metrics.rate_valid_for_us = PATH_METRICS_MAX_RATE_VALID_FOR_US;
+    let exact_wire = encode_frame(&Frame::PathMetrics { metrics }, CodecLimits::default())
+        .expect("encode exact maximum rate authority");
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(exact_wire.clone()), CodecLimits::default())
+            .expect("decode exact maximum rate authority"),
+        Frame::PathMetrics { metrics }
+    );
+
+    let mut hostile_wire = exact_wire;
+    hostile_wire[FRAME_HEADER_LEN + 16..FRAME_HEADER_LEN + 24]
+        .copy_from_slice(&(PATH_METRICS_MAX_RATE_VALID_FOR_US + 1).to_be_bytes());
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(hostile_wire), CodecLimits::default()),
+        Err(CodecError::InvalidPathMetrics)
+    );
+
+    let local_noncanonical = PathMetrics {
+        rate_valid_for_us: u64::MAX,
+        ..metrics
+    };
+    let capped_wire = encode_frame(
+        &Frame::PathMetrics {
+            metrics: local_noncanonical,
+        },
+        CodecLimits::default(),
+    )
+    .expect("local encoder caps a noncanonical authority budget");
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(capped_wire), CodecLimits::default())
+            .expect("decode capped local rate authority"),
+        Frame::PathMetrics { metrics }
+    );
+
+    for malformed in [
+        PathMetrics {
+            rate_valid_for_us: 1,
+            rate_observed: false,
+            pacing_rate_observed: false,
+            ..metrics
+        },
+        PathMetrics {
+            rate_valid_for_us: 0,
+            rate_observed: false,
+            pacing_rate_observed: true,
+            ..metrics
+        },
+    ] {
+        let invalid_wire = encode_frame(
+            &Frame::PathMetrics { metrics: malformed },
+            CodecLimits::default(),
+        )
+        .expect("encode malformed provenance for decoder validation");
+        assert_eq!(
+            decode_frame_bytes(Bytes::from(invalid_wire), CodecLimits::default()),
+            Err(CodecError::InvalidPathMetrics)
+        );
+    }
 }
 
 #[test]
@@ -391,15 +527,20 @@ fn control_frames_round_trip_auth_and_path_metrics() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: 1_735_689_600,
             metric_age_us: 5_000,
+            rate_valid_for_us: 100_000,
+            rate_observed: true,
             srtt_us: 25_000,
             rttvar_us: 3_000,
             jitter_us: 1_200,
             delivery_rate_bps: 125_000_000,
             pacing_rate_bps: 150_000_000,
+            pacing_rate_observed: true,
             loss_ppm: 1_500,
             ecn_ppm: 25,
             loss_observed: true,
             ecn_observed: true,
+            bytes_in_flight_observed: true,
+            queue_observed: true,
             bytes_in_flight: 64 * 1024,
             queue_bytes: 16 * 1024,
             inflight_limit_bytes: 512 * 1024,
@@ -513,7 +654,7 @@ fn peer_status_frames_round_trip_with_bounded_fixed_entries() {
     };
     let encoded = encode_frame(&response, CodecLimits::default()).expect("encode");
     assert_eq!(encoded[5], 37);
-    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11 + 4 * 106);
+    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11 + 4 * 118);
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
         response
@@ -642,7 +783,7 @@ fn peer_status_response_limit_follows_the_configured_frame_size() {
     );
     assert_eq!(
         peer_status_response_path_limit(CodecLimits {
-            max_frame_bytes: fixed_bytes + 106,
+            max_frame_bytes: fixed_bytes + 118,
             ..CodecLimits::default()
         }),
         1

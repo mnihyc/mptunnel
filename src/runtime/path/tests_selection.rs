@@ -61,7 +61,9 @@ fn seed_native_packet_evidence(
     record.carrier_delivery_samples = 10;
     record.carrier_delivery_sample_bytes = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
     record.carrier_delivery_window_covered = true;
-    record.carrier_bulk_proof_expires_at = Some(Instant::now() + Duration::from_secs(60));
+    let now = Instant::now();
+    record.carrier_last_delivery_at = Some(now);
+    record.carrier_bulk_proof_expires_at = Some(now + Duration::from_secs(60));
     record.carrier_app_limited = false;
     record.carrier_ack_derived_data_seen = true;
 }
@@ -180,13 +182,17 @@ fn packet_candidates_require_the_current_instance_and_do_not_consume_product_sta
         record.product_delivery_rate_bps = Some(9_000_000_000.0);
         record.product_delivery_sample_bytes =
             (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).saturating_mul(2);
-        record.last_delivery_at = Some(Instant::now());
+        let sample_at = Instant::now();
+        record.last_delivery_at = Some(sample_at);
+        record.delivery_rate_expires_at = Some(sample_at + Duration::from_secs(1));
         record.active_flows = 7;
         record.active_latency_sensitive_flows = 3;
         record.relay_queue_bytes = 64 * 1024;
         record.relay_bytes_in_flight = 128 * 1024;
         record.carrier_queue_bytes = 1_200;
+        record.carrier_queue_bytes_observed = true;
         record.carrier_bytes_in_flight = 2_400;
+        record.carrier_bytes_in_flight_observed = true;
         record.measured_loss_rate = Some(0.02);
     }
 

@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 RESULT_SCHEMA_VERSION = 2
 RUN_MANIFEST_SCHEMA_VERSION = 3
-MPTUNNEL_PROTOCOL_VERSION = 7
+MPTUNNEL_PROTOCOL_VERSION = 8
 MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE = {
     "standard": "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297",
     "shared-secret": (

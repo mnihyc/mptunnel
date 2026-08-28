@@ -144,6 +144,7 @@
     lastReceivedAt: 0,
     lastError: null,
     peerResult: null,
+    peerResultReceivedAt: 0,
     selectedPeerSessionKey: "",
     selectedTab: "overview"
   };
@@ -464,6 +465,15 @@
     return Math.floor(elapsed / 86400000) + "d ago";
   }
 
+  function formatResidenceRelative(milliseconds) {
+    const elapsed = Math.max(0, finiteNumber(milliseconds));
+    if (elapsed < 1500) return "just now";
+    if (elapsed < 60000) return Math.floor(elapsed / 1000) + "s ago";
+    if (elapsed < 3600000) return Math.floor(elapsed / 60000) + "m ago";
+    if (elapsed < 86400000) return Math.floor(elapsed / 3600000) + "h ago";
+    return Math.floor(elapsed / 86400000) + "d ago";
+  }
+
   function formatWallTime(timestamp) {
     const date = new Date(finiteNumber(timestamp));
     if (Number.isNaN(date.getTime())) return "--";
@@ -495,9 +505,18 @@
     return (value < 10 ? value.toFixed(2) : value < 100 ? value.toFixed(1) : Math.round(value).toString()) + " ms";
   }
 
+  function formatObservedLatency(milliseconds) {
+    const value = Math.max(0, finiteNumber(milliseconds));
+    return (value < 10 ? value.toFixed(2) : value < 100 ? value.toFixed(1) : Math.round(value).toString()) + " ms";
+  }
+
   function formatRttMicros(microseconds) {
     const value = finiteNumber(microseconds);
     return value > 0 ? formatRtt(value / 1000) : "--";
+  }
+
+  function formatObservedLatencyMicros(microseconds) {
+    return formatObservedLatency(Math.max(0, finiteNumber(microseconds)) / 1000);
   }
 
   function formatPpm(value) {
@@ -506,6 +525,63 @@
     const percent = ppm / 10000;
     if (percent < 0.001) return "<0.001%";
     return (percent < 0.1 ? percent.toFixed(3) : percent < 10 ? percent.toFixed(2) : percent.toFixed(1)) + "%";
+  }
+
+  function metricAvailable(value) {
+    return value !== undefined && value !== null;
+  }
+
+  function formatOptionalMetric(value, formatter, stale) {
+    if (!metricAvailable(value)) return "-";
+    const formatted = formatter(value);
+    return stale ? "~" + formatted : formatted;
+  }
+
+  function formatOptionalFlag(value) {
+    if (!metricAvailable(value)) return "-";
+    return value ? "yes" : "no";
+  }
+
+  function formatOptionalBit(value) {
+    if (!metricAvailable(value)) return "-";
+    return value ? "1" : "0";
+  }
+
+  function statusResidenceMs() {
+    return state.lastReceivedAt > 0 ? Math.max(0, Date.now() - state.lastReceivedAt) : 0;
+  }
+
+  function effectivePathMetricAgeMs(path) {
+    if (!metricAvailable(path.last_delivery_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.last_delivery_age_ms)) + statusResidenceMs();
+  }
+
+  function effectivePathPacingAgeMs(path) {
+    if (!metricAvailable(path.pacing_age_ms)) return null;
+    return Math.max(0, finiteNumber(path.pacing_age_ms)) + statusResidenceMs();
+  }
+
+  function peerResultResidenceMs(result) {
+    if (result && result === state.peerResult && state.peerResultReceivedAt > 0) {
+      return Math.max(0, Date.now() - state.peerResultReceivedAt);
+    }
+    const generatedAt = finiteNumber(asObject(state.status).generated_unix_ms);
+    const receivedAt = finiteNumber(asObject(result).received_unix_ms);
+    const residenceAtSnapshot = generatedAt > 0 && receivedAt > 0
+      ? Math.max(0, generatedAt - receivedAt)
+      : 0;
+    return residenceAtSnapshot + statusResidenceMs();
+  }
+
+  function effectivePeerMetricAgeMs(path, result) {
+    if (!metricAvailable(path.metric_age_us)) return null;
+    return Math.max(0, finiteNumber(path.metric_age_us) / 1000) +
+      peerResultResidenceMs(result);
+  }
+
+  function metricIsStale(ageMs, horizonMs) {
+    return metricAvailable(ageMs) && metricAvailable(horizonMs) &&
+      finiteNumber(ageMs) >= finiteNumber(horizonMs);
   }
 
   function formatIdentifier(value) {
@@ -824,8 +900,10 @@
     }
 
     const generatedAt = finiteNumber(status.generated_unix_ms);
-    const sampleAge = generatedAt > 0 ? Math.max(0, Date.now() - generatedAt) : Infinity;
-    const freshness = generatedAt > 0 ? "Updated " + formatRelative(generatedAt) : "Update time unavailable";
+    const sampleAge = state.lastReceivedAt > 0 ? statusResidenceMs() : Infinity;
+    const freshness = generatedAt > 0
+      ? "Updated " + formatResidenceRelative(sampleAge)
+      : "Update time unavailable";
     if (state.lastError) {
       setConnection("offline", "Refresh failed", freshness);
       setNotice("offline", "Live refresh failed. Showing the last received runtime sample.", true);
@@ -877,7 +955,7 @@
   function renderHeader() {
     const status = state.status;
     replaceText(elements.roleLabel, titleCase(status.role));
-    elements.overviewTimestamp.textContent = "Sample " + formatWallTime(status.generated_unix_ms) + " / " + formatRelative(status.generated_unix_ms);
+    elements.overviewTimestamp.textContent = "Sample " + formatWallTime(status.generated_unix_ms) + " / " + formatResidenceRelative(statusResidenceMs());
     elements.balancersTabCount.textContent = String(asArray(status.balancers).length);
     elements.pathsTabCount.textContent = String(asArray(status.paths).length);
     elements.sessionsTabCount.textContent = String(asArray(status.sessions).length);
@@ -916,7 +994,8 @@
         formatBytes(summary.data_level_bytes_in_flight) + " data in flight"
     );
     replaceText(elements.kpiPathRate, formatBitRate(summary.path_delivery_rate_bps));
-    replaceText(elements.kpiPathPacing, formatBitRate(summary.path_pacing_rate_bps) + " pacing");
+    const pathPacing = formatOptionalMetric(summary.path_pacing_rate_bps, formatBitRate, false);
+    replaceText(elements.kpiPathPacing, pathPacing === "-" ? "-" : pathPacing + " pacing");
   }
 
   function renderTrafficBreakdown() {
@@ -1463,17 +1542,47 @@
 
   function createPathRow(pathValue) {
     const path = asObject(pathValue);
+    const effectiveAgeMs = effectivePathMetricAgeMs(path);
+    const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
+    const pacingStale = metricIsStale(
+      effectivePathPacingAgeMs(path),
+      path.freshness_horizon_ms
+    );
+    const snapshotStale = statusResidenceMs() >= staleAfterMs();
     const row = createElement("tr");
     appendCell(row, "State", stateIndicator(pathEffectiveState(path)));
 
     const identity = createElement("div");
     identity.append(createElement("span", "cell-primary", formatIdentifier(path.path)));
-    identity.append(createElement("span", "cell-secondary", path.endpoint || "--"));
+    identity.append(createElement("span", "cell-secondary", path.endpoint || "-"));
+    const identityDetail = [
+      formatIdentifier(path.path_id) + " / " + formatIdentifier(path.path_instance_id)
+    ];
+    if (path.port_hopping) {
+      const activePort = formatOptionalMetric(
+        path.active_port,
+        function (port) { return String(port); },
+        statusResidenceMs() >= staleAfterMs()
+      );
+      identityDetail.push(activePort === "-" ? "-" : ":" + activePort);
+    }
     identity.append(createElement(
       "span",
       "cell-secondary cell-mono",
-      formatIdentifier(path.path_id) + " / " + formatIdentifier(path.path_instance_id)
+      identityDetail.join(" · ")
     ));
+    identity.title = [
+      "Configured endpoint: " + (path.endpoint || "-"),
+      path.port_hopping
+        ? "Active observed port: " + formatOptionalMetric(
+          path.active_port,
+          function (port) { return String(port); },
+          statusResidenceMs() >= staleAfterMs()
+        )
+        : "",
+      "Path ID: " + formatIdentifier(path.path_id),
+      "Carrier instance: " + formatIdentifier(path.path_instance_id)
+    ].filter(Boolean).join("\n");
     appendCell(row, "Path", identity);
 
     const service = createElement("div");
@@ -1498,56 +1607,91 @@
 
     const usage = createElement("div");
     if (path.usage) usage.append(stateIndicator(path.usage));
-    else usage.append(createElement("span", "cell-primary", "--"));
+    else usage.append(createElement("span", "cell-primary", "-"));
     usage.append(createElement(
       "span",
       "cell-secondary",
       [
-        path.direction ? directionLabel(path.direction) : "",
-        path.source ? titleCase(path.source) : "",
+        path.usage_direction ? directionLabel(path.usage_direction) : "",
         pathPolicyLabel(path.policy)
       ].filter(Boolean).join(" / ")
     ));
+    usage.title = [
+      "Usage direction: " + directionLabel(path.usage_direction),
+      "Policy: " + pathPolicyLabel(path.policy)
+    ].join("\n");
     appendCell(row, "Use", usage);
 
     const rtt = createElement("div");
-    rtt.append(createElement("span", "cell-primary", formatRtt(path.srtt_ms)));
-    rtt.append(createElement("span", "cell-secondary", formatRtt(path.jitter_ms)));
+    rtt.append(createElement("span", "cell-primary", formatOptionalMetric(path.srtt_ms, formatRtt, snapshotStale)));
+    rtt.append(createElement("span", "cell-secondary", formatOptionalMetric(path.jitter_ms, formatObservedLatency, snapshotStale)));
+    rtt.title = [
+      "RTT / jitter",
+      "Source: " + (path.latency_source ? titleCase(path.latency_source) : "-"),
+      "Evidence: " + (snapshotStale ? "stale" : "current")
+    ].join("\n");
     appendCell(row, "Latency", rtt);
 
     const delivery = createElement("div");
-    delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
-    delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
+    delivery.append(createElement("span", "cell-primary", formatOptionalMetric(path.delivery_rate_bps, formatBitRate, rateStale)));
+    delivery.append(createElement("span", "cell-secondary", formatOptionalMetric(path.pacing_rate_bps, formatBitRate, pacingStale)));
+    delivery.title = [
+      "Delivery rate / pacing rate",
+      "Metric direction: " + directionLabel(path.direction),
+      "Delivery source: " + (path.delivery_rate_source ? titleCase(path.delivery_rate_source) : "-"),
+      "Delivery scope: " + (path.delivery_rate_scope ? titleCase(path.delivery_rate_scope) : "-"),
+      "Pacing source: " + (path.pacing_rate_source ? titleCase(path.pacing_rate_source) : "-"),
+      "Delivery age: " + formatOptionalMetric(effectiveAgeMs, formatDuration, false),
+      "Pacing age: " + formatOptionalMetric(effectivePathPacingAgeMs(path), formatDuration, false),
+      "Freshness window: " + formatOptionalMetric(path.freshness_horizon_ms, formatDuration, false)
+    ].join("\n");
     appendCell(row, "Rate", delivery);
 
     const loss = createElement("div");
-    loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
-    loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
+    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, snapshotStale)));
+    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, snapshotStale)));
+    loss.title = [
+      "Loss / ECN",
+      "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
+      "Evidence: " + (snapshotStale ? "stale" : "current")
+    ].join("\n");
     appendCell(row, "Loss", loss);
 
     const flight = createElement("div");
-    flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes)));
+    flight.append(createElement("span", "cell-primary", formatOptionalMetric(path.queue_bytes, formatBytes, snapshotStale)));
     flight.append(createElement(
       "span",
       "cell-secondary",
-      formatBytes(path.bytes_in_flight) + " / " + formatBytes(path.data_level_bytes_in_flight)
+      formatOptionalMetric(path.bytes_in_flight, formatBytes, snapshotStale) +
+        " / " + formatOptionalMetric(path.data_level_bytes_in_flight, formatBytes, snapshotStale)
     ));
-    flight.append(createElement("span", "cell-secondary", formatBytes(path.inflight_limit_bytes)));
+    flight.append(createElement("span", "cell-secondary", formatOptionalMetric(path.inflight_limit_bytes, formatBytes, snapshotStale)));
+    flight.title = "Queue / native carrier flight / MPP data flight / native limit";
     appendCell(row, "Flight", flight);
 
     const evidence = createElement("div");
-    evidence.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm)));
+    evidence.append(createElement("span", "cell-primary", formatOptionalMetric(path.confidence_ppm, formatPpm, rateStale)));
     evidence.append(createElement(
       "span",
       "cell-secondary",
-      formatCount(path.delivery_samples) + " / " + formatBytes(path.data_sample_bytes)
+      formatOptionalMetric(path.delivery_samples, formatCount, rateStale) +
+        " / " + formatOptionalMetric(path.data_sample_bytes, formatBytes, rateStale)
     ));
     evidence.append(createElement(
       "span",
       "cell-secondary",
-      (path.last_delivery_age_ms === undefined ? "--" : formatDuration(path.last_delivery_age_ms)) +
-        " / " + (path.app_limited ? "1" : "0")
+      formatOptionalMetric(effectiveAgeMs, formatDuration, false) +
+        " / " + formatOptionalBit(path.app_limited)
     ));
+    evidence.title = [
+      "Confidence / delivery samples and bytes / effective age and app-limited",
+      "Freshness window: " + formatOptionalMetric(path.freshness_horizon_ms, formatDuration, false),
+      "Metric age scope: " + (path.metric_age_scope ? titleCase(path.metric_age_scope) : "-"),
+      "Native delivery observed: " + formatOptionalFlag(path.native_delivery_observed),
+      "Product delivery observed: " + formatOptionalFlag(path.product_delivery_observed),
+      "ACK-derived data observed: " + formatOptionalFlag(path.ack_derived_data_observed),
+      "App-limited: " + formatOptionalFlag(path.app_limited)
+    ].join("\n");
     appendCell(row, "Evidence", evidence);
 
     const flows = createElement("div");
@@ -1744,63 +1888,131 @@
     renderOverviewPeerResult(result, selectedSession);
   }
 
-  function appendPeerPathRow(body, pathValue) {
+  function appendPeerPathRow(body, pathValue, result) {
     const path = asObject(pathValue);
+    const effectiveAgeMs = effectivePeerMetricAgeMs(path, result);
+    const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
+    const snapshotStale = peerResultResidenceMs(result) >= staleAfterMs();
+    const portStale = path.active_port_retired || snapshotStale;
     const row = createElement("tr");
     appendCell(row, "State", stateIndicator(path.state));
 
     const identity = createElement("div");
     identity.append(createElement("span", "cell-primary", formatIdentifier(path.path)));
-    identity.append(createElement("span", "cell-secondary", path.endpoint || "Local mapping unavailable"));
+    identity.append(createElement("span", "cell-secondary", path.endpoint || "-"));
+    const identityDetail = [
+      formatIdentifier(path.path_id) + " / " + formatIdentifier(path.metric_epoch)
+    ];
+    if (path.port_hopping) {
+      const activePort = formatOptionalMetric(
+        path.active_port,
+        function (port) { return String(port); },
+        portStale
+      );
+      identityDetail.push(activePort === "-" ? "-" : ":" + activePort);
+    }
     identity.append(createElement(
       "span",
       "cell-secondary cell-mono",
-      formatIdentifier(path.path_id) + " / " + formatIdentifier(path.metric_epoch)
+      identityDetail.join(" · ")
     ));
+    identity.title = [
+      "Local path mapping: " + (path.path || "-"),
+      "Configured endpoint: " + (path.endpoint || "-"),
+      "Peer Path ID: " + formatIdentifier(path.path_id),
+      "Metric epoch: " + formatIdentifier(path.metric_epoch),
+      path.port_hopping
+        ? "Active observed port: " + formatOptionalMetric(
+          path.active_port,
+          function (port) { return String(port); },
+          portStale
+        )
+        : ""
+    ].filter(Boolean).join("\n");
     appendCell(row, "Path", identity);
     appendCell(row, "Carrier", carrierLabel(path.underlay));
 
     const useDirection = createElement("div");
     useDirection.append(stateIndicator(path.usage));
-    useDirection.append(createElement("span", "cell-secondary", directionLabel(path.direction)));
+    useDirection.append(createElement("span", "cell-secondary", directionLabel(path.usage_direction)));
+    useDirection.title = "Usage direction: " + directionLabel(path.usage_direction);
     appendCell(row, "Use", useDirection);
 
     const rtt = createElement("div");
-    rtt.append(createElement("span", "cell-primary", formatRttMicros(path.srtt_us)));
+    rtt.append(createElement("span", "cell-primary", formatOptionalMetric(path.srtt_us, formatRttMicros, snapshotStale)));
     rtt.append(createElement(
       "span",
       "cell-secondary",
-      formatRttMicros(path.rttvar_us) + " / " + formatRttMicros(path.jitter_us)
+      formatOptionalMetric(path.rttvar_us, formatObservedLatencyMicros, snapshotStale) +
+        " / " + formatOptionalMetric(path.jitter_us, formatObservedLatencyMicros, snapshotStale)
     ));
+    rtt.title = [
+      "RTT / RTT variation / jitter",
+      "Source: " + (path.latency_source ? titleCase(path.latency_source) : "-"),
+      "Evidence: " + (snapshotStale ? "stale" : "current")
+    ].join("\n");
     appendCell(row, "Latency", rtt);
 
     const delivery = createElement("div");
-    delivery.append(createElement("span", "cell-primary", formatBitRate(path.delivery_rate_bps)));
-    delivery.append(createElement("span", "cell-secondary", formatBitRate(path.pacing_rate_bps)));
+    delivery.append(createElement("span", "cell-primary", formatOptionalMetric(path.delivery_rate_bps, formatBitRate, rateStale)));
+    delivery.append(createElement("span", "cell-secondary", formatOptionalMetric(path.pacing_rate_bps, formatBitRate, rateStale)));
+    delivery.title = [
+      "Delivery rate / pacing rate",
+      "Metric direction: " + directionLabel(path.direction),
+      "Delivery source: " + (path.delivery_rate_source ? titleCase(path.delivery_rate_source) : "-"),
+      "Delivery scope: " + (path.delivery_rate_scope ? titleCase(path.delivery_rate_scope) : "-"),
+      "Pacing source: " + (path.pacing_rate_source ? titleCase(path.pacing_rate_source) : "-"),
+      "Effective age: " + formatOptionalMetric(effectiveAgeMs, formatDuration, false),
+      "Freshness window: " + formatOptionalMetric(path.freshness_horizon_ms, formatDuration, false)
+    ].join("\n");
     appendCell(row, "Rate", delivery);
 
     const loss = createElement("div");
-    loss.append(createElement("span", "cell-primary", formatPpm(path.loss_ppm)));
-    loss.append(createElement("span", "cell-secondary", formatPpm(path.ecn_ppm)));
+    loss.append(createElement("span", "cell-primary", formatOptionalMetric(path.loss_ppm, formatPpm, snapshotStale)));
+    loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, snapshotStale)));
+    loss.title = [
+      "Loss / ECN",
+      "Loss source: " + (path.loss_source ? titleCase(path.loss_source) : "-"),
+      "ECN source: " + (path.ecn_source ? titleCase(path.ecn_source) : "-"),
+      "Loss observed: " + formatOptionalFlag(path.loss_observed),
+      "ECN observed: " + formatOptionalFlag(path.ecn_observed)
+    ].join("\n");
     appendCell(row, "Loss", loss);
 
     const flight = createElement("div");
-    flight.append(createElement("span", "cell-primary", formatBytes(path.queue_bytes)));
+    flight.append(createElement("span", "cell-primary", formatOptionalMetric(path.queue_bytes, formatBytes, snapshotStale)));
     flight.append(createElement(
       "span",
       "cell-secondary",
-      formatBytes(path.bytes_in_flight) + " / " + formatBytes(path.inflight_limit_bytes)
+      formatOptionalMetric(path.bytes_in_flight, formatBytes, snapshotStale) +
+        " / " + formatOptionalMetric(path.inflight_limit_bytes, formatBytes, snapshotStale)
     ));
+    flight.title = "Queue / native carrier flight / native limit";
     appendCell(row, "Flight", flight);
 
     const samples = createElement("div");
-    samples.append(createElement("span", "cell-primary", formatPpm(path.confidence_ppm)));
+    samples.append(createElement("span", "cell-primary", formatOptionalMetric(path.confidence_ppm, formatPpm, rateStale)));
     samples.append(createElement(
       "span",
       "cell-secondary",
-      formatCount(path.data_sample_count) + " / " + formatBytes(path.data_sample_bytes) + " / " +
-        formatDuration(finiteNumber(path.metric_age_us) / 1000) + " / " + (path.app_limited ? "1" : "0")
+      formatOptionalMetric(path.data_sample_count, formatCount, rateStale) +
+        " / " + formatOptionalMetric(path.data_sample_bytes, formatBytes, rateStale)
     ));
+    samples.append(createElement(
+      "span",
+      "cell-secondary",
+      formatOptionalMetric(effectiveAgeMs, formatDuration, false) +
+        " / " + formatOptionalBit(path.app_limited)
+    ));
+    samples.title = [
+      "Confidence / samples and bytes / effective age and app-limited",
+      "Freshness window: " + formatOptionalMetric(path.freshness_horizon_ms, formatDuration, false),
+      "Metric age scope: " + (path.metric_age_scope ? titleCase(path.metric_age_scope) : "-"),
+      "ACK-derived data observed: " + formatOptionalFlag(path.ack_derived_data_observed),
+      "Loss observed: " + formatOptionalFlag(path.loss_observed),
+      "ECN observed: " + formatOptionalFlag(path.ecn_observed),
+      "App-limited: " + formatOptionalFlag(path.app_limited)
+    ].join("\n");
     appendCell(row, "Evidence", samples);
     body.append(row);
   }
@@ -1809,7 +2021,7 @@
     const paths = result ? asArray(result.paths) : [];
     body.replaceChildren();
     empty.hidden = paths.length !== 0;
-    paths.forEach(function (path) { appendPeerPathRow(body, path); });
+    paths.forEach(function (path) { appendPeerPathRow(body, path, result); });
   }
 
   function renderOverviewPeerResult(result, selectedSession) {
@@ -1827,7 +2039,7 @@
     elements.overviewPeerState.textContent = titleCase(result.code);
     elements.overviewPeerContext.textContent =
       serviceLabel(result) + " / " + formatSessionId(result.session_id) + " / " +
-      formatRelative(result.received_unix_ms);
+      formatResidenceRelative(peerResultResidenceMs(result));
     renderPeerPaths(elements.overviewPeerPathsBody, elements.overviewPeerPathsEmpty, result);
   }
 
@@ -1844,7 +2056,11 @@
     appendMetric(elements.peerResultSummary, "Service", serviceLabel(result));
     appendMetric(elements.peerResultSummary, "Session", formatSessionId(result.session_id));
     appendMetric(elements.peerResultSummary, "Request", formatIdentifier(result.request_id));
-    appendMetric(elements.peerResultSummary, "Received", formatRelative(result.received_unix_ms));
+    appendMetric(
+      elements.peerResultSummary,
+      "Received",
+      formatResidenceRelative(peerResultResidenceMs(result))
+    );
 
     renderPeerPaths(elements.peerPathsBody, elements.peerPathsEmpty, result);
   }
@@ -1872,8 +2088,10 @@
         body: JSON.stringify(payload)
       });
       state.peerResult = result;
+      state.peerResultReceivedAt = Date.now();
       elements.peerRequestState.className = "inline-status";
-      elements.peerRequestState.textContent = "Peer response received " + formatRelative(result.received_unix_ms);
+      elements.peerRequestState.textContent = "Peer response received " +
+        formatResidenceRelative(peerResultResidenceMs(result));
       renderSelectedPeerResult();
       if (source === "manual") announce("Peer path status received");
     } catch (error) {
@@ -2559,7 +2777,9 @@
       if (!document.hidden) {
         updateConnectionState();
         if (state.status) {
-          elements.overviewTimestamp.textContent = "Sample " + formatWallTime(state.status.generated_unix_ms) + " / " + formatRelative(state.status.generated_unix_ms);
+          elements.overviewTimestamp.textContent = "Sample " + formatWallTime(state.status.generated_unix_ms) + " / " + formatResidenceRelative(statusResidenceMs());
+          if (state.selectedTab === "overview") renderOverviewPaths();
+          if (state.selectedTab === "paths") renderPaths();
         }
         if (state.status && !elements.peerResult.hidden) {
           renderSelectedPeerResult();

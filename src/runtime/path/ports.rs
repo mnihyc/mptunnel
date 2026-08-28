@@ -31,9 +31,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct CarrierDeliveryRateSample {
     pub(in crate::runtime) delivery_rate_bps: u64,
+    /// Native pacing sampled in the same ACK epoch, when exposed by the host.
+    pub(in crate::runtime) pacing_rate_bps: Option<u64>,
     pub(in crate::runtime) sample_count: u32,
     pub(in crate::runtime) sample_bytes: u64,
     pub(in crate::runtime) delivery_window_covered: bool,
+    /// Exact local epoch of the newest qualified native ACK in this sample.
+    /// Registry refreshes must preserve this provenance unchanged.
+    pub(in crate::runtime) observed_at: std::time::Instant,
+    /// Three-PTO expiry frozen from the transport timing observed in the same
+    /// ACK epoch. Later app-limited RTT polls cannot rewrite this lifetime.
+    pub(in crate::runtime) expires_at: std::time::Instant,
 }
 
 /// Stable notification that the complete authenticated MPP session became
@@ -443,6 +451,7 @@ pub(in crate::runtime) struct ServerCarrierPathStatusSnapshot {
     pub(in crate::runtime) state: PeerPathState,
     pub(in crate::runtime) usage: Option<PathUsage>,
     pub(in crate::runtime) metrics: Option<PathMetrics>,
+    pub(in crate::runtime) carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     pub(in crate::runtime) source: Option<&'static str>,
 }
 

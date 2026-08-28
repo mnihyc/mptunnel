@@ -1378,6 +1378,7 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
         UnderlayProtocol::Tcp,
         path_id,
         runtime.path_index,
+        Some(carrier.remote_port),
     );
     Ok(ClientTcpPathConnection::new(
         path_instance_id,

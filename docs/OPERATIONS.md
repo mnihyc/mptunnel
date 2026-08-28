@@ -628,6 +628,14 @@ peer-supplied `path_id` is opaque runtime identity and never indexes local
 configuration. Client and server path lists therefore do not need matching
 names or order.
 
+Peer diagnostics retain an authenticated endpoint-local PathId mapping after
+local carrier teardown until a complete successful peer snapshot proves that
+the peer no longer reports it. Each request then freezes the active and
+retained mappings at dispatch. Failure convergence therefore keeps its
+historical path name, while later PathId reuse cannot relabel an already
+requested response. A carrier authenticated after the request boundary is
+resolved by the next diagnostic request.
+
 During authenticated setup the peer advertises sequence-zero directional
 `PathUsage::{Available, Backup}`. This is separate from local path health.
 Ordinary scheduling considers available paths first and uses backup paths only
@@ -777,9 +785,27 @@ the local source; `from_peer` counts bytes or datagrams delivered to the local
 destination. They do not grow from
 carrier retransmission, MPP reinjection, multipath copies, DNS connector work,
 or path probes. Native and MPP boundaries never count one flow twice. Path
-delivery rate, queue, and flight remain separate current
-carrier evidence. Numeric identifiers and monotonic byte totals are decimal
-strings so browser clients do not lose 64-bit precision.
+delivery, pacing, queue, and flight remain separate from those forwarding
+counters. Their management fields are best-effort diagnostic observations:
+where the local runtime carries an availability signal, an unobserved value is
+JSON `null` and renders as `-`; peer wire fields without such a signal remain
+advisory observations and are not reclassified from numeric zero. Native carrier,
+Product goodput, MPP feedback, configured-prior, and scheduler-default values
+are labeled by source and rate scope. On client-local rows, a native pacing
+value is shown only when the carrier actually supplied one;
+scheduler-normalized delivery is not called native pacing. Measured delivery
+and pacing values remain visible after their shared three-PTO freshness window,
+prefixed with `~`; effective sample age includes time the management snapshot
+has resided in the browser. RTT, loss, queue, flight, and other instantaneous
+snapshot fields use API-result residence instead of the age of the most recent
+delivery sample. Path usage direction and metric direction are displayed
+independently. For a port-hopping client path, the dashboard shows only the
+remote port observed on the current live carrier and never substitutes a
+configured range endpoint. A peer diagnostic may retain the exact last port of
+a retired authenticated carrier for correlation, but marks that historical port
+with `~`. Numeric identifiers and
+monotonic byte totals are decimal strings so browser clients do not lose 64-bit
+precision.
 The dashboard renders Session IDs as lowercase, fixed-width 16-digit
 hexadecimal for compact visual correlation, while matching, control payloads,
 and the management API retain the original decimal strings.
@@ -804,11 +830,16 @@ authenticated session. The requester separately correlates each returned
 admitted that authenticated carrier. The management response and dashboard may
 therefore show the local path name and configured carrier endpoint, including a
 draining assignment captured while that carrier registration was live; those
-fields were not disclosed by the peer. Correlation is snapshotted with the
-completed result, so later authenticated reuse of the same numeric Path ID
-cannot relabel cached diagnostics. Carrier retirement removes only its exact
-live assignment and cannot erase a newer owner. An unavailable local
-correlation is shown as unknown and is never guessed from configuration order. One
+fields were not disclosed by the peer. Correlation is snapshotted when the
+request is dispatched, so later authenticated reuse of the same numeric Path ID
+cannot relabel the in-flight request or its cached diagnostics. Carrier
+retirement removes only its exact live assignment and cannot erase a newer
+owner. An unavailable local correlation is shown as unknown and is never
+guessed from configuration order.
+Peer metrics are labeled advisory, and their effective age adds residence in
+the requester's cached result to the wire-reported metric age; stale values
+remain visible with the same `~` convention. The peer's usage direction is
+presented separately from the direction of the reported sender metrics. One
 request per session may be in flight, requests time out, and responders admit
 at most one snapshot request per session per second. A rate-limited or
 codec-oversized complete snapshot returns `unavailable`; it is never truncated.

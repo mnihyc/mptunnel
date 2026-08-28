@@ -7,16 +7,22 @@
 use super::super::metrics::TcpMetricPublisher;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
+    reliable_capacity_measurement_session_limit_bytes,
+};
+use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::mux::MuxLimits;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
-use crate::protocol::{Frame, PathId, PathMetricDirection, PathMetrics};
+use crate::protocol::{
+    Frame, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame};
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{CarrierDeliveryRateSample, ServerCarrierPathRegistration};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(in crate::runtime::path::tcp) struct ServerTcpEvidenceState {
     tcp_metrics: Option<TcpMetricPublisher>,
@@ -132,11 +138,15 @@ impl ServerTcpEvidenceState {
             || observation
                 .queue_bytes()
                 .is_some_and(|queue_bytes| queue_bytes > 0);
-        self.observe_delivery_rate_sample(observation);
+        let observed_at = Instant::now();
+        self.observe_delivery_rate_sample_at(observation, observed_at);
         self.native_drain_observed = observation.has_native_drain_evidence();
-        let Some(metrics) = merge_local_tcp_metrics(self.local_metrics, observation) else {
+        let Some(mut metrics) = merge_local_tcp_metrics(self.local_metrics, observation) else {
             return;
         };
+        if let Some(sample) = self.delivery_rate_sample {
+            project_tcp_delivery_rate_sample(&mut metrics, sample, observed_at);
+        }
         self.local_metrics = Some(metrics);
         context
             .reliable_streams
@@ -148,9 +158,10 @@ impl ServerTcpEvidenceState {
             );
     }
 
-    fn observe_delivery_rate_sample(
+    fn observe_delivery_rate_sample_at(
         &mut self,
         observation: super::super::metrics::TcpNativeObservation,
+        observed_at: Instant,
     ) {
         if observation.app_limited() != Some(false) {
             return;
@@ -161,15 +172,36 @@ impl ServerTcpEvidenceState {
         let Some(delivery_rate_bps) = observation.delivery_rate_bps() else {
             return;
         };
-        let previous = self.delivery_rate_sample;
+        let srtt_us = observation
+            .srtt_us()
+            .or_else(|| self.local_metrics.map(|metrics| metrics.srtt_us))
+            .unwrap_or(1)
+            .max(1);
+        let rttvar_us = observation
+            .rttvar_us()
+            .or_else(|| self.local_metrics.map(|metrics| metrics.rttvar_us))
+            .unwrap_or(srtt_us / 8);
+        let freshness_horizon = transport_rate_sample_freshness_horizon(
+            Duration::from_micros(u64::from(srtt_us)),
+            Duration::from_micros(u64::from(rttvar_us)),
+        );
+        let previous = self
+            .delivery_rate_sample
+            .filter(|sample| observed_at < sample.expires_at);
+        let expires_at = observed_at
+            .checked_add(freshness_horizon)
+            .unwrap_or(observed_at);
         self.delivery_rate_sample = Some(CarrierDeliveryRateSample {
             delivery_rate_bps,
+            pacing_rate_bps: observation.pacing_rate_bps().filter(|rate| *rate > 0),
             sample_count: previous.map_or(1, |sample| sample.sample_count.saturating_add(1)),
             sample_bytes: previous.map_or(sample_bytes, |sample| {
                 sample.sample_bytes.saturating_add(sample_bytes)
             }),
             delivery_window_covered: observation.delivery_window_covered()
                 || previous.is_some_and(|sample| sample.delivery_window_covered),
+            observed_at,
+            expires_at,
         });
     }
 
@@ -254,6 +286,41 @@ impl ServerTcpEvidenceState {
     }
 }
 
+fn project_tcp_delivery_rate_sample(
+    metrics: &mut PathMetrics,
+    sample: CarrierDeliveryRateSample,
+    now: Instant,
+) {
+    let qualified_epoch =
+        sample.sample_count > 0 && sample.sample_bytes > 0 && sample.observed_at <= now;
+    metrics.delivery_rate_bps = sample.delivery_rate_bps.max(1);
+    metrics.pacing_rate_bps = sample
+        .pacing_rate_bps
+        .unwrap_or(sample.delivery_rate_bps)
+        .max(1);
+    metrics.pacing_rate_observed = qualified_epoch && sample.pacing_rate_bps.is_some();
+    metrics.metric_age_us = u32::try_from(
+        now.saturating_duration_since(sample.observed_at)
+            .as_micros(),
+    )
+    .unwrap_or(u32::MAX);
+    metrics.rate_valid_for_us = if qualified_epoch {
+        u64::try_from(sample.expires_at.saturating_duration_since(now).as_micros())
+            .unwrap_or(u64::MAX)
+            .min(PATH_METRICS_MAX_RATE_VALID_FOR_US)
+    } else {
+        0
+    };
+    metrics.rate_observed = qualified_epoch;
+    let byte_confidence =
+        (sample.sample_bytes as f64 / PATH_OPEN_SCORE_BYTES.max(1) as f64).clamp(0.0, 1.0);
+    let count_confidence = (f64::from(sample.sample_count)
+        / f64::from(RELIABLE_INITIAL_WINDOW_PACKETS as u32))
+    .clamp(0.0, 1.0);
+    metrics.confidence_ppm = (byte_confidence.min(count_confidence) * 1_000_000.0).round() as u32;
+    metrics.app_limited = false;
+}
+
 fn merge_local_tcp_metrics(
     current: Option<PathMetrics>,
     observation: super::super::metrics::TcpNativeObservation,
@@ -268,6 +335,13 @@ fn merge_local_tcp_metrics(
     observation.apply_transport_shape(&mut metrics);
     metrics.metric_epoch = metric_epoch_now();
     metrics.metric_age_us = 0;
+    // A partial shape observation is not a new rate epoch. The retained typed
+    // sample, when present, is projected immediately by the caller with its
+    // original deadline.
+    metrics.rate_valid_for_us = 0;
+    metrics.rate_observed = false;
+    metrics.pacing_rate_observed = false;
+    metrics.pacing_rate_bps = metrics.delivery_rate_bps;
     Some(metrics)
 }
 

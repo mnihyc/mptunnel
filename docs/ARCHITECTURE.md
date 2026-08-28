@@ -71,7 +71,7 @@ outbound. The authenticated principal selects a server-configured address
 allocation. Host routing, forwarding, DNS, firewall policy, and NAT are outside
 the packet-copy boundary.
 
-## MPP v7 model
+## MPP v8 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
 or attaching a stream does not assign a persistent primary, validation, or

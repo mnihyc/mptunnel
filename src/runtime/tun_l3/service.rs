@@ -11,7 +11,8 @@ use crate::protocol::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{
-    ServerCarrierPathRegistration, ServerRealtimeFlowLease, ServerStreamPort,
+    CarrierDeliveryRateSample, ServerCarrierPathRegistration, ServerRealtimeFlowLease,
+    ServerStreamPort,
 };
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -759,6 +760,22 @@ fn server_packet_snapshot(
     status: Option<&crate::runtime::path::ServerCarrierPathStatusSnapshot>,
     attachment: &ServerIpAttachment,
 ) -> crate::scheduler::PathSnapshot {
+    server_packet_snapshot_at(status, attachment, Instant::now())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerPacketRateAuthority {
+    delivery_rate_bps: f64,
+    pacing_rate_bps: f64,
+    confidence: f64,
+    app_limited: bool,
+}
+
+fn server_packet_snapshot_at(
+    status: Option<&crate::runtime::path::ServerCarrierPathStatusSnapshot>,
+    attachment: &ServerIpAttachment,
+    now: Instant,
+) -> crate::scheduler::PathSnapshot {
     // A peer hint describes the opposite direction. Packet dispatch consumes
     // only this endpoint's native sender state (or its configured startup
     // prior), keeping Product delivery evidence outside the packet plane.
@@ -768,7 +785,28 @@ fn server_packet_snapshot(
     let startup_metrics = attachment
         .startup_metrics
         .filter(|metrics| metrics.direction == PathMetricDirection::ServerToClient);
-    let rate = server_packet_delivery_rate(metrics, startup_metrics);
+    let measured_rate = server_packet_rate_authority_at(
+        attachment.key.underlay,
+        metrics,
+        status.and_then(|status| status.carrier_delivery_rate_sample),
+        now,
+    );
+    let startup_rate = startup_metrics.map(|metrics| ServerPacketRateAuthority {
+        delivery_rate_bps: metrics.delivery_rate_bps.max(1) as f64,
+        pacing_rate_bps: if metrics.pacing_rate_observed {
+            metrics.pacing_rate_bps
+        } else {
+            metrics.delivery_rate_bps
+        }
+        .max(1) as f64,
+        confidence: f64::from(metrics.confidence_ppm) / 1_000_000.0,
+        app_limited: metrics.app_limited,
+    });
+    let rate = measured_rate
+        .or(startup_rate)
+        .map_or_else(crate::runtime::path::model::default_path_rate_bps, |rate| {
+            rate.delivery_rate_bps
+        });
     let srtt_ms = metrics.or(startup_metrics).map_or_else(
         crate::runtime::path::model::default_path_srtt_ms,
         |metrics| f64::from(metrics.srtt_us) / 1_000.0,
@@ -800,28 +838,90 @@ fn server_packet_snapshot(
         } else {
             0.0
         };
-        snapshot.queue_bytes = metrics.queue_bytes;
-        snapshot.bytes_in_flight = metrics.bytes_in_flight;
-        // Pacing is sender intent, not delivered capacity. As on the client,
-        // packet completion ranking uses the ACK-derived rate or startup prior.
-        snapshot.pacing_rate_bps = rate;
+        snapshot.queue_bytes = if metrics.queue_observed {
+            metrics.queue_bytes
+        } else {
+            0
+        };
+        snapshot.bytes_in_flight = if metrics.bytes_in_flight_observed {
+            metrics.bytes_in_flight
+        } else {
+            0
+        };
+        // A nonzero native limit is independent congestion credit, not an
+        // assertion that an exact queue or flight observation is available.
         snapshot.carrier_inflight_limit_bytes = metrics.inflight_limit_bytes;
-        snapshot.confidence = f64::from(metrics.confidence_ppm) / 1_000_000.0;
-        snapshot.app_limited = metrics.app_limited;
-        snapshot.carrier_delivery_rate_bps = (metrics.has_ack_derived_data_sample
-            && metrics.delivery_rate_bps > 0)
-            .then_some(metrics.delivery_rate_bps as f64);
     }
+    if let Some(rate_authority) = measured_rate.or(startup_rate) {
+        snapshot.pacing_rate_bps = rate_authority.pacing_rate_bps;
+        snapshot.confidence = rate_authority.confidence;
+        snapshot.app_limited = rate_authority.app_limited;
+    }
+    snapshot.carrier_delivery_rate_bps = measured_rate.map(|rate| rate.delivery_rate_bps);
     snapshot
 }
 
+fn server_packet_rate_authority_at(
+    underlay: UnderlayProtocol,
+    metrics: Option<crate::protocol::PathMetrics>,
+    carrier_sample: Option<CarrierDeliveryRateSample>,
+    now: Instant,
+) -> Option<ServerPacketRateAuthority> {
+    if let Some(sample) = carrier_sample {
+        // Presence is authoritative: an expired sidecar cannot fall through
+        // to retained PathMetrics and silently regain scheduling authority.
+        if sample.delivery_rate_bps == 0 || sample.observed_at > now || now >= sample.expires_at {
+            return None;
+        }
+        let delivery_rate_bps = sample.delivery_rate_bps as f64;
+        return Some(ServerPacketRateAuthority {
+            delivery_rate_bps,
+            pacing_rate_bps: sample
+                .pacing_rate_bps
+                .filter(|rate| *rate > 0)
+                .map_or(delivery_rate_bps, |rate| rate as f64),
+            confidence: metrics.map_or(1.0, |metrics| {
+                f64::from(metrics.confidence_ppm) / 1_000_000.0
+            }),
+            // A CarrierDeliveryRateSample is, by contract, a qualified
+            // positive-ACK non-application-limited sample.
+            app_limited: false,
+        });
+    }
+
+    let metrics = metrics.filter(|metrics| {
+        underlay == UnderlayProtocol::Udp
+            && metrics.underlay == UnderlayProtocol::Udp
+            && metrics.has_ack_derived_data_sample
+            && metrics.rate_observed
+            && metrics.data_sample_count > 0
+            && metrics.data_sample_bytes > 0
+            && metrics.delivery_rate_bps > 0
+            && metrics.rate_valid_for_us > 0
+    })?;
+    Some(ServerPacketRateAuthority {
+        delivery_rate_bps: metrics.delivery_rate_bps as f64,
+        pacing_rate_bps: if metrics.pacing_rate_observed {
+            metrics.pacing_rate_bps
+        } else {
+            metrics.delivery_rate_bps
+        }
+        .max(1) as f64,
+        confidence: f64::from(metrics.confidence_ppm) / 1_000_000.0,
+        app_limited: metrics.app_limited,
+    })
+}
+
+#[cfg(test)]
 pub(super) fn server_packet_delivery_rate(
     metrics: Option<crate::protocol::PathMetrics>,
     startup_metrics: Option<crate::protocol::PathMetrics>,
 ) -> f64 {
-    metrics
-        .filter(|metrics| metrics.has_ack_derived_data_sample && metrics.delivery_rate_bps > 0)
-        .map(|metrics| metrics.delivery_rate_bps as f64)
+    let underlay = metrics
+        .or(startup_metrics)
+        .map_or(UnderlayProtocol::Udp, |metrics| metrics.underlay);
+    server_packet_rate_authority_at(underlay, metrics, None, Instant::now())
+        .map(|authority| authority.delivery_rate_bps)
         .or_else(|| startup_metrics.map(|metrics| metrics.delivery_rate_bps.max(1) as f64))
         .unwrap_or_else(crate::runtime::path::model::default_path_rate_bps)
 }
@@ -849,5 +949,250 @@ fn close_attachments(
 ) {
     for attachment in attachments.into_values() {
         attachment.carrier.close(tunnel_id, reason);
+    }
+}
+
+#[cfg(test)]
+mod packet_metric_authority_tests {
+    use super::*;
+    use crate::model::path::PathPolicy;
+    use crate::protocol::PathMetrics;
+    use crate::runtime::path::ServerCarrierPathStatusSnapshot;
+
+    #[derive(Debug)]
+    struct UnusedCarrier;
+
+    impl ServerIpTunnelCarrier for UnusedCarrier {
+        fn try_send_packet(
+            &self,
+            _tunnel_id: IpTunnelId,
+            _packet_id: IpPacketId,
+            _payload: Bytes,
+            _budget: &IpPacketQueueBudget,
+        ) -> Result<IpTunnelPacketSendOutcome, RuntimeError> {
+            panic!("packet carrier is not used by snapshot tests")
+        }
+
+        fn close(&self, _tunnel_id: IpTunnelId, _reason: CloseReason) {}
+    }
+
+    fn packet_metrics(underlay: UnderlayProtocol) -> (PathMetrics, PathMetrics) {
+        let startup = PathMetrics {
+            path_id: PathId(7),
+            underlay,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: 1,
+            metric_age_us: 0,
+            rate_valid_for_us: 0,
+            rate_observed: false,
+            srtt_us: 20_000,
+            rttvar_us: 2_000,
+            jitter_us: 2_000,
+            delivery_rate_bps: 5_000_000,
+            pacing_rate_bps: 6_000_000,
+            pacing_rate_observed: false,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight_observed: false,
+            queue_observed: false,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 0,
+            inflight_hi_bytes: 0,
+            confidence_ppm: 100_000,
+            app_limited: true,
+            has_ack_derived_data_sample: false,
+            data_sample_count: 0,
+            data_sample_bytes: 0,
+        };
+        let live = PathMetrics {
+            rate_valid_for_us: 1_000_000,
+            rate_observed: true,
+            delivery_rate_bps: 80_000_000,
+            pacing_rate_bps: 90_000_000,
+            pacing_rate_observed: true,
+            confidence_ppm: 700_000,
+            app_limited: false,
+            has_ack_derived_data_sample: true,
+            data_sample_count: 8,
+            data_sample_bytes: 128 * 1024,
+            ..startup
+        };
+        (startup, live)
+    }
+
+    fn attachment(
+        underlay: UnderlayProtocol,
+        startup_metrics: PathMetrics,
+    ) -> (ServerIpAttachment, Arc<()>) {
+        let lifetime = Arc::new(());
+        (
+            ServerIpAttachment {
+                key: ServerIpCarrierKey {
+                    session_id: SessionId(11),
+                    underlay,
+                    path_id: PathId(7),
+                    path_instance_id: CarrierPathInstanceId::from_raw(19),
+                },
+                config_ordinal: 0,
+                backup: false,
+                startup_metrics: Some(startup_metrics),
+                attachment_generation: 1,
+                lifetime: Arc::downgrade(&lifetime),
+                carrier: Arc::new(UnusedCarrier),
+            },
+            lifetime,
+        )
+    }
+
+    fn status(
+        underlay: UnderlayProtocol,
+        metrics: PathMetrics,
+        carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    ) -> ServerCarrierPathStatusSnapshot {
+        ServerCarrierPathStatusSnapshot {
+            session_id: SessionId(11),
+            underlay,
+            path_id: PathId(7),
+            path_instance_id: CarrierPathInstanceId::from_raw(19),
+            configured_index: 0,
+            policy: PathPolicy::default(),
+            state: PeerPathState::Active,
+            usage: Some(crate::protocol::PathUsage::Available),
+            metrics: Some(metrics),
+            carrier_delivery_rate_sample,
+            source: Some("local_sender"),
+        }
+    }
+
+    fn assert_startup_rate_bundle(snapshot: crate::scheduler::PathSnapshot) {
+        assert_eq!(snapshot.delivery_rate_bps, 5_000_000.0);
+        assert_eq!(snapshot.pacing_rate_bps, 5_000_000.0);
+        assert_eq!(snapshot.confidence, 0.1);
+        assert!(snapshot.app_limited);
+        assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+    }
+
+    #[test]
+    fn packet_snapshot_presence_flags_gate_retained_values_but_not_native_limit() {
+        let (startup, mut live) = packet_metrics(UnderlayProtocol::Udp);
+        live.queue_observed = false;
+        live.queue_bytes = 41_000;
+        live.bytes_in_flight_observed = false;
+        live.bytes_in_flight = 73_000;
+        live.inflight_limit_bytes = 256_000;
+        let retained_status = status(UnderlayProtocol::Udp, live, None);
+        let (attachment, _lifetime) = attachment(UnderlayProtocol::Udp, startup);
+
+        let snapshot =
+            server_packet_snapshot_at(Some(&retained_status), &attachment, Instant::now());
+        assert_eq!(snapshot.queue_bytes, 0);
+        assert_eq!(snapshot.bytes_in_flight, 0);
+        assert_eq!(snapshot.carrier_inflight_limit_bytes, 256_000);
+
+        let observed = status(
+            UnderlayProtocol::Udp,
+            PathMetrics {
+                queue_observed: true,
+                bytes_in_flight_observed: true,
+                ..live
+            },
+            None,
+        );
+        let snapshot = server_packet_snapshot_at(Some(&observed), &attachment, Instant::now());
+        assert_eq!(snapshot.queue_bytes, 41_000);
+        assert_eq!(snapshot.bytes_in_flight, 73_000);
+        assert_eq!(snapshot.carrier_inflight_limit_bytes, 256_000);
+    }
+
+    #[test]
+    fn packet_snapshot_sidecar_deadline_is_authoritative_for_tcp_and_quic() {
+        let now = Instant::now();
+        let expires_at = now + Duration::from_millis(10);
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let (startup, live) = packet_metrics(underlay);
+            let sample = CarrierDeliveryRateSample {
+                delivery_rate_bps: 120_000_000,
+                pacing_rate_bps: Some(140_000_000),
+                sample_count: 3,
+                sample_bytes: 192 * 1024,
+                delivery_window_covered: true,
+                observed_at: now,
+                expires_at,
+            };
+            let status = status(underlay, live, Some(sample));
+            let (attachment, _lifetime) = attachment(underlay, startup);
+
+            let fresh = server_packet_snapshot_at(
+                Some(&status),
+                &attachment,
+                expires_at - Duration::from_nanos(1),
+            );
+            assert_eq!(fresh.delivery_rate_bps, 120_000_000.0);
+            assert_eq!(fresh.pacing_rate_bps, 140_000_000.0);
+            assert_eq!(fresh.confidence, 0.7);
+            assert!(!fresh.app_limited);
+            assert_eq!(fresh.carrier_delivery_rate_bps, Some(120_000_000.0));
+
+            // Retained live PathMetrics are deliberately still qualified. At
+            // the exact deadline, an expired sidecar must not fall through.
+            let expired = server_packet_snapshot_at(Some(&status), &attachment, expires_at);
+            assert_startup_rate_bundle(expired);
+        }
+    }
+
+    #[test]
+    fn packet_snapshot_quic_remaining_budget_boundary_reverts_whole_rate_bundle() {
+        let (startup, mut live) = packet_metrics(UnderlayProtocol::Udp);
+        let (attachment, _lifetime) = attachment(UnderlayProtocol::Udp, startup);
+
+        live.metric_age_us = u32::MAX;
+        live.rate_valid_for_us = 1;
+        let fresh_status = status(UnderlayProtocol::Udp, live, None);
+        let fresh = server_packet_snapshot_at(Some(&fresh_status), &attachment, Instant::now());
+        assert_eq!(fresh.delivery_rate_bps, 80_000_000.0);
+        assert_eq!(fresh.pacing_rate_bps, 90_000_000.0);
+        assert_eq!(fresh.confidence, 0.7);
+        assert!(!fresh.app_limited);
+        assert_eq!(fresh.carrier_delivery_rate_bps, Some(80_000_000.0));
+
+        live.metric_age_us = 0;
+        live.rate_valid_for_us = 0;
+        let stale_status = status(UnderlayProtocol::Udp, live, None);
+        let stale = server_packet_snapshot_at(Some(&stale_status), &attachment, Instant::now());
+        assert_startup_rate_bundle(stale);
+    }
+
+    #[test]
+    fn packet_snapshot_tcp_path_metrics_never_replace_missing_sidecar() {
+        let (startup, live) = packet_metrics(UnderlayProtocol::Tcp);
+        let status = status(UnderlayProtocol::Tcp, live, None);
+        let (attachment, _lifetime) = attachment(UnderlayProtocol::Tcp, startup);
+
+        assert_startup_rate_bundle(server_packet_snapshot_at(
+            Some(&status),
+            &attachment,
+            Instant::now(),
+        ));
+    }
+
+    #[test]
+    fn packet_snapshot_ack_reachability_without_sample_volume_is_not_capacity() {
+        let (startup, mut live) = packet_metrics(UnderlayProtocol::Udp);
+        live.has_ack_derived_data_sample = true;
+        live.data_sample_count = 0;
+        live.data_sample_bytes = 0;
+        live.delivery_rate_bps = 800_000_000;
+        live.pacing_rate_bps = 900_000_000;
+        let status = status(UnderlayProtocol::Udp, live, None);
+        let (attachment, _lifetime) = attachment(UnderlayProtocol::Udp, startup);
+
+        assert_startup_rate_bundle(server_packet_snapshot_at(
+            Some(&status),
+            &attachment,
+            Instant::now(),
+        ));
     }
 }

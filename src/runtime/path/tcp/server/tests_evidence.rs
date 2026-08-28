@@ -1,16 +1,19 @@
-use super::{ServerTcpEvidenceState, merge_local_tcp_metrics};
+use super::{ServerTcpEvidenceState, merge_local_tcp_metrics, project_tcp_delivery_rate_sample};
 use crate::config::{
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, ServerSecurityConfig,
     SharedSecret,
 };
+use crate::model::capacity::RELIABLE_INITIAL_WINDOW_PACKETS;
+use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::mux::MuxLimits;
 use crate::outbound::OutboundConfig;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
-use crate::runtime::path::ServerLocalPathProperties;
 use crate::runtime::path::proof::allocated_path_proof_data_frame;
 use crate::runtime::path::tcp::metrics::TcpSenderMetricTracker;
+use crate::runtime::path::{CarrierDeliveryRateSample, ServerLocalPathProperties};
 use crate::transport::tcp_telemetry::{TcpNativeFlight, TcpNativeRtt, TcpNativeSnapshot};
+use std::time::{Duration, Instant};
 
 fn baseline_metrics() -> PathMetrics {
     PathMetrics {
@@ -19,15 +22,20 @@ fn baseline_metrics() -> PathMetrics {
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: 1,
         metric_age_us: 9_000,
+        rate_valid_for_us: 0,
+        rate_observed: false,
         srtt_us: 180_000,
         rttvar_us: 90_000,
         jitter_us: 90_000,
         delivery_rate_bps: 25_000_000,
         pacing_rate_bps: 25_000_000,
+        pacing_rate_observed: false,
         loss_ppm: 0,
         ecn_ppm: 0,
         loss_observed: false,
         ecn_observed: false,
+        bytes_in_flight_observed: false,
+        queue_observed: false,
         bytes_in_flight: 0,
         queue_bytes: 0,
         inflight_limit_bytes: 0,
@@ -60,13 +68,21 @@ fn partial_native_shape_updates_credit_without_fabricating_delivery_evidence() {
         snapshot,
     );
 
-    let metrics = merge_local_tcp_metrics(Some(baseline_metrics()), observation)
+    let mut previous = baseline_metrics();
+    previous.loss_ppm = 12_345;
+    previous.loss_observed = true;
+    let metrics = merge_local_tcp_metrics(Some(previous), observation)
         .expect("partial native transport shape");
     assert_eq!(metrics.srtt_us, 25_000);
     assert_eq!(metrics.rttvar_us, 90_000, "unknown variance stays unknown");
     assert_eq!(metrics.bytes_in_flight, 64 * 1024);
     assert_eq!(metrics.inflight_limit_bytes, 512 * 1024);
     assert_eq!(metrics.delivery_rate_bps, 25_000_000);
+    assert_eq!(metrics.loss_ppm, 12_345, "raw prior stays diagnostic");
+    assert!(
+        !metrics.loss_observed,
+        "missing current loss loses authority"
+    );
     assert!(!metrics.has_ack_derived_data_sample);
     assert_eq!(metrics.data_sample_count, 0);
     assert_eq!(metrics.metric_age_us, 0);
@@ -120,13 +136,21 @@ fn server_retains_qualified_native_delivery_across_later_app_limited_polls() {
         },
     );
     let mut state = ServerTcpEvidenceState::new(None, None, MuxLimits::default());
-    state.observe_delivery_rate_sample(qualified);
+    let observed_at = Instant::now();
+    state.observe_delivery_rate_sample_at(qualified, observed_at);
     let retained = state
         .delivery_rate_sample
         .expect("qualified native delivery sample");
     assert_eq!(retained.delivery_rate_bps, 80_000_000);
+    assert_eq!(retained.pacing_rate_bps, Some(160_000_000));
     assert_eq!(retained.sample_bytes, 100_000);
     assert!(retained.delivery_window_covered);
+    let frozen_horizon = transport_rate_sample_freshness_horizon(
+        Duration::from_millis(20),
+        Duration::from_millis(2),
+    );
+    assert_eq!(retained.observed_at, observed_at);
+    assert_eq!(retained.expires_at, observed_at + frozen_horizon);
 
     let idle = tracker.observe(
         PathId(2),
@@ -138,9 +162,86 @@ fn server_retains_qualified_native_delivery_across_later_app_limited_polls() {
             ..baseline
         },
     );
-    state.observe_delivery_rate_sample(idle);
+    state.observe_delivery_rate_sample_at(idle, observed_at + Duration::from_millis(1));
 
     assert_eq!(state.delivery_rate_sample, Some(retained));
+
+    state.observe_delivery_rate_sample_at(qualified, retained.expires_at - Duration::from_nanos(1));
+    let accumulated = state.delivery_rate_sample.expect("in-horizon accumulation");
+    assert_eq!(accumulated.sample_count, 2);
+    assert_eq!(accumulated.sample_bytes, 200_000);
+
+    state.observe_delivery_rate_sample_at(qualified, accumulated.expires_at);
+    let reset = state.delivery_rate_sample.expect("new post-expiry epoch");
+    assert_eq!(reset.sample_count, 1);
+    assert_eq!(reset.sample_bytes, 100_000);
+    assert_eq!(reset.observed_at, accumulated.expires_at);
+}
+
+#[test]
+fn retained_tcp_sidecar_projects_one_immutable_rate_epoch_through_idle_shape_refreshes() {
+    let observed_at = Instant::now();
+    let sample = CarrierDeliveryRateSample {
+        delivery_rate_bps: 80_000_000,
+        pacing_rate_bps: Some(100_000_000),
+        sample_count: 1,
+        sample_bytes: 512 * 1024,
+        delivery_window_covered: true,
+        observed_at,
+        expires_at: observed_at + Duration::from_millis(300),
+    };
+    let mut metrics = baseline_metrics();
+    metrics.delivery_rate_bps = 900_000_000;
+    metrics.pacing_rate_bps = 1_000_000_000;
+    metrics.confidence_ppm = 1_000_000;
+    metrics.app_limited = true;
+
+    let projected_at = observed_at + Duration::from_millis(123);
+    project_tcp_delivery_rate_sample(&mut metrics, sample, projected_at);
+
+    assert_eq!(metrics.delivery_rate_bps, 80_000_000);
+    assert_eq!(metrics.pacing_rate_bps, 100_000_000);
+    assert!(metrics.rate_observed);
+    assert!(metrics.pacing_rate_observed);
+    assert_eq!(metrics.metric_age_us, 123_000);
+    assert_eq!(metrics.rate_valid_for_us, 177_000);
+    assert_eq!(
+        metrics.confidence_ppm,
+        1_000_000 / RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        "one ACK in a new epoch cannot inherit cumulative socket confidence"
+    );
+    assert!(!metrics.app_limited);
+
+    for later_rtt in [1_000, 5_000_000] {
+        metrics.srtt_us = later_rtt;
+        metrics.rttvar_us = later_rtt / 2;
+        project_tcp_delivery_rate_sample(
+            &mut metrics,
+            sample,
+            observed_at + Duration::from_millis(250),
+        );
+        assert_eq!(metrics.metric_age_us, 250_000);
+        assert_eq!(metrics.rate_valid_for_us, 50_000);
+        assert_eq!(metrics.delivery_rate_bps, 80_000_000);
+        assert_eq!(sample.expires_at, observed_at + Duration::from_millis(300));
+    }
+
+    project_tcp_delivery_rate_sample(&mut metrics, sample, sample.expires_at);
+    assert_eq!(metrics.rate_valid_for_us, 0);
+    assert!(metrics.rate_observed);
+    assert!(metrics.pacing_rate_observed);
+    assert_eq!(metrics.pacing_rate_bps, 100_000_000);
+
+    let overlong = CarrierDeliveryRateSample {
+        expires_at: observed_at
+            + Duration::from_micros(crate::protocol::PATH_METRICS_MAX_RATE_VALID_FOR_US + 1),
+        ..sample
+    };
+    project_tcp_delivery_rate_sample(&mut metrics, overlong, observed_at);
+    assert_eq!(
+        metrics.rate_valid_for_us,
+        crate::protocol::PATH_METRICS_MAX_RATE_VALID_FOR_US
+    );
 }
 
 #[test]

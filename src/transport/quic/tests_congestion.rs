@@ -465,6 +465,7 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
                 let non_app_limited = index % 2 == 0;
                 telemetry.publish_ack_batch(
                     QuicAckTelemetryTotals {
+                        delivery_clock_epoch: 1,
                         acked_bytes: ACKS_PER_BATCH * ACK_BYTES,
                         non_app_limited_acked_bytes: if non_app_limited {
                             NON_APP_ACKS_PER_BATCH * ACK_BYTES
@@ -492,6 +493,9 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
                         } else {
                             0
                         },
+                        timed_non_app_limited_delivery_evidence_acked_bytes: 0,
+                        timed_non_app_limited_delivery_evidence_sample_count: 0,
+                        timed_non_app_limited_delivery_evidence_elapsed_nanos: 0,
                         delivery_evidence_acked_bytes: 0,
                     },
                     0,
@@ -505,7 +509,9 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
     let mut non_app_limited_bytes = 0_u64;
     let mut samples = 0_u64;
     let mut non_app_limited_samples = 0_u64;
-    let mut non_app_limited_elapsed = Duration::ZERO;
+    let mut current_timed_non_app_limited_bytes = 0_u64;
+    let mut current_timed_non_app_limited_samples = 0_u64;
+    let mut current_non_app_limited_elapsed = Duration::ZERO;
     while !writer.is_finished() {
         let snapshot = telemetry.snapshot();
         assert_eq!(
@@ -517,17 +523,14 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
             snapshot.non_app_limited_delivery_sample_count * ACK_BYTES
         );
         assert_eq!(
-            snapshot.timed_non_app_limited_acked_bytes,
-            snapshot.non_app_limited_acked_bytes
-        );
-        assert_eq!(
-            snapshot.timed_non_app_limited_delivery_sample_count,
-            snapshot.non_app_limited_delivery_sample_count
+            snapshot.timed_non_app_limited_acked_bytes.unwrap_or(0),
+            snapshot.timed_non_app_limited_delivery_sample_count * ACK_BYTES
         );
         assert_eq!(
             snapshot.non_app_limited_ack_elapsed.unwrap_or_default(),
             ELAPSED_PER_BATCH
-                * (snapshot.non_app_limited_delivery_sample_count / NON_APP_ACKS_PER_BATCH) as u32
+                * (snapshot.timed_non_app_limited_delivery_sample_count / NON_APP_ACKS_PER_BATCH)
+                    as u32
         );
         acked_bytes = acked_bytes.saturating_add(snapshot.newly_acked_bytes.unwrap_or(0));
         non_app_limited_bytes =
@@ -535,7 +538,11 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
         samples = samples.saturating_add(snapshot.delivery_sample_count);
         non_app_limited_samples =
             non_app_limited_samples.saturating_add(snapshot.non_app_limited_delivery_sample_count);
-        non_app_limited_elapsed += snapshot.non_app_limited_ack_elapsed.unwrap_or_default();
+        current_timed_non_app_limited_bytes =
+            snapshot.timed_non_app_limited_acked_bytes.unwrap_or(0);
+        current_timed_non_app_limited_samples =
+            snapshot.timed_non_app_limited_delivery_sample_count;
+        current_non_app_limited_elapsed = snapshot.non_app_limited_ack_elapsed.unwrap_or_default();
     }
     writer.join().expect("QUIC ACK telemetry writer");
     let final_snapshot = telemetry.snapshot();
@@ -552,7 +559,7 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
             .non_app_limited_ack_elapsed
             .unwrap_or_default(),
         ELAPSED_PER_BATCH
-            * (final_snapshot.non_app_limited_delivery_sample_count / NON_APP_ACKS_PER_BATCH)
+            * (final_snapshot.timed_non_app_limited_delivery_sample_count / NON_APP_ACKS_PER_BATCH)
                 as u32
     );
     acked_bytes = acked_bytes.saturating_add(final_snapshot.newly_acked_bytes.unwrap_or(0));
@@ -561,9 +568,15 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
     samples = samples.saturating_add(final_snapshot.delivery_sample_count);
     non_app_limited_samples = non_app_limited_samples
         .saturating_add(final_snapshot.non_app_limited_delivery_sample_count);
-    non_app_limited_elapsed += final_snapshot
+    current_timed_non_app_limited_bytes = final_snapshot
+        .timed_non_app_limited_acked_bytes
+        .unwrap_or(current_timed_non_app_limited_bytes);
+    current_timed_non_app_limited_samples = final_snapshot
+        .timed_non_app_limited_delivery_sample_count
+        .max(current_timed_non_app_limited_samples);
+    current_non_app_limited_elapsed = final_snapshot
         .non_app_limited_ack_elapsed
-        .unwrap_or_default();
+        .unwrap_or(current_non_app_limited_elapsed);
 
     assert_eq!(acked_bytes, BATCHES * ACKS_PER_BATCH * ACK_BYTES);
     assert_eq!(
@@ -576,7 +589,15 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
         BATCHES / 2 * NON_APP_ACKS_PER_BATCH
     );
     assert_eq!(
-        non_app_limited_elapsed,
+        current_timed_non_app_limited_bytes,
+        BATCHES / 2 * NON_APP_ACKS_PER_BATCH * ACK_BYTES
+    );
+    assert_eq!(
+        current_timed_non_app_limited_samples,
+        BATCHES / 2 * NON_APP_ACKS_PER_BATCH
+    );
+    assert_eq!(
+        current_non_app_limited_elapsed,
         ELAPSED_PER_BATCH * (BATCHES / 2) as u32
     );
 }
@@ -600,6 +621,7 @@ fn quic_first_ack_batch_excludes_path_rtt_and_app_limited_idle() {
     controller.accumulate_ack_telemetry(base + Duration::from_millis(4), 100, false);
     controller.finish_ack_telemetry(base + Duration::from_millis(200), 900, false);
     let first = telemetry.snapshot();
+    assert_eq!(first.delivery_clock_epoch, 1);
     assert_eq!(first.non_app_limited_acked_bytes, Some(300));
     assert_eq!(first.non_app_limited_delivery_sample_count, 2);
     assert_eq!(
@@ -611,14 +633,20 @@ fn quic_first_ack_batch_excludes_path_rtt_and_app_limited_idle() {
     controller.accumulate_ack_telemetry(base + Duration::from_millis(205), 25, true);
     controller.finish_ack_telemetry(base + Duration::from_millis(210), 875, true);
     let idle = telemetry.snapshot();
+    assert_eq!(idle.delivery_clock_epoch, 1);
     assert_eq!(idle.newly_acked_bytes, Some(25));
     assert_eq!(idle.non_app_limited_acked_bytes, None);
-    assert_eq!(idle.non_app_limited_ack_elapsed, None);
+    assert_eq!(idle.timed_non_app_limited_acked_bytes, Some(300));
+    assert_eq!(
+        idle.non_app_limited_ack_elapsed,
+        Some(Duration::from_millis(4))
+    );
 
     controller.accumulate_ack_telemetry(base + Duration::from_millis(300), 250, false);
     controller.accumulate_ack_telemetry(base + Duration::from_millis(306), 250, false);
     controller.finish_ack_telemetry(base + Duration::from_millis(600), 0, false);
     let after_idle = telemetry.snapshot();
+    assert_eq!(after_idle.delivery_clock_epoch, 2);
     assert_eq!(after_idle.non_app_limited_acked_bytes, Some(500));
     assert_eq!(
         after_idle.non_app_limited_ack_elapsed,
@@ -626,6 +654,122 @@ fn quic_first_ack_batch_excludes_path_rtt_and_app_limited_idle() {
         "an app-limited end must reset both delivery clocks"
     );
     assert_eq!(after_idle.bytes_in_flight, Some(0));
+}
+
+#[test]
+fn quic_coalesced_snapshot_exposes_only_current_delivery_clock_epoch() {
+    let base = Instant::now();
+    let (mut controller, telemetry) = test_instrumented_controller(base);
+
+    controller.telemetry.record_delivery_evidence_written(900);
+    controller.accumulate_ack_telemetry(base, 100, false);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(10), 100, false);
+    controller.finish_ack_telemetry(base + Duration::from_millis(100), 700, false);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(110), 100, true);
+    controller.finish_ack_telemetry(base + Duration::from_millis(120), 600, true);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(130), 300, false);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(135), 300, false);
+    controller.finish_ack_telemetry(base + Duration::from_millis(140), 0, false);
+
+    let coalesced = telemetry.snapshot();
+    assert_eq!(coalesced.delivery_clock_epoch, 2);
+    assert_eq!(coalesced.newly_acked_bytes, Some(900));
+    assert_eq!(coalesced.timed_non_app_limited_acked_bytes, Some(600));
+    assert_eq!(
+        coalesced.timed_non_app_limited_delivery_evidence_acked_bytes, 600,
+        "app-limited Product ACKs and the completed prior clock cannot enter the current timed epoch"
+    );
+    assert_eq!(
+        coalesced.timed_non_app_limited_delivery_evidence_sample_count,
+        2
+    );
+    assert_eq!(
+        coalesced.timed_non_app_limited_delivery_evidence_elapsed,
+        Duration::from_millis(5)
+    );
+    assert_eq!(coalesced.timed_non_app_limited_delivery_sample_count, 2);
+    assert_eq!(
+        coalesced.non_app_limited_ack_elapsed,
+        Some(Duration::from_millis(5))
+    );
+
+    controller.finish_ack_telemetry(base + Duration::from_millis(150), 0, true);
+    controller.finish_ack_telemetry(base + Duration::from_millis(160), 0, true);
+    assert_eq!(
+        telemetry.snapshot().delivery_clock_epoch,
+        2,
+        "repeated idle callbacks arm one boundary but cannot mint epochs"
+    );
+}
+
+#[test]
+fn quic_mixed_app_limited_batch_omits_ambiguous_timed_product_attribution() {
+    let base = Instant::now();
+    let (mut controller, telemetry) = test_instrumented_controller(base);
+    controller.telemetry.record_delivery_evidence_written(300);
+    controller.accumulate_ack_telemetry(base, 100, false);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(5), 100, true);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(10), 100, false);
+    controller.finish_ack_telemetry(base + Duration::from_millis(100), 0, true);
+
+    let mixed = telemetry.snapshot();
+    assert_eq!(mixed.delivery_clock_epoch, 1);
+    assert_eq!(mixed.delivery_evidence_newly_acked_bytes, Some(300));
+    assert_eq!(mixed.timed_non_app_limited_acked_bytes, Some(200));
+    assert_eq!(
+        mixed.non_app_limited_ack_elapsed,
+        Some(Duration::from_millis(10))
+    );
+    assert_eq!(
+        mixed.timed_non_app_limited_delivery_evidence_acked_bytes, 0,
+        "aggregate Product attribution cannot be guessed across mixed app-limited packet classes"
+    );
+    assert_eq!(
+        mixed.timed_non_app_limited_delivery_evidence_sample_count,
+        0
+    );
+    assert_eq!(
+        mixed.timed_non_app_limited_delivery_evidence_elapsed,
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn quic_final_non_app_batch_publishes_before_delivery_clock_closes() {
+    let base = Instant::now();
+    let (mut controller, telemetry) = test_instrumented_controller(base);
+    controller.telemetry.record_delivery_evidence_written(200);
+    controller.accumulate_ack_telemetry(base, 100, false);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(10), 100, false);
+    controller.finish_ack_telemetry(base + Duration::from_millis(100), 0, true);
+
+    let closing = telemetry.snapshot();
+    assert_eq!(closing.delivery_clock_epoch, 1);
+    assert!(closing.app_limited);
+    assert_eq!(
+        closing.timed_non_app_limited_delivery_evidence_acked_bytes,
+        200
+    );
+    assert_eq!(
+        closing.timed_non_app_limited_delivery_evidence_sample_count,
+        2
+    );
+    assert_eq!(
+        closing.timed_non_app_limited_delivery_evidence_elapsed,
+        Duration::from_millis(10)
+    );
+
+    controller.finish_ack_telemetry(base + Duration::from_millis(110), 0, true);
+    assert_eq!(telemetry.snapshot().delivery_clock_epoch, 1);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(120), 100, false);
+    controller.accumulate_ack_telemetry(base + Duration::from_millis(125), 100, false);
+    controller.finish_ack_telemetry(base + Duration::from_millis(130), 0, false);
+    let reopened = telemetry.snapshot();
+    assert_eq!(reopened.delivery_clock_epoch, 2);
+    assert_eq!(
+        reopened.timed_non_app_limited_delivery_evidence_acked_bytes,
+        0
+    );
 }
 
 #[test]
@@ -646,7 +790,7 @@ fn quic_ack_send_clock_resists_ack_compression() {
     controller.finish_ack_telemetry(base + Duration::from_millis(101), 0, false);
     assert_eq!(
         telemetry.snapshot().non_app_limited_ack_elapsed,
-        Some(Duration::from_millis(20)),
+        Some(Duration::from_millis(30)),
         "the send clock must win when ACK batches are only 1 ms apart"
     );
 }
@@ -713,7 +857,7 @@ fn quic_reordered_ack_batch_cannot_move_send_frontier_backward() {
     controller.finish_ack_telemetry(base + Duration::from_millis(101), 0, false);
     assert_eq!(
         telemetry.snapshot().non_app_limited_ack_elapsed,
-        Some(Duration::from_millis(6)),
+        Some(Duration::from_millis(16)),
         "within-batch send spacing must guard a reordered ACK batch"
     );
 
@@ -721,7 +865,7 @@ fn quic_reordered_ack_batch_cannot_move_send_frontier_backward() {
     controller.finish_ack_telemetry(base + Duration::from_millis(102), 0, false);
     assert_eq!(
         telemetry.snapshot().non_app_limited_ack_elapsed,
-        Some(Duration::from_millis(2)),
+        Some(Duration::from_millis(18)),
         "the send frontier must remain at 10 ms rather than regress to 8 ms"
     );
 }

@@ -1,10 +1,12 @@
+use super::super::attachment::ResponseProductRateEpoch;
 use super::super::next_server_carrier_path_instance_id;
 use super::super::test_support::{binding_for_underlay, output_entry_for_key};
 use super::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_output_has_bulk_rate_evidence,
     server_output_has_durable_product_ack_progress, server_output_local_path_metrics,
     server_path_metrics_bulk_sample_floor_bytes, server_path_metrics_estimate_rate_bps,
-    server_path_metrics_has_bulk_rate_evidence,
+    server_path_metrics_has_bulk_rate_evidence, server_path_metrics_has_bulk_rate_evidence_at,
+    server_path_metrics_snapshot_is_fresh_at,
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_path_startup_sample_limit_bytes};
 use crate::model::path::CarrierPathKey;
@@ -21,15 +23,20 @@ fn response_metrics(key: CarrierPathKey) -> PathMetrics {
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
+        rate_valid_for_us: 1_000_000,
+        rate_observed: true,
         srtt_us: 20_000,
         rttvar_us: 2_000,
         jitter_us: 1_000,
         delivery_rate_bps: 200_000_000,
         pacing_rate_bps: 200_000_000,
+        pacing_rate_observed: true,
         loss_ppm: 0,
         ecn_ppm: 0,
         loss_observed: false,
         ecn_observed: false,
+        bytes_in_flight_observed: false,
+        queue_observed: false,
         bytes_in_flight: 0,
         queue_bytes: 0,
         inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
@@ -50,6 +57,34 @@ fn local_metrics_entry(metrics: PathMetrics) -> ServerPathMetricsEntry {
         carrier_delivery_rate_sample: None,
         recorded_at: Instant::now(),
     }
+}
+
+#[test]
+fn wire_rate_authority_expires_at_exact_remaining_budget_boundary() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(9),
+    };
+    let received_at = Instant::now();
+    let entry = ServerPathMetricsEntry {
+        metrics: PathMetrics {
+            metric_age_us: u32::MAX,
+            rate_valid_for_us: 1,
+            ..response_metrics(key)
+        },
+        source: ServerPathMetricsSource::LocalSender,
+        native_drain_observed: false,
+        carrier_delivery_rate_sample: None,
+        recorded_at: received_at,
+    };
+    assert!(server_path_metrics_snapshot_is_fresh_at(
+        entry,
+        received_at + Duration::from_nanos(999),
+    ));
+    assert!(!server_path_metrics_snapshot_is_fresh_at(
+        entry,
+        received_at + Duration::from_micros(1),
+    ));
 }
 
 #[test]
@@ -202,7 +237,13 @@ fn data_ack_progress_is_tcp_fallback_not_udp_carrier_evidence() {
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let (binding, key, _receivers) = binding_for_underlay(underlay);
         let mut output = output_entry_for_key(&binding, key);
-        output.product_progress_rate_bps = Some(100_000_000.0);
+        output.product_rate_epoch = ResponseProductRateEpoch::new(
+            100_000_000.0,
+            1,
+            sample_floor,
+            Instant::now(),
+            Duration::from_secs(60),
+        );
         output.original_data_acked_bytes = sample_floor.saturating_sub(accounting_slack + 1);
         assert!(!server_output_has_durable_product_ack_progress(
             &output, mux_limits
@@ -263,15 +304,20 @@ fn retained_native_tcp_sample_is_carrier_capacity_not_product_ack_evidence() {
     metrics.has_ack_derived_data_sample = false;
     metrics.data_sample_count = 0;
     metrics.data_sample_bytes = 0;
-    let entry = ServerPathMetricsEntry {
+    let observed_at = Instant::now();
+    let expires_at = observed_at + Duration::from_millis(100);
+    let mut entry = ServerPathMetricsEntry {
         metrics,
         source: ServerPathMetricsSource::LocalSender,
         native_drain_observed: true,
         carrier_delivery_rate_sample: Some(CarrierDeliveryRateSample {
             delivery_rate_bps: 80_000_000,
+            pacing_rate_bps: Some(100_000_000),
             sample_count: 8,
             sample_bytes: 512 * 1024,
             delivery_window_covered: true,
+            observed_at,
+            expires_at,
         }),
         recorded_at: Instant::now(),
     };
@@ -279,6 +325,25 @@ fn retained_native_tcp_sample_is_carrier_capacity_not_product_ack_evidence() {
     assert!(server_path_metrics_has_bulk_rate_evidence(entry));
     assert_eq!(server_path_metrics_estimate_rate_bps(entry), 80_000_000.0);
     assert!(!entry.metrics.has_ack_derived_data_sample);
+    assert!(server_path_metrics_has_bulk_rate_evidence_at(
+        entry,
+        expires_at - Duration::from_nanos(1),
+    ));
+
+    // A fresh registry refresh may retain old wire ACK counters; the sidecar
+    // deadline remains the sole authority whenever the sidecar exists.
+    entry.metrics.has_ack_derived_data_sample = true;
+    entry.metrics.data_sample_count = 99;
+    entry.metrics.data_sample_bytes = u64::MAX;
+    entry.recorded_at = expires_at;
+    assert!(!server_path_metrics_has_bulk_rate_evidence_at(
+        entry, expires_at,
+    ));
+    assert_eq!(
+        server_path_metrics_estimate_rate_bps(entry),
+        80_000_000.0,
+        "the immutable sidecar value cannot fall back to retained wire rate at expiry; eligibility owns the deadline"
+    );
 }
 
 #[test]
@@ -298,15 +363,20 @@ fn scheduling_equivalent_metric_refresh_does_not_advance_generation_or_notify() 
     assert!(updates.has_changed().expect("response update channel"));
     updates.borrow_and_update();
 
-    binding.update_path_metrics_for_instance(
+    binding.install_stored_path_metrics_for_instance(
         key,
         path_instance_id,
-        PathMetrics {
-            metric_epoch: metrics.metric_epoch.wrapping_add(1),
-            metric_age_us: metrics.metric_age_us.saturating_add(100),
-            ..metrics
+        ServerPathMetricsEntry {
+            metrics: PathMetrics {
+                metric_epoch: metrics.metric_epoch.wrapping_add(1),
+                metric_age_us: metrics.metric_age_us.saturating_add(100),
+                ..metrics
+            },
+            source: ServerPathMetricsSource::LocalSender,
+            native_drain_observed: false,
+            carrier_delivery_rate_sample: None,
+            recorded_at: Instant::now(),
         },
-        ServerPathMetricsSource::LocalSender,
     );
     assert_eq!(binding.response_model_generation(), installed_generation);
     assert!(!updates.has_changed().expect("response update channel"));

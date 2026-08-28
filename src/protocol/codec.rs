@@ -1,17 +1,17 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IpPacketId, IpTunnelId,
-    OffsetRange, PathId, PathMetricDirection, PathMetrics, PathUsage, PeerPathState,
-    PeerPathStatus, PeerStatusCode, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
-    UnderlayProtocol,
+    OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics,
+    PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode, ResetReason, SessionId,
+    StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
-const PATH_METRICS_ENCODED_LEN: usize = 104;
+const PATH_METRICS_ENCODED_LEN: usize = 116;
 const PEER_PATH_STATUS_ENCODED_LEN: usize = 2 + PATH_METRICS_ENCODED_LEN;
 const PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN: usize = 11;
 
@@ -953,15 +953,25 @@ fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
     put_u8(out, path_metric_direction_to_u8(metrics.direction));
     put_u64(out, metrics.metric_epoch);
     put_u32(out, metrics.metric_age_us);
+    put_u64(
+        out,
+        metrics
+            .rate_valid_for_us
+            .min(PATH_METRICS_MAX_RATE_VALID_FOR_US),
+    );
+    put_u8(out, u8::from(metrics.rate_observed));
     put_u32(out, metrics.srtt_us);
     put_u32(out, metrics.rttvar_us);
     put_u32(out, metrics.jitter_us);
     put_u64(out, metrics.delivery_rate_bps);
     put_u64(out, metrics.pacing_rate_bps);
+    put_u8(out, u8::from(metrics.pacing_rate_observed));
     put_u32(out, metrics.loss_ppm);
     put_u32(out, metrics.ecn_ppm);
     put_u8(out, u8::from(metrics.loss_observed));
     put_u8(out, u8::from(metrics.ecn_observed));
+    put_u8(out, u8::from(metrics.bytes_in_flight_observed));
+    put_u8(out, u8::from(metrics.queue_observed));
     put_u64(out, metrics.bytes_in_flight);
     put_u64(out, metrics.queue_bytes);
     put_u64(out, metrics.inflight_limit_bytes);
@@ -974,21 +984,26 @@ fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
 }
 
 fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecError> {
-    Ok(PathMetrics {
+    let metrics = PathMetrics {
         path_id: PathId(reader.get_u16()?),
         underlay: underlay_from_u8(reader.get_u8()?)?,
         direction: path_metric_direction_from_u8(reader.get_u8()?)?,
         metric_epoch: reader.get_u64()?,
         metric_age_us: reader.get_u32()?,
+        rate_valid_for_us: reader.get_u64()?,
+        rate_observed: decode_bool(reader.get_u8()?)?,
         srtt_us: reader.get_u32()?,
         rttvar_us: reader.get_u32()?,
         jitter_us: reader.get_u32()?,
         delivery_rate_bps: reader.get_u64()?,
         pacing_rate_bps: reader.get_u64()?,
+        pacing_rate_observed: decode_bool(reader.get_u8()?)?,
         loss_ppm: reader.get_u32()?,
         ecn_ppm: reader.get_u32()?,
         loss_observed: decode_bool(reader.get_u8()?)?,
         ecn_observed: decode_bool(reader.get_u8()?)?,
+        bytes_in_flight_observed: decode_bool(reader.get_u8()?)?,
+        queue_observed: decode_bool(reader.get_u8()?)?,
         bytes_in_flight: reader.get_u64()?,
         queue_bytes: reader.get_u64()?,
         inflight_limit_bytes: reader.get_u64()?,
@@ -998,7 +1013,14 @@ fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecErro
         has_ack_derived_data_sample: decode_bool(reader.get_u8()?)?,
         data_sample_count: reader.get_u32()?,
         data_sample_bytes: reader.get_u64()?,
-    })
+    };
+    if metrics.rate_valid_for_us > PATH_METRICS_MAX_RATE_VALID_FOR_US
+        || (!metrics.rate_observed && metrics.rate_valid_for_us != 0)
+        || (metrics.pacing_rate_observed && !metrics.rate_observed)
+    {
+        return Err(CodecError::InvalidPathMetrics);
+    }
+    Ok(metrics)
 }
 
 fn encode_offset_ranges(
@@ -1452,6 +1474,7 @@ pub enum CodecError {
     InvalidPeerStatus,
     InvalidIpTunnel,
     InvalidIpPacket,
+    InvalidPathMetrics,
     InvalidEnum,
     InvalidRange,
     InvalidPort,
@@ -1486,6 +1509,7 @@ impl std::fmt::Display for CodecError {
             Self::InvalidPeerStatus => write!(f, "non-OK peer status contains path entries"),
             Self::InvalidIpTunnel => write!(f, "invalid IP tunnel frame"),
             Self::InvalidIpPacket => write!(f, "invalid empty IP packet"),
+            Self::InvalidPathMetrics => write!(f, "invalid path metrics"),
             Self::InvalidEnum => write!(f, "invalid enum value"),
             Self::InvalidRange => write!(f, "invalid offset range"),
             Self::InvalidPort => write!(f, "port must be in 1..=65535"),

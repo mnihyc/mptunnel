@@ -6,11 +6,12 @@ use crate::model::capacity::{
     adaptive_reliable_relay_inflight_bytes, product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
-use crate::model::timing::{
-    quic_bulk_proof_freshness_horizon, transport_pto_from_ms, transport_pto_from_snapshot,
-};
+use crate::model::timing::{transport_pto_from_ms, transport_pto_from_snapshot};
 use crate::mux::MuxLimits;
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics, PathUsage, UnderlayProtocol};
+use crate::protocol::{
+    PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics, PathUsage,
+    UnderlayProtocol,
+};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::scheduler::{
     self, PathRateScope, PathSnapshot, PathState as SchedulerPathState, TrafficClass,
@@ -334,8 +335,10 @@ fn endpoint_only_startup_observation_for_scoring(
         product_delivery_rate_bps: None,
         product_delivery_sample_bytes: 0,
         last_delivery_at: None,
+        delivery_rate_expires_at: None,
         carrier_srtt_ms: validated_timing.and_then(|timing| timing.2),
         carrier_rttvar_ms: validated_timing.and_then(|timing| timing.3),
+        carrier_loss_rate: None,
         carrier_delivery_rate_bps: None,
         carrier_pacing_rate_bps: None,
         carrier_delivery_samples: 0,
@@ -597,6 +600,7 @@ pub(in crate::runtime) fn packet_path_snapshot(
             product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
+            delivery_rate_expires_at: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
             relay_bytes_in_flight: 0,
@@ -667,10 +671,26 @@ pub(in crate::runtime) fn path_snapshot_with_id(
         carrier_delivery_rate_bps: carrier_capacity_rate_bps,
         product_progress_rate_bps,
         has_durable_product_progress,
-        loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
-        queue_bytes: observation.carrier_queue_bytes,
+        loss_rate: match path.underlay {
+            UnderlayProtocol::Tcp => observation
+                .carrier_loss_rate
+                .or(observation.measured_loss_rate),
+            // QUIC native loss is congestion telemetry, not authenticated MPP
+            // datagram feedback; it must not drive Product path pruning.
+            UnderlayProtocol::Udp => observation.measured_loss_rate,
+        }
+        .unwrap_or(0.0),
+        queue_bytes: if observation.carrier_queue_bytes_observed {
+            observation.carrier_queue_bytes
+        } else {
+            0
+        },
         data_level_queue_bytes: observation.relay_queue_bytes,
-        bytes_in_flight: observation.carrier_bytes_in_flight,
+        bytes_in_flight: if observation.carrier_bytes_in_flight_observed {
+            observation.carrier_bytes_in_flight
+        } else {
+            0
+        },
         data_level_bytes_in_flight: observation.relay_bytes_in_flight,
         active_flows: observation.active_flows,
         active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
@@ -720,6 +740,15 @@ pub(in crate::runtime) fn path_metrics_from_snapshot(
     observation: ClientPathObservation,
     direction: PathMetricDirection,
 ) -> PathMetrics {
+    path_metrics_from_snapshot_at(snapshot, observation, direction, Instant::now())
+}
+
+pub(in crate::runtime) fn path_metrics_from_snapshot_at(
+    snapshot: PathSnapshot,
+    observation: ClientPathObservation,
+    direction: PathMetricDirection,
+    now: Instant,
+) -> PathMetrics {
     let carrier_data_sample_count = if snapshot.underlay == UnderlayProtocol::Udp {
         observation.carrier_delivery_samples
     } else {
@@ -730,25 +759,78 @@ pub(in crate::runtime) fn path_metrics_from_snapshot(
         .saturating_add(carrier_data_sample_count);
     let has_ack_derived_data_sample =
         data_sample_count > 0 || observation.carrier_ack_derived_data_seen;
+    // Preserve the authority epoch selected by `path_snapshot_with_id` rather
+    // than guessing it from equal numeric rates. Startup priors have no rate
+    // authority; carrier, Product, and generic samples retain only the
+    // remaining lifetime of their immutable source deadline.
+    let carrier_rate_selected = snapshot.carrier_delivery_rate_bps.is_some();
+    let product_rate_selected = !carrier_rate_selected
+        && snapshot.product_progress_rate_bps.is_some()
+        && snapshot.rate_scope == PathRateScope::PerFlowGoodput;
+    let generic_rate_selected = !carrier_rate_selected
+        && snapshot.product_progress_rate_bps.is_none()
+        && observation.measured_rate_bps.is_some();
+    let (rate_observed_at, rate_expires_at) = if carrier_rate_selected {
+        (
+            observation.carrier_last_delivery_at,
+            observation.carrier_bulk_proof_expires_at,
+        )
+    } else if product_rate_selected || generic_rate_selected {
+        (
+            observation.last_delivery_at,
+            observation.delivery_rate_expires_at,
+        )
+    } else {
+        (None, None)
+    };
+    let has_rate_epoch = rate_observed_at
+        .zip(rate_expires_at)
+        .is_some_and(|(observed_at, _)| observed_at <= now);
+    let rate_valid_for_us = has_rate_epoch
+        .then_some(rate_expires_at)
+        .flatten()
+        .map(|expires_at| duration_micros_u64(expires_at.saturating_duration_since(now)))
+        .unwrap_or(0)
+        .min(PATH_METRICS_MAX_RATE_VALID_FOR_US);
+    let metric_age_us = rate_observed_at
+        .map(|observed_at| duration_micros_u32(now.saturating_duration_since(observed_at)))
+        .unwrap_or(0);
+    let pacing_rate_observed = has_rate_epoch
+        && carrier_rate_selected
+        && !observation.explicit_carrier_capacity_proof
+        && observation.carrier_pacing_rate_bps.is_some();
+    let pacing_rate_bps = if pacing_rate_observed {
+        observation
+            .carrier_pacing_rate_bps
+            .unwrap_or(snapshot.delivery_rate_bps)
+    } else {
+        snapshot.delivery_rate_bps
+    };
     PathMetrics {
         path_id: snapshot.id,
         underlay: snapshot.underlay,
         direction,
         metric_epoch: metric_epoch_now(),
-        metric_age_us: 0,
+        metric_age_us,
+        rate_valid_for_us,
+        rate_observed: has_rate_epoch,
         srtt_us: millis_to_micros_u32(snapshot.srtt_ms),
         rttvar_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
         jitter_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
         delivery_rate_bps: snapshot.delivery_rate_bps.max(1.0).round() as u64,
-        pacing_rate_bps: observation
-            .carrier_pacing_rate_bps
-            .unwrap_or(snapshot.pacing_rate_bps)
-            .max(1.0)
-            .round() as u64,
+        pacing_rate_bps: pacing_rate_bps.max(1.0).round() as u64,
+        pacing_rate_observed,
         loss_ppm: (snapshot.loss_rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32,
         ecn_ppm: 0,
-        loss_observed: observation.delivery_samples > 0 || observation.carrier_delivery_samples > 0,
+        loss_observed: match snapshot.underlay {
+            UnderlayProtocol::Tcp => {
+                observation.carrier_loss_rate.is_some() || observation.measured_loss_rate.is_some()
+            }
+            UnderlayProtocol::Udp => observation.measured_loss_rate.is_some(),
+        },
         ecn_observed: false,
+        bytes_in_flight_observed: observation.carrier_bytes_in_flight_observed,
+        queue_observed: observation.carrier_queue_bytes_observed,
         bytes_in_flight: snapshot.bytes_in_flight,
         queue_bytes: snapshot.queue_bytes,
         inflight_limit_bytes: snapshot.carrier_inflight_limit_bytes,
@@ -778,6 +860,14 @@ pub(in crate::runtime) fn ratio_to_ppm(value: f64) -> u32 {
 fn millis_to_micros_u32(ms: f64) -> u32 {
     let micros = (ms.max(0.0) * 1000.0).round();
     micros.clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+fn duration_micros_u32(duration: Duration) -> u32 {
+    duration.as_micros().min(u128::from(u32::MAX)) as u32
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 pub(in crate::runtime) fn path_model_srtt_ms(
@@ -946,26 +1036,11 @@ pub(in crate::runtime) fn bulk_candidate_has_fresh_native_carrier_rate_evidence(
     if sample_at < valid_after || sample_at > now {
         return false;
     }
-    let proof_is_fresh = match path.underlay {
-        UnderlayProtocol::Udp => observation
-            .carrier_bulk_proof_expires_at
-            .is_some_and(|expires_at| now < expires_at),
-        UnderlayProtocol::Tcp => {
-            let srtt = Duration::from_secs_f64(
-                observation
-                    .carrier_srtt_ms
-                    .unwrap_or(RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0)
-                    .max(0.001)
-                    / 1000.0,
-            );
-            let rttvar = observation
-                .carrier_rttvar_ms
-                .map(|rttvar_ms| Duration::from_secs_f64(rttvar_ms.max(0.001) / 1000.0))
-                .unwrap_or(srtt / 2);
-            now.saturating_duration_since(sample_at)
-                < quic_bulk_proof_freshness_horizon(srtt, rttvar)
-        }
-    };
+    // Explicit TCP capacity transactions and native ACK samples for both TCP
+    // and QUIC expose the immutable deadline frozen by their source epoch.
+    let proof_is_fresh = observation
+        .carrier_bulk_proof_expires_at
+        .is_some_and(|expires_at| now < expires_at);
     bulk_candidate_has_native_carrier_rate_evidence(path, observation) && proof_is_fresh
 }
 
@@ -1070,16 +1145,20 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) product_delivery_sample_bytes: u64,
     pub(in crate::runtime) datagram_feedback_samples: u32,
     pub(in crate::runtime) last_delivery_at: Option<Instant>,
+    pub(in crate::runtime) delivery_rate_expires_at: Option<Instant>,
     pub(in crate::runtime) active_flows: u32,
     pub(in crate::runtime) active_latency_sensitive_flows: u32,
     pub(in crate::runtime) relay_bytes_in_flight: u64,
     pub(in crate::runtime) relay_queue_bytes: u64,
     pub(in crate::runtime) carrier_srtt_ms: Option<f64>,
     pub(in crate::runtime) carrier_rttvar_ms: Option<f64>,
+    pub(in crate::runtime) carrier_loss_rate: Option<f64>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_pacing_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_bytes_in_flight: u64,
+    pub(in crate::runtime) carrier_bytes_in_flight_observed: bool,
     pub(in crate::runtime) carrier_queue_bytes: u64,
+    pub(in crate::runtime) carrier_queue_bytes_observed: bool,
     pub(in crate::runtime) carrier_inflight_limit_bytes: u64,
     pub(in crate::runtime) carrier_delivery_samples: u32,
     pub(in crate::runtime) carrier_delivery_sample_bytes: u64,
@@ -1108,16 +1187,20 @@ impl Default for ClientPathObservation {
             product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
+            delivery_rate_expires_at: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
             relay_bytes_in_flight: 0,
             relay_queue_bytes: 0,
             carrier_srtt_ms: None,
             carrier_rttvar_ms: None,
+            carrier_loss_rate: None,
             carrier_delivery_rate_bps: None,
             carrier_pacing_rate_bps: None,
             carrier_bytes_in_flight: 0,
+            carrier_bytes_in_flight_observed: false,
             carrier_queue_bytes: 0,
+            carrier_queue_bytes_observed: false,
             carrier_inflight_limit_bytes: 0,
             carrier_delivery_samples: 0,
             carrier_delivery_sample_bytes: 0,
@@ -1171,8 +1254,11 @@ fn paths_have_sender_delivery_evidence(
 pub(in crate::runtime) struct UdpDatagramPathObservation {
     pub(in crate::runtime) rtt: Duration,
     pub(in crate::runtime) jitter: Duration,
-    pub(in crate::runtime) loss_rate: f64,
+    pub(in crate::runtime) loss_rate: Option<f64>,
     pub(in crate::runtime) rate_sample: Option<PathRateSample>,
+    /// Absolute lifetime of an externally aged rate sample. Local feedback
+    /// leaves this absent so the health record establishes its own 3-PTO epoch.
+    pub(in crate::runtime) rate_sample_expires_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

@@ -5,7 +5,7 @@
 
 use crate::protocol::codec::{CodecLimits, peer_status_response_path_limit};
 use crate::protocol::{Frame, PathId, PeerPathStatus, PeerStatusCode, SessionId, UnderlayProtocol};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot};
@@ -20,11 +20,26 @@ pub(in crate::runtime) struct PeerStatusResult {
     pub(in crate::runtime) request_id: u64,
     pub(in crate::runtime) code: PeerStatusCode,
     pub(in crate::runtime) paths: Vec<PeerPathStatus>,
-    /// Endpoint-local identities captured with this exact response. Keeping
-    /// them on the result prevents later authenticated PathId reuse from
-    /// relabeling cached diagnostics.
-    pub(in crate::runtime) local_path_indices: BTreeMap<(UnderlayProtocol, PathId), usize>,
+    /// Endpoint-local identities captured when this exact request was sent.
+    /// The peer snapshot is causally downstream of that boundary; retaining
+    /// the request snapshot prevents both in-flight carrier retirement from
+    /// erasing an identity and later authenticated PathId reuse from
+    /// relabeling the response.
+    pub(in crate::runtime) local_paths:
+        BTreeMap<(UnderlayProtocol, PathId), PeerStatusLocalPathSnapshot>,
     pub(in crate::runtime) received_at: SystemTime,
+}
+
+/// Endpoint-local metadata owned by one exact authenticated carrier
+/// registration and frozen at peer-request dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct PeerStatusLocalPathSnapshot {
+    pub(in crate::runtime) local_path_index: usize,
+    pub(in crate::runtime) active_port: Option<u16>,
+    /// True when this mapping was already a retired carrier tombstone at the
+    /// exact request-dispatch boundary. Retaining the port is useful for
+    /// diagnosis, but it must not be presented as a current live port.
+    pub(in crate::runtime) retired: bool,
 }
 
 impl PeerStatusResult {
@@ -34,7 +49,31 @@ impl PeerStatusResult {
         underlay: UnderlayProtocol,
         path_id: PathId,
     ) -> Option<usize> {
-        self.local_path_indices.get(&(underlay, path_id)).copied()
+        self.local_paths
+            .get(&(underlay, path_id))
+            .map(|path| path.local_path_index)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn local_active_port(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+    ) -> Option<u16> {
+        self.local_paths
+            .get(&(underlay, path_id))
+            .and_then(|path| path.active_port)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn local_path_retired(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+    ) -> Option<bool> {
+        self.local_paths
+            .get(&(underlay, path_id))
+            .map(|path| path.retired)
     }
 }
 
@@ -88,6 +127,11 @@ struct PeerStatusSession {
     // management may map them back to the local configured path that admitted
     // the authenticated carrier without putting names or endpoints on wire.
     local_path_assignments: BTreeMap<(UnderlayProtocol, PathId), LocalPathAssignment>,
+    // Local teardown can precede the peer observing EOF. Retain that exact
+    // authenticated identity until a complete OK peer snapshot proves the
+    // peer no longer reports it; otherwise failure diagnostics lose the path
+    // name at precisely the point where it is useful.
+    retired_local_path_assignments: BTreeMap<(UnderlayProtocol, PathId), LocalPathAssignment>,
     preferred_registration: Option<u64>,
     last_attempted_registration: Option<u64>,
     last_incoming_response_at: Option<Instant>,
@@ -99,12 +143,14 @@ struct PeerStatusSession {
 struct LocalPathAssignment {
     local_path_index: usize,
     registration_id: u64,
+    active_port: Option<u16>,
 }
 
 #[derive(Debug)]
 struct PendingPeerStatusRequest {
     request_id: u64,
     registration_id: u64,
+    local_paths: BTreeMap<(UnderlayProtocol, PathId), PeerStatusLocalPathSnapshot>,
     response: oneshot::Sender<PeerStatusResult>,
 }
 
@@ -114,6 +160,17 @@ pub(in crate::runtime) struct PeerStatusCarrier {
     registration_id: u64,
     local_path_identity: Option<(UnderlayProtocol, PathId)>,
     requests: mpsc::Receiver<u64>,
+}
+
+/// Generation-fenced metadata writer for an exact authenticated path.
+/// A successor registration with the same wire identity makes this handle a
+/// no-op instead of allowing stale migration completion to relabel it.
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct PeerStatusPathMetadataHandle {
+    broker: Weak<PeerStatusBrokerInner>,
+    session_id: SessionId,
+    registration_id: u64,
+    local_path_identity: (UnderlayProtocol, PathId),
 }
 
 #[derive(Clone)]
@@ -214,8 +271,16 @@ impl PeerStatusBroker {
         underlay: UnderlayProtocol,
         path_id: PathId,
         local_path_index: usize,
+        active_port: Option<u16>,
     ) -> PeerStatusCarrier {
-        self.register_path_with_incoming(session_id, underlay, path_id, local_path_index, false)
+        self.register_path_with_incoming(
+            session_id,
+            underlay,
+            path_id,
+            local_path_index,
+            active_port,
+            false,
+        )
     }
 
     #[cfg(test)]
@@ -233,12 +298,13 @@ impl PeerStatusBroker {
         underlay: UnderlayProtocol,
         path_id: PathId,
         local_path_index: usize,
+        active_port: Option<u16>,
         allow_incoming: bool,
     ) -> PeerStatusCarrier {
         self.register_inner(
             session_id,
             allow_incoming,
-            Some(((underlay, path_id), local_path_index)),
+            Some(((underlay, path_id), local_path_index, active_port)),
         )
     }
 
@@ -246,24 +312,27 @@ impl PeerStatusBroker {
         &self,
         session_id: SessionId,
         allow_incoming: bool,
-        local_path: Option<((UnderlayProtocol, PathId), usize)>,
+        local_path: Option<((UnderlayProtocol, PathId), usize, Option<u16>)>,
     ) -> PeerStatusCarrier {
         let (requests, requests_rx) = mpsc::channel(PEER_STATUS_COMMAND_CAPACITY);
-        let local_path_identity = local_path.map(|(identity, _)| identity);
+        let local_path_identity = local_path.map(|(identity, _, _)| identity);
         let registration_id = {
             let mut state = self.inner.state.lock().expect("peer status broker lock");
             let registration_id = next_nonzero(&mut state.next_registration_id);
             let session = state.sessions.entry(session_id).or_default();
             session.allow_incoming |= allow_incoming;
-            if let Some((identity, local_path_index)) = local_path {
+            if let Some((identity, local_path_index, active_port)) = local_path {
                 // Only successful carrier authentication installs or replaces
-                // a live assignment. Completed response objects snapshot the
-                // then-current value, so this reuse cannot relabel cached data.
+                // a live assignment. Pending requests snapshot this mapping at
+                // their causal send boundary, so later reuse cannot relabel a
+                // response that was already requested.
+                session.retired_local_path_assignments.remove(&identity);
                 session.local_path_assignments.insert(
                     identity,
                     LocalPathAssignment {
                         local_path_index,
                         registration_id,
+                        active_port,
                     },
                 );
             }
@@ -294,6 +363,32 @@ impl PeerStatusBroker {
             .get(&session_id)
             .and_then(|session| session.local_path_assignments.get(&(underlay, path_id)))
             .map(|assignment| assignment.local_path_index)
+    }
+
+    /// Return the destination port owned by the currently authenticated
+    /// carrier in one endpoint-local path slot. Retired assignments are
+    /// deliberately excluded: their ports remain useful only for correlating
+    /// a peer snapshot that still reports the retired wire identity.
+    pub(in crate::runtime) fn live_path_active_port(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        local_path_index: usize,
+    ) -> Option<u16> {
+        self.inner
+            .state
+            .lock()
+            .expect("peer status broker lock")
+            .sessions
+            .get(&session_id)?
+            .local_path_assignments
+            .iter()
+            .find_map(|((assignment_underlay, _), assignment)| {
+                (*assignment_underlay == underlay
+                    && assignment.local_path_index == local_path_index)
+                    .then_some(assignment.active_port)
+                    .flatten()
+            })
     }
 
     pub(in crate::runtime) fn session_ids(&self) -> Vec<SessionId> {
@@ -341,9 +436,36 @@ impl PeerStatusBroker {
             let Some(registration_id) = try_send_request(session, request_id) else {
                 return Err(PeerStatusRequestError::NoAvailableCarrier);
             };
+            let mut local_paths = session
+                .retired_local_path_assignments
+                .iter()
+                .map(|(identity, assignment)| {
+                    (
+                        *identity,
+                        PeerStatusLocalPathSnapshot {
+                            local_path_index: assignment.local_path_index,
+                            active_port: assignment.active_port,
+                            retired: true,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            local_paths.extend(session.local_path_assignments.iter().map(
+                |(identity, assignment)| {
+                    (
+                        *identity,
+                        PeerStatusLocalPathSnapshot {
+                            local_path_index: assignment.local_path_index,
+                            active_port: assignment.active_port,
+                            retired: false,
+                        },
+                    )
+                },
+            ));
             session.pending = Some(PendingPeerStatusRequest {
                 request_id,
                 registration_id,
+                local_paths,
                 response: response_tx,
             });
             request_id
@@ -385,14 +507,23 @@ impl PeerStatusBroker {
             return false;
         };
         session.preferred_registration = Some(pending.registration_id);
-        let local_path_indices = paths
+        if code == PeerStatusCode::Ok {
+            let reported_identities = paths
+                .iter()
+                .map(|path| (path.metrics.underlay, path.metrics.path_id))
+                .collect::<BTreeSet<_>>();
+            session
+                .retired_local_path_assignments
+                .retain(|identity, _| reported_identities.contains(identity));
+        }
+        let local_paths = paths
             .iter()
             .filter_map(|path| {
                 let identity = (path.metrics.underlay, path.metrics.path_id);
-                session
-                    .local_path_assignments
+                pending
+                    .local_paths
                     .get(&identity)
-                    .map(|assignment| (identity, assignment.local_path_index))
+                    .map(|local_path| (identity, *local_path))
             })
             .collect();
         let result = PeerStatusResult {
@@ -400,7 +531,7 @@ impl PeerStatusBroker {
             request_id,
             code,
             paths,
-            local_path_indices,
+            local_paths,
             received_at: SystemTime::now(),
         };
         session.latest = Some(result.clone());
@@ -448,12 +579,16 @@ impl PeerStatusBroker {
         let remove_session = if let Some(session) = state.sessions.get_mut(&session_id) {
             session.carriers.remove(&registration_id);
             if let Some(identity) = local_path_identity
-                && session
+                && let Some(assignment) = session
                     .local_path_assignments
                     .get(&identity)
-                    .is_some_and(|assignment| assignment.registration_id == registration_id)
+                    .copied()
+                    .filter(|assignment| assignment.registration_id == registration_id)
             {
                 session.local_path_assignments.remove(&identity);
+                session
+                    .retired_local_path_assignments
+                    .insert(identity, assignment);
             }
             if session.preferred_registration == Some(registration_id) {
                 session.preferred_registration = None;
@@ -479,6 +614,16 @@ impl PeerStatusBroker {
 }
 
 impl PeerStatusCarrier {
+    pub(in crate::runtime) fn path_metadata_handle(&self) -> Option<PeerStatusPathMetadataHandle> {
+        self.local_path_identity
+            .map(|local_path_identity| PeerStatusPathMetadataHandle {
+                broker: Arc::downgrade(&self.broker.inner),
+                session_id: self.session_id,
+                registration_id: self.registration_id,
+                local_path_identity,
+            })
+    }
+
     pub(in crate::runtime) async fn recv_request(&mut self) -> Option<u64> {
         self.requests.recv().await
     }
@@ -532,6 +677,29 @@ impl PeerStatusCarrier {
     ) -> bool {
         self.broker
             .receive_response(self.session_id, request_id, code, paths)
+    }
+}
+
+impl PeerStatusPathMetadataHandle {
+    pub(in crate::runtime) fn set_active_port(&self, active_port: u16) -> bool {
+        let Some(broker) = self.broker.upgrade() else {
+            return false;
+        };
+        let mut state = broker.state.lock().expect("peer status broker lock");
+        let Some(assignment) = state
+            .sessions
+            .get_mut(&self.session_id)
+            .and_then(|session| {
+                session
+                    .local_path_assignments
+                    .get_mut(&self.local_path_identity)
+            })
+            .filter(|assignment| assignment.registration_id == self.registration_id)
+        else {
+            return false;
+        };
+        assignment.active_port = Some(active_port);
+        true
     }
 }
 

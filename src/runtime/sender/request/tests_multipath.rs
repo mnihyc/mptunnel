@@ -1132,7 +1132,9 @@ async fn unbound_reinjection_requires_idle_but_measured_recovery_may_use_busy() 
     {
         let mut health = context.health().lock().expect("path health lock");
         health.tcp[busy.key.index].carrier_bytes_in_flight = 64 * 1024;
+        health.tcp[busy.key.index].carrier_bytes_in_flight_observed = true;
         health.tcp[busy.key.index].carrier_queue_bytes = 8 * 1024;
+        health.tcp[busy.key.index].carrier_queue_bytes_observed = true;
         health.tcp[busy.key.index].carrier_inflight_limit_bytes = 512 * 1024;
         health.tcp[busy.key.index].native_drain_observed = true;
     }

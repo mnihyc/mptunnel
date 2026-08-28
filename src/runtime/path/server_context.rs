@@ -208,6 +208,7 @@ impl ServerPathContext {
             path.underlay(),
             path.path_id(),
             path.local_config_ordinal(),
+            None,
             self.peer_diagnostics_principals
                 .allows(path.principal_permit().principal()),
         )

@@ -360,6 +360,7 @@ impl Connection {
         let snapshot = instrumented.snapshot();
         CongestionMetrics {
             path_epoch: snapshot.path_epoch,
+            delivery_clock_epoch: snapshot.delivery_clock_epoch,
             congestion_window: metrics.congestion_window,
             bytes_in_flight: snapshot.bytes_in_flight,
             pending_bytes: self.write_backlog.load(Ordering::Relaxed),
@@ -373,6 +374,12 @@ impl Connection {
             non_app_limited_acked_bytes: snapshot.non_app_limited_acked_bytes,
             timed_non_app_limited_acked_bytes: snapshot.timed_non_app_limited_acked_bytes,
             non_app_limited_ack_elapsed: snapshot.non_app_limited_ack_elapsed,
+            timed_non_app_limited_delivery_evidence_acked_bytes: snapshot
+                .timed_non_app_limited_delivery_evidence_acked_bytes,
+            timed_non_app_limited_delivery_evidence_sample_count: snapshot
+                .timed_non_app_limited_delivery_evidence_sample_count,
+            timed_non_app_limited_delivery_evidence_elapsed: snapshot
+                .timed_non_app_limited_delivery_evidence_elapsed,
             delivery_evidence_written_bytes: self.telemetry.delivery_evidence_written_bytes(),
             delivery_evidence_cancelled_bytes: self.telemetry.delivery_evidence_cancelled_bytes(),
             delivery_evidence_pending_ack_bytes: self

@@ -173,6 +173,7 @@ async fn tcp_measurement_bounds_existing_carrier_flight_and_does_not_restart() {
         let mut health = fixture.context.health().lock().expect("path health lock");
         health.tcp[fixture.candidate.key.index].relay_bytes_in_flight = 0;
         health.tcp[fixture.candidate.key.index].carrier_bytes_in_flight = CARRIER_FLIGHT_BYTES;
+        health.tcp[fixture.candidate.key.index].carrier_bytes_in_flight_observed = true;
     }
     let candidate_snapshot = fixture
         .context

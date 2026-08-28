@@ -50,15 +50,20 @@ fn native_quic_test_metrics(path_id: PathId) -> PathMetrics {
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
+        rate_valid_for_us: 1_000_000,
+        rate_observed: true,
         srtt_us: 20_000,
         rttvar_us: 1_000,
         jitter_us: 0,
         delivery_rate_bps: 1,
         pacing_rate_bps: 1,
+        pacing_rate_observed: true,
         loss_ppm: 0,
         ecn_ppm: 0,
         loss_observed: false,
         ecn_observed: false,
+        bytes_in_flight_observed: true,
+        queue_observed: true,
         bytes_in_flight: 0,
         queue_bytes: 0,
         inflight_limit_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
@@ -69,6 +74,28 @@ fn native_quic_test_metrics(path_id: PathId) -> PathMetrics {
         data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         data_sample_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
     }
+}
+
+#[test]
+fn forwarding_decrements_only_remaining_authority_and_preserves_provenance() {
+    let mut metrics = native_quic_test_metrics(PathId(4));
+    metrics.metric_age_us = u32::MAX - 1;
+    metrics.rate_valid_for_us = 5;
+    metrics.pacing_rate_bps = 9;
+    metrics.pacing_rate_observed = true;
+
+    let near_expiry = path_metrics_after_residence(metrics, Duration::from_micros(4));
+    assert_eq!(near_expiry.metric_age_us, u32::MAX);
+    assert_eq!(near_expiry.rate_valid_for_us, 1);
+    assert!(near_expiry.rate_observed);
+    assert_eq!(near_expiry.pacing_rate_bps, 9);
+    assert!(near_expiry.pacing_rate_observed);
+
+    let expired = path_metrics_after_residence(metrics, Duration::from_micros(5));
+    assert_eq!(expired.rate_valid_for_us, 0);
+    assert!(expired.rate_observed);
+    assert_eq!(expired.pacing_rate_bps, 9);
+    assert!(expired.pacing_rate_observed);
 }
 
 #[test]
@@ -1339,6 +1366,8 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
     let path_id = PathId(4);
     let mut first_metrics = native_quic_test_metrics(path_id);
     first_metrics.delivery_rate_bps = 111;
+    first_metrics.bytes_in_flight_observed = false;
+    first_metrics.queue_observed = true;
     let mut second_metrics = native_quic_test_metrics(path_id);
     second_metrics.delivery_rate_bps = 222;
     let first = port.register_test_carrier_path(
@@ -1388,7 +1417,10 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
     assert!(managed.policy.backup);
     assert_eq!(managed.usage, None);
     assert_eq!(managed.source, Some("local_sender"));
-    assert_eq!(managed.metrics.expect("metrics").delivery_rate_bps, 111);
+    let managed_metrics = managed.metrics.expect("metrics");
+    assert_eq!(managed_metrics.delivery_rate_bps, 111);
+    assert!(!managed_metrics.bytes_in_flight_observed);
+    assert!(managed_metrics.queue_observed);
     assert!(managed.path_instance_id.as_u64() > 0);
     assert!(
         management

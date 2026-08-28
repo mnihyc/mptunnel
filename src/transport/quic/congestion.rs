@@ -10,6 +10,8 @@ use tokio::sync::Notify;
 pub struct CongestionMetrics {
     /// Monotonic identity of the current network-path congestion model.
     pub path_epoch: u64,
+    /// Monotonic identity of the current non-app-limited delivery clock.
+    pub delivery_clock_epoch: u64,
     pub congestion_window: u64,
     pub bytes_in_flight: Option<u64>,
     pub pending_bytes: u64,
@@ -20,14 +22,26 @@ pub struct CongestionMetrics {
     pub ecn_ppm: Option<u32>,
     pub newly_acked_bytes: Option<u64>,
     pub non_app_limited_acked_bytes: Option<u64>,
+    /// Timed ACK bytes accumulated within `delivery_clock_epoch`.
+    ///
+    /// Unlike the preceding per-snapshot counters, this is a current-epoch
+    /// total. Consumers must subtract a cursor with the same epoch identity.
     pub timed_non_app_limited_acked_bytes: Option<u64>,
+    /// Timed ACK/send-clock duration accumulated within `delivery_clock_epoch`.
     pub non_app_limited_ack_elapsed: Option<Duration>,
+    /// Current-clock Product bytes carried by timed non-app-limited ACKs.
+    pub timed_non_app_limited_delivery_evidence_acked_bytes: u64,
+    /// Current-clock ACK samples in the qualified Product-proof tuple.
+    pub timed_non_app_limited_delivery_evidence_sample_count: u64,
+    /// Current-clock duration in the qualified Product-proof tuple.
+    pub timed_non_app_limited_delivery_evidence_elapsed: Duration,
     pub delivery_evidence_written_bytes: u64,
     pub delivery_evidence_cancelled_bytes: u64,
     pub delivery_evidence_pending_ack_bytes: u64,
     pub delivery_evidence_newly_acked_bytes: Option<u64>,
     pub delivery_sample_count: u64,
     pub non_app_limited_delivery_sample_count: u64,
+    /// Timed ACK samples accumulated within `delivery_clock_epoch`.
     pub timed_non_app_limited_delivery_sample_count: u64,
     pub app_limited: bool,
 }
@@ -54,6 +68,7 @@ struct QuicPathTelemetry {
     // sequence makes its cumulative ACK counters coherent for a concurrent
     // metrics reader without putting a lock on the packet ACK hot path.
     ack_snapshot_sequence: AtomicU64,
+    delivery_clock_epoch: AtomicU64,
     newly_acked_bytes: AtomicU64,
     non_app_limited_acked_bytes: AtomicU64,
     timed_non_app_limited_acked_bytes: AtomicU64,
@@ -61,6 +76,9 @@ struct QuicPathTelemetry {
     delivery_sample_count: AtomicU64,
     non_app_limited_delivery_sample_count: AtomicU64,
     timed_non_app_limited_delivery_sample_count: AtomicU64,
+    timed_non_app_limited_delivery_evidence_acked_bytes: AtomicU64,
+    timed_non_app_limited_delivery_evidence_sample_count: AtomicU64,
+    timed_non_app_limited_delivery_evidence_elapsed_nanos: AtomicU64,
     delivery_evidence_acked_bytes: AtomicU64,
     ack_snapshot_cursor: Mutex<QuicAckTelemetryTotals>,
     sent_bytes: AtomicU64,
@@ -70,6 +88,7 @@ struct QuicPathTelemetry {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct QuicAckTelemetryTotals {
+    delivery_clock_epoch: u64,
     acked_bytes: u64,
     non_app_limited_acked_bytes: u64,
     timed_non_app_limited_acked_bytes: u64,
@@ -77,17 +96,24 @@ struct QuicAckTelemetryTotals {
     sample_count: u64,
     non_app_limited_sample_count: u64,
     timed_non_app_limited_sample_count: u64,
+    timed_non_app_limited_delivery_evidence_acked_bytes: u64,
+    timed_non_app_limited_delivery_evidence_sample_count: u64,
+    timed_non_app_limited_delivery_evidence_elapsed_nanos: u64,
     delivery_evidence_acked_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct QuicCarrierTelemetrySnapshot {
     pub(super) path_epoch: u64,
+    pub(super) delivery_clock_epoch: u64,
     pub(super) bytes_in_flight: Option<u64>,
     pub(super) newly_acked_bytes: Option<u64>,
     pub(super) non_app_limited_acked_bytes: Option<u64>,
     pub(super) timed_non_app_limited_acked_bytes: Option<u64>,
     pub(super) non_app_limited_ack_elapsed: Option<Duration>,
+    pub(super) timed_non_app_limited_delivery_evidence_acked_bytes: u64,
+    pub(super) timed_non_app_limited_delivery_evidence_sample_count: u64,
+    pub(super) timed_non_app_limited_delivery_evidence_elapsed: Duration,
     pub(super) delivery_sample_count: u64,
     pub(super) non_app_limited_delivery_sample_count: u64,
     pub(super) timed_non_app_limited_delivery_sample_count: u64,
@@ -109,6 +135,8 @@ pub(super) struct InstrumentedController {
     ack_batch_latest_non_app_limited_sent: Option<Instant>,
     last_non_app_limited_ack: Option<Instant>,
     non_app_limited_sent_high_watermark: Option<Instant>,
+    delivery_clock_epoch: u64,
+    next_non_app_limited_ack_starts_epoch: bool,
 }
 
 impl std::fmt::Debug for InstrumentedController {
@@ -216,6 +244,7 @@ impl QuicPathTelemetry {
                 continue;
             }
             let totals = QuicAckTelemetryTotals {
+                delivery_clock_epoch: self.delivery_clock_epoch.load(Ordering::Relaxed),
                 acked_bytes: self.newly_acked_bytes.load(Ordering::Relaxed),
                 non_app_limited_acked_bytes: self
                     .non_app_limited_acked_bytes
@@ -232,6 +261,15 @@ impl QuicPathTelemetry {
                     .load(Ordering::Relaxed),
                 timed_non_app_limited_sample_count: self
                     .timed_non_app_limited_delivery_sample_count
+                    .load(Ordering::Relaxed),
+                timed_non_app_limited_delivery_evidence_acked_bytes: self
+                    .timed_non_app_limited_delivery_evidence_acked_bytes
+                    .load(Ordering::Relaxed),
+                timed_non_app_limited_delivery_evidence_sample_count: self
+                    .timed_non_app_limited_delivery_evidence_sample_count
+                    .load(Ordering::Relaxed),
+                timed_non_app_limited_delivery_evidence_elapsed_nanos: self
+                    .timed_non_app_limited_delivery_evidence_elapsed_nanos
                     .load(Ordering::Relaxed),
                 delivery_evidence_acked_bytes: self
                     .delivery_evidence_acked_bytes
@@ -255,19 +293,16 @@ impl QuicPathTelemetry {
         let non_app_limited_acked_bytes = totals
             .non_app_limited_acked_bytes
             .wrapping_sub(cursor.non_app_limited_acked_bytes);
-        let timed_non_app_limited_acked_bytes = totals
-            .timed_non_app_limited_acked_bytes
-            .wrapping_sub(cursor.timed_non_app_limited_acked_bytes);
-        let non_app_limited_ack_elapsed_nanos = totals
-            .non_app_limited_ack_elapsed_nanos
-            .wrapping_sub(cursor.non_app_limited_ack_elapsed_nanos);
+        // Timed fields are cumulative only within `delivery_clock_epoch`.
+        // Returning the coherent current-epoch totals prevents a metrics poll
+        // that spans an app-limited reset from joining two delivery clocks.
+        let timed_non_app_limited_acked_bytes = totals.timed_non_app_limited_acked_bytes;
+        let non_app_limited_ack_elapsed_nanos = totals.non_app_limited_ack_elapsed_nanos;
         let delivery_sample_count = totals.sample_count.wrapping_sub(cursor.sample_count);
         let non_app_limited_delivery_sample_count = totals
             .non_app_limited_sample_count
             .wrapping_sub(cursor.non_app_limited_sample_count);
-        let timed_non_app_limited_delivery_sample_count = totals
-            .timed_non_app_limited_sample_count
-            .wrapping_sub(cursor.timed_non_app_limited_sample_count);
+        let timed_non_app_limited_delivery_sample_count = totals.timed_non_app_limited_sample_count;
         let delivery_evidence_newly_acked_bytes = totals
             .delivery_evidence_acked_bytes
             .wrapping_sub(cursor.delivery_evidence_acked_bytes);
@@ -282,6 +317,7 @@ impl QuicPathTelemetry {
         let bytes_in_flight = self.bytes_in_flight();
         QuicCarrierTelemetrySnapshot {
             path_epoch: self.path_epoch,
+            delivery_clock_epoch: totals.delivery_clock_epoch,
             bytes_in_flight,
             newly_acked_bytes: (newly_acked_bytes > 0).then_some(newly_acked_bytes),
             non_app_limited_acked_bytes: (non_app_limited_acked_bytes > 0)
@@ -290,6 +326,13 @@ impl QuicPathTelemetry {
                 .then_some(timed_non_app_limited_acked_bytes),
             non_app_limited_ack_elapsed: (non_app_limited_ack_elapsed_nanos > 0)
                 .then(|| Duration::from_nanos(non_app_limited_ack_elapsed_nanos)),
+            timed_non_app_limited_delivery_evidence_acked_bytes: totals
+                .timed_non_app_limited_delivery_evidence_acked_bytes,
+            timed_non_app_limited_delivery_evidence_sample_count: totals
+                .timed_non_app_limited_delivery_evidence_sample_count,
+            timed_non_app_limited_delivery_evidence_elapsed: Duration::from_nanos(
+                totals.timed_non_app_limited_delivery_evidence_elapsed_nanos,
+            ),
             delivery_sample_count,
             non_app_limited_delivery_sample_count,
             timed_non_app_limited_delivery_sample_count,
@@ -313,6 +356,27 @@ impl QuicPathTelemetry {
     fn publish_ack_batch(&self, totals: QuicAckTelemetryTotals, in_flight: u64, app_limited: bool) {
         if totals.sample_count > 0 {
             self.ack_snapshot_sequence.fetch_add(1, Ordering::AcqRel);
+            let current_delivery_clock_epoch = self.delivery_clock_epoch.load(Ordering::Relaxed);
+            if totals.delivery_clock_epoch != current_delivery_clock_epoch {
+                debug_assert!(
+                    totals.delivery_clock_epoch > current_delivery_clock_epoch,
+                    "QUIC delivery-clock epochs must advance monotonically"
+                );
+                self.delivery_clock_epoch
+                    .store(totals.delivery_clock_epoch, Ordering::Relaxed);
+                self.timed_non_app_limited_acked_bytes
+                    .store(0, Ordering::Relaxed);
+                self.non_app_limited_ack_elapsed_nanos
+                    .store(0, Ordering::Relaxed);
+                self.timed_non_app_limited_delivery_sample_count
+                    .store(0, Ordering::Relaxed);
+                self.timed_non_app_limited_delivery_evidence_acked_bytes
+                    .store(0, Ordering::Relaxed);
+                self.timed_non_app_limited_delivery_evidence_sample_count
+                    .store(0, Ordering::Relaxed);
+                self.timed_non_app_limited_delivery_evidence_elapsed_nanos
+                    .store(0, Ordering::Relaxed);
+            }
             self.newly_acked_bytes
                 .fetch_add(totals.acked_bytes, Ordering::Relaxed);
             if totals.non_app_limited_sample_count > 0 {
@@ -327,6 +391,21 @@ impl QuicPathTelemetry {
                         .fetch_add(totals.timed_non_app_limited_acked_bytes, Ordering::Relaxed);
                     self.timed_non_app_limited_delivery_sample_count
                         .fetch_add(totals.timed_non_app_limited_sample_count, Ordering::Relaxed);
+                    self.timed_non_app_limited_delivery_evidence_acked_bytes
+                        .fetch_add(
+                            totals.timed_non_app_limited_delivery_evidence_acked_bytes,
+                            Ordering::Relaxed,
+                        );
+                    self.timed_non_app_limited_delivery_evidence_sample_count
+                        .fetch_add(
+                            totals.timed_non_app_limited_delivery_evidence_sample_count,
+                            Ordering::Relaxed,
+                        );
+                    self.timed_non_app_limited_delivery_evidence_elapsed_nanos
+                        .fetch_add(
+                            totals.timed_non_app_limited_delivery_evidence_elapsed_nanos,
+                            Ordering::Relaxed,
+                        );
                 }
             }
             self.delivery_evidence_acked_bytes
@@ -378,6 +457,8 @@ impl InstrumentedController {
             ack_batch_latest_non_app_limited_sent: None,
             last_non_app_limited_ack: None,
             non_app_limited_sent_high_watermark: None,
+            delivery_clock_epoch: 0,
+            next_non_app_limited_ack_starts_epoch: true,
         }
     }
 
@@ -417,6 +498,13 @@ impl InstrumentedController {
         let batch_sent_range = self
             .ack_batch_earliest_non_app_limited_sent
             .zip(self.ack_batch_latest_non_app_limited_sent);
+        if batch_sent_range.is_some() && self.next_non_app_limited_ack_starts_epoch {
+            self.delivery_clock_epoch = self
+                .delivery_clock_epoch
+                .checked_add(1)
+                .expect("QUIC delivery-clock epoch exhausted");
+            self.next_non_app_limited_ack_starts_epoch = false;
+        }
         let non_app_limited_ack_elapsed =
             batch_sent_range.and_then(|(earliest_sent, latest_sent)| {
                 let within_batch_send_elapsed =
@@ -438,6 +526,7 @@ impl InstrumentedController {
                 (!elapsed.is_zero()).then_some(elapsed)
             });
         let mut totals = QuicAckTelemetryTotals {
+            delivery_clock_epoch: self.delivery_clock_epoch,
             acked_bytes: self.ack_batch_acked_bytes,
             non_app_limited_acked_bytes: self.ack_batch_non_app_limited_acked_bytes,
             timed_non_app_limited_acked_bytes: non_app_limited_ack_elapsed
@@ -448,6 +537,9 @@ impl InstrumentedController {
             non_app_limited_sample_count: self.ack_batch_non_app_limited_sample_count,
             timed_non_app_limited_sample_count: non_app_limited_ack_elapsed
                 .map_or(0, |_| self.ack_batch_non_app_limited_sample_count),
+            timed_non_app_limited_delivery_evidence_acked_bytes: 0,
+            timed_non_app_limited_delivery_evidence_sample_count: 0,
+            timed_non_app_limited_delivery_evidence_elapsed_nanos: 0,
             delivery_evidence_acked_bytes: 0,
         };
 
@@ -461,6 +553,7 @@ impl InstrumentedController {
         if app_limited {
             self.last_non_app_limited_ack = None;
             self.non_app_limited_sent_high_watermark = None;
+            self.next_non_app_limited_ack_starts_epoch = true;
         } else if let Some((_, latest_sent)) = batch_sent_range {
             self.last_non_app_limited_ack = Some(now);
             self.non_app_limited_sent_high_watermark = Some(
@@ -473,6 +566,23 @@ impl InstrumentedController {
         totals.delivery_evidence_acked_bytes = self
             .telemetry
             .reconcile_delivery_evidence_ack(self.path_telemetry.path_epoch, totals.acked_bytes);
+        let whole_batch_is_non_app_limited =
+            totals.sample_count > 0 && totals.non_app_limited_sample_count == totals.sample_count;
+        if whole_batch_is_non_app_limited
+            && non_app_limited_ack_elapsed.is_some()
+            && totals.delivery_evidence_acked_bytes > 0
+        {
+            // Product attribution is connection-wide, while app-limited
+            // classification is packet-specific. A mixed batch has no exact
+            // aggregate partition, so conservatively omit it from timed rate
+            // proof instead of guessing or adding an atomic operation per ACK.
+            totals.timed_non_app_limited_delivery_evidence_acked_bytes =
+                totals.delivery_evidence_acked_bytes;
+            totals.timed_non_app_limited_delivery_evidence_sample_count =
+                totals.timed_non_app_limited_sample_count;
+            totals.timed_non_app_limited_delivery_evidence_elapsed_nanos =
+                totals.non_app_limited_ack_elapsed_nanos;
+        }
         self.path_telemetry
             .publish_ack_batch(totals, in_flight, app_limited);
     }
@@ -677,6 +787,8 @@ impl quinn::congestion::Controller for InstrumentedController {
             ack_batch_latest_non_app_limited_sent: self.ack_batch_latest_non_app_limited_sent,
             last_non_app_limited_ack: self.last_non_app_limited_ack,
             non_app_limited_sent_high_watermark: self.non_app_limited_sent_high_watermark,
+            delivery_clock_epoch: self.delivery_clock_epoch,
+            next_non_app_limited_ack_starts_epoch: self.next_non_app_limited_ack_starts_epoch,
         })
     }
 

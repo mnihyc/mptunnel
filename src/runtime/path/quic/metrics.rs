@@ -6,10 +6,12 @@ use crate::model::capacity::{QUIC_INITIAL_WINDOW_PACKETS, QUIC_TIMER_GRANULARITY
 use crate::model::timing::transport_pto_from_ms;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
-use crate::runtime::path::ServerCarrierPathRegistration;
+use crate::protocol::{
+    PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics, UnderlayProtocol,
+};
 use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
 use crate::runtime::path::server_context::ServerPathContext;
+use crate::runtime::path::{CarrierDeliveryRateSample, ServerCarrierPathRegistration};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "lab-diagnostics")]
@@ -79,6 +81,7 @@ pub(super) async fn run_server_quic_path_metrics(
     #[cfg(feature = "lab-diagnostics")]
     let session_id = path_registration.session_id();
     let mut tracker = UdpPathMetricTracker::default();
+    let mut delivery_rate_sample = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_metrics_poll_at = None;
     let delivery_activity = connection.delivery_activity_notify();
@@ -90,6 +93,8 @@ pub(super) async fn run_server_quic_path_metrics(
             return;
         }
         let metrics = connection.tx_metrics(&mut tracker, PathMetricDirection::ServerToClient);
+        let previous_delivery_rate_sample = delivery_rate_sample;
+        delivery_rate_sample = retained_quic_delivery_rate_sample(delivery_rate_sample, metrics);
         #[cfg(feature = "lab-diagnostics")]
         let metrics_poll_at = Instant::now();
         #[cfg(feature = "lab-diagnostics")]
@@ -106,7 +111,9 @@ pub(super) async fn run_server_quic_path_metrics(
             poll_elapsed,
         );
 
-        if quic_path_metrics_should_publish_local_sender(metrics) {
+        if quic_path_metrics_should_publish_local_sender(metrics)
+            || (previous_delivery_rate_sample.is_some() && delivery_rate_sample.is_none())
+        {
             #[cfg(feature = "lab-diagnostics")]
             if let (Some(carrier_elapsed), Some(rate_elapsed)) = (
                 metrics.latest_carrier_ack_elapsed,
@@ -136,11 +143,14 @@ pub(super) async fn run_server_quic_path_metrics(
                     ),
                 );
             }
-            context.reliable_streams.record_local_path_metrics(
-                &path_registration,
-                path_metrics_from_quic_path(path_id, metrics),
-                false,
-            );
+            context
+                .reliable_streams
+                .record_local_path_metrics_with_delivery_rate_sample(
+                    &path_registration,
+                    path_metrics_from_quic_path(path_id, metrics, delivery_rate_sample),
+                    false,
+                    delivery_rate_sample,
+                );
         }
         tokio::select! {
             _ = tokio::time::sleep(quic_path_metrics_poll_interval(metrics)) => {}
@@ -151,6 +161,38 @@ pub(super) async fn run_server_quic_path_metrics(
             }
         }
     }
+}
+
+fn retained_quic_delivery_rate_sample(
+    previous: Option<CarrierDeliveryRateSample>,
+    metrics: UdpPathMetrics,
+) -> Option<CarrierDeliveryRateSample> {
+    let Some(observed_at) = metrics.last_delivery_sample_at else {
+        // The tracker clears this only at a path-evidence epoch reset. That is
+        // the causal boundary that clears a retained expired sidecar.
+        return None;
+    };
+    let Some(expires_at) = metrics.bulk_proof_expires_at else {
+        // Expiry deliberately removes placement authority while retaining the
+        // immutable diagnostic sample. Do not fall through to mutable RTT-aged
+        // PathMetrics or erase its provenance.
+        return previous;
+    };
+    if previous.is_some_and(|sample| sample.observed_at == observed_at) {
+        // App-limited shape polls can refresh current pacing/RTT without a new
+        // qualified ACK sample. Preserve the whole prior sample epoch bundle.
+        return previous;
+    }
+    Some(CarrierDeliveryRateSample {
+        delivery_rate_bps: metrics.delivery_rate_bps.max(1.0).round() as u64,
+        pacing_rate_bps: (metrics.pacing_rate_bps.is_finite() && metrics.pacing_rate_bps > 0.0)
+            .then(|| metrics.pacing_rate_bps.round() as u64),
+        sample_count: u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX),
+        sample_bytes: metrics.delivery_sample_bytes,
+        delivery_window_covered: true,
+        observed_at,
+        expires_at,
+    })
 }
 
 fn quic_path_metrics_should_publish_local_sender(metrics: UdpPathMetrics) -> bool {
@@ -213,28 +255,65 @@ pub(super) fn log_quic_ack_poll_diagnostics(
     }
 }
 
-fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> PathMetrics {
+fn path_metrics_from_quic_path(
+    path_id: PathId,
+    metrics: UdpPathMetrics,
+    delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+) -> PathMetrics {
+    let now = Instant::now();
+    // The retained sidecar is the immutable qualified ACK epoch. Current
+    // shape polls may update RTT, flight, and Quinn pacing, but cannot relabel
+    // those values as belonging to an older delivery sample.
+    let qualified_rate_epoch = delivery_rate_sample.filter(|sample| {
+        sample.sample_count > 0 && sample.sample_bytes > 0 && sample.observed_at <= now
+    });
+    let rate_valid_for_us = qualified_rate_epoch
+        .map(|sample| {
+            u64::try_from(sample.expires_at.saturating_duration_since(now).as_micros())
+                .unwrap_or(u64::MAX)
+        })
+        .unwrap_or(0)
+        .min(PATH_METRICS_MAX_RATE_VALID_FOR_US);
+    let pacing_rate_observed =
+        qualified_rate_epoch.is_some_and(|sample| sample.pacing_rate_bps.is_some());
+    let rate_observed = qualified_rate_epoch.is_some();
+    let delivery_rate_bps = qualified_rate_epoch.map_or_else(
+        || metrics.delivery_rate_bps.max(1.0).round() as u64,
+        |sample| sample.delivery_rate_bps.max(1),
+    );
+    let pacing_rate_bps = if pacing_rate_observed {
+        qualified_rate_epoch
+            .and_then(|sample| sample.pacing_rate_bps)
+            .unwrap_or(delivery_rate_bps)
+    } else {
+        delivery_rate_bps
+    };
     PathMetrics {
         path_id,
         underlay: UnderlayProtocol::Udp,
         direction: metrics.direction,
         metric_epoch: metric_epoch_now(),
-        metric_age_us: metrics
-            .last_delivery_sample_at
-            .map(|seen| {
-                let micros = Instant::now().saturating_duration_since(seen).as_micros();
+        metric_age_us: qualified_rate_epoch
+            .map(|sample| {
+                let seen = sample.observed_at;
+                let micros = now.saturating_duration_since(seen).as_micros();
                 u32::try_from(micros).unwrap_or(u32::MAX)
             })
             .unwrap_or(0),
+        rate_valid_for_us,
+        rate_observed,
         srtt_us: duration_to_micros_u32(metrics.srtt),
         rttvar_us: duration_to_micros_u32(metrics.rttvar),
         jitter_us: duration_to_micros_u32(metrics.rttvar),
-        delivery_rate_bps: metrics.delivery_rate_bps.max(1.0).round() as u64,
-        pacing_rate_bps: metrics.pacing_rate_bps.max(1.0).round() as u64,
+        delivery_rate_bps,
+        pacing_rate_bps,
+        pacing_rate_observed,
         loss_ppm: metrics.loss_ppm.unwrap_or(0),
         ecn_ppm: metrics.ecn_ppm.unwrap_or(0),
         loss_observed: metrics.loss_ppm.is_some(),
         ecn_observed: metrics.ecn_ppm.is_some(),
+        bytes_in_flight_observed: true,
+        queue_observed: true,
         bytes_in_flight: metrics.bytes_in_flight as u64,
         queue_bytes: metrics
             .pending_bytes
@@ -242,13 +321,14 @@ fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> Path
         inflight_limit_bytes: metrics.inflight_hi as u64,
         inflight_hi_bytes: metrics.inflight_hi as u64,
         confidence_ppm: ratio_to_ppm(
-            (metrics.delivery_sample_count as f64 / QUIC_INITIAL_WINDOW_PACKETS as f64)
+            (qualified_rate_epoch.map_or(0, |sample| sample.sample_count) as f64
+                / QUIC_INITIAL_WINDOW_PACKETS as f64)
                 .clamp(0.0, 1.0),
         ),
-        app_limited: metrics.app_limited,
-        has_ack_derived_data_sample: metrics.ack_derived_data_seen,
-        data_sample_count: u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX),
-        data_sample_bytes: metrics.delivery_sample_bytes,
+        app_limited: qualified_rate_epoch.is_none() && metrics.app_limited,
+        has_ack_derived_data_sample: rate_observed || metrics.ack_derived_data_seen,
+        data_sample_count: qualified_rate_epoch.map_or(0, |sample| sample.sample_count),
+        data_sample_bytes: qualified_rate_epoch.map_or(0, |sample| sample.sample_bytes),
     }
 }
 

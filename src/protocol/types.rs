@@ -99,6 +99,13 @@ pub enum PathUsage {
     Backup,
 }
 
+/// Largest remaining delivery-rate authority representable by protocol v8.
+///
+/// This is the three-PTO horizon at the maximum wire RTT and RTT variance:
+/// `(u32::MAX + 4 * u32::MAX + 25_000us) * 3`. A receiver rejects larger
+/// values so an untrusted peer cannot manufacture unbounded rate authority.
+pub const PATH_METRICS_MAX_RATE_VALID_FOR_US: u64 = 64_424_584_425;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathMetrics {
     pub path_id: PathId,
@@ -106,15 +113,33 @@ pub struct PathMetrics {
     pub direction: PathMetricDirection,
     pub metric_epoch: u64,
     pub metric_age_us: u32,
+    /// Non-increasing remaining authority budget for the advertised delivery
+    /// epoch. Forwarders subtract local residence; zero means the rate is
+    /// diagnostic or a startup prior only.
+    pub rate_valid_for_us: u64,
+    /// Whether `delivery_rate_bps` belongs to a measured rate epoch.
+    /// This remains true after expiry so diagnostics can distinguish stale
+    /// measured evidence from an unmeasured startup prior.
+    pub rate_observed: bool,
     pub srtt_us: u32,
     pub rttvar_us: u32,
     pub jitter_us: u32,
     pub delivery_rate_bps: u64,
     pub pacing_rate_bps: u64,
+    /// Whether pacing belongs to the same qualified native delivery epoch.
+    /// This is provenance, not freshness: expired samples retain it for stale
+    /// diagnostics, while authority also requires a nonzero remaining budget.
+    pub pacing_rate_observed: bool,
     pub loss_ppm: u32,
     pub ecn_ppm: u32,
     pub loss_observed: bool,
     pub ecn_observed: bool,
+    /// Whether `bytes_in_flight` is an actual carrier observation.
+    /// Numeric zero remains a valid observation when this is true.
+    pub bytes_in_flight_observed: bool,
+    /// Whether `queue_bytes` is an actual carrier observation.
+    /// Numeric zero remains a valid observation when this is true.
+    pub queue_observed: bool,
     pub bytes_in_flight: u64,
     pub queue_bytes: u64,
     pub inflight_limit_bytes: u64,

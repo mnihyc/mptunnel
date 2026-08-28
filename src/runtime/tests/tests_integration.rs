@@ -1968,6 +1968,10 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         ResourceLimits::default(),
     )
     .expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+    // This is a synthetic current delivery measurement used by the selection
+    // under test. Seed it after carrier probing so its frozen rate-evidence
+    // epoch cannot expire while unrelated path setup is still in progress.
     context.mark_tcp_path_delivery(
         1,
         PathDeliveryStats {
@@ -1976,7 +1980,6 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
             last_payload_at: Some(Instant::now() + Duration::from_millis(100)),
         },
     );
-    probe_client_paths(&context, Duration::from_secs(2)).await;
     let health_context = context.clone();
     let ingress_listener = TcpListener::bind("127.0.0.1:0")
         .await

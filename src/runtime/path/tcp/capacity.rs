@@ -526,6 +526,7 @@ fn tcp_capacity_receipt_metrics(
         native.apply_transport_shape(&mut metrics);
         metrics.metric_epoch = metric_epoch_now();
         metrics.metric_age_us = 0;
+        metrics.rate_valid_for_us = 0;
     }
     let rate_bps = receipt_rate_bps.max(1);
     metrics.path_id = path_id;
@@ -533,6 +534,11 @@ fn tcp_capacity_receipt_metrics(
     metrics.direction = direction;
     metrics.delivery_rate_bps = rate_bps;
     metrics.pacing_rate_bps = rate_bps;
+    // The receipt becomes authority only after the caller installs its typed
+    // proof candidate and immutable deadline into path health.
+    metrics.rate_valid_for_us = 0;
+    metrics.rate_observed = true;
+    metrics.pacing_rate_observed = false;
     metrics.has_ack_derived_data_sample = true;
     metrics.data_sample_count = metrics.data_sample_count.max(1);
     metrics.data_sample_bytes = metrics.data_sample_bytes.max(received_bytes);
@@ -561,15 +567,20 @@ fn portable_tcp_receipt_metrics(path_id: PathId, direction: PathMetricDirection)
         direction,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
+        rate_valid_for_us: 0,
+        rate_observed: false,
         srtt_us: initial_rtt_us,
         rttvar_us: initial_rtt_us / 2,
         jitter_us: initial_rtt_us / 2,
         delivery_rate_bps: 1,
         pacing_rate_bps: 1,
+        pacing_rate_observed: false,
         loss_ppm: 0,
         ecn_ppm: 0,
         loss_observed: false,
         ecn_observed: false,
+        bytes_in_flight_observed: false,
+        queue_observed: false,
         bytes_in_flight: 0,
         queue_bytes: 0,
         inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,

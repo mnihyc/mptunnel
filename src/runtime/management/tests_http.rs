@@ -345,12 +345,28 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("state.chartSamples.splice(0, removeCount);"));
     assert!(DASHBOARD_JS.contains("state.trafficChartMode === \"speed\""));
     assert!(DASHBOARD_JS.contains("direction === \"server_to_client\""));
-    assert!(DASHBOARD_JS.contains("formatRttMicros(path.rttvar_us)"));
-    assert!(DASHBOARD_JS.contains("formatBytes(path.inflight_limit_bytes)"));
-    assert!(DASHBOARD_JS.contains("formatDuration(finiteNumber(path.metric_age_us) / 1000)"));
+    assert!(DASHBOARD_JS.contains("function formatOptionalMetric(value, formatter, stale)"));
+    assert!(DASHBOARD_JS.contains("function formatObservedLatency(milliseconds)"));
+    assert!(DASHBOARD_JS.contains("function formatObservedLatencyMicros(microseconds)"));
+    assert!(DASHBOARD_JS.contains("if (!metricAvailable(value)) return \"-\";"));
+    assert!(DASHBOARD_JS.contains("return stale ? \"~\" + formatted : formatted;"));
+    assert!(DASHBOARD_JS.contains("function effectivePeerMetricAgeMs(path, result)"));
+    assert!(DASHBOARD_JS.contains("function peerResultResidenceMs(result)"));
+    assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.lastReceivedAt)"));
+    assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.peerResultReceivedAt)"));
+    assert!(DASHBOARD_JS.contains("Math.max(0, generatedAt - receivedAt)"));
+    assert!(!DASHBOARD_JS.contains("Math.max(0, Date.now() - receivedAt)"));
+    assert!(DASHBOARD_JS.contains("finiteNumber(ageMs) >= finiteNumber(horizonMs)"));
+    assert!(DASHBOARD_JS.contains("path.active_port"));
+    assert!(DASHBOARD_JS.contains("const snapshotStale = statusResidenceMs() >= staleAfterMs();"));
+    assert!(
+        DASHBOARD_JS
+            .contains("const snapshotStale = peerResultResidenceMs(result) >= staleAfterMs();")
+    );
+    assert!(DASHBOARD_JS.contains("const portStale = path.active_port_retired || snapshotStale;"));
     for (heading, expected_count) in [
         (
-            r#"title="Configured path / endpoint / Path ID / physical carrier instance">Path</th>"#,
+            r#"title="Configured path / endpoint / active observed hopping port / Path ID / physical carrier instance">Path</th>"#,
             2,
         ),
         (
@@ -362,7 +378,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
             2,
         ),
         (
-            r#"title="Locally configured path / endpoint / peer Path ID / metric epoch">Path</th>"#,
+            r#"title="Locally configured path / endpoint / peer Path ID / metric epoch / active observed hopping port">Path</th>"#,
             2,
         ),
         (
@@ -379,7 +395,29 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_HTML.contains(r#"<th scope="col">Source</th>"#));
     assert!(!DASHBOARD_HTML.contains("Queue / native / MPP / cap"));
     assert!(DASHBOARD_CSS.contains("min-width: 1540px;"));
-    assert!(DASHBOARD_JS.contains("path.endpoint || \"Local mapping unavailable\""));
+    assert_eq!(
+        DASHBOARD_HTML
+            .matches("records-table--peer records-table--paths-complete")
+            .count(),
+        2
+    );
+    assert!(
+        DASHBOARD_CSS
+            .contains(".records-table--peer {\n  min-width: 1050px;\n  table-layout: fixed;\n}")
+    );
+    for peer_column in [
+        "state", "path", "carrier", "use", "latency", "rate", "loss", "flight", "evidence",
+    ] {
+        assert_eq!(
+            DASHBOARD_HTML
+                .matches(&format!("peer-col--{peer_column}"))
+                .count(),
+            2,
+            "peer table column sizing must cover both surfaces: {peer_column}"
+        );
+    }
+    assert!(DASHBOARD_JS.contains("path.endpoint || \"-\""));
+    assert!(!DASHBOARD_JS.contains("Local mapping unavailable"));
     assert!(DASHBOARD_JS.contains("formatIdentifier(path.path)"));
     assert!(DASHBOARD_JS.contains("function formatSessionId(value)"));
     assert!(
@@ -448,7 +486,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         .expect("end of local path row renderer")
         .0;
     let peer_row = DASHBOARD_JS
-        .split_once("function appendPeerPathRow(body, pathValue)")
+        .split_once("function appendPeerPathRow(body, pathValue, result)")
         .expect("peer path row renderer")
         .1
         .split_once("function renderPeerPaths")
@@ -488,6 +526,28 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         .find("outbound-services-title")
         .expect("outbound section");
     assert!(peer < connections && connections < outbound);
+    assert!(DASHBOARD_JS.contains("identityDetail.join(\" · \")"));
+    assert!(DASHBOARD_JS.contains("\"Usage direction: \" + directionLabel(path.usage_direction)"));
+    assert!(DASHBOARD_JS.contains("\"Metric direction: \" + directionLabel(path.direction)"));
+    assert!(!local_row.contains("path.direction ? directionLabel(path.direction) : \"-\""));
+    assert!(!peer_row.contains("path.direction ? directionLabel(path.direction) : \"-\""));
+    assert!(DASHBOARD_JS.contains("titleCase(path.delivery_rate_source)"));
+    assert!(DASHBOARD_JS.contains("titleCase(path.delivery_rate_scope)"));
+    assert!(DASHBOARD_JS.contains("formatOptionalFlag(path.native_delivery_observed)"));
+    assert!(DASHBOARD_JS.contains("formatOptionalFlag(path.product_delivery_observed)"));
+    assert!(DASHBOARD_JS.contains("formatOptionalFlag(path.ack_derived_data_observed)"));
+    for verbose_metric_prefix in [
+        r#""Pace " + formatOptionalMetric"#,
+        r#""Queue " + formatOptionalMetric"#,
+        r#""Conf " + formatOptionalMetric"#,
+        r#""Age " + formatOptionalMetric"#,
+        r#""Active port " + formatOptionalMetric"#,
+    ] {
+        assert!(
+            !local_row.contains(verbose_metric_prefix) && !peer_row.contains(verbose_metric_prefix),
+            "metric tuples must stay compact; prose belongs in tooltips: {verbose_metric_prefix}"
+        );
+    }
     assert_eq!(
         DASHBOARD_HTML.matches("overview-connections-title").count(),
         2

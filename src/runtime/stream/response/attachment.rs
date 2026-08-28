@@ -23,6 +23,7 @@ use crate::runtime::stream::feedback::{
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> CarrierPathInstanceId {
@@ -58,6 +59,45 @@ pub(in crate::runtime) struct ResponseOutputAttachment {
     pub(in crate::runtime::stream) local_policy: PathPolicy,
     pub(in crate::runtime::stream) commands: ReliablePathCommandSender,
     pub(in crate::runtime::stream) state: ResponseOutputAttachmentState,
+}
+
+/// Per-output Product goodput proven by one exact Data-ACK epoch.
+///
+/// The deadline is frozen when the ACK is observed. Retaining an expired
+/// value is diagnostic only; every authority consumer must ask this epoch for
+/// its value at the same scheduling instant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ResponseProductRateEpoch {
+    pub(super) rate_bps: f64,
+    pub(super) sample_count: u32,
+    pub(super) sample_bytes: u64,
+    pub(super) observed_at: Instant,
+    pub(super) expires_at: Instant,
+}
+
+impl ResponseProductRateEpoch {
+    pub(super) fn new(
+        rate_bps: f64,
+        sample_count: u32,
+        sample_bytes: u64,
+        observed_at: Instant,
+        freshness_horizon: Duration,
+    ) -> Option<Self> {
+        (rate_bps.is_finite() && rate_bps > 0.0)
+            .then(|| observed_at.checked_add(freshness_horizon))
+            .flatten()
+            .map(|expires_at| Self {
+                rate_bps,
+                sample_count,
+                sample_bytes,
+                observed_at,
+                expires_at,
+            })
+    }
+
+    pub(super) fn fresh_rate_at(self, now: Instant) -> Option<f64> {
+        (self.observed_at <= now && now < self.expires_at).then_some(self.rate_bps)
+    }
 }
 
 fn apply_attachment_state(
@@ -108,11 +148,9 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// without closing it or interfering with native carrier recovery.
     pub(super) stale_for_original_data: bool,
     pub(super) bytes_in_flight: u64,
-    pub(super) product_progress_rate_bps: Option<f64>,
-    pub(super) delivery_rate_bps: Option<f64>,
-    /// TCP per-flow goodput from exact OriginalData ACKs. It is not carrier
-    /// capacity; assignment-time evidence never publishes a rate or RTT.
-    pub(super) tcp_ack_clock_rate_bps: Option<f64>,
+    /// Exact OriginalData ACK goodput. It is per-flow evidence, not carrier
+    /// capacity, and its immutable deadline owns all placement authority.
+    pub(super) product_rate_epoch: Option<ResponseProductRateEpoch>,
     /// Per-output ACK clock; product ordering timestamps can be advanced when a
     /// different path closes a hole and therefore cannot own this boundary.
     pub(super) tcp_product_rate_evidence: Option<ResponseAckClockRateEvidence>,
@@ -523,9 +561,7 @@ impl ResponseStreamBinding {
                 entry.original_data_in_flight_bytes = 0;
                 entry.stale_for_original_data = false;
                 entry.bytes_in_flight = 0;
-                entry.product_progress_rate_bps = None;
-                entry.delivery_rate_bps = None;
-                entry.tcp_ack_clock_rate_bps = None;
+                entry.product_rate_epoch = None;
                 entry.tcp_product_rate_evidence = None;
                 entry.srtt_ms = None;
                 entry.delivery_samples = 0;
@@ -572,9 +608,7 @@ impl ResponseStreamBinding {
                 original_data_in_flight_bytes: 0,
                 stale_for_original_data: false,
                 bytes_in_flight: 0,
-                product_progress_rate_bps: None,
-                delivery_rate_bps: None,
-                tcp_ack_clock_rate_bps: None,
+                product_rate_epoch: None,
                 tcp_product_rate_evidence: None,
                 srtt_ms: None,
                 delivery_samples: 0,

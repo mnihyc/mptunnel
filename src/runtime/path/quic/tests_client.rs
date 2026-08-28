@@ -180,6 +180,21 @@ impl ClientOpenRaceFixture {
 async fn server_quic_observed_ingress_captures_the_real_authenticated_carrier_peer() {
     let fixture = ClientOpenRaceFixture::new().await;
     let accepted = fixture.establish_current().await;
+    assert_eq!(
+        fixture.session.runtime.peer_status.live_path_active_port(
+            fixture.session.runtime.session_id,
+            UnderlayProtocol::Udp,
+            fixture.session.runtime.config_index,
+        ),
+        Some(
+            fixture
+                .server_endpoint
+                .local_addr()
+                .expect("server QUIC endpoint")
+                .port()
+        ),
+        "management reads the authenticated live assignment, not configuration or Quinn's canonical locator",
+    );
     let client_bind = fixture
         .session
         .connection

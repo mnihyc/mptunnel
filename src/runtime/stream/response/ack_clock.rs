@@ -3,10 +3,15 @@
 //! Data ACK timing informs path completion estimates. It never creates a
 //! congestion window or replaces TCP/QUIC congestion control and recovery.
 
-use super::attachment::ResponseStreamOutputs;
+use super::attachment::{
+    ResponseProductRateEpoch, ResponseStreamOutputEntry, ResponseStreamOutputs,
+};
+use super::evidence::server_output_local_path_metrics;
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, PathRateSample};
 use crate::model::path::CarrierPathKey;
+use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::protocol::UnderlayProtocol;
+use crate::runtime::path::model::default_path_srtt_ms;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -23,6 +28,7 @@ pub(in crate::runtime) struct ResponseAckClockRateEvidence {
     previous_window_acked_at: Option<Instant>,
     goodput_last_acked_at: Option<Instant>,
     goodput_bytes: u64,
+    goodput_sample_count: u32,
     goodput_elapsed: Duration,
 }
 
@@ -41,6 +47,7 @@ impl ResponseAckClockRateEvidence {
             previous_window_acked_at: None,
             goodput_last_acked_at: None,
             goodput_bytes: 0,
+            goodput_sample_count: 0,
             goodput_elapsed: Duration::ZERO,
         }
     }
@@ -53,13 +60,16 @@ impl ResponseAckClockRateEvidence {
         let elapsed = acked_at.saturating_duration_since(previous_acked_at);
         if elapsed > RESPONSE_ACK_CLOCK_GOODPUT_MAX_ELAPSED {
             self.goodput_bytes = 0;
+            self.goodput_sample_count = 0;
             self.goodput_elapsed = Duration::ZERO;
             return;
         }
         self.goodput_bytes = self.goodput_bytes.saturating_add(bytes);
+        self.goodput_sample_count = self.goodput_sample_count.saturating_add(1);
         self.goodput_elapsed = self.goodput_elapsed.saturating_add(elapsed);
         while self.goodput_elapsed > RESPONSE_ACK_CLOCK_GOODPUT_MAX_ELAPSED {
             self.goodput_bytes = self.goodput_bytes.div_ceil(2);
+            self.goodput_sample_count = self.goodput_sample_count.div_ceil(2);
             self.goodput_elapsed /= 2;
         }
     }
@@ -70,14 +80,9 @@ impl ResponseAckClockRateEvidence {
             .flatten()
     }
 
-    pub(super) fn fresh_goodput_sample(
-        &self,
-        now: Instant,
-        freshness_horizon: Duration,
-    ) -> Option<PathRateSample> {
-        self.goodput_last_acked_at
-            .filter(|acked_at| now.saturating_duration_since(*acked_at) < freshness_horizon)
-            .and_then(|_| self.goodput_sample())
+    fn goodput_epoch_sample(&self) -> Option<(PathRateSample, u32)> {
+        self.goodput_sample()
+            .map(|sample| (sample, self.goodput_sample_count))
     }
 
     #[cfg(test)]
@@ -127,6 +132,43 @@ impl ResponseAckClockRateEvidence {
     }
 }
 
+fn response_product_rate_freshness_horizon(entry: &ResponseStreamOutputEntry) -> Duration {
+    // Capture the local carrier timing visible in this exact Data-ACK
+    // transaction. The resulting epoch stores an absolute deadline, so later
+    // transport-shape polls cannot rewrite its authority.
+    let (srtt, rttvar) = server_output_local_path_metrics(entry).map_or_else(
+        || {
+            let srtt = Duration::from_secs_f64(
+                entry
+                    .srtt_ms
+                    .unwrap_or_else(default_path_srtt_ms)
+                    .max(0.001)
+                    / 1000.0,
+            );
+            (srtt, srtt / 8)
+        },
+        |metrics| {
+            (
+                Duration::from_micros(u64::from(metrics.metrics.srtt_us.max(1))),
+                Duration::from_micros(u64::from(metrics.metrics.rttvar_us)),
+            )
+        },
+    );
+    transport_rate_sample_freshness_horizon(srtt, rttvar)
+}
+
+fn install_response_product_rate_epoch(
+    entry: &mut ResponseStreamOutputEntry,
+    rate_bps: f64,
+    sample_count: u32,
+    sample_bytes: u64,
+    now: Instant,
+) {
+    let freshness_horizon = response_product_rate_freshness_horizon(entry);
+    entry.product_rate_epoch =
+        ResponseProductRateEpoch::new(rate_bps, sample_count, sample_bytes, now, freshness_horizon);
+}
+
 /// Applies exact Data ACK samples while the caller holds the output lock.
 pub(super) fn apply_response_ack_clock_release_samples(
     outputs: &mut ResponseStreamOutputs,
@@ -144,15 +186,28 @@ pub(super) fn apply_response_ack_clock_release_samples(
 
         match entry.key.underlay {
             UnderlayProtocol::Tcp => {
+                if entry
+                    .product_rate_epoch
+                    .is_some_and(|epoch| epoch.fresh_rate_at(now).is_none())
+                {
+                    // The first post-expiry ACK only seeds the new ACK clock;
+                    // no byte or elapsed-time evidence crosses epochs.
+                    entry.product_rate_epoch = None;
+                    entry.tcp_product_rate_evidence =
+                        Some(ResponseAckClockRateEvidence::new(first_sent_at));
+                }
                 let evidence = entry
                     .tcp_product_rate_evidence
                     .get_or_insert_with(|| ResponseAckClockRateEvidence::new(first_sent_at));
                 evidence.observe_with_fresh_bytes(bytes, bytes, first_sent_at, last_sent_at, now);
-                if let Some(sample) = evidence.goodput_sample() {
-                    let rate_bps = sample.rate_bps();
-                    entry.tcp_ack_clock_rate_bps = Some(rate_bps);
-                    entry.product_progress_rate_bps = Some(rate_bps);
-                    entry.delivery_rate_bps = Some(rate_bps);
+                if let Some((sample, sample_count)) = evidence.goodput_epoch_sample() {
+                    install_response_product_rate_epoch(
+                        entry,
+                        sample.rate_bps(),
+                        sample_count,
+                        sample.bytes(),
+                        now,
+                    );
                 }
             }
             UnderlayProtocol::Udp => {
@@ -165,11 +220,25 @@ pub(super) fn apply_response_ack_clock_release_samples(
                 let carrier_app_limited = entry
                     .local_path_metrics
                     .is_some_and(|metrics| metrics.metrics.app_limited);
-                entry.product_progress_rate_bps = Some(match entry.product_progress_rate_bps {
-                    Some(previous) if carrier_app_limited => previous.max(sample_bps),
-                    Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                let previous_fresh_epoch = entry
+                    .product_rate_epoch
+                    .filter(|epoch| epoch.fresh_rate_at(now).is_some());
+                let rate_bps = match previous_fresh_epoch {
+                    Some(previous) if carrier_app_limited => previous.rate_bps.max(sample_bps),
+                    Some(previous) => previous.rate_bps.mul_add(0.75, sample_bps * 0.25),
                     None => sample_bps,
-                });
+                };
+                let sample_count =
+                    previous_fresh_epoch.map_or(1, |epoch| epoch.sample_count.saturating_add(1));
+                let sample_bytes = previous_fresh_epoch
+                    .map_or(bytes, |epoch| epoch.sample_bytes.saturating_add(bytes));
+                install_response_product_rate_epoch(
+                    entry,
+                    rate_bps,
+                    sample_count,
+                    sample_bytes,
+                    now,
+                );
             }
         }
     }

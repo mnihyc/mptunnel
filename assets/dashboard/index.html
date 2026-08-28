@@ -329,7 +329,7 @@
         <div class="data-section__header data-section__header--actions">
           <div>
             <h2 id="overview-paths-title">Path health and capacity</h2>
-            <p class="section-meta">Live transport metrics, ownership, and configured TCP carrier bounds.</p>
+            <p class="section-meta">Live transport metrics, ownership, and configured TCP carrier bounds. ~ = stale.</p>
           </div>
           <span id="overview-paths-count" class="badge badge--neutral">0 paths</span>
         </div>
@@ -338,15 +338,15 @@
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col" title="Configured path / endpoint / Path ID / physical carrier instance">Path</th>
+                <th scope="col" title="Configured path / endpoint / active observed hopping port / Path ID / physical carrier instance">Path</th>
                 <th scope="col" title="Service name / service kind / MPP session (16-hex)">Service</th>
                 <th scope="col" title="Carrier / TCP member and pool size">Carrier</th>
-                <th scope="col" title="Path usage / metric direction / source / policy">Use</th>
-                <th scope="col" title="Round-trip time / jitter">Latency</th>
-                <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                <th scope="col" title="Path usage and its traffic direction / policy">Use</th>
+                <th scope="col" title="Round-trip time / jitter / evidence source">Latency</th>
+                <th scope="col" title="Delivery rate / native pacing when observed / independent metric direction / provenance / scope">Rate</th>
                 <th scope="col" title="Loss / ECN">Loss</th>
                 <th scope="col" title="Queue / native carrier flight / MPP data flight / native limit">Flight</th>
-                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
+                <th scope="col" title="Confidence / samples / bytes / effective age and freshness window / native, Product, ACK and app-limited flags">Evidence</th>
                 <th scope="col" title="Active flows / latency-sensitive flows">Flows</th>
               </tr>
             </thead>
@@ -370,18 +370,29 @@
           </div>
         </div>
         <div class="table-wrap table-wrap--records">
-          <table class="records-table records-table--peer">
+          <table class="records-table records-table--peer records-table--paths-complete">
+            <colgroup>
+              <col class="peer-col--state">
+              <col class="peer-col--path">
+              <col class="peer-col--carrier">
+              <col class="peer-col--use">
+              <col class="peer-col--latency">
+              <col class="peer-col--rate">
+              <col class="peer-col--loss">
+              <col class="peer-col--flight">
+              <col class="peer-col--evidence">
+            </colgroup>
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch">Path</th>
+                <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch / active observed hopping port">Path</th>
                 <th scope="col" title="Carrier">Carrier</th>
-                <th scope="col" title="Path usage / metric direction">Use</th>
-                <th scope="col" title="Round-trip time / RTT variation / jitter">Latency</th>
-                <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                <th scope="col" title="Path usage and its traffic direction">Use</th>
+                <th scope="col" title="Round-trip time / RTT variation / jitter / peer-advisory source">Latency</th>
+                <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Rate</th>
                 <th scope="col" title="Loss / ECN">Loss</th>
                 <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
-                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
+                <th scope="col" title="Confidence / samples / bytes / wire age plus cached residence / freshness window / observation flags">Evidence</th>
               </tr>
             </thead>
             <tbody id="overview-peer-paths-body"></tbody>
@@ -567,15 +578,15 @@
             <thead>
               <tr>
                 <th scope="col">State</th>
-                <th scope="col" title="Configured path / endpoint / Path ID / physical carrier instance">Path</th>
+                <th scope="col" title="Configured path / endpoint / active observed hopping port / Path ID / physical carrier instance">Path</th>
                 <th scope="col" title="Service name / service kind / MPP session (16-hex)">Service</th>
                 <th scope="col" title="Carrier / TCP member and pool size">Carrier</th>
-                <th scope="col" title="Path usage / metric direction / source / policy">Use</th>
-                <th scope="col" title="Round-trip time / jitter">Latency</th>
-                <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                <th scope="col" title="Path usage and its traffic direction / policy">Use</th>
+                <th scope="col" title="Round-trip time / jitter / evidence source">Latency</th>
+                <th scope="col" title="Delivery rate / native pacing when observed / independent metric direction / provenance / scope">Rate</th>
                 <th scope="col" title="Loss / ECN">Loss</th>
                 <th scope="col" title="Queue / native carrier flight / MPP data flight / native limit">Flight</th>
-                <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
+                <th scope="col" title="Confidence / samples / bytes / effective age and freshness window / native, Product, ACK and app-limited flags">Evidence</th>
                 <th scope="col" title="Active flows / latency-sensitive flows">Flows</th>
               </tr>
             </thead>
@@ -665,18 +676,29 @@
           <div id="peer-result" class="peer-result" hidden>
             <dl id="peer-result-summary" class="metric-list metric-list--compact"></dl>
             <div class="table-wrap table-wrap--records">
-              <table class="records-table records-table--peer">
+              <table class="records-table records-table--peer records-table--paths-complete">
+                <colgroup>
+                  <col class="peer-col--state">
+                  <col class="peer-col--path">
+                  <col class="peer-col--carrier">
+                  <col class="peer-col--use">
+                  <col class="peer-col--latency">
+                  <col class="peer-col--rate">
+                  <col class="peer-col--loss">
+                  <col class="peer-col--flight">
+                  <col class="peer-col--evidence">
+                </colgroup>
                 <thead>
                   <tr>
                     <th scope="col">State</th>
-                    <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch">Path</th>
+                    <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch / active observed hopping port">Path</th>
                     <th scope="col" title="Carrier">Carrier</th>
-                    <th scope="col" title="Path usage / metric direction">Use</th>
-                    <th scope="col" title="Round-trip time / RTT variation / jitter">Latency</th>
-                    <th scope="col" title="Delivery rate / pacing rate">Rate</th>
+                    <th scope="col" title="Path usage and its traffic direction">Use</th>
+                    <th scope="col" title="Round-trip time / RTT variation / jitter / peer-advisory source">Latency</th>
+                    <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Rate</th>
                     <th scope="col" title="Loss / ECN">Loss</th>
                     <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
-                    <th scope="col" title="Confidence / samples / sample bytes / sample age / application limited">Evidence</th>
+                    <th scope="col" title="Confidence / samples / bytes / wire age plus cached residence / freshness window / observation flags">Evidence</th>
                   </tr>
                 </thead>
                 <tbody id="peer-paths-body"></tbody>

@@ -147,6 +147,10 @@ fn quic_combined_poll_excludes_untimed_ack_bytes_from_rate() {
     combined.non_app_limited_acked_bytes = Some(total_bytes);
     combined.timed_non_app_limited_acked_bytes = Some(timed_bytes);
     combined.non_app_limited_ack_elapsed = Some(Duration::from_millis(20));
+    combined.timed_non_app_limited_delivery_evidence_acked_bytes = timed_bytes;
+    combined.timed_non_app_limited_delivery_evidence_sample_count =
+        QUIC_INITIAL_WINDOW_PACKETS as u64;
+    combined.timed_non_app_limited_delivery_evidence_elapsed = Duration::from_millis(20);
     combined.delivery_sample_count = (QUIC_INITIAL_WINDOW_PACKETS * 2) as u64;
     combined.non_app_limited_delivery_sample_count = (QUIC_INITIAL_WINDOW_PACKETS * 2) as u64;
     combined.timed_non_app_limited_delivery_sample_count = QUIC_INITIAL_WINDOW_PACKETS as u64;
@@ -164,6 +168,108 @@ fn quic_combined_poll_excludes_untimed_ack_bytes_from_rate() {
 }
 
 #[test]
+fn mixed_app_limited_batch_keeps_reachability_but_cannot_enter_product_rate_tuple() {
+    let sample_floor = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+    let congestion = quic_congestion(sample_floor, Some(100_000_000));
+    let mut stats = quinn::ConnectionStats::default();
+    stats.path.rtt = Duration::from_millis(50);
+    stats.path.cwnd = sample_floor;
+    stats.path.current_mtu = 1400;
+    let mut tracker = QuicPathMetricTracker::default();
+    let _ = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
+    let mut mixed = with_delivery_evidence_written(congestion, 64 * 1024);
+    mixed.newly_acked_bytes = Some(64 * 1024);
+    mixed.delivery_evidence_newly_acked_bytes = Some(64 * 1024);
+    mixed.non_app_limited_acked_bytes = Some(32 * 1024);
+    mixed.timed_non_app_limited_acked_bytes = Some(32 * 1024);
+    mixed.non_app_limited_ack_elapsed = Some(Duration::from_millis(20));
+    mixed.delivery_sample_count = 2;
+    mixed.non_app_limited_delivery_sample_count = 1;
+    mixed.timed_non_app_limited_delivery_sample_count = 1;
+    mixed.app_limited = true;
+
+    let observed = tracker.observe(stats, mixed, PathMetricDirection::ServerToClient);
+    assert!(observed.ack_derived_data_seen);
+    assert_eq!(observed.delivery_sample_count, 0);
+    assert_eq!(observed.delivery_sample_bytes, 0);
+    assert!(tracker.pending_delivery_sample.is_none());
+}
+
+#[test]
+fn control_only_clock_prefix_is_partition_invariant_for_product_rate() {
+    let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+    let congestion = quic_congestion(sample_bytes, Some(100_000_000));
+    let mut stats = quinn::ConnectionStats::default();
+    stats.path.rtt = Duration::from_millis(50);
+    stats.path.cwnd = sample_bytes;
+    stats.path.current_mtu = 1400;
+    let base = Instant::now();
+    let published_at = base + Duration::from_millis(100);
+
+    let mut control_only = congestion;
+    control_only.newly_acked_bytes = Some(1200);
+    control_only.non_app_limited_acked_bytes = Some(1200);
+    control_only.timed_non_app_limited_acked_bytes = Some(1200);
+    control_only.non_app_limited_ack_elapsed = Some(Duration::from_millis(10));
+    control_only.delivery_sample_count = 1;
+    control_only.non_app_limited_delivery_sample_count = 1;
+    control_only.timed_non_app_limited_delivery_sample_count = 1;
+    control_only.app_limited = false;
+    let final_snapshot = with_acked_bytes_elapsed(
+        with_delivery_evidence_written(control_only, sample_bytes),
+        sample_bytes,
+        QUIC_INITIAL_WINDOW_PACKETS as u64,
+        Duration::from_millis(100),
+    );
+
+    let mut split = QuicPathMetricTracker::default();
+    let _ = split.observe_at(stats, congestion, PathMetricDirection::ServerToClient, base);
+    let control = split.observe_at(
+        stats,
+        control_only,
+        PathMetricDirection::ServerToClient,
+        base + Duration::from_millis(10),
+    );
+    assert_eq!(control.delivery_sample_count, 0);
+    let split_published = split.observe_at(
+        stats,
+        final_snapshot,
+        PathMetricDirection::ServerToClient,
+        published_at,
+    );
+
+    let mut coalesced = QuicPathMetricTracker::default();
+    let _ = coalesced.observe_at(stats, congestion, PathMetricDirection::ServerToClient, base);
+    let coalesced_published = coalesced.observe_at(
+        stats,
+        final_snapshot,
+        PathMetricDirection::ServerToClient,
+        published_at,
+    );
+
+    assert_eq!(
+        split_published.latest_delivery_sample_bytes,
+        coalesced_published.latest_delivery_sample_bytes
+    );
+    assert_eq!(
+        split_published.latest_delivery_sample_count,
+        coalesced_published.latest_delivery_sample_count
+    );
+    assert_eq!(
+        split_published.latest_carrier_ack_elapsed,
+        coalesced_published.latest_carrier_ack_elapsed
+    );
+    assert_eq!(
+        split_published.delivery_rate_bps.to_bits(),
+        coalesced_published.delivery_rate_bps.to_bits()
+    );
+    assert_eq!(
+        split_published.bulk_proof_expires_at,
+        coalesced_published.bulk_proof_expires_at
+    );
+}
+
+#[test]
 fn quic_split_ack_polls_sum_carrier_elapsed_before_one_timer_clamp() {
     let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
     let chunk_bytes = sample_bytes / 2;
@@ -175,32 +281,61 @@ fn quic_split_ack_polls_sum_carrier_elapsed_before_one_timer_clamp() {
     let mut tracker = QuicPathMetricTracker::default();
     let _ = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
 
-    let first = tracker.observe(
-        stats,
-        with_acked_bytes_elapsed(
-            with_delivery_evidence_written(congestion, sample_bytes),
-            chunk_bytes,
-            (QUIC_INITIAL_WINDOW_PACKETS / 2) as u64,
-            Duration::from_millis(20),
-        ),
-        PathMetricDirection::ServerToClient,
+    let mut carrier = with_acked_bytes_elapsed(
+        with_delivery_evidence_written(congestion, sample_bytes),
+        chunk_bytes,
+        (QUIC_INITIAL_WINDOW_PACKETS / 2) as u64,
+        Duration::from_millis(20),
     );
+    let first = tracker.observe(stats, carrier, PathMetricDirection::ServerToClient);
     assert_eq!(first.delivery_sample_count, 0);
-    let measured = tracker.observe(
-        stats,
-        with_acked_bytes_elapsed(
-            with_delivery_evidence_written(congestion, sample_bytes),
-            chunk_bytes,
-            (QUIC_INITIAL_WINDOW_PACKETS / 2) as u64,
-            Duration::from_millis(30),
-        ),
-        PathMetricDirection::ServerToClient,
+    carrier = with_acked_bytes_elapsed(
+        with_delivery_evidence_written(carrier, sample_bytes),
+        chunk_bytes,
+        (QUIC_INITIAL_WINDOW_PACKETS / 2) as u64,
+        Duration::from_millis(30),
     );
+    let measured = tracker.observe(stats, carrier, PathMetricDirection::ServerToClient);
 
     assert_eq!(measured.delivery_sample_bytes, sample_bytes);
     assert_eq!(
         measured.delivery_rate_bps.round() as u64,
         (sample_bytes as f64 * 8.0 / 0.050).round() as u64
+    );
+}
+
+#[test]
+fn repeated_snapshot_of_one_delivery_clock_total_is_consumed_once() {
+    let sample_floor = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+    let fragment_bytes = 16 * 1024_u64;
+    let congestion = quic_congestion(sample_floor, Some(100_000_000));
+    let mut stats = quinn::ConnectionStats::default();
+    stats.path.rtt = Duration::from_millis(50);
+    stats.path.cwnd = sample_floor;
+    stats.path.current_mtu = 1400;
+    let mut tracker = QuicPathMetricTracker::default();
+    let _ = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
+    let carrier = with_acked_bytes_elapsed(
+        with_delivery_evidence_written(congestion, fragment_bytes),
+        fragment_bytes,
+        1,
+        Duration::from_millis(50),
+    );
+    let _ = tracker.observe(stats, carrier, PathMetricDirection::ServerToClient);
+    let first_pending = tracker
+        .pending_delivery_sample
+        .expect("first current-clock fragment");
+
+    let repeated = with_delivery_evidence_written(carrier, fragment_bytes);
+    let _ = tracker.observe(stats, repeated, PathMetricDirection::ServerToClient);
+    let repeated_pending = tracker
+        .pending_delivery_sample
+        .expect("same pending acquisition after repeated snapshot");
+    assert_eq!(repeated_pending.sample_bytes, first_pending.sample_bytes);
+    assert_eq!(repeated_pending.sample_count, first_pending.sample_count);
+    assert_eq!(
+        repeated_pending.sample_elapsed,
+        first_pending.sample_elapsed
     );
 }
 
@@ -422,26 +557,23 @@ fn quic_bulk_rate_evidence_accumulates_across_small_ack_polls() {
         .observe(stats, congestion, PathMetricDirection::ServerToClient);
 
     let mut measured = None;
+    let mut carrier = with_delivery_evidence_written(congestion, sample_bytes);
     for _ in 0..8 {
-        measured = Some(tracker.quic.observe(
-            stats,
-            with_acked_bytes(
-                with_delivery_evidence_written(congestion, sample_bytes),
-                chunk_bytes,
-                2,
-            ),
-            PathMetricDirection::ServerToClient,
-        ));
+        carrier = with_acked_bytes(carrier, chunk_bytes, 2);
+        measured = Some(
+            tracker
+                .quic
+                .observe(stats, carrier, PathMetricDirection::ServerToClient),
+        );
+        carrier = with_delivery_evidence_written(carrier, sample_bytes);
     }
     let measured = measured.expect("split measurement sample");
     assert_eq!(measured.delivery_sample_bytes, sample_bytes);
     assert!(!measured.app_limited);
 
-    let idle = tracker.quic.observe(
-        stats,
-        with_delivery_evidence_written(congestion, sample_bytes),
-        PathMetricDirection::ServerToClient,
-    );
+    let idle = tracker
+        .quic
+        .observe(stats, carrier, PathMetricDirection::ServerToClient);
     assert!(idle.app_limited);
     assert!(
         idle.bulk_proof_expires_at.is_some(),
@@ -567,27 +699,25 @@ fn quic_lower_full_sample_smoothly_reduces_bulk_rate_model() {
     stats.udp_tx.bytes = 8 * 1024 * 1024;
     stats.frame_tx.stream = 512;
     stats.frame_rx.acks = 16;
-    let raised = tracker.quic.observe(
-        stats,
-        with_acked_bytes(
-            with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
-            8 * 1024 * 1024,
-            16,
-        ),
-        PathMetricDirection::ServerToClient,
+    let mut carrier = with_acked_bytes(
+        with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
+        8 * 1024 * 1024,
+        16,
     );
+    let raised = tracker
+        .quic
+        .observe(stats, carrier, PathMetricDirection::ServerToClient);
     stats.udp_tx.bytes += 512 * 1024;
     stats.frame_tx.stream += 512;
     stats.frame_rx.acks += 16;
-    let after_low = tracker.quic.observe(
-        stats,
-        with_acked_bytes(
-            with_delivery_evidence_written(congestion, 8 * 1024 * 1024 + 512 * 1024),
-            512 * 1024,
-            16,
-        ),
-        PathMetricDirection::ServerToClient,
+    carrier = with_acked_bytes(
+        with_delivery_evidence_written(carrier, 8 * 1024 * 1024 + 512 * 1024),
+        512 * 1024,
+        16,
     );
+    let after_low = tracker
+        .quic
+        .observe(stats, carrier, PathMetricDirection::ServerToClient);
 
     assert_eq!(after_low.delivery_sample_count, 32);
     let low_sample_rate = 512.0 * 1024.0 * 8.0 / 0.100;

@@ -23,6 +23,7 @@ from derive_performance_series import (
     load_result_file,
     parse_repetition_spec,
 )
+from result_enrichment import MPTUNNEL_CARRIER_PRESENTATION, MPTUNNEL_PROTOCOL_VERSION
 
 RELEASE = "v0.4.4"
 SCHEMA_VERSION = 1
@@ -45,6 +46,7 @@ RUNTIME_IDENTITY_FIELDS = (
     "mptunnel_server_sha256",
 )
 RUNTIME_SHA_FIELDS = {"mptunnel_client_sha256", "mptunnel_server_sha256"}
+CONTAINER_ROLES = ("client", "server", "target")
 
 
 class EvaluationError(ValueError):
@@ -85,8 +87,79 @@ def _runtime_identity(record, prefix):
     return identity
 
 
+def _validate_release_wire_identity(record, prefix):
+    _require(
+        record.get("mptunnel_build_profile") == "release"
+        and record.get("mptunnel_build_features") == []
+        and record.get("mptunnel_protocol_version") == MPTUNNEL_PROTOCOL_VERSION
+        and record.get("mptunnel_carrier_presentation")
+        == MPTUNNEL_CARRIER_PRESENTATION,
+        f"{prefix} does not use the frozen release wire/build identity",
+    )
+
+
 def _result_directory_name(path):
     return Path(path).resolve().parent.name
+
+
+def _release_manifest_image_identity(path):
+    manifest_path = Path(path).parent / "run-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvaluationError(f"cannot read {manifest_path}: {exc}") from exc
+    containers = manifest.get("containers")
+    _require(
+        isinstance(containers, dict),
+        f"{manifest_path} has no container image identity",
+    )
+    workload = manifest.get("workload")
+    execution = manifest.get("execution")
+    overrides = manifest.get("safe_environment_overrides")
+    product = manifest.get("product")
+    _require(
+        isinstance(product, dict)
+        and product.get("mptunnel_build_profile") == "release"
+        and product.get("mptunnel_build_features") == []
+        and product.get("mptunnel_protocol_version") == MPTUNNEL_PROTOCOL_VERSION
+        and product.get("mptunnel_transport_profile") == "shared-secret"
+        and product.get("mptunnel_carrier_presentation")
+        == MPTUNNEL_CARRIER_PRESENTATION,
+        f"{manifest_path} does not use the frozen release wire/build identity",
+    )
+    _require(
+        isinstance(workload, dict)
+        and workload.get("object_mib") == 4096
+        and workload.get("bulk_connections") == 1
+        and isinstance(execution, dict)
+        and execution.get("lab_diagnostics") == "0"
+        and execution.get("lab_perf") == "0"
+        and execution.get("management_snapshots") == "0"
+        and execution.get("container_stats") == "1"
+        and execution.get("use_path_hints") is False
+        and execution.get("require_competitor_baselines") is True
+        and isinstance(overrides, dict)
+        and overrides.get("MPTUNNEL_LAB_NETEM_MODE") == "apply"
+        and overrides.get("MPTUNNEL_LAB_INTERNET_SEED")
+        == "mptunnel-random-internet-v1"
+        and overrides.get("MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES") == "0",
+        f"{manifest_path} does not use the frozen v0.4.4 release profile",
+    )
+    identity = tuple(
+        containers.get(role, {}).get("image_id")
+        if isinstance(containers.get(role), dict)
+        else None
+        for role in CONTAINER_ROLES
+    )
+    _require(
+        all(
+            isinstance(image_id, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is not None
+            for image_id in identity
+        ),
+        f"{manifest_path} has an incomplete or invalid container image-ID triple",
+    )
+    return identity
 
 
 def _probe_p95(record, prefix):
@@ -312,10 +385,7 @@ def _evaluate_repetition(
         raw.get("source_commit") == common_source_commit,
         f"{repetition_id} raw control source commit differs from the candidate",
     )
-    _require(
-        raw.get("mptunnel_build_features") == [],
-        f"{raw_path}:{RAW_CASE} must record the unmodified release feature set",
-    )
+    _validate_release_wire_identity(raw, f"{raw_path}:{RAW_CASE}")
     _require(
         _runtime_identity(raw, f"{raw_path}:{RAW_CASE}") == common_runtime_identity,
         f"{repetition_id} raw control runtime identity differs from the product cohort",
@@ -343,6 +413,7 @@ def _evaluate_repetition(
         subjects[series_id] = {
             "label": label,
             "receiver_bytes": record["bulk_bytes"],
+            "interactive_attempts": len(record["interactive_attempt_series"]),
             "trajectory_windows": len(trajectory),
             "trajectory_first_window_s": [1, 2],
             "trajectory_last_window_s": [38, 39],
@@ -361,6 +432,7 @@ def _evaluate_repetition(
         "case": RAW_CASE,
         "source": _result_directory_name(raw_path),
         "receiver_bytes": raw["bulk_bytes"],
+        "interactive_attempts": len(raw["interactive_attempt_series"]),
         "trajectory_windows": len(raw_trajectory),
         "trajectory_first_window_s": [1, 2],
         "trajectory_last_window_s": [38, 39],
@@ -463,6 +535,15 @@ def record_workload_signature_from_probe(probe):
     return {field: probe.get(field) for field in record_workload_signature({})}
 
 
+def parse_product_repetition(value):
+    paths = parse_repetition_spec(value)
+    _require(
+        len(paths) == 1,
+        "each --product-repetition must name exactly one results.jsonl path",
+    )
+    return paths
+
+
 def evaluate(product_specs, raw_paths, candidate_commit):
     _require(
         isinstance(candidate_commit, str)
@@ -473,7 +554,7 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         len(product_specs) == REPETITIONS and len(raw_paths) == REPETITIONS,
         "exactly two --product-repetition and two paired --raw-control inputs are required",
     )
-    product_paths = [parse_repetition_spec(spec) for spec in product_specs]
+    product_paths = [parse_product_repetition(spec) for spec in product_specs]
     repetitions = load_repetitions(product_paths)
     _require(
         len(repetitions) == REPETITIONS, "exactly two product repetitions are required"
@@ -493,6 +574,19 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         "product repetitions and paired raw controls require distinct result "
         "directories and names",
     )
+    container_image_identities = {
+        _release_manifest_image_identity(path)
+        for paths in product_paths
+        for path in paths
+    }
+    container_image_identities.update(
+        _release_manifest_image_identity(Path(path)) for path in raw_paths
+    )
+    _require(
+        len(container_image_identities) == 1,
+        "all product and raw runs must identify one container image-ID triple",
+    )
+    container_image_identity = next(iter(container_image_identities))
 
     commits = {
         record.get("source_commit")
@@ -514,10 +608,7 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         for case, record in repetition["records"].items()
     ]
     for record, path, case in product_records:
-        _require(
-            record.get("mptunnel_build_features") == [],
-            f"{path}:{case} must use the unmodified release feature set",
-        )
+        _validate_release_wire_identity(record, f"{path}:{case}")
     runtime_identities = {
         _runtime_identity(record, f"{path}:{case}")
         for record, path, case in product_records
@@ -527,6 +618,12 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         "all product rows must identify one client/server runtime binary pair",
     )
     runtime_identity = next(iter(runtime_identities))
+    _require(
+        runtime_identity[0:2] == ("native", "native")
+        and runtime_identity[2] == runtime_identity[4]
+        and runtime_identity[3] == runtime_identity[5],
+        "the release cohort must use one symmetric native client/server runtime",
+    )
     results = []
     for repetition, raw_path in zip(repetitions, raw_paths):
         try:
@@ -551,6 +648,28 @@ def evaluate(product_specs, raw_paths, candidate_commit):
             }
         results.append(result)
     invalid = any(result["status"] == "invalid" for result in results)
+    if not invalid:
+        _require(
+            len(
+                {
+                    result["raw_control"]["interactive_attempts"]
+                    for result in results
+                }
+            )
+            == 1,
+            "paired raw controls must have equal interactive attempt counts",
+        )
+        for series_id, _label, _case in CASE_SERIES:
+            _require(
+                len(
+                    {
+                        result["subjects"][series_id]["interactive_attempts"]
+                        for result in results
+                    }
+                )
+                == 1,
+                f"paired {series_id} runs must have equal interactive attempt counts",
+            )
     passed = all(result["status"] == "pass" for result in results)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -559,6 +678,9 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         "candidate_commit": candidate_commit,
         "source_commit": source_commit,
         "runtime_identity": dict(zip(RUNTIME_IDENTITY_FIELDS, runtime_identity)),
+        "container_image_identity": dict(
+            zip(CONTAINER_ROLES, container_image_identity)
+        ),
         "criteria": {
             "repetitions": REPETITIONS,
             "raw_controls": REPETITIONS,
@@ -612,7 +734,7 @@ def parse_args(argv=None):
         "--product-repetition",
         action="append",
         default=[],
-        help="comma-separated exact-five results files for one repetition",
+        help="one exact-five results.jsonl for one repetition",
     )
     parser.add_argument(
         "--raw-control",

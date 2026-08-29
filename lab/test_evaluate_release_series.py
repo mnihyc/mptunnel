@@ -8,17 +8,23 @@ LAB_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(LAB_DIR))
 
 from derive_performance_series import CASE_SERIES  # noqa: E402
-from evaluate_release_series import main as evaluate_main  # noqa: E402
+from evaluate_release_series import RAW_CASE, main as evaluate_main  # noqa: E402
+from result_enrichment import MPTUNNEL_CARRIER_PRESENTATION  # noqa: E402
 import test_performance_series as performance_fixtures  # noqa: E402
 
 SOURCE_COMMIT = "b" * 40
 HOST_SNAPSHOT = "a" * 64
 CLIENT_SHA256 = "1" * 64
-SERVER_SHA256 = "2" * 64
+SERVER_SHA256 = CLIENT_SHA256
 CLIENT_RUNTIME = "native"
-CLIENT_RUNTIME_VERSION = "test-runtime-v1"
+CLIENT_RUNTIME_VERSION = "native"
 CLIENT_TARGET = "x86_64-unknown-linux-gnu"
 SERVER_TARGET = "x86_64-unknown-linux-gnu"
+CONTAINER_IMAGE_IDS = {
+    "client": "sha256:" + "5" * 64,
+    "server": "sha256:" + "6" * 64,
+    "target": "sha256:" + "7" * 64,
+}
 RATES = {
     "mpp_tcp": 100.0,
     "mpp_quic": 100.0,
@@ -53,6 +59,9 @@ def product_record(series_id, case):
         source_commit=SOURCE_COMMIT,
         host_snapshot_sha256=HOST_SNAPSHOT,
         mptunnel_build_features=[],
+        mptunnel_build_profile="release",
+        mptunnel_protocol_version=8,
+        mptunnel_carrier_presentation=MPTUNNEL_CARRIER_PRESENTATION,
         mptunnel_client_runtime=CLIENT_RUNTIME,
         mptunnel_client_runtime_version=CLIENT_RUNTIME_VERSION,
         mptunnel_client_target=CLIENT_TARGET,
@@ -95,6 +104,9 @@ def raw_record():
         source_commit=SOURCE_COMMIT,
         host_snapshot_sha256=HOST_SNAPSHOT,
         mptunnel_build_features=[],
+        mptunnel_build_profile="release",
+        mptunnel_protocol_version=8,
+        mptunnel_carrier_presentation=MPTUNNEL_CARRIER_PRESENTATION,
         mptunnel_client_runtime=CLIENT_RUNTIME,
         mptunnel_client_runtime_version=CLIENT_RUNTIME_VERSION,
         mptunnel_client_target=CLIENT_TARGET,
@@ -111,6 +123,36 @@ def raw_record():
     return record
 
 
+def release_manifest():
+    manifest = performance_fixtures.PerformanceSeriesDerivationTests.manifest()
+    manifest["safe_environment_overrides"].update(
+        MPTUNNEL_LAB_NETEM_MODE="apply",
+        MPTUNNEL_LAB_INTERNET_SEED="mptunnel-random-internet-v1",
+        MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES="0",
+    )
+    manifest["workload"].update(object_mib=4096, bulk_connections=1)
+    manifest["execution"].update(
+        lab_diagnostics="0",
+        lab_perf="0",
+        management_snapshots="0",
+        container_stats="1",
+        use_path_hints=False,
+        require_competitor_baselines=True,
+    )
+    manifest["containers"] = {
+        role: {"image_id": image_id}
+        for role, image_id in CONTAINER_IMAGE_IDS.items()
+    }
+    manifest["product"] = {
+        "mptunnel_build_profile": "release",
+        "mptunnel_build_features": [],
+        "mptunnel_protocol_version": 8,
+        "mptunnel_transport_profile": "shared-secret",
+        "mptunnel_carrier_presentation": MPTUNNEL_CARRIER_PRESENTATION,
+    }
+    return manifest
+
+
 def write_result(root, name, records):
     result_dir = root / name
     result_dir.mkdir()
@@ -119,7 +161,7 @@ def write_result(root, name, records):
         "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
     )
     (result_dir / "run-manifest.json").write_text(
-        json.dumps(performance_fixtures.PerformanceSeriesDerivationTests.manifest()),
+        json.dumps(release_manifest()),
         encoding="utf-8",
     )
     return result
@@ -178,6 +220,7 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
                 "mptunnel_server_sha256": SERVER_SHA256,
             },
         )
+        self.assertEqual(verdict["container_image_identity"], CONTAINER_IMAGE_IDS)
         self.assertEqual(len(verdict["repetitions"]), 2)
         for index, repetition in enumerate(verdict["repetitions"], 1):
             self.assertEqual(repetition["status"], "pass")
@@ -331,6 +374,220 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
         self.assertEqual(source["repetitions"][1]["status"], "invalid")
         self.assertIn("source commit differs", source["repetitions"][1]["errors"][0])
 
+    def test_product_repetition_is_one_indivisible_results_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            products, raws = write_cohort(root)
+            accepted_output = root / "accepted.json"
+            accepted_status = evaluate_main(
+                invocation(products, raws, accepted_output)
+            )
+
+            split_products = [f"{products[0]},{products[1]}", products[1]]
+            rejected_output = root / "rejected.json"
+            rejected_status = evaluate_main(
+                invocation(split_products, raws, rejected_output)
+            )
+            rejected = json.loads(rejected_output.read_text(encoding="utf-8"))
+
+        self.assertEqual(accepted_status, 0)
+        self.assertEqual(rejected_status, 2)
+        self.assertEqual(rejected["status"], "invalid")
+        self.assertEqual(rejected["repetitions"], [])
+        self.assertIn("exactly one results.jsonl path", rejected["errors"][0])
+
+    def test_all_four_runs_require_one_complete_container_image_triple(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            products, raws = write_cohort(root)
+            manifest_path = raws[1].parent / "run-manifest.json"
+            original = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            mismatched = json.loads(json.dumps(original))
+            mismatched["containers"]["server"]["image_id"] = "sha256:" + "8" * 64
+            manifest_path.write_text(json.dumps(mismatched), encoding="utf-8")
+            mismatch_output = root / "image-mismatch.json"
+            mismatch_status = evaluate_main(
+                invocation(products, raws, mismatch_output)
+            )
+            mismatch = json.loads(mismatch_output.read_text(encoding="utf-8"))
+
+            incomplete = json.loads(json.dumps(original))
+            del incomplete["containers"]["target"]
+            manifest_path.write_text(json.dumps(incomplete), encoding="utf-8")
+            incomplete_output = root / "image-incomplete.json"
+            incomplete_status = evaluate_main(
+                invocation(products, raws, incomplete_output)
+            )
+            incomplete_verdict = json.loads(
+                incomplete_output.read_text(encoding="utf-8")
+            )
+
+            malformed = json.loads(json.dumps(original))
+            malformed["containers"]["target"]["image_id"] = "latest"
+            manifest_path.write_text(json.dumps(malformed), encoding="utf-8")
+            malformed_output = root / "image-malformed.json"
+            malformed_status = evaluate_main(
+                invocation(products, raws, malformed_output)
+            )
+            malformed_verdict = json.loads(
+                malformed_output.read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(mismatch_status, 2)
+        self.assertEqual(mismatch["status"], "invalid")
+        self.assertEqual(mismatch["repetitions"], [])
+        self.assertIn("one container image-ID triple", mismatch["errors"][0])
+        self.assertEqual(incomplete_status, 2)
+        self.assertEqual(incomplete_verdict["status"], "invalid")
+        self.assertEqual(incomplete_verdict["repetitions"], [])
+        self.assertIn(
+            "incomplete or invalid container image-ID triple",
+            incomplete_verdict["errors"][0],
+        )
+        self.assertEqual(malformed_status, 2)
+        self.assertEqual(malformed_verdict["status"], "invalid")
+        self.assertIn(
+            "incomplete or invalid container image-ID triple",
+            malformed_verdict["errors"][0],
+        )
+
+    def test_all_four_manifests_require_the_exact_release_profile(self):
+        invalid_fields = (
+            (("workload", "object_mib"), 2048),
+            (("workload", "bulk_connections"), 2),
+            (("execution", "lab_diagnostics"), "1"),
+            (("execution", "lab_perf"), "1"),
+            (("execution", "management_snapshots"), "1"),
+            (("execution", "container_stats"), "0"),
+            (("execution", "use_path_hints"), True),
+            (("execution", "require_competitor_baselines"), False),
+            (
+                ("safe_environment_overrides", "MPTUNNEL_LAB_NETEM_MODE"),
+                "internet-five-path-epoch-0",
+            ),
+            (
+                ("safe_environment_overrides", "MPTUNNEL_LAB_INTERNET_SEED"),
+                "different-seed",
+            ),
+            (
+                (
+                    "safe_environment_overrides",
+                    "MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES",
+                ),
+                "1",
+            ),
+        )
+        for index, (keys, value) in enumerate(invalid_fields):
+            with self.subTest(field=".".join(keys)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                products, raws = write_cohort(root)
+                manifest_path = raws[1].parent / "run-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest[keys[0]][keys[1]] = value
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                output = root / f"invalid-profile-{index}.json"
+
+                status = evaluate_main(invocation(products, raws, output))
+                verdict = json.loads(output.read_text(encoding="utf-8"))
+
+                self.assertEqual(status, 2)
+                self.assertEqual(verdict["status"], "invalid")
+                self.assertEqual(verdict["repetitions"], [])
+                self.assertIn("frozen v0.4.4 release profile", verdict["errors"][0])
+
+    def test_release_wire_and_native_runtime_identity_are_exact(self):
+        invalid_wire_fields = (
+            ("mptunnel_build_profile", "debug"),
+            ("mptunnel_build_features", ["lab-diagnostics"]),
+            ("mptunnel_protocol_version", 7),
+            ("mptunnel_transport_profile", "standard"),
+            ("mptunnel_carrier_presentation", "invalid-carrier"),
+        )
+        for field, value in invalid_wire_fields:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                products, raws = write_cohort(root)
+                manifest_path = raws[0].parent / "run-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["product"][field] = value
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                output = root / f"invalid-{field}.json"
+
+                status = evaluate_main(invocation(products, raws, output))
+                verdict = json.loads(output.read_text(encoding="utf-8"))
+
+                self.assertEqual(status, 2)
+                self.assertIn("frozen release wire/build identity", verdict["errors"][0])
+
+        invalid_runtime_updates = (
+            {
+                "mptunnel_client_runtime": "wine",
+                "mptunnel_client_runtime_version": "wine-9.0",
+            },
+            {"mptunnel_client_runtime_version": "native-v2"},
+            {"mptunnel_server_target": "aarch64-unknown-linux-gnu"},
+            {"mptunnel_server_sha256": "2" * 64},
+        )
+        for index, updates in enumerate(invalid_runtime_updates):
+            with self.subTest(runtime=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                products, raws = write_cohort(root)
+                for path in (*products, *raws):
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    for row in rows:
+                        row.update(updates)
+                    path.write_text(
+                        "".join(json.dumps(row) + "\n" for row in rows),
+                        encoding="utf-8",
+                    )
+                output = root / f"invalid-runtime-{index}.json"
+
+                status = evaluate_main(invocation(products, raws, output))
+                verdict = json.loads(output.read_text(encoding="utf-8"))
+
+                self.assertEqual(status, 2)
+                self.assertIn("symmetric native", verdict["errors"][0])
+
+    def test_paired_raw_and_product_attempt_counts_must_match(self):
+        def shorten(path, case):
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            record = next(row for row in rows if row["case"] == case)
+            record["interactive_attempt_series"].pop()
+            last = record["interactive_attempt_series"][-1]
+            last["start_offset_s"] = 39.5
+            last["end_offset_s"] = 39.5 + last["latency_ms"] / 1000.0
+            record["interactive_count"] = 79
+            record["interactive_ok"] = 79
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            products, raws = write_cohort(root)
+            raw_original = raws[1].read_text(encoding="utf-8")
+            shorten(raws[1], RAW_CASE)
+            raw_output = root / "raw-attempt-mismatch.json"
+            raw_status = evaluate_main(invocation(products, raws, raw_output))
+            raw_verdict = json.loads(raw_output.read_text(encoding="utf-8"))
+
+            raws[1].write_text(raw_original, encoding="utf-8")
+            product_case = CASE_SERIES[0][2]
+            shorten(products[1], product_case)
+            product_output = root / "product-attempt-mismatch.json"
+            product_status = evaluate_main(
+                invocation(products, raws, product_output)
+            )
+            product_verdict = json.loads(product_output.read_text(encoding="utf-8"))
+
+        self.assertEqual(raw_status, 2)
+        self.assertEqual(raw_verdict["status"], "invalid")
+        self.assertIn("raw controls", raw_verdict["errors"][0])
+        self.assertEqual(product_status, 2)
+        self.assertEqual(product_verdict["status"], "invalid")
+        self.assertIn("paired mpp_tcp", product_verdict["errors"][0])
+
     def test_zero_ratio_reference_invalidates_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -409,7 +666,7 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
         self.assertIn("one client/server runtime binary pair", stale["errors"][0])
         self.assertEqual(feature_status, 2)
         self.assertEqual(feature["status"], "invalid")
-        self.assertIn("unmodified release feature set", feature["errors"][0])
+        self.assertIn("frozen release wire/build identity", feature["errors"][0])
 
     def test_paired_raw_control_must_record_the_clean_complete_runtime_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -455,7 +712,7 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
         )
         self.assertEqual(altered_status, 2)
         self.assertIn(
-            "unmodified release feature set",
+            "frozen release wire/build identity",
             altered_verdict["repetitions"][1]["errors"][0],
         )
 

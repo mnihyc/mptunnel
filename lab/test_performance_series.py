@@ -1073,17 +1073,13 @@ class CheckedInPerformanceSeriesTests(unittest.TestCase):
         self.assertEqual(
             [series["id"] for series in self.dataset["series"]], EXPECTED_IDS
         )
-        self.assertGreaterEqual(self.dataset["provenance"]["valid_repetitions"], 2)
+        self.assertEqual(self.dataset["provenance"]["valid_repetitions"], 2)
         for series in self.dataset["series"]:
-            self.assertGreaterEqual(len(series["goodput"]), 20)
-            self.assertGreaterEqual(len(series["latency"]), 20)
+            self.assertEqual(len(series["goodput"]), 38)
+            self.assertGreaterEqual(len(series["latency"]), 3)
             self.assertTrue(
-                any(
-                    sample["low"] < sample["high"]
-                    for sample in series["goodput"]
-                    if sample["low"] is not None
-                ),
-                f"{series['id']} has no measured variability",
+                all(sample["available"] == 2 for sample in series["latency"]),
+                f"{series['id']} does not retain both accepted latency trajectories",
             )
 
     def test_checked_in_svg_is_exact_renderer_output(self):

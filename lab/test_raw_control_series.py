@@ -35,11 +35,13 @@ sys.path.insert(0, str(LAB_DIR))
 from derive_performance_series import (  # noqa: E402
     DerivationError,
     derive_dataset as derive_product_dataset,
+    main as derive_product_main,
 )
 from derive_raw_control_series import main as derive_raw_main  # noqa: E402
 from evaluate_release_series import main as evaluate_main  # noqa: E402
 from render_performance_series import (  # noqa: E402
     load_dataset,
+    main as render_main,
     render_svg,
     validate_dataset,
 )
@@ -212,21 +214,50 @@ class RawControlSeriesTests(unittest.TestCase):
         self.assertEqual(contamination_status, 2)
         self.assertFalse(contamination_output.exists())
 
-    def test_raw_svg_is_deterministic_and_product_svg_is_byte_stable(self):
+    def test_passing_cohort_derives_and_renders_both_asset_contracts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            _products, raws, verdict = _write_passing_evidence(root)
-            output = root / "raw-control.json"
-            self.assertEqual(
-                derive_raw_main(_derive_invocation(raws, verdict, output)), 0
+            products, raws, verdict = _write_passing_evidence(root)
+            product_output = root / "product.json"
+            product_arguments = []
+            for product in products:
+                product_arguments.extend(("--result", str(product)))
+            product_arguments.extend(
+                (
+                    "--output",
+                    str(product_output),
+                    "--cohort-id",
+                    "synthetic-product",
+                    "--title",
+                    "Product trajectories",
+                    "--subtitle",
+                    "Synthetic contract evidence; never a performance claim.",
+                    "--condition-note",
+                    "Fixed release condition.",
+                )
             )
-            dataset = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(derive_product_main(product_arguments), 0)
 
-        validate_dataset(dataset)
-        first_svg = render_svg(dataset)
-        second_svg = render_svg(copy.deepcopy(dataset))
-        self.assertEqual(first_svg, second_svg)
-        self.assertIn('data-series="raw_tcp"', first_svg)
+            raw_output = root / "raw-control.json"
+            self.assertEqual(
+                derive_raw_main(_derive_invocation(raws, verdict, raw_output)), 0
+            )
+            product_dataset = json.loads(product_output.read_text(encoding="utf-8"))
+            raw_dataset = json.loads(raw_output.read_text(encoding="utf-8"))
+            product_svg_path = root / "product.svg"
+            raw_svg_path = root / "raw.svg"
+            self.assertEqual(
+                render_main([str(product_output), str(product_svg_path)]), 0
+            )
+            self.assertEqual(render_main([str(raw_output), str(raw_svg_path)]), 0)
+            product_svg = product_svg_path.read_text(encoding="utf-8")
+            raw_svg = raw_svg_path.read_text(encoding="utf-8")
+
+        validate_dataset(product_dataset)
+        validate_dataset(raw_dataset)
+        self.assertEqual(product_svg, render_svg(product_dataset))
+        self.assertEqual(raw_svg, render_svg(copy.deepcopy(raw_dataset)))
+        self.assertIn('data-series="raw_tcp"', raw_svg)
         self.assertEqual(
             hashlib.sha256(render_svg(contract_fixture()).encode()).hexdigest(),
             PRODUCT_SVG_SHA256,

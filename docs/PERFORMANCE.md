@@ -4,6 +4,13 @@ MPTUNNEL aggregates independent links and keeps active traffic attached when a
 carrier changes or disappears. Results depend on path conditions, direction,
 workload, host capacity, and the native TCP or QUIC implementation.
 
+## Current evidence publication gate
+
+No current five-series time-series figure or ranking is published. Publication
+requires at least two matched repetitions with accepted host and source
+provenance under identical isolated conditions; single-repetition and
+diagnostic artifacts do not update the historical scalar tables below.
+
 ## Historical accepted fixed-profile evidence (v0.2.1–v0.2.2)
 
 The fixed-profile tables in this section, through local processing capacity,

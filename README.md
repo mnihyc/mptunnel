@@ -70,10 +70,16 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 
 ## Performance
 
-Results below are receiver-delivered goodput from controlled Linux tests,
-rounded to the nearest Mbps. Xray-core 26.3.27 uses VMess/TCP; Hysteria2 2.10.0
-uses Brutal at the shaped link rate; MPTUNNEL uses its default TCP+QUIC paths
-unless a transport is named explicitly.
+The scalar tables below are accepted historical evidence for v0.2.1–v0.2.2;
+they do not characterize v0.4.4 or the current source tree. No current
+five-series time-series figure or ranking is published until at least two
+matched repetitions pass the host, source, workload, isolation, and provenance
+gates described in the [performance methodology](docs/PERFORMANCE.md).
+
+These historical results are receiver-delivered goodput from controlled Linux
+tests, rounded to the nearest Mbps. Xray-core 26.3.27 uses VMess/TCP; Hysteria2
+2.10.0 uses Brutal at the shaped link rate; MPTUNNEL uses the measured
+release's default TCP+QUIC paths unless a transport is named explicitly.
 
 ### One link
 

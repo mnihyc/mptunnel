@@ -24,6 +24,7 @@ class FakeCommands:
         self.source_paths = source_paths
         self.status = b""
         self.containers = b""
+        self.container_inventory_available = True
 
     def __call__(self, arguments, cwd=None):
         command = tuple(arguments)
@@ -58,6 +59,8 @@ class FakeCommands:
         ):
             return b""
         if command == ("docker", "ps", "-q", "--no-trunc"):
+            if not self.container_inventory_available:
+                raise SnapshotError("container inventory unavailable")
             return self.containers
         if command == ("rustc", "-vV"):
             return (
@@ -219,7 +222,6 @@ class HostSnapshotTests(unittest.TestCase):
                 "host_memory_pressure",
                 "cpu_governor_not_performance",
                 "host_thermal_limit_exceeded",
-                "external_containers_running",
                 "source_tree_dirty",
             }.issubset(codes)
         )
@@ -253,6 +255,30 @@ class HostSnapshotTests(unittest.TestCase):
         self.assertNotIn(lab_id, serialized)
         self.assertNotIn(external_id, serialized)
         self.assertNotIn(str(self.repo), serialized)
+
+    def test_external_container_is_inventory_not_host_pressure(self):
+        self.commands.containers = (b"2" * 64) + b"\n"
+
+        snapshot = self.capture()
+
+        self.assertEqual(snapshot["host"]["containers"]["external_running"], 1)
+        self.assertTrue(snapshot["validity"]["valid"])
+        self.assertIn(
+            {"code": "external_containers_observed", "observed": 1},
+            snapshot["validity"]["warnings"],
+        )
+
+    def test_unavailable_container_inventory_is_not_host_pressure(self):
+        self.commands.container_inventory_available = False
+
+        snapshot = self.capture()
+
+        self.assertFalse(snapshot["host"]["containers"]["inventory_available"])
+        self.assertTrue(snapshot["validity"]["valid"])
+        self.assertIn(
+            {"code": "container_inventory_unavailable"},
+            snapshot["validity"]["warnings"],
+        )
 
     def test_source_snapshot_changes_with_git_visible_content(self):
         first = self.capture()

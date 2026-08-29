@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 HOST_SNAPSHOT_SCHEMA_VERSION = 1
-HOST_VALIDITY_RULES_VERSION = 1
+HOST_VALIDITY_RULES_VERSION = 2
 HOST_SNAPSHOT_KIND = "mptunnel.lab.host-snapshot"
 SOURCE_SNAPSHOT_ALGORITHM = "git-visible-tree-sha256-v1"
 
@@ -34,7 +34,6 @@ MAX_LOAD1_PER_AFFINITY_CPU = 0.5
 MAX_RUNNABLE_PER_AFFINITY_CPU = 1.0
 MIN_MEMORY_AVAILABLE_RATIO = 0.15
 MAX_THERMAL_MILLICELSIUS = 85_000
-MAX_EXTERNAL_RUNNING_CONTAINERS = 0
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{12,64}")
@@ -581,15 +580,17 @@ def _evaluate_validity(
             )
     else:
         warnings.append({"code": "thermal_state_unavailable"})
-    if not containers["inventory_available"]:
-        reasons.append(_reason("container_inventory_unavailable"))
-    elif containers["external_running"] > MAX_EXTERNAL_RUNNING_CONTAINERS:
-        reasons.append(
-            _reason(
-                "external_containers_running",
-                containers["external_running"],
-                MAX_EXTERNAL_RUNNING_CONTAINERS,
-            )
+    # A container's existence is inventory, not evidence of pressure. Actual
+    # CPU, runnable-work, memory, and thermal signals remain validity gates.
+    if (
+        containers["inventory_available"]
+        and containers["external_running"] > 0
+    ):
+        warnings.append(
+            {
+                "code": "external_containers_observed",
+                "observed": containers["external_running"],
+            }
         )
     if source["tree_dirty"]:
         reasons.append(_reason("source_tree_dirty"))
@@ -609,7 +610,6 @@ def _evaluate_validity(
             "max_runnable_per_affinity_cpu": MAX_RUNNABLE_PER_AFFINITY_CPU,
             "min_memory_available_ratio": MIN_MEMORY_AVAILABLE_RATIO,
             "max_thermal_millicelsius": MAX_THERMAL_MILLICELSIUS,
-            "max_external_running_containers": MAX_EXTERNAL_RUNNING_CONTAINERS,
             "required_governor_when_exposed": "performance",
             "source_tree_must_be_clean": True,
             "source_capture_must_be_stable": True,
@@ -778,7 +778,9 @@ def validate_snapshot(snapshot: Any) -> dict[str, Any]:
 
     validity = snapshot["validity"]
     if validity.get("rules_version") != HOST_VALIDITY_RULES_VERSION:
-        raise SnapshotError("host validity rules_version must be 1")
+        raise SnapshotError(
+            f"host validity rules_version must be {HOST_VALIDITY_RULES_VERSION}"
+        )
     if not isinstance(validity.get("valid"), bool):
         raise SnapshotError("host validity decision is invalid")
     reasons = validity.get("invalid_reasons")

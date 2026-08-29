@@ -32,6 +32,7 @@ from typing import Any, Mapping, Sequence
 
 try:
     from result_enrichment import (
+        HOST_VALIDITY_RULES_VERSION,
         MPTUNNEL_CARRIER_PRESENTATION,
         MPTUNNEL_CARRIER_PRESENTATIONS,
         MPTUNNEL_PROTOCOL_VERSION,
@@ -41,6 +42,7 @@ try:
     )
 except ModuleNotFoundError:
     from lab.result_enrichment import (
+        HOST_VALIDITY_RULES_VERSION,
         MPTUNNEL_CARRIER_PRESENTATION,
         MPTUNNEL_CARRIER_PRESENTATIONS,
         MPTUNNEL_PROTOCOL_VERSION,
@@ -330,7 +332,7 @@ def validate_subject_identity(value: Any) -> dict[str, Any]:
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "run_manifest_schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "host_snapshot_schema_version": 1,
-        "host_validity_rules_version": 1,
+        "host_validity_rules_version": HOST_VALIDITY_RULES_VERSION,
     }
     for field, expected in version_fields.items():
         if subject[field] != expected:

@@ -12,6 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+try:
+    from host_snapshot import HOST_VALIDITY_RULES_VERSION
+except ModuleNotFoundError:
+    from lab.host_snapshot import HOST_VALIDITY_RULES_VERSION
+
 
 RESULT_SCHEMA_VERSION = 2
 RUN_MANIFEST_SCHEMA_VERSION = 4
@@ -482,8 +487,11 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
         )
     if metadata.get("host_snapshot_schema_version") != 1:
         raise ValueError("host_snapshot_schema_version must be 1")
-    if metadata.get("host_validity_rules_version") != 1:
-        raise ValueError("host_validity_rules_version must be 1")
+    if metadata.get("host_validity_rules_version") != HOST_VALIDITY_RULES_VERSION:
+        raise ValueError(
+            "host_validity_rules_version must be "
+            f"{HOST_VALIDITY_RULES_VERSION}"
+        )
     if not isinstance(metadata.get("host_valid"), bool):
         raise ValueError("host_valid must be a boolean")
     for field in (

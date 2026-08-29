@@ -28,6 +28,7 @@ from performance_ledger import (
     validate_ledger,
 )
 from result_enrichment import (
+    HOST_VALIDITY_RULES_VERSION,
     MPTUNNEL_CARRIER_PRESENTATION,
     MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE,
     MPTUNNEL_PROTOCOL_VERSION,
@@ -46,7 +47,7 @@ def subject(digit):
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "run_manifest_schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "host_snapshot_schema_version": 1,
-        "host_validity_rules_version": 1,
+        "host_validity_rules_version": HOST_VALIDITY_RULES_VERSION,
         "host_snapshot_sha256": "e" * 64,
         "host_valid": True,
         "source_commit": digit * 40,

@@ -439,10 +439,24 @@ enum ReliableRelayTailRecoveryCandidate {
 }
 
 impl ReliableRelayTailRecoveryCandidate {
-    fn sent_at(self) -> Instant {
+    fn recovery_anchor(
+        self,
+        data_ack_progress_at: Instant,
+        tracked_first_live_attempt: bool,
+    ) -> Instant {
         match self {
-            Self::Tracked(candidate) => candidate.sent_at,
-            Self::Untracked { sent_at, .. } => sent_at,
+            // A tracked OriginalData flight has an exact immutable assignment
+            // epoch. Advancing the connection frontier can expose another old
+            // flight, but it does not make that flight newly sent. Once a
+            // repair has been attempted, however, subsequent live-owner
+            // retries require a full quiet recovery interval after the latest
+            // Data ACK progress.
+            Self::Tracked(candidate) if tracked_first_live_attempt => candidate.sent_at,
+            Self::Tracked(candidate) => data_ack_progress_at.max(candidate.sent_at),
+            // The fallback has no exact flight ledger. Keep the conservative
+            // connection-progress bound so newly published untracked work is
+            // never declared stalled before it could have been assigned.
+            Self::Untracked { sent_at, .. } => data_ack_progress_at.max(sent_at),
         }
     }
 }
@@ -453,6 +467,16 @@ impl ReliableRelayTailReinjectionTimer {
         candidate: ReliableRelayTailRecoveryCandidate,
         deadline: Instant,
     ) {
+        if self.last_attempt_at.is_some() {
+            // This deadline is derived from the immutable OriginalData
+            // assignment. It is valid for the first repair only. After an
+            // attempt or scan, leave the deadline unarmed so observe() can
+            // enforce the current retry clock: latest Data ACK progress for a
+            // live owner, or the existing attempt-paced failed-owner retry.
+            self.candidate = Some(candidate);
+            self.deadline = None;
+            return;
+        }
         let deadline = tokio::time::Instant::from_std(deadline);
         if self.candidate != Some(candidate) {
             self.candidate = Some(candidate);
@@ -483,10 +507,13 @@ impl ReliableRelayTailReinjectionTimer {
             self.candidate = Some(candidate);
             self.deadline = None;
         }
-        // A range cannot be stalled before it is assigned to a carrier. Data
-        // ACK progress after that assignment starts a fresh recovery interval.
-        // Native TCP or QUIC recovery retains ownership below this clock.
-        let recovery_progress_at = data_ack_progress_at.max(candidate.sent_at());
+        // The first live-owner repair uses exact tracked assignment age. After
+        // any repair attempt or empty eligibility scan, a repeat waits for a
+        // full quiet recovery interval after the latest Data ACK progress.
+        // Confirmed owner failure retains the pre-existing failover clock.
+        let tracked_first_live_attempt = self.last_attempt_at.is_none() && !failed_original_ready;
+        let recovery_progress_at =
+            candidate.recovery_anchor(data_ack_progress_at, tracked_first_live_attempt);
         // Retain the last attempt across candidates to prevent a repair burst.
         let candidate = reliable_relay_effective_tail_reinjection_deadline(
             recovery_progress_at,

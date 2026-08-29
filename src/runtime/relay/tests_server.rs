@@ -36,6 +36,23 @@ fn tail_recovery_candidate(start: u64, sent_at: Instant) -> ReliableRelayTailRec
     }
 }
 
+fn tracked_tail_recovery_candidate(
+    start: u64,
+    sent_at: Instant,
+    underlay: UnderlayProtocol,
+) -> ReliableRelayTailRecoveryCandidate {
+    ReliableRelayTailRecoveryCandidate::Tracked(ResponseDataAckRecoveryCandidate {
+        start,
+        end: start + 64,
+        key: CarrierPathKey {
+            underlay,
+            path_id: PathId(0),
+        },
+        output_incarnation: 1,
+        sent_at,
+    })
+}
+
 #[test]
 fn server_ack_gap_timer_uses_the_evaluation_epoch() {
     let now = Instant::now();
@@ -1178,7 +1195,7 @@ fn new_original_flight_does_not_inherit_pre_send_data_ack_stall_time() {
 }
 
 #[test]
-fn data_ack_progress_rearms_live_path_recovery_for_an_old_original_flight() {
+fn untracked_data_ack_progress_rearms_live_path_recovery_for_an_old_original_flight() {
     let original_sent_at = Instant::now() - Duration::from_secs(2);
     let data_ack_progress_at = Instant::now();
     let mut timer = ReliableRelayTailReinjectionTimer::default();
@@ -1197,24 +1214,253 @@ fn data_ack_progress_rearms_live_path_recovery_for_an_old_original_flight() {
 }
 
 #[test]
+fn proof_exact_completion_deadline_prevents_slow_progress_from_postponing_old_frontier() {
+    let now = Instant::now();
+    let original_sent_at = now - Duration::from_secs(2);
+    let owner = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 2_000_000.0);
+    let candidate = tracked_tail_recovery_candidate(64, original_sent_at, UnderlayProtocol::Tcp);
+
+    let legacy_deadline = reliable_relay_tail_reinjection_deadline(now, None, Some(owner));
+    assert!(legacy_deadline > tokio::time::Instant::from_std(now));
+
+    let measured_alternate_completion = Duration::from_millis(55);
+    let exact_deadline = reliable_data_ack_recovery_deadline(
+        Some(original_sent_at),
+        Some(UnderlayProtocol::Tcp),
+        Some(owner),
+        Some(measured_alternate_completion),
+    )
+    .expect("measured alternate beats native owner recovery");
+    assert!(
+        exact_deadline < now,
+        "the newly exposed range is already overdue"
+    );
+
+    let mut exact = ReliableRelayTailReinjectionTimer::default();
+    let preserved = exact.observe(Some(candidate), now, Some(owner), false);
+    println!(
+        "old-frontier sent_age_ms={} legacy_due_in_ms={} exact_due_age_ms={} completion_rescue_due=true",
+        now.saturating_duration_since(original_sent_at).as_millis(),
+        legacy_deadline
+            .saturating_duration_since(tokio::time::Instant::from_std(now))
+            .as_millis(),
+        now.saturating_duration_since(exact_deadline).as_millis(),
+    );
+    assert_eq!(preserved, tokio::time::Instant::from_std(exact_deadline));
+    assert!(preserved <= tokio::time::Instant::from_std(now));
+}
+
+#[test]
+fn tracked_old_frontier_assignments_keep_exact_age_across_multiple_progress_events() {
+    let now = Instant::now();
+    let owner = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 2_000_000.0);
+    let recovery = reliable_relay_tail_reinjection_delay(Some(owner));
+    let assignments = [
+        (0_u64, now - Duration::from_secs(3)),
+        (64_u64, now - Duration::from_secs(2)),
+        (128_u64, now - Duration::from_secs(1)),
+    ];
+
+    for (index, (start, sent_at)) in assignments.into_iter().enumerate() {
+        let progress_at = now + Duration::from_millis((index as u64 + 1) * 10);
+        let mut timer = ReliableRelayTailReinjectionTimer::default();
+        let deadline = timer.observe(
+            Some(tracked_tail_recovery_candidate(
+                start,
+                sent_at,
+                UnderlayProtocol::Tcp,
+            )),
+            progress_at,
+            Some(owner),
+            false,
+        );
+        assert_eq!(
+            deadline,
+            tokio::time::Instant::from_std(sent_at + recovery),
+            "frontier movement must not rewrite the next tracked flight's assignment epoch",
+        );
+        assert!(deadline <= tokio::time::Instant::from_std(progress_at));
+    }
+}
+
+#[test]
+fn tracked_fresh_frontier_and_untracked_fallback_do_not_fire_early() {
+    let now = Instant::now();
+    let owner = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 2_000_000.0);
+    let recovery = reliable_relay_tail_reinjection_delay(Some(owner));
+
+    let mut tracked = ReliableRelayTailReinjectionTimer::default();
+    let tracked_deadline = tracked.observe(
+        Some(tracked_tail_recovery_candidate(
+            0,
+            now,
+            UnderlayProtocol::Tcp,
+        )),
+        now + Duration::from_millis(10),
+        Some(owner),
+        false,
+    );
+    assert_eq!(
+        tracked_deadline,
+        tokio::time::Instant::from_std(now + recovery),
+    );
+    assert!(tracked_deadline > tokio::time::Instant::from_std(now));
+
+    let progress_at = now + Duration::from_millis(50);
+    let mut untracked = ReliableRelayTailReinjectionTimer::default();
+    let untracked_deadline = untracked.observe(
+        Some(ReliableRelayTailRecoveryCandidate::Untracked {
+            start: 0,
+            end: 64,
+            sent_at: now,
+        }),
+        progress_at,
+        Some(owner),
+        false,
+    );
+    assert_eq!(
+        untracked_deadline,
+        tokio::time::Instant::from_std(progress_at + recovery),
+        "unknown assignment ownership retains the conservative progress bound",
+    );
+
+    let mut failed_owner = ReliableRelayTailReinjectionTimer::default();
+    let failed_deadline = failed_owner.observe(
+        Some(tracked_tail_recovery_candidate(
+            0,
+            now - Duration::from_secs(1),
+            UnderlayProtocol::Tcp,
+        )),
+        progress_at,
+        Some(owner),
+        true,
+    );
+    assert_eq!(
+        failed_deadline,
+        tokio::time::Instant::from_std(progress_at),
+        "confirmed owner failure retains the existing immediate failover clock",
+    );
+}
+
+#[test]
+fn tracked_frontier_repair_is_paced_across_candidate_changes_without_duplicate_burst() {
+    let now = Instant::now();
+    let owner = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 2_000_000.0);
+    let recovery = reliable_relay_tail_reinjection_delay(Some(owner));
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+
+    let first =
+        tracked_tail_recovery_candidate(0, now - Duration::from_secs(2), UnderlayProtocol::Tcp);
+    assert!(
+        timer.observe(Some(first), now, Some(owner), false) <= tokio::time::Instant::from_std(now)
+    );
+    timer.record_attempt_at(now);
+
+    let next =
+        tracked_tail_recovery_candidate(64, now - Duration::from_secs(1), UnderlayProtocol::Tcp);
+    let next_progress_at = now + Duration::from_millis(10);
+    let next_deadline = timer.observe(Some(next), next_progress_at, Some(owner), false);
+    assert_eq!(
+        next_deadline,
+        tokio::time::Instant::from_std(next_progress_at + recovery),
+        "after one repair, frontier progress starts a full quiet interval before the next repair",
+    );
+    let same_deadline = timer.observe(Some(next), next_progress_at, Some(owner), false);
+    assert_eq!(same_deadline, next_deadline);
+}
+
+#[test]
+fn actor_flight_ledger_preserves_first_age_then_paces_next_frontier_from_ack_progress() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(123);
+    let original_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(123),
+        original_key.underlay,
+        original_key.path_id,
+        commands,
+        TrafficClass::Throughput,
+    );
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: original_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    for value in [0x51, 0x52] {
+        let frame = send_stream
+            .send_data(Bytes::from(vec![value; 64]))
+            .expect("seed tracked OriginalData flight");
+        binding.record_original_flight(original_key, &frame);
+    }
+
+    let first = path_stream
+        .data_ack_recovery_candidate(0)
+        .expect("first tracked flight is reachable from the actor ledger");
+    assert_eq!((first.start, first.end), (0, 64));
+    let recovery = reliable_relay_tail_reinjection_delay(None);
+    let first_observed_at = first.sent_at + Duration::from_secs(2);
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    assert_eq!(
+        timer.observe(
+            Some(ReliableRelayTailRecoveryCandidate::Tracked(first)),
+            first_observed_at,
+            None,
+            false,
+        ),
+        tokio::time::Instant::from_std(first.sent_at + recovery),
+        "the first tracked repair inherits the immutable ledger assignment age",
+    );
+    timer.record_attempt_at(first_observed_at);
+
+    let acknowledged = [OffsetRange { start: 0, end: 64 }];
+    let _ = send_stream.apply_ack(&acknowledged);
+    path_stream.release_normalized_acked_ranges(&acknowledged);
+    let next_frontier = send_stream.data_ack_frontier();
+    assert_eq!(next_frontier, 64);
+    let next = path_stream
+        .data_ack_recovery_candidate(next_frontier)
+        .expect("ACK progress exposes the next tracked ledger flight");
+    assert_eq!((next.start, next.end), (64, 128));
+    let ack_progress_at = first_observed_at + Duration::from_millis(10);
+    timer.arm_recovery_deadline(
+        ReliableRelayTailRecoveryCandidate::Tracked(next),
+        next.sent_at + recovery,
+    );
+    assert_eq!(
+        timer.observe(
+            Some(ReliableRelayTailRecoveryCandidate::Tracked(next)),
+            ack_progress_at,
+            None,
+            false,
+        ),
+        tokio::time::Instant::from_std(ack_progress_at + recovery),
+        "after a repair, the newly exposed frontier waits one quiet interval after Data ACK progress",
+    );
+}
+
+#[test]
 fn failed_original_retry_keeps_pacing_across_ack_progress() {
     let original_sent_at = Instant::now() - Duration::from_secs(2);
     let attempted_at = Instant::now();
     let mut timer = ReliableRelayTailReinjectionTimer::default();
-    let _ = timer.observe(
-        Some(tail_recovery_candidate(0, original_sent_at)),
-        original_sent_at,
-        None,
-        true,
-    );
+    let first = tracked_tail_recovery_candidate(0, original_sent_at, UnderlayProtocol::Tcp);
+    let _ = timer.observe(Some(first), original_sent_at, None, true);
     timer.record_attempt_at(attempted_at);
 
-    let deadline = timer.observe(
-        Some(tail_recovery_candidate(64, original_sent_at)),
-        attempted_at,
-        None,
-        true,
-    );
+    let next = tracked_tail_recovery_candidate(64, original_sent_at, UnderlayProtocol::Tcp);
+    timer.arm_recovery_deadline(next, original_sent_at + transport_pto_from_snapshot(None));
+    let deadline = timer.observe(Some(next), attempted_at, None, true);
 
     assert_eq!(
         deadline,

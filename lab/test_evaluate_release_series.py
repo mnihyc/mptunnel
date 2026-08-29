@@ -9,7 +9,10 @@ sys.path.insert(0, str(LAB_DIR))
 
 from derive_performance_series import CASE_SERIES  # noqa: E402
 from evaluate_release_series import RAW_CASE, main as evaluate_main  # noqa: E402
-from result_enrichment import MPTUNNEL_CARRIER_PRESENTATION  # noqa: E402
+from result_enrichment import (  # noqa: E402
+    MPTUNNEL_CARRIER_PRESENTATION,
+    RUN_MANIFEST_SCHEMA_VERSION,
+)
 import test_performance_series as performance_fixtures  # noqa: E402
 
 SOURCE_COMMIT = "b" * 40
@@ -125,6 +128,7 @@ def raw_record():
 
 def release_manifest():
     manifest = performance_fixtures.PerformanceSeriesDerivationTests.manifest()
+    manifest["schema_version"] = RUN_MANIFEST_SCHEMA_VERSION
     manifest["safe_environment_overrides"].update(
         MPTUNNEL_LAB_NETEM_MODE="apply",
         MPTUNNEL_LAB_INTERNET_SEED="mptunnel-random-internet-v1",
@@ -518,6 +522,31 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
                 self.assertEqual(verdict["status"], "invalid")
                 self.assertEqual(verdict["repetitions"], [])
                 self.assertIn("frozen v0.4.4 release profile", verdict["errors"][0])
+
+    def test_release_profile_rejects_stale_or_missing_manifest_schema(self):
+        for schema_version in (3, None):
+            with (
+                self.subTest(schema_version=schema_version),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                products, raws = write_cohort(root)
+                manifest_path = raws[0].parent / "run-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if schema_version is None:
+                    del manifest["schema_version"]
+                else:
+                    manifest["schema_version"] = schema_version
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                output = root / f"schema-{schema_version}.json"
+
+                status = evaluate_main(invocation(products, raws, output))
+                verdict = json.loads(output.read_text(encoding="utf-8"))
+
+                self.assertEqual(status, 2)
+                self.assertEqual(verdict["status"], "invalid")
+                self.assertEqual(verdict["repetitions"], [])
+                self.assertIn("run-manifest schema 4", verdict["errors"][0])
 
     def test_release_wire_and_native_runtime_identity_are_exact(self):
         invalid_wire_fields = (

@@ -23,7 +23,11 @@ from derive_performance_series import (
     load_result_file,
     parse_repetition_spec,
 )
-from result_enrichment import MPTUNNEL_CARRIER_PRESENTATION, MPTUNNEL_PROTOCOL_VERSION
+from result_enrichment import (
+    MPTUNNEL_CARRIER_PRESENTATION,
+    MPTUNNEL_PROTOCOL_VERSION,
+    RUN_MANIFEST_SCHEMA_VERSION,
+)
 
 RELEASE = "v0.4.4"
 SCHEMA_VERSION = 1
@@ -108,6 +112,11 @@ def _release_manifest_image_identity(path):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise EvaluationError(f"cannot read {manifest_path}: {exc}") from exc
+    _require(
+        manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION,
+        f"{manifest_path} does not use run-manifest schema "
+        f"{RUN_MANIFEST_SCHEMA_VERSION}",
+    )
     containers = manifest.get("containers")
     _require(
         isinstance(containers, dict),

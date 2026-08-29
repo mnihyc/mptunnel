@@ -15,6 +15,7 @@ from mixed_workload_probe import (
     interactive_attempt_record,
     interval_metric_fields,
     small_http_response_budget_seconds,
+    write_finished_file,
     write_started_file,
 )
 
@@ -173,6 +174,28 @@ class MixedWorkloadProbeTests(unittest.TestCase):
         self.assertGreater(float(unix_seconds), 0)
         self.assertGreater(int(monotonic_ms), 0)
         self.assertAlmostEqual(float(unix_seconds) * 1000, int(unix_ms), delta=1)
+
+    def test_started_file_returns_same_monotonic_sample_as_persisted_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "started"
+            with mock.patch.object(
+                probe.time, "monotonic_ns", return_value=1_999_999
+            ):
+                started_at = write_started_file(path)
+            monotonic_ms = int(path.read_text(encoding="utf-8").splitlines()[1])
+
+        self.assertEqual(started_at, 0.001999999)
+        self.assertEqual(monotonic_ms, 1)
+
+    def test_finished_file_records_monotonic_completion_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "finished"
+            write_finished_file(path)
+            finished_ms = int(path.read_text(encoding="utf-8"))
+            leftovers = list(path.parent.glob("finished.tmp-*"))
+
+        self.assertGreater(finished_ms, 0)
+        self.assertEqual(leftovers, [])
 
     def test_attempt_requires_full_response_budget_before_workload_deadline(self):
         self.assertTrue(attempt_has_response_budget(7.0, 10.0, 2.5))

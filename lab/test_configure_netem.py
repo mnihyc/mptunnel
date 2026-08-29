@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,147 @@ BASE_ROWS = (
 
 
 class ConfigureNetemTests(unittest.TestCase):
+    @staticmethod
+    def scheduler_environment(root: Path, netem_script: Path) -> dict[str, str]:
+        origin_ms = time.monotonic_ns() // 1_000_000
+        (root / "started").write_text(f"0\n{origin_ms}\n0\n", encoding="utf-8")
+        env = os.environ.copy()
+        env.update(
+            MPTUNNEL_LAB_SCHEDULE_ROLE="client-egress",
+            MPTUNNEL_LAB_SCHEDULE_SERVICE="client",
+            MPTUNNEL_LAB_SCHEDULE_STARTED_FILE=str(root / "started"),
+            MPTUNNEL_LAB_SCHEDULE_FINISHED_FILE=str(root / "finished"),
+            MPTUNNEL_LAB_SCHEDULE_CANCEL_FILE=str(root / "cancel"),
+            MPTUNNEL_LAB_SCHEDULE_READY_FILE=str(root / "ready"),
+            MPTUNNEL_LAB_SCHEDULE_STATUS_FILE=str(root / "status"),
+            MPTUNNEL_LAB_SCHEDULE_PID_FILE=str(root / "pid"),
+            MPTUNNEL_LAB_SCHEDULE_RESULT_PREFIX=str(root / "result"),
+            MPTUNNEL_LAB_SCHEDULE_EPOCH_MS="100",
+            MPTUNNEL_LAB_SCHEDULE_DURATION_MS="100",
+            MPTUNNEL_LAB_SCHEDULE_LATENESS_MS="250",
+            MPTUNNEL_LAB_SCHEDULE_COMMAND_TIMEOUT_S="0.05",
+            MPTUNNEL_LAB_SCHEDULE_LOSSES="1",
+            MPTUNNEL_LAB_SCHEDULE_NETEM_SCRIPT=str(netem_script),
+        )
+        return env
+
+    @staticmethod
+    def process_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def test_scheduler_timeout_reaps_ignoring_process_tree(self):
+        project_tmp = LAB_DIR.parent / ".tmp"
+        project_tmp.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=project_tmp) as temporary:
+            root = Path(temporary)
+            fake_netem = root / "blocking-netem.sh"
+            fake_netem.write_text(
+                """#!/usr/bin/env bash
+trap '' TERM
+printf '%s\n' "$BASHPID" > "$FAKE_PARENT_PID_FILE"
+(
+  trap '' TERM
+  printf '%s\n' "$BASHPID" > "$FAKE_DESCENDANT_PID_FILE"
+  while :; do sleep 10; done
+) &
+wait
+""",
+                encoding="utf-8",
+            )
+            fake_netem.chmod(0o755)
+            env = self.scheduler_environment(root, fake_netem)
+            env["FAKE_PARENT_PID_FILE"] = str(root / "parent.pid")
+            env["FAKE_DESCENDANT_PID_FILE"] = str(root / "descendant.pid")
+            completed = subprocess.run(
+                [str(NETEM_SCRIPT), "bulk-interactive-loss-schedule"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            pids = [
+                int((root / name).read_text(encoding="utf-8"))
+                for name in ("parent.pid", "descendant.pid")
+            ]
+            deadline = time.monotonic() + 0.5
+            while (
+                any(self.process_exists(pid) for pid in pids)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertFalse(any(self.process_exists(pid) for pid in pids))
+
+    def test_scheduler_rejects_probe_finished_before_duration(self):
+        project_tmp = LAB_DIR.parent / ".tmp"
+        project_tmp.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=project_tmp) as temporary:
+            root = Path(temporary)
+            missing_netem = root / "must-not-run"
+            env = self.scheduler_environment(root, missing_netem)
+            origin_ms = int((root / "started").read_text().splitlines()[1])
+            (root / "finished").write_text(f"{origin_ms + 50}\n", encoding="utf-8")
+            completed = subprocess.run(
+                [str(NETEM_SCRIPT), "bulk-interactive-loss-schedule"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 124)
+            self.assertIn('"exit_code":124', (root / "status").read_text())
+
+    def test_scheduler_signal_cancels_wait_without_running_netem(self):
+        project_tmp = LAB_DIR.parent / ".tmp"
+        project_tmp.mkdir(exist_ok=True)
+        for phase in ("before-start", "before-epoch"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(
+                dir=project_tmp
+            ) as temporary:
+                root = Path(temporary)
+                fake_netem = root / "must-not-run.sh"
+                fake_netem.write_text(
+                    "#!/usr/bin/env bash\ntouch \"$FAKE_NETEM_RAN\"\n",
+                    encoding="utf-8",
+                )
+                fake_netem.chmod(0o755)
+                env = self.scheduler_environment(root, fake_netem)
+                marker = root / "netem-ran"
+                env["FAKE_NETEM_RAN"] = str(marker)
+                if phase == "before-start":
+                    (root / "started").unlink()
+                else:
+                    origin_ms = time.monotonic_ns() // 1_000_000 + 1000
+                    (root / "started").write_text(
+                        f"0\n{origin_ms}\n0\n", encoding="utf-8"
+                    )
+
+                process = subprocess.Popen(
+                    [str(NETEM_SCRIPT), "bulk-interactive-loss-schedule"],
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                ready_deadline = time.monotonic() + 1.0
+                while not (root / "ready").exists() and time.monotonic() < ready_deadline:
+                    time.sleep(0.005)
+                self.assertTrue((root / "ready").exists())
+                signal_at = time.monotonic()
+                process.terminate()
+                process.communicate(timeout=1)
+
+                self.assertEqual(process.returncode, 124)
+                self.assertLess(time.monotonic() - signal_at, 0.5)
+                self.assertFalse(marker.exists())
+                self.assertIn('"exit_code":124', (root / "status").read_text())
+
     def run_mode(
         self,
         mode: str,

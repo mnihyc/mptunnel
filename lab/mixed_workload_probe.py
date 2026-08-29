@@ -191,16 +191,32 @@ def interval_metric_fields(
 
 
 def write_started_file(path):
+    # This one sample defines both the workload deadline and the persisted
+    # scheduler anchor.  Sampling them separately can cross a millisecond
+    # boundary and falsely make a complete workload appear 1 ms short.
+    monotonic_ns = time.monotonic_ns()
+    started_at = monotonic_ns / 1_000_000_000
     if not path:
-        return
+        return started_at
     unix_ns = time.time_ns()
-    monotonic_ms = time.monotonic_ns() // 1_000_000
+    monotonic_ms = monotonic_ns // 1_000_000
     temporary_path = f"{path}.tmp-{os.getpid()}"
     with open(temporary_path, "w", encoding="utf-8") as handle:
         # Keep the first-line Unix timestamp compatible with existing callers.
         handle.write(f"{unix_ns / 1_000_000_000:.9f}\n")
         handle.write(f"{monotonic_ms}\n")
         handle.write(f"{unix_ns // 1_000_000}\n")
+    os.replace(temporary_path, path)
+    return started_at
+
+
+def write_finished_file(path):
+    if not path:
+        return
+    monotonic_ms = time.monotonic_ns() // 1_000_000
+    temporary_path = f"{path}.tmp-{os.getpid()}"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        handle.write(f"{monotonic_ms}\n")
     os.replace(temporary_path, path)
 
 
@@ -1217,6 +1233,7 @@ def main():
     parser.add_argument("--tcp-echo-timeout-ms", type=int, default=5000)
     parser.add_argument("--tcp-echo-interval-ms", type=int, default=500)
     parser.add_argument("--started-file")
+    parser.add_argument("--finished-file")
     args = parser.parse_args()
     if (
         args.workload_mode == "mixed"
@@ -1239,8 +1256,7 @@ def main():
     if args.small_response_budget_ms < 1:
         parser.error("--small-response-budget-ms must be positive")
 
-    started_at = time.monotonic()
-    write_started_file(args.started_file)
+    started_at = write_started_file(args.started_file)
     interactive_ready = threading.Event()
     bulk_ready = threading.Event()
     bulk = {}
@@ -1305,6 +1321,7 @@ def main():
         )
     for thread in threads:
         thread.join(timeout=join_timeout)
+    write_finished_file(args.finished_file)
     record = build_record(args, bulk, small, interactive, udp)
     print(json.dumps(record, separators=(",", ":")))
     return 0 if record["status"] != "fail" else 1

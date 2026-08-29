@@ -854,6 +854,234 @@ show_profile() {
   done
 }
 
+run_bulk_interactive_loss_schedule() {
+  # Keep deadline waiting and qdisc application in one endpoint-local process.
+  # Starting a fresh container-control command at every epoch made its launch
+  # latency part of the measured transition, rather than part of lab setup.
+  exec python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import time
+
+
+def required(name):
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} is required")
+    return value
+
+
+def atomic_write(path, value):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+    temporary.write_text(value, encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def cancelled(cancel_file):
+    return cancel_file.exists()
+
+
+def wait_until(
+    deadline_ms,
+    cancel_file,
+    finished_file,
+    earliest_allowed_finish_ms=None,
+):
+    while True:
+        if termination_requested or cancelled(cancel_file):
+            return False
+        if finished_file.exists():
+            try:
+                finished_ms = int(finished_file.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                return False
+            if (
+                earliest_allowed_finish_ms is None
+                or finished_ms < earliest_allowed_finish_ms
+            ):
+                return False
+        remaining = deadline_ms - time.monotonic_ns() // 1_000_000
+        if remaining <= 0:
+            return True
+        time.sleep(min(remaining / 1000.0, 0.01))
+
+
+active_process = None
+termination_requested = False
+
+
+def request_termination(_signum, _frame):
+    global termination_requested
+    termination_requested = True
+    if active_process is not None and active_process.poll() is None:
+        try:
+            os.killpg(active_process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def terminate_process_group(process):
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        output, _ = process.communicate(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        output, _ = process.communicate(timeout=0.25)
+    return output or ""
+
+
+role = required("MPTUNNEL_LAB_SCHEDULE_ROLE")
+service = required("MPTUNNEL_LAB_SCHEDULE_SERVICE")
+started_file = Path(required("MPTUNNEL_LAB_SCHEDULE_STARTED_FILE"))
+finished_file = Path(required("MPTUNNEL_LAB_SCHEDULE_FINISHED_FILE"))
+cancel_file = Path(required("MPTUNNEL_LAB_SCHEDULE_CANCEL_FILE"))
+ready_file = required("MPTUNNEL_LAB_SCHEDULE_READY_FILE")
+status_file = required("MPTUNNEL_LAB_SCHEDULE_STATUS_FILE")
+pid_file = required("MPTUNNEL_LAB_SCHEDULE_PID_FILE")
+result_prefix = required("MPTUNNEL_LAB_SCHEDULE_RESULT_PREFIX")
+epoch_ms = int(required("MPTUNNEL_LAB_SCHEDULE_EPOCH_MS"))
+duration_ms = int(required("MPTUNNEL_LAB_SCHEDULE_DURATION_MS"))
+lateness_ms = int(required("MPTUNNEL_LAB_SCHEDULE_LATENESS_MS"))
+command_timeout_s = float(required("MPTUNNEL_LAB_SCHEDULE_COMMAND_TIMEOUT_S"))
+losses = [int(value) for value in required("MPTUNNEL_LAB_SCHEDULE_LOSSES").split(",")]
+netem_script = os.environ.get(
+    "MPTUNNEL_LAB_SCHEDULE_NETEM_SCRIPT",
+    "/workspace/lab/configure-netem.sh",
+)
+if epoch_ms <= 0 or duration_ms != epoch_ms * len(losses) or lateness_ms < 0:
+    raise SystemExit("invalid bulk-interactive schedule dimensions")
+
+atomic_write(pid_file, f"{os.getpid()}\n")
+signal.signal(signal.SIGTERM, request_termination)
+signal.signal(signal.SIGINT, request_termination)
+atomic_write(ready_file, json.dumps({"pid": os.getpid()}, separators=(",", ":")) + "\n")
+
+exit_code = 0
+completed_offset_ms = None
+try:
+    while not started_file.exists():
+        if termination_requested or cancelled(cancel_file) or finished_file.exists():
+            exit_code = 124
+            break
+        time.sleep(0.005)
+    if exit_code == 0:
+        anchor_lines = started_file.read_text(encoding="utf-8").splitlines()
+        if len(anchor_lines) != 3:
+            exit_code = 2
+        else:
+            origin_ms = int(anchor_lines[1])
+            for index, loss in enumerate(losses):
+                planned_offset_ms = index * epoch_ms
+                if not wait_until(
+                    origin_ms + planned_offset_ms,
+                    cancel_file,
+                    finished_file,
+                ):
+                    exit_code = 124
+                    break
+                if termination_requested or cancelled(cancel_file):
+                    exit_code = 124
+                    break
+                start_offset_ms = time.monotonic_ns() // 1_000_000 - origin_ms
+                env = os.environ.copy()
+                env["MPTUNNEL_LAB_BALANCED_LOSS"] = f"{loss}%"
+                command_exit = 0
+                output = ""
+                try:
+                    active_process = subprocess.Popen(
+                        [netem_script, "change-balanced-observed"],
+                        env=env,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    try:
+                        output, _ = active_process.communicate(
+                            timeout=command_timeout_s
+                        )
+                    except subprocess.TimeoutExpired:
+                        output = terminate_process_group(active_process)
+                        command_exit = 124
+                    else:
+                        command_exit = active_process.returncode
+                    finally:
+                        active_process = None
+                except OSError:
+                    command_exit = 124
+                    output = ""
+                end_offset_ms = time.monotonic_ns() // 1_000_000 - origin_ms
+                apply_exit = 125
+                readback_exit = 125
+                readback_base64 = "-"
+                if output:
+                    match = re.fullmatch(
+                        r"([0-9]+)\t([0-9]+)\t([A-Za-z0-9+/=]+|-)",
+                        output.rstrip().splitlines()[-1],
+                    )
+                    if match:
+                        apply_exit = int(match.group(1))
+                        readback_exit = int(match.group(2))
+                        readback_base64 = match.group(3)
+                event = {
+                    "role": role,
+                    "service": service,
+                    "start_offset_ms": start_offset_ms,
+                    "end_offset_ms": end_offset_ms,
+                    "command_exit_code": command_exit,
+                    "apply_exit_code": apply_exit,
+                    "readback_exit_code": readback_exit,
+                    "readback_base64": readback_base64,
+                }
+                atomic_write(
+                    f"{result_prefix}-epoch-{index}.json",
+                    json.dumps(event, separators=(",", ":")) + "\n",
+                )
+                if not (
+                    command_exit == apply_exit == readback_exit == 0
+                    and readback_base64 != "-"
+                    and planned_offset_ms <= start_offset_ms <= end_offset_ms
+                    <= planned_offset_ms + lateness_ms
+                ):
+                    exit_code = 1
+                if termination_requested or cancelled(cancel_file):
+                    exit_code = 124
+                    break
+            if exit_code != 124 and wait_until(
+                origin_ms + duration_ms,
+                cancel_file,
+                finished_file,
+                earliest_allowed_finish_ms=origin_ms + duration_ms,
+            ):
+                completed_offset_ms = time.monotonic_ns() // 1_000_000 - origin_ms
+            elif exit_code == 0:
+                exit_code = 124
+except (OSError, ValueError):
+    exit_code = 2
+finally:
+    status = {
+        "exit_code": exit_code,
+        "completed_offset_ms": completed_offset_ms,
+    }
+    atomic_write(status_file, json.dumps(status, separators=(",", ":")) + "\n")
+
+raise SystemExit(exit_code)
+PY
+}
+
 case "$mode" in
   apply)
     # Short regional hop: low RTT, modest bandwidth, nearly clean.
@@ -884,6 +1112,9 @@ case "$mode" in
   change-balanced-observed)
     # Apply and report the exact root-qdisc state used by a scheduled epoch.
     change_balanced_observed
+    ;;
+  bulk-interactive-loss-schedule)
+    run_bulk_interactive_loss_schedule
     ;;
   apply-mildloss)
     apply_profile "172.31.16" "$mildloss_rate" "$mildloss_delay" "$mildloss_jitter" "$mildloss_loss"
@@ -1025,7 +1256,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|change-balanced|change-balanced-observed|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|internet-five-path-epoch-N-{client,server}|internet-five-path-load-coupled-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|change-balanced|change-balanced-observed|bulk-interactive-loss-schedule|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|internet-five-path-epoch-N-{client,server}|internet-five-path-load-coupled-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

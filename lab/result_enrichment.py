@@ -143,6 +143,32 @@ def validate_bulk_interactive_dynamic_loss_metadata(metadata: Any) -> None:
     )
     if host_offset != client_offset:
         raise ValueError("dynamic-loss effective monotonic offsets differ")
+    endpoint_clocks = metadata.get("endpoint_clocks")
+    if not isinstance(endpoint_clocks, dict) or set(endpoint_clocks) != set(
+        condition["dynamic_roles"]
+    ):
+        raise ValueError("dynamic-loss endpoint clock provenance is invalid")
+    for role in condition["dynamic_roles"]:
+        endpoint_clock = endpoint_clocks.get(role)
+        endpoint_namespace = (
+            endpoint_clock.get("time_namespace_id")
+            if isinstance(endpoint_clock, dict)
+            else None
+        )
+        if (
+            not isinstance(endpoint_clock, dict)
+            or set(endpoint_clock)
+            != {"service", "time_namespace_id", "monotonic_offset"}
+            or endpoint_clock.get("service")
+            != expected_topology["dynamic_role_to_service"][role]
+            or not isinstance(endpoint_namespace, str)
+            or re.fullmatch(r"time:\[[0-9]+\]", endpoint_namespace) is None
+            or _validated_monotonic_timens_offset(
+                endpoint_clock.get("monotonic_offset")
+            )
+            != host_offset
+        ):
+            raise ValueError("dynamic-loss endpoint clock provenance is invalid")
 
     losses = condition["loss_percent"]
     epoch_ms = condition["epoch_seconds"] * 1000

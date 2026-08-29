@@ -281,6 +281,18 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             "client_time_namespace_id": "time:[4026532522]",
             "host_monotonic_offset": {"seconds": 0, "nanoseconds": 0},
             "client_monotonic_offset": {"seconds": 0, "nanoseconds": 0},
+            "endpoint_clocks": {
+                "client-egress": {
+                    "service": "client",
+                    "time_namespace_id": "time:[4026532522]",
+                    "monotonic_offset": {"seconds": 0, "nanoseconds": 0},
+                },
+                "remote-egress": {
+                    "service": "server",
+                    "time_namespace_id": "time:[4026532523]",
+                    "monotonic_offset": {"seconds": 0, "nanoseconds": 0},
+                },
+            },
             "topology_mode": "proxy",
             "dynamic_role_to_service": {
                 "client-egress": "client",
@@ -739,6 +751,15 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
         metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
         validate_bulk_interactive_dynamic_loss_metadata(metadata)
 
+    def test_dynamic_loss_trace_rejects_unproven_remote_endpoint_clock(self):
+        metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
+        metadata["endpoint_clocks"]["remote-egress"]["monotonic_offset"] = {
+            "seconds": 1,
+            "nanoseconds": 0,
+        }
+        with self.assertRaisesRegex(ValueError, "endpoint clock provenance"):
+            validate_bulk_interactive_dynamic_loss_metadata(metadata)
+
     def test_dynamic_loss_trace_rejects_effective_monotonic_offset_mismatch(self):
         metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
         for same_namespace in (True, False):
@@ -847,6 +868,7 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             "client-egress": "client",
             "remote-egress": "target",
         }
+        metadata["endpoint_clocks"]["remote-egress"]["service"] = "target"
         for event, loss in zip(metadata["events"], condition["loss_percent"]):
             endpoint = event["endpoints"]["remote-egress"]
             endpoint["service"] = "target"

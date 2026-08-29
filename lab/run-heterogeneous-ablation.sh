@@ -419,6 +419,9 @@ active_mptcp_evidence_case=""
 active_client_config_artifact=""
 active_bulk_interactive_probe_pid_file=""
 active_bulk_interactive_schedule_pids=()
+active_bulk_interactive_schedule_services=()
+active_bulk_interactive_schedule_pid_files=()
+active_bulk_interactive_cancel_file=""
 active_bulk_interactive_host_files=()
 
 scale_lab_netem_value() {
@@ -2107,15 +2110,26 @@ flapping_result_metadata() {
 }
 
 cleanup_active_bulk_interactive_probe() {
-  local schedule_pid
+  local index schedule_pid schedule_service schedule_pid_file
+  if [[ -n "$active_bulk_interactive_cancel_file" ]]; then
+    : > "$active_bulk_interactive_cancel_file"
+  fi
+  for index in "${!active_bulk_interactive_schedule_services[@]}"; do
+    schedule_service="${active_bulk_interactive_schedule_services[$index]}"
+    schedule_pid_file="${active_bulk_interactive_schedule_pid_files[$index]}"
+    exec_in "$schedule_service" "schedule_pid=\$(cat '${schedule_pid_file}' 2>/dev/null || true); if [[ \"\$schedule_pid\" =~ ^[0-9]+$ ]]; then for child_pid in \$(pgrep -P \"\$schedule_pid\" 2>/dev/null || true); do kill -TERM -- \"-\$child_pid\" >/dev/null 2>&1 || true; done; kill -TERM \"\$schedule_pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 2)); while kill -0 \"\$schedule_pid\" >/dev/null 2>&1 && (( SECONDS < deadline )); do sleep 0.02; done; if kill -0 \"\$schedule_pid\" >/dev/null 2>&1; then for child_pid in \$(pgrep -P \"\$schedule_pid\" 2>/dev/null || true); do kill -KILL -- \"-\$child_pid\" >/dev/null 2>&1 || true; done; kill -KILL \"\$schedule_pid\" >/dev/null 2>&1 || true; fi; fi" \
+      >/dev/null 2>&1 || true
+  done
   for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"; do
-    pkill -TERM -P "$schedule_pid" >/dev/null 2>&1 || true
     kill "$schedule_pid" >/dev/null 2>&1 || true
   done
   for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"; do
     wait "$schedule_pid" >/dev/null 2>&1 || true
   done
   active_bulk_interactive_schedule_pids=()
+  active_bulk_interactive_schedule_services=()
+  active_bulk_interactive_schedule_pid_files=()
+  active_bulk_interactive_cancel_file=""
   if [[ -n "$active_bulk_interactive_probe_pid_file" ]]; then
     exec_in client "probe_pid=\$(cat '${active_bulk_interactive_probe_pid_file}' 2>/dev/null || true); if [[ \"\$probe_pid\" =~ ^[0-9]+$ ]]; then pkill -TERM -P \"\$probe_pid\" >/dev/null 2>&1 || true; kill \"\$probe_pid\" >/dev/null 2>&1 || true; fi; rm -f '${active_bulk_interactive_probe_pid_file}'" \
       >/dev/null 2>&1 || true
@@ -2713,132 +2727,98 @@ apply_bulk_interactive_baseline_profile() {
   done
 }
 
-wait_for_bulk_interactive_deadline() {
-  local deadline_ms="$1"
-  local probe_finished_file="$2"
-  local allow_probe_finished="${3:-0}"
-  local now_ms remaining_ms
-  now_ms="$(monotonic_milliseconds)"
-  if [[ "$allow_probe_finished" != "1" && -f "$probe_finished_file" ]]; then
-    return 1
-  fi
-  if (( now_ms >= deadline_ms )); then
-    return 0
-  fi
-  remaining_ms=$((deadline_ms - now_ms))
-  sleep "$((remaining_ms / 1000)).$(printf '%03d' "$((remaining_ms % 1000))")" \
-    || return 1
-  if [[ "$allow_probe_finished" != "1" && -f "$probe_finished_file" ]]; then
-    return 1
-  fi
-  return 0
-}
-
-apply_bulk_interactive_loss_endpoint() {
+start_bulk_interactive_loss_scheduler() {
   local role="$1"
   local service="$2"
-  local loss_percent="$3"
-  local probe_started_monotonic_ms="$4"
-  local planned_offset_ms="$5"
-  local result_file="$6"
-  local absolute_deadline_ms="$7"
-  local probe_finished_file="$8"
-  local start_offset_ms end_offset_ms command_exit_code
-  local apply_exit_code readback_exit_code readback_base64 observed_output observed_line
-
-  if ! wait_for_bulk_interactive_deadline \
-    "$absolute_deadline_ms" "$probe_finished_file"; then
-    return 124
-  fi
-  start_offset_ms="$(($(monotonic_milliseconds) - probe_started_monotonic_ms))"
-  command_exit_code=0
-  if observed_output="$(
-    MPTUNNEL_LAB_BALANCED_RATE="$bulk_interactive_rate" \
-    MPTUNNEL_LAB_BALANCED_DELAY="$bulk_interactive_delay" \
-    MPTUNNEL_LAB_BALANCED_JITTER="$bulk_interactive_jitter" \
-    MPTUNNEL_LAB_BALANCED_LOSS="${loss_percent}%" \
-      exec_netem \
-        "$service" change-balanced-observed \
-        "$bulk_interactive_transition_command_timeout_seconds" 2>&1
-  )"; then
-    :
-  else
-    command_exit_code="$?"
-  fi
-  end_offset_ms="$(($(monotonic_milliseconds) - probe_started_monotonic_ms))"
-
-  apply_exit_code=125
-  readback_exit_code=125
-  readback_base64="-"
-  observed_line="${observed_output##*$'\n'}"
-  if [[ "$observed_line" =~ ^([0-9]+)$'\t'([0-9]+)$'\t'([A-Za-z0-9+/=]+|-)$ ]]; then
-    apply_exit_code="${BASH_REMATCH[1]}"
-    readback_exit_code="${BASH_REMATCH[2]}"
-    readback_base64="${BASH_REMATCH[3]}"
-  fi
-  printf '{"role":"%s","service":"%s","start_offset_ms":%s,"end_offset_ms":%s,"command_exit_code":%s,"apply_exit_code":%s,"readback_exit_code":%s,"readback_base64":"%s"}\n' \
-    "$role" "$service" "$start_offset_ms" "$end_offset_ms" \
-    "$command_exit_code" "$apply_exit_code" "$readback_exit_code" \
-    "$readback_base64" > "${result_file}.tmp"
-  mv "${result_file}.tmp" "$result_file"
-  [[ "$command_exit_code" == "0" && "$apply_exit_code" == "0" \
-    && "$readback_exit_code" == "0" && "$readback_base64" != "-" \
-    && "$start_offset_ms" -ge "$planned_offset_ms" \
-    && "$end_offset_ms" -le "$((planned_offset_ms + bulk_interactive_transition_complete_lateness_ms))" ]]
+  local probe_started_file="$3"
+  local probe_finished_file="$4"
+  local cancel_file="$5"
+  local ready_file="$6"
+  local status_file="$7"
+  local pid_file="$8"
+  local result_prefix="$9"
+  local log_file="${10}"
+  local losses_csv
+  losses_csv="$(IFS=,; printf '%s' "${bulk_interactive_loss_percent[*]}")"
+  compose exec -T \
+    -e MPTUNNEL_LAB_BALANCED_RATE="$bulk_interactive_rate" \
+    -e MPTUNNEL_LAB_BALANCED_DELAY="$bulk_interactive_delay" \
+    -e MPTUNNEL_LAB_BALANCED_JITTER="$bulk_interactive_jitter" \
+    -e MPTUNNEL_LAB_SCHEDULE_ROLE="$role" \
+    -e MPTUNNEL_LAB_SCHEDULE_SERVICE="$service" \
+    -e MPTUNNEL_LAB_SCHEDULE_STARTED_FILE="$probe_started_file" \
+    -e MPTUNNEL_LAB_SCHEDULE_FINISHED_FILE="$probe_finished_file" \
+    -e MPTUNNEL_LAB_SCHEDULE_CANCEL_FILE="$cancel_file" \
+    -e MPTUNNEL_LAB_SCHEDULE_READY_FILE="$ready_file" \
+    -e MPTUNNEL_LAB_SCHEDULE_STATUS_FILE="$status_file" \
+    -e MPTUNNEL_LAB_SCHEDULE_PID_FILE="$pid_file" \
+    -e MPTUNNEL_LAB_SCHEDULE_RESULT_PREFIX="$result_prefix" \
+    -e MPTUNNEL_LAB_SCHEDULE_EPOCH_MS="$((bulk_interactive_epoch_seconds * 1000))" \
+    -e MPTUNNEL_LAB_SCHEDULE_DURATION_MS="$((bulk_interactive_duration_seconds * 1000))" \
+    -e MPTUNNEL_LAB_SCHEDULE_LATENESS_MS="$bulk_interactive_transition_complete_lateness_ms" \
+    -e MPTUNNEL_LAB_SCHEDULE_COMMAND_TIMEOUT_S="$bulk_interactive_transition_command_timeout_seconds" \
+    -e MPTUNNEL_LAB_SCHEDULE_LOSSES="$losses_csv" \
+    "$service" bash -lc \
+    "exec /workspace/lab/configure-netem.sh bulk-interactive-loss-schedule" \
+    >"$log_file" 2>&1 &
+  bulk_interactive_scheduler_wrapper_pid="$!"
 }
 
-run_bulk_interactive_dynamic_loss_schedule() {
-  local probe_finished_file="$1"
-  local probe_started_monotonic_ms="$2"
-  local remote_service="$3"
-  local result_prefix="$4"
-  local epoch loss_percent planned_offset_ms absolute_deadline_ms
-  local client_result_file remote_result_file client_pid remote_pid
-  local client_wait_exit remote_wait_exit event_json client_json remote_json
+wait_for_bulk_interactive_schedulers() {
+  local client_status_file="$1"
+  local remote_status_file="$2"
+  local deadline=$((SECONDS + bulk_interactive_probe_timeout_seconds + 10))
+  while [[ ! -f "$client_status_file" || ! -f "$remote_status_file" ]]; do
+    if (( SECONDS >= deadline )); then
+      return 124
+    fi
+    sleep 0.01
+  done
+}
+
+collect_bulk_interactive_dynamic_loss_schedule() {
+  local client_status_file="$1"
+  local remote_status_file="$2"
+  local client_result_prefix="$3"
+  local remote_result_prefix="$4"
+  local epoch loss_percent planned_offset_ms event_json client_json remote_json
+  local status_fields client_exit remote_exit client_completed remote_completed
   local schedule_status=0
 
   bulk_interactive_schedule_events_json=""
   bulk_interactive_schedule_event_count=0
+  status_fields="$(python3 - "$client_status_file" "$remote_status_file" <<'PY'
+import json
+import sys
+
+values = []
+for path in sys.argv[1:]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        values.extend((int(data["exit_code"]), data["completed_offset_ms"]))
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        values.extend((2, None))
+print("\t".join("null" if value is None else str(value) for value in values))
+PY
+)"
+  IFS=$'\t' read -r client_exit client_completed remote_exit remote_completed \
+    <<< "$status_fields"
+  if [[ "$client_exit" == "124" || "$remote_exit" == "124" ]]; then
+    schedule_status=124
+  elif [[ "$client_exit" != "0" || "$remote_exit" != "0" ]]; then
+    schedule_status=1
+  fi
   for epoch in "${!bulk_interactive_loss_percent[@]}"; do
     loss_percent="${bulk_interactive_loss_percent[$epoch]}"
     planned_offset_ms=$((epoch * bulk_interactive_epoch_seconds * 1000))
-    absolute_deadline_ms=$((probe_started_monotonic_ms + planned_offset_ms))
-
-    client_result_file="${result_prefix}-epoch-${epoch}-client"
-    remote_result_file="${result_prefix}-epoch-${epoch}-remote"
-    active_bulk_interactive_host_files+=(
-      "$client_result_file" "${client_result_file}.tmp"
-      "$remote_result_file" "${remote_result_file}.tmp"
-    )
-    apply_bulk_interactive_loss_endpoint \
-      client-egress client "$loss_percent" \
-      "$probe_started_monotonic_ms" "$planned_offset_ms" "$client_result_file" \
-      "$absolute_deadline_ms" "$probe_finished_file" &
-    client_pid="$!"
-    active_bulk_interactive_schedule_pids=("$client_pid")
-    apply_bulk_interactive_loss_endpoint \
-      remote-egress "$remote_service" "$loss_percent" \
-      "$probe_started_monotonic_ms" "$planned_offset_ms" "$remote_result_file" \
-      "$absolute_deadline_ms" "$probe_finished_file" &
-    remote_pid="$!"
-    active_bulk_interactive_schedule_pids+=("$remote_pid")
-    if wait "$client_pid"; then client_wait_exit=0; else client_wait_exit="$?"; fi
-    if wait "$remote_pid"; then remote_wait_exit=0; else remote_wait_exit="$?"; fi
-    active_bulk_interactive_schedule_pids=()
-
-    if [[ "$client_wait_exit" == "124" || "$remote_wait_exit" == "124" ]]; then
-      schedule_status=124
+    client_json="$(cat "${client_result_prefix}-epoch-${epoch}.json" 2>/dev/null || true)"
+    remote_json="$(cat "${remote_result_prefix}-epoch-${epoch}.json" 2>/dev/null || true)"
+    if [[ -z "$client_json" || -z "$remote_json" ]]; then
+      if [[ "$schedule_status" == "0" ]]; then
+        schedule_status=1
+      fi
       break
-    elif [[ "$client_wait_exit" != "0" || "$remote_wait_exit" != "0" ]]; then
-      schedule_status=1
-    fi
-    client_json="$(cat "$client_result_file" 2>/dev/null || true)"
-    remote_json="$(cat "$remote_result_file" 2>/dev/null || true)"
-    if [[ -z "$client_json" ]]; then
-      printf -v client_json '{"role":"client-egress","service":"client","start_offset_ms":-1,"end_offset_ms":-1,"command_exit_code":%s,"apply_exit_code":125,"readback_exit_code":125,"readback_base64":"-"}' "$client_wait_exit"
-    fi
-    if [[ -z "$remote_json" ]]; then
-      printf -v remote_json '{"role":"remote-egress","service":"%s","start_offset_ms":-1,"end_offset_ms":-1,"command_exit_code":%s,"apply_exit_code":125,"readback_exit_code":125,"readback_base64":"-"}' "$remote_service" "$remote_wait_exit"
     fi
     printf -v event_json '{"index":%s,"loss_percent":%s,"planned_offset_ms":%s,"endpoints":{"client-egress":%s,"remote-egress":%s}}' \
       "$epoch" \
@@ -2852,11 +2832,13 @@ run_bulk_interactive_dynamic_loss_schedule() {
     bulk_interactive_schedule_events_json+="$event_json"
     bulk_interactive_schedule_event_count=$((bulk_interactive_schedule_event_count + 1))
   done
-  if [[ "$schedule_status" != "124" ]] && \
-     ! wait_for_bulk_interactive_deadline \
-       "$((probe_started_monotonic_ms + bulk_interactive_duration_seconds * 1000))" \
-       "$probe_finished_file" 1; then
-    schedule_status=124
+  bulk_interactive_schedule_completed_offset_ms=""
+  if [[ "$client_completed" =~ ^[0-9]+$ && "$remote_completed" =~ ^[0-9]+$ ]]; then
+    if (( client_completed > remote_completed )); then
+      bulk_interactive_schedule_completed_offset_ms="$client_completed"
+    else
+      bulk_interactive_schedule_completed_offset_ms="$remote_completed"
+    fi
   fi
   return "$schedule_status"
 }
@@ -2871,23 +2853,26 @@ bulk_interactive_dynamic_loss_metadata() {
   local client_monotonic_offset_json="${7:-null}"
   local topology_mode="$8"
   local role_service_mapping_json="$9"
+  local endpoint_clocks_json="${10:-null}"
   local trace_complete=false
   if [[ "$schedule_exit_code" == "0" ]] && \
      [[ "$host_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
        && "$client_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
        && "$host_monotonic_offset_json" != "null" \
-       && "$host_monotonic_offset_json" == "$client_monotonic_offset_json" ]] && \
+       && "$host_monotonic_offset_json" == "$client_monotonic_offset_json" \
+       && "$endpoint_clocks_json" != "null" ]] && \
      (( bulk_interactive_schedule_event_count == ${#bulk_interactive_loss_percent[@]} )) && \
      (( schedule_completed_offset_ms >= bulk_interactive_duration_seconds * 1000 )); then
     trace_complete=true
   fi
-  printf '{"condition":%s,"probe_started_monotonic_ms":%s,"schedule_origin":"probe-started-file-clock-monotonic-ms","clock_name":"CLOCK_MONOTONIC","host_time_namespace_id":"%s","client_time_namespace_id":"%s","host_monotonic_offset":%s,"client_monotonic_offset":%s,"topology_mode":"%s","dynamic_role_to_service":%s,"schedule_exit_code":%s,"schedule_completed_offset_ms":%s,"applied_event_count":%s,"events":[%s],"trace_complete":%s}\n' \
+  printf '{"condition":%s,"probe_started_monotonic_ms":%s,"schedule_origin":"probe-started-file-clock-monotonic-ms","clock_name":"CLOCK_MONOTONIC","host_time_namespace_id":"%s","client_time_namespace_id":"%s","host_monotonic_offset":%s,"client_monotonic_offset":%s,"endpoint_clocks":%s,"topology_mode":"%s","dynamic_role_to_service":%s,"schedule_exit_code":%s,"schedule_completed_offset_ms":%s,"applied_event_count":%s,"events":[%s],"trace_complete":%s}\n' \
     "$bulk_interactive_dynamic_loss_json" \
     "$probe_started_monotonic_ms" \
     "$host_time_namespace_id" \
     "$client_time_namespace_id" \
     "$host_monotonic_offset_json" \
     "$client_monotonic_offset_json" \
+    "$endpoint_clocks_json" \
     "$topology_mode" \
     "$role_service_mapping_json" \
     "$schedule_exit_code" \
@@ -2912,19 +2897,45 @@ run_bulk_interactive_probe_case() {
   local probe_gate_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.started"
   local probe_finished_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.finished"
   local probe_status_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.status"
+  local scheduler_base_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$-schedule"
+  local scheduler_cancel_relative="${scheduler_base_relative}.cancel"
+  local client_scheduler_ready_relative="${scheduler_base_relative}-client.ready"
+  local remote_scheduler_ready_relative="${scheduler_base_relative}-remote.ready"
+  local client_scheduler_status_relative="${scheduler_base_relative}-client.status"
+  local remote_scheduler_status_relative="${scheduler_base_relative}-remote.status"
+  local client_scheduler_pid_relative="${scheduler_base_relative}-client.pid"
+  local remote_scheduler_pid_relative="${scheduler_base_relative}-remote.pid"
+  local client_scheduler_result_relative="${scheduler_base_relative}-client"
+  local remote_scheduler_result_relative="${scheduler_base_relative}-remote"
   local probe_launch_file="${repo_root}/${probe_launch_relative}"
   local probe_gate_file="${repo_root}/${probe_gate_relative}"
   local probe_finished_file="${repo_root}/${probe_finished_relative}"
   local probe_status_file="${repo_root}/${probe_status_relative}"
+  local scheduler_cancel_file="${repo_root}/${scheduler_cancel_relative}"
+  local client_scheduler_ready_file="${repo_root}/${client_scheduler_ready_relative}"
+  local remote_scheduler_ready_file="${repo_root}/${remote_scheduler_ready_relative}"
+  local client_scheduler_status_file="${repo_root}/${client_scheduler_status_relative}"
+  local remote_scheduler_status_file="${repo_root}/${remote_scheduler_status_relative}"
   local probe_launch_container_file="/workspace/${probe_launch_relative}"
   local probe_gate_container_file="/workspace/${probe_gate_relative}"
   local probe_finished_container_file="/workspace/${probe_finished_relative}"
   local probe_status_container_file="/workspace/${probe_status_relative}"
+  local scheduler_cancel_container_file="/workspace/${scheduler_cancel_relative}"
+  local client_scheduler_ready_container_file="/workspace/${client_scheduler_ready_relative}"
+  local remote_scheduler_ready_container_file="/workspace/${remote_scheduler_ready_relative}"
+  local client_scheduler_status_container_file="/workspace/${client_scheduler_status_relative}"
+  local remote_scheduler_status_container_file="/workspace/${remote_scheduler_status_relative}"
+  local client_scheduler_pid_container_file="/workspace/${client_scheduler_pid_relative}"
+  local remote_scheduler_pid_container_file="/workspace/${remote_scheduler_pid_relative}"
+  local client_scheduler_result_container_prefix="/workspace/${client_scheduler_result_relative}"
+  local remote_scheduler_result_container_prefix="/workspace/${remote_scheduler_result_relative}"
   local output probe_stderr exit_code telemetry_pid schedule_exit_code
   local schedule_completed_offset_ms=""
   local dynamic_loss_metadata_json=""
-  local host_time_namespace_id client_time_namespace_id
+  local host_time_namespace_id client_time_namespace_id remote_time_namespace_id
   local host_monotonic_offset_json client_monotonic_offset_json
+  local remote_monotonic_offset_json endpoint_clocks_json
+  local bulk_interactive_scheduler_wrapper_pid scheduler_ready_deadline schedule_pid
   local clock_preflight_error=""
   local probe_target_ip probe_route_arguments topology_mode
   local role_service_mapping_json
@@ -2955,11 +2966,16 @@ run_bulk_interactive_probe_case() {
   mkdir -p "$(dirname "$probe_gate_file")"
   rm -f \
     "$probe_launch_file" "$probe_gate_file" "$probe_finished_file" \
-    "$probe_status_file" "${probe_status_file}.tmp"
+    "$probe_status_file" "${probe_status_file}.tmp" "$scheduler_cancel_file" \
+    "$client_scheduler_ready_file" "$remote_scheduler_ready_file" \
+    "$client_scheduler_status_file" "$remote_scheduler_status_file"
   exec_in client "rm -f '${out_file}' '${err_file}' '${probe_pid_file}'"
   host_time_namespace_id="$(readlink /proc/self/ns/time 2>/dev/null || true)"
   client_time_namespace_id="$(
     exec_in client "readlink /proc/self/ns/time" 2>/dev/null || true
+  )"
+  remote_time_namespace_id="$(
+    exec_in "$remote_service" "readlink /proc/self/ns/time" 2>/dev/null || true
   )"
   host_monotonic_offset_json="$(
     normalize_monotonic_timens_offset </proc/self/timens_offsets 2>/dev/null || true
@@ -2968,13 +2984,24 @@ run_bulk_interactive_probe_case() {
     exec_in client "cat /proc/self/timens_offsets" 2>/dev/null \
       | normalize_monotonic_timens_offset 2>/dev/null || true
   )"
+  remote_monotonic_offset_json="$(
+    exec_in "$remote_service" "cat /proc/self/timens_offsets" 2>/dev/null \
+      | normalize_monotonic_timens_offset 2>/dev/null || true
+  )"
+  printf -v endpoint_clocks_json '{"client-egress":{"service":"client","time_namespace_id":"%s","monotonic_offset":%s},"remote-egress":{"service":"%s","time_namespace_id":"%s","monotonic_offset":%s}}' \
+    "$client_time_namespace_id" "${client_monotonic_offset_json:-null}" \
+    "$remote_service" "$remote_time_namespace_id" \
+    "${remote_monotonic_offset_json:-null}"
   if [[ ! "$host_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
-    || ! "$client_time_namespace_id" =~ ^time:\[[0-9]+\]$ ]]; then
+    || ! "$client_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
+    || ! "$remote_time_namespace_id" =~ ^time:\[[0-9]+\]$ ]]; then
     clock_preflight_error="time namespace provenance invalid"
   elif [[ -z "$host_monotonic_offset_json" \
-    || -z "$client_monotonic_offset_json" ]]; then
+    || -z "$client_monotonic_offset_json" \
+    || -z "$remote_monotonic_offset_json" ]]; then
     clock_preflight_error="effective monotonic offset unavailable"
-  elif [[ "$host_monotonic_offset_json" != "$client_monotonic_offset_json" ]]; then
+  elif [[ "$host_monotonic_offset_json" != "$client_monotonic_offset_json" \
+    || "$host_monotonic_offset_json" != "$remote_monotonic_offset_json" ]]; then
     clock_preflight_error="effective monotonic offset mismatch"
   fi
   if [[ -n "$clock_preflight_error" ]]; then
@@ -2984,7 +3011,8 @@ run_bulk_interactive_probe_case() {
       "$host_time_namespace_id" "$client_time_namespace_id" \
       "${host_monotonic_offset_json:-null}" \
       "${client_monotonic_offset_json:-null}" \
-      "$topology_mode" "$role_service_mapping_json")"
+      "$topology_mode" "$role_service_mapping_json" \
+      "$endpoint_clocks_json")"
     append_mixed_probe_result \
       "$case_name" 78 "" "" "$clock_preflight_error" \
       "$mptunnel_row" "$baseline_identity_json" "$dynamic_loss_metadata_json" \
@@ -2996,34 +3024,125 @@ run_bulk_interactive_probe_case() {
   active_telemetry_case="$case_name"
   active_telemetry_pid="$telemetry_pid"
   active_bulk_interactive_probe_pid_file="$probe_pid_file"
+  active_bulk_interactive_cancel_file="$scheduler_cancel_file"
   active_bulk_interactive_host_files=(
     "$probe_launch_file" "$probe_gate_file" "$probe_finished_file"
     "$probe_status_file" "${probe_status_file}.tmp"
+    "$scheduler_cancel_file"
+    "$client_scheduler_ready_file" "$remote_scheduler_ready_file"
+    "$client_scheduler_status_file" "$remote_scheduler_status_file"
+    "${repo_root}/${client_scheduler_pid_relative}"
+    "${repo_root}/${remote_scheduler_pid_relative}"
+    "${repo_root}/${client_scheduler_result_relative}.log"
+    "${repo_root}/${remote_scheduler_result_relative}.log"
   )
-  exec_in client "(while [[ ! -f '${probe_launch_container_file}' ]]; do sleep 0.01; done; if timeout $((bulk_interactive_probe_timeout_seconds + 10))s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --workload-mode bulk-interactive ${probe_route_arguments} --http-target ${probe_target_ip}:8080 --tcp-echo-target ${probe_target_ip}:10022 --bulk-path '${large_http_path}' --failover-after -1 --timeout '${bulk_interactive_probe_timeout_seconds}' --load-duration '${bulk_interactive_duration_seconds}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${probe_gate_container_file}' >'${out_file}' 2>'${err_file}'; then probe_exit=0; else probe_exit=\$?; fi; : > '${probe_finished_container_file}'; printf '%s\n' \"\$probe_exit\" > '${probe_status_container_file}.tmp'; mv '${probe_status_container_file}.tmp' '${probe_status_container_file}') </dev/null >/dev/null 2>&1 & echo \$! > '${probe_pid_file}'"
-  : > "$probe_launch_file"
+  local epoch
+  for epoch in "${!bulk_interactive_loss_percent[@]}"; do
+    active_bulk_interactive_host_files+=(
+      "${repo_root}/${client_scheduler_result_relative}-epoch-${epoch}.json"
+      "${repo_root}/${remote_scheduler_result_relative}-epoch-${epoch}.json"
+    )
+  done
+  rm -f "${active_bulk_interactive_host_files[@]}"
+  exec_in client "(while [[ ! -f '${probe_launch_container_file}' ]]; do sleep 0.01; done; if timeout $((bulk_interactive_probe_timeout_seconds + 10))s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --workload-mode bulk-interactive ${probe_route_arguments} --http-target ${probe_target_ip}:8080 --tcp-echo-target ${probe_target_ip}:10022 --bulk-path '${large_http_path}' --failover-after -1 --timeout '${bulk_interactive_probe_timeout_seconds}' --load-duration '${bulk_interactive_duration_seconds}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${probe_gate_container_file}' --finished-file '${probe_finished_container_file}' >'${out_file}' 2>'${err_file}'; then probe_exit=0; else probe_exit=\$?; fi; if [[ ! -f '${probe_finished_container_file}' ]]; then python3 - '${probe_finished_container_file}' <<'PY'
+import os
+import sys
+import time
+path = sys.argv[1]
+temporary = f\"{path}.tmp-{os.getpid()}\"
+with open(temporary, \"w\", encoding=\"utf-8\") as handle:
+    handle.write(f\"{time.monotonic_ns() // 1_000_000}\\n\")
+os.replace(temporary, path)
+PY
+fi; printf '%s\n' \"\$probe_exit\" > '${probe_status_container_file}.tmp'; mv '${probe_status_container_file}.tmp' '${probe_status_container_file}') </dev/null >/dev/null 2>&1 & echo \$! > '${probe_pid_file}'"
+
+  start_bulk_interactive_loss_scheduler \
+    client-egress client "$probe_gate_container_file" \
+    "$probe_finished_container_file" "$scheduler_cancel_container_file" \
+    "$client_scheduler_ready_container_file" \
+    "$client_scheduler_status_container_file" \
+    "$client_scheduler_pid_container_file" \
+    "$client_scheduler_result_container_prefix" \
+    "${repo_root}/${client_scheduler_result_relative}.log"
+  active_bulk_interactive_schedule_pids=("$bulk_interactive_scheduler_wrapper_pid")
+  active_bulk_interactive_schedule_services=(client)
+  active_bulk_interactive_schedule_pid_files=("$client_scheduler_pid_container_file")
+  start_bulk_interactive_loss_scheduler \
+    remote-egress "$remote_service" "$probe_gate_container_file" \
+    "$probe_finished_container_file" "$scheduler_cancel_container_file" \
+    "$remote_scheduler_ready_container_file" \
+    "$remote_scheduler_status_container_file" \
+    "$remote_scheduler_pid_container_file" \
+    "$remote_scheduler_result_container_prefix" \
+    "${repo_root}/${remote_scheduler_result_relative}.log"
+  active_bulk_interactive_schedule_pids+=("$bulk_interactive_scheduler_wrapper_pid")
+  active_bulk_interactive_schedule_services+=("$remote_service")
+  active_bulk_interactive_schedule_pid_files+=("$remote_scheduler_pid_container_file")
+
+  scheduler_ready_deadline=$((SECONDS + 10))
+  while [[ ! -f "$client_scheduler_ready_file" \
+    || ! -f "$remote_scheduler_ready_file" ]] \
+    && (( SECONDS < scheduler_ready_deadline )); do
+    sleep 0.01
+  done
+  schedule_exit_code=78
+  if [[ -f "$client_scheduler_ready_file" \
+    && -f "$remote_scheduler_ready_file" ]]; then
+    : > "$probe_launch_file"
+  else
+    : > "$scheduler_cancel_file"
+    cleanup_active_bulk_interactive_probe
+    stop_case_telemetry "$case_name" "$telemetry_pid"
+    active_telemetry_case=""
+    active_telemetry_pid=""
+    dynamic_loss_metadata_json="$(bulk_interactive_dynamic_loss_metadata \
+      null "$schedule_exit_code" null \
+      "$host_time_namespace_id" "$client_time_namespace_id" \
+      "${host_monotonic_offset_json:-null}" \
+      "${client_monotonic_offset_json:-null}" \
+      "$topology_mode" "$role_service_mapping_json" \
+      "$endpoint_clocks_json")"
+    apply_netem "$default_netem_mode"
+    append_mixed_probe_result \
+      "$case_name" 78 "" "" "endpoint loss scheduler readiness failed" \
+      "$mptunnel_row" "$baseline_identity_json" "$dynamic_loss_metadata_json" \
+      "$protocol_override"
+    return 0
+  fi
 
   local gate_deadline=$((SECONDS + 10))
   while [[ ! -f "$probe_gate_file" && ! -f "$probe_status_file" ]] \
     && (( SECONDS < gate_deadline )); do
     sleep 0.01
   done
-  schedule_exit_code=124
   if [[ -f "$probe_gate_file" ]]; then
     mapfile -t probe_anchor < "$probe_gate_file"
     if (( ${#probe_anchor[@]} == 3 )); then
-      if run_bulk_interactive_dynamic_loss_schedule \
-        "$probe_finished_file" "${probe_anchor[1]}" "$remote_service" \
-        "${repo_root}/.tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$"; then
-        schedule_exit_code=0
+      if wait_for_bulk_interactive_schedulers \
+        "$client_scheduler_status_file" "$remote_scheduler_status_file"; then
+        if collect_bulk_interactive_dynamic_loss_schedule \
+          "$client_scheduler_status_file" "$remote_scheduler_status_file" \
+          "${repo_root}/${client_scheduler_result_relative}" \
+          "${repo_root}/${remote_scheduler_result_relative}"; then
+          schedule_exit_code=0
+        else
+          schedule_exit_code="$?"
+        fi
+        schedule_completed_offset_ms="$bulk_interactive_schedule_completed_offset_ms"
       else
         schedule_exit_code="$?"
       fi
-      schedule_completed_offset_ms="$(($(monotonic_milliseconds) - probe_anchor[1]))"
     else
       schedule_exit_code=2
     fi
   fi
+
+  for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"; do
+    wait "$schedule_pid" >/dev/null 2>&1 || true
+  done
+  active_bulk_interactive_schedule_pids=()
+  active_bulk_interactive_schedule_services=()
+  active_bulk_interactive_schedule_pid_files=()
 
   wait_for_case_probe \
     "$probe_status_file" "$probe_pid_file" "$bulk_interactive_probe_timeout_seconds"
@@ -3040,7 +3159,8 @@ run_bulk_interactive_probe_case() {
     "$host_time_namespace_id" "$client_time_namespace_id" \
     "${host_monotonic_offset_json:-null}" \
     "${client_monotonic_offset_json:-null}" \
-    "$topology_mode" "$role_service_mapping_json")"
+    "$topology_mode" "$role_service_mapping_json" \
+    "$endpoint_clocks_json")"
   apply_netem "$default_netem_mode"
   append_mixed_probe_result \
     "$case_name" "$exit_code" "$output" "" "$probe_stderr" \

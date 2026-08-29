@@ -390,6 +390,7 @@ class RunnerContractTests(unittest.TestCase):
         self.assertNotIn("--small-path", probe)
         self.assertNotIn("--udp-target", probe)
         self.assertIn("--started-file '${probe_gate_container_file}'", probe)
+        self.assertIn("--finished-file '${probe_finished_container_file}'", probe)
         self.assertIn("--load-duration '${bulk_interactive_duration_seconds}'", probe)
         self.assertIn('local mptunnel_row="${3:-1}"', probe)
         self.assertIn('local baseline_identity_json="${4:-}"', probe)
@@ -408,54 +409,35 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('bulk_interactive_initial_loss="3%"', SCRIPT)
         self.assertIn("bulk_interactive_transition_complete_lateness_ms=250", SCRIPT)
         self.assertIn("bulk_interactive_transition_command_timeout_seconds=2", SCRIPT)
-        schedule = SCRIPT.split(
-            "run_bulk_interactive_dynamic_loss_schedule() {", 1
+        scheduler = NETEM.split("run_bulk_interactive_loss_schedule() {", 1)[1].split(
+            '\n}\n\ncase "$mode" in', 1
+        )[0]
+        collector = SCRIPT.split(
+            "collect_bulk_interactive_dynamic_loss_schedule() {", 1
         )[1].split("\n}\n\nbulk_interactive_dynamic_loss_metadata()", 1)[0]
-        endpoint_change = SCRIPT.split(
-            "apply_bulk_interactive_loss_endpoint() {", 1
-        )[1].split("\n}\n\nrun_bulk_interactive_dynamic_loss_schedule()", 1)[0]
-        self.assertIn("probe_started_monotonic_ms + planned_offset_ms", schedule)
-        self.assertIn(
-            "probe_started_monotonic_ms + bulk_interactive_duration_seconds * 1000",
-            schedule,
-        )
-        self.assertIn('client-egress client "$loss_percent"', schedule)
-        self.assertIn('remote-egress "$remote_service" "$loss_percent"', schedule)
-        self.assertIn(
-            'active_bulk_interactive_schedule_pids=("$client_pid")',
-            schedule,
-        )
-        self.assertIn('active_bulk_interactive_schedule_pids+=("$remote_pid")', schedule)
-        early_probe_exit = (
-            'if [[ "$client_wait_exit" == "124" || '
-            '"$remote_wait_exit" == "124" ]]; then'
-        )
-        self.assertIn(early_probe_exit, schedule)
-        self.assertLess(schedule.index(early_probe_exit), schedule.index('client_json="$('))
-        self.assertLess(
-            schedule.index(early_probe_exit),
-            schedule.index(
-                "bulk_interactive_schedule_event_count=$((bulk_interactive_schedule_event_count + 1))"
-            ),
-        )
-        self.assertEqual(schedule.count("wait_for_bulk_interactive_deadline"), 1)
-        self.assertIn('change-balanced-observed', endpoint_change)
-        self.assertIn(
-            '"$absolute_deadline_ms" "$probe_finished_file"', endpoint_change
-        )
-        self.assertLess(
-            endpoint_change.index("wait_for_bulk_interactive_deadline"),
-            endpoint_change.index('start_offset_ms="$(('),
-        )
-        self.assertIn('"$bulk_interactive_transition_command_timeout_seconds"', endpoint_change)
-        self.assertIn('"readback_base64"', schedule)
-        self.assertIn('readlink /proc/self/ns/time', probe)
-        self.assertIn('cat /proc/self/timens_offsets', probe)
-        self.assertIn('normalize_monotonic_timens_offset', probe)
+        self.assertIn("time.monotonic_ns()", scheduler)
+        self.assertIn("origin_ms + planned_offset_ms", scheduler)
+        self.assertIn("change-balanced-observed", scheduler)
+        self.assertIn("atomic_write(ready_file", scheduler)
+        self.assertIn("atomic_write(status_file", scheduler)
+        self.assertIn('"readback_base64": readback_base64', scheduler)
+        self.assertIn("bulk_interactive_transition_complete_lateness_ms=250", SCRIPT)
+        self.assertIn("client_status_file", collector)
+        self.assertNotIn("compose exec", scheduler)
+        self.assertNotIn("apply_bulk_interactive_loss_endpoint", SCRIPT)
+        self.assertNotIn("wait_for_bulk_interactive_deadline", SCRIPT)
+        self.assertIn("readlink /proc/self/ns/time", probe)
+        self.assertIn("cat /proc/self/timens_offsets", probe)
+        self.assertIn("normalize_monotonic_timens_offset", probe)
         self.assertIn(
             '"$host_monotonic_offset_json" != "$client_monotonic_offset_json"',
             probe,
         )
+        self.assertIn(
+            '"$host_monotonic_offset_json" != "$remote_monotonic_offset_json"',
+            probe,
+        )
+        self.assertIn("endpoint_clocks_json", probe)
         self.assertNotIn(
             '"$host_time_namespace_id" != "$client_time_namespace_id"', probe
         )
@@ -528,7 +510,7 @@ class RunnerContractTests(unittest.TestCase):
     def test_bulk_interactive_profile_and_metadata_match_the_probe_route(self):
         baseline_profile = SCRIPT.split(
             "apply_bulk_interactive_baseline_profile() {", 1
-        )[1].split("\n}\n\nwait_for_bulk_interactive_deadline()", 1)[0]
+        )[1].split("\n}\n\nstart_bulk_interactive_loss_scheduler()", 1)[0]
         probe = SCRIPT.split("run_bulk_interactive_probe_case() {", 1)[1].split(
             "\n}\n\nrun_raw_tcp_bulk_interactive_case()", 1
         )[0]
@@ -541,13 +523,15 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('probe_target_ip="172.31.15.30"', probe)
         self.assertNotIn("constant_service_loss", probe)
 
-    def test_bulk_interactive_wait_rechecks_early_probe_completion(self):
-        wait = SCRIPT.split("wait_for_bulk_interactive_deadline() {", 1)[1].split(
-            "\n}\n\napply_bulk_interactive_loss_endpoint()", 1
+    def test_bulk_interactive_endpoint_scheduler_checks_finish_and_cancel(self):
+        scheduler = NETEM.split("run_bulk_interactive_loss_schedule() {", 1)[1].split(
+            '\n}\n\ncase "$mode" in', 1
         )[0]
-        self.assertEqual(wait.count('-f "$probe_finished_file"'), 2)
-        self.assertIn('sleep "$((remaining_ms / 1000))', wait)
-        self.assertNotIn("sleep 0.01", wait)
+        self.assertIn("finished_file.exists()", scheduler)
+        self.assertIn("cancelled(cancel_file)", scheduler)
+        self.assertIn("earliest_allowed_finish_ms=origin_ms + duration_ms", scheduler)
+        self.assertIn("start_new_session=True", scheduler)
+        self.assertIn("os.killpg(process.pid, signal.SIGKILL)", scheduler)
 
     def test_bulk_interactive_probe_start_is_released_by_host_after_launch(self):
         probe = SCRIPT.split("run_bulk_interactive_probe_case() {", 1)[1].split(
@@ -557,11 +541,13 @@ class RunnerContractTests(unittest.TestCase):
         release = ': > "$probe_launch_file"'
         invocation = 'exec_in client "(while'
         gate_wait = 'while [[ ! -f "$probe_gate_file"'
+        scheduler_ready = '[[ -f "$client_scheduler_ready_file"'
 
         self.assertIn(launch, probe)
         self.assertIn("</dev/null >/dev/null 2>&1 &", probe)
         self.assertIn(release, probe)
         self.assertLess(probe.index(invocation), probe.index(release))
+        self.assertLess(probe.index(scheduler_ready), probe.index(release))
         self.assertLess(probe.index(release), probe.index(gate_wait))
         self.assertIn('"$probe_launch_file" "$probe_gate_file"', probe)
 
@@ -591,7 +577,10 @@ class RunnerContractTests(unittest.TestCase):
             'for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"',
             probe_cleanup,
         )
-        self.assertIn('pkill -TERM -P "$schedule_pid"', probe_cleanup)
+        self.assertIn(': > "$active_bulk_interactive_cancel_file"', probe_cleanup)
+        self.assertIn('kill -TERM -- \\"-\\$child_pid\\"', probe_cleanup)
+        self.assertIn('kill -KILL -- \\"-\\$child_pid\\"', probe_cleanup)
+        self.assertIn("active_bulk_interactive_schedule_services", probe_cleanup)
         self.assertIn('wait "$schedule_pid"', probe_cleanup)
         self.assertLess(
             probe_cleanup.index('wait "$schedule_pid"'),

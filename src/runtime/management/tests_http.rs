@@ -401,8 +401,9 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
             .count(),
         2
     );
+    let dashboard_css_lf = DASHBOARD_CSS.replace("\r\n", "\n");
     assert!(
-        DASHBOARD_CSS
+        dashboard_css_lf
             .contains(".records-table--peer {\n  min-width: 1050px;\n  table-layout: fixed;\n}")
     );
     for peer_column in [

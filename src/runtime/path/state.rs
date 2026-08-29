@@ -140,7 +140,7 @@ impl ClientPathState {
         if self.path_model_generation() != observed_generation {
             Box::pin(std::future::ready(()))
         } else {
-            Box::pin(async move { publication.await })
+            publication
         }
     }
 

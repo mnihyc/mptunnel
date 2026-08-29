@@ -1461,7 +1461,7 @@ async fn ranged_tcp_maximum_one_replaces_before_drain_without_breaking_active_pr
         loop {
             let snapshot = carrier_server.paths.reliable_streams.management_snapshot();
             if snapshot.paths.len() == 1 {
-                break snapshot.paths[0].clone();
+                break snapshot.paths[0];
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1553,7 +1553,7 @@ async fn ranged_tcp_maximum_one_replaces_before_drain_without_breaking_active_pr
             if snapshot.paths.len() == 1
                 && snapshot.paths[0].path_instance_id != initial_server_path.path_instance_id
             {
-                break snapshot.paths[0].clone();
+                break snapshot.paths[0];
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

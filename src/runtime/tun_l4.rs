@@ -179,6 +179,10 @@ pub(super) const fn tun_tcp_flow_limit(mux_limits: crate::mux::MuxLimits) -> usi
     mux_limits.max_streams
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the accepted TUN-flow boundary transfers distinct endpoint, routing, and lifecycle owners"
+)]
 pub(super) async fn handle_tun_tcp_stream<S>(
     mut stream: S,
     local: SocketAddr,

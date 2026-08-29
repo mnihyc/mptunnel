@@ -220,6 +220,10 @@ where
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the UDP lane actor boundary transfers independent routing, queue, and lifecycle owners"
+)]
 async fn run_udp_edge_lane<M>(
     lane_id: usize,
     local_metadata: M,
@@ -354,6 +358,10 @@ async fn run_udp_edge_lane<M>(
 /// UDP has no protocol-level rejection response. Completing each queued send
 /// without opening an outbound preserves silent Reject/Drop behavior and
 /// prevents later datagrams from repeating DNS and policy evaluation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the denied-lane actor boundary retains independent queue and lifecycle owners"
+)]
 async fn run_silent_udp_denial_lane<M>(
     lane_id: usize,
     local_metadata: M,

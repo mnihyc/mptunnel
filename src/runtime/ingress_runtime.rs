@@ -456,6 +456,10 @@ async fn handle_mixed_client_stream(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener composition boundary transfers each independent Product owner"
+)]
 pub(super) async fn spawn_http_connect_client_ingress(
     listen: Vec<SocketAddr>,
     router: ClientIngressRouter,

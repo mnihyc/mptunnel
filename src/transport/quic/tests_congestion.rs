@@ -255,8 +255,10 @@ fn path_loss_compensation_constructs_initial_and_fresh_bbr3_without_reusing_init
         .expect("fresh instrumented controller");
     assert_eq!(fresh.loss_compensation.ppm(), 51_234);
     assert_bbr3_loss_compensation(&fresh, "loss_compensation_floor: 0.051234");
-    let mut rate_only = crate::transport::PathMetadata::default();
-    rate_only.initial_rate = crate::transport::RateHint::BitsPerSecond(25_000_000);
+    let rate_only = crate::transport::PathMetadata {
+        initial_rate: crate::transport::RateHint::BitsPerSecond(25_000_000),
+        ..Default::default()
+    };
     let default_controller = quinn::congestion::ControllerFactory::build(
         Arc::new(InstrumentedBbrConfig::for_path(&rate_only)),
         now,

@@ -47,7 +47,7 @@ pub struct CongestionMetrics {
     pub app_limited: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct InstrumentedBbrConfig {
     loss_compensation: LossPolicyPercent,
 }
@@ -75,14 +75,6 @@ impl InstrumentedBbrConfig {
             now,
             current_mtu,
         )
-    }
-}
-
-impl Default for InstrumentedBbrConfig {
-    fn default() -> Self {
-        Self {
-            loss_compensation: LossPolicyPercent::default(),
-        }
     }
 }
 

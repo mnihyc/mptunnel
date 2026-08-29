@@ -16,11 +16,11 @@ use crate::model::response::{
     CarrierPathFlightDebt, response_oldest_lower_flight_owner, response_ordering_debt_bytes,
 };
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, UnderlayProtocol};
+use crate::protocol::Frame;
 use crate::runtime::sender::response::ResponseOutputIdentity;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::ResponseSenderPathTarget;
-use crate::scheduler::{self, PathRateScope, PathSnapshot, TrafficClass};
+use crate::scheduler::{self, TrafficClass};
 
 /// Selects the path for the next unique connection-data range.
 ///
@@ -176,18 +176,6 @@ pub(super) fn select_response_data_path_with_payload(
                 } else {
                     BulkCandidatePosition::AdditionalPath
                 };
-                let completion_snapshot = if lane.is_bulk() {
-                    response_bulk_completion_snapshot(snapshot, position)
-                } else {
-                    snapshot
-                };
-                let completion_eta_ms = if completion_snapshot.delivery_rate_bps
-                    == snapshot.delivery_rate_bps
-                {
-                    eta_ms
-                } else {
-                    scheduler::score_path(completion_snapshot, lane, payload_bytes)?.eta_ms
-                };
                 let (best_snapshot, best_eta_ms) = if owns_lower_frontier {
                     (snapshot, eta_ms)
                 } else {
@@ -227,7 +215,7 @@ pub(super) fn select_response_data_path_with_payload(
                                 best_snapshot,
                                 best_eta_ms,
                                 candidate_snapshot: snapshot,
-                                candidate_eta_ms: completion_eta_ms,
+                                candidate_eta_ms: eta_ms,
                                 payload_bytes: target_payload_bytes,
                                 mux_limits,
                                 position,
@@ -256,7 +244,7 @@ pub(super) fn select_response_data_path_with_payload(
                         lead_key.underlay,
                         lead_key.path_id.0,
                         lead.0.observation.incarnation,
-                        completion_eta_ms,
+                        eta_ms,
                         lead_eta_ms,
                         payload_bytes,
                         target_payload_bytes,
@@ -280,7 +268,7 @@ pub(super) fn select_response_data_path_with_payload(
                 suppression.is_none().then_some((
                     target,
                     snapshot,
-                    completion_eta_ms,
+                    eta_ms,
                     external_flight,
                     target_payload_bytes,
                 ))
@@ -340,40 +328,6 @@ pub(super) fn select_response_data_path_with_payload(
                 .then(|| select(true, true))
                 .flatten()
         })
-}
-
-/// Keeps a demonstrated Product lower bound from becoming evidence of unused
-/// TCP service. Product progress may raise the current path's completion floor,
-/// but an already-active Additional path is projected from its current
-/// qualified native observation. Product-only fallback and frontier service
-/// retain their original completion view.
-fn response_bulk_completion_snapshot(
-    mut snapshot: PathSnapshot,
-    position: BulkCandidatePosition,
-) -> PathSnapshot {
-    if position != BulkCandidatePosition::AdditionalPath
-        || snapshot.underlay != UnderlayProtocol::Tcp
-        || snapshot.rate_scope != PathRateScope::PathCapacity
-        || !snapshot.has_durable_product_progress
-    {
-        return snapshot;
-    }
-    let (Some(native_rate_bps), Some(product_rate_bps)) = (
-        snapshot.carrier_delivery_rate_bps,
-        snapshot.product_progress_rate_bps,
-    ) else {
-        return snapshot;
-    };
-    if native_rate_bps.is_finite()
-        && native_rate_bps > 0.0
-        && product_rate_bps.is_finite()
-        && snapshot.delivery_rate_bps.is_finite()
-        && snapshot.delivery_rate_bps > native_rate_bps
-        && product_rate_bps >= snapshot.delivery_rate_bps
-    {
-        snapshot.delivery_rate_bps = native_rate_bps;
-    }
-    snapshot
 }
 
 pub(super) fn response_completion_snapshot(

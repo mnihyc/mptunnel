@@ -438,7 +438,7 @@ fn additional_unproven_path_owns_at_most_one_startup_flight() {
 }
 
 #[test]
-fn regression_product_raised_tcp_capacity_cannot_mint_marginal_additional_service() {
+fn mature_additional_tcp_output_keeps_fresh_product_completion_evidence() {
     let mux_limits = MuxLimits::default();
     let startup_flight = reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
     let owner = response_target(
@@ -489,72 +489,17 @@ fn regression_product_raised_tcp_capacity_cannot_mint_marginal_additional_servic
     );
 
     let selected = select_response_data_path(
-        &[owner.clone(), candidate],
+        &[owner.clone(), candidate.clone()],
         TrafficClass::Throughput,
         64 * 1024,
         mux_limits,
         &lower,
         ordering_debt,
     )
-    .expect("the lower-frontier owner remains schedulable");
+    .expect("fresh Product completion keeps the mature additional output schedulable");
     assert_eq!(
-        selected.observation.key, owner.observation.key,
-        "REGRESSION: a Product-raised TCP rate was treated as independent carrier capacity and minted marginal Additional-output service",
-    );
-}
-
-#[test]
-fn product_raised_rate_projection_is_scoped_to_tcp_bulk_additional_service() {
-    let mut raised = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
-    raised.rate_scope = PathRateScope::PathCapacity;
-    raised.carrier_delivery_rate_bps = Some(1_000_000.0);
-    raised.product_progress_rate_bps = Some(500_000_000.0);
-    raised.has_durable_product_progress = true;
-
-    assert_eq!(
-        response_bulk_completion_snapshot(raised, BulkCandidatePosition::AdditionalPath)
-            .delivery_rate_bps,
-        1_000_000.0,
-        "only the retained qualified native rate represents the Additional path's carrier-capacity projection",
-    );
-    for position in [
-        BulkCandidatePosition::FirstPath,
-        BulkCandidatePosition::ContiguousFrontier,
-    ] {
-        assert_eq!(
-            response_bulk_completion_snapshot(raised, position).delivery_rate_bps,
-            500_000_000.0,
-            "frontier service retains the demonstrated Product lower bound",
-        );
-    }
-
-    let mut product_only = raised;
-    product_only.carrier_delivery_rate_bps = None;
-    assert_eq!(
-        response_bulk_completion_snapshot(product_only, BulkCandidatePosition::AdditionalPath)
-            .delivery_rate_bps,
-        500_000_000.0,
-        "Product completion remains the portable fallback when native capacity is unavailable",
-    );
-
-    let mut native_dominates = raised;
-    native_dominates.delivery_rate_bps = 500_000_000.0;
-    native_dominates.carrier_delivery_rate_bps = Some(500_000_000.0);
-    native_dominates.product_progress_rate_bps = Some(1_000_000.0);
-    assert_eq!(
-        response_bulk_completion_snapshot(native_dominates, BulkCandidatePosition::AdditionalPath,)
-            .delivery_rate_bps,
-        500_000_000.0,
-        "qualified native capacity remains eligible for independent aggregation",
-    );
-
-    let mut quic = raised;
-    quic.underlay = UnderlayProtocol::Udp;
-    assert_eq!(
-        response_bulk_completion_snapshot(quic, BulkCandidatePosition::AdditionalPath)
-            .delivery_rate_bps,
-        500_000_000.0,
-        "the TCP-specific Product/native merge must not alter QUIC",
+        selected.observation.key, candidate.observation.key,
+        "REGRESSION: a transient Additional-output role discarded fresh exact-output Product completion evidence and stranded mature TCP acquisition",
     );
 }
 

@@ -1466,8 +1466,9 @@ once per candidate carrier.
 Per-flow evidence MUST NOT be extrapolated into shared carrier capacity. A
 fresh durable Product delivery sample on one output MAY establish only the
 lower bound that the same carrier has just delivered at least that rate. It
-MUST NOT be scaled by flow count, used to infer unused or marginal capacity, or
-retained past the transport-rate freshness horizon. Only the directional
+MUST NOT be multiplied by flow count to infer aggregate capacity, used to
+infer unused or marginal capacity, or retained past the transport-rate
+freshness horizon. Only the directional
 sender may combine per-stream events into an aggregate conclusion, and only
 while the target demand, ordinary carrier membership and eligibility,
 concurrent Product workload, and local admission and resource policy remain
@@ -1510,12 +1511,19 @@ MUST NOT cap an otherwise qualified native carrier. This provenance order is
 identical in both stream directions and for every carrier underlay.
 
 For TCP response placement, exact durable MPP Data ACK progress MAY raise a
-fresh qualified native capacity observation to the demonstrated Product lower
-bound while both samples remain fresh. The resulting observation retains
-carrier-capacity scope: it is divided among active Product flows and remains
-subject to native send credit and backpressure. It does not replace the native
-congestion controller, authorize additional-output placement, or change the
-Data-ACK ownership rules in Section 15.
+fresh qualified native delivery observation to the demonstrated same-output
+Product lower bound while both samples remain fresh. The lower bound is
+completion evidence for that exact output in every placement role; changing
+between leading, contiguous-frontier, and additional-output roles MUST NOT
+rewrite its value or provenance. It MUST NOT be added to native delivery,
+multiplied by flow count to infer aggregate capacity, or treated as proof of
+unused, independent, or marginal carrier capacity. It does not replace the
+native congestion controller or, by itself, bypass exact Data-ACK maturity,
+native send credit and backpressure, shared receive credit, queue and flight,
+completion-time, or reorder gates in Section 15. For conservative per-flow
+completion ranking, an implementation MAY apportion this demonstrated lower
+bound among concurrently active Product flows; that accounting does not prove
+aggregate carrier capacity or bypass the additional-output admission gates.
 
 A locator, interface, or route cannot establish carrier capacity, marginal
 benefit, or bottleneck identity.

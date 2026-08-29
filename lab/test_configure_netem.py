@@ -158,6 +158,28 @@ print(os.environ["FAKE_SCHEDULE_TSV"], end="")
         self.assertIn("corrupt 0.05%", outage)
         self.assertIn("seed 105", outage)
 
+    def test_balanced_dynamic_transition_changes_the_existing_qdisc(self):
+        completed, tc_calls, generator_args = self.run_mode(
+            "change-balanced",
+            extra_env={
+                "MPTUNNEL_LAB_BALANCED_RATE": "500mbit",
+                "MPTUNNEL_LAB_BALANCED_DELAY": "50ms",
+                "MPTUNNEL_LAB_BALANCED_JITTER": "20ms",
+                "MPTUNNEL_LAB_BALANCED_LOSS": "6%",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(generator_args, [])
+        self.assertEqual(len(tc_calls), 1)
+        self.assertTrue(tc_calls[0].startswith("qdisc change dev if15 root netem "))
+        for fragment in (
+            "rate 500mbit",
+            "delay 50ms 20ms distribution normal",
+            "loss 6%",
+        ):
+            self.assertIn(fragment, tc_calls[0])
+
     def test_later_epoch_is_an_independent_seeded_replacement(self):
         completed, tc_calls, generator_args = self.run_mode(
             "internet-five-path-epoch-7-server"

@@ -33,6 +33,13 @@ python3 lab/validate_performance_declaration.py \
   --phase acceptance
 ```
 
+Separate preparation from measurement for every release cohort. Build the
+product and lab images first, then wait for a valid-host preflight; every
+measured invocation sets `BUILD_PRODUCT=0` and `BUILD_LAB_IMAGES=0`, while the
+recorded binary, runtime, and container-image identities prove exact reuse.
+Once P1 starts there is no retry: any invalid or failed invocation requires a
+new candidate identity and a complete cohort restart.
+
 An acceptance record may split a cell across multiple evidence entries, but
 every declared `(cell, metric)` pair must occur exactly once. Each entry must:
 

@@ -114,6 +114,43 @@ class RunnerContractTests(unittest.TestCase):
             2,
         )
 
+    def test_no_build_invocation_cannot_build_or_use_missing_product(self):
+        product_check = SCRIPT.split("require_prebuilt_product() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        compose_up = SCRIPT.split("compose_up() {", 1)[1].split("\n}", 1)[0]
+        startup = SCRIPT.split("docker compose version >/dev/null", 1)[1].split(
+            "trap cleanup EXIT", 1
+        )[0]
+
+        self.assertIn('[[ -x "${host_build_root}/release/mptunnel" ]]', product_check)
+        self.assertIn('[[ -x "$client_binary_host" ]]', product_check)
+        self.assertIn('if [[ "$build_product" == "1" ]]; then', startup)
+        self.assertIn("require_prebuilt_product", startup)
+        self.assertIn('if [[ "$build_lab_images" == "1" ]]; then', startup)
+        self.assertIn("compose build", startup)
+        self.assertIn("compose up --no-build -d --remove-orphans", compose_up)
+        self.assertNotIn("compose up -d --remove-orphans", startup)
+        self.assertEqual(SCRIPT.count("compose up --no-build -d --remove-orphans"), 1)
+        self.assertNotIn("compose up -d --remove-orphans", SCRIPT)
+
+    def test_build_decisions_accept_only_normalized_binary_flags(self):
+        validation = SCRIPT.split("validate_build_decision() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn('[[ "$value" != "0" && "$value" != "1" ]]', validation)
+        self.assertIn('validate_build_decision BUILD_PRODUCT "$build_product"', SCRIPT)
+        self.assertIn(
+            'validate_build_decision BUILD_LAB_IMAGES "$build_lab_images"', SCRIPT
+        )
+
+    def test_run_manifest_records_normalized_build_decisions(self):
+        manifest = SCRIPT.split("write_run_manifest() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn('BUILD_PRODUCT="$build_product"', manifest)
+        self.assertIn('BUILD_LAB_IMAGES="$build_lab_images"', manifest)
+
     def test_wine_runtime_is_opt_in_and_client_only(self):
         build_function = SCRIPT.split("build_mptunnel_binary() {", 1)[1].split(
             "\n}", 1

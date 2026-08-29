@@ -16,6 +16,15 @@ flag_enabled() {
   esac
 }
 
+validate_build_decision() {
+  local name="$1"
+  local value="$2"
+  if [[ "$value" != "0" && "$value" != "1" ]]; then
+    echo "$name must be 0 or 1" >&2
+    exit 2
+  fi
+}
+
 hysteria_bandwidth_from_netem_rate() {
   local value="${1,,}"
   if [[ "$value" =~ ^([0-9]+([.][0-9]+)?)([kmgt]?)bit$ ]]; then
@@ -176,6 +185,8 @@ failover_trigger_timeout_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_TIMEOUT_SECOND
 failover_trigger_poll_interval_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_POLL_INTERVAL_SECONDS:-0.02}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
+validate_build_decision BUILD_PRODUCT "$build_product"
+validate_build_decision BUILD_LAB_IMAGES "$build_lab_images"
 client_runtime="${MPTUNNEL_LAB_CLIENT_RUNTIME:-native}"
 wine_prefix="${MPTUNNEL_LAB_WINE_PREFIX:-.tmp/lab/wine}"
 host_build_root="${MPTUNNEL_LAB_BUILD_ROOT:-target}"
@@ -467,6 +478,10 @@ compose() {
   docker compose -f "$compose_file" "$@"
 }
 
+compose_up() {
+  compose up --no-build -d --remove-orphans
+}
+
 exec_in() {
   local service="$1"
   shift
@@ -553,6 +568,17 @@ build_mptunnel_binary() {
     CARGO_TARGET_DIR="$host_build_root" \
       cargo build --release --locked --target "$client_target" --bin mptunnel "${feature_args[@]}"
   fi
+}
+
+require_prebuilt_product() {
+  [[ -x "${host_build_root}/release/mptunnel" ]] || {
+    echo "BUILD_PRODUCT=0 requires an executable server binary at ${host_build_root}/release/mptunnel" >&2
+    return 2
+  }
+  [[ -x "$client_binary_host" ]] || {
+    echo "BUILD_PRODUCT=0 requires an executable client binary at $client_binary_host" >&2
+    return 2
+  }
 }
 
 client_mptunnel_command() {
@@ -676,6 +702,8 @@ write_run_manifest() {
   FAILOVER_AFTER_SECONDS="$failover_after" \
   FAILOVER_PROFILE="$failover_profile" \
   FAILOVER_TX_TRIGGER_BYTES="$failover_tx_trigger_bytes" \
+  BUILD_PRODUCT="$build_product" \
+  BUILD_LAB_IMAGES="$build_lab_images" \
   ISOLATE_CASES_VALUE="$isolate_cases" \
   ISOLATE_CONTAINERS_VALUE="$isolate_containers" \
   CLIENT_SETTLE_SECONDS="$client_start_settle_seconds" \
@@ -2494,7 +2522,7 @@ start_client_with_netem() {
     if [[ "$isolate_containers" == "1" ]]; then
       stop_server
       compose down --remove-orphans >/dev/null 2>&1 || true
-      compose up -d --remove-orphans >/dev/null
+      compose_up >/dev/null
     fi
     prepare_client_runtime
     apply_netem "$netem_mode"
@@ -2540,7 +2568,7 @@ start_tun_client() {
     if [[ "$isolate_containers" == "1" ]]; then
       stop_server
       compose down --remove-orphans >/dev/null 2>&1 || true
-      compose up -d --remove-orphans >/dev/null
+      compose_up >/dev/null
     fi
     apply_netem "$default_netem_mode"
     start_target_services
@@ -2625,7 +2653,7 @@ prepare_baseline_case() {
   if [[ "$isolate_cases" == "1" && "$isolate_containers" == "1" ]]; then
     stop_server
     compose down --remove-orphans >/dev/null 2>&1 || true
-    compose up -d --remove-orphans >/dev/null
+    compose_up >/dev/null
   else
     stop_server
   fi
@@ -3553,7 +3581,7 @@ run_direct_mixed_case() {
     if [[ "$isolate_containers" == "1" ]]; then
       stop_server
       compose down --remove-orphans >/dev/null 2>&1 || true
-      compose up -d --remove-orphans >/dev/null
+      compose_up >/dev/null
     fi
     apply_netem "$netem_mode"
     start_target_services
@@ -4449,11 +4477,13 @@ mkdir -p "$result_dir"
 docker compose version >/dev/null
 if [[ "$build_product" == "1" ]]; then
   build_mptunnel_binary
+else
+  require_prebuilt_product
 fi
 if [[ "$build_lab_images" == "1" ]]; then
   compose build
 fi
-compose up -d --remove-orphans
+compose_up
 trap cleanup EXIT
 prepare_client_runtime
 capture_host_snapshot

@@ -132,6 +132,8 @@ def _release_manifest_image_identity(path):
         and workload.get("object_mib") == 4096
         and workload.get("bulk_connections") == 1
         and isinstance(execution, dict)
+        and execution.get("build_product") is False
+        and execution.get("build_lab_images") is False
         and execution.get("lab_diagnostics") == "0"
         and execution.get("lab_perf") == "0"
         and execution.get("management_snapshots") == "0"

@@ -290,6 +290,7 @@ class ResultEnrichmentTests(unittest.TestCase):
             )
 
     def test_run_manifest_records_inputs_without_secrets(self):
+        self.assertEqual(RUN_MANIFEST_SCHEMA_VERSION, 4)
         baseline_lock = {
             "schema_version": 1,
             "tools": {
@@ -321,6 +322,8 @@ class ResultEnrichmentTests(unittest.TestCase):
             "FAILOVER_AFTER_SECONDS": "2",
             "FAILOVER_PROFILE": "fat",
             "FAILOVER_TX_TRIGGER_BYTES": "2097152",
+            "BUILD_PRODUCT": "0",
+            "BUILD_LAB_IMAGES": "0",
             "ISOLATE_CASES_VALUE": "1",
             "ISOLATE_CONTAINERS_VALUE": "1",
             "CLIENT_SETTLE_SECONDS": "2",
@@ -405,6 +408,8 @@ class ResultEnrichmentTests(unittest.TestCase):
                 manifest["workload"]["bulk_interactive_dynamic_loss"],
                 BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION,
             )
+            self.assertIs(manifest["execution"]["build_product"], False)
+            self.assertIs(manifest["execution"]["build_lab_images"], False)
             self.assertTrue(manifest["execution"]["isolate_containers_per_case"])
             self.assertTrue(
                 manifest["execution"]["require_competitor_baselines"]

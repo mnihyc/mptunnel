@@ -132,6 +132,8 @@ def release_manifest():
     )
     manifest["workload"].update(object_mib=4096, bulk_connections=1)
     manifest["execution"].update(
+        build_product=False,
+        build_lab_images=False,
         lab_diagnostics="0",
         lab_perf="0",
         management_snapshots="0",
@@ -456,6 +458,8 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
         invalid_fields = (
             (("workload", "object_mib"), 2048),
             (("workload", "bulk_connections"), 2),
+            (("execution", "build_product"), True),
+            (("execution", "build_lab_images"), True),
             (("execution", "lab_diagnostics"), "1"),
             (("execution", "lab_perf"), "1"),
             (("execution", "management_snapshots"), "1"),
@@ -487,6 +491,25 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
                 manifest[keys[0]][keys[1]] = value
                 manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
                 output = root / f"invalid-profile-{index}.json"
+
+                status = evaluate_main(invocation(products, raws, output))
+                verdict = json.loads(output.read_text(encoding="utf-8"))
+
+                self.assertEqual(status, 2)
+                self.assertEqual(verdict["status"], "invalid")
+                self.assertEqual(verdict["repetitions"], [])
+                self.assertIn("frozen v0.4.4 release profile", verdict["errors"][0])
+
+    def test_release_profile_rejects_missing_build_provenance(self):
+        for flag in ("build_product", "build_lab_images"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                products, raws = write_cohort(root)
+                manifest_path = products[0].parent / "run-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                del manifest["execution"][flag]
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                output = root / f"missing-{flag}.json"
 
                 status = evaluate_main(invocation(products, raws, output))
                 verdict = json.loads(output.read_text(encoding="utf-8"))

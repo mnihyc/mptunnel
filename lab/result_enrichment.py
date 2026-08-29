@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 
 RESULT_SCHEMA_VERSION = 2
-RUN_MANIFEST_SCHEMA_VERSION = 3
+RUN_MANIFEST_SCHEMA_VERSION = 4
 MPTUNNEL_PROTOCOL_VERSION = 8
 MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE = {
     "standard": "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297",
@@ -618,6 +618,13 @@ def write_run_manifest(
     if bulk_interactive_dynamic_loss != BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION:
         raise ValueError("BULK_INTERACTIVE_DYNAMIC_LOSS does not match the lab contract")
 
+    build_decisions = {}
+    for key in ("BUILD_PRODUCT", "BUILD_LAB_IMAGES"):
+        value = env.get(key)
+        if value not in {"0", "1"}:
+            raise ValueError(f"{key} must be 0 or 1")
+        build_decisions[key] = value == "1"
+
     manifest = {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "kind": "mptunnel.lab.run-manifest",
@@ -640,6 +647,8 @@ def write_run_manifest(
             "failover_tx_trigger_bytes": int(env["FAILOVER_TX_TRIGGER_BYTES"]),
         },
         "execution": {
+            "build_product": build_decisions["BUILD_PRODUCT"],
+            "build_lab_images": build_decisions["BUILD_LAB_IMAGES"],
             "isolate_cases": env["ISOLATE_CASES_VALUE"] == "1",
             "isolate_containers_per_case": env["ISOLATE_CONTAINERS_VALUE"] == "1",
             "client_settle_seconds": float(env["CLIENT_SETTLE_SECONDS"]),

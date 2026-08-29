@@ -1,9 +1,40 @@
 # MPTUNNEL Quinn protocol patch
 
-This core crate contains the crates.io source for `quinn-proto` 0.11.16,
-checksum `2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560`,
+This core crate contains the crates.io source for `quinn-proto` 0.11.17,
+checksum `04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83`,
 plus MPTUNNEL's congestion-control and private-Initial extensions. The
 upstream MIT and Apache-2.0 licenses are included unchanged.
+
+The release baseline is official tag `quinn-proto-0.11.17`, commit
+`0343120eb7ccdd067a7e975613b96190c8562bf7`. Its release lineage carried the
+datagram-buffer refactor without the earlier main-line pruning chain, and the
+tag therefore decrements `payload_bytes` twice after `pop_front()` while also
+testing capacity before accounting for the new datagram payload. The public-API
+`datagram_drop_pruning_preserves_accounting` reproduction against the exact tag
+deterministically panics from that accounting error.
+MPTUNNEL retains the bounded official-main correction chain
+`7b497af3515a138c9a26a455d4b7084c77ed668f`,
+`8da45f49af1866559194f78db53bc683a6651eb2`,
+`107b6ef5e0b2205e8ae0e2a0077e98886307f610`,
+`88c4e96d119e1ada071356986415de8294a89d65`, and
+`c50f83bc4f5df16aa71d05e2d20e8f2b04ae4f62`. These commits make pruning a
+single-owner operation, account for the new datagram payload before pruning,
+perform overflow-safe capacity checks, and reject a datagram larger than its
+configured send buffer. The 0.11.17 tag is not an ancestor of current Quinn
+main, so this is an explicit retained upstream-main correction rather than an
+unrecorded local transport tweak.
+
+One bounded local correction completes that same memory invariant beyond the
+five-commit official-main chain. Main commit
+`35fe3379205ed2ace0e6a858f60f3a8a2ff6510e` intended the configured send
+buffer to bound payload plus queued `Datagram` metadata, and
+`send_buffer_space()` subtracts the next entry's metadata accordingly. Its
+admission helper added only the new payload to current memory, however, so an
+empty one-byte buffer accepted a one-byte datagram in both drop and non-drop
+modes and then held more than the configured bound; drop mode could exhaust
+the queue and still push. Admission and capacity checks here use checked
+arithmetic for both the new payload and its metadata. The peer-advertised
+maximum remains payload-only. Separate public-API tests cover both modes.
 
 The production congestion controller is BBR3, maintained from Quinn PR #2481
 head `e19f9e25` and completed with the draft-06 lifecycle and recovery-scoped
@@ -11,7 +42,7 @@ spurious-loss undo proven in standalone candidate
 `a41a12ac7464f2b1165d76997881e64ca7dac002`. The older BBR and `min_max`
 modules remain only for API compatibility and their existing tests; MPTUNNEL's
 initial and fresh-network-path constructors select BBR3. The semantic
-deviations from upstream 0.11.16 are:
+deviations from upstream 0.11.17 are:
 
 - each ack-eliciting packet records packet-space and controller-epoch
   provenance, and the connection forwards per-packet send, ACK, loss, ECN,
@@ -61,7 +92,10 @@ deviations from upstream 0.11.16 are:
   the tested candidate; and
 - MPTUNNEL keeps ACK-derived delivery freshness and path telemetry separate
   from BBR3's model bandwidth estimate. The product endpoint is the sole
-  byte-per-second to bit-per-second conversion boundary.
+  byte-per-second to bit-per-second conversion boundary; and
+- outbound datagram pruning uses the official-main correction chain recorded
+  above instead of the defective 0.11.17-tag implementation, and completes
+  its documented total-memory admission invariant for the new queue entry.
 
 The private-Initial extension keeps QUIC packet framing and TLS unchanged while
 allowing both endpoints to supply the same 32-byte input to Initial key
@@ -77,7 +111,8 @@ stateless reset, or a TLS certificate flight. The maintained surface is:
 
 The added BBR3, pacer, callback-ownership, late-ACK, path-lifecycle,
 endpoint-admission, and packet tests cover these changes. No unrelated upstream
-source file differs semantically from 0.11.16. Preserve the local private
+source file differs semantically from 0.11.17 except for the documented
+official-main datagram correction. Preserve the local private
 Initial, `SpaceId` and per-packet delivery hooks, and the matching `quinn`/H3
 surface when refreshing the controller source.
 

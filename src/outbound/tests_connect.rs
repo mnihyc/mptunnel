@@ -162,11 +162,11 @@ fn allow_restricted_destination_policy() -> TestDestinationPolicy {
     )])
 }
 
-fn scoped_loopback_policy(domain: &str, port: u16) -> TestDestinationPolicy {
+fn scoped_loopback_policy(domain: &str, ports: &[u16]) -> TestDestinationPolicy {
     let matcher = RouteMatchSpec {
         domain_exact: vec![DomainName::parse(domain).expect("test route domain")],
         destination_cidrs: vec!["127.0.0.0/8".parse().expect("test route CIDR")],
-        destination_ports: vec![PortRange::single(port)],
+        destination_ports: ports.iter().copied().map(PortRange::single).collect(),
         networks: vec![Network::Tcp, Network::Udp],
         ..RouteMatchSpec::default()
     };
@@ -556,7 +556,7 @@ async fn socks5_tcp_preserves_domain_unless_policy_requires_ip_evidence() {
     drop(stream);
 
     let resolved_dns = static_dns_runtime([("example.com", vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])]);
-    let resolved_policy = scoped_loopback_policy("example.com", 443);
+    let resolved_policy = scoped_loopback_policy("example.com", &[443]);
     let target = TargetAddr::Domain {
         host: "example.com".to_string(),
         port: 443,
@@ -920,15 +920,57 @@ async fn scoped_lan_override_authorizes_matching_domain_port_for_tcp_and_udp() {
     let tcp_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("TCP target bind");
-    let target_addr = tcp_listener.local_addr().expect("TCP target address");
-    let udp_target = UdpSocket::bind(target_addr).await.expect("UDP target bind");
-    let port = target_addr.port();
+    let tcp_port = tcp_listener
+        .local_addr()
+        .expect("TCP target address")
+        .port();
+    let udp_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("UDP target bind");
+    let udp_port = udp_socket.local_addr().expect("UDP target address").port();
     let dns = static_dns_runtime([("lan.test", vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])]);
-    let policy = scoped_loopback_policy("lan.test", port);
-    let target = TargetAddr::Domain {
+    // TCP and UDP each ask their own socket namespace for an available port.
+    // Equal numeric results would still be independent allocations, so the
+    // proof binds each protocol target to its own socket instead of comparing
+    // the two numbers.
+    let policy = scoped_loopback_policy("lan.test", &[tcp_port, udp_port]);
+    let tcp_target = TargetAddr::Domain {
         host: "lan.test".to_string(),
-        port,
+        port: tcp_port,
     };
+    let udp_target = TargetAddr::Domain {
+        host: "lan.test".to_string(),
+        port: udp_port,
+    };
+
+    let tcp_authorization = policy
+        .begin(Network::Tcp, &tcp_target)
+        .expect("matching TCP domain and port enter scoped policy");
+    assert_eq!(tcp_authorization.flow().network(), Network::Tcp);
+    assert_eq!(tcp_authorization.flow().target().port().get(), tcp_port);
+    let tcp_targets = policy
+        .authorize_addresses(tcp_authorization, &[IpAddr::V4(Ipv4Addr::LOCALHOST)])
+        .expect("TCP-scoped rule authorizes loopback answer");
+    assert_eq!(tcp_targets.len(), 1);
+    assert_eq!(
+        tcp_targets[0].permit().rule_id().as_str(),
+        "allow-scoped-loopback"
+    );
+
+    let udp_authorization = policy
+        .begin(Network::Udp, &udp_target)
+        .expect("matching UDP domain and port enter scoped policy");
+    assert_eq!(udp_authorization.flow().network(), Network::Udp);
+    assert_eq!(udp_authorization.flow().target().port().get(), udp_port);
+    let udp_targets = policy
+        .authorize_addresses(udp_authorization, &[IpAddr::V4(Ipv4Addr::LOCALHOST)])
+        .expect("UDP-scoped rule authorizes loopback answer");
+    assert_eq!(udp_targets.len(), 1);
+    assert_eq!(
+        udp_targets[0].permit().rule_id().as_str(),
+        "allow-scoped-loopback"
+    );
+
     let tcp_server = tokio::spawn(async move {
         let (mut stream, _) = tcp_listener.accept().await.expect("TCP accept");
         let mut request = [0u8; 4];
@@ -938,12 +980,12 @@ async fn scoped_lan_override_authorizes_matching_domain_port_for_tcp_and_udp() {
     });
     let udp_server = tokio::spawn(async move {
         let mut request = [0u8; 4];
-        let (len, peer) = udp_target
+        let (len, peer) = udp_socket
             .recv_from(&mut request)
             .await
             .expect("UDP receive");
         assert_eq!(&request[..len], b"ping");
-        udp_target.send_to(b"pong", peer).await.expect("UDP reply");
+        udp_socket.send_to(b"pong", peer).await.expect("UDP reply");
     });
 
     let mut tcp = super::connect_tcp(
@@ -951,7 +993,7 @@ async fn scoped_lan_override_authorizes_matching_domain_port_for_tcp_and_udp() {
         &dns,
         None,
         &policy,
-        &target,
+        &tcp_target,
         Duration::from_secs(1),
     )
     .await
@@ -966,7 +1008,7 @@ async fn scoped_lan_override_authorizes_matching_domain_port_for_tcp_and_udp() {
         &dns,
         None,
         &policy,
-        &target,
+        &udp_target,
         Duration::from_secs(1),
     )
     .await

@@ -12,3 +12,5 @@ server-key.pem
 /AGENTS.md
 /PROGRESS.md
 /docs-dev
+/.playwright-cli
+/output

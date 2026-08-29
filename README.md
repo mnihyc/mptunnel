@@ -72,7 +72,7 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 
 The scalar tables below are accepted historical evidence for v0.2.1–v0.2.2;
 they do not characterize v0.4.4 or the current source tree. No current
-five-series time-series figure or ranking is published until at least two
+current-release time-series figure or ranking is published until at least two
 matched repetitions pass the host, source, workload, isolation, and provenance
 gates described in the [performance methodology](docs/PERFORMANCE.md).
 

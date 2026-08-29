@@ -6,7 +6,7 @@ workload, host capacity, and the native TCP or QUIC implementation.
 
 ## Current evidence publication gate
 
-No current five-series time-series figure or ranking is published. Publication
+No current-release time-series figure or ranking is published. Publication
 requires at least two matched repetitions with accepted host and source
 provenance under identical isolated conditions; single-repetition and
 diagnostic artifacts do not update the historical scalar tables below.

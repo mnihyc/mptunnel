@@ -623,6 +623,18 @@ class RunnerContractTests(unittest.TestCase):
         ):
             self.assertIn(subject, RANDOM_INTERNET)
 
+    def test_load_coupled_profile_is_explicit_and_forwarded(self):
+        self.assertIn(
+            "internet-five-path-load-coupled-epoch-[0-9]+", SCRIPT
+        )
+        self.assertIn(
+            '-e MPTUNNEL_LAB_INTERNET_LOAD_QUEUE_DELAY="$internet_load_queue_delay"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'exec_netem client "${mode}-client"', SCRIPT
+        )
+
     def test_active_mpp_client_keeps_an_explicit_direct_outbound_control(self):
         client = SCRIPT.split("socks_client_config_toml() {", 1)[1].split(
             "\n}", 1

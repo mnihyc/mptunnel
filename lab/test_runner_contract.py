@@ -421,7 +421,32 @@ class RunnerContractTests(unittest.TestCase):
         )
         self.assertIn('client-egress client "$loss_percent"', schedule)
         self.assertIn('remote-egress "$remote_service" "$loss_percent"', schedule)
+        self.assertIn(
+            'active_bulk_interactive_schedule_pids=("$client_pid")',
+            schedule,
+        )
+        self.assertIn('active_bulk_interactive_schedule_pids+=("$remote_pid")', schedule)
+        early_probe_exit = (
+            'if [[ "$client_wait_exit" == "124" || '
+            '"$remote_wait_exit" == "124" ]]; then'
+        )
+        self.assertIn(early_probe_exit, schedule)
+        self.assertLess(schedule.index(early_probe_exit), schedule.index('client_json="$('))
+        self.assertLess(
+            schedule.index(early_probe_exit),
+            schedule.index(
+                "bulk_interactive_schedule_event_count=$((bulk_interactive_schedule_event_count + 1))"
+            ),
+        )
+        self.assertEqual(schedule.count("wait_for_bulk_interactive_deadline"), 1)
         self.assertIn('change-balanced-observed', endpoint_change)
+        self.assertIn(
+            '"$absolute_deadline_ms" "$probe_finished_file"', endpoint_change
+        )
+        self.assertLess(
+            endpoint_change.index("wait_for_bulk_interactive_deadline"),
+            endpoint_change.index('start_offset_ms="$(('),
+        )
         self.assertIn('"$bulk_interactive_transition_command_timeout_seconds"', endpoint_change)
         self.assertIn('"readback_base64"', schedule)
         self.assertIn('readlink /proc/self/ns/time', probe)
@@ -524,6 +549,22 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('sleep "$((remaining_ms / 1000))', wait)
         self.assertNotIn("sleep 0.01", wait)
 
+    def test_bulk_interactive_probe_start_is_released_by_host_after_launch(self):
+        probe = SCRIPT.split("run_bulk_interactive_probe_case() {", 1)[1].split(
+            "\n}\n\nrun_raw_tcp_bulk_interactive_case()", 1
+        )[0]
+        launch = "while [[ ! -f '${probe_launch_container_file}' ]]"
+        release = ': > "$probe_launch_file"'
+        invocation = 'exec_in client "(while'
+        gate_wait = 'while [[ ! -f "$probe_gate_file"'
+
+        self.assertIn(launch, probe)
+        self.assertIn("</dev/null >/dev/null 2>&1 &", probe)
+        self.assertIn(release, probe)
+        self.assertLess(probe.index(invocation), probe.index(release))
+        self.assertLess(probe.index(release), probe.index(gate_wait))
+        self.assertIn('"$probe_launch_file" "$probe_gate_file"', probe)
+
     def test_raw_tcp_control_is_direct_isolated_and_restores_nonisolated_server(self):
         raw = SCRIPT.split("run_raw_tcp_bulk_interactive_case() {", 1)[1].split(
             "\n}\n\nrun_baseline_upload_probe_case()", 1
@@ -540,9 +581,22 @@ class RunnerContractTests(unittest.TestCase):
         )
 
     def test_bulk_interactive_async_probe_cleanup_is_not_keep_lab_gated(self):
+        probe_cleanup = SCRIPT.split(
+            "cleanup_active_bulk_interactive_probe() {", 1
+        )[1].split("\n}\n\ncleanup()", 1)[0]
         cleanup = SCRIPT.split("cleanup() {", 1)[1].split(
             "\n}\n\napply_netem()", 1
         )[0]
+        self.assertIn(
+            'for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"',
+            probe_cleanup,
+        )
+        self.assertIn('pkill -TERM -P "$schedule_pid"', probe_cleanup)
+        self.assertIn('wait "$schedule_pid"', probe_cleanup)
+        self.assertLess(
+            probe_cleanup.index('wait "$schedule_pid"'),
+            probe_cleanup.index('rm -f "${active_bulk_interactive_host_files[@]}"'),
+        )
         self.assertIn("cleanup_active_bulk_interactive_probe", cleanup)
         self.assertLess(
             cleanup.index("cleanup_active_bulk_interactive_probe"),

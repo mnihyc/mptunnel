@@ -418,6 +418,7 @@ case_management_pid=""
 active_mptcp_evidence_case=""
 active_client_config_artifact=""
 active_bulk_interactive_probe_pid_file=""
+active_bulk_interactive_schedule_pids=()
 active_bulk_interactive_host_files=()
 
 scale_lab_netem_value() {
@@ -2106,6 +2107,15 @@ flapping_result_metadata() {
 }
 
 cleanup_active_bulk_interactive_probe() {
+  local schedule_pid
+  for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"; do
+    pkill -TERM -P "$schedule_pid" >/dev/null 2>&1 || true
+    kill "$schedule_pid" >/dev/null 2>&1 || true
+  done
+  for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"; do
+    wait "$schedule_pid" >/dev/null 2>&1 || true
+  done
+  active_bulk_interactive_schedule_pids=()
   if [[ -n "$active_bulk_interactive_probe_pid_file" ]]; then
     exec_in client "probe_pid=\$(cat '${active_bulk_interactive_probe_pid_file}' 2>/dev/null || true); if [[ \"\$probe_pid\" =~ ^[0-9]+$ ]]; then pkill -TERM -P \"\$probe_pid\" >/dev/null 2>&1 || true; kill \"\$probe_pid\" >/dev/null 2>&1 || true; fi; rm -f '${active_bulk_interactive_probe_pid_file}'" \
       >/dev/null 2>&1 || true
@@ -2731,9 +2741,15 @@ apply_bulk_interactive_loss_endpoint() {
   local probe_started_monotonic_ms="$4"
   local planned_offset_ms="$5"
   local result_file="$6"
+  local absolute_deadline_ms="$7"
+  local probe_finished_file="$8"
   local start_offset_ms end_offset_ms command_exit_code
   local apply_exit_code readback_exit_code readback_base64 observed_output observed_line
 
+  if ! wait_for_bulk_interactive_deadline \
+    "$absolute_deadline_ms" "$probe_finished_file"; then
+    return 124
+  fi
   start_offset_ms="$(($(monotonic_milliseconds) - probe_started_monotonic_ms))"
   command_exit_code=0
   if observed_output="$(
@@ -2776,7 +2792,7 @@ run_bulk_interactive_dynamic_loss_schedule() {
   local probe_started_monotonic_ms="$2"
   local remote_service="$3"
   local result_prefix="$4"
-  local epoch loss_percent planned_offset_ms
+  local epoch loss_percent planned_offset_ms absolute_deadline_ms
   local client_result_file remote_result_file client_pid remote_pid
   local client_wait_exit remote_wait_exit event_json client_json remote_json
   local schedule_status=0
@@ -2786,12 +2802,7 @@ run_bulk_interactive_dynamic_loss_schedule() {
   for epoch in "${!bulk_interactive_loss_percent[@]}"; do
     loss_percent="${bulk_interactive_loss_percent[$epoch]}"
     planned_offset_ms=$((epoch * bulk_interactive_epoch_seconds * 1000))
-    if ! wait_for_bulk_interactive_deadline \
-      "$((probe_started_monotonic_ms + planned_offset_ms))" \
-      "$probe_finished_file"; then
-      schedule_status=124
-      break
-    fi
+    absolute_deadline_ms=$((probe_started_monotonic_ms + planned_offset_ms))
 
     client_result_file="${result_prefix}-epoch-${epoch}-client"
     remote_result_file="${result_prefix}-epoch-${epoch}-remote"
@@ -2801,16 +2812,24 @@ run_bulk_interactive_dynamic_loss_schedule() {
     )
     apply_bulk_interactive_loss_endpoint \
       client-egress client "$loss_percent" \
-      "$probe_started_monotonic_ms" "$planned_offset_ms" "$client_result_file" &
+      "$probe_started_monotonic_ms" "$planned_offset_ms" "$client_result_file" \
+      "$absolute_deadline_ms" "$probe_finished_file" &
     client_pid="$!"
+    active_bulk_interactive_schedule_pids=("$client_pid")
     apply_bulk_interactive_loss_endpoint \
       remote-egress "$remote_service" "$loss_percent" \
-      "$probe_started_monotonic_ms" "$planned_offset_ms" "$remote_result_file" &
+      "$probe_started_monotonic_ms" "$planned_offset_ms" "$remote_result_file" \
+      "$absolute_deadline_ms" "$probe_finished_file" &
     remote_pid="$!"
+    active_bulk_interactive_schedule_pids+=("$remote_pid")
     if wait "$client_pid"; then client_wait_exit=0; else client_wait_exit="$?"; fi
     if wait "$remote_pid"; then remote_wait_exit=0; else remote_wait_exit="$?"; fi
+    active_bulk_interactive_schedule_pids=()
 
-    if [[ "$client_wait_exit" != "0" || "$remote_wait_exit" != "0" ]]; then
+    if [[ "$client_wait_exit" == "124" || "$remote_wait_exit" == "124" ]]; then
+      schedule_status=124
+      break
+    elif [[ "$client_wait_exit" != "0" || "$remote_wait_exit" != "0" ]]; then
       schedule_status=1
     fi
     client_json="$(cat "$client_result_file" 2>/dev/null || true)"
@@ -2889,12 +2908,15 @@ run_bulk_interactive_probe_case() {
   local out_file="/tmp/mptunnel-bulk-interactive-${case_name}.out"
   local err_file="/tmp/mptunnel-bulk-interactive-${case_name}.err"
   local probe_pid_file="/tmp/mptunnel-bulk-interactive-${case_name}.pid"
+  local probe_launch_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.launch"
   local probe_gate_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.started"
   local probe_finished_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.finished"
   local probe_status_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.status"
+  local probe_launch_file="${repo_root}/${probe_launch_relative}"
   local probe_gate_file="${repo_root}/${probe_gate_relative}"
   local probe_finished_file="${repo_root}/${probe_finished_relative}"
   local probe_status_file="${repo_root}/${probe_status_relative}"
+  local probe_launch_container_file="/workspace/${probe_launch_relative}"
   local probe_gate_container_file="/workspace/${probe_gate_relative}"
   local probe_finished_container_file="/workspace/${probe_finished_relative}"
   local probe_status_container_file="/workspace/${probe_status_relative}"
@@ -2932,7 +2954,7 @@ run_bulk_interactive_probe_case() {
   apply_bulk_interactive_baseline_profile "$remote_service"
   mkdir -p "$(dirname "$probe_gate_file")"
   rm -f \
-    "$probe_gate_file" "$probe_finished_file" \
+    "$probe_launch_file" "$probe_gate_file" "$probe_finished_file" \
     "$probe_status_file" "${probe_status_file}.tmp"
   exec_in client "rm -f '${out_file}' '${err_file}' '${probe_pid_file}'"
   host_time_namespace_id="$(readlink /proc/self/ns/time 2>/dev/null || true)"
@@ -2975,10 +2997,11 @@ run_bulk_interactive_probe_case() {
   active_telemetry_pid="$telemetry_pid"
   active_bulk_interactive_probe_pid_file="$probe_pid_file"
   active_bulk_interactive_host_files=(
-    "$probe_gate_file" "$probe_finished_file"
+    "$probe_launch_file" "$probe_gate_file" "$probe_finished_file"
     "$probe_status_file" "${probe_status_file}.tmp"
   )
-  exec_in client "(if timeout $((bulk_interactive_probe_timeout_seconds + 10))s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --workload-mode bulk-interactive ${probe_route_arguments} --http-target ${probe_target_ip}:8080 --tcp-echo-target ${probe_target_ip}:10022 --bulk-path '${large_http_path}' --failover-after -1 --timeout '${bulk_interactive_probe_timeout_seconds}' --load-duration '${bulk_interactive_duration_seconds}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${probe_gate_container_file}' >'${out_file}' 2>'${err_file}'; then probe_exit=0; else probe_exit=\$?; fi; : > '${probe_finished_container_file}'; printf '%s\n' \"\$probe_exit\" > '${probe_status_container_file}.tmp'; mv '${probe_status_container_file}.tmp' '${probe_status_container_file}') & echo \$! > '${probe_pid_file}'"
+  exec_in client "(while [[ ! -f '${probe_launch_container_file}' ]]; do sleep 0.01; done; if timeout $((bulk_interactive_probe_timeout_seconds + 10))s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --workload-mode bulk-interactive ${probe_route_arguments} --http-target ${probe_target_ip}:8080 --tcp-echo-target ${probe_target_ip}:10022 --bulk-path '${large_http_path}' --failover-after -1 --timeout '${bulk_interactive_probe_timeout_seconds}' --load-duration '${bulk_interactive_duration_seconds}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${probe_gate_container_file}' >'${out_file}' 2>'${err_file}'; then probe_exit=0; else probe_exit=\$?; fi; : > '${probe_finished_container_file}'; printf '%s\n' \"\$probe_exit\" > '${probe_status_container_file}.tmp'; mv '${probe_status_container_file}.tmp' '${probe_status_container_file}') </dev/null >/dev/null 2>&1 & echo \$! > '${probe_pid_file}'"
+  : > "$probe_launch_file"
 
   local gate_deadline=$((SECONDS + 10))
   while [[ ! -f "$probe_gate_file" && ! -f "$probe_status_file" ]] \

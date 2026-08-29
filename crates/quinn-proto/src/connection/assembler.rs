@@ -13,6 +13,11 @@ use crate::range_set::RangeSet;
 pub(super) struct Assembler {
     state: State,
     data: BinaryHeap<Buffer>,
+    /// Unique stream byte ranges currently represented by `data`.
+    ///
+    /// This is the authoritative count of genuine disjoint spans. Buffer count is deliberately
+    /// not used: one contiguous span can legitimately comprise many packet-backed buffers.
+    buffered_ranges: RangeSet,
     /// Total number of buffered bytes, including duplicates in ordered mode.
     buffered: usize,
     /// Estimated number of allocated bytes, will never be less than `buffered`.
@@ -22,6 +27,8 @@ pub(super) struct Assembler {
     /// aka the stream offset.
     bytes_read: u64,
     end: u64,
+    #[cfg(test)]
+    payload_bytes_copied: usize,
 }
 
 impl Assembler {
@@ -35,6 +42,7 @@ impl Assembler {
         *self = Self::default();
         self.data = old_data;
         self.data.clear();
+        self.release_excess_heap();
     }
 
     pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
@@ -67,6 +75,8 @@ impl Assembler {
                     return None;
                 } else if (chunk.offset + chunk.bytes.len() as u64) <= self.bytes_read {
                     // Next chunk is useless as the read index is beyond its end
+                    self.buffered_ranges
+                        .remove(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
                     self.buffered -= chunk.bytes.len();
                     self.allocated -= chunk.allocation_size;
                     PeekMut::pop(chunk);
@@ -76,6 +86,8 @@ impl Assembler {
                 // Determine `start` and `len` of the slice of useful data in chunk
                 let start = (self.bytes_read - chunk.offset) as usize;
                 if start > 0 {
+                    self.buffered_ranges
+                        .remove(chunk.offset..chunk.offset + start as u64);
                     chunk.bytes.advance(start);
                     chunk.offset += start as u64;
                     self.buffered -= start;
@@ -87,11 +99,16 @@ impl Assembler {
                 let offset = chunk.offset;
                 chunk.offset += max_length as u64;
                 self.buffered -= max_length;
+                self.buffered_ranges
+                    .remove(offset..offset + max_length as u64);
                 Chunk::new(offset, chunk.bytes.split_to(max_length))
             } else {
-                self.bytes_read += chunk.bytes.len() as u64;
-                self.buffered -= chunk.bytes.len();
+                let offset = chunk.offset;
+                let len = chunk.bytes.len();
+                self.bytes_read += len as u64;
+                self.buffered -= len;
                 self.allocated -= chunk.allocation_size;
+                self.buffered_ranges.remove(offset..offset + len as u64);
                 let chunk = PeekMut::pop(chunk);
                 Chunk::new(chunk.offset, chunk.bytes)
             });
@@ -103,8 +120,7 @@ impl Assembler {
     /// This makes sure we're not unnecessarily holding on to many larger allocations.
     /// We merge contiguous chunks in the process of doing so.
     fn defragment(&mut self) {
-        let new = BinaryHeap::with_capacity(self.data.len());
-        let old = mem::replace(&mut self.data, new);
+        let old = mem::take(&mut self.data);
         let mut buffers = old.into_sorted_vec();
         self.buffered = 0;
         let mut fragmented_buffered = 0;
@@ -117,6 +133,10 @@ impl Assembler {
             if !chunk.defragmented {
                 fragmented_buffered += size;
             }
+        }
+        #[cfg(test)]
+        {
+            self.payload_bytes_copied += fragmented_buffered;
         }
         self.allocated = self.buffered;
         let mut buffer = BytesMut::with_capacity(fragmented_buffered);
@@ -143,6 +163,7 @@ impl Assembler {
             self.data
                 .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
         }
+        self.data.shrink_to_fit();
     }
 
     // Note: If a packet contains many frames from the same stream, the estimated over-allocation
@@ -159,20 +180,23 @@ impl Assembler {
             allocation_size,
             bytes.len()
         );
-        self.end = self.end.max(offset + bytes.len() as u64);
+        let frame_end = offset + bytes.len() as u64;
+        self.end = self.end.max(frame_end);
         if let State::Unordered { ref mut recvd } = self.state {
             // Discard duplicate data
-            for duplicate in recvd.replace(offset..offset + bytes.len() as u64) {
+            for duplicate in recvd.replace(offset..frame_end) {
                 if duplicate.start > offset {
+                    let unique_end = duplicate.start;
                     let buffer = Buffer::new(
                         offset,
-                        bytes.split_to((duplicate.start - offset) as usize),
+                        bytes.split_to((unique_end - offset) as usize),
                         allocation_size,
                     );
                     self.buffered += buffer.bytes.len();
                     self.allocated += buffer.allocation_size;
                     self.data.push(buffer);
-                    offset = duplicate.start;
+                    self.buffered_ranges.insert(offset..unique_end);
+                    offset = unique_end;
                 }
                 bytes.advance((duplicate.end - offset) as usize);
                 offset = duplicate.end;
@@ -189,17 +213,21 @@ impl Assembler {
 
         // No early return when empty: the dedup loop above may already have pushed chunks.
         if !bytes.is_empty() {
+            let unique_end = offset + bytes.len() as u64;
             let buffer = Buffer::new(offset, bytes, allocation_size);
             self.buffered += buffer.bytes.len();
             self.allocated += buffer.allocation_size;
             self.data.push(buffer);
+            self.buffered_ranges.insert(offset..unique_end);
+        }
+        if self.buffered_ranges.len() > MAX_SPANS {
+            return Err(TooManyChunks);
         }
         // `self.buffered` also counts duplicate bytes, therefore we use
         // `self.end - self.bytes_read` as an upper bound of buffered unique
         // bytes. This will cause a defragmentation if the amount of duplicate
         // bytes exceedes a proportion of the receive window size.
         let buffered = self.buffered.min((self.end - self.bytes_read) as usize);
-        let over_allocation = self.allocated - buffered;
         // Rationale: on the one hand, we want to defragment rarely, ideally never
         // in non-pathological scenarios. However, a pathological or malicious
         // peer could send us one-byte frames, and since we use reference-counted
@@ -207,14 +235,19 @@ impl Assembler {
         // of memory allocated. This limits over-allocation in proportion to the
         // buffered data. The constants are chosen somewhat arbitrarily and try to
         // balance between defragmentation overhead and over-allocation.
-        let threshold = 32768.max(buffered * 3 / 2);
-        // Small gapped frames hold over-allocation below the threshold, so bound the count too.
-        if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
+        // One Buffer per genuine span is irreducible and independently bounded by MAX_SPANS.
+        // Count only additional heap slots as fragmentation overhead, including spare capacity.
+        let excess_buffer_slots = self
+            .data
+            .capacity()
+            .saturating_sub(self.buffered_ranges.len());
+        let retained = self.allocated.saturating_add(
+            excess_buffer_slots.saturating_mul(mem::size_of::<Buffer>()),
+        );
+        let over_allocation = retained.saturating_sub(buffered);
+        let threshold = MIN_DEFRAGMENT_OVERHEAD.max(buffered * 3 / 2);
+        if over_allocation > threshold {
             self.defragment();
-            // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
-            if self.data.len() > MAX_CHUNKS {
-                return Err(TooManyChunks);
-            }
         }
 
         Ok(())
@@ -228,8 +261,22 @@ impl Assembler {
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
         self.data.clear();
+        self.release_excess_heap();
+        self.buffered_ranges = RangeSet::new();
         self.buffered = 0;
         self.allocated = 0;
+        #[cfg(test)]
+        {
+            self.payload_bytes_copied = 0;
+        }
+    }
+
+    fn release_excess_heap(&mut self) {
+        if self.data.capacity().saturating_mul(mem::size_of::<Buffer>())
+            > MIN_DEFRAGMENT_OVERHEAD
+        {
+            self.data.shrink_to_fit();
+        }
     }
 }
 
@@ -294,8 +341,13 @@ impl Buffer {
         }
         self.bytes.advance(duplicate);
         // Make sure that fragmented buffers with high utilization become defragmented and
-        // defragmented buffers remain defragmented
-        self.defragmented = self.defragmented || self.bytes.len() * 6 / 5 >= self.allocation_size;
+        // defragmented buffers remain defragmented. Include the heap slot itself: a tiny Bytes
+        // allocation is not efficient if its Buffer metadata dominates the retained payload.
+        let retained_size = self
+            .allocation_size
+            .saturating_add(mem::size_of::<Buffer>());
+        self.defragmented = self.defragmented
+            || self.bytes.len().saturating_mul(6) / 5 >= retained_size;
         if self.defragmented {
             // Make sure that defragmented buffers do not contribute to over-allocation
             self.allocation_size = self.bytes.len();
@@ -347,21 +399,15 @@ impl State {
 #[derive(Debug)]
 pub struct IllegalOrderedRead;
 
-/// Error indicating that too many chunks are buffered due to maliciously small/gapped frames
+/// Error indicating that too many disjoint stream spans are buffered
 #[derive(Debug)]
 pub(crate) struct TooManyChunks;
 
-/// Bound on the number of distinct spans kept for a stream
-///
-/// Independent of how much memory those spans over-allocate. A frame is rejected only
-/// if compaction cannot get the count back down to this.
-const MAX_CHUNKS: usize = 1024;
+/// Bound on genuine disjoint received spans, independent of packet-buffer fragmentation
+const MAX_SPANS: usize = 1024;
 
-/// Chunk count past which `insert` compacts before deciding whether to reject
-///
-/// Above `MAX_CHUNKS` so a flood of mergeable frames cannot force a defragmentation
-/// per frame.
-const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
+/// Fixed retained-memory overhead tolerated before allocation-pressure defragmentation
+const MIN_DEFRAGMENT_OVERHEAD: usize = 32 * 1024;
 
 #[cfg(test)]
 mod test {
@@ -677,14 +723,25 @@ mod test {
     }
 
     #[test]
-    fn bounded_chunks_under_low_over_allocation() {
-        // Gapped frames whose `allocation_size` equals their length hold
-        // `over_allocation` at zero, so that trigger never fires.
+    fn consumed_unordered_spans_do_not_exhaust_buffered_span_limit() {
+        let mut x = Assembler::new();
+        x.ensure_ordering(false).unwrap();
+        for i in 0..=MAX_SPANS {
+            let offset = 2 * i as u64;
+            x.insert(offset, Bytes::from_static(b"x"), 1)
+                .expect("consumed ranges are not buffered gaps");
+            assert_eq!(x.read(usize::MAX, false), Some(Chunk::new(offset, Bytes::from_static(b"x"))));
+            assert!(x.buffered_ranges.is_empty());
+        }
+    }
+
+    #[test]
+    fn genuine_span_limit_is_enforced_without_payload_copy() {
         let mut x = Assembler::new();
         // Withhold offset 0 so an ordered reader can never drain anything.
         let mut offset = 1u64;
         let mut result = Ok(());
-        for _ in 0..(MAX_CHUNKS * 8) {
+        for _ in 0..=MAX_SPANS {
             result = x.insert(offset, Bytes::from_static(b"gap"), 3);
             if result.is_err() {
                 break;
@@ -692,11 +749,103 @@ mod test {
             offset += 3 + 1; // 3 data bytes, 1 byte gap
         }
         assert_matches!(result, Err(TooManyChunks));
-        assert!(
-            x.data.len() <= COMPACT_THRESHOLD + 1,
-            "chunk count {} exceeded the bound",
-            x.data.len()
-        );
+        assert_eq!(x.buffered_ranges.len(), MAX_SPANS + 1);
+        assert_eq!(x.payload_bytes_copied, 0);
+    }
+
+    #[test]
+    fn contiguous_full_frames_beyond_upstream_chunk_cap() {
+        let mut x = Assembler::new();
+        let bytes = Bytes::from(vec![0; 1150]);
+        for i in 0..=2 * MAX_SPANS {
+            x.insert(1 + i as u64 * bytes.len() as u64, bytes.clone(), bytes.len())
+                .expect("contiguous packet buffers are one received span");
+        }
+        assert_eq!(x.buffered_ranges.len(), 1);
+        assert!(x.data.len() > MAX_SPANS);
+        assert_eq!(x.payload_bytes_copied, 0);
+    }
+
+    #[test]
+    fn contiguous_full_frames_growing_backward() {
+        let mut x = Assembler::new();
+        let bytes = Bytes::from(vec![0; 1150]);
+        for i in (0..=2 * MAX_SPANS).rev() {
+            x.insert(1 + i as u64 * bytes.len() as u64, bytes.clone(), bytes.len())
+                .expect("reverse reordering remains one received span");
+        }
+        assert_eq!(x.buffered_ranges.len(), 1);
+        assert!(x.data.len() > MAX_SPANS);
+        assert_eq!(x.payload_bytes_copied, 0);
+    }
+
+    #[test]
+    fn contiguous_full_frames_growing_at_both_ends() {
+        let mut x = Assembler::new();
+        let bytes = Bytes::from(vec![0; 1150]);
+        let mut low = 1 + MAX_SPANS as u64 * bytes.len() as u64;
+        let mut high = low + bytes.len() as u64;
+        x.insert(low, bytes.clone(), bytes.len()).unwrap();
+        for i in 0..2 * MAX_SPANS {
+            let offset = if i % 2 == 0 {
+                low -= bytes.len() as u64;
+                low
+            } else {
+                let offset = high;
+                high += bytes.len() as u64;
+                offset
+            };
+            x.insert(offset, bytes.clone(), bytes.len())
+                .expect("alternating contiguous growth remains one received span");
+        }
+        assert_eq!(x.buffered_ranges.len(), 1);
+        assert!(x.data.len() > MAX_SPANS);
+        assert_eq!(x.payload_bytes_copied, 0);
+    }
+
+    #[test]
+    fn contiguous_small_buffers_are_compacted_by_storage_amplification() {
+        let mut x = Assembler::new();
+        let frames = 8 * MAX_SPANS;
+        for i in 0..frames {
+            x.insert(1 + 2 * i as u64, Bytes::from_static(b"ab"), 4)
+                .expect("contiguous tiny buffers are not genuine gaps");
+        }
+        assert_eq!(x.buffered_ranges.len(), 1);
+        assert!(x.data.len() < frames);
+        assert!(x.payload_bytes_copied <= 2 * frames);
+
+        x.insert(0, Bytes::from_static(b"z"), 1).unwrap();
+        let mut read = 0usize;
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            for (index, byte) in chunk.bytes.iter().enumerate() {
+                let offset = chunk.offset + index as u64;
+                let expected = if offset == 0 {
+                    b'z'
+                } else if (offset - 1) % 2 == 0 {
+                    b'a'
+                } else {
+                    b'b'
+                };
+                assert_eq!(*byte, expected, "wrong byte at stream offset {offset}");
+            }
+            read += chunk.bytes.len();
+        }
+        assert_eq!(read, 1 + 2 * frames);
+        assert!(x.buffered_ranges.is_empty());
+    }
+
+    #[test]
+    fn oversized_packet_heap_is_not_retained_on_reinit() {
+        let mut x = Assembler::new();
+        let bytes = Bytes::from(vec![0; 1150]);
+        for i in 0..=2 * MAX_SPANS {
+            x.insert(1 + i as u64 * bytes.len() as u64, bytes.clone(), bytes.len())
+                .unwrap();
+        }
+        assert!(x.data.capacity() * mem::size_of::<Buffer>() > MIN_DEFRAGMENT_OVERHEAD);
+        x.reinit();
+        assert!(x.data.capacity() * mem::size_of::<Buffer>() <= MIN_DEFRAGMENT_OVERHEAD);
     }
 
     #[test]
@@ -707,44 +856,25 @@ mod test {
         let mut x = Assembler::new();
         x.ensure_ordering(false).unwrap();
         let top = 1_000_000u64;
-        x.insert(top, Bytes::from_static(b"ab"), 2).unwrap();
-        for k in 0..(4 * MAX_CHUNKS as u64) {
-            x.insert(top - k - 1, Bytes::from_static(b"ab"), 2)
+        x.insert(top, Bytes::from_static(b"ab"), 4).unwrap();
+        for k in 0..(4 * MAX_SPANS as u64) {
+            x.insert(top - k - 1, Bytes::from_static(b"ab"), 4)
                 .unwrap();
-            assert!(
-                x.data.len() <= COMPACT_THRESHOLD + 1,
-                "chunk count {} exceeded the bound at k={k}",
-                x.data.len()
-            );
         }
+        assert_eq!(x.buffered_ranges.len(), 1);
+        assert!(x.payload_bytes_copied <= 2 * (4 * MAX_SPANS + 1));
     }
 
     #[test]
     fn bounded_chunks_duplicate_flood() {
-        // Duplicates against a stream already at the cap. Ordered mode does not dedup,
-        // so each one pushes a chunk; they must not be rejected, or compact every frame.
         let mut x = Assembler::new();
-        // Withhold offset 0 so nothing can be drained.
-        for i in 0..MAX_CHUNKS as u64 {
-            x.insert(1 + i * 4, Bytes::from_static(b"abc"), 3)
-                .unwrap();
-        }
-        let mut max_len = x.data.len();
-        for _ in 0..(3 * MAX_CHUNKS) {
+        x.insert(1, Bytes::from_static(b"abc"), 3).unwrap();
+        for _ in 0..(4 * MAX_SPANS) {
             x.insert(1, Bytes::from_static(b"abc"), 3)
                 .expect("duplicate flood must not be rejected");
-            max_len = max_len.max(x.data.len());
-            assert!(
-                x.data.len() <= COMPACT_THRESHOLD + 1,
-                "chunk count {} exceeded the bound",
-                x.data.len()
-            );
         }
-        // Compacting on every frame would pin the count at `MAX_CHUNKS`.
-        assert!(
-            max_len > MAX_CHUNKS,
-            "buffer compacted on every frame (max observed len {max_len})"
-        );
+        assert_eq!(x.buffered_ranges.len(), 1);
+        assert!(x.data.len() < MAX_SPANS);
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {

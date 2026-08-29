@@ -95,7 +95,14 @@ deviations from upstream 0.11.17 are:
   byte-per-second to bit-per-second conversion boundary; and
 - outbound datagram pruning uses the official-main correction chain recorded
   above instead of the defective 0.11.17-tag implementation, and completes
-  its documented total-memory admission invariant for the new queue entry.
+  its documented total-memory admission invariant for the new queue entry; and
+- stream reassembly retains the 0.11.17 security bound of 1,024 buffered spans,
+  but counts actual disjoint byte ranges rather than packet-backed buffers. The
+  tag implementation closed a valid connection when 2,049 contiguous full-size
+  STREAM frames accumulated behind one missing prefix. Buffer-allocation and
+  heap-slot amplification remain independently bounded: metadata-dominant
+  fragments are defragmented, full-size packet slices stay zero-copy, and an
+  oversized heap is released after defragmentation or stream reuse.
 
 The private-Initial extension keeps QUIC packet framing and TLS unchanged while
 allowing both endpoints to supply the same 32-byte input to Initial key
@@ -110,9 +117,9 @@ stateless reset, or a TLS certificate flight. The maintained surface is:
 - packet-shape and wrong-key coverage in `src/packet.rs`.
 
 The added BBR3, pacer, callback-ownership, late-ACK, path-lifecycle,
-endpoint-admission, and packet tests cover these changes. No unrelated upstream
-source file differs semantically from 0.11.17 except for the documented
-official-main datagram correction. Preserve the local private
+endpoint-admission, assembler, and packet tests cover these changes. No
+unrelated upstream source file differs semantically from 0.11.17 except for
+the documented datagram and assembler corrections. Preserve the local private
 Initial, `SpaceId` and per-packet delivery hooks, and the matching `quinn`/H3
 surface when refreshing the controller source.
 
@@ -126,6 +133,9 @@ References:
 
 - <https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/>
 - <https://quiche.googlesource.com/quiche/+/refs/heads/main/quiche/quic/core/congestion_control/bbr_sender.cc>
+- <https://github.com/quinn-rs/quinn/security/advisories/GHSA-4w2j-m93h-cj5j>
+- <https://github.com/quinn-rs/quinn/pull/2694>
+- <https://github.com/quinn-rs/quinn/issues/981>
 
 ## Updating the upstream baseline
 

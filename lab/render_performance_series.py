@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -33,6 +34,8 @@ EXPECTED_STYLE = {
     "xray_vmess": ("#5B6472", "3 3"),
     "hysteria2": ("#CC79A7", "10 3 2 3"),
 }
+RAW_CONTROL_STYLE = {"raw_tcp": ("#6B4C9A", "")}
+SERIES_STYLE = {**EXPECTED_STYLE, **RAW_CONTROL_STYLE}
 
 
 class DatasetError(ValueError):
@@ -144,6 +147,20 @@ def validate_dataset(dataset):
             f"figure.{field} is required",
         )
 
+    series = dataset.get("series")
+    series_ids = (
+        [entry.get("id") if isinstance(entry, dict) else None for entry in series]
+        if isinstance(series, list)
+        else None
+    )
+    product_dataset = series_ids == list(EXPECTED_STYLE)
+    raw_control_dataset = series_ids == ["raw_tcp"]
+    _require(
+        product_dataset or raw_control_dataset,
+        "series must contain either the exact five ordered implementation "
+        "trajectories or the exact one-series raw_tcp control",
+    )
+
     provenance = dataset.get("provenance")
     _require(isinstance(provenance, dict), "provenance is required")
     _require(
@@ -161,6 +178,11 @@ def validate_dataset(dataset):
         and run_count >= 2,
         "provenance.valid_repetitions must be at least two",
     )
+    if raw_control_dataset:
+        _require(
+            run_count == 2,
+            "raw_tcp provenance must contain exactly two valid repetitions",
+        )
     _require(
         isinstance(provenance.get("source_runs"), list)
         and len(provenance["source_runs"]) == run_count,
@@ -193,6 +215,11 @@ def validate_dataset(dataset):
                 f"{prefix}.result_dirs must contain unique directory names",
             )
             result_directories.add(directory)
+        if raw_control_dataset:
+            _require(
+                len(directories) == 1,
+                f"{prefix}.result_dirs must identify exactly one raw-control run",
+            )
     condition = provenance.get("condition")
     _require(isinstance(condition, dict), "provenance.condition is required")
     for field in (
@@ -225,8 +252,9 @@ def validate_dataset(dataset):
     )
     probe = condition.get("probe")
     _require(isinstance(probe, dict), "provenance.condition.probe is required")
+    expected_probe_mode = "direct" if raw_control_dataset else "socks5"
     _require(
-        probe.get("mode") == "socks5"
+        probe.get("mode") == expected_probe_mode
         and isinstance(probe.get("target"), str)
         and probe["target"]
         and isinstance(probe.get("tcp_echo_target"), str)
@@ -261,15 +289,80 @@ def validate_dataset(dataset):
         ),
         "provenance.condition.probe workload is invalid",
     )
+    if raw_control_dataset:
+        _require(
+            probe.get("target") == "172.31.15.30:8080"
+            and probe.get("tcp_echo_target") == "172.31.15.30:10022",
+            "raw_tcp probe must retain the direct target route",
+        )
 
-    series = dataset.get("series")
-    expected_series_ids = list(EXPECTED_STYLE)
-    _require(
-        isinstance(series, list)
-        and [entry.get("id") if isinstance(entry, dict) else None for entry in series]
-        == expected_series_ids,
-        "series must contain the exact five ordered implementation trajectories",
-    )
+        _require(
+            dataset.get("dataset_kind") == "raw_tcp_direct_control",
+            "raw_tcp dataset kind is invalid",
+        )
+        candidate_commit = provenance.get("candidate_commit")
+        _require(
+            isinstance(candidate_commit, str)
+            and re.fullmatch(r"[0-9a-f]{40}", candidate_commit) is not None
+            and provenance.get("source_commit") == candidate_commit,
+            "raw_tcp candidate/source commit provenance is invalid",
+        )
+        runtime_identity = provenance.get("paired_candidate_runtime_identity")
+        _require(
+            isinstance(runtime_identity, dict)
+            and set(runtime_identity)
+            == {
+                "mptunnel_client_runtime",
+                "mptunnel_client_runtime_version",
+                "mptunnel_client_target",
+                "mptunnel_client_sha256",
+                "mptunnel_server_target",
+                "mptunnel_server_sha256",
+            }
+            and all(
+                isinstance(value, str)
+                and value
+                and (
+                    field not in {"mptunnel_client_sha256", "mptunnel_server_sha256"}
+                    or re.fullmatch(r"[0-9a-f]{64}", value) is not None
+                )
+                for field, value in runtime_identity.items()
+            ),
+            "raw_tcp paired candidate runtime identity provenance is invalid",
+        )
+        host_snapshots = provenance.get("host_snapshot_sha256")
+        _require(
+            isinstance(host_snapshots, list)
+            and len(host_snapshots) == 2
+            and all(
+                isinstance(value, str)
+                and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+                for value in host_snapshots
+            ),
+            "raw_tcp host snapshot provenance is invalid",
+        )
+        verdict = provenance.get("release_verdict")
+        _require(
+            isinstance(verdict, dict)
+            and verdict.get("file") == "sustained-random-internet-release-verdict.json"
+            and isinstance(verdict.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", verdict["sha256"]) is not None
+            and verdict.get("status") == "pass"
+            and verdict.get("release") == "v0.4.4"
+            and verdict.get("candidate_commit") == candidate_commit,
+            "raw_tcp release-verdict provenance is invalid",
+        )
+        _require(
+            provenance.get("comparison_scope")
+            == {
+                "role": "context-only",
+                "route": "direct-client-to-target",
+                "included_in_exact_five": False,
+                "included_in_product_comparisons": False,
+            },
+            "raw_tcp must remain a route-distinct context-only control",
+        )
+
     seen = set()
     for entry in series:
         _require(isinstance(entry, dict), "each series entry must be an object")
@@ -279,7 +372,7 @@ def validate_dataset(dataset):
             "each series must have an id",
         )
         _require(series_id not in seen, f"duplicate series id {series_id}")
-        _require(series_id in EXPECTED_STYLE, f"no accessible style for {series_id}")
+        _require(series_id in SERIES_STYLE, f"no accessible style for {series_id}")
         seen.add(series_id)
         _require(
             isinstance(entry.get("label"), str) and entry["label"].strip(),
@@ -289,7 +382,11 @@ def validate_dataset(dataset):
         expected_tool = (
             "mptunnel"
             if series_id.startswith("mpp_")
-            else "xray" if series_id == "xray_vmess" else "hysteria2"
+            else (
+                "xray"
+                if series_id == "xray_vmess"
+                else "raw-tcp" if series_id == "raw_tcp" else "hysteria2"
+            )
         )
         _require(
             isinstance(implementation, dict)
@@ -304,6 +401,12 @@ def validate_dataset(dataset):
                 and implementation["protocol_version"] > 0
                 and implementation.get("build_profile") == "release",
                 f"{series_id}.implementation does not identify the release protocol",
+            )
+        elif series_id == "raw_tcp":
+            _require(
+                implementation.get("carrier") == "Direct TCP"
+                and implementation.get("route_scope") == "direct-client-to-target",
+                "raw_tcp.implementation does not identify its direct route",
             )
         else:
             _require(
@@ -320,6 +423,16 @@ def validate_dataset(dataset):
         )
         _validate_metric_samples(series_id, "goodput", entry.get("goodput"), run_count)
         _validate_metric_samples(series_id, "latency", entry.get("latency"), run_count)
+        if series_id == "raw_tcp":
+            _require(
+                [sample["time_s"] for sample in entry["goodput"]]
+                == [index + 0.5 for index in range(1, 39)],
+                "raw_tcp.goodput must retain the exact 38-window trajectory",
+            )
+            _require(
+                all(sample["available"] == 2 for sample in entry["latency"]),
+                "raw_tcp.latency must retain both accepted pointwise observations",
+            )
     return dataset
 
 
@@ -549,7 +662,7 @@ def _draw_metric(root, dataset, metric, top, bottom, y_max, x_max, clip_id):
 
     group = _svg(root, "g", {"clip-path": f"url(#{clip_id})"})
     for series_index, entry in enumerate(dataset["series"]):
-        color, dash = EXPECTED_STYLE[entry["id"]]
+        color, dash = SERIES_STYLE[entry["id"]]
         for segment in _segments(entry[metric]):
             if len(segment) >= 2:
                 _svg(
@@ -678,7 +791,7 @@ def _draw_legend(root, dataset):
     group = _svg(root, "g", {"class": "legend", "aria-label": "Series legend"})
     cell_width = PLOT_WIDTH / len(dataset["series"])
     for index, entry in enumerate(dataset["series"]):
-        color, dash = EXPECTED_STYLE[entry["id"]]
+        color, dash = SERIES_STYLE[entry["id"]]
         x = PLOT_LEFT + index * cell_width
         line_attributes = {
             "x1": _format_coordinate(x),

@@ -36,6 +36,15 @@ WINDOWS = 38
 MIN_RATE_RATIO = 0.90
 MAX_LATENCY_RATIO = 1.10
 RECURRENCE_EPOCHS = (("loss_1_percent", 0, 5), ("loss_2_percent", 2, 6))
+RUNTIME_IDENTITY_FIELDS = (
+    "mptunnel_client_runtime",
+    "mptunnel_client_runtime_version",
+    "mptunnel_client_target",
+    "mptunnel_client_sha256",
+    "mptunnel_server_target",
+    "mptunnel_server_sha256",
+)
+RUNTIME_SHA_FIELDS = {"mptunnel_client_sha256", "mptunnel_server_sha256"}
 
 
 class EvaluationError(ValueError):
@@ -57,6 +66,27 @@ def _number(value):
 
 def _json_number(value):
     return round(float(value), 9)
+
+
+def _runtime_identity(record, prefix):
+    identity = tuple(record.get(field) for field in RUNTIME_IDENTITY_FIELDS)
+    _require(
+        all(
+            isinstance(value, str)
+            and bool(value)
+            and (
+                field not in RUNTIME_SHA_FIELDS
+                or re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            )
+            for field, value in zip(RUNTIME_IDENTITY_FIELDS, identity)
+        ),
+        f"{prefix} has no complete client/server runtime identity",
+    )
+    return identity
+
+
+def _result_directory_name(path):
+    return Path(path).resolve().parent.name
 
 
 def _probe_p95(record, prefix):
@@ -255,7 +285,9 @@ def _maximum_comparison(identifier, actual, reference, factor):
     }
 
 
-def _evaluate_repetition(repetition, raw_path, common_source_commit):
+def _evaluate_repetition(
+    repetition, raw_path, common_source_commit, common_runtime_identity
+):
     repetition_id = repetition["id"]
     raw_records = load_result_file(raw_path)
     _require(
@@ -279,6 +311,14 @@ def _evaluate_repetition(repetition, raw_path, common_source_commit):
     _require(
         raw.get("source_commit") == common_source_commit,
         f"{repetition_id} raw control source commit differs from the candidate",
+    )
+    _require(
+        raw.get("mptunnel_build_features") == [],
+        f"{raw_path}:{RAW_CASE} must record the unmodified release feature set",
+    )
+    _require(
+        _runtime_identity(raw, f"{raw_path}:{RAW_CASE}") == common_runtime_identity,
+        f"{repetition_id} raw control runtime identity differs from the product cohort",
     )
 
     subjects = {}
@@ -319,7 +359,7 @@ def _evaluate_repetition(repetition, raw_path, common_source_commit):
     }
     raw_summary = {
         "case": RAW_CASE,
-        "source": str(raw_path),
+        "source": _result_directory_name(raw_path),
         "receiver_bytes": raw["bulk_bytes"],
         "trajectory_windows": len(raw_trajectory),
         "trajectory_first_window_s": [1, 2],
@@ -392,7 +432,10 @@ def _evaluate_repetition(repetition, raw_path, common_source_commit):
         "id": repetition_id,
         "status": "pass" if not failures else "fail",
         "product_sources": sorted(
-            {str(path) for path in repetition["record_sources"].values()}
+            {
+                _result_directory_name(path)
+                for path in repetition["record_sources"].values()
+            }
         ),
         "raw_control": raw_summary,
         "subjects": subjects,
@@ -440,10 +483,15 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         path.resolve().parent for paths in product_paths for path in paths
     }
     raw_directories = [Path(path).resolve().parent for path in raw_paths]
+    product_directory_names = {directory.name for directory in product_directories}
+    raw_directory_names = [directory.name for directory in raw_directories]
     _require(
         len(set(raw_directories)) == REPETITIONS
-        and not product_directories.intersection(raw_directories),
-        "product repetitions and paired raw controls require distinct result directories",
+        and len(set(raw_directory_names)) == REPETITIONS
+        and not product_directories.intersection(raw_directories)
+        and not product_directory_names.intersection(raw_directory_names),
+        "product repetitions and paired raw controls require distinct result "
+        "directories and names",
     )
 
     commits = {
@@ -460,18 +508,45 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         source_commit == candidate_commit,
         "product cohort source commit does not match --candidate-commit",
     )
+    product_records = [
+        (record, repetition["record_sources"][case], case)
+        for repetition in repetitions
+        for case, record in repetition["records"].items()
+    ]
+    for record, path, case in product_records:
+        _require(
+            record.get("mptunnel_build_features") == [],
+            f"{path}:{case} must use the unmodified release feature set",
+        )
+    runtime_identities = {
+        _runtime_identity(record, f"{path}:{case}")
+        for record, path, case in product_records
+    }
+    _require(
+        len(runtime_identities) == 1,
+        "all product rows must identify one client/server runtime binary pair",
+    )
+    runtime_identity = next(iter(runtime_identities))
     results = []
     for repetition, raw_path in zip(repetitions, raw_paths):
         try:
-            result = _evaluate_repetition(repetition, Path(raw_path), source_commit)
+            result = _evaluate_repetition(
+                repetition,
+                Path(raw_path),
+                source_commit,
+                runtime_identity,
+            )
         except (DerivationError, EvaluationError, OSError, ValueError) as exc:
             result = {
                 "id": repetition["id"],
                 "status": "invalid",
                 "product_sources": sorted(
-                    {str(path) for path in repetition["record_sources"].values()}
+                    {
+                        _result_directory_name(path)
+                        for path in repetition["record_sources"].values()
+                    }
                 ),
-                "raw_control_source": str(raw_path),
+                "raw_control_source": _result_directory_name(raw_path),
                 "errors": [str(exc)],
             }
         results.append(result)
@@ -483,6 +558,7 @@ def evaluate(product_specs, raw_paths, candidate_commit):
         "status": "pass" if passed else "invalid" if invalid else "fail",
         "candidate_commit": candidate_commit,
         "source_commit": source_commit,
+        "runtime_identity": dict(zip(RUNTIME_IDENTITY_FIELDS, runtime_identity)),
         "criteria": {
             "repetitions": REPETITIONS,
             "raw_controls": REPETITIONS,

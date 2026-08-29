@@ -13,6 +13,12 @@ import test_performance_series as performance_fixtures  # noqa: E402
 
 SOURCE_COMMIT = "b" * 40
 HOST_SNAPSHOT = "a" * 64
+CLIENT_SHA256 = "1" * 64
+SERVER_SHA256 = "2" * 64
+CLIENT_RUNTIME = "native"
+CLIENT_RUNTIME_VERSION = "test-runtime-v1"
+CLIENT_TARGET = "x86_64-unknown-linux-gnu"
+SERVER_TARGET = "x86_64-unknown-linux-gnu"
 RATES = {
     "mpp_tcp": 100.0,
     "mpp_quic": 100.0,
@@ -46,6 +52,13 @@ def product_record(series_id, case):
     record.update(
         source_commit=SOURCE_COMMIT,
         host_snapshot_sha256=HOST_SNAPSHOT,
+        mptunnel_build_features=[],
+        mptunnel_client_runtime=CLIENT_RUNTIME,
+        mptunnel_client_runtime_version=CLIENT_RUNTIME_VERSION,
+        mptunnel_client_target=CLIENT_TARGET,
+        mptunnel_client_sha256=CLIENT_SHA256,
+        mptunnel_server_target=SERVER_TARGET,
+        mptunnel_server_sha256=SERVER_SHA256,
         bulk_error=None,
         interactive_error=None,
         bulk_interval_goodput_raw_mbps=[rate] * 200,
@@ -82,6 +95,13 @@ def raw_record():
         tcp_echo_target="172.31.15.30:10022",
         source_commit=SOURCE_COMMIT,
         host_snapshot_sha256=HOST_SNAPSHOT,
+        mptunnel_build_features=[],
+        mptunnel_client_runtime=CLIENT_RUNTIME,
+        mptunnel_client_runtime_version=CLIENT_RUNTIME_VERSION,
+        mptunnel_client_target=CLIENT_TARGET,
+        mptunnel_client_sha256=CLIENT_SHA256,
+        mptunnel_server_target=SERVER_TARGET,
+        mptunnel_server_sha256=SERVER_SHA256,
         bulk_error=None,
         interactive_error=None,
         bulk_interactive_dynamic_loss=direct_trace(),
@@ -148,19 +168,36 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
         self.assertEqual(verdict["status"], "pass")
         self.assertEqual(verdict["candidate_commit"], SOURCE_COMMIT)
         self.assertEqual(verdict["source_commit"], SOURCE_COMMIT)
+        self.assertEqual(
+            verdict["runtime_identity"],
+            {
+                "mptunnel_client_runtime": CLIENT_RUNTIME,
+                "mptunnel_client_runtime_version": CLIENT_RUNTIME_VERSION,
+                "mptunnel_client_target": CLIENT_TARGET,
+                "mptunnel_client_sha256": CLIENT_SHA256,
+                "mptunnel_server_target": SERVER_TARGET,
+                "mptunnel_server_sha256": SERVER_SHA256,
+            },
+        )
         self.assertEqual(len(verdict["repetitions"]), 2)
-        for repetition in verdict["repetitions"]:
+        for index, repetition in enumerate(verdict["repetitions"], 1):
             self.assertEqual(repetition["status"], "pass")
             self.assertTrue(repetition["raw_control"]["pass"])
+            self.assertEqual(repetition["raw_control"]["source"], f"raw-{index}")
+            self.assertEqual(repetition["product_sources"], [f"product-{index}"])
             self.assertEqual(repetition["raw_control"]["trajectory_windows"], 38)
             self.assertEqual(len(repetition["comparisons"]), 11)
             self.assertTrue(all(item["pass"] for item in repetition["comparisons"]))
+            self.assertFalse(
+                any("raw" in item["id"] for item in repetition["comparisons"])
+            )
             self.assertFalse(
                 any(
                     item["id"].startswith(("xray_vmess.loss_", "hysteria2.loss_"))
                     for item in repetition["comparisons"]
                 )
             )
+        self.assertNotIn(str(root), json.dumps(verdict))
 
     def test_failed_rate_gate_returns_one_and_retains_exact_comparison(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -341,6 +378,87 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
         self.assertIn("does not match --candidate-commit", verdict["errors"][0])
         self.assertEqual(malformed_status, 2)
         self.assertIn("40-character lowercase", malformed["errors"][0])
+
+    def test_stale_or_feature_altered_product_binary_invalidates_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            products, raws = write_cohort(root)
+            rows = [json.loads(line) for line in products[1].read_text().splitlines()]
+            for row in rows:
+                row["mptunnel_server_sha256"] = "3" * 64
+            products[1].write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            stale_output = root / "stale-runtime.json"
+            stale_status = evaluate_main(invocation(products, raws, stale_output))
+            stale = json.loads(stale_output.read_text(encoding="utf-8"))
+
+            feature_root = root / "feature-cohort"
+            feature_root.mkdir()
+            products, raws = write_cohort(feature_root)
+            rows = [json.loads(line) for line in products[0].read_text().splitlines()]
+            rows[0]["mptunnel_build_features"] = ["lab-diagnostics"]
+            products[0].write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            feature_output = root / "feature-runtime.json"
+            feature_status = evaluate_main(invocation(products, raws, feature_output))
+            feature = json.loads(feature_output.read_text(encoding="utf-8"))
+
+        self.assertEqual(stale_status, 2)
+        self.assertEqual(stale["status"], "invalid")
+        self.assertIn("one client/server runtime binary pair", stale["errors"][0])
+        self.assertEqual(feature_status, 2)
+        self.assertEqual(feature["status"], "invalid")
+        self.assertIn("unmodified release feature set", feature["errors"][0])
+
+    def test_paired_raw_control_must_record_the_clean_complete_runtime_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            products, raws = write_cohort(root)
+            original = json.loads(raws[1].read_text(encoding="utf-8"))
+            row = dict(original)
+            row["mptunnel_client_sha256"] = "4" * 64
+            raws[1].write_text(json.dumps(row) + "\n", encoding="utf-8")
+            output = root / "raw-runtime.json"
+
+            status = evaluate_main(invocation(products, raws, output))
+            verdict = json.loads(output.read_text(encoding="utf-8"))
+
+            incomplete = dict(original)
+            del incomplete["mptunnel_client_runtime_version"]
+            raws[1].write_text(json.dumps(incomplete) + "\n", encoding="utf-8")
+            incomplete_output = root / "raw-incomplete-runtime.json"
+            incomplete_status = evaluate_main(
+                invocation(products, raws, incomplete_output)
+            )
+            incomplete_verdict = json.loads(
+                incomplete_output.read_text(encoding="utf-8")
+            )
+
+            altered = dict(original)
+            altered["mptunnel_build_features"] = ["lab-diagnostics"]
+            raws[1].write_text(json.dumps(altered) + "\n", encoding="utf-8")
+            altered_output = root / "raw-feature-runtime.json"
+            altered_status = evaluate_main(invocation(products, raws, altered_output))
+            altered_verdict = json.loads(altered_output.read_text(encoding="utf-8"))
+
+        self.assertEqual(status, 2)
+        self.assertEqual(verdict["repetitions"][1]["status"], "invalid")
+        self.assertIn(
+            "raw control runtime identity differs",
+            verdict["repetitions"][1]["errors"][0],
+        )
+        self.assertEqual(incomplete_status, 2)
+        self.assertIn(
+            "complete client/server runtime identity",
+            incomplete_verdict["repetitions"][1]["errors"][0],
+        )
+        self.assertEqual(altered_status, 2)
+        self.assertIn(
+            "unmodified release feature set",
+            altered_verdict["repetitions"][1]["errors"][0],
+        )
 
 
 if __name__ == "__main__":

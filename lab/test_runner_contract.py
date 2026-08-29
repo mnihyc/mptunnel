@@ -596,6 +596,14 @@ class RunnerContractTests(unittest.TestCase):
             'MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES="${MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES:-1}"',
             RANDOM_INTERNET,
         )
+        self.assertIn(
+            'MPTUNNEL_LAB_TCP_CARRIER_MAX="${MPTUNNEL_LAB_TCP_CARRIER_MAX:-}"',
+            RANDOM_INTERNET,
+        )
+        self.assertNotIn(
+            'MPTUNNEL_LAB_TCP_CARRIER_MAX="${MPTUNNEL_LAB_TCP_CARRIER_MAX:-1}"',
+            RANDOM_INTERNET,
+        )
         self.assertIn('BUILD_PRODUCT="$build_product"', RANDOM_INTERNET)
         self.assertIn("first_run=0", RANDOM_INTERNET)
         self.assertIn('RESULT_DIR="$run_result_dir"', RANDOM_INTERNET)

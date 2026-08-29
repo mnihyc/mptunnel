@@ -243,6 +243,59 @@ apply_scale_profile() {
   apply_profile_to_interface "$operation" "$iface" "$rate" "$delay" "$jitter" "$loss"
 }
 
+change_balanced_observed() {
+  local iface address apply_exit readback_exit readback_output root_line evidence
+
+  iface="$(interface_for_subnet "172.31.15" || true)"
+  if [[ -z "$iface" ]]; then
+    printf '69\t69\t-\n'
+    return 69
+  fi
+
+  apply_exit=0
+  if apply_profile_to_interface \
+    change "$iface" \
+    "$balanced_rate" "$balanced_delay" "$balanced_jitter" "$balanced_loss"; then
+    :
+  else
+    apply_exit="$?"
+  fi
+
+  readback_exit=0
+  readback_output=""
+  if readback_output="$(tc -s -d qdisc show dev "$iface")"; then
+    :
+  else
+    readback_exit="$?"
+  fi
+  address="$(
+    ip -o -4 addr show dev "$iface" scope global \
+      | awk '$4 ~ /^172[.]31[.]15[.]/ {print $4; exit}' \
+      || true
+  )"
+  root_line="$(
+    printf '%s\n' "$readback_output" \
+      | awk '$1 == "qdisc" && $2 == "netem" && $0 ~ /(^|[[:space:]])root([[:space:]]|$)/ {print; exit}'
+  )"
+  evidence="-"
+  if [[ "$readback_exit" == "0" && -n "$address" && -n "$root_line" ]]; then
+    if evidence="$(
+      printf 'interface=%s\naddress=%s\n%s\n' "$iface" "$address" "$root_line" \
+        | base64 -w0
+    )"; then
+      :
+    else
+      readback_exit="$?"
+      evidence="-"
+    fi
+  elif [[ "$readback_exit" == "0" ]]; then
+    readback_exit=65
+  fi
+
+  printf '%s\t%s\t%s\n' "$apply_exit" "$readback_exit" "$evidence"
+  [[ "$apply_exit" == "0" && "$readback_exit" == "0" ]]
+}
+
 apply_profile_all() {
   local rate="$1"
   local delay="$2"
@@ -828,6 +881,10 @@ case "$mode" in
       change "172.31.15" \
       "$balanced_rate" "$balanced_delay" "$balanced_jitter" "$balanced_loss"
     ;;
+  change-balanced-observed)
+    # Apply and report the exact root-qdisc state used by a scheduled epoch.
+    change_balanced_observed
+    ;;
   apply-mildloss)
     apply_profile "172.31.16" "$mildloss_rate" "$mildloss_delay" "$mildloss_jitter" "$mildloss_loss"
     ;;
@@ -968,7 +1025,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|change-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|internet-five-path-epoch-N-{client,server}|internet-five-path-load-coupled-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|change-balanced|change-balanced-observed|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|asymmetric-client|asymmetric-server|scale-{access,gigabit,multi-gigabit}-epoch-N-{client,server}|internet-five-path-epoch-N-{client,server}|internet-five-path-load-coupled-epoch-N-{client,server}|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

@@ -7,6 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from result_enrichment import (
+    BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION,
     MPTUNNEL_CARRIER_PRESENTATION,
     MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE,
     MPTUNNEL_PROTOCOL_VERSION,
@@ -313,7 +314,10 @@ class ResultEnrichmentTests(unittest.TestCase):
             "OBJECT_MIB": "4096",
             "LOAD_DURATION_SECONDS": "10",
             "UPLOAD_COMPLETION_TIMEOUT_SECONDS": "5",
-            "BULK_CONNECTIONS": "1",
+            "BULK_CONNECTIONS": "2",
+            "BULK_INTERACTIVE_DYNAMIC_LOSS": json.dumps(
+                BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION
+            ),
             "FAILOVER_AFTER_SECONDS": "2",
             "FAILOVER_PROFILE": "fat",
             "FAILOVER_TX_TRIGGER_BYTES": "2097152",
@@ -394,8 +398,13 @@ class ResultEnrichmentTests(unittest.TestCase):
             self.assertEqual(
                 manifest["result_schema_version"], RESULT_SCHEMA_VERSION
             )
-            self.assertEqual(manifest["workload"]["bulk_connections"], 1)
+            self.assertEqual(manifest["workload"]["bulk_connections"], 2)
+            self.assertEqual(manifest["workload"]["bulk_streams"], 1)
             self.assertEqual(manifest["workload"]["object_mib"], 4096)
+            self.assertEqual(
+                manifest["workload"]["bulk_interactive_dynamic_loss"],
+                BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION,
+            )
             self.assertTrue(manifest["execution"]["isolate_containers_per_case"])
             self.assertTrue(
                 manifest["execution"]["require_competitor_baselines"]

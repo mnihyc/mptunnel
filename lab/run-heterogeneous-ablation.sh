@@ -69,6 +69,22 @@ small_http_path="${MPTUNNEL_LAB_SMALL_HTTP_PATH:-/small.bin}"
 small_object_kib="${MPTUNNEL_LAB_SMALL_OBJECT_KIB:-32}"
 load_duration_seconds="${MPTUNNEL_LAB_LOAD_DURATION_SECONDS:-30}"
 bulk_connections="${MPTUNNEL_LAB_BULK_CONNECTIONS:-2}"
+bulk_interactive_epoch_seconds=5
+bulk_interactive_loss_percent=(1 4 2 3 5 1 2 6)
+bulk_interactive_duration_seconds=$((${#bulk_interactive_loss_percent[@]} * bulk_interactive_epoch_seconds))
+bulk_interactive_probe_timeout_seconds=$((bulk_interactive_duration_seconds + 20))
+bulk_interactive_rate="500mbit"
+bulk_interactive_delay="50ms"
+bulk_interactive_jitter="20ms"
+bulk_interactive_target_loss="3%"
+bulk_interactive_transition_complete_lateness_ms=250
+bulk_interactive_transition_command_timeout_seconds=2
+bulk_interactive_dynamic_loss_json="$(
+  PYTHONPATH="$script_dir" python3 -c \
+    'import json; from result_enrichment import BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION as c; print(json.dumps(c, separators=(",", ":"), sort_keys=True))'
+)"
+bulk_interactive_schedule_events_json=""
+bulk_interactive_schedule_event_count=0
 tcp_carrier_qos_cohort="${MPTUNNEL_LAB_TCP_CARRIER_QOS_COHORT:-0}"
 tcp_carrier_qos_duration_seconds=30
 tcp_carrier_qos_workers=3
@@ -390,6 +406,8 @@ case_telemetry_pid=""
 case_management_pid=""
 active_mptcp_evidence_case=""
 active_client_config_artifact=""
+active_bulk_interactive_probe_pid_file=""
+active_bulk_interactive_host_files=()
 
 scale_lab_netem_value() {
   python3 - "$1" "$2" <<'PY'
@@ -412,12 +430,30 @@ PY
 }
 
 monotonic_milliseconds() {
-  local uptime_seconds whole_seconds fractional_seconds
-  read -r uptime_seconds _ < /proc/uptime
-  IFS='.' read -r whole_seconds fractional_seconds <<< "$uptime_seconds"
-  fractional_seconds="${fractional_seconds}000"
-  fractional_seconds="${fractional_seconds:0:3}"
-  printf '%d\n' "$((10#$whole_seconds * 1000 + 10#$fractional_seconds))"
+  printf '%d\n' "$(($(monotonic_time_ns) / 1000000))"
+}
+
+normalize_monotonic_timens_offset() {
+  python3 -c 'import json, sys
+
+matches = []
+for line in sys.stdin:
+    fields = line.split()
+    if fields and fields[0] == "monotonic":
+        matches.append(fields)
+if len(matches) != 1 or len(matches[0]) != 3:
+    raise SystemExit(2)
+try:
+    seconds = int(matches[0][1])
+    nanoseconds = int(matches[0][2])
+except ValueError:
+    raise SystemExit(2)
+if not 0 <= nanoseconds < 1_000_000_000:
+    raise SystemExit(2)
+print(json.dumps(
+    {"seconds": seconds, "nanoseconds": nanoseconds},
+    separators=(",", ":"),
+))'
 }
 
 balanced_rate_for_mildloss="${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}"
@@ -440,7 +476,15 @@ exec_in() {
 exec_netem() {
   local service="$1"
   local mode="$2"
-  compose exec -T \
+  local timeout_seconds="${3:-}"
+  local -a netem_command=(docker compose -f "$compose_file")
+  if [[ -n "$timeout_seconds" ]]; then
+    netem_command=(
+      timeout --signal=TERM --kill-after=1s "${timeout_seconds}s"
+      docker compose -f "$compose_file"
+    )
+  fi
+  "${netem_command[@]}" exec -T \
     -e MPTUNNEL_LAB_LOWLAT_RATE="${MPTUNNEL_LAB_LOWLAT_RATE:-80mbit}" \
     -e MPTUNNEL_LAB_LOWLAT_DELAY="${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms}" \
     -e MPTUNNEL_LAB_LOWLAT_JITTER="${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms}" \
@@ -628,6 +672,7 @@ write_run_manifest() {
   LOAD_DURATION_SECONDS="$load_duration_seconds" \
   UPLOAD_COMPLETION_TIMEOUT_SECONDS="$curl_timeout" \
   BULK_CONNECTIONS="$bulk_connections" \
+  BULK_INTERACTIVE_DYNAMIC_LOSS="$bulk_interactive_dynamic_loss_json" \
   FAILOVER_AFTER_SECONDS="$failover_after" \
   FAILOVER_PROFILE="$failover_profile" \
   FAILOVER_TX_TRIGGER_BYTES="$failover_tx_trigger_bytes" \
@@ -2032,7 +2077,20 @@ flapping_result_metadata() {
     "${anchor_args[@]}"
 }
 
+cleanup_active_bulk_interactive_probe() {
+  if [[ -n "$active_bulk_interactive_probe_pid_file" ]]; then
+    exec_in client "probe_pid=\$(cat '${active_bulk_interactive_probe_pid_file}' 2>/dev/null || true); if [[ \"\$probe_pid\" =~ ^[0-9]+$ ]]; then pkill -TERM -P \"\$probe_pid\" >/dev/null 2>&1 || true; kill \"\$probe_pid\" >/dev/null 2>&1 || true; fi; rm -f '${active_bulk_interactive_probe_pid_file}'" \
+      >/dev/null 2>&1 || true
+  fi
+  if (( ${#active_bulk_interactive_host_files[@]} > 0 )); then
+    rm -f "${active_bulk_interactive_host_files[@]}"
+  fi
+  active_bulk_interactive_probe_pid_file=""
+  active_bulk_interactive_host_files=()
+}
+
 cleanup() {
+  cleanup_active_bulk_interactive_probe
   stop_random_flapping
   if [[ -n "$active_mptcp_evidence_case" ]]; then
     stop_mptcp_evidence "$active_mptcp_evidence_case"
@@ -2605,27 +2663,367 @@ run_baseline_download_probe_case() {
   fi
 }
 
+apply_bulk_interactive_baseline_profile() {
+  local service
+  for service in client server target; do
+    MPTUNNEL_LAB_BALANCED_RATE="$bulk_interactive_rate" \
+    MPTUNNEL_LAB_BALANCED_DELAY="$bulk_interactive_delay" \
+    MPTUNNEL_LAB_BALANCED_JITTER="$bulk_interactive_jitter" \
+    MPTUNNEL_LAB_BALANCED_LOSS="$bulk_interactive_target_loss" \
+      exec_netem "$service" apply-balanced >/dev/null
+  done
+}
+
+wait_for_bulk_interactive_deadline() {
+  local deadline_ms="$1"
+  local probe_finished_file="$2"
+  local allow_probe_finished="${3:-0}"
+  local now_ms remaining_ms
+  now_ms="$(monotonic_milliseconds)"
+  if [[ "$allow_probe_finished" != "1" && -f "$probe_finished_file" ]]; then
+    return 1
+  fi
+  if (( now_ms >= deadline_ms )); then
+    return 0
+  fi
+  remaining_ms=$((deadline_ms - now_ms))
+  sleep "$((remaining_ms / 1000)).$(printf '%03d' "$((remaining_ms % 1000))")" \
+    || return 1
+  if [[ "$allow_probe_finished" != "1" && -f "$probe_finished_file" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+apply_bulk_interactive_loss_endpoint() {
+  local role="$1"
+  local service="$2"
+  local loss_percent="$3"
+  local probe_started_monotonic_ms="$4"
+  local planned_offset_ms="$5"
+  local result_file="$6"
+  local start_offset_ms end_offset_ms command_exit_code
+  local apply_exit_code readback_exit_code readback_base64 observed_output observed_line
+
+  start_offset_ms="$(($(monotonic_milliseconds) - probe_started_monotonic_ms))"
+  command_exit_code=0
+  if observed_output="$(
+    MPTUNNEL_LAB_BALANCED_RATE="$bulk_interactive_rate" \
+    MPTUNNEL_LAB_BALANCED_DELAY="$bulk_interactive_delay" \
+    MPTUNNEL_LAB_BALANCED_JITTER="$bulk_interactive_jitter" \
+    MPTUNNEL_LAB_BALANCED_LOSS="${loss_percent}%" \
+      exec_netem \
+        "$service" change-balanced-observed \
+        "$bulk_interactive_transition_command_timeout_seconds" 2>&1
+  )"; then
+    :
+  else
+    command_exit_code="$?"
+  fi
+  end_offset_ms="$(($(monotonic_milliseconds) - probe_started_monotonic_ms))"
+
+  apply_exit_code=125
+  readback_exit_code=125
+  readback_base64="-"
+  observed_line="${observed_output##*$'\n'}"
+  if [[ "$observed_line" =~ ^([0-9]+)$'\t'([0-9]+)$'\t'([A-Za-z0-9+/=]+|-)$ ]]; then
+    apply_exit_code="${BASH_REMATCH[1]}"
+    readback_exit_code="${BASH_REMATCH[2]}"
+    readback_base64="${BASH_REMATCH[3]}"
+  fi
+  printf '{"role":"%s","service":"%s","start_offset_ms":%s,"end_offset_ms":%s,"command_exit_code":%s,"apply_exit_code":%s,"readback_exit_code":%s,"readback_base64":"%s"}\n' \
+    "$role" "$service" "$start_offset_ms" "$end_offset_ms" \
+    "$command_exit_code" "$apply_exit_code" "$readback_exit_code" \
+    "$readback_base64" > "${result_file}.tmp"
+  mv "${result_file}.tmp" "$result_file"
+  [[ "$command_exit_code" == "0" && "$apply_exit_code" == "0" \
+    && "$readback_exit_code" == "0" && "$readback_base64" != "-" \
+    && "$start_offset_ms" -ge "$planned_offset_ms" \
+    && "$end_offset_ms" -le "$((planned_offset_ms + bulk_interactive_transition_complete_lateness_ms))" ]]
+}
+
+run_bulk_interactive_dynamic_loss_schedule() {
+  local probe_finished_file="$1"
+  local probe_started_monotonic_ms="$2"
+  local remote_service="$3"
+  local result_prefix="$4"
+  local epoch loss_percent planned_offset_ms
+  local client_result_file remote_result_file client_pid remote_pid
+  local client_wait_exit remote_wait_exit event_json client_json remote_json
+  local schedule_status=0
+
+  bulk_interactive_schedule_events_json=""
+  bulk_interactive_schedule_event_count=0
+  for epoch in "${!bulk_interactive_loss_percent[@]}"; do
+    loss_percent="${bulk_interactive_loss_percent[$epoch]}"
+    planned_offset_ms=$((epoch * bulk_interactive_epoch_seconds * 1000))
+    if ! wait_for_bulk_interactive_deadline \
+      "$((probe_started_monotonic_ms + planned_offset_ms))" \
+      "$probe_finished_file"; then
+      schedule_status=124
+      break
+    fi
+
+    client_result_file="${result_prefix}-epoch-${epoch}-client"
+    remote_result_file="${result_prefix}-epoch-${epoch}-remote"
+    active_bulk_interactive_host_files+=(
+      "$client_result_file" "${client_result_file}.tmp"
+      "$remote_result_file" "${remote_result_file}.tmp"
+    )
+    apply_bulk_interactive_loss_endpoint \
+      client-egress client "$loss_percent" \
+      "$probe_started_monotonic_ms" "$planned_offset_ms" "$client_result_file" &
+    client_pid="$!"
+    apply_bulk_interactive_loss_endpoint \
+      remote-egress "$remote_service" "$loss_percent" \
+      "$probe_started_monotonic_ms" "$planned_offset_ms" "$remote_result_file" &
+    remote_pid="$!"
+    if wait "$client_pid"; then client_wait_exit=0; else client_wait_exit="$?"; fi
+    if wait "$remote_pid"; then remote_wait_exit=0; else remote_wait_exit="$?"; fi
+
+    if [[ "$client_wait_exit" != "0" || "$remote_wait_exit" != "0" ]]; then
+      schedule_status=1
+    fi
+    client_json="$(cat "$client_result_file" 2>/dev/null || true)"
+    remote_json="$(cat "$remote_result_file" 2>/dev/null || true)"
+    if [[ -z "$client_json" ]]; then
+      printf -v client_json '{"role":"client-egress","service":"client","start_offset_ms":-1,"end_offset_ms":-1,"command_exit_code":%s,"apply_exit_code":125,"readback_exit_code":125,"readback_base64":"-"}' "$client_wait_exit"
+    fi
+    if [[ -z "$remote_json" ]]; then
+      printf -v remote_json '{"role":"remote-egress","service":"%s","start_offset_ms":-1,"end_offset_ms":-1,"command_exit_code":%s,"apply_exit_code":125,"readback_exit_code":125,"readback_base64":"-"}' "$remote_service" "$remote_wait_exit"
+    fi
+    printf -v event_json '{"index":%s,"loss_percent":%s,"planned_offset_ms":%s,"endpoints":{"client-egress":%s,"remote-egress":%s}}' \
+      "$epoch" \
+      "$loss_percent" \
+      "$planned_offset_ms" \
+      "$client_json" \
+      "$remote_json"
+    if [[ -n "$bulk_interactive_schedule_events_json" ]]; then
+      bulk_interactive_schedule_events_json+=","
+    fi
+    bulk_interactive_schedule_events_json+="$event_json"
+    bulk_interactive_schedule_event_count=$((bulk_interactive_schedule_event_count + 1))
+  done
+  if [[ "$schedule_status" != "124" ]] && \
+     ! wait_for_bulk_interactive_deadline \
+       "$((probe_started_monotonic_ms + bulk_interactive_duration_seconds * 1000))" \
+       "$probe_finished_file" 1; then
+    schedule_status=124
+  fi
+  return "$schedule_status"
+}
+
+bulk_interactive_dynamic_loss_metadata() {
+  local probe_started_monotonic_ms="${1:-null}"
+  local schedule_exit_code="$2"
+  local schedule_completed_offset_ms="${3:-null}"
+  local host_time_namespace_id="${4:-}"
+  local client_time_namespace_id="${5:-}"
+  local host_monotonic_offset_json="${6:-null}"
+  local client_monotonic_offset_json="${7:-null}"
+  local topology_mode="$8"
+  local role_service_mapping_json="$9"
+  local constant_service_loss_json="${10}"
+  local trace_complete=false
+  if [[ "$schedule_exit_code" == "0" ]] && \
+     [[ "$host_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
+       && "$client_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
+       && "$host_monotonic_offset_json" != "null" \
+       && "$host_monotonic_offset_json" == "$client_monotonic_offset_json" ]] && \
+     (( bulk_interactive_schedule_event_count == ${#bulk_interactive_loss_percent[@]} )) && \
+     (( schedule_completed_offset_ms >= bulk_interactive_duration_seconds * 1000 )); then
+    trace_complete=true
+  fi
+  printf '{"condition":%s,"probe_started_monotonic_ms":%s,"schedule_origin":"probe-started-file-clock-monotonic-ms","clock_name":"CLOCK_MONOTONIC","host_time_namespace_id":"%s","client_time_namespace_id":"%s","host_monotonic_offset":%s,"client_monotonic_offset":%s,"topology_mode":"%s","dynamic_role_to_service":%s,"constant_service_loss_percent":%s,"schedule_exit_code":%s,"schedule_completed_offset_ms":%s,"applied_event_count":%s,"events":[%s],"trace_complete":%s}\n' \
+    "$bulk_interactive_dynamic_loss_json" \
+    "$probe_started_monotonic_ms" \
+    "$host_time_namespace_id" \
+    "$client_time_namespace_id" \
+    "$host_monotonic_offset_json" \
+    "$client_monotonic_offset_json" \
+    "$topology_mode" \
+    "$role_service_mapping_json" \
+    "$constant_service_loss_json" \
+    "$schedule_exit_code" \
+    "$schedule_completed_offset_ms" \
+    "$bulk_interactive_schedule_event_count" \
+    "$bulk_interactive_schedule_events_json" \
+    "$trace_complete"
+}
+
 run_bulk_interactive_probe_case() {
   local case_name="$1"
   local proxy_port_arg="$2"
   local mptunnel_row="${3:-1}"
   local baseline_identity_json="${4:-}"
+  local probe_mode="${5:-socks5}"
+  local remote_service="${6:-server}"
+  local protocol_override="${7:-}"
   local out_file="/tmp/mptunnel-bulk-interactive-${case_name}.out"
   local err_file="/tmp/mptunnel-bulk-interactive-${case_name}.err"
-  local output probe_stderr exit_code
-  local telemetry_pid
+  local probe_pid_file="/tmp/mptunnel-bulk-interactive-${case_name}.pid"
+  local probe_gate_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.started"
+  local probe_finished_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.finished"
+  local probe_status_relative=".tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$.status"
+  local probe_gate_file="${repo_root}/${probe_gate_relative}"
+  local probe_finished_file="${repo_root}/${probe_finished_relative}"
+  local probe_status_file="${repo_root}/${probe_status_relative}"
+  local probe_gate_container_file="/workspace/${probe_gate_relative}"
+  local probe_finished_container_file="/workspace/${probe_finished_relative}"
+  local probe_status_container_file="/workspace/${probe_status_relative}"
+  local output probe_stderr exit_code telemetry_pid schedule_exit_code
+  local schedule_completed_offset_ms=""
+  local dynamic_loss_metadata_json=""
+  local host_time_namespace_id client_time_namespace_id
+  local host_monotonic_offset_json client_monotonic_offset_json
+  local clock_preflight_error=""
+  local probe_target_ip probe_route_arguments topology_mode
+  local role_service_mapping_json constant_service_loss_json
+  local -a probe_anchor=()
+
+  case "$probe_mode:$remote_service" in
+    socks5:server)
+      probe_target_ip="172.31.40.30"
+      probe_route_arguments="--proxy 127.0.0.1:${proxy_port_arg}"
+      topology_mode="proxy"
+      role_service_mapping_json='{"client-egress":"client","remote-egress":"server"}'
+      constant_service_loss_json='{"target":3}'
+      ;;
+    direct:target)
+      probe_target_ip="172.31.15.30"
+      probe_route_arguments="--mode direct"
+      topology_mode="direct"
+      role_service_mapping_json='{"client-egress":"client","remote-egress":"target"}'
+      constant_service_loss_json='{}'
+      ;;
+    *)
+      echo "unsupported bulk-interactive topology: $probe_mode/$remote_service" >&2
+      return 2
+      ;;
+  esac
+
+  bulk_interactive_schedule_events_json=""
+  bulk_interactive_schedule_event_count=0
+  apply_bulk_interactive_baseline_profile
+  mkdir -p "$(dirname "$probe_gate_file")"
+  rm -f \
+    "$probe_gate_file" "$probe_finished_file" \
+    "$probe_status_file" "${probe_status_file}.tmp"
+  exec_in client "rm -f '${out_file}' '${err_file}' '${probe_pid_file}'"
+  host_time_namespace_id="$(readlink /proc/self/ns/time 2>/dev/null || true)"
+  client_time_namespace_id="$(
+    exec_in client "readlink /proc/self/ns/time" 2>/dev/null || true
+  )"
+  host_monotonic_offset_json="$(
+    normalize_monotonic_timens_offset </proc/self/timens_offsets 2>/dev/null || true
+  )"
+  client_monotonic_offset_json="$(
+    exec_in client "cat /proc/self/timens_offsets" 2>/dev/null \
+      | normalize_monotonic_timens_offset 2>/dev/null || true
+  )"
+  if [[ ! "$host_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
+    || ! "$client_time_namespace_id" =~ ^time:\[[0-9]+\]$ ]]; then
+    clock_preflight_error="time namespace provenance invalid"
+  elif [[ -z "$host_monotonic_offset_json" \
+    || -z "$client_monotonic_offset_json" ]]; then
+    clock_preflight_error="effective monotonic offset unavailable"
+  elif [[ "$host_monotonic_offset_json" != "$client_monotonic_offset_json" ]]; then
+    clock_preflight_error="effective monotonic offset mismatch"
+  fi
+  if [[ -n "$clock_preflight_error" ]]; then
+    schedule_exit_code=78
+    dynamic_loss_metadata_json="$(bulk_interactive_dynamic_loss_metadata \
+      null "$schedule_exit_code" null \
+      "$host_time_namespace_id" "$client_time_namespace_id" \
+      "${host_monotonic_offset_json:-null}" \
+      "${client_monotonic_offset_json:-null}" \
+      "$topology_mode" "$role_service_mapping_json" \
+      "$constant_service_loss_json")"
+    append_mixed_probe_result \
+      "$case_name" 78 "" "" "$clock_preflight_error" \
+      "$mptunnel_row" "$baseline_identity_json" "$dynamic_loss_metadata_json" \
+      "$protocol_override"
+    return 0
+  fi
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
-  set +e
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --workload-mode bulk-interactive --proxy 127.0.0.1:${proxy_port_arg} --http-target 172.31.40.30:8080 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' >'${out_file}' 2>'${err_file}'"
-  exit_code="$?"
+  active_telemetry_case="$case_name"
+  active_telemetry_pid="$telemetry_pid"
+  active_bulk_interactive_probe_pid_file="$probe_pid_file"
+  active_bulk_interactive_host_files=(
+    "$probe_gate_file" "$probe_finished_file"
+    "$probe_status_file" "${probe_status_file}.tmp"
+  )
+  exec_in client "(if timeout $((bulk_interactive_probe_timeout_seconds + 10))s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --workload-mode bulk-interactive ${probe_route_arguments} --http-target ${probe_target_ip}:8080 --tcp-echo-target ${probe_target_ip}:10022 --bulk-path '${large_http_path}' --failover-after -1 --timeout '${bulk_interactive_probe_timeout_seconds}' --load-duration '${bulk_interactive_duration_seconds}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${probe_gate_container_file}' >'${out_file}' 2>'${err_file}'; then probe_exit=0; else probe_exit=\$?; fi; : > '${probe_finished_container_file}'; printf '%s\n' \"\$probe_exit\" > '${probe_status_container_file}.tmp'; mv '${probe_status_container_file}.tmp' '${probe_status_container_file}') & echo \$! > '${probe_pid_file}'"
+
+  local gate_deadline=$((SECONDS + 10))
+  while [[ ! -f "$probe_gate_file" && ! -f "$probe_status_file" ]] \
+    && (( SECONDS < gate_deadline )); do
+    sleep 0.01
+  done
+  schedule_exit_code=124
+  if [[ -f "$probe_gate_file" ]]; then
+    mapfile -t probe_anchor < "$probe_gate_file"
+    if (( ${#probe_anchor[@]} == 3 )); then
+      if run_bulk_interactive_dynamic_loss_schedule \
+        "$probe_finished_file" "${probe_anchor[1]}" "$remote_service" \
+        "${repo_root}/.tmp/lab/bulk-interactive-${case_name}-${timestamp}-$$"; then
+        schedule_exit_code=0
+      else
+        schedule_exit_code="$?"
+      fi
+      schedule_completed_offset_ms="$(($(monotonic_milliseconds) - probe_anchor[1]))"
+    else
+      schedule_exit_code=2
+    fi
+  fi
+
+  wait_for_case_probe \
+    "$probe_status_file" "$probe_pid_file" "$bulk_interactive_probe_timeout_seconds"
   stop_case_telemetry "$case_name" "$telemetry_pid"
+  active_telemetry_case=""
+  active_telemetry_pid=""
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
-  set -e
+  exit_code="$(cat "$probe_status_file" 2>/dev/null || echo 124)"
+  dynamic_loss_metadata_json="$(bulk_interactive_dynamic_loss_metadata \
+    "${probe_anchor[1]:-}" \
+    "$schedule_exit_code" \
+    "$schedule_completed_offset_ms" \
+    "$host_time_namespace_id" "$client_time_namespace_id" \
+    "${host_monotonic_offset_json:-null}" \
+    "${client_monotonic_offset_json:-null}" \
+    "$topology_mode" "$role_service_mapping_json" \
+    "$constant_service_loss_json")"
+  apply_netem "$default_netem_mode"
   append_mixed_probe_result \
     "$case_name" "$exit_code" "$output" "" "$probe_stderr" \
-    "$mptunnel_row" "$baseline_identity_json"
+    "$mptunnel_row" "$baseline_identity_json" "$dynamic_loss_metadata_json" \
+    "$protocol_override"
+  cleanup_active_bulk_interactive_probe
+}
+
+run_raw_tcp_bulk_interactive_case() {
+  local case_name="baseline_raw_tcp_bulk_interactive_balanced"
+  local probe_status=0
+  local service pid_file
+  prepare_baseline_case "$default_netem_mode"
+  stop_client
+  stop_server
+  for service in client server; do
+    pid_file="/tmp/mptunnel-${service}.pid"
+    exec_in "$service" "deadline=\$((SECONDS + 5)); while pgrep -f '[m]ptunnel.*--config' >/dev/null && (( SECONDS < deadline )); do sleep 0.05; done; test ! -e '${pid_file}'; ! pgrep -f '[m]ptunnel.*--config' >/dev/null"
+  done
+  if run_bulk_interactive_probe_case \
+    "$case_name" "" 0 "" direct target raw-tcp; then
+    :
+  else
+    probe_status="$?"
+  fi
+  if [[ "$isolate_cases" != "1" ]]; then
+    start_server
+  fi
+  return "$probe_status"
 }
 
 run_baseline_upload_probe_case() {
@@ -2995,6 +3393,8 @@ append_mixed_probe_result() {
   local probe_stderr="${5:-}"
   local mptunnel_row="${6:-1}"
   local baseline_identity_json="${7:-}"
+  local dynamic_loss_metadata_json="${8:-}"
+  local protocol_override="${9:-}"
   local client_log server_log
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -3015,6 +3415,8 @@ append_mixed_probe_result() {
   PROBE_STDERR="$probe_stderr" \
   RESULT_REPRODUCIBILITY="$result_reproducibility" \
   BASELINE_IDENTITY="$baseline_identity_json" \
+  BULK_INTERACTIVE_DYNAMIC_LOSS_METADATA="$dynamic_loss_metadata_json" \
+  PROTOCOL_OVERRIDE="$protocol_override" \
   LAB_SCRIPT_DIR="$script_dir" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -3038,6 +3440,9 @@ if not row:
         "status": "fail",
         "exit_code": exit_code,
     }
+protocol_override = os.environ.get("PROTOCOL_OVERRIDE", "")
+if protocol_override:
+    row["protocol"] = protocol_override
 sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
 from result_enrichment import enrich_instrumentation_for_scope
 lab_diag, lab_perf = enrich_instrumentation_for_scope(
@@ -3060,6 +3465,28 @@ if raw_flapping:
         row["status"] = "fail"
         row["failure_reason"] = "flapping metadata is invalid"
         row["flapping_metadata_error"] = str(exc)
+raw_dynamic_loss = os.environ.get("BULK_INTERACTIVE_DYNAMIC_LOSS_METADATA", "")
+if raw_dynamic_loss:
+    try:
+        dynamic_loss = json.loads(raw_dynamic_loss)
+        if not isinstance(dynamic_loss, dict):
+            raise ValueError("dynamic-loss metadata is not an object")
+        row["bulk_interactive_dynamic_loss"] = dynamic_loss
+        from result_enrichment import (
+            validate_bulk_interactive_dynamic_loss_metadata,
+            validate_bulk_interactive_probe_route,
+        )
+        validate_bulk_interactive_dynamic_loss_metadata(dynamic_loss)
+        validate_bulk_interactive_probe_route(row, dynamic_loss)
+    except (json.JSONDecodeError, ValueError) as exc:
+        row["probe_status_before_dynamic_loss_validation"] = row.get("status")
+        row["status"] = "fail"
+        row["failure_reason"] = "bulk-interactive dynamic-loss trace is invalid"
+        row["bulk_interactive_dynamic_loss_error"] = str(exc)
+elif row.get("workload_mode") == "bulk-interactive":
+    row["probe_status_before_dynamic_loss_validation"] = row.get("status")
+    row["status"] = "fail"
+    row["failure_reason"] = "bulk-interactive dynamic-loss trace is missing"
 try:
     log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
 except ValueError:
@@ -4161,6 +4588,9 @@ fi
 if should_run_case "direct_mixed_balanced"; then
   run_direct_mixed_case "direct_mixed_balanced" "172.31.15.30"
 fi
+if should_run_case "baseline_raw_tcp_bulk_interactive_balanced"; then
+  run_raw_tcp_bulk_interactive_case
+fi
 if should_run_case "direct_mixed_cross_continent_high_bandwidth"; then
   run_direct_mixed_case "direct_mixed_cross_continent_high_bandwidth" "172.31.20.30"
 fi
@@ -4226,9 +4656,9 @@ fi
 
 if should_run_case "baseline_hysteria2_udp_bulk_interactive_balanced"; then
   hysteria_up_rate="$(hysteria_bandwidth_from_netem_rate \
-    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+    "$bulk_interactive_rate")"
   hysteria_down_rate="$(hysteria_bandwidth_from_netem_rate \
-    "${MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE:-${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}}")"
+    "$bulk_interactive_rate")"
   run_hysteria2_baseline_case \
     "baseline_hysteria2_udp_bulk_interactive_balanced" \
     "172.31.15.20" \

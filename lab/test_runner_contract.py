@@ -347,14 +347,57 @@ class RunnerContractTests(unittest.TestCase):
             "\n}\n\nrun_baseline_upload_probe_case()", 1
         )[0]
         self.assertIn("--workload-mode bulk-interactive", probe)
-        self.assertIn("--http-target 172.31.40.30:8080", probe)
-        self.assertIn("--tcp-echo-target 172.31.40.30:10022", probe)
+        self.assertIn("--http-target ${probe_target_ip}:8080", probe)
+        self.assertIn("--tcp-echo-target ${probe_target_ip}:10022", probe)
         self.assertIn("--tcp-echo-interval-ms '${tcp_echo_interval_ms}'", probe)
         self.assertNotIn("--small-path", probe)
         self.assertNotIn("--udp-target", probe)
+        self.assertIn("--started-file '${probe_gate_container_file}'", probe)
+        self.assertIn("--load-duration '${bulk_interactive_duration_seconds}'", probe)
         self.assertIn('local mptunnel_row="${3:-1}"', probe)
         self.assertIn('local baseline_identity_json="${4:-}"', probe)
-        self.assertIn('"$mptunnel_row" "$baseline_identity_json"', probe)
+        self.assertIn('local protocol_override="${7:-}"', probe)
+        self.assertIn(
+            '"$mptunnel_row" "$baseline_identity_json" "$dynamic_loss_metadata_json"',
+            probe,
+        )
+        self.assertIn('"$protocol_override"', probe)
+
+        self.assertIn("bulk_interactive_epoch_seconds=5", SCRIPT)
+        self.assertIn("bulk_interactive_loss_percent=(1 4 2 3 5 1 2 6)", SCRIPT)
+        self.assertIn('bulk_interactive_rate="500mbit"', SCRIPT)
+        self.assertIn('bulk_interactive_delay="50ms"', SCRIPT)
+        self.assertIn('bulk_interactive_jitter="20ms"', SCRIPT)
+        self.assertIn('bulk_interactive_target_loss="3%"', SCRIPT)
+        self.assertIn("bulk_interactive_transition_complete_lateness_ms=250", SCRIPT)
+        self.assertIn("bulk_interactive_transition_command_timeout_seconds=2", SCRIPT)
+        schedule = SCRIPT.split(
+            "run_bulk_interactive_dynamic_loss_schedule() {", 1
+        )[1].split("\n}\n\nbulk_interactive_dynamic_loss_metadata()", 1)[0]
+        endpoint_change = SCRIPT.split(
+            "apply_bulk_interactive_loss_endpoint() {", 1
+        )[1].split("\n}\n\nrun_bulk_interactive_dynamic_loss_schedule()", 1)[0]
+        self.assertIn("probe_started_monotonic_ms + planned_offset_ms", schedule)
+        self.assertIn(
+            "probe_started_monotonic_ms + bulk_interactive_duration_seconds * 1000",
+            schedule,
+        )
+        self.assertIn('client-egress client "$loss_percent"', schedule)
+        self.assertIn('remote-egress "$remote_service" "$loss_percent"', schedule)
+        self.assertIn('change-balanced-observed', endpoint_change)
+        self.assertIn('"$bulk_interactive_transition_command_timeout_seconds"', endpoint_change)
+        self.assertIn('"readback_base64"', schedule)
+        self.assertIn('readlink /proc/self/ns/time', probe)
+        self.assertIn('cat /proc/self/timens_offsets', probe)
+        self.assertIn('normalize_monotonic_timens_offset', probe)
+        self.assertIn(
+            '"$host_monotonic_offset_json" != "$client_monotonic_offset_json"',
+            probe,
+        )
+        self.assertNotIn(
+            '"$host_time_namespace_id" != "$client_time_namespace_id"', probe
+        )
+        self.assertNotIn("set +e", probe)
 
         for case_name in (
             "baseline_vmess_tcp_bulk_interactive_balanced",
@@ -382,8 +425,7 @@ class RunnerContractTests(unittest.TestCase):
             'if should_run_case "baseline_hysteria2_udp_bulk_interactive_balanced";',
             1,
         )[1].split("\nfi", 1)[0]
-        self.assertIn("MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE", hysteria_case)
-        self.assertIn("MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE", hysteria_case)
+        self.assertEqual(hysteria_case.count('"$bulk_interactive_rate"'), 2)
         self.assertIn('"$hysteria_up_rate"', hysteria_case)
         self.assertIn('"$hysteria_down_rate"', hysteria_case)
 
@@ -401,7 +443,58 @@ class RunnerContractTests(unittest.TestCase):
         for wrapper in (vmess, hysteria):
             self.assertIn('"$case_name" "$baseline_proxy_port" 0 "$baseline_identity_json"', wrapper)
         self.assertIn('BASELINE_IDENTITY="$baseline_identity_json"', append)
+        self.assertIn('local dynamic_loss_metadata_json="${8:-}"', append)
+        self.assertIn('local protocol_override="${9:-}"', append)
         self.assertIn("enrich_baseline_identity", append)
+        self.assertIn(
+            'BULK_INTERACTIVE_DYNAMIC_LOSS_METADATA="$dynamic_loss_metadata_json"',
+            append,
+        )
+        self.assertIn("validate_bulk_interactive_dynamic_loss_metadata", append)
+        self.assertIn("validate_bulk_interactive_probe_route", append)
+
+    def test_bulk_interactive_transition_reads_back_the_exact_balanced_qdisc(self):
+        observed = NETEM.split("change_balanced_observed() {", 1)[1].split(
+            "\n}\n\napply_profile_all()", 1
+        )[0]
+        self.assertIn('interface_for_subnet "172.31.15"', observed)
+        self.assertIn('tc -s -d qdisc show dev "$iface"', observed)
+        self.assertIn('address=%s\\n%s\\n', observed)
+        self.assertIn("base64 -w0", observed)
+        self.assertIn("change-balanced-observed)", NETEM)
+
+    def test_bulk_interactive_wait_rechecks_early_probe_completion(self):
+        wait = SCRIPT.split("wait_for_bulk_interactive_deadline() {", 1)[1].split(
+            "\n}\n\napply_bulk_interactive_loss_endpoint()", 1
+        )[0]
+        self.assertEqual(wait.count('-f "$probe_finished_file"'), 2)
+        self.assertIn('sleep "$((remaining_ms / 1000))', wait)
+        self.assertNotIn("sleep 0.01", wait)
+
+    def test_raw_tcp_control_is_direct_isolated_and_restores_nonisolated_server(self):
+        raw = SCRIPT.split("run_raw_tcp_bulk_interactive_case() {", 1)[1].split(
+            "\n}\n\nrun_baseline_upload_probe_case()", 1
+        )[0]
+        self.assertIn("stop_client", raw)
+        self.assertIn("stop_server", raw)
+        self.assertEqual(raw.count("pgrep -f '[m]ptunnel.*--config'"), 2)
+        self.assertIn('"$case_name" "" 0 "" direct target raw-tcp', raw)
+        self.assertIn('if [[ "$isolate_cases" != "1" ]]; then', raw)
+        self.assertIn("start_server", raw)
+        self.assertIn(
+            'if should_run_case "baseline_raw_tcp_bulk_interactive_balanced";',
+            SCRIPT,
+        )
+
+    def test_bulk_interactive_async_probe_cleanup_is_not_keep_lab_gated(self):
+        cleanup = SCRIPT.split("cleanup() {", 1)[1].split(
+            "\n}\n\napply_netem()", 1
+        )[0]
+        self.assertIn("cleanup_active_bulk_interactive_probe", cleanup)
+        self.assertLess(
+            cleanup.index("cleanup_active_bulk_interactive_probe"),
+            cleanup.index('if [[ "${KEEP_LAB:-0}" != "1" ]]'),
+        )
 
     def test_flapper_cannot_be_stopped_by_background_terminal_signals(self):
         flapper = SCRIPT.split("start_random_flapping() {", 1)[1].split(

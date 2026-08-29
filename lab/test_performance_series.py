@@ -1,3 +1,4 @@
+import base64
 import copy
 import contextlib
 import io
@@ -41,6 +42,11 @@ from derive_performance_series import (  # noqa: E402
     derive_dataset,
     main as derive_main,
     parse_args,
+)
+from result_enrichment import (  # noqa: E402
+    BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION,
+    validate_bulk_interactive_dynamic_loss_metadata,
+    validate_bulk_interactive_probe_route,
 )
 
 
@@ -216,6 +222,79 @@ class PerformanceSeriesContractTests(unittest.TestCase):
 
 class PerformanceSeriesDerivationTests(unittest.TestCase):
     @staticmethod
+    def dynamic_loss_condition():
+        return copy.deepcopy(BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION)
+
+    @staticmethod
+    def qdisc_readback(condition, service, loss):
+        payload = (
+            "interface=eth-balanced\n"
+            f"address={condition['service_addresses'][service]}\n"
+            "qdisc netem 1: root refcnt 2 limit 1000 "
+            f"rate 500Mbit delay 50ms 20ms loss random {loss}%\n"
+        )
+        return base64.b64encode(payload.encode()).decode()
+
+    @staticmethod
+    def dynamic_loss_trace(condition):
+        def endpoint(role, service, start_ms, end_ms, loss):
+            return {
+                "role": role,
+                "service": service,
+                "start_offset_ms": start_ms,
+                "end_offset_ms": end_ms,
+                "command_exit_code": 0,
+                "apply_exit_code": 0,
+                "readback_exit_code": 0,
+                "readback_base64": PerformanceSeriesDerivationTests.qdisc_readback(
+                    condition, service, loss
+                ),
+            }
+
+        events = []
+        epoch_ms = condition["epoch_seconds"] * 1000
+        for index, loss in enumerate(condition["loss_percent"]):
+            planned_offset_ms = index * epoch_ms
+            events.append(
+                {
+                    "index": index,
+                    "loss_percent": loss,
+                    "planned_offset_ms": planned_offset_ms,
+                    "endpoints": {
+                        "client-egress": endpoint(
+                            "client-egress", "client", planned_offset_ms,
+                            planned_offset_ms + 1, loss,
+                        ),
+                        "remote-egress": endpoint(
+                            "remote-egress", "server", planned_offset_ms,
+                            planned_offset_ms + 2, loss,
+                        ),
+                    },
+                }
+            )
+        return {
+            "condition": copy.deepcopy(condition),
+            "probe_started_monotonic_ms": 1000,
+            "schedule_origin": "probe-started-file-clock-monotonic-ms",
+            "clock_name": "CLOCK_MONOTONIC",
+            "host_time_namespace_id": "time:[4026531834]",
+            "client_time_namespace_id": "time:[4026532522]",
+            "host_monotonic_offset": {"seconds": 0, "nanoseconds": 0},
+            "client_monotonic_offset": {"seconds": 0, "nanoseconds": 0},
+            "topology_mode": "proxy",
+            "dynamic_role_to_service": {
+                "client-egress": "client",
+                "remote-egress": "server",
+            },
+            "constant_service_loss_percent": {"target": 3},
+            "schedule_exit_code": 0,
+            "schedule_completed_offset_ms": condition["duration_seconds"] * 1000,
+            "applied_event_count": len(events),
+            "events": events,
+            "trace_complete": True,
+        }
+
+    @staticmethod
     def valid_raw_record():
         attempts = [
             {
@@ -225,44 +304,48 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
                 "latency_ms": 100.0 + index,
                 "outcome": "success",
             }
-            for index in range(3)
+            for index in range(80)
         ]
+        raw_goodput = [1.0] * 200
         return {
             "status": "ok",
             "bulk_status": "ok",
+            "protocol": "bulk-interactive",
             "host_valid": True,
             "source_tree_dirty": False,
             "workload_mode": "bulk-interactive",
             "mode": "socks5",
-            "target": "target:8080",
-            "tcp_echo_target": "target:10022",
-            "test_duration_s": 1.0,
-            "bulk_time_s": 1.0,
-            "bulk_load_duration_s": 1.0,
+            "target": "172.31.40.30:8080",
+            "tcp_echo_target": "172.31.40.30:10022",
+            "test_duration_s": 40.0,
+            "bulk_time_s": 40.0,
+            "bulk_load_duration_s": 40.0,
             "bulk_bytes": 1,
             "bulk_interval_seconds": 0.2,
             "bulk_interval_trim_discard_each_end": 3,
-            "bulk_interval_goodput_raw_mbps": [1.0] * 21,
-            "bulk_interval_goodput_mbps": [1.0] * 15,
+            "bulk_interval_goodput_raw_mbps": raw_goodput,
+            "bulk_interval_goodput_mbps": raw_goodput[3:-3],
             "interactive_interval_ms": 500,
             "interactive_timeout_ms": 5000,
             "interactive_payload_bytes": 64,
-            "interactive_time_s": 1.0,
+            "interactive_time_s": 40.0,
             "interactive_attempt_series": attempts,
-            "interactive_count": 3,
-            "interactive_ok": 3,
+            "interactive_count": 80,
+            "interactive_ok": 80,
             "interactive_fail": 0,
         }
 
     @classmethod
     def record_for(cls, series_id, case, value_offset=0.0):
         record = cls.valid_raw_record()
+        condition = cls.dynamic_loss_condition()
         record.update(
             {
                 "case": case,
                 "source_commit": "accepted-source-commit",
+                "bulk_interactive_dynamic_loss": cls.dynamic_loss_trace(condition),
                 "bulk_interval_trim_discard_each_end": 3,
-                "bulk_interval_goodput_raw_mbps": [1.0 + value_offset] * 21,
+                "bulk_interval_goodput_raw_mbps": [1.0 + value_offset] * 200,
                 "bulk_interval_goodput_mbps": [
                     value + value_offset
                     for value in record["bulk_interval_goodput_mbps"]
@@ -300,9 +383,13 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
                 "MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE": "130963kbit",
             },
             "workload": {
-                "load_duration_seconds": 1.0,
+                "load_duration_seconds": 40.0,
                 "bulk_connections": 1,
+                "bulk_streams": 1,
                 "object_mib": 1,
+                "bulk_interactive_dynamic_loss": (
+                    PerformanceSeriesDerivationTests.dynamic_loss_condition()
+                ),
             },
             "execution": {
                 "isolate_cases": True,
@@ -456,7 +543,7 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             "hysteria2",
             "baseline_hysteria2_udp_bulk_interactive_balanced",
         )
-        record.update(status="loss", interactive_ok=2, interactive_fail=1)
+        record.update(status="loss", interactive_ok=79, interactive_fail=1)
         record["interactive_attempt_series"][1].update(
             latency_ms=None,
             outcome="timeout",
@@ -579,6 +666,170 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             ],
         )
 
+    def test_derivation_rejects_incomplete_dynamic_loss_trace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self.write_split_repetition(root, "run-a")
+            second = self.write_split_repetition(root, "run-b")
+            row = json.loads(first[0].read_text(encoding="utf-8"))
+            row["bulk_interactive_dynamic_loss"]["trace_complete"] = False
+            first[0].write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(DerivationError, "dynamic-loss trace"):
+                derive_dataset(
+                    [first, second],
+                    "title",
+                    "subtitle",
+                    "condition",
+                    "incomplete-dynamic-loss",
+                )
+
+    def test_derivation_rejects_dynamic_loss_trace_manifest_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self.write_split_repetition(root, "run-a")
+            second = self.write_split_repetition(root, "run-b")
+            row = json.loads(first[0].read_text(encoding="utf-8"))
+            row["bulk_interactive_dynamic_loss"]["condition"][
+                "condition_id"
+            ] = "different-condition"
+            first[0].write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(DerivationError, "dynamic-loss trace"):
+                derive_dataset(
+                    [first, second],
+                    "title",
+                    "subtitle",
+                    "condition",
+                    "dynamic-loss-mismatch",
+                )
+
+    def test_dynamic_loss_trace_rejects_missing_or_wrong_qdisc_readback(self):
+        condition = self.dynamic_loss_condition()
+        metadata = self.dynamic_loss_trace(condition)
+        validate_bulk_interactive_dynamic_loss_metadata(metadata)
+
+        missing = copy.deepcopy(metadata)
+        missing["events"][0]["endpoints"]["client-egress"][
+            "readback_base64"
+        ] = "-"
+        with self.assertRaisesRegex(ValueError, "readback is invalid"):
+            validate_bulk_interactive_dynamic_loss_metadata(missing)
+
+        valid_payload = base64.b64decode(
+            metadata["events"][0]["endpoints"]["client-egress"][
+                "readback_base64"
+            ]
+        ).decode()
+        for old, new in (
+            ("500Mbit", "499Mbit"),
+            ("50ms", "51ms"),
+            ("20ms", "21ms"),
+            ("loss random 1%", "loss random 6%"),
+        ):
+            wrong_profile = copy.deepcopy(metadata)
+            wrong_profile["events"][0]["endpoints"]["client-egress"][
+                "readback_base64"
+            ] = base64.b64encode(valid_payload.replace(old, new).encode()).decode()
+            with self.subTest(field=old), self.assertRaisesRegex(
+                ValueError, "qdisc does not match"
+            ):
+                validate_bulk_interactive_dynamic_loss_metadata(wrong_profile)
+
+    def test_dynamic_loss_trace_accepts_distinct_namespaces_with_equal_offsets(self):
+        metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
+        validate_bulk_interactive_dynamic_loss_metadata(metadata)
+
+    def test_dynamic_loss_trace_rejects_effective_monotonic_offset_mismatch(self):
+        metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
+        for same_namespace in (True, False):
+            mismatched_clock = copy.deepcopy(metadata)
+            if same_namespace:
+                mismatched_clock["client_time_namespace_id"] = (
+                    mismatched_clock["host_time_namespace_id"]
+                )
+            mismatched_clock["client_monotonic_offset"] = {
+                "seconds": 1,
+                "nanoseconds": 0,
+            }
+            with self.subTest(same_namespace=same_namespace), self.assertRaisesRegex(
+                ValueError, "monotonic offsets differ"
+            ):
+                validate_bulk_interactive_dynamic_loss_metadata(mismatched_clock)
+
+    def test_dynamic_loss_trace_rejects_missing_or_malformed_offsets(self):
+        metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
+        invalid_values = (
+            None,
+            {},
+            {"seconds": 0},
+            {"seconds": 0, "nanoseconds": -1},
+            {"seconds": 0, "nanoseconds": 1_000_000_000},
+            {"seconds": "0", "nanoseconds": 0},
+            {"seconds": True, "nanoseconds": 0},
+            {"seconds": 0, "nanoseconds": 0, "extra": 0},
+        )
+        for field in ("host_monotonic_offset", "client_monotonic_offset"):
+            for value in invalid_values:
+                malformed = copy.deepcopy(metadata)
+                malformed[field] = value
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    ValueError, "monotonic offset is invalid"
+                ):
+                    validate_bulk_interactive_dynamic_loss_metadata(malformed)
+
+    def test_dynamic_loss_trace_rejects_malformed_namespace_ids(self):
+        metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
+        for field in ("host_time_namespace_id", "client_time_namespace_id"):
+            for value in (None, "", "time:4026531834", "time:[invalid]"):
+                malformed = copy.deepcopy(metadata)
+                malformed[field] = value
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    ValueError, "clock provenance is invalid"
+                ):
+                    validate_bulk_interactive_dynamic_loss_metadata(malformed)
+
+    def test_dynamic_loss_trace_rejects_late_transition(self):
+        metadata = self.dynamic_loss_trace(self.dynamic_loss_condition())
+
+        late = copy.deepcopy(metadata)
+        late["events"][0]["endpoints"]["remote-egress"]["end_offset_ms"] = 251
+        with self.assertRaisesRegex(ValueError, "did not complete on time"):
+            validate_bulk_interactive_dynamic_loss_metadata(late)
+
+    def test_raw_tcp_trace_requires_its_direct_route_and_target_role(self):
+        condition = self.dynamic_loss_condition()
+        metadata = self.dynamic_loss_trace(condition)
+        metadata["topology_mode"] = "direct"
+        metadata["dynamic_role_to_service"] = {
+            "client-egress": "client",
+            "remote-egress": "target",
+        }
+        metadata["constant_service_loss_percent"] = {}
+        for event, loss in zip(metadata["events"], condition["loss_percent"]):
+            endpoint = event["endpoints"]["remote-egress"]
+            endpoint["service"] = "target"
+            endpoint["readback_base64"] = self.qdisc_readback(
+                condition, "target", loss
+            )
+        row = {
+            "mode": "direct",
+            "target": "172.31.15.30:8080",
+            "tcp_echo_target": "172.31.15.30:10022",
+            "protocol": "raw-tcp",
+        }
+        validate_bulk_interactive_dynamic_loss_metadata(metadata)
+        validate_bulk_interactive_probe_route(row, metadata)
+
+        wrong_mapping = copy.deepcopy(metadata)
+        wrong_mapping["dynamic_role_to_service"]["remote-egress"] = "server"
+        with self.assertRaisesRegex(ValueError, "role-to-service mapping"):
+            validate_bulk_interactive_dynamic_loss_metadata(wrong_mapping)
+
+        wrong_route = dict(row, target="172.31.40.30:8080")
+        with self.assertRaisesRegex(ValueError, "probe route"):
+            validate_bulk_interactive_probe_route(wrong_route, metadata)
+
     def test_cli_forbids_mixing_complete_and_split_forms(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
@@ -640,10 +891,14 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             first = self.write_split_repetition(root, "run-a")
             second = self.write_split_repetition(root, "run-b")
             mismatched_manifest = first[-1].parent / "run-manifest.json"
+            manifest = self.manifest()
+            manifest["workload"]["bulk_interactive_dynamic_loss"]["profile"][
+                "jitter"
+            ] = "21ms"
             mismatched_manifest.write_text(
-                json.dumps(self.manifest("different-seed")), encoding="utf-8"
+                json.dumps(manifest), encoding="utf-8"
             )
-            with self.assertRaisesRegex(DerivationError, "conditions differ within"):
+            with self.assertRaisesRegex(DerivationError, "invalid dynamic-loss condition"):
                 derive_dataset(
                     [first, second],
                     "title",
@@ -720,10 +975,18 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             first = self.write_complete_repetition(root, "complete-a")
             second = self.write_complete_repetition(root, "complete-b")
             for result in (first, second):
-                manifest_path = result.parent / "run-manifest.json"
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                manifest["workload"]["load_duration_seconds"] = 2.0
-                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                rows = [
+                    json.loads(line)
+                    for line in result.read_text(encoding="utf-8").splitlines()
+                    if line
+                ]
+                for row in rows:
+                    row["test_duration_s"] = 2.0
+                    row["bulk_load_duration_s"] = 2.0
+                result.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
             with self.assertRaisesRegex(
                 DerivationError, "manifest and probe durations"
             ):

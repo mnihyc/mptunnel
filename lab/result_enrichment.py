@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -27,6 +29,235 @@ MPTUNNEL_CARRIER_PRESENTATION = MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE[
 MPTUNNEL_CARRIER_PRESENTATIONS = frozenset(
     MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE.values()
 )
+BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION = {
+    "schema_version": 3,
+    "condition_id": "balanced-dynamic-loss-8x5-v3",
+    "application_scope": "protocol-neutral-balanced-egress",
+    "profile": {"rate": "500mbit", "delay": "50ms", "jitter": "20ms"},
+    "epoch_seconds": 5,
+    "duration_seconds": 40,
+    "loss_percent": [1, 4, 2, 3, 5, 1, 2, 6],
+    "mean_loss_percent": 3.0,
+    "dynamic_roles": ["client-egress", "remote-egress"],
+    "service_addresses": {
+        "client": "172.31.15.10/24",
+        "server": "172.31.15.20/24",
+        "target": "172.31.15.30/24",
+    },
+    "series_topology": {
+        "proxy": {
+            "dynamic_role_to_service": {
+                "client-egress": "client",
+                "remote-egress": "server",
+            },
+            "constant_service_loss_percent": {"target": 3},
+        },
+        "direct": {
+            "dynamic_role_to_service": {
+                "client-egress": "client",
+                "remote-egress": "target",
+            },
+            "constant_service_loss_percent": {},
+        },
+    },
+    "transition_model": "probe-start-anchored-observed-qdisc-change",
+    "transition_complete_lateness_ms": 250,
+    "transition_command_timeout_seconds": 2,
+    "clock": {
+        "name": "CLOCK_MONOTONIC",
+        "linux_time_namespace_requirement": "effective-monotonic-offset-equal",
+        "offset_source": "/proc/self/timens_offsets:monotonic",
+    },
+    "randomness": {
+        "model": "independent-tc-netem-random-realization",
+        "matching": "same-time-varying-law-not-packet-ordinal-replay",
+        "seed_policy": "kernel-generated-per-qdisc",
+        "justification": (
+            "existing-netem-hook-has-no-seed-input; independent-realizations-avoid-"
+            "packet-order-coupling-while-preserving-the-same-time-varying-law"
+        ),
+    },
+}
+
+
+def _validated_monotonic_timens_offset(value: Any) -> tuple[int, int]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"seconds", "nanoseconds"}
+        or type(value.get("seconds")) is not int
+        or type(value.get("nanoseconds")) is not int
+        or not 0 <= value["nanoseconds"] < 1_000_000_000
+    ):
+        raise ValueError("dynamic-loss effective monotonic offset is invalid")
+    return value["seconds"], value["nanoseconds"]
+
+
+def validate_bulk_interactive_dynamic_loss_metadata(metadata: Any) -> None:
+    """Reject a scheduled-loss trace unless every applied qdisc is observed."""
+
+    condition = BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION
+    if not isinstance(metadata, dict) or metadata.get("condition") != condition:
+        raise ValueError("dynamic-loss condition does not match the lab contract")
+    topology_mode = metadata.get("topology_mode")
+    expected_topology = condition["series_topology"].get(topology_mode)
+    if (
+        expected_topology is None
+        or metadata.get("dynamic_role_to_service")
+        != expected_topology["dynamic_role_to_service"]
+        or metadata.get("constant_service_loss_percent")
+        != expected_topology["constant_service_loss_percent"]
+    ):
+        raise ValueError("dynamic-loss role-to-service mapping is invalid")
+    host_namespace = metadata.get("host_time_namespace_id")
+    client_namespace = metadata.get("client_time_namespace_id")
+    if (
+        metadata.get("schedule_origin")
+        != "probe-started-file-clock-monotonic-ms"
+        or metadata.get("clock_name") != "CLOCK_MONOTONIC"
+        or not isinstance(host_namespace, str)
+        or re.fullmatch(r"time:\[[0-9]+\]", host_namespace) is None
+        or not isinstance(client_namespace, str)
+        or re.fullmatch(r"time:\[[0-9]+\]", client_namespace) is None
+    ):
+        raise ValueError("dynamic-loss clock provenance is invalid")
+    host_offset = _validated_monotonic_timens_offset(
+        metadata.get("host_monotonic_offset")
+    )
+    client_offset = _validated_monotonic_timens_offset(
+        metadata.get("client_monotonic_offset")
+    )
+    if host_offset != client_offset:
+        raise ValueError("dynamic-loss effective monotonic offsets differ")
+
+    losses = condition["loss_percent"]
+    epoch_ms = condition["epoch_seconds"] * 1000
+    lateness_ms = condition["transition_complete_lateness_ms"]
+    events = metadata.get("events")
+    if (
+        metadata.get("trace_complete") is not True
+        or metadata.get("schedule_exit_code") != 0
+        or type(metadata.get("probe_started_monotonic_ms")) is not int
+        or metadata["probe_started_monotonic_ms"] < 0
+        or metadata.get("applied_event_count") != len(losses)
+        or not isinstance(events, list)
+        or len(events) != len(losses)
+        or type(metadata.get("schedule_completed_offset_ms")) is not int
+        or not condition["duration_seconds"] * 1000
+        <= metadata["schedule_completed_offset_ms"]
+        <= condition["duration_seconds"] * 1000 + lateness_ms
+    ):
+        raise ValueError("dynamic-loss trace is incomplete")
+
+    for index, (event, loss_percent) in enumerate(zip(events, losses)):
+        planned_offset_ms = index * epoch_ms
+        if (
+            not isinstance(event, dict)
+            or event.get("index") != index
+            or event.get("loss_percent") != loss_percent
+            or event.get("planned_offset_ms") != planned_offset_ms
+            or set(event.get("endpoints", {})) != set(condition["dynamic_roles"])
+        ):
+            raise ValueError(f"dynamic-loss event {index} is invalid")
+        endpoints = event["endpoints"]
+        completion_offsets = []
+        for role in condition["dynamic_roles"]:
+            endpoint = endpoints.get(role)
+            service = expected_topology["dynamic_role_to_service"][role]
+            integer_fields = (
+                "start_offset_ms",
+                "end_offset_ms",
+                "command_exit_code",
+                "apply_exit_code",
+                "readback_exit_code",
+            )
+            if (
+                not isinstance(endpoint, dict)
+                or endpoint.get("role") != role
+                or endpoint.get("service") != service
+                or not all(type(endpoint.get(field)) is int for field in integer_fields)
+                or not planned_offset_ms
+                <= endpoint["start_offset_ms"]
+                <= endpoint["end_offset_ms"]
+                <= planned_offset_ms + lateness_ms
+                or any(endpoint[field] != 0 for field in integer_fields[2:])
+            ):
+                raise ValueError(
+                    f"dynamic-loss event {index} {role} did not complete on time"
+                )
+            completion_offsets.append(endpoint["end_offset_ms"])
+            encoded = endpoint.get("readback_base64")
+            try:
+                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+                raise ValueError(
+                    f"dynamic-loss event {index} {role} readback is invalid"
+                ) from exc
+            lines = decoded.splitlines()
+            expected_address = condition["service_addresses"][service]
+            if (
+                len(lines) != 3
+                or re.fullmatch(r"interface=[^\s=]+", lines[0]) is None
+                or lines[1] != f"address={expected_address}"
+            ):
+                raise ValueError(
+                    f"dynamic-loss event {index} {role} readback interface is invalid"
+                )
+            qdisc = lines[2]
+            loss = re.escape(str(loss_percent))
+            if (
+                re.search(r"^qdisc\s+netem\s+\S+.*\broot\b", qdisc) is None
+                or re.search(r"\brate\s+500(?:[.]0+)?Mbit\b", qdisc, re.I)
+                is None
+                or re.search(
+                    r"\bdelay\s+50(?:[.]0+)?ms\s+20(?:[.]0+)?ms\b",
+                    qdisc,
+                    re.I,
+                )
+                is None
+                or re.search(
+                    rf"\bloss(?:\s+random)?\s+{loss}(?:[.]0+)?%(?:\s|$)",
+                    qdisc,
+                    re.I,
+                )
+                is None
+            ):
+                raise ValueError(
+                    f"dynamic-loss event {index} {role} qdisc does not match"
+                )
+        if max(completion_offsets) - min(completion_offsets) > lateness_ms:
+            raise ValueError(f"dynamic-loss event {index} endpoint skew is too large")
+
+
+def validate_bulk_interactive_probe_route(
+    row: Mapping[str, Any], metadata: Mapping[str, Any]
+) -> None:
+    """Bind one observed schedule to its proxy or direct probe topology."""
+
+    topology_mode = metadata.get("topology_mode")
+    if topology_mode == "proxy":
+        expected = (
+            "socks5",
+            "172.31.40.30:8080",
+            "172.31.40.30:10022",
+            "bulk-interactive",
+        )
+    elif topology_mode == "direct":
+        expected = (
+            "direct",
+            "172.31.15.30:8080",
+            "172.31.15.30:10022",
+            "raw-tcp",
+        )
+    else:
+        raise ValueError("bulk-interactive topology mode is invalid")
+    actual = (
+        row.get("mode"),
+        row.get("target"),
+        row.get("tcp_echo_target"),
+        row.get("protocol"),
+    )
+    if actual != expected:
+        raise ValueError("bulk-interactive probe route does not match its topology")
 
 _SAFE_RUN_OVERRIDE = re.compile(
     r"(?:MPTUNNEL_MAX_(?:FRAME_BYTES|PAYLOAD_BYTES|ACK_RANGES|PATHS|STREAMS|"
@@ -373,6 +604,16 @@ def write_run_manifest(
         raise ValueError("product source_commit does not match the host snapshot")
     if validated_product["source_tree_dirty"] != source["tree_dirty"]:
         raise ValueError("product source_tree_dirty does not match the host snapshot")
+    try:
+        bulk_interactive_dynamic_loss = json.loads(
+            env["BULK_INTERACTIVE_DYNAMIC_LOSS"]
+        )
+    except (KeyError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "BULK_INTERACTIVE_DYNAMIC_LOSS must be valid inline JSON"
+        ) from exc
+    if bulk_interactive_dynamic_loss != BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION:
+        raise ValueError("BULK_INTERACTIVE_DYNAMIC_LOSS does not match the lab contract")
 
     manifest = {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
@@ -389,6 +630,8 @@ def write_run_manifest(
                 env["UPLOAD_COMPLETION_TIMEOUT_SECONDS"]
             ),
             "bulk_connections": int(env["BULK_CONNECTIONS"]),
+            "bulk_streams": 1,
+            "bulk_interactive_dynamic_loss": bulk_interactive_dynamic_loss,
             "failover_after_seconds": float(env["FAILOVER_AFTER_SECONDS"]),
             "failover_profile": env["FAILOVER_PROFILE"],
             "failover_tx_trigger_bytes": int(env["FAILOVER_TX_TRIGGER_BYTES"]),

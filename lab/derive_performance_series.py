@@ -13,6 +13,12 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
+from result_enrichment import (
+    BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION,
+    validate_bulk_interactive_dynamic_loss_metadata,
+    validate_bulk_interactive_probe_route,
+)
+
 CASE_SERIES = (
     (
         "mpp_tcp",
@@ -109,6 +115,20 @@ def load_result_file(path):
     return records
 
 
+def _validate_dynamic_loss_trace(record, condition, case, path):
+    prefix = f"{path}:{case}"
+    metadata = record.get("bulk_interactive_dynamic_loss")
+    _require(
+        isinstance(metadata, dict) and metadata.get("condition") == condition,
+        f"{prefix} has a manifest-mismatched dynamic-loss trace",
+    )
+    try:
+        validate_bulk_interactive_dynamic_loss_metadata(metadata)
+        validate_bulk_interactive_probe_route(record, metadata)
+    except ValueError as exc:
+        raise DerivationError(f"{prefix} has an invalid dynamic-loss trace: {exc}") from exc
+
+
 def load_condition(path):
     manifest_path = Path(path).parent / "run-manifest.json"
     try:
@@ -129,20 +149,24 @@ def load_condition(path):
         and execution.get("isolate_containers_per_case") is True,
         f"{manifest_path} did not isolate cases and containers",
     )
+    dynamic_loss = workload.get("bulk_interactive_dynamic_loss")
+    _require(
+        dynamic_loss == BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION
+        and workload.get("bulk_streams") == 1,
+        f"{manifest_path} has an invalid dynamic-loss condition",
+    )
     return {
         "netem_mode": overrides.get("MPTUNNEL_LAB_NETEM_MODE"),
         "internet_seed": overrides.get("MPTUNNEL_LAB_INTERNET_SEED"),
         "include_outages": overrides.get("MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES"),
         "mpp_path_hints": overrides.get("MPTUNNEL_LAB_USE_PATH_HINTS"),
-        "hysteria_client_rate": overrides.get(
-            "MPTUNNEL_LAB_HYSTERIA_BALANCED_CLIENT_RATE"
-        ),
-        "hysteria_server_rate": overrides.get(
-            "MPTUNNEL_LAB_HYSTERIA_BALANCED_SERVER_RATE"
-        ),
-        "load_duration_s": workload.get("load_duration_seconds"),
+        "hysteria_client_rate": dynamic_loss["profile"]["rate"],
+        "hysteria_server_rate": dynamic_loss["profile"]["rate"],
+        "load_duration_s": dynamic_loss["duration_seconds"],
         "bulk_connections": workload.get("bulk_connections"),
+        "bulk_streams": workload.get("bulk_streams"),
         "object_mib": workload.get("object_mib"),
+        "bulk_interactive_dynamic_loss": dynamic_loss,
         "case_isolation": execution.get("isolate_cases"),
         "container_isolation": execution.get("isolate_containers_per_case"),
     }
@@ -220,6 +244,13 @@ def load_repetitions(repetition_paths):
             not missing,
             f"{repetition_id} omits required cases: {', '.join(sorted(missing))}",
         )
+        for case in sorted(records):
+            _validate_dynamic_loss_trace(
+                records[case],
+                conditions[0]["bulk_interactive_dynamic_loss"],
+                case,
+                record_sources[case],
+            )
         probe_conditions = [
             record_probe_condition(records[case]) for case in sorted(records)
         ]

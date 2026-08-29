@@ -76,7 +76,7 @@ bulk_interactive_probe_timeout_seconds=$((bulk_interactive_duration_seconds + 20
 bulk_interactive_rate="500mbit"
 bulk_interactive_delay="50ms"
 bulk_interactive_jitter="20ms"
-bulk_interactive_target_loss="3%"
+bulk_interactive_initial_loss="3%"
 bulk_interactive_transition_complete_lateness_ms=250
 bulk_interactive_transition_command_timeout_seconds=2
 bulk_interactive_dynamic_loss_json="$(
@@ -2664,12 +2664,13 @@ run_baseline_download_probe_case() {
 }
 
 apply_bulk_interactive_baseline_profile() {
+  local remote_service="$1"
   local service
-  for service in client server target; do
+  for service in client "$remote_service"; do
     MPTUNNEL_LAB_BALANCED_RATE="$bulk_interactive_rate" \
     MPTUNNEL_LAB_BALANCED_DELAY="$bulk_interactive_delay" \
     MPTUNNEL_LAB_BALANCED_JITTER="$bulk_interactive_jitter" \
-    MPTUNNEL_LAB_BALANCED_LOSS="$bulk_interactive_target_loss" \
+    MPTUNNEL_LAB_BALANCED_LOSS="$bulk_interactive_initial_loss" \
       exec_netem "$service" apply-balanced >/dev/null
   done
 }
@@ -2823,7 +2824,6 @@ bulk_interactive_dynamic_loss_metadata() {
   local client_monotonic_offset_json="${7:-null}"
   local topology_mode="$8"
   local role_service_mapping_json="$9"
-  local constant_service_loss_json="${10}"
   local trace_complete=false
   if [[ "$schedule_exit_code" == "0" ]] && \
      [[ "$host_time_namespace_id" =~ ^time:\[[0-9]+\]$ \
@@ -2834,7 +2834,7 @@ bulk_interactive_dynamic_loss_metadata() {
      (( schedule_completed_offset_ms >= bulk_interactive_duration_seconds * 1000 )); then
     trace_complete=true
   fi
-  printf '{"condition":%s,"probe_started_monotonic_ms":%s,"schedule_origin":"probe-started-file-clock-monotonic-ms","clock_name":"CLOCK_MONOTONIC","host_time_namespace_id":"%s","client_time_namespace_id":"%s","host_monotonic_offset":%s,"client_monotonic_offset":%s,"topology_mode":"%s","dynamic_role_to_service":%s,"constant_service_loss_percent":%s,"schedule_exit_code":%s,"schedule_completed_offset_ms":%s,"applied_event_count":%s,"events":[%s],"trace_complete":%s}\n' \
+  printf '{"condition":%s,"probe_started_monotonic_ms":%s,"schedule_origin":"probe-started-file-clock-monotonic-ms","clock_name":"CLOCK_MONOTONIC","host_time_namespace_id":"%s","client_time_namespace_id":"%s","host_monotonic_offset":%s,"client_monotonic_offset":%s,"topology_mode":"%s","dynamic_role_to_service":%s,"schedule_exit_code":%s,"schedule_completed_offset_ms":%s,"applied_event_count":%s,"events":[%s],"trace_complete":%s}\n' \
     "$bulk_interactive_dynamic_loss_json" \
     "$probe_started_monotonic_ms" \
     "$host_time_namespace_id" \
@@ -2843,7 +2843,6 @@ bulk_interactive_dynamic_loss_metadata() {
     "$client_monotonic_offset_json" \
     "$topology_mode" \
     "$role_service_mapping_json" \
-    "$constant_service_loss_json" \
     "$schedule_exit_code" \
     "$schedule_completed_offset_ms" \
     "$bulk_interactive_schedule_event_count" \
@@ -2878,7 +2877,7 @@ run_bulk_interactive_probe_case() {
   local host_monotonic_offset_json client_monotonic_offset_json
   local clock_preflight_error=""
   local probe_target_ip probe_route_arguments topology_mode
-  local role_service_mapping_json constant_service_loss_json
+  local role_service_mapping_json
   local -a probe_anchor=()
 
   case "$probe_mode:$remote_service" in
@@ -2887,14 +2886,12 @@ run_bulk_interactive_probe_case() {
       probe_route_arguments="--proxy 127.0.0.1:${proxy_port_arg}"
       topology_mode="proxy"
       role_service_mapping_json='{"client-egress":"client","remote-egress":"server"}'
-      constant_service_loss_json='{"target":3}'
       ;;
     direct:target)
       probe_target_ip="172.31.15.30"
       probe_route_arguments="--mode direct"
       topology_mode="direct"
       role_service_mapping_json='{"client-egress":"client","remote-egress":"target"}'
-      constant_service_loss_json='{}'
       ;;
     *)
       echo "unsupported bulk-interactive topology: $probe_mode/$remote_service" >&2
@@ -2904,7 +2901,7 @@ run_bulk_interactive_probe_case() {
 
   bulk_interactive_schedule_events_json=""
   bulk_interactive_schedule_event_count=0
-  apply_bulk_interactive_baseline_profile
+  apply_bulk_interactive_baseline_profile "$remote_service"
   mkdir -p "$(dirname "$probe_gate_file")"
   rm -f \
     "$probe_gate_file" "$probe_finished_file" \
@@ -2937,8 +2934,7 @@ run_bulk_interactive_probe_case() {
       "$host_time_namespace_id" "$client_time_namespace_id" \
       "${host_monotonic_offset_json:-null}" \
       "${client_monotonic_offset_json:-null}" \
-      "$topology_mode" "$role_service_mapping_json" \
-      "$constant_service_loss_json")"
+      "$topology_mode" "$role_service_mapping_json")"
     append_mixed_probe_result \
       "$case_name" 78 "" "" "$clock_preflight_error" \
       "$mptunnel_row" "$baseline_identity_json" "$dynamic_loss_metadata_json" \
@@ -2993,8 +2989,7 @@ run_bulk_interactive_probe_case() {
     "$host_time_namespace_id" "$client_time_namespace_id" \
     "${host_monotonic_offset_json:-null}" \
     "${client_monotonic_offset_json:-null}" \
-    "$topology_mode" "$role_service_mapping_json" \
-    "$constant_service_loss_json")"
+    "$topology_mode" "$role_service_mapping_json")"
   apply_netem "$default_netem_mode"
   append_mixed_probe_result \
     "$case_name" "$exit_code" "$output" "" "$probe_stderr" \

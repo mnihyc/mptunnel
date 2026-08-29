@@ -286,7 +286,6 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
                 "client-egress": "client",
                 "remote-egress": "server",
             },
-            "constant_service_loss_percent": {"target": 3},
             "schedule_exit_code": 0,
             "schedule_completed_offset_ms": condition["duration_seconds"] * 1000,
             "applied_event_count": len(events),
@@ -797,6 +796,49 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not complete on time"):
             validate_bulk_interactive_dynamic_loss_metadata(late)
 
+    def test_dynamic_loss_condition_declares_only_route_matched_impairments(self):
+        condition = self.dynamic_loss_condition()
+        proxy_target = self.valid_raw_record()["target"].rsplit(":", 1)[0]
+        balanced_target = condition["service_addresses"]["target"].split("/", 1)[0]
+
+        self.assertEqual(condition["schema_version"], 4)
+        self.assertEqual(condition["condition_id"], "balanced-dynamic-loss-8x5-v4")
+        self.assertEqual(proxy_target, "172.31.40.30")
+        self.assertEqual(balanced_target, "172.31.15.30")
+        self.assertNotEqual(proxy_target, balanced_target)
+        self.assertEqual(
+            condition["series_topology"]["proxy"]["dynamic_role_to_service"],
+            {"client-egress": "client", "remote-egress": "server"},
+        )
+        self.assertEqual(
+            condition["series_topology"]["direct"]["dynamic_role_to_service"],
+            {"client-egress": "client", "remote-egress": "target"},
+        )
+        self.assertEqual(
+            condition["series_topology"]["proxy"]["probe"],
+            {
+                "mode": "socks5",
+                "target": "172.31.40.30:8080",
+                "tcp_echo_target": "172.31.40.30:10022",
+                "protocol": "bulk-interactive",
+            },
+        )
+        self.assertEqual(
+            condition["series_topology"]["direct"]["probe"],
+            {
+                "mode": "direct",
+                "target": "172.31.15.30:8080",
+                "tcp_echo_target": "172.31.15.30:10022",
+                "protocol": "raw-tcp",
+            },
+        )
+        self.assertNotIn("constant_service_loss_percent", json.dumps(condition))
+
+        legacy_claim = self.dynamic_loss_trace(condition)
+        legacy_claim["constant_service_loss_percent"] = {"target": 3}
+        with self.assertRaisesRegex(ValueError, "off-contract impairment"):
+            validate_bulk_interactive_dynamic_loss_metadata(legacy_claim)
+
     def test_raw_tcp_trace_requires_its_direct_route_and_target_role(self):
         condition = self.dynamic_loss_condition()
         metadata = self.dynamic_loss_trace(condition)
@@ -805,7 +847,6 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             "client-egress": "client",
             "remote-egress": "target",
         }
-        metadata["constant_service_loss_percent"] = {}
         for event, loss in zip(metadata["events"], condition["loss_percent"]):
             endpoint = event["endpoints"]["remote-egress"]
             endpoint["service"] = "target"

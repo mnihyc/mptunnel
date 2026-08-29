@@ -30,8 +30,8 @@ MPTUNNEL_CARRIER_PRESENTATIONS = frozenset(
     MPTUNNEL_CARRIER_PRESENTATION_BY_PROFILE.values()
 )
 BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION = {
-    "schema_version": 3,
-    "condition_id": "balanced-dynamic-loss-8x5-v3",
+    "schema_version": 4,
+    "condition_id": "balanced-dynamic-loss-8x5-v4",
     "application_scope": "protocol-neutral-balanced-egress",
     "profile": {"rate": "500mbit", "delay": "50ms", "jitter": "20ms"},
     "epoch_seconds": 5,
@@ -46,18 +46,28 @@ BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION = {
     },
     "series_topology": {
         "proxy": {
+            "probe": {
+                "mode": "socks5",
+                "target": "172.31.40.30:8080",
+                "tcp_echo_target": "172.31.40.30:10022",
+                "protocol": "bulk-interactive",
+            },
             "dynamic_role_to_service": {
                 "client-egress": "client",
                 "remote-egress": "server",
             },
-            "constant_service_loss_percent": {"target": 3},
         },
         "direct": {
+            "probe": {
+                "mode": "direct",
+                "target": "172.31.15.30:8080",
+                "tcp_echo_target": "172.31.15.30:10022",
+                "protocol": "raw-tcp",
+            },
             "dynamic_role_to_service": {
                 "client-egress": "client",
                 "remote-egress": "target",
             },
-            "constant_service_loss_percent": {},
         },
     },
     "transition_model": "probe-start-anchored-observed-qdisc-change",
@@ -100,12 +110,12 @@ def validate_bulk_interactive_dynamic_loss_metadata(metadata: Any) -> None:
         raise ValueError("dynamic-loss condition does not match the lab contract")
     topology_mode = metadata.get("topology_mode")
     expected_topology = condition["series_topology"].get(topology_mode)
+    if "constant_service_loss_percent" in metadata:
+        raise ValueError("dynamic-loss metadata declares an off-contract impairment")
     if (
         expected_topology is None
         or metadata.get("dynamic_role_to_service")
         != expected_topology["dynamic_role_to_service"]
-        or metadata.get("constant_service_loss_percent")
-        != expected_topology["constant_service_loss_percent"]
     ):
         raise ValueError("dynamic-loss role-to-service mapping is invalid")
     host_namespace = metadata.get("host_time_namespace_id")
@@ -233,23 +243,15 @@ def validate_bulk_interactive_probe_route(
 ) -> None:
     """Bind one observed schedule to its proxy or direct probe topology."""
 
-    topology_mode = metadata.get("topology_mode")
-    if topology_mode == "proxy":
-        expected = (
-            "socks5",
-            "172.31.40.30:8080",
-            "172.31.40.30:10022",
-            "bulk-interactive",
-        )
-    elif topology_mode == "direct":
-        expected = (
-            "direct",
-            "172.31.15.30:8080",
-            "172.31.15.30:10022",
-            "raw-tcp",
-        )
-    else:
+    topology = BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION["series_topology"].get(
+        metadata.get("topology_mode")
+    )
+    if topology is None:
         raise ValueError("bulk-interactive topology mode is invalid")
+    probe = topology["probe"]
+    expected = tuple(
+        probe[field] for field in ("mode", "target", "tcp_echo_target", "protocol")
+    )
     actual = (
         row.get("mode"),
         row.get("target"),
@@ -258,6 +260,7 @@ def validate_bulk_interactive_probe_route(
     )
     if actual != expected:
         raise ValueError("bulk-interactive probe route does not match its topology")
+
 
 _SAFE_RUN_OVERRIDE = re.compile(
     r"(?:MPTUNNEL_MAX_(?:FRAME_BYTES|PAYLOAD_BYTES|ACK_RANGES|PATHS|STREAMS|"

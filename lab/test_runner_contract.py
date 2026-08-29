@@ -368,7 +368,7 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('bulk_interactive_rate="500mbit"', SCRIPT)
         self.assertIn('bulk_interactive_delay="50ms"', SCRIPT)
         self.assertIn('bulk_interactive_jitter="20ms"', SCRIPT)
-        self.assertIn('bulk_interactive_target_loss="3%"', SCRIPT)
+        self.assertIn('bulk_interactive_initial_loss="3%"', SCRIPT)
         self.assertIn("bulk_interactive_transition_complete_lateness_ms=250", SCRIPT)
         self.assertIn("bulk_interactive_transition_command_timeout_seconds=2", SCRIPT)
         schedule = SCRIPT.split(
@@ -462,6 +462,22 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('address=%s\\n%s\\n', observed)
         self.assertIn("base64 -w0", observed)
         self.assertIn("change-balanced-observed)", NETEM)
+
+    def test_bulk_interactive_profile_and_metadata_match_the_probe_route(self):
+        baseline_profile = SCRIPT.split(
+            "apply_bulk_interactive_baseline_profile() {", 1
+        )[1].split("\n}\n\nwait_for_bulk_interactive_deadline()", 1)[0]
+        probe = SCRIPT.split("run_bulk_interactive_probe_case() {", 1)[1].split(
+            "\n}\n\nrun_raw_tcp_bulk_interactive_case()", 1
+        )[0]
+
+        self.assertIn('local remote_service="$1"', baseline_profile)
+        self.assertIn('for service in client "$remote_service"; do', baseline_profile)
+        self.assertNotIn("client server target", baseline_profile)
+        self.assertIn('apply_bulk_interactive_baseline_profile "$remote_service"', probe)
+        self.assertIn('probe_target_ip="172.31.40.30"', probe)
+        self.assertIn('probe_target_ip="172.31.15.30"', probe)
+        self.assertNotIn("constant_service_loss", probe)
 
     def test_bulk_interactive_wait_rechecks_early_probe_completion(self):
         wait = SCRIPT.split("wait_for_bulk_interactive_deadline() {", 1)[1].split(

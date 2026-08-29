@@ -77,7 +77,6 @@ def direct_trace():
         "client-egress": "client",
         "remote-egress": "target",
     }
-    metadata["constant_service_loss_percent"] = {}
     for event, loss in zip(metadata["events"], condition["loss_percent"]):
         endpoint = event["endpoints"]["remote-egress"]
         endpoint["service"] = "target"

@@ -973,6 +973,22 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
+    pub(in crate::runtime) fn age_original_flights_for_test(&self, age: Duration) {
+        let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        let mut flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        for path_flights in flights.values_mut() {
+            for flight in path_flights {
+                if flight.kind == CarrierWorkKind::OriginalData {
+                    flight.sent_at = sent_at;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn record_product_flight(
         &self,
         key: CarrierPathKey,

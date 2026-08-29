@@ -883,7 +883,7 @@ fn spawn_client_udp_path_metrics(
                 metrics,
                 poll_elapsed,
             );
-            let _ = runtime.state.mutate_path_eligibility(
+            let _ = runtime.state.mutate_path_model(
                 crate::model::path::RelayPathKey {
                     underlay: crate::protocol::UnderlayProtocol::Udp,
                     index: runtime.path_index,

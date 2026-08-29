@@ -27,11 +27,17 @@ use crate::protocol::{DatagramFlowId, PathId, PathUsage, StreamId, UnderlayProto
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::TrafficClass;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
+
+pub(in crate::runtime) type ArmedClientPathModelPublication =
+    Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub(in crate::runtime) struct ClientTcpCarrierPublication {
     pub(in crate::runtime) path_index: usize,
@@ -57,6 +63,12 @@ pub(in crate::runtime) struct ClientPathState {
     next_reliable_stream_id: Mutex<u64>,
     next_datagram_flow_id: Mutex<u64>,
     request_tcp_capacity_probe: RequestTcpCapacityProbeSession,
+    // Measurement and eligibility publication is separate from transient
+    // Product load mutation. A blocked ACK-gap owner needs the former to make
+    // a newly measured alternate selectable, while the latter would create a
+    // self-wake loop during ordinary queue/in-flight accounting.
+    path_model_generation: AtomicU64,
+    path_model_publication: Arc<Notify>,
 }
 
 impl ClientPathState {
@@ -70,6 +82,8 @@ impl ClientPathState {
             next_reliable_stream_id: Mutex::new(0),
             next_datagram_flow_id: Mutex::new(0),
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
+            path_model_generation: AtomicU64::new(0),
+            path_model_publication: Arc::new(Notify::new()),
         })
     }
 
@@ -95,6 +109,39 @@ impl ClientPathState {
         let record = health.path_record_mut(key)?;
         let result = mutation(record);
         Some(result)
+    }
+
+    /// Publishes a measurement/eligibility mutation after releasing the
+    /// coherent health lock. Transient Product load accounting deliberately
+    /// continues to use `mutate_path_eligibility` directly.
+    pub(in crate::runtime) fn mutate_path_model<R>(
+        &self,
+        key: RelayPathKey,
+        mutation: impl FnOnce(&mut ClientPathHealthRecord) -> R,
+    ) -> Option<R> {
+        let result = self.mutate_path_eligibility(key, mutation)?;
+        self.path_model_generation.fetch_add(1, Ordering::Release);
+        self.path_model_publication.notify_waiters();
+        Some(result)
+    }
+
+    pub(in crate::runtime) fn path_model_generation(&self) -> u64 {
+        self.path_model_generation.load(Ordering::Acquire)
+    }
+
+    /// Arms the notification before re-reading the generation. This covers
+    /// both publication-before-arm and publication-after-arm without polling.
+    pub(in crate::runtime) fn arm_path_model_publication(
+        &self,
+        observed_generation: u64,
+    ) -> ArmedClientPathModelPublication {
+        let mut publication = Box::pin(self.path_model_publication.clone().notified_owned());
+        publication.as_mut().enable();
+        if self.path_model_generation() != observed_generation {
+            Box::pin(std::future::ready(()))
+        } else {
+            Box::pin(async move { publication.await })
+        }
     }
 
     pub(in crate::runtime) fn tcp_path_observation_for_instance(
@@ -247,7 +294,7 @@ impl ClientPathState {
             publish_readiness();
         }
         if let Some(readiness_rtt) = publication.readiness_rtt {
-            let _ = self.mutate_path_eligibility(
+            let _ = self.mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Tcp,
                     index: publication.path_index,
@@ -293,7 +340,7 @@ impl ClientPathState {
             publish_readiness();
         }
         if let Some(readiness_rtt) = publication.readiness_rtt {
-            let _ = self.mutate_path_eligibility(
+            let _ = self.mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Tcp,
                     index: publication.path_index,
@@ -349,7 +396,7 @@ impl ClientPathState {
         sequence: u64,
         usage: PathUsage,
     ) -> bool {
-        self.mutate_path_eligibility(RelayPathKey { underlay, index }, |record| {
+        self.mutate_path_model(RelayPathKey { underlay, index }, |record| {
             record.update_peer_usage(path_instance_id, sequence, usage)
         })
         .unwrap_or(false)
@@ -679,6 +726,17 @@ impl ClientPathContext {
         self.state.health()
     }
 
+    pub(in crate::runtime) fn path_model_generation(&self) -> u64 {
+        self.state.path_model_generation()
+    }
+
+    pub(in crate::runtime) fn arm_path_model_publication(
+        &self,
+        observed_generation: u64,
+    ) -> ArmedClientPathModelPublication {
+        self.state.arm_path_model_publication(observed_generation)
+    }
+
     pub(in crate::runtime) fn session_retirement(&self) -> ClientSessionRetirement {
         self.state.session_retirement()
     }
@@ -933,7 +991,7 @@ impl ClientPathContext {
     ) -> bool {
         self.commit_if_session_active(|| {
             self.state
-                .mutate_path_eligibility(
+                .mutate_path_model(
                     RelayPathKey {
                         underlay: UnderlayProtocol::Tcp,
                         index,
@@ -1003,7 +1061,7 @@ impl ClientPathContext {
         }
         self.commit_if_session_active(|| {
             self.state
-                .mutate_path_eligibility(
+                .mutate_path_model(
                     RelayPathKey {
                         underlay: UnderlayProtocol::Udp,
                         index,
@@ -1085,7 +1143,7 @@ impl ClientPathContext {
         instance: RelayPathInstance,
         sample: PathRateSample,
     ) {
-        let _ = self.state.mutate_path_eligibility(instance.key, |current| {
+        let _ = self.state.mutate_path_model(instance.key, |current| {
             current.mark_product_delivery_for_instance(instance.path_instance_id, sample);
         });
     }
@@ -1096,14 +1154,9 @@ impl ClientPathContext {
         key: RelayPathKey,
         sample: PathRateSample,
     ) {
-        let mut health = self.state.health.lock().expect("client path health lock");
-        let records = match key.underlay {
-            UnderlayProtocol::Tcp => &mut health.tcp,
-            UnderlayProtocol::Udp => &mut health.udp,
-        };
-        if let Some(current) = records.get_mut(key.index) {
-            current.mark_product_delivery(sample);
-        }
+        let _ = self
+            .state
+            .mutate_path_model(key, |current| current.mark_product_delivery(sample));
     }
 
     pub(in crate::runtime) fn mark_relay_path_ack_clock_rate_sample(
@@ -1112,7 +1165,7 @@ impl ClientPathContext {
         sample: PathRateSample,
         replace_startup_rate: bool,
     ) {
-        let _ = self.state.mutate_path_eligibility(instance.key, |current| {
+        let _ = self.state.mutate_path_model(instance.key, |current| {
             if replace_startup_rate {
                 current.mark_product_delivery_replacing_rate_for_instance(
                     instance.path_instance_id,
@@ -1180,7 +1233,7 @@ impl ClientPathContext {
         elapsed: Duration,
     ) -> bool {
         self.state
-            .mutate_path_eligibility(
+            .mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Udp,
                     index,
@@ -1195,7 +1248,7 @@ impl ClientPathContext {
     #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_path_open_success(&self, index: usize, elapsed: Duration) {
         let _ = self.commit_if_session_active(|| {
-            let _ = self.state.mutate_path_eligibility(
+            let _ = self.state.mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Udp,
                     index,
@@ -1212,7 +1265,7 @@ impl ClientPathContext {
         elapsed: Duration,
     ) -> bool {
         self.state
-            .mutate_path_eligibility(
+            .mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Udp,
                     index,
@@ -1225,7 +1278,7 @@ impl ClientPathContext {
     #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_path_probe_success(&self, index: usize, elapsed: Duration) {
         let _ = self.commit_if_session_active(|| {
-            let _ = self.state.mutate_path_eligibility(
+            let _ = self.state.mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Udp,
                     index,
@@ -1243,7 +1296,7 @@ impl ClientPathContext {
     ) -> Option<Option<CarrierPathInstanceId>> {
         let now = Instant::now();
         self.state
-            .mutate_path_eligibility(
+            .mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Udp,
                     index,
@@ -1281,7 +1334,7 @@ impl ClientPathContext {
         let Some(sample) = stats.rate_sample() else {
             return;
         };
-        let _ = self.state.mutate_path_eligibility(
+        let _ = self.state.mutate_path_model(
             RelayPathKey {
                 underlay: UnderlayProtocol::Udp,
                 index,
@@ -1297,7 +1350,7 @@ impl ClientPathContext {
         observation: UdpDatagramPathObservation,
     ) -> bool {
         self.state
-            .mutate_path_eligibility(
+            .mutate_path_model(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Udp,
                     index,
@@ -1315,7 +1368,7 @@ impl ClientPathContext {
         index: usize,
         observation: UdpDatagramPathObservation,
     ) {
-        let _ = self.state.mutate_path_eligibility(
+        let _ = self.state.mutate_path_model(
             RelayPathKey {
                 underlay: UnderlayProtocol::Udp,
                 index,

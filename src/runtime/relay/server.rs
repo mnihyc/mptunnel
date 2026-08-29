@@ -33,7 +33,7 @@ use crate::model::capacity::{
     reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::{
-    reliable_data_ack_gap_reinjection_deadline, reliable_data_ack_recovery_deadline,
+    reliable_data_ack_gap_timing, reliable_data_ack_recovery_deadline,
     reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
     sender_service_retry_delay,
 };
@@ -963,17 +963,47 @@ fn prefix_reinjection_frames_with_unknown_owner_output(
     (accepted, None)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
 struct ServerDataAckReinjectionOutcome {
+    /// Epoch sampled after the current target snapshot and completion score.
+    /// The caller reuses it when deciding whether the resulting timer is due.
+    observed_at: Instant,
     frame_count: usize,
     queued: usize,
     persistent_ready: bool,
     has_multipath_alternative: bool,
+    has_measured_target: bool,
     base_limit: usize,
     service_limit: usize,
     tail_recovery_candidate: Option<ResponseDataAckRecoveryCandidate>,
     tail_recovery_deadline: Option<Instant>,
+}
+
+fn server_ack_gap_capacity_wait_arm_active(
+    authoritative_gap: bool,
+    has_multipath_alternative: bool,
+) -> bool {
+    authoritative_gap && has_multipath_alternative
+}
+
+fn server_ack_gap_missing_target_wait_active(
+    authoritative_gap: bool,
+    has_multipath_alternative: bool,
+    has_measured_target: bool,
+) -> bool {
+    authoritative_gap && has_multipath_alternative && !has_measured_target
+}
+
+fn server_ack_gap_timer_deadline(
+    deadline: Option<Instant>,
+    observed_at: Instant,
+) -> Option<tokio::time::Instant> {
+    // Evaluation owns this epoch. Sampling the clock again here can cross a
+    // not-yet-due deadline after evaluation and discard its only wakeup.
+    deadline
+        .filter(|deadline| *deadline > observed_at)
+        .map(tokio::time::Instant::from_std)
 }
 
 /// Evaluates the retained response Data ACK state as one recovery lifecycle.
@@ -1019,6 +1049,10 @@ fn evaluate_server_data_ack_reinjection(
             )
         })
         .flatten();
+    // Completion starts from the current target observation, not from a
+    // caller epoch sampled before target selection and lock acquisition.
+    let observed_at = Instant::now();
+    let has_measured_target = target.is_some();
 
     // Silence and a later ACK are distinct RFC authorities. The tail timer
     // retains the original owner's RTO/PTO fallback, while this lifecycle uses
@@ -1029,32 +1063,35 @@ fn evaluate_server_data_ack_reinjection(
         original_path_snapshot,
         target.map(|target| target.completion),
     );
-    let candidate_gap_deadline = reliable_data_ack_gap_reinjection_deadline(
+    let observed_gap_timing = reliable_data_ack_gap_timing(
         original_flight.map(|candidate| candidate.sent_at),
         original_underlay,
         original_path_snapshot,
-        target.map(|target| target.completion),
     );
-    let gap_deadline = progress.arm_recovery_deadline(
+    let candidate_gap_deadline = progress.observe_recovery_timing(
         complete,
         ranges,
         has_multipath_alternative,
-        candidate_gap_deadline,
+        observed_gap_timing,
+        target.map(|target| target.completion),
+        observed_at,
     );
-    let observed_at = Instant::now();
-    let measured_ready = candidate_gap_deadline.is_some()
-        && gap_deadline.is_some_and(|deadline| observed_at >= deadline);
+    let measured_ready = candidate_gap_deadline.is_some_and(|deadline| observed_at >= deadline);
     let persistent_ready =
         progress.reinjection_ready(complete, ranges, has_multipath_alternative, measured_ready)
             && target.is_some();
     let Some(target) = target.filter(|_| persistent_ready) else {
         return ServerDataAckReinjectionOutcome {
+            observed_at,
+            frame_count: 0,
+            queued: 0,
             persistent_ready,
             has_multipath_alternative,
+            has_measured_target,
             base_limit,
+            service_limit: 0,
             tail_recovery_candidate: original_flight,
             tail_recovery_deadline: recovery_deadline,
-            ..ServerDataAckReinjectionOutcome::default()
         };
     };
 
@@ -1122,10 +1159,12 @@ fn evaluate_server_data_ack_reinjection(
         );
     }
     ServerDataAckReinjectionOutcome {
+        observed_at,
         frame_count,
         queued,
         persistent_ready,
         has_multipath_alternative,
+        has_measured_target,
         base_limit,
         service_limit,
         tail_recovery_candidate: original_flight,
@@ -1876,12 +1915,22 @@ where
             }
         }
         let max_data_publication_pending = path_stream.has_pending_max_data_publication();
-        let mut response_state_capacity_notifies =
-            if response_recovery_due || response_recovery_capacity_blocked {
-                path_stream.response_recovery_capacity_notifies()
-            } else {
-                Vec::new()
-            };
+        let authoritative_data_ack_gap = stream_ack_ranges_expose_authoritative_gap(
+            last_send_ack.complete(),
+            last_send_ack.ranges(),
+        );
+        let ack_gap_capacity_wait_arm_active = server_ack_gap_capacity_wait_arm_active(
+            authoritative_data_ack_gap,
+            path_stream.has_multipath_reinjection_alternative(),
+        );
+        let mut response_state_capacity_notifies = if response_recovery_due
+            || response_recovery_capacity_blocked
+            || ack_gap_capacity_wait_arm_active
+        {
+            path_stream.response_recovery_capacity_notifies()
+        } else {
+            Vec::new()
+        };
         if max_data_publication_pending {
             for notify in path_stream.pending_max_data_capacity_notifies() {
                 if !response_state_capacity_notifies
@@ -1929,12 +1978,19 @@ where
             mux_limits,
             stream_id,
         );
+        let ack_gap_observed_at = ack_gap_recovery.observed_at;
         if ack_gap_recovery.queued > 0 {
             response_sender_retry_at = None;
         }
+        let ack_gap_missing_target_wait_active = server_ack_gap_missing_target_wait_active(
+            authoritative_data_ack_gap,
+            ack_gap_recovery.has_multipath_alternative,
+            ack_gap_recovery.has_measured_target,
+        );
         let max_data_publication_blocked = path_stream.has_pending_max_data_publication();
-        let response_state_capacity_blocked =
-            response_recovery_capacity_blocked || max_data_publication_blocked;
+        let response_state_capacity_blocked = response_recovery_capacity_blocked
+            || max_data_publication_blocked
+            || ack_gap_missing_target_wait_active;
         let has_request_ack_capacity_wait = request_ack_capacity_wait.is_some();
         let response_path_recovery_deadline = response_path_staleness
             .next_deadline()
@@ -2006,9 +2062,9 @@ where
                 last_send_ack.ranges(),
             ))
         .then(|| ack_gap_reinjection.next_reinjection_deadline())
-        .flatten()
-        .filter(|deadline| *deadline > Instant::now())
-        .map(tokio::time::Instant::from_std);
+        .flatten();
+        let ack_gap_reinjection_deadline =
+            server_ack_gap_timer_deadline(ack_gap_reinjection_deadline, ack_gap_observed_at);
         let tail_reinjection_deadline = ack_gap_reinjection_deadline
             .map_or(tail_timer_deadline, |deadline| {
                 deadline.min(tail_timer_deadline)
@@ -2861,6 +2917,9 @@ where
                 wait.await;
             }
         }, if response_state_capacity_blocked && has_response_state_capacity_wait => {
+            // ACK-gap target selection reads the bounded reinjection queues
+            // after this waiter is enabled. A release between a negative
+            // selection and this poll is therefore retained rather than lost.
             if response_recovery_capacity_blocked {
                 response_recovery_dirty = true;
             }

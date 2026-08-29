@@ -15,9 +15,7 @@ use super::lifecycle::RelayAdditionalPathOpenTask;
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::model::timing::{
-    reliable_data_ack_gap_reinjection_deadline, reliable_data_retransmission_interval,
-};
+use crate::model::timing::{reliable_data_ack_gap_timing, reliable_data_retransmission_interval};
 use crate::model::work::reliable_reinjection_service_limit_bytes;
 use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
 use crate::protocol::{OffsetRange, StreamId};
@@ -393,6 +391,7 @@ pub(super) struct ClientDataAckReinjectionOutcome {
     pub(super) frame_count: usize,
     pub(super) persistent_ready: bool,
     pub(super) has_multipath_alternative: bool,
+    pub(super) has_measured_target: bool,
 }
 
 /// Evaluates retained authoritative Data ACK evidence against the exact
@@ -418,11 +417,13 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         authoritative_ack_ranges,
     ) || !has_multipath_reinjection_alternative
     {
-        state.progress.ack_gap_reinjection.arm_recovery_deadline(
+        state.progress.ack_gap_reinjection.observe_recovery_timing(
             authoritative_ack_complete,
             authoritative_ack_ranges,
             has_multipath_reinjection_alternative,
             None,
+            None,
+            Instant::now(),
         );
         state.progress.data_ack_reinjection_at = None;
         return ClientDataAckReinjectionOutcome {
@@ -445,29 +446,31 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     let has_live_original_path = reinjection.has_live_original_path;
     let original_path_timing = reinjection.original_path_timing;
     let reinjection_target = reinjection.reinjection_target;
+    let has_measured_reinjection_target = reinjection_target.is_some();
     let ack_gap_original_underlay = original_path_timing
         .map(|snapshot| snapshot.underlay)
         .or(reinjection.original_underlay)
         .or(path_snapshot.map(|snapshot| snapshot.underlay));
     let observed_at = Instant::now();
-    let candidate_gap_deadline = has_live_original_path
+    let observed_gap_timing = has_live_original_path
         .then(|| {
-            reliable_data_ack_gap_reinjection_deadline(
+            reliable_data_ack_gap_timing(
                 reinjection.original_assignment_at,
                 ack_gap_original_underlay,
                 original_path_timing,
-                reinjection.reinjection_completion,
             )
         })
         .flatten();
-    let recovery_deadline = state.progress.ack_gap_reinjection.arm_recovery_deadline(
+    let candidate_gap_deadline = state.progress.ack_gap_reinjection.observe_recovery_timing(
         authoritative_ack_complete,
         authoritative_ack_ranges,
         has_multipath_reinjection_alternative,
-        candidate_gap_deadline,
+        observed_gap_timing,
+        reinjection.reinjection_completion,
+        observed_at,
     );
-    let measured_reinjection_ready = candidate_gap_deadline.is_some()
-        && recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
+    let measured_reinjection_ready =
+        candidate_gap_deadline.is_some_and(|deadline| observed_at >= deadline);
     let reinjection_retry_after = reinjection_target.map_or_else(
         || reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing),
         |(_, snapshot)| {
@@ -556,7 +559,11 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         authoritative_ack_complete,
         authoritative_ack_ranges,
     ) && has_multipath_reinjection_alternative
-        && recovery_deadline.is_some();
+        && state
+            .progress
+            .ack_gap_reinjection
+            .next_reinjection_deadline()
+            .is_some();
     let next_deadline = state
         .progress
         .ack_gap_reinjection
@@ -571,6 +578,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         frame_count,
         persistent_ready: persistent_ack_gap_reinjection_ready,
         has_multipath_alternative: has_multipath_reinjection_alternative,
+        has_measured_target: has_measured_reinjection_target,
     }
 }
 

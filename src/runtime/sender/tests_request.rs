@@ -391,6 +391,9 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         end: 8192,
     }];
 
+    // Match the relay actor's race-free ordering: generation precedes every
+    // model read that can conclude there is no measured alternate.
+    let path_model_generation_before_observation = context.path_model_generation();
     let observation = sender.data_ack_gap_reinjection_model(
         &context,
         &remotes,
@@ -412,7 +415,14 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         unproven_reinjection_path.is_none(),
         "proof-only membership may carry a bounded reinjection quantum but must not authorize a BDP-sized burst from configured hints"
     );
+    // Exercise the exact lost-wake interval: measurement is published after
+    // the negative model read but before the relay can arm its waiter.
     seed_client_bulk_evidence_for_test(&context, udp);
+    let path_model_publication =
+        context.arm_path_model_publication(path_model_generation_before_observation);
+    tokio::time::timeout(Duration::from_millis(50), path_model_publication)
+        .await
+        .expect("bulk evidence must wake a client blocked on an unmeasured ACK-gap alternate");
     let observation = sender.data_ack_gap_reinjection_model(
         &context,
         &remotes,

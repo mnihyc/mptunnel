@@ -37,6 +37,57 @@ fn tail_recovery_candidate(start: u64, sent_at: Instant) -> ReliableRelayTailRec
 }
 
 #[test]
+fn server_ack_gap_timer_uses_the_evaluation_epoch() {
+    let now = Instant::now();
+    let observed_at = now - Duration::from_millis(2);
+    let deadline = now - Duration::from_millis(1);
+
+    assert_eq!(
+        server_ack_gap_timer_deadline(Some(deadline), observed_at),
+        Some(tokio::time::Instant::from_std(deadline)),
+        "a deadline future at evaluation must remain armed even if it crosses during synchronous loop work",
+    );
+    assert_eq!(
+        server_ack_gap_timer_deadline(Some(deadline), deadline),
+        None,
+        "a deadline already due at evaluation belongs to the current evaluation rather than a new timer",
+    );
+}
+
+#[test]
+fn server_ack_gap_capacity_wait_is_limited_to_unready_multipath_gaps() {
+    assert!(server_ack_gap_capacity_wait_arm_active(true, true));
+    assert!(!server_ack_gap_capacity_wait_arm_active(false, true));
+    assert!(!server_ack_gap_capacity_wait_arm_active(true, false));
+
+    assert!(server_ack_gap_missing_target_wait_active(true, true, false));
+    assert!(!server_ack_gap_missing_target_wait_active(
+        false, true, false,
+    ));
+    assert!(!server_ack_gap_missing_target_wait_active(
+        true, false, false,
+    ));
+    assert!(!server_ack_gap_missing_target_wait_active(true, true, true));
+}
+
+#[tokio::test]
+async fn prearmed_server_ack_gap_capacity_wait_retains_release_before_select_poll() {
+    let capacity = Arc::new(tokio::sync::Notify::new());
+    let wait = arm_carrier_capacity_notifies(vec![capacity.clone()])
+        .expect("one server reinjection-capacity notification");
+
+    // This is the exact negative-selection race: the actor has already armed
+    // the carrier notification, target selection reports no current target,
+    // and the writer releases capacity before `select!` polls the waiter.
+    assert!(server_ack_gap_missing_target_wait_active(true, true, false));
+    capacity.notify_waiters();
+
+    tokio::time::timeout(Duration::from_millis(50), wait)
+        .await
+        .expect("a pre-armed server ACK-gap capacity release must not be lost");
+}
+
+#[test]
 fn server_completion_waits_for_every_live_ack_publication() {
     let mut publication = ServerAckPublicationState::default();
     publication.record_status(1, true, true);
@@ -285,6 +336,14 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
 }
 
 fn record_server_delivery_evidence(binding: &ResponseStreamBinding, key: CarrierPathKey) {
+    record_server_delivery_evidence_with_srtt(binding, key, 40_000);
+}
+
+fn record_server_delivery_evidence_with_srtt(
+    binding: &ResponseStreamBinding,
+    key: CarrierPathKey,
+    srtt_us: u32,
+) {
     binding.update_path_metrics(
         key,
         PathMetrics {
@@ -295,7 +354,7 @@ fn record_server_delivery_evidence(binding: &ResponseStreamBinding, key: Carrier
             metric_age_us: 0,
             rate_valid_for_us: 10_000_000,
             rate_observed: true,
-            srtt_us: 40_000,
+            srtt_us,
             rttvar_us: 5_000,
             jitter_us: 5_000,
             delivery_rate_bps: 100_000_000,
@@ -3413,7 +3472,7 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    record_server_delivery_evidence(&binding, reinjection_key);
+    record_server_delivery_evidence_with_srtt(&binding, reinjection_key, 100_000);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -3435,6 +3494,7 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
         .commit_prepared_data(&frame)
         .expect("commit sparse ACK-gap flight");
     binding.record_original_flight(original_key, &frame);
+    binding.age_original_flights_for_test(Duration::from_millis(150));
     let ack_ranges = [
         OffsetRange {
             start: 0,
@@ -3463,6 +3523,12 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
     let mut authoritative_ack = AuthoritativeStreamAckSnapshot::default();
     update_reinjection_authoritative_ack_snapshot(&mut authoritative_ack, &validated_ack);
     let modeled_path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
+    let owner_timing_path = PathSnapshot::new(
+        original_key.path_id,
+        original_key.underlay,
+        80.0,
+        400_000_000.0,
+    );
     let base_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         Some(modeled_path),
         TrafficClass::Throughput,
@@ -3484,12 +3550,31 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
         },
     );
     let mut progress = ReliableAckGapReinjectionProgress::default();
-    progress.arm_recovery_deadline(
-        true,
-        &ack_ranges,
-        true,
-        Some(Instant::now() - Duration::from_secs(1)),
+    let assignment_at = path_stream
+        .data_ack_recovery_candidate(quantum as u64)
+        .expect("exact original assignment")
+        .sent_at;
+    let stale_pre_selection_epoch = assignment_at + Duration::from_millis(100);
+    assert!(Instant::now() > stale_pre_selection_epoch);
+    let early = evaluate_server_data_ack_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &mut progress,
+        &authoritative_ack,
+        quantum as u64,
+        Some(owner_timing_path),
+        Some(modeled_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
     );
+    assert_eq!(
+        early.queued, 0,
+        "a caller epoch sampled before target selection must not authorize loss-boundary repair when the current observation can no longer finish before fallback",
+    );
+
+    binding.age_original_flights_for_test(Duration::from_secs(1));
     let outcome = evaluate_server_data_ack_reinjection(
         &mut response_sender,
         &path_stream,

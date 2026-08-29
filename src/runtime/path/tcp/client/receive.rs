@@ -102,7 +102,7 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
                     .path_proofs
                     .acknowledge(path_id, proof_id, payload_bytes)
             {
-                let _ = runtime.state.mutate_path_eligibility(
+                let _ = runtime.state.mutate_path_model(
                     crate::model::path::RelayPathKey {
                         underlay: crate::protocol::UnderlayProtocol::Tcp,
                         index: runtime.path_index,

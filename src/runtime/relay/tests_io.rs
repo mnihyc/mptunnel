@@ -1179,7 +1179,7 @@ fn ack_gap_reinjection_progress_resets_repeat_suppression_when_frontier_advances
 }
 
 #[test]
-fn ack_gap_recovery_timer_cannot_be_postponed_for_the_same_frontier() {
+fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
     let mut progress = ReliableAckGapReinjectionProgress::default();
     let first = [
         OffsetRange {
@@ -1202,27 +1202,84 @@ fn ack_gap_recovery_timer_cannot_be_postponed_for_the_same_frontier() {
         },
     ];
     let now = Instant::now();
-    let first_deadline = now + Duration::from_millis(100);
-    let later_deadline = now + Duration::from_millis(200);
+    let assignment_at = now;
+    let timing = crate::model::timing::ReliableDataAckGapTiming {
+        assignment_at,
+        loss_at: Some(now + Duration::from_millis(100)),
+        fallback_at: now + Duration::from_millis(200),
+    };
+    let later_observation = crate::model::timing::ReliableDataAckGapTiming {
+        assignment_at,
+        loss_at: Some(now + Duration::from_millis(150)),
+        fallback_at: now + Duration::from_millis(250),
+    };
 
     assert_eq!(
-        progress.arm_recovery_deadline(true, &first, true, Some(first_deadline)),
-        Some(first_deadline),
+        progress.observe_recovery_timing(
+            true,
+            &first,
+            true,
+            Some(timing),
+            Some(Duration::from_millis(50)),
+            now,
+        ),
+        timing.loss_at,
     );
     assert_eq!(
-        progress.arm_recovery_deadline(true, &first, true, Some(later_deadline)),
-        Some(first_deadline),
-        "metric refresh cannot postpone an armed loss timer",
+        progress.observe_recovery_timing(true, &first, false, None, None, now),
+        None,
+        "temporary absence of an alternate cannot authorize repair",
     );
     assert_eq!(
-        progress.arm_recovery_deadline(true, &first, true, None),
-        Some(first_deadline),
-        "a partial observation cannot disarm established loss evidence",
+        progress.next_reinjection_deadline(),
+        None,
+        "a departed target cannot leave its candidate wake armed",
     );
     assert_eq!(
-        progress.arm_recovery_deadline(true, &advanced, true, Some(later_deadline)),
-        Some(later_deadline),
-        "an advanced Data ACK frontier arms a new flight timer",
+        progress.observe_recovery_timing(
+            true,
+            &first,
+            true,
+            Some(later_observation),
+            Some(Duration::from_millis(50)),
+            now,
+        ),
+        timing.loss_at,
+        "a later observation or returning alternate cannot restart exact owner clocks",
+    );
+    assert_eq!(
+        progress.observe_recovery_timing(
+            true,
+            &first,
+            true,
+            Some(later_observation),
+            Some(Duration::from_millis(150)),
+            now,
+        ),
+        Some(timing.fallback_at),
+        "a slower replacement target must not inherit an earlier target's deadline",
+    );
+    assert_eq!(
+        progress.observe_recovery_timing(true, &first, true, Some(timing), None, now,),
+        None,
+        "without a current target there is no target-bound repair deadline",
+    );
+    let advanced_timing = crate::model::timing::ReliableDataAckGapTiming {
+        assignment_at: now + Duration::from_millis(10),
+        loss_at: Some(now + Duration::from_millis(110)),
+        fallback_at: now + Duration::from_millis(210),
+    };
+    assert_eq!(
+        progress.observe_recovery_timing(
+            true,
+            &advanced,
+            true,
+            Some(advanced_timing),
+            Some(Duration::from_millis(50)),
+            now,
+        ),
+        advanced_timing.loss_at,
+        "an advanced Data ACK frontier starts with its current candidate",
     );
 }
 

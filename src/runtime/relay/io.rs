@@ -1,5 +1,5 @@
 use crate::model::path::RelayPathInstance;
-use crate::model::timing::reliable_path_stale_interval;
+use crate::model::timing::{ReliableDataAckGapTiming, reliable_path_stale_interval};
 use crate::mux::stream::{
     ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
     validate_stream_ack,
@@ -215,7 +215,10 @@ pub(in crate::runtime) fn stream_final_offset_tail_reinjection_frames_normalized
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct ReliableAckGapReinjectionProgress {
     first_gap_start: Option<u64>,
-    recovery_deadline: Option<Instant>,
+    original_assignment_at: Option<Instant>,
+    loss_at: Option<Instant>,
+    fallback_at: Option<Instant>,
+    candidate_deadline: Option<Instant>,
     next_reinjection_at: Option<Instant>,
 }
 
@@ -343,27 +346,54 @@ impl<Candidate: Copy + Eq> ReliablePathStaleness<Candidate> {
 }
 
 impl ReliableAckGapReinjectionProgress {
-    pub(in crate::runtime) fn arm_recovery_deadline(
+    pub(in crate::runtime) fn observe_recovery_timing(
         &mut self,
         complete: bool,
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
-        candidate: Option<Instant>,
+        observed_timing: Option<ReliableDataAckGapTiming>,
+        alternate_completion: Option<Duration>,
+        observed_at: Instant,
     ) -> Option<Instant> {
         if !self.retain_gap_identity(
             complete,
             normalized_ranges,
             has_multipath_reinjection_alternative,
         ) {
+            self.candidate_deadline = None;
             return None;
         }
-        if let Some(candidate) = candidate {
-            self.recovery_deadline = Some(
-                self.recovery_deadline
-                    .map_or(candidate, |deadline| deadline.min(candidate)),
+        if let Some(observed_timing) = observed_timing {
+            if self.original_assignment_at != Some(observed_timing.assignment_at) {
+                self.original_assignment_at = Some(observed_timing.assignment_at);
+                self.loss_at = None;
+                self.fallback_at = None;
+                self.candidate_deadline = None;
+                self.next_reinjection_at = None;
+            }
+            if let Some(loss_at) = observed_timing.loss_at {
+                self.loss_at = Some(self.loss_at.map_or(loss_at, |current| current.min(loss_at)));
+            }
+            self.fallback_at = Some(
+                self.fallback_at
+                    .map_or(observed_timing.fallback_at, |current| {
+                        current.min(observed_timing.fallback_at)
+                    }),
             );
         }
-        self.recovery_deadline
+
+        // Owner clocks remain monotonic for the exact assignment, but target
+        // eligibility is current. A slower replacement must not inherit an
+        // early target's completion claim.
+        self.candidate_deadline = self.fallback_at.and_then(|fallback_at| {
+            ReliableDataAckGapTiming {
+                assignment_at: self.original_assignment_at?,
+                loss_at: self.loss_at,
+                fallback_at,
+            }
+            .target_deadline(alternate_completion, observed_at)
+        });
+        self.candidate_deadline
     }
 
     pub(in crate::runtime) fn reinjection_ready(
@@ -429,16 +459,19 @@ impl ReliableAckGapReinjectionProgress {
     }
 
     pub(in crate::runtime) fn next_reinjection_deadline(&self) -> Option<Instant> {
-        match (self.recovery_deadline, self.next_reinjection_at) {
-            (Some(recovery), Some(repeat)) => Some(recovery.max(repeat)),
-            (Some(recovery), None) => Some(recovery),
+        match (self.candidate_deadline, self.next_reinjection_at) {
+            (Some(candidate), Some(repeat)) => Some(candidate.max(repeat)),
+            (Some(candidate), None) => Some(candidate),
             (None, repeat) => repeat,
         }
     }
 
     fn clear(&mut self) {
         self.first_gap_start = None;
-        self.recovery_deadline = None;
+        self.original_assignment_at = None;
+        self.loss_at = None;
+        self.fallback_at = None;
+        self.candidate_deadline = None;
         self.next_reinjection_at = None;
     }
 
@@ -448,7 +481,7 @@ impl ReliableAckGapReinjectionProgress {
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
     ) -> bool {
-        if !complete || !has_multipath_reinjection_alternative {
+        if !complete {
             self.clear();
             return false;
         }
@@ -458,10 +491,13 @@ impl ReliableAckGapReinjectionProgress {
         };
         if self.first_gap_start != Some(first_gap.0) {
             self.first_gap_start = Some(first_gap.0);
-            self.recovery_deadline = None;
+            self.original_assignment_at = None;
+            self.loss_at = None;
+            self.fallback_at = None;
+            self.candidate_deadline = None;
             self.next_reinjection_at = None;
         }
-        true
+        has_multipath_reinjection_alternative
     }
 }
 

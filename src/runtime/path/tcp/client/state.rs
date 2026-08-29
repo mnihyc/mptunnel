@@ -223,7 +223,7 @@ impl ClientTcpPathSessionRuntime {
                 ),
             );
         }
-        let _ = self.state.mutate_path_eligibility(
+        let _ = self.state.mutate_path_model(
             crate::model::path::RelayPathKey {
                 underlay: crate::protocol::UnderlayProtocol::Tcp,
                 index: self.path_index,

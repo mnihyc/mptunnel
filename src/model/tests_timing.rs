@@ -20,44 +20,77 @@ fn data_ack_loss_delay_uses_rack_and_quic_time_thresholds() {
 }
 
 #[test]
-fn data_ack_gap_repair_requires_loss_age_and_a_faster_alternate() {
+fn data_ack_gap_repair_uses_absolute_completion_and_owner_fallback() {
     let mut tcp = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 80.0, 1.0);
     tcp.jitter_ms = 10.0;
-    let now = Instant::now();
-    let assignment_at = now
-        .checked_sub(Duration::from_millis(99))
-        .expect("test clock has sufficient history");
+    let assignment_at = Instant::now();
+    let loss_at = assignment_at + Duration::from_millis(100);
+    let recovery_at = assignment_at + Duration::from_millis(200);
 
     assert_eq!(
         reliable_data_ack_gap_reinjection_deadline(
             Some(assignment_at),
             Some(UnderlayProtocol::Tcp),
             Some(tcp),
-            Some(Duration::from_millis(150)),
+            Some(Duration::from_millis(50)),
+            assignment_at,
         ),
-        Some(assignment_at + Duration::from_millis(100)),
+        Some(loss_at),
+    );
+    assert_eq!(
+        reliable_data_ack_gap_reinjection_deadline(
+            Some(assignment_at),
+            Some(UnderlayProtocol::Tcp),
+            Some(tcp),
+            Some(Duration::from_millis(50)),
+            assignment_at + Duration::from_millis(175),
+        ),
+        Some(recovery_at),
+        "a current completion estimate starts at observation time, not assignment time",
     );
 
     assert!(!reliable_data_ack_gap_reinjection_ready(
         Some(assignment_at),
         Some(UnderlayProtocol::Tcp),
         Some(tcp),
-        Some(Duration::from_millis(150)),
-        now,
+        Some(Duration::from_millis(50)),
+        assignment_at + Duration::from_millis(99),
     ));
     assert!(reliable_data_ack_gap_reinjection_ready(
-        now.checked_sub(Duration::from_millis(100)),
+        Some(assignment_at),
+        Some(UnderlayProtocol::Tcp),
+        Some(tcp),
+        Some(Duration::from_millis(50)),
+        loss_at,
+    ));
+
+    // A 150 ms copy launched at the 100 ms loss threshold would finish at
+    // 250 ms, after the owner's 200 ms recovery boundary. Arm the exact owner
+    // fallback instead of comparing the two durations as if both started at
+    // assignment time.
+    assert_eq!(
+        reliable_data_ack_gap_reinjection_deadline(
+            Some(assignment_at),
+            Some(UnderlayProtocol::Tcp),
+            Some(tcp),
+            Some(Duration::from_millis(150)),
+            assignment_at,
+        ),
+        Some(recovery_at),
+    );
+    assert!(!reliable_data_ack_gap_reinjection_ready(
+        Some(assignment_at),
         Some(UnderlayProtocol::Tcp),
         Some(tcp),
         Some(Duration::from_millis(150)),
-        now,
+        loss_at,
     ));
-    assert!(!reliable_data_ack_gap_reinjection_ready(
-        now.checked_sub(Duration::from_millis(100)),
+    assert!(reliable_data_ack_gap_reinjection_ready(
+        Some(assignment_at),
         Some(UnderlayProtocol::Tcp),
         Some(tcp),
-        Some(Duration::from_millis(200)),
-        now,
+        Some(Duration::from_millis(500)),
+        recovery_at,
     ));
 }
 
@@ -83,7 +116,7 @@ fn data_ack_silence_waits_for_the_owner_recovery_interval() {
             Some(tcp),
             Some(Duration::from_millis(200)),
         ),
-        None,
+        Some(assigned_at + Duration::from_millis(200)),
     );
 }
 

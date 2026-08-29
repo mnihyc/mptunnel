@@ -4,7 +4,7 @@ use crate::model::path::CarrierPathKey;
 use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::sender::response::test_support::response_target;
-use crate::scheduler::PathState;
+use crate::scheduler::{PathRateScope, PathState};
 use bytes::Bytes;
 
 fn select(
@@ -435,6 +435,229 @@ fn additional_unproven_path_owns_at_most_one_startup_flight() {
     )
     .expect("durable Data ACK progress unlocks additional-path placement");
     assert_eq!(selected.observation.key, candidate.observation.key);
+}
+
+#[test]
+fn regression_product_raised_tcp_capacity_cannot_mint_marginal_additional_service() {
+    let mux_limits = MuxLimits::default();
+    let startup_flight = reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
+    let owner = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        80.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    let mut candidate = response_target(
+        1,
+        UnderlayProtocol::Tcp,
+        20.0,
+        startup_flight,
+        16 * 1024 * 1024,
+        false,
+    );
+    let native_rate_bps = 1_000_000.0;
+    let product_rate_bps = 500_000_000.0;
+    candidate.observation.snapshot.carrier_delivery_rate_bps = Some(native_rate_bps);
+    candidate.observation.snapshot.delivery_rate_bps = product_rate_bps;
+    candidate.observation.snapshot.product_progress_rate_bps = Some(product_rate_bps);
+    candidate.observation.snapshot.has_durable_product_progress = true;
+    candidate.observation.has_bulk_rate_evidence = true;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+    let ordering_debt = (64 * 1024) + startup_flight as usize;
+
+    let mut native_only = candidate.clone();
+    native_only.observation.snapshot.delivery_rate_bps = native_rate_bps;
+    native_only.observation.snapshot.product_progress_rate_bps = None;
+    let native_selection = select_response_data_path(
+        &[owner.clone(), native_only],
+        TrafficClass::Throughput,
+        64 * 1024,
+        mux_limits,
+        &lower,
+        ordering_debt,
+    )
+    .expect("the lower-frontier owner remains schedulable");
+    assert_eq!(
+        native_selection.observation.key, owner.observation.key,
+        "the candidate's qualified native TCP completion cannot beat the existing lower frontier",
+    );
+
+    let selected = select_response_data_path(
+        &[owner.clone(), candidate],
+        TrafficClass::Throughput,
+        64 * 1024,
+        mux_limits,
+        &lower,
+        ordering_debt,
+    )
+    .expect("the lower-frontier owner remains schedulable");
+    assert_eq!(
+        selected.observation.key, owner.observation.key,
+        "REGRESSION: a Product-raised TCP rate was treated as independent carrier capacity and minted marginal Additional-output service",
+    );
+}
+
+#[test]
+fn product_raised_rate_projection_is_scoped_to_tcp_bulk_additional_service() {
+    let mut raised = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
+    raised.rate_scope = PathRateScope::PathCapacity;
+    raised.carrier_delivery_rate_bps = Some(1_000_000.0);
+    raised.product_progress_rate_bps = Some(500_000_000.0);
+    raised.has_durable_product_progress = true;
+
+    assert_eq!(
+        response_bulk_completion_snapshot(raised, BulkCandidatePosition::AdditionalPath)
+            .delivery_rate_bps,
+        1_000_000.0,
+        "only the retained qualified native rate represents the Additional path's carrier-capacity projection",
+    );
+    for position in [
+        BulkCandidatePosition::FirstPath,
+        BulkCandidatePosition::ContiguousFrontier,
+    ] {
+        assert_eq!(
+            response_bulk_completion_snapshot(raised, position).delivery_rate_bps,
+            500_000_000.0,
+            "frontier service retains the demonstrated Product lower bound",
+        );
+    }
+
+    let mut product_only = raised;
+    product_only.carrier_delivery_rate_bps = None;
+    assert_eq!(
+        response_bulk_completion_snapshot(product_only, BulkCandidatePosition::AdditionalPath)
+            .delivery_rate_bps,
+        500_000_000.0,
+        "Product completion remains the portable fallback when native capacity is unavailable",
+    );
+
+    let mut native_dominates = raised;
+    native_dominates.delivery_rate_bps = 500_000_000.0;
+    native_dominates.carrier_delivery_rate_bps = Some(500_000_000.0);
+    native_dominates.product_progress_rate_bps = Some(1_000_000.0);
+    assert_eq!(
+        response_bulk_completion_snapshot(native_dominates, BulkCandidatePosition::AdditionalPath,)
+            .delivery_rate_bps,
+        500_000_000.0,
+        "qualified native capacity remains eligible for independent aggregation",
+    );
+
+    let mut quic = raised;
+    quic.underlay = UnderlayProtocol::Udp;
+    assert_eq!(
+        response_bulk_completion_snapshot(quic, BulkCandidatePosition::AdditionalPath)
+            .delivery_rate_bps,
+        500_000_000.0,
+        "the TCP-specific Product/native merge must not alter QUIC",
+    );
+}
+
+#[test]
+fn product_only_completion_fallback_remains_eligible_on_an_additional_tcp_path() {
+    let mux_limits = MuxLimits::default();
+    let startup_flight = reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
+    let owner = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        80.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    let mut candidate = response_target(
+        1,
+        UnderlayProtocol::Tcp,
+        20.0,
+        startup_flight,
+        16 * 1024 * 1024,
+        false,
+    );
+    candidate.observation.snapshot.carrier_delivery_rate_bps = None;
+    candidate.observation.snapshot.delivery_rate_bps = 500_000_000.0;
+    candidate.observation.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
+    candidate.observation.snapshot.product_progress_rate_bps = Some(500_000_000.0);
+    candidate.observation.snapshot.has_durable_product_progress = true;
+    candidate.observation.has_bulk_rate_evidence = true;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+
+    let selected = select_response_data_path(
+        &[owner, candidate.clone()],
+        TrafficClass::Throughput,
+        64 * 1024,
+        mux_limits,
+        &lower,
+        (64 * 1024) + startup_flight as usize,
+    )
+    .expect("the Product-only completion fallback remains schedulable");
+    assert_eq!(
+        selected.observation.key, candidate.observation.key,
+        "a missing native observation must not disable the RFC Product fallback",
+    );
+}
+
+#[test]
+fn product_raised_tcp_floor_remains_effective_for_the_contiguous_frontier() {
+    let mux_limits = MuxLimits::default();
+    let startup_flight = reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        20.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    owner.observation.snapshot.carrier_delivery_rate_bps = Some(1_000_000.0);
+    owner.observation.snapshot.delivery_rate_bps = 500_000_000.0;
+    owner.observation.snapshot.product_progress_rate_bps = Some(500_000_000.0);
+    let mut candidate = response_target(
+        1,
+        UnderlayProtocol::Tcp,
+        80.0,
+        startup_flight,
+        16 * 1024 * 1024,
+        false,
+    );
+    candidate.observation.snapshot.carrier_delivery_rate_bps = Some(100_000_000.0);
+    candidate.observation.snapshot.delivery_rate_bps = 100_000_000.0;
+    candidate.observation.snapshot.product_progress_rate_bps = None;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+    let ordering_debt = (64 * 1024) + startup_flight as usize;
+
+    let mut native_only_owner = owner.clone();
+    native_only_owner.observation.snapshot.delivery_rate_bps = 1_000_000.0;
+    native_only_owner
+        .observation
+        .snapshot
+        .product_progress_rate_bps = None;
+    assert_eq!(
+        select(
+            &[native_only_owner, candidate.clone()],
+            &lower,
+            ordering_debt,
+        ),
+        Some(candidate.observation.key),
+        "the faster candidate wins when the frontier has only its low native estimate",
+    );
+    assert_eq!(
+        select(&[owner.clone(), candidate], &lower, ordering_debt),
+        Some(owner.observation.key),
+        "the current frontier retains its demonstrated Product completion floor",
+    );
 }
 
 #[test]

@@ -2043,16 +2043,25 @@ These are MPP estimates. They do not read, reset, or replace a native TCP RTO
 or QUIC PTO.
 
 After a Data ACK transaction in either direction leaves a retained complete
-snapshot with an omitted range, it may authorize bounded repair on one
-measured alternate after the exact original flight exceeds the local MPP
-Data-ACK threshold:
+snapshot with an omitted range, define two absolute clocks from the exact
+original flight's assignment epoch: `loss_at` is that epoch plus the local MPP
+Data-ACK threshold, and `fallback_at` is that epoch plus the MPP recovery
+interval. The thresholds are:
 
 - `5/4 * SRTT` for TCP; or
 - `9/8 * SRTT` for QUIC;
 
-provided the alternative is estimated to complete before the MPP recovery
-interval. The repair may fill the alternate's available throughput-lane Product
-service window, bounded by exact omitted ranges and the configured repair and
+Before `fallback_at`, bounded repair on a currently measured alternate is
+authorized at `loss_at` only when a copy launched at
+`max(observation_at, loss_at)` is estimated to finish strictly before
+`fallback_at`. If the alternate cannot win that absolute comparison, the
+retained gap waits until `fallback_at`. At or after `fallback_at`, an eligible
+measured distinct alternate may perform bounded repair without a completion
+gain; expiration is liveness authority, not evidence that the alternate is
+faster or that native recovery failed.
+
+The repair may fill the alternate's available throughput-lane Product service
+window, bounded by exact omitted ranges and the configured repair and
 path-flight envelopes. Existing target flight and queued Product work consume
 that window. Queue and flight are summed within the Product and native carrier
 domains, while the overlapping domain totals are counted only once; one repair
@@ -2066,9 +2075,14 @@ multi-frame cumulative publication consists only of positive, incomplete
 frames and cannot establish an omission. Later incomplete updates may fill a
 gap already established below a retained complete snapshot's horizon, but
 cannot extend that horizon or create negative evidence. Both directions use
-the exact unique original flight's assignment epoch; without that ownership,
-a live measured distinct alternate, or an alternate that can beat the MPP
-recovery interval, ACK silence waits one MPP recovery interval.
+the exact unique original flight's assignment epoch. For the same exact gap
+and assignment, later owner observations may move `loss_at` or `fallback_at`
+earlier but MUST NOT restart either clock later. Alternate eligibility and
+completion are evaluated from the current target; a departed target's early
+completion claim MUST NOT be inherited by its replacement. Without exact
+ownership or a live measured distinct alternate no target-bound repair is
+sent; when an eligible alternate cannot win early, ACK silence waits until the
+one-interval `fallback_at` rather than erasing that fallback.
 
 When a persistent-gap reinjection attempt is accepted by a selected alternate,
 its repeat deadline is fixed from that alternate's observed MPP recovery

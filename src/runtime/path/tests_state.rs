@@ -47,6 +47,59 @@ fn udp_path_load_test_context() -> ClientPathContext {
     .expect("UDP load test context")
 }
 
+#[tokio::test]
+async fn path_model_publication_before_wait_arm_is_not_lost() {
+    let context = udp_path_load_test_context();
+    let observed_generation = context.path_model_generation();
+
+    context.mark_udp_path_open_success(0, Duration::from_millis(20));
+    let publication = context.arm_path_model_publication(observed_generation);
+
+    tokio::time::timeout(Duration::from_millis(50), publication)
+        .await
+        .expect("a generation change before arming must make the wait immediately ready");
+}
+
+#[tokio::test]
+async fn path_model_publication_after_wait_arm_is_not_lost() {
+    let context = udp_path_load_test_context();
+    let observed_generation = context.path_model_generation();
+    let publication = context.arm_path_model_publication(observed_generation);
+
+    context.mark_udp_path_open_success(0, Duration::from_millis(20));
+
+    tokio::time::timeout(Duration::from_millis(50), publication)
+        .await
+        .expect("an armed wait must observe a later path-model publication");
+}
+
+#[tokio::test]
+async fn transient_product_load_does_not_publish_path_model_change() {
+    let context = udp_path_load_test_context();
+    context.mark_udp_path_open_success(0, Duration::from_millis(20));
+    let observed_generation = context.path_model_generation();
+    let publication = context.arm_path_model_publication(observed_generation);
+
+    let lease = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("active UDP path load lease");
+    drop(lease);
+
+    assert_eq!(context.path_model_generation(), observed_generation);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), publication)
+            .await
+            .is_err(),
+        "queue/in-flight load accounting must not self-wake an ACK-gap path-model wait"
+    );
+}
+
 #[test]
 fn tcp_carrier_groups_publish_every_bounded_pool_member() {
     let primary_security = ClientSecurityConfig::for_test(

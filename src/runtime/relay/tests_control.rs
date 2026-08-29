@@ -11,6 +11,7 @@ use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
 use bytes::Bytes;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::sync::mpsc;
@@ -54,6 +55,39 @@ async fn wait_for_buffered_remote_frame(remotes: &ReliableRelayRemoteSet) {
     })
     .await
     .expect("relay frame-forwarder deadline");
+}
+
+#[test]
+fn client_ack_gap_path_model_wait_tracks_measured_and_unmeasured_alternates() {
+    assert!(
+        reliable_relay_client_ack_gap_path_model_wait_active(true, true,),
+        "the wait is deliberately independent of current target measurement: a target can appear, while a measured slow target can improve enough to pull fallback forward to the owner loss boundary"
+    );
+    assert!(!reliable_relay_client_ack_gap_path_model_wait_active(
+        false, true,
+    ));
+    assert!(!reliable_relay_client_ack_gap_path_model_wait_active(
+        true, false,
+    ));
+    assert!(reliable_relay_client_ack_gap_capacity_wait_arm_active(
+        true, true,
+    ));
+    assert!(!reliable_relay_client_ack_gap_capacity_wait_arm_active(
+        true, false,
+    ));
+}
+
+#[tokio::test]
+async fn prearmed_ack_gap_capacity_wait_retains_release_before_select_poll() {
+    let capacity = Arc::new(tokio::sync::Notify::new());
+    let wait = arm_carrier_capacity_notifies(vec![capacity.clone()])
+        .expect("one carrier capacity notification");
+
+    capacity.notify_waiters();
+
+    tokio::time::timeout(Duration::from_millis(50), wait)
+        .await
+        .expect("pre-armed capacity release must remain ready before the select poll");
 }
 
 #[tokio::test]

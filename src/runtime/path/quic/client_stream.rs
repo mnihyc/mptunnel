@@ -237,7 +237,7 @@ async fn handle_client_udp_stream_input(
             payload_bytes,
         } if proof_path_id == path_id => {
             if let Some(observation) = path_proofs.acknowledge(path_id, proof_id, payload_bytes) {
-                let _ = state.mutate_path_eligibility(
+                let _ = state.mutate_path_model(
                     crate::model::path::RelayPathKey {
                         underlay: crate::protocol::UnderlayProtocol::Udp,
                         index: path_index,

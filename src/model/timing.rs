@@ -9,11 +9,43 @@ use super::capacity::{
 };
 use crate::protocol::UnderlayProtocol;
 use crate::scheduler::PathSnapshot;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TCP_MIN_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(200);
 const TCP_INITIAL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const MPTCP_STALE_LOSS_COUNT: u32 = 4;
+
+/// Target-independent clocks for one exact original Product assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReliableDataAckGapTiming {
+    pub(crate) assignment_at: Instant,
+    pub(crate) loss_at: Option<Instant>,
+    pub(crate) fallback_at: Instant,
+}
+
+impl ReliableDataAckGapTiming {
+    /// Selects the next evaluation epoch for the currently measured target.
+    /// A target may race at the loss boundary only when a copy launched from
+    /// the current observation can finish before the owner fallback. Once the
+    /// fallback expires, completion gain is no longer a liveness condition.
+    pub(crate) fn target_deadline(
+        self,
+        alternate_completion: Option<Duration>,
+        observed_at: Instant,
+    ) -> Option<Instant> {
+        let alternate_completion = alternate_completion?;
+        if let Some(loss_at) = self.loss_at {
+            let launch_at = observed_at.max(loss_at);
+            let alternate_wins_before_fallback = launch_at
+                .checked_add(alternate_completion)
+                .is_some_and(|completion_at| completion_at < self.fallback_at);
+            if alternate_wins_before_fallback {
+                return Some(loss_at);
+            }
+        }
+        Some(self.fallback_at)
+    }
+}
 
 pub(crate) fn transport_pto_from_ms(srtt_ms: f64, rttvar_ms: f64) -> Duration {
     let srtt = Duration::from_secs_f64(srtt_ms.max(0.0) / 1000.0);
@@ -67,37 +99,57 @@ pub(crate) fn reliable_data_ack_loss_delay(
         .then(|| Duration::from_secs_f64(delay_ms / 1000.0))
 }
 
-/// An authoritative later Data ACK may start bounded repair only after the
-/// original flight is time-threshold lost and an alternate can beat recovery.
+/// Derives absolute owner clocks from the exact assignment epoch and latest
+/// observation. Runtime gap state may tighten these clocks, but never lets a
+/// later observation restart them for the same assignment.
+pub(crate) fn reliable_data_ack_gap_timing(
+    original_assignment_at: Option<std::time::Instant>,
+    underlay: Option<UnderlayProtocol>,
+    original_path: Option<PathSnapshot>,
+) -> Option<ReliableDataAckGapTiming> {
+    let original_assignment_at = original_assignment_at?;
+    let fallback_at = original_assignment_at.checked_add(reliable_data_retransmission_interval(
+        underlay,
+        original_path,
+    ))?;
+    let loss_at = reliable_data_ack_loss_delay(underlay, original_path)
+        .and_then(|loss_delay| original_assignment_at.checked_add(loss_delay));
+    Some(ReliableDataAckGapTiming {
+        assignment_at: original_assignment_at,
+        loss_at,
+        fallback_at,
+    })
+}
+
+/// An authoritative later Data ACK may start bounded repair at the owner's
+/// time-threshold loss boundary when the currently measured alternate can
+/// still finish before the owner's absolute recovery boundary. Otherwise that
+/// exact recovery boundary remains the bounded liveness fallback.
+#[cfg(test)]
 pub(crate) fn reliable_data_ack_gap_reinjection_deadline(
     original_assignment_at: Option<std::time::Instant>,
     underlay: Option<UnderlayProtocol>,
     original_path: Option<PathSnapshot>,
     alternate_completion: Option<Duration>,
+    observed_at: std::time::Instant,
 ) -> Option<std::time::Instant> {
-    let original_assignment_at = original_assignment_at?;
-    let loss_delay = reliable_data_ack_loss_delay(underlay, original_path)?;
-    let alternate_completion = alternate_completion?;
-    if alternate_completion >= reliable_data_retransmission_interval(underlay, original_path) {
-        return None;
-    }
-    original_assignment_at.checked_add(loss_delay)
+    reliable_data_ack_gap_timing(original_assignment_at, underlay, original_path)?
+        .target_deadline(alternate_completion, observed_at)
 }
 
 /// Without a later ACK, connection-level recovery waits for the owning
-/// carrier's RTO/PTO. Silence alone is not a RACK or QUIC loss declaration.
+/// carrier's RTO/PTO whenever an eligible alternate exists. The alternate's
+/// completion estimate decides whether it can win earlier; it cannot erase the
+/// exact owner fallback. Silence alone is not a RACK or QUIC loss declaration.
 pub(crate) fn reliable_data_ack_recovery_deadline(
     original_assignment_at: Option<std::time::Instant>,
     underlay: Option<UnderlayProtocol>,
     original_path: Option<PathSnapshot>,
     alternate_completion: Option<Duration>,
 ) -> Option<std::time::Instant> {
-    let original_assignment_at = original_assignment_at?;
-    let recovery_interval = reliable_data_retransmission_interval(underlay, original_path);
-    if alternate_completion? >= recovery_interval {
-        return None;
-    }
-    original_assignment_at.checked_add(recovery_interval)
+    alternate_completion?;
+    reliable_data_ack_gap_timing(original_assignment_at, underlay, original_path)
+        .map(|timing| timing.fallback_at)
 }
 
 #[cfg(test)]
@@ -113,6 +165,7 @@ pub(crate) fn reliable_data_ack_gap_reinjection_ready(
         underlay,
         original_path,
         alternate_completion,
+        now,
     )
     .is_some_and(|deadline| now >= deadline)
 }

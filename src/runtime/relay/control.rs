@@ -10,8 +10,8 @@ use super::flow::{
 use super::io::{
     ReadyStreamDataBatchBounds, ReadyStreamDataDirection, apply_and_write_ready_stream_data_batch,
     collect_ready_stream_data_batch, pending_stream_fin_ready, read_reliable_relay_payload,
-    receive_stream_fin, resize_reliable_relay_buffer, stream_data_range_already_delivered,
-    stream_terminal_fin_replay_required,
+    receive_stream_fin, resize_reliable_relay_buffer, stream_ack_ranges_expose_authoritative_gap,
+    stream_data_range_already_delivered, stream_terminal_fin_replay_required,
 };
 use super::lifecycle::{
     attach_reliable_relay_paths_with_recovery_exclusions, cancel_pending_additional_path_opens,
@@ -70,6 +70,20 @@ async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
+}
+
+fn reliable_relay_client_ack_gap_path_model_wait_active(
+    authoritative_gap: bool,
+    has_multipath_alternative: bool,
+) -> bool {
+    authoritative_gap && has_multipath_alternative
+}
+
+fn reliable_relay_client_ack_gap_capacity_wait_arm_active(
+    authoritative_gap: bool,
+    has_multipath_alternative: bool,
+) -> bool {
+    authoritative_gap && has_multipath_alternative
 }
 
 async fn commit_pending_remote_fin<S>(
@@ -501,6 +515,10 @@ where
             state.progress.sender_retry_at = None;
             send_stream.update_max_offset(remotes.max_offset());
         }
+        // Capture before every path-model read used by ACK-gap recovery. The
+        // generation-backed arm below then closes the publication/read/arm
+        // race without making the relay poll shared path health.
+        let path_model_generation_before_recovery_observation = context.path_model_generation();
         let timing_path_snapshot =
             remotes.lowest_eta_path_snapshot(context, TrafficClass::Latency, PATH_OPEN_SCORE_BYTES);
         let response_demand_update = response_flow_demand.refresh(
@@ -912,6 +930,30 @@ where
         if data_ack_timer_due {
             state.progress.data_ack_reinjection_at = None;
         }
+        let authoritative_data_ack_gap = stream_ack_ranges_expose_authoritative_gap(
+            state.progress.last_send_ack.complete(),
+            state.progress.last_send_ack.ranges(),
+        );
+        let data_ack_capacity_wait_arm_active =
+            reliable_relay_client_ack_gap_capacity_wait_arm_active(
+                authoritative_data_ack_gap,
+                remotes.path_keys().len() > 1,
+            );
+        // Arm before target selection reads queue credit. A release between a
+        // negative selection and the select poll is then retained by the
+        // enabled waiter instead of being lost by `Notify::notify_waiters`.
+        let data_ack_target_capacity_wait = data_ack_capacity_wait_arm_active
+            .then(|| {
+                arm_carrier_capacity_notifies(
+                    remotes
+                        .paths
+                        .iter()
+                        .flat_map(|path| path.stream.capacity_notifies())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten();
+        let has_data_ack_target_capacity_wait = data_ack_target_capacity_wait.is_some();
         // ACK receipt, timer expiry, path/model publication, and carrier
         // capacity all return through this stream-owner evaluation. A due gap
         // therefore remains recoverable when no target was eligible at the
@@ -943,12 +985,22 @@ where
         }
         #[cfg(not(feature = "lab-diagnostics"))]
         let _ = data_ack_reinjection;
+        let data_ack_path_model_wait_active = reliable_relay_client_ack_gap_path_model_wait_active(
+            authoritative_data_ack_gap,
+            data_ack_reinjection.has_multipath_alternative,
+        );
+        let data_ack_missing_target_wait_active =
+            data_ack_path_model_wait_active && !data_ack_reinjection.has_measured_target;
+        let data_ack_path_model_publication = data_ack_path_model_wait_active.then(|| {
+            context.arm_path_model_publication(path_model_generation_before_recovery_observation)
+        });
         let data_ack_reinjection_at = state.progress.data_ack_reinjection_at;
-        let retained_data_ack_recovery_due = state
-            .progress
-            .ack_gap_reinjection
-            .next_reinjection_deadline()
-            .is_some_and(|deadline| deadline <= Instant::now());
+        let retained_data_ack_recovery_due = data_ack_reinjection.has_multipath_alternative
+            && state
+                .progress
+                .ack_gap_reinjection
+                .next_reinjection_deadline()
+                .is_some_and(|deadline| deadline <= Instant::now());
         let inbound_frame_ready = deferred_remote_frame.is_some() || remotes.has_buffered_frame();
         let pending_remote_fin_ready =
             pending_stream_fin_ready(&recv_stream, state.endpoint.pending_remote_fin_offset);
@@ -1085,6 +1137,26 @@ where
         }
 
         tokio::select! {
+            _ = async move {
+                if let Some(publication) = data_ack_path_model_publication {
+                    publication.await;
+                }
+            }, if data_ack_path_model_wait_active => {
+                // Current owner or alternate evidence may introduce a target
+                // or pull its absolute completion from fallback to the loss
+                // boundary. Preserve the ACK-gap clocks and derive only the
+                // current target on the next serialized pass.
+                continue;
+            }
+            _ = async move {
+                if let Some(wait) = data_ack_target_capacity_wait {
+                    wait.await;
+                }
+            }, if data_ack_missing_target_wait_active && has_data_ack_target_capacity_wait => {
+                // Queue credit changed after the negative target observation;
+                // reselect without changing any recovery epoch.
+                continue;
+            }
             _ = wait_for_optional_deadline(request_path_recovery_deadline), if request_path_recovery_deadline.is_some() => {
                 // Re-evaluate exact attachment and range recovery clocks
                 // before assigning more OriginalData; native recovery continues.

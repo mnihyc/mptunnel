@@ -318,7 +318,7 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_capacity_frame(
             };
             let accepted = runtime
                 .state
-                .mutate_path_eligibility(
+                .mutate_path_model(
                     crate::model::path::RelayPathKey {
                         underlay: crate::protocol::UnderlayProtocol::Tcp,
                         index: runtime.path_index,

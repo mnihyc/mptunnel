@@ -618,8 +618,14 @@ pub struct Bbr3 {
     completed_loss_decision_events: u64,
     /// Whether the completed Startup loss decision had congestion authority independent of the
     /// configured erasure contract (explicit ECN, persistent congestion, or unaligned evidence).
-    /// A compensated budget crossing alone is not such authority.
+    /// A compensated budget crossing alone is not such authority while capacity acquisition is
+    /// backlogged.
     completed_loss_round_raw_authority: bool,
+    /// Whether the exact completed compensated decision epoch remained application-limited both
+    /// in its delivery sample and when the ACK transaction closed. This preserves Startup's loss
+    /// escape only where its full-bandwidth plateau is unavailable, without allowing a stale
+    /// send-time application-limited watermark to terminate newly backlogged acquisition.
+    completed_loss_round_app_limited_authority: bool,
     /// Attributable ECN authority is independent of packet-loss records. Validated ambiguous ECN
     /// abandons undo but does not manufacture exempt loss bytes.
     ecn_congestion_in_round: bool,
@@ -830,6 +836,7 @@ impl Bbr3 {
             undo_loss_budget_had_open_predecessor: false,
             completed_loss_decision_events: 0,
             completed_loss_round_raw_authority: false,
+            completed_loss_round_app_limited_authority: false,
             ecn_congestion_in_round: false,
             explicit_congestion_in_round: false,
             loss_round_evidence_anchor: None,
@@ -851,9 +858,14 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRUpdateModelAndState <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.2.3>
-    fn update_model_and_state(&mut self, p: BbrPacket, now: Instant) {
+    fn update_model_and_state(
+        &mut self,
+        p: BbrPacket,
+        now: Instant,
+        connection_app_limited: bool,
+    ) {
         self.update_latest_delivery_signals();
-        self.update_congestion_signals(p, now);
+        self.update_congestion_signals(p, now, connection_app_limited);
         self.update_ack_aggregation(now);
         self.check_full_bw_reached();
         self.check_startup_done();
@@ -1374,6 +1386,7 @@ impl Bbr3 {
         self.completed_loss_round_is_high = false;
         self.completed_loss_decision_events = 0;
         self.completed_loss_round_raw_authority = false;
+        self.completed_loss_round_app_limited_authority = false;
         if let Some(rate_sample) = self.rs {
             self.bw_latest = [self.bw_latest, self.model_delivery_rate(rate_sample)]
                 .iter()
@@ -1390,12 +1403,19 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRUpdateCongestionSignals <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
-    fn update_congestion_signals(&mut self, p: BbrPacket, now: Instant) {
+    fn update_congestion_signals(
+        &mut self,
+        p: BbrPacket,
+        now: Instant,
+        connection_app_limited: bool,
+    ) {
         self.update_max_bw(p);
         let mut budget_high = false;
         let mut budget_is_app_limited = false;
         if self.round_start && self.loss_compensation_floor > 0.0 {
             budget_is_app_limited = self.rs.is_some_and(|sample| sample.is_app_limited);
+            self.completed_loss_round_app_limited_authority =
+                budget_is_app_limited && connection_app_limited;
             budget_high = self
                 .advance_compensated_loss_budget(budget_is_app_limited)
                 .unwrap_or(true);
@@ -1582,13 +1602,15 @@ impl Bbr3 {
         if self.full_bw_reached {
             return;
         }
-        // A configured erasure contract makes ordinary packet loss ambiguous during capacity
-        // acquisition. A short compensated-budget crossing cannot safely distinguish random
-        // erasure from a queue, and using it here can terminate STARTUP before the sender has a
-        // representative bandwidth sample. Keep the draft high-loss shortcut only when the
-        // completed decision has independent raw authority; otherwise the ordinary full-bandwidth
-        // plateau remains STARTUP's congestion authority.
-        if self.loss_compensation_floor > 0.0 && !self.completed_loss_round_raw_authority {
+        // During backlogged acquisition, a finite compensated-budget crossing cannot safely
+        // distinguish random erasure placement from a queue; the ordinary full-bandwidth plateau
+        // remains the capacity exit. An application-limited completed epoch cannot use that
+        // plateau, so its exhausted envelope retains BBR's loss escape. Raw ECN, persistence, and
+        // unknown evidence remain eligible in either case.
+        if self.loss_compensation_floor > 0.0
+            && !self.completed_loss_round_raw_authority
+            && !self.completed_loss_round_app_limited_authority
+        {
             return;
         }
         let decision_events = if self.loss_compensation_floor == 0.0 {
@@ -2834,7 +2856,7 @@ impl Controller for Bbr3 {
                     self.rs = Some(rate_sample);
                     self.finish_inflight_rtt_ack_epoch();
                     // UpdateOnACK consumes exactly this ACK's completed sample, exactly once.
-                    self.update_model_and_state(rate_sample.last_packet, now);
+                    self.update_model_and_state(rate_sample.last_packet, now, app_limited);
                     self.update_control_parameters();
 
                     // Preserve the completed sample for post-ACK loss processing, but close the
@@ -4409,6 +4431,122 @@ mod test {
         assert!(!bbr.full_bw_reached);
         assert_eq!(bbr.cwnd, 240_000);
         assert_eq!(bbr.undo_state, None);
+    }
+
+    fn startup_loss_gate_controller(
+        config: Bbr3Config,
+        sample_app_limited: bool,
+    ) -> Bbr3 {
+        let now = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let mut bbr = Bbr3::new(Arc::new(config), smss as u16);
+        bbr.cwnd = 240_000;
+        bbr.max_bw = 6_000_000.0;
+        bbr.bw = bbr.max_bw;
+        bbr.min_rtt = Duration::from_millis(100);
+        bbr.inflight_rtt = Duration::from_millis(100);
+        assert!(bbr.enter_recovery(now, now - Duration::from_millis(100)));
+        bbr.save_state_upon_loss();
+        bbr.round_count = 2;
+        bbr.recovery_start_round = 0;
+        bbr.loss_round_start = true;
+        bbr.loss_events_in_round = STARTUP_FULL_LOSS_CNT;
+        let mut sample = max_bw_epoch_sample(now, sample_app_limited);
+        sample.delivered = 100 * smss;
+        sample.tx_in_flight = 100 * smss;
+        sample.lost = 20 * smss;
+        sample.last_packet.is_app_limited = sample_app_limited;
+        bbr.rs = Some(sample);
+        bbr
+    }
+
+    #[test]
+    fn compensated_app_limited_completed_decision_retains_startup_loss_exit() {
+        let mut bbr =
+            startup_loss_gate_controller(mptunnel_loss_profile_config(), true);
+        bbr.completed_loss_round_is_high = true;
+        bbr.completed_loss_decision_events = STARTUP_FULL_LOSS_CNT;
+        bbr.completed_loss_round_raw_authority = false;
+        bbr.completed_loss_round_app_limited_authority = true;
+
+        bbr.check_startup_done();
+
+        assert_eq!(bbr.state, BbrState::Drain);
+        assert!(bbr.full_bw_reached);
+        assert_eq!(bbr.undo_state, Some(BbrState::Startup));
+    }
+
+    #[test]
+    fn compensated_non_app_limited_completed_decision_defers_to_plateau() {
+        let mut bbr =
+            startup_loss_gate_controller(mptunnel_loss_profile_config(), false);
+        bbr.completed_loss_round_is_high = true;
+        bbr.completed_loss_decision_events = STARTUP_FULL_LOSS_CNT;
+        bbr.completed_loss_round_raw_authority = false;
+        bbr.completed_loss_round_app_limited_authority = false;
+
+        bbr.check_startup_done();
+
+        assert_eq!(bbr.state, BbrState::Startup);
+        assert!(!bbr.full_bw_reached);
+        assert_eq!(bbr.undo_state, None);
+    }
+
+    #[test]
+    fn compensated_completed_epoch_rejects_stale_app_limited_watermark() {
+        let now = Instant::now();
+        for (connection_app_limited, expected_authority) in [(false, false), (true, true)] {
+            let mut bbr = Bbr3::new(
+                Arc::new(mptunnel_loss_profile_config()),
+                BASE_DATAGRAM_SIZE as u16,
+            );
+            let sample = max_bw_epoch_sample(now, true);
+            bbr.delivered = sample.delivered;
+            bbr.rs = Some(sample);
+            bbr.update_latest_delivery_signals();
+            bbr.update_congestion_signals(
+                sample.last_packet,
+                now,
+                connection_app_limited,
+            );
+            assert_eq!(
+                bbr.completed_loss_round_app_limited_authority,
+                expected_authority,
+                "send-time app-limited evidence and current connection state must both qualify"
+            );
+            bbr.in_recovery = true;
+            bbr.recovery_start_round = 0;
+            bbr.round_count = 2;
+            bbr.completed_loss_round_is_high = true;
+            bbr.completed_loss_decision_events = STARTUP_FULL_LOSS_CNT;
+            bbr.check_startup_done();
+            assert_eq!(
+                bbr.state,
+                if expected_authority {
+                    BbrState::Drain
+                } else {
+                    BbrState::Startup
+                },
+                "a stale send-time watermark must not authorize the first backlogged epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_and_zero_policy_startup_loss_authority_is_preserved() {
+        let mut raw = startup_loss_gate_controller(mptunnel_loss_profile_config(), false);
+        raw.completed_loss_round_is_high = true;
+        raw.completed_loss_decision_events = STARTUP_FULL_LOSS_CNT;
+        raw.completed_loss_round_raw_authority = true;
+        raw.completed_loss_round_app_limited_authority = false;
+        raw.check_startup_done();
+        assert_eq!(raw.state, BbrState::Drain);
+
+        let mut zero = startup_loss_gate_controller(draft_bbr3_config(), false);
+        zero.completed_loss_round_raw_authority = false;
+        zero.completed_loss_round_app_limited_authority = false;
+        zero.check_startup_done();
+        assert_eq!(zero.state, BbrState::Drain);
     }
 
     #[test]
@@ -6400,7 +6538,7 @@ mod test {
         assert_eq!(bbr.effective_probe_loss_thresh(), LOSS_THRESH);
 
         bbr.loss_round_start = true;
-        bbr.update_congestion_signals(max_bw_epoch_sample(now, false).last_packet, now);
+        bbr.update_congestion_signals(max_bw_epoch_sample(now, false).last_packet, now, false);
         assert!(bbr.bw_shortterm.is_finite());
         assert!(!bbr.loss_in_round);
         assert!(!bbr.loss_round_evidence_unknown);
@@ -6460,7 +6598,7 @@ mod test {
         sample.lost = 3 * BASE_DATAGRAM_SIZE;
         sample.tx_in_flight = 3 * BASE_DATAGRAM_SIZE;
         bbr.rs = Some(sample);
-        bbr.update_congestion_signals(sample.last_packet, now);
+        bbr.update_congestion_signals(sample.last_packet, now, false);
 
         assert_eq!(
             bbr.completed_loss_decision_events, 2,
@@ -7042,7 +7180,11 @@ mod test {
         bbr.rs = Some(sample);
         bbr.update_latest_delivery_signals();
         assert!(bbr.loss_round_start);
-        bbr.update_congestion_signals(sample.last_packet, now + Duration::from_millis(100));
+        bbr.update_congestion_signals(
+            sample.last_packet,
+            now + Duration::from_millis(100),
+            false,
+        );
         assert!(!bbr.loss_in_round);
         let responded_bw = bbr.bw_shortterm;
         let responded_inflight = bbr.inflight_shortterm;
@@ -10573,13 +10715,20 @@ mod test {
             "cold randomized loss {} did not exercise residual headroom (0.10, {boundary})",
             run.observed_loss,
         );
+        let transition = run
+            .points
+            .iter()
+            .find(|point| point.full_bw_reached)
+            .expect("authorized cold acquisition never left Startup");
+        assert_ne!(transition.state, BbrState::Startup);
         assert!(
-            run.points.iter().all(|point| {
-                !point.full_bw_reached || point.max_bw >= 0.8 * SERVICE_BYTES_PER_SECOND
-            }),
+            transition.max_bw >= 0.8 * SERVICE_BYTES_PER_SECOND,
             "authorized startup loss prematurely ended bandwidth acquisition: {:?}",
             run.points,
         );
+        assert!(run.points.iter().all(|point| {
+            !point.full_bw_reached || point.max_bw >= 0.8 * SERVICE_BYTES_PER_SECOND
+        }));
         let late = mean_goodput(&run, 4, 5);
         let late_loss = observed_loss_between(&run, 4, 5);
         let window_quantum = 2.0 * BASE_DATAGRAM_SIZE as f64 / 2.0;

@@ -12,7 +12,7 @@ use super::io::{
 use super::ip_tunnel::handle_server_udp_ip_tunnel;
 use super::metrics::run_server_quic_path_metrics;
 use super::server_stream::{ServerUdpReliableStreamContext, handle_server_udp_reliable_stream};
-use crate::protocol::{Frame, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, PeerPathState, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
@@ -225,8 +225,21 @@ async fn handle_server_udp_connection(
             }
         }
     };
-    connection.close();
+    retire_server_udp_connection(&connection, &mut streams, &path_registration).await;
     result
+}
+
+async fn retire_server_udp_connection(
+    connection: &UdpPathConnection,
+    streams: &mut tokio::task::JoinSet<()>,
+    path_registration: &ServerCarrierPathRegistration,
+) {
+    // Stop new selection first, then terminate every native child before the
+    // registry snapshots this exact carrier's remaining attachments.
+    path_registration.set_state(PeerPathState::Draining);
+    connection.close();
+    streams.shutdown().await;
+    path_registration.begin_retirement().wait().await;
 }
 
 async fn accept_server_udp_path_handshake(

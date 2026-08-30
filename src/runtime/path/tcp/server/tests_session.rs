@@ -1,5 +1,6 @@
 use super::super::datagram::ServerTcpDatagramState;
 use super::super::evidence::ServerTcpEvidenceState;
+use super::super::observe_authenticated_server_tcp_frame;
 use super::super::writer::ServerTcpWriter;
 use super::{
     ServerTcpPathAdmission, ServerTcpPathEvent, ServerTcpPathSession, ServerTcpSessionDisposition,
@@ -11,8 +12,8 @@ use crate::config::{
 };
 use crate::outbound::OutboundConfig;
 use crate::protocol::{
-    Frame, PathId, PathUsage, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
-    UnderlayProtocol,
+    Frame, PathId, PathUsage, PeerPathState, ResetReason, SessionId, StreamDemandHint, StreamId,
+    TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
@@ -1231,6 +1232,121 @@ async fn server_tcp_attachment_refusal_is_stream_local_during_ordered_detach() {
         1,
         "the existing logical stream must survive attachment refusal",
     );
+}
+
+#[tokio::test]
+async fn server_tcp_native_terminal_signal_cancels_and_retires_the_exact_registry_instance() {
+    let session_id = SessionId(401);
+    let path_id = PathId(0);
+    let (session, mut client_framed, commands, _path_frames, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    let context = session.context.clone();
+    let retained_registration = session.path_registration.clone();
+
+    let actor = tokio::spawn(session.run());
+    tokio::task::yield_now().await;
+    commands.terminate_failed_path();
+    assert!(matches!(
+        actor.await.expect("server TCP actor join"),
+        Err(RuntimeError::ReliablePathSessionClosed)
+    ));
+
+    assert!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .is_empty(),
+        "actor exit must explicitly retire the exact registry entry even while another registration clone remains"
+    );
+    let terminal = tokio::time::timeout(Duration::from_secs(1), client_framed.read_frame())
+        .await
+        .expect("server TCP writer should close after actor retirement");
+    assert!(
+        !matches!(terminal, Ok(Frame::PathClose { .. })),
+        "native terminal retirement must not synthesize an ordered PATH_CLOSE"
+    );
+    drop(retained_registration);
+}
+
+#[tokio::test(start_paused = true)]
+async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
+    let session_id = SessionId(402);
+    let path_id = PathId(0);
+    let (mut session, mut client_framed, commands, _path_frames, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    let retention = Duration::from_secs(10);
+    session.context.session_retention_timeout = retention;
+    let context = session.context.clone();
+    let retained_registration = session.path_registration.clone();
+    let path_state = session.path_registration.state_handle();
+    let drain = commands.path_drain_signal();
+
+    observe_authenticated_server_tcp_frame(
+        &Frame::PathDrain {
+            path_id: PathId(path_id.0 + 1),
+        },
+        path_id,
+        &commands,
+        &path_state,
+    );
+    assert_eq!(drain.drain_started_at(), None);
+    assert_eq!(
+        context.reliable_streams.management_snapshot().paths[0].state,
+        PeerPathState::Active,
+        "a PATH_DRAIN for another path must not mutate this carrier"
+    );
+
+    let requested_at = tokio::time::Instant::now();
+    observe_authenticated_server_tcp_frame(
+        &Frame::PathDrain { path_id },
+        path_id,
+        &commands,
+        &path_state,
+    );
+    assert_eq!(drain.drain_started_at(), Some(requested_at));
+    assert_eq!(
+        context.reliable_streams.management_snapshot().paths[0].state,
+        PeerPathState::Draining,
+        "authenticated decode must publish exact-path drain before bounded actor delivery"
+    );
+
+    let actor = tokio::spawn(session.run());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    observe_authenticated_server_tcp_frame(
+        &Frame::PathDrain { path_id },
+        path_id,
+        &commands,
+        &path_state,
+    );
+    assert_eq!(
+        drain.drain_started_at(),
+        Some(requested_at),
+        "duplicate authenticated PATH_DRAIN must not restart retention"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        actor.await.expect("server TCP actor join"),
+        Err(RuntimeError::ReliablePathSessionClosed)
+    ));
+    assert!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .is_empty(),
+        "whole-actor expiry must explicitly retire the exact registry entry"
+    );
+    let terminal = tokio::time::timeout(Duration::from_secs(1), client_framed.read_frame())
+        .await
+        .expect("server TCP writer should close after drain expiry");
+    assert!(
+        !matches!(terminal, Ok(Frame::PathClose { .. })),
+        "drain expiry must not synthesize a successful ordered PATH_CLOSE"
+    );
+    drop(retained_registration);
 }
 
 #[tokio::test]

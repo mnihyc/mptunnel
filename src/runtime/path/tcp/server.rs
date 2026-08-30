@@ -15,16 +15,17 @@ use self::evidence::ServerTcpEvidenceState;
 use self::session::{ServerTcpPathAdmission, ServerTcpPathSession};
 use self::writer::ServerTcpWriter;
 use super::admission::authenticate_prelude;
-use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader};
+use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader_with_observers};
 use super::metrics::TcpMetricPublisher;
-use crate::protocol::{Frame, UnderlayProtocol};
+use crate::protocol::{Frame, PeerPathState, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     reliable_path_command_channels, reliable_path_command_queue, reliable_path_writer_frame_queue,
 };
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
 use crate::runtime::path::{
-    ServerCarrierPeer, ServerLocalPathProperties, fence_server_carrier_readiness,
+    ServerCarrierPathStateHandle, ServerCarrierPeer, ServerLocalPathProperties,
+    fence_server_carrier_readiness,
 };
 use crate::transport::encrypted::{EncryptedFramedStream, ServerEncryptedStreamAdmission};
 use tokio::net::TcpStream;
@@ -32,6 +33,25 @@ use tokio::sync::OwnedSemaphorePermit;
 
 fn tcp_carrier_peer(stream: &TcpStream) -> Result<ServerCarrierPeer, std::io::Error> {
     stream.peer_addr().map(ServerCarrierPeer::fixed)
+}
+
+/// Publishes exact-path drain intent at the first authenticated decode boundary.
+///
+/// The bounded actor queue remains the sole ordered frame consumer. This early
+/// publication only closes fresh Product admission and starts the immutable
+/// carrier drain clock; the actor must still consume PATH_DRAIN in order before
+/// it may emit a successful PATH_CLOSE.
+fn observe_authenticated_server_tcp_frame(
+    frame: &Frame,
+    path_id: crate::protocol::PathId,
+    commands: &crate::runtime::path::commands::ReliablePathCommandSender,
+    path_state: &ServerCarrierPathStateHandle,
+) {
+    if !matches!(frame, Frame::PathDrain { path_id: drain_path_id } if *drain_path_id == path_id) {
+        return;
+    }
+    commands.begin_path_drain();
+    path_state.set_state(PeerPathState::Draining);
 }
 
 #[cfg(test)]
@@ -185,13 +205,27 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     }
 
     let (reader, writer) = framed.split()?;
-    let path_frames =
-        spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(context.mux_limits));
+    let (commands_tx, commands_rx) =
+        reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
+    let observed_commands = commands_tx.clone();
+    let observed_path_state = path_registration.state_handle();
+    let terminal_commands = commands_tx.clone();
+    let path_frames = spawn_encrypted_tcp_reader_with_observers(
+        reader,
+        reliable_path_writer_frame_queue(context.mux_limits),
+        move |frame| {
+            observe_authenticated_server_tcp_frame(
+                frame,
+                path_id,
+                &observed_commands,
+                &observed_path_state,
+            );
+        },
+        move |_| terminal_commands.terminate_failed_path(),
+    );
     let evidence =
         ServerTcpEvidenceState::new(tcp_metrics, Some(local_metrics), context.mux_limits);
     let peer_status = context.register_peer_status(&path_registration);
-    let (commands_tx, commands_rx) =
-        reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
     ServerTcpPathSession::new(ServerTcpPathAdmission {
         context,
         session_id,

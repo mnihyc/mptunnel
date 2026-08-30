@@ -643,7 +643,10 @@ Native failure before that boundary uses ordinary retained-state recovery.
 
 The client starts a local absolute graceful-retirement ceiling when it closes
 new carrier admission and begins local drain; the server starts its own when
-it receives `PATH_DRAIN`. Each uses the configured
+it receives `PATH_DRAIN`. For the server, receipt is the authenticated frame
+decode boundary, before delivery through any bounded actor queue: writer,
+routing, or queue backpressure MUST NOT defer closure of new Product admission
+or the start of this ceiling. Each uses the configured
 `[session].retention_timeout_s`, never restarts or extends it, and does not
 assume that the peer's deadline is equal or synchronized. Expiry closes that
 exact native TCP carrier and enters ordinary exact-failure recovery; it does

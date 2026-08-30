@@ -133,10 +133,61 @@ async fn failed_path_termination_fences_admission_and_signals_terminal() {
     signal.wait().await;
 
     assert!(signal.is_terminal());
+    assert_eq!(
+        signal.drain_started_at(),
+        None,
+        "native failure does not manufacture a planned-drain budget"
+    );
+    commands.begin_path_drain();
+    assert_eq!(
+        signal.drain_started_at(),
+        None,
+        "a late drain request cannot relabel terminal failure as planned retirement"
+    );
     assert!(matches!(
         commands.try_reserve_admitted_frame(stream_data_frame(1, 1024), TrafficClass::Throughput),
         Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn path_drain_deadline_starts_at_request_boundary_and_never_restarts() {
+    let (commands, receivers) = reliable_path_command_channels(1);
+    let signal = receivers.path_drain_signal();
+    let retention = std::time::Duration::from_secs(10);
+    let requested_at = tokio::time::Instant::now();
+
+    commands.begin_path_drain();
+    assert_eq!(signal.drain_started_at(), Some(requested_at));
+    assert_eq!(
+        signal.drain_deadline(retention),
+        Some(requested_at + retention)
+    );
+
+    let deadline = signal.wait_for_drain_deadline(retention);
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        () = &mut deadline => panic!("drain expired at its request boundary"),
+        () = std::future::ready(()) => {}
+    }
+
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    commands.begin_path_drain();
+    assert_eq!(
+        signal.drain_deadline(retention),
+        Some(requested_at + retention),
+        "duplicate drain request extended the absolute retention ceiling"
+    );
+
+    tokio::time::advance(std::time::Duration::from_millis(5_999)).await;
+    tokio::select! {
+        biased;
+        () = &mut deadline => panic!("drain expired before its absolute ceiling"),
+        () = std::future::ready(()) => {}
+    }
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    deadline.await;
 }
 
 #[test]

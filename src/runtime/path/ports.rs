@@ -491,6 +491,15 @@ pub(in crate::runtime) struct ServerCarrierPathRegistration {
     inner: Arc<ServerCarrierPathRegistrationInner>,
 }
 
+/// Non-owning exact-carrier state publication for authenticated I/O observers.
+///
+/// Decode tasks may publish a peer's ordered drain intent before bounded actor
+/// delivery without extending the carrier registration lifetime themselves.
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerCarrierPathStateHandle {
+    inner: Weak<ServerCarrierPathRegistrationInner>,
+}
+
 #[derive(Clone)]
 pub(in crate::runtime) struct ServerCarrierPeer {
     observe: Arc<dyn Fn() -> SocketAddr + Send + Sync>,
@@ -747,12 +756,27 @@ impl ServerCarrierPathRegistration {
             .set_carrier_path_state(self.inner.identity, state);
     }
 
+    pub(in crate::runtime) fn state_handle(&self) -> ServerCarrierPathStateHandle {
+        ServerCarrierPathStateHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub(in crate::runtime) fn begin_retirement(&self) -> ServerCarrierPathRetirement {
         self.inner.backend.retire_carrier_path(self.inner.identity)
     }
 
     fn belongs_to(&self, port: &ServerStreamPort) -> bool {
         self.inner.owner_token == port.owner_token
+    }
+}
+
+impl ServerCarrierPathStateHandle {
+    pub(in crate::runtime) fn set_state(&self, state: PeerPathState) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner.backend.set_carrier_path_state(inner.identity, state);
     }
 }
 

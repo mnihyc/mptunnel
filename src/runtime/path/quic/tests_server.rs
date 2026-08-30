@@ -33,6 +33,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
+struct ServerQuicChildDropProbe<F: FnOnce()> {
+    callback: Option<F>,
+}
+
+impl<F: FnOnce()> ServerQuicChildDropProbe<F> {
+    fn new(callback: F) -> Self {
+        Self {
+            callback: Some(callback),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for ServerQuicChildDropProbe<F> {
+    fn drop(&mut self) {
+        if let Some(callback) = self.callback.take() {
+            callback();
+        }
+    }
+}
+
 struct ServerControlFixture {
     context: ServerPathContext,
     client_send: UdpPathSendStream,
@@ -308,6 +328,73 @@ async fn open_server_ip_tunnel_actor(
         } if ready_id == tunnel_id
     ));
     (client_send, client_recv, actor)
+}
+
+#[tokio::test]
+async fn server_quic_terminal_shutdown_joins_children_before_exact_registry_retirement() {
+    let fixture = ServerControlFixture::open().await;
+    let (path_registration, sibling_registration) = fixture.register_mixed_carriers();
+    let session_id = path_registration.session_id();
+    let underlay = path_registration.underlay();
+    let path_id = path_registration.path_id();
+    let path_instance_id = path_registration.path_instance_id();
+    let sibling_instance_id = sibling_registration.path_instance_id();
+    let connection = fixture._server_connection.clone();
+    let observed_connection = connection.clone();
+    let observed_context = fixture.context.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+    let mut streams = tokio::task::JoinSet::new();
+    streams.spawn(async move {
+        let _drop_probe = ServerQuicChildDropProbe::new(move || {
+            let state = observed_context
+                .reliable_streams
+                .management_snapshot()
+                .paths
+                .into_iter()
+                .find(|path| {
+                    path.session_id == session_id
+                        && path.underlay == underlay
+                        && path.path_id == path_id
+                        && path.path_instance_id == path_instance_id
+                })
+                .map(|path| path.state);
+            let _ = stopped_tx.send((observed_connection.is_locally_closed(), state));
+        });
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    started_rx.await.expect("server QUIC child started");
+
+    retire_server_udp_connection(&connection, &mut streams, &path_registration).await;
+
+    let (native_closed, state_at_child_drop) =
+        tokio::time::timeout(Duration::from_secs(1), stopped_rx)
+            .await
+            .expect("server QUIC child shutdown timeout")
+            .expect("server QUIC child shutdown observation");
+    assert!(
+        native_closed,
+        "native QUIC must close before child shutdown"
+    );
+    assert_eq!(
+        state_at_child_drop,
+        Some(PeerPathState::Draining),
+        "the exact carrier must remain registered as Draining until every child has joined",
+    );
+    let paths = fixture.context.reliable_streams.management_snapshot().paths;
+    assert!(
+        paths
+            .iter()
+            .all(|path| path.path_instance_id != path_instance_id),
+        "terminal shutdown must retire the exact QUIC carrier",
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.path_instance_id == sibling_instance_id),
+        "exact QUIC retirement must preserve the sibling carrier",
+    );
 }
 
 #[tokio::test]

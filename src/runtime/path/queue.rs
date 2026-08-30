@@ -16,6 +16,7 @@ use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
+use std::time::Duration;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
@@ -289,6 +290,10 @@ struct TcpCapacityProbeLeaseState {
 #[derive(Debug)]
 struct ReliablePathCarrierLifecycle {
     phase: AtomicU8,
+    // This lock is also the transition lock. Publishing Draining and recording
+    // its monotonic start are one transaction, so neither a competing failure
+    // nor a duplicate drain request can create or extend a retirement budget.
+    drain_started_at: Mutex<Option<tokio::time::Instant>>,
     changed: Notify,
 }
 
@@ -321,6 +326,7 @@ impl Default for ReliablePathCarrierLifecycle {
     fn default() -> Self {
         Self {
             phase: AtomicU8::new(RELIABLE_PATH_CARRIER_ACTIVE),
+            drain_started_at: Mutex::new(None),
             changed: Notify::new(),
         }
     }
@@ -332,18 +338,23 @@ impl ReliablePathCarrierLifecycle {
     }
 
     fn begin_drain(&self) {
-        if self
-            .phase
-            .compare_exchange(
-                RELIABLE_PATH_CARRIER_ACTIVE,
-                RELIABLE_PATH_CARRIER_DRAINING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
+        let mut drain_started_at = self
+            .drain_started_at
+            .lock()
+            .expect("reliable path carrier lifecycle transition lock");
+        if self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_ACTIVE {
+            *drain_started_at = Some(tokio::time::Instant::now());
+            self.phase
+                .store(RELIABLE_PATH_CARRIER_DRAINING, Ordering::Release);
             self.changed.notify_waiters();
         }
+    }
+
+    fn drain_started_at(&self) -> Option<tokio::time::Instant> {
+        *self
+            .drain_started_at
+            .lock()
+            .expect("reliable path carrier lifecycle transition lock")
     }
 
     fn is_terminal(&self) -> bool {
@@ -361,37 +372,26 @@ impl ReliablePathCarrierLifecycle {
     }
 
     fn finish_failed(&self) {
-        let mut phase = self.phase.load(Ordering::Acquire);
-        loop {
-            if phase >= RELIABLE_PATH_CARRIER_TERMINAL_FAILED {
-                return;
-            }
-            match self.phase.compare_exchange_weak(
-                phase,
-                RELIABLE_PATH_CARRIER_TERMINAL_FAILED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.changed.notify_waiters();
-                    return;
-                }
-                Err(current) => phase = current,
-            }
+        let _transition = self
+            .drain_started_at
+            .lock()
+            .expect("reliable path carrier lifecycle transition lock");
+        if self.phase.load(Ordering::Acquire) < RELIABLE_PATH_CARRIER_TERMINAL_FAILED {
+            self.phase
+                .store(RELIABLE_PATH_CARRIER_TERMINAL_FAILED, Ordering::Release);
+            self.changed.notify_waiters();
         }
     }
 
     fn finish_planned_retirement(&self) -> bool {
-        let finished = self
-            .phase
-            .compare_exchange(
-                RELIABLE_PATH_CARRIER_DRAINING,
-                RELIABLE_PATH_CARRIER_TERMINAL_RETIRED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
+        let _transition = self
+            .drain_started_at
+            .lock()
+            .expect("reliable path carrier lifecycle transition lock");
+        let finished = self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_DRAINING;
         if finished {
+            self.phase
+                .store(RELIABLE_PATH_CARRIER_TERMINAL_RETIRED, Ordering::Release);
             self.changed.notify_waiters();
         }
         finished
@@ -434,6 +434,32 @@ impl ReliablePathDrainSignal {
 
     pub(in crate::runtime) fn is_terminal(&self) -> bool {
         self.metrics.lifecycle.is_terminal()
+    }
+
+    /// Monotonic start of this exact carrier's first planned drain request.
+    /// Direct native failure has no drain start, and repeated requests retain
+    /// the original value.
+    pub(in crate::runtime) fn drain_started_at(&self) -> Option<tokio::time::Instant> {
+        self.metrics.lifecycle.drain_started_at()
+    }
+
+    pub(in crate::runtime) fn drain_deadline(
+        &self,
+        retention_timeout: Duration,
+    ) -> Option<tokio::time::Instant> {
+        self.drain_started_at()
+            .map(|started_at| started_at + retention_timeout)
+    }
+
+    /// Waits for the first planned drain and then for its absolute,
+    /// non-restarting retention ceiling. Direct terminal failure never creates
+    /// a planned-drain deadline.
+    pub(in crate::runtime) async fn wait_for_drain_deadline(&self, retention_timeout: Duration) {
+        self.wait().await;
+        match self.drain_deadline(retention_timeout) {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
     }
 }
 
@@ -703,6 +729,12 @@ impl ReliablePathCommandReceivers {
         }
     }
 
+    pub(in crate::runtime) fn terminal_signal(&self) -> ReliablePathCarrierTerminalSignal {
+        ReliablePathCarrierTerminalSignal {
+            metrics: self.metrics.clone(),
+        }
+    }
+
     /// Stops new admission while preserving every already reserved command.
     ///
     /// Tokio keeps a closed channel alive until outstanding permits resolve.
@@ -806,6 +838,12 @@ impl ReliablePathCommandSender {
     pub(in crate::runtime) fn begin_path_drain(&self) {
         self.metrics.lifecycle.begin_drain();
         self.metrics.capacity_released.notify_waiters();
+    }
+
+    pub(in crate::runtime) fn path_drain_signal(&self) -> ReliablePathDrainSignal {
+        ReliablePathDrainSignal {
+            metrics: self.metrics.clone(),
+        }
     }
 
     /// Stops admission and wakes the carrier actor for immediate failure

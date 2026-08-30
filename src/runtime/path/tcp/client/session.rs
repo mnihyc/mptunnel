@@ -22,8 +22,8 @@ use crate::model::path::{CarrierPathInstanceId, RelayPathKey, next_carrier_path_
 use crate::protocol::{CloseReason, Frame, PathMetricDirection, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    ClientTcpOpenResponse, ClientTcpOpenedDatagramAttachment, ReliablePathCommand,
-    ReliablePathCommandReceivers, recv_reliable_path_command,
+    ClientTcpOpenResponse, ClientTcpOpenedDatagramAttachment, ReliablePathCarrierTerminalCause,
+    ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     recv_reliable_path_command_during_drain, reliable_path_command_pending_bytes,
     reliable_path_receivers_closed, try_recv_reliable_path_command,
 };
@@ -31,6 +31,7 @@ use crate::runtime::path::model::{path_startup_metrics, path_startup_snapshot};
 use crate::runtime::path::state::ClientTcpCarrierPublication;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -125,6 +126,33 @@ struct ClientTcpPathSessionStart {
     connection: Option<ClientTcpPathConnection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientTcpPathActiveExit {
+    Completed,
+    CarrierFailed,
+    DrainDeadline,
+}
+
+/// Applies exact carrier failure and planned-drain boundaries around the
+/// complete actor future. Individual handlers still use the same absolute
+/// deadline, but this outer boundary also cancels a native connect, read,
+/// write, or routing await that never returns to the actor select loop.
+async fn run_client_tcp_path_session_until_lifecycle_boundary(
+    active: impl Future<Output = ()>,
+    carrier_failure: impl Future<Output = ()>,
+    drain_deadline: impl Future<Output = ()>,
+) -> ClientTcpPathActiveExit {
+    tokio::pin!(active);
+    tokio::pin!(carrier_failure);
+    tokio::pin!(drain_deadline);
+    tokio::select! {
+        biased;
+        () = &mut active => ClientTcpPathActiveExit::Completed,
+        () = &mut carrier_failure => ClientTcpPathActiveExit::CarrierFailed,
+        () = &mut drain_deadline => ClientTcpPathActiveExit::DrainDeadline,
+    }
+}
+
 pub(in crate::runtime::path::tcp) async fn run_client_tcp_path_session(
     runtime: ClientTcpPathSessionRuntime,
     commands: ReliablePathCommandReceivers,
@@ -208,7 +236,16 @@ async fn run_client_tcp_path_session_inner(
     let mut pending_frames = Vec::<Frame>::new();
     let session_closed = runtime.state.session_retirement().wait();
     tokio::pin!(session_closed);
-    let terminal_reason = {
+    let drain_signal = commands.path_drain_signal();
+    let drain_deadline = drain_signal.wait_for_drain_deadline(runtime.session_retention_timeout);
+    let carrier_terminal_signal = commands.terminal_signal();
+    let carrier_failure = async {
+        match carrier_terminal_signal.wait().await {
+            ReliablePathCarrierTerminalCause::Failed => {}
+            ReliablePathCarrierTerminalCause::Retired => std::future::pending::<()>().await,
+        }
+    };
+    let (terminal_reason, lifecycle_failed) = {
         let active = run_client_tcp_path_session_active(
             &runtime,
             &mut commands,
@@ -217,18 +254,29 @@ async fn run_client_tcp_path_session_inner(
             &mut state,
             &mut pending_frames,
         );
-        tokio::pin!(active);
+        let bounded_active = run_client_tcp_path_session_until_lifecycle_boundary(
+            active,
+            carrier_failure,
+            drain_deadline,
+        );
+        tokio::pin!(bounded_active);
         tokio::select! {
             biased;
-            reason = &mut session_closed => Some(reason),
-            () = &mut active => None,
+            reason = &mut session_closed => (Some(reason), false),
+            exit = &mut bounded_active => match exit {
+                ClientTcpPathActiveExit::Completed => (None, false),
+                ClientTcpPathActiveExit::CarrierFailed => (None, true),
+                ClientTcpPathActiveExit::DrainDeadline => (None, true),
+            },
         }
     };
-    let Some(reason) = terminal_reason else {
+    if terminal_reason.is_none() && !lifecycle_failed {
         return;
-    };
+    }
 
-    let error = RuntimeError::RemoteClosed(reason);
+    let error = terminal_reason.map_or(RuntimeError::ReliablePathSessionClosed, |reason| {
+        RuntimeError::RemoteClosed(reason)
+    });
     fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &error, &runtime);
     if state.connection.is_some() {
         retire_failed_client_tcp_connection(&runtime, &mut state, &mut carrier_readiness);
@@ -366,8 +414,11 @@ async fn run_client_tcp_path_session_active(
                     runtime,
                 );
                 draining = true;
-                drain_deadline =
-                    Some(tokio::time::Instant::now() + runtime.session_retention_timeout);
+                drain_deadline = Some(
+                    drain_signal
+                        .drain_deadline(runtime.session_retention_timeout)
+                        .expect("draining TCP path owns one absolute retention deadline"),
+                );
             }
             _ = &mut path_drain_timer, if draining => {
                 drop_connection = true;
@@ -1535,6 +1586,110 @@ async fn wait_for_endpoint_policy_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_tcp_planned_drain_deadline_bounds_the_complete_actor() {
+        let (commands, receivers) =
+            crate::runtime::path::commands::reliable_path_command_channels(1);
+        let signal = receivers.path_drain_signal();
+        let retention = Duration::from_secs(5);
+        let requested_at = tokio::time::Instant::now();
+        let active_dropped = Arc::new(AtomicBool::new(false));
+        let active_drop = DropFlag(active_dropped.clone());
+        let active = async move {
+            let _active_drop = active_drop;
+            std::future::pending::<()>().await;
+        };
+        let deadline = signal.wait_for_drain_deadline(retention);
+        let bounded = run_client_tcp_path_session_until_lifecycle_boundary(
+            active,
+            std::future::pending(),
+            deadline,
+        );
+        tokio::pin!(bounded);
+
+        commands.begin_path_drain();
+        assert_eq!(
+            signal.drain_deadline(retention),
+            Some(requested_at + retention)
+        );
+        tokio::time::advance(retention - Duration::from_millis(1)).await;
+        tokio::select! {
+            biased;
+            exit = &mut bounded => panic!("complete client TCP actor exited early: {exit:?}"),
+            () = std::future::ready(()) => {}
+        }
+
+        commands.begin_path_drain();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(bounded.await, ClientTcpPathActiveExit::DrainDeadline);
+        assert!(
+            active_dropped.load(Ordering::Acquire),
+            "whole-actor deadline did not cancel a blocked inner await"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_tcp_terminal_failure_cancels_a_blocked_complete_actor_without_planned_close() {
+        let (commands, receivers) =
+            crate::runtime::path::commands::reliable_path_command_channels(1);
+        let drain_signal = receivers.path_drain_signal();
+        let terminal_signal = commands.terminal_signal();
+        let active_dropped = Arc::new(AtomicBool::new(false));
+        let planned_close_attempted = Arc::new(AtomicBool::new(false));
+        let active_drop = DropFlag(active_dropped.clone());
+        let active_planned_close = planned_close_attempted.clone();
+        let active = async move {
+            let _active_drop = active_drop;
+            std::future::pending::<()>().await;
+            active_planned_close.store(true, Ordering::Release);
+        };
+        let carrier_failure = async move {
+            match terminal_signal.wait().await {
+                ReliablePathCarrierTerminalCause::Failed => {}
+                ReliablePathCarrierTerminalCause::Retired => std::future::pending::<()>().await,
+            }
+        };
+        let drain_deadline = drain_signal.wait_for_drain_deadline(Duration::from_secs(5));
+        let bounded = run_client_tcp_path_session_until_lifecycle_boundary(
+            active,
+            carrier_failure,
+            drain_deadline,
+        );
+        tokio::pin!(bounded);
+
+        commands.terminate_failed_path();
+        assert_eq!(
+            bounded.await,
+            ClientTcpPathActiveExit::CarrierFailed,
+            "direct terminal failure remained hidden behind a blocked inner await"
+        );
+        assert!(
+            active_dropped.load(Ordering::Acquire),
+            "terminal failure did not cancel the complete actor future"
+        );
+        assert!(
+            !planned_close_attempted.load(Ordering::Acquire),
+            "terminal failure entered the planned PATH_CLOSE continuation"
+        );
+        assert_eq!(
+            drain_signal.drain_started_at(),
+            None,
+            "terminal failure manufactured a planned-drain deadline"
+        );
+        assert!(
+            !receivers.finish_planned_path_retirement(),
+            "terminal failure was relabeled as planned retirement"
+        );
+    }
 
     #[test]
     fn authenticated_readiness_warms_only_successor_timing_startup_evidence() {

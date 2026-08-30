@@ -14,8 +14,8 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{CloseReason, Frame, PathId, PeerPathState, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
-    recv_reliable_path_command, recv_reliable_path_command_during_drain,
+    ReliablePathCarrierTerminalCause, ReliablePathCommand, ReliablePathCommandReceivers,
+    ReliablePathCommandSender, recv_reliable_path_command, recv_reliable_path_command_during_drain,
     reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
     reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
     reliable_path_frame_requires_capacity_command, reliable_path_receivers_closed,
@@ -118,22 +118,42 @@ impl ServerTcpPathSession {
         }
     }
 
-    pub(in crate::runtime::path::tcp) async fn run(self) -> Result<(), RuntimeError> {
+    pub(in crate::runtime::path::tcp) async fn run(mut self) -> Result<(), RuntimeError> {
         let retirement = self
             .context
             .wait_for_credential_retirement(self.path_registration.principal_permit().clone());
         tokio::pin!(retirement);
         let session_retirement = self.path_registration.session_retirement().wait();
         tokio::pin!(session_retirement);
-        tokio::select! {
+        let drain_signal = self.commands_tx.path_drain_signal();
+        let drain_expiry =
+            drain_signal.wait_for_drain_deadline(self.context.session_retention_timeout);
+        tokio::pin!(drain_expiry);
+        let carrier_terminal_signal = self.commands_tx.terminal_signal();
+        let carrier_terminal = carrier_terminal_signal.wait();
+        tokio::pin!(carrier_terminal);
+        let result = tokio::select! {
             biased;
             reason = &mut session_retirement => Err(RuntimeError::RemoteClosed(reason)),
             () = &mut retirement => Ok(()),
+            cause = &mut carrier_terminal => match cause {
+                ReliablePathCarrierTerminalCause::Failed => {
+                    Err(RuntimeError::ReliablePathSessionClosed)
+                }
+                ReliablePathCarrierTerminalCause::Retired => Ok(()),
+            },
+            () = &mut drain_expiry => Err(RuntimeError::ReliablePathSessionClosed),
             result = self.run_active() => result,
-        }
+        };
+        // Native EOF/error, credential expiry, session retirement, and drain
+        // expiry all retire this exact registry instance explicitly. Ordered
+        // successful drain already began the same idempotent transaction and
+        // remains the only path that writes PATH_CLOSE.
+        let _ = self.path_registration.begin_retirement();
+        result
     }
 
-    async fn run_active(mut self) -> Result<(), RuntimeError> {
+    async fn run_active(&mut self) -> Result<(), RuntimeError> {
         loop {
             let event = if let Some(frame) = self.deferred_input.take() {
                 Some(ServerTcpPathEvent::Frame(frame))
@@ -193,7 +213,13 @@ impl ServerTcpPathSession {
     }
 
     async fn run_path_drain(&mut self) -> Result<(), RuntimeError> {
-        let deadline = tokio::time::Instant::now() + self.context.session_retention_timeout;
+        let deadline = self
+            .commands_tx
+            .path_drain_signal()
+            .drain_deadline(self.context.session_retention_timeout)
+            .ok_or(RuntimeError::Protocol(
+                "TCP path drain is missing its committed lifecycle start",
+            ))?;
         tokio::time::timeout_at(deadline, self.complete_path_drain())
             .await
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)?

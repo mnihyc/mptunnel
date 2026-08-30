@@ -4,7 +4,7 @@ use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes, relay_lane_startup_chunk_bytes,
     reliable_relay_buffer_len,
 };
-use crate::model::path::RelayPathKey;
+use crate::model::path::{RelayPathInstance, RelayPathKey, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::{Frame, PathId, ResetReason, StreamId, UnderlayProtocol};
@@ -518,40 +518,69 @@ async fn terminal_product_failure_resets_before_queued_payload() {
 }
 
 #[test]
-fn recovery_candidates_skip_failed_path_unless_it_is_last_resort() {
+fn path_open_suppression_is_exact_instance_and_deadline_bounded() {
+    let context = context(&["tcp://127.0.0.1:10177"]);
     let tcp0 = RelayPathKey {
         underlay: UnderlayProtocol::Tcp,
         index: 0,
     };
-    let tcp1 = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 1,
+    let failed = RelayPathInstance {
+        key: tcp0,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 1,
     };
-    let excluded = HashSet::from([tcp0]);
+    context.install_relay_path_instance_for_test(failed);
+    let now = tokio::time::Instant::now();
+    let retry_at = now + Duration::from_secs(60);
+    let mut suppressions = ClientRelayPathOpenSuppressions::default();
+    suppressions.suppress(failed, retry_at);
 
+    assert!(suppressions.blocks(&context, tcp0, now));
+    assert_eq!(suppressions.next_retry_at(&context, now), Some(retry_at));
+    assert!(!suppressions.blocks(&context, tcp0, retry_at));
+    assert_eq!(suppressions.next_retry_at(&context, retry_at), None);
+    let rearmed_retry_at = retry_at + Duration::from_secs(60);
+    suppressions.suppress(failed, rearmed_retry_at);
+    assert!(suppressions.blocks(&context, tcp0, retry_at));
     assert_eq!(
-        reliable_relay_recovery_attach_candidates(vec![tcp0, tcp1], &excluded, false),
-        vec![tcp1]
+        suppressions.next_retry_at(&context, retry_at),
+        Some(rearmed_retry_at)
     );
-    assert!(reliable_relay_recovery_attach_candidates(vec![tcp0], &excluded, false).is_empty());
+    assert!(
+        reliable_relay_path_open_candidates_after_suppression(&context, vec![tcp0], &suppressions,)
+            .is_empty()
+    );
+
+    let successor = RelayPathInstance {
+        key: tcp0,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 2,
+    };
+    context.install_relay_path_instance_for_test(successor);
+    assert!(!suppressions.blocks(&context, tcp0, retry_at));
+    assert_eq!(suppressions.next_retry_at(&context, retry_at), None);
     assert_eq!(
-        reliable_relay_recovery_attach_candidates(vec![tcp0], &excluded, true),
+        reliable_relay_path_open_candidates_after_suppression(&context, vec![tcp0], &suppressions,),
         vec![tcp0]
     );
 }
 
 #[test]
-fn inflight_open_claim_remains_excluded_from_last_resort_recovery() {
+fn inflight_open_claim_remains_excluded_after_suppression_gate() {
+    let context = context(&["tcp://127.0.0.1:10178", "tcp://127.0.0.1:10179"]);
     let claimed = RelayPathKey {
         underlay: UnderlayProtocol::Tcp,
         index: 1,
     };
-    let excluded = HashSet::from([claimed]);
     let inflight = HashSet::from([claimed]);
-    let last_resort = reliable_relay_recovery_attach_candidates(vec![claimed], &excluded, true);
+    let gated = reliable_relay_path_open_candidates_after_suppression(
+        &context,
+        vec![claimed],
+        &ClientRelayPathOpenSuppressions::default(),
+    );
 
-    assert_eq!(last_resort, vec![claimed]);
-    assert!(reliable_relay_exclude_inflight_open_claims(last_resort, &inflight).is_empty());
+    assert_eq!(gated, vec![claimed]);
+    assert!(reliable_relay_exclude_inflight_open_claims(gated, &inflight).is_empty());
 }
 
 #[tokio::test]

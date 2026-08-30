@@ -1105,6 +1105,12 @@ revoke carrier eligibility, discard exact-instance evidence, alter sibling
 attachments, or release the carrier's endpoint-group reservation. The exact
 operation's temporary scheduler-load reservation is settled normally.
 
+Operation-local retry suppression MUST identify the exact carrier instance,
+last no longer than one path-derived PTO, and apply consistently to every
+attachment-selection path. After it expires, the same live carrier MAY own a
+fresh attachment incarnation; a successor carrier instance bypasses it
+immediately.
+
 ### 8.2 Offset mapping and delivery
 
 `STREAM_DATA(stream_id, offset, payload)` maps its bytes to:

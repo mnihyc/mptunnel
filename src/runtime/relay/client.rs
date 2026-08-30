@@ -14,7 +14,7 @@ use super::lifecycle::RelayAdditionalPathOpenTask;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::timing::{reliable_data_ack_gap_timing, reliable_data_retransmission_interval};
 use crate::model::work::reliable_reinjection_service_limit_bytes;
 use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
@@ -60,8 +60,76 @@ pub(super) struct ClientRelayProgressState {
 
 pub(super) struct ClientRelayRecoveryState {
     pub(super) pending_additional_path_opens: HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-    pub(super) excluded_paths: HashSet<RelayPathKey>,
+    pub(super) path_open_suppressions: ClientRelayPathOpenSuppressions,
     pub(super) disconnected: Option<ClientRelayDisconnectedState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientRelayPathOpenSuppression {
+    path_instance_id: CarrierPathInstanceId,
+    retry_at: tokio::time::Instant,
+}
+
+/// Per-logical-stream retry bounds for failed carrier attachments.
+///
+/// A Product operation cannot fence shared carrier health. It can only defer
+/// another attachment to the same physical owner until one path-derived PTO
+/// has elapsed. A replacement carrier instance bypasses the old entry.
+#[derive(Default)]
+pub(super) struct ClientRelayPathOpenSuppressions {
+    entries: HashMap<RelayPathKey, ClientRelayPathOpenSuppression>,
+}
+
+impl ClientRelayPathOpenSuppressions {
+    pub(super) fn suppress(&mut self, instance: RelayPathInstance, retry_at: tokio::time::Instant) {
+        self.entries.insert(
+            instance.key,
+            ClientRelayPathOpenSuppression {
+                path_instance_id: instance.path_instance_id,
+                retry_at,
+            },
+        );
+    }
+
+    pub(super) fn blocks(
+        &self,
+        context: &ClientPathContext,
+        key: RelayPathKey,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let Some(suppression) = self.entries.get(&key) else {
+            return false;
+        };
+        if now >= suppression.retry_at {
+            return false;
+        }
+        context
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .path_record(key)
+            .and_then(|record| record.path_instance_id())
+            == Some(suppression.path_instance_id)
+    }
+
+    pub(super) fn next_retry_at(
+        &self,
+        context: &ClientPathContext,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        let health = context.health().lock().expect("client path health lock");
+        self.entries
+            .iter()
+            .filter_map(|(key, suppression)| {
+                (suppression.retry_at > now
+                    && health
+                        .path_record(*key)
+                        .and_then(|record| record.path_instance_id())
+                        == Some(suppression.path_instance_id))
+                .then_some(suppression.retry_at)
+            })
+            .min()
+    }
 }
 
 /// Break-before-make state for one already-established logical stream.
@@ -159,7 +227,7 @@ impl ClientRelayState {
             },
             recovery: ClientRelayRecoveryState {
                 pending_additional_path_opens: HashMap::new(),
-                excluded_paths: HashSet::new(),
+                path_open_suppressions: ClientRelayPathOpenSuppressions::default(),
                 disconnected: None,
             },
             delivery: ClientRelayDeliveryState::default(),

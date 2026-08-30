@@ -4,13 +4,15 @@
 //! progress is authoritative, when completion is safe, and how path loss or
 //! stalls open and attach replacement carriers.
 
+use super::client::ClientRelayPathOpenSuppressions;
 use super::open::{
     ReliableRelayOpenSpec, open_remote_stream_for_relay_path, relay_path_open_error_is_retryable,
 };
 use super::remote::{
-    ReliableRelayAttachMode, ReliableRelayPathLanes, attach_reliable_relay_paths,
-    attach_reliable_relay_paths_with_claims_and_recovery_exclusions,
+    ReliableRelayAttachMode, ReliableRelayPathLanes,
+    attach_reliable_relay_paths_with_claims_and_suppressions,
     reliable_relay_additional_path_open_payload_bytes, reliable_relay_attach_payload_bytes,
+    reliable_relay_path_open_candidates_after_suppression,
     reliable_relay_reinjection_path_candidates,
 };
 #[cfg(feature = "lab-diagnostics")]
@@ -76,13 +78,14 @@ pub(super) async fn switch_reliable_relay_to_best_path(
     send_stream: &ReliableSendStream,
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending_additional_path_opens: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
 ) -> Result<bool, RuntimeError> {
     let inflight_path_claims = pending_additional_path_opens
         .keys()
         .copied()
         .collect::<HashSet<_>>();
-    let attached = attach_reliable_relay_paths(
+    let attached = attach_reliable_relay_paths_with_claims_and_suppressions(
         context,
         spec,
         lanes,
@@ -90,6 +93,7 @@ pub(super) async fn switch_reliable_relay_to_best_path(
         send_stream,
         resend_fin,
         mode,
+        path_open_suppressions,
         &inflight_path_claims,
     )
     .await?;
@@ -334,6 +338,7 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
     lanes: ReliableRelayPathLanes,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
 ) -> bool {
@@ -352,7 +357,12 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
         lanes.selection,
         payload_bytes,
     );
-    let candidates = reliable_relay_available_path_open_candidates(candidates, pending);
+    let candidates = reliable_relay_bulk_path_open_candidates(
+        context,
+        candidates,
+        path_open_suppressions,
+        pending,
+    );
     if candidates.is_empty() {
         return false;
     }
@@ -375,7 +385,7 @@ pub(super) fn spawn_reliable_relay_recovery_path_open(
     lanes: ReliableRelayPathLanes,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
-    recovery_excluded_paths: &HashSet<RelayPathKey>,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
 ) -> bool {
@@ -390,8 +400,12 @@ pub(super) fn spawn_reliable_relay_recovery_path_open(
         lanes.selection,
         payload_bytes,
     );
-    let candidates =
-        reliable_relay_recovery_path_open_candidates(candidates, recovery_excluded_paths, pending);
+    let candidates = reliable_relay_recovery_path_open_candidates(
+        context,
+        candidates,
+        path_open_suppressions,
+        pending,
+    );
     if candidates.is_empty() {
         return false;
     }
@@ -414,6 +428,7 @@ pub(super) fn spawn_reliable_relay_disconnected_path_open(
     lanes: ReliableRelayPathLanes,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
     attempted_paths: &mut HashSet<RelayPathKey>,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
@@ -428,6 +443,11 @@ pub(super) fn spawn_reliable_relay_disconnected_path_open(
         remotes,
         lanes.selection,
         payload_bytes,
+    );
+    let candidates = reliable_relay_path_open_candidates_after_suppression(
+        context,
+        candidates,
+        path_open_suppressions,
     );
     let Some(key) = candidates
         .iter()
@@ -600,21 +620,37 @@ fn reliable_relay_available_path_open_candidates(
 }
 
 fn reliable_relay_recovery_path_open_candidates(
+    context: &ClientPathContext,
     candidates: Vec<RelayPathKey>,
-    recovery_excluded_paths: &HashSet<RelayPathKey>,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
 ) -> Vec<RelayPathKey> {
-    let candidates = candidates
-        .into_iter()
-        .filter(|key| !recovery_excluded_paths.contains(key))
-        .collect::<Vec<_>>();
+    let candidates = reliable_relay_path_open_candidates_after_suppression(
+        context,
+        candidates,
+        path_open_suppressions,
+    );
     let mut candidates = reliable_relay_available_path_open_candidates(candidates, pending);
     candidates.truncate(1);
     candidates
 }
 
+fn reliable_relay_bulk_path_open_candidates(
+    context: &ClientPathContext,
+    candidates: Vec<RelayPathKey>,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
+    pending: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+) -> Vec<RelayPathKey> {
+    let candidates = reliable_relay_path_open_candidates_after_suppression(
+        context,
+        candidates,
+        path_open_suppressions,
+    );
+    reliable_relay_available_path_open_candidates(candidates, pending)
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
+pub(super) async fn attach_reliable_relay_paths_with_suppressions(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lanes: ReliableRelayPathLanes,
@@ -622,7 +658,7 @@ pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
     send_stream: &ReliableSendStream,
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
-    recovery_excluded_paths: &mut HashSet<RelayPathKey>,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
     pending_additional_path_opens: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
 ) -> Result<usize, RuntimeError> {
     // A pending open owns logical (stream, path) membership. Synchronous
@@ -631,7 +667,7 @@ pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
         .keys()
         .copied()
         .collect::<HashSet<_>>();
-    attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
+    attach_reliable_relay_paths_with_claims_and_suppressions(
         context,
         spec,
         lanes,
@@ -639,7 +675,7 @@ pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
         send_stream,
         resend_fin,
         mode,
-        recovery_excluded_paths,
+        path_open_suppressions,
         &inflight_path_claims,
     )
     .await

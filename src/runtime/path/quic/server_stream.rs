@@ -23,6 +23,130 @@ use crate::runtime::path::{
     ServerStreamPathAttachment, ServerStreamPort,
 };
 
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use tokio::sync::oneshot;
+
+#[cfg(test)]
+struct ServerUdpStreamAbortActor {
+    attached: oneshot::Sender<()>,
+    abort: oneshot::Receiver<()>,
+    released: oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+type ServerUdpStreamAbortRegistry =
+    HashMap<(SessionId, StreamId), (u64, ServerUdpStreamAbortActor)>;
+
+#[cfg(test)]
+static SERVER_UDP_STREAM_ABORTS: OnceLock<Mutex<ServerUdpStreamAbortRegistry>> = OnceLock::new();
+
+#[cfg(test)]
+static NEXT_SERVER_UDP_STREAM_ABORT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Test-only observation and one-shot abort for one accepted H3 request stream.
+///
+/// The key is the logical stream, while the effect is deliberately scoped to
+/// the currently accepted native request stream. It does not close or replace
+/// the shared QUIC connection.
+#[cfg(test)]
+pub(in crate::runtime) struct ServerUdpStreamAbortHandle {
+    key: (SessionId, StreamId),
+    id: u64,
+    attached: oneshot::Receiver<()>,
+    abort: Option<oneshot::Sender<()>>,
+    released: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+impl ServerUdpStreamAbortHandle {
+    pub(in crate::runtime) async fn wait_attached(&mut self) -> bool {
+        (&mut self.attached).await.is_ok()
+    }
+
+    pub(in crate::runtime) fn abort(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            let _ = abort.send(());
+        }
+    }
+
+    pub(in crate::runtime) async fn wait_released(&mut self) -> bool {
+        (&mut self.released).await.is_ok()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ServerUdpStreamAbortHandle {
+    fn drop(&mut self) {
+        let mut armed = SERVER_UDP_STREAM_ABORTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("server UDP stream abort registry lock");
+        if armed
+            .get(&self.key)
+            .is_some_and(|(registered_id, _)| *registered_id == self.id)
+        {
+            armed.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::runtime) fn arm_server_udp_stream_abort_for_test(
+    session_id: SessionId,
+    stream_id: StreamId,
+) -> ServerUdpStreamAbortHandle {
+    let key = (session_id, stream_id);
+    let id = NEXT_SERVER_UDP_STREAM_ABORT_ID.fetch_add(1, Ordering::Relaxed);
+    let (attached_tx, attached_rx) = oneshot::channel();
+    let (abort_tx, abort_rx) = oneshot::channel();
+    let (released_tx, released_rx) = oneshot::channel();
+    let replaced = SERVER_UDP_STREAM_ABORTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("server UDP stream abort registry lock")
+        .insert(
+            key,
+            (
+                id,
+                ServerUdpStreamAbortActor {
+                    attached: attached_tx,
+                    abort: abort_rx,
+                    released: released_tx,
+                },
+            ),
+        );
+    assert!(
+        replaced.is_none(),
+        "a server UDP request-stream abort is already armed for this logical stream"
+    );
+    ServerUdpStreamAbortHandle {
+        key,
+        id,
+        attached: attached_rx,
+        abort: Some(abort_tx),
+        released: released_rx,
+    }
+}
+
+#[cfg(test)]
+fn take_server_udp_stream_abort_for_test(
+    session_id: SessionId,
+    stream_id: StreamId,
+) -> Option<ServerUdpStreamAbortActor> {
+    SERVER_UDP_STREAM_ABORTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("server UDP stream abort registry lock")
+        .remove(&(session_id, stream_id))
+        .map(|(_, actor)| actor)
+}
+
 pub(super) struct ServerUdpReliableStreamContext {
     pub(super) session_id: SessionId,
     pub(super) path_id: PathId,
@@ -165,6 +289,18 @@ pub(super) async fn handle_server_udp_reliable_stream(
             &mut path_proofs,
         )
         .await?;
+    }
+    #[cfg(test)]
+    if let Some(abort) = take_server_udp_stream_abort_for_test(session_id, stream_id) {
+        let _ = abort.attached.send(());
+        if abort.abort.await.is_ok() {
+            // Drop only this native H3 request-stream attachment. The detach
+            // guard removes its logical-path lease; the shared QUIC connection
+            // and every sibling request stream remain alive.
+            drop(_output_detach_guard);
+            let _ = abort.released.send(());
+            return Ok(());
+        }
     }
     run_server_udp_reliable_stream_loop(
         send,

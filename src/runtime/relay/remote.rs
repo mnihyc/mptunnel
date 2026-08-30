@@ -4,6 +4,7 @@
 //! membership, generations, scheduler leases, and frame fan-in stay in
 //! `stream::request::attachment`.
 
+use super::client::ClientRelayPathOpenSuppressions;
 use super::open::{
     ReliableRelayOpenSpec, no_schedulable_reliable_path_error, open_remote_stream_for_relay_path,
     relay_path_open_error_is_retryable,
@@ -74,7 +75,6 @@ struct RelayPathAttachRequest<'a> {
 
 struct RelayPathAttachResult {
     attached: usize,
-    key: Option<RelayPathKey>,
 }
 
 async fn attach_relay_path_candidates(
@@ -110,10 +110,7 @@ async fn attach_relay_path_candidates(
                         let attach_outcome = remotes.attach_candidate(opened);
                         match attach_outcome {
                             ReliableRelayAttachOutcome::Attached => {
-                                return Ok(RelayPathAttachResult {
-                                    attached: 1,
-                                    key: Some(key),
-                                });
+                                return Ok(RelayPathAttachResult { attached: 1 });
                             }
                             ReliableRelayAttachOutcome::RejectedDuplicate => {
                                 continue;
@@ -140,15 +137,12 @@ async fn attach_relay_path_candidates(
     if remotes.is_empty() {
         Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
     } else {
-        Ok(RelayPathAttachResult {
-            attached: 0,
-            key: None,
-        })
+        Ok(RelayPathAttachResult { attached: 0 })
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn attach_reliable_relay_paths(
+pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lanes: ReliableRelayPathLanes,
@@ -156,33 +150,7 @@ pub(super) async fn attach_reliable_relay_paths(
     send_stream: &ReliableSendStream,
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
-    inflight_path_claims: &HashSet<RelayPathKey>,
-) -> Result<usize, RuntimeError> {
-    let mut recovery_excluded_paths = HashSet::<RelayPathKey>::new();
-    attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
-        context,
-        spec,
-        lanes,
-        remotes,
-        send_stream,
-        resend_fin,
-        mode,
-        &mut recovery_excluded_paths,
-        inflight_path_claims,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
-    context: &ClientPathContext,
-    spec: &ReliableRelayOpenSpec,
-    lanes: ReliableRelayPathLanes,
-    remotes: &mut ReliableRelayRemoteSet,
-    send_stream: &ReliableSendStream,
-    resend_fin: bool,
-    mode: ReliableRelayAttachMode,
-    recovery_excluded_paths: &mut HashSet<RelayPathKey>,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
     inflight_path_claims: &HashSet<RelayPathKey>,
 ) -> Result<usize, RuntimeError> {
     let payload_bytes = match mode {
@@ -203,7 +171,11 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
                 send_stream,
                 resend_fin,
                 candidates: reliable_relay_exclude_inflight_open_claims(
-                    context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
+                    reliable_relay_path_open_candidates_after_suppression(
+                        context,
+                        context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
+                        path_open_suppressions,
+                    ),
                     inflight_path_claims,
                 ),
             },
@@ -234,26 +206,21 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
                 send_stream,
                 resend_fin,
                 candidates: reliable_relay_exclude_inflight_open_claims(
-                    reliable_relay_recovery_attach_candidates(
+                    reliable_relay_path_open_candidates_after_suppression(
+                        context,
                         reliable_relay_reinjection_path_candidates(
                             context,
                             remotes,
                             lanes.selection,
                             payload_bytes,
                         ),
-                        recovery_excluded_paths,
-                        remotes.is_empty(),
+                        path_open_suppressions,
                     ),
                     inflight_path_claims,
                 ),
             },
         )
         .await?;
-        if result.attached > 0
-            && let Some(key) = result.key
-        {
-            recovery_excluded_paths.insert(key);
-        }
         return Ok(result.attached);
     }
     let result = attach_relay_path_candidates(
@@ -265,15 +232,15 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
             send_stream,
             resend_fin,
             candidates: reliable_relay_exclude_inflight_open_claims(
-                reliable_relay_recovery_attach_candidates(
+                reliable_relay_path_open_candidates_after_suppression(
+                    context,
                     reliable_relay_additional_path_candidates(
                         context,
                         remotes,
                         lanes.selection,
                         payload_bytes,
                     ),
-                    recovery_excluded_paths,
-                    remotes.is_empty(),
+                    path_open_suppressions,
                 ),
                 inflight_path_claims,
             ),
@@ -296,24 +263,17 @@ pub(in crate::runtime) fn reliable_relay_additional_path_candidates(
         .collect()
 }
 
-fn reliable_relay_recovery_attach_candidates(
+pub(super) fn reliable_relay_path_open_candidates_after_suppression(
+    context: &ClientPathContext,
     candidates: Vec<RelayPathKey>,
-    recovery_excluded_paths: &HashSet<RelayPathKey>,
-    allow_excluded_last_resort: bool,
+    path_open_suppressions: &ClientRelayPathOpenSuppressions,
 ) -> Vec<RelayPathKey> {
-    if recovery_excluded_paths.is_empty() {
-        return candidates;
-    }
-    let filtered = candidates
+    let now = tokio::time::Instant::now();
+    candidates
         .iter()
         .copied()
-        .filter(|key| !recovery_excluded_paths.contains(key))
-        .collect::<Vec<_>>();
-    if filtered.is_empty() && allow_excluded_last_resort {
-        candidates
-    } else {
-        filtered
-    }
+        .filter(|key| !path_open_suppressions.blocks(context, *key, now))
+        .collect()
 }
 
 fn reliable_relay_exclude_inflight_open_claims(

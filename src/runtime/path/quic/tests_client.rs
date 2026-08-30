@@ -4,15 +4,12 @@ use crate::config::{
 };
 use crate::outbound::OutboundConfig;
 use crate::protocol::{CloseReason, Frame, StreamDemandHint, TargetAddr};
+use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::health::{ClientPathHealth, ClientPathHealthRecord};
 use crate::runtime::path::quic::server::accept_server_udp_path_handshake_for_test;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
-use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
-use crate::transport::encrypted::test_client_tls_config;
-use crate::transport::{
-    CarrierEndpoint, CarrierPathIdentity, PathBinding, PathMetadata, SystemCarrierNetworkProvider,
-};
+use crate::transport::{CarrierEndpoint, PathBinding, PathMetadata};
 use std::net::SocketAddr;
 
 #[test]
@@ -51,6 +48,7 @@ fn closed_native_transport_still_authorizes_carrier_local_retry() {
 }
 
 struct ClientOpenRaceFixture {
+    context: ClientPathContext,
     session: ClientUdpPathSessionHandle,
     server_endpoint: UdpPathEndpoint,
     server_local_path: ServerLocalPath,
@@ -103,36 +101,16 @@ impl ClientOpenRaceFixture {
             binding: PathBinding::default(),
             metadata: PathMetadata::default(),
         };
-        let runtime = ClientUdpPathSessionRuntime {
-            paths: Arc::new(vec![client_path]),
-            config_index: 0,
-            path_index: 0,
-            carrier_identity: CarrierPathIdentity {
-                group_ordinal: 0,
-                path_ordinal: 0,
-            },
-            session_id: SessionId(941),
-            candidate_selector: QuicCandidateSelector::derive(
-                client_security.credential.id().as_str(),
-                client_security.credential.secret().as_bytes(),
-            ),
-            security: Arc::new(vec![client_security]),
-            tls: Arc::new(vec![test_client_tls_config()]),
-            codec_limits: server_context.codec_limits,
-            mux_limits: server_context.mux_limits,
-            stream_frame_queue: 8,
-            state: ClientPathState::new(ClientPathHealth::new(
-                Vec::new(),
-                vec![ClientPathHealthRecord::default()],
-            )),
-            carrier_network: Arc::new(SystemCarrierNetworkProvider),
-            peer_status: PeerStatusBroker::new(false),
-            peer_status_snapshot: PeerStatusSnapshotSource::new(|| Some(Vec::new())),
-            authenticated_carriers: crate::runtime::path::AuthenticatedCarrierInventory::default(),
-            ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub::default(),
-        };
+        let context = ClientPathContext::new(
+            vec![client_path],
+            client_security,
+            ResourceLimits::default(),
+        )
+        .expect("client QUIC context");
+        let session = context.udp_sessions[0].clone();
         Self {
-            session: ClientUdpPathSessionHandle::new(runtime),
+            context,
+            session,
             server_endpoint,
             server_local_path: ServerLocalPath::new(0, server_path),
             server_context,
@@ -221,7 +199,7 @@ async fn server_quic_observed_ingress_captures_the_real_authenticated_carrier_pe
         .mpp_ingress()
         .expect("QUIC observed ingress");
     assert_eq!(ingress.peer(), expected_peer);
-    assert_eq!(ingress.session_id(), SessionId(941));
+    assert_eq!(ingress.session_id(), fixture.context.session_id);
     assert_eq!(ingress.underlay(), UnderlayProtocol::Udp);
     assert_eq!(ingress.configured_path(), None);
     assert_eq!(ingress.path_id(), PathId(0));
@@ -347,6 +325,30 @@ fn spawn_test_open(
             )
             .await
     })
+}
+
+async fn open_test_relay_remote(
+    fixture: &ClientOpenRaceFixture,
+    connection: UdpPathConnection,
+    stream_id: StreamId,
+) -> crate::runtime::stream::ReliableRelayRemoteSet {
+    let accepted_stream = tokio::spawn(accept_test_stream(
+        connection,
+        stream_id,
+        fixture.server_context.codec_limits,
+    ));
+    let opened = spawn_test_open(&fixture.session, stream_id)
+        .await
+        .expect("client Product open join")
+        .expect("client Product open");
+    accepted_stream
+        .await
+        .expect("server Product accept join")
+        .expect("server Product accept");
+    crate::runtime::stream::ReliableRelayRemoteSet::new(
+        crate::runtime::stream::OpenedRemoteStream::from_opened_carrier(opened, 0, 65_536),
+        8,
+    )
 }
 
 fn spawn_test_datagram_open(
@@ -1035,4 +1037,76 @@ async fn carrier_lifetime_settlement_takes_and_fails_only_the_exact_owner() {
     assert_eq!(health.udp[0].consecutive_failures, 1);
     drop(health);
     drop(first);
+}
+
+#[tokio::test]
+async fn relay_carrier_lifetime_error_retires_attachment_and_exact_quic_owner() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted_carrier = fixture.establish_current().await;
+    let stream_id = StreamId(1025);
+    let mut remotes =
+        open_test_relay_remote(&fixture, accepted_carrier.connection.clone(), stream_id).await;
+    let attachment = remotes.paths[0].instance();
+    let failed_instance = attachment.path_instance_id;
+    let mut sender = crate::runtime::sender::RequestSenderService::new(stream_id);
+
+    let suppressed = crate::runtime::relay::control::resolve_client_relay_path_error_for_test(
+        &mut sender,
+        &fixture.context,
+        &mut remotes,
+        attachment,
+        &RuntimeError::QuicCarrier(QuicCarrierError::H3DriverClosed),
+    )
+    .await;
+
+    assert!(remotes.is_empty());
+    assert!(suppressed);
+    assert!(current_client_carrier(&fixture.session).await.is_none());
+    let health = fixture.context.health().lock().expect("QUIC path health");
+    let record = &health.udp[0];
+    assert_eq!(record.path_instance_id(), Some(failed_instance));
+    assert!(!record.accepts_product_commit(failed_instance));
+    assert_eq!(record.consecutive_failures, 1);
+    drop(accepted_carrier);
+}
+
+#[tokio::test]
+async fn relay_request_stream_abandonment_preserves_live_quic_owner_and_health() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted_carrier = fixture.establish_current().await;
+    let stream_id = StreamId(1026);
+    let mut remotes =
+        open_test_relay_remote(&fixture, accepted_carrier.connection.clone(), stream_id).await;
+    let attachment = remotes.paths[0].instance();
+    let mut sender = crate::runtime::sender::RequestSenderService::new(stream_id);
+    let error = RuntimeError::QuicCarrier(QuicCarrierError::H3Stream(
+        h3::error::StreamError::RemoteTerminate {
+            code: h3::error::Code::from(0_u64),
+        },
+    ));
+
+    let suppressed = crate::runtime::relay::control::resolve_client_relay_path_error_for_test(
+        &mut sender,
+        &fixture.context,
+        &mut remotes,
+        attachment,
+        &error,
+    )
+    .await;
+
+    assert!(remotes.is_empty());
+    assert!(suppressed);
+    assert_eq!(
+        current_client_carrier(&fixture.session)
+            .await
+            .expect("operation-local failure preserves exact owner")
+            .path_instance_id,
+        attachment.path_instance_id,
+    );
+    let health = fixture.context.health().lock().expect("QUIC path health");
+    let record = &health.udp[0];
+    assert_eq!(record.path_instance_id(), Some(attachment.path_instance_id));
+    assert!(record.accepts_product_commit(attachment.path_instance_id));
+    assert_eq!(record.consecutive_failures, 0);
+    drop(accepted_carrier);
 }

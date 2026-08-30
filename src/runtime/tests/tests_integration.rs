@@ -3,8 +3,9 @@ use crate::config::{
     ClientPathConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SessionConfig,
 };
 use crate::outbound::OutboundConfig;
-use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId};
+use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId, StreamId};
 use crate::runtime::path::ServerLocalPath;
+use crate::runtime::path::quic::server::arm_server_udp_stream_abort_for_test;
 use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
 use crate::transport::SystemCarrierNetworkProvider;
 
@@ -2384,6 +2385,267 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     server_relay.abort();
     let _ = server_relay.await;
     target.await.expect("target join");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = target_listener.local_addr().expect("target address");
+        let (target_release_tx, target_release_rx) = oneshot::channel();
+        let (target_payload_tx, target_payload_rx) = oneshot::channel();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.expect("target accept");
+            target_release_rx.await.expect("release target reads");
+            let mut received = Vec::new();
+            stream
+                .read_to_end(&mut received)
+                .await
+                .expect("target patterned payload");
+            target_payload_tx
+                .send(received)
+                .expect("publish target payload");
+            stream.write_all(b"done").await.expect("target response");
+            stream.shutdown().await.expect("target shutdown");
+        });
+
+        let tcp_path = reserve_tcp_path_with_query(
+            "initial-srtt-s=0.002&initial-rate-mbps=500&max-tcp-carriers=1",
+        )
+        .await;
+        let udp_port = reserve_process_unique_udp_port().await;
+        let udp_path =
+            format!("quic://127.0.0.1:{udp_port}?initial-srtt-s=0.08&initial-rate-mbps=500")
+                .parse::<PathSpec>()
+                .expect("QUIC path");
+        let tcp_listener = bind_listener(&tcp_path).await.expect("TCP path bind");
+        let tcp_local_path = ServerLocalPath::new(0, tcp_path.clone());
+        let resources = ResourceLimits {
+            max_stream_window_bytes: 1_048_512,
+            max_repair_bytes: 1_048_512,
+            max_reorder_bytes: 1_048_512,
+            max_path_flight_bytes: 1_048_512,
+            max_reliable_relay_chunk_bytes: 128 * 1024,
+            tcp_path_heartbeat_interval: Duration::from_secs(60),
+            tcp_path_heartbeat_timeout: Duration::from_secs(60),
+            ..ResourceLimits::default()
+        };
+        resources.validate().expect("focused resource limits");
+        let ServerIdentityRuntime {
+            paths: server_context,
+            reliable_relay,
+        } = crate::runtime::node::server::new_identity_runtime(
+            Vec::new(),
+            OutboundConfig::Direct,
+            DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+            server_security(),
+            MppPerformanceConfig::default(),
+            resources,
+        );
+        let server_relay = tokio::spawn(
+            reliable_relay
+                .expect("L4 test server has a reliable relay")
+                .run(),
+        );
+        let tcp_server_context = server_context.clone();
+        let tcp_server = tokio::spawn(async move {
+            let (stream, _) = tcp_listener.accept().await.expect("TCP path accept");
+            handle_server_path(stream, tcp_local_path, tcp_server_context).await
+        });
+        let udp_endpoint = bind_server_udp_endpoint(&udp_path, &server_context)
+            .await
+            .expect("QUIC path bind");
+        let udp_server = tokio::spawn(run_server_udp_listener(
+            udp_endpoint,
+            ServerLocalPath::new(1, udp_path.clone()),
+            server_context,
+        ));
+
+        let carrier_network = Arc::new(CountingCarrierNetworkProvider::default());
+        let context = ClientPathContext::new_with_carrier_network(
+            vec![
+                ClientPathConfig {
+                    name: "surviving-tcp".to_string(),
+                    tls: crate::transport::encrypted::test_client_tls_config(),
+                    spec: tcp_path,
+                    security: security(),
+                },
+                ClientPathConfig {
+                    name: "recovering-quic".to_string(),
+                    tls: crate::transport::encrypted::test_client_tls_config(),
+                    spec: udp_path,
+                    security: security(),
+                },
+            ],
+            resources,
+            None,
+            0,
+            carrier_network.clone(),
+        )
+        .expect("mixed client context");
+        let _tcp_pool = spawn_tcp_pool_reconciliation(&context);
+        wait_for_tcp_ready_count(&context, 1).await;
+
+        let stream_id = StreamId(0);
+        let mut first_abort = arm_server_udp_stream_abort_for_test(context.session_id, stream_id);
+        let (mut client, ingress) = duplex(256 * 1024);
+        let product = tokio::spawn(handle_socks5_client_stream(ingress, context.clone()));
+        open_socks5_tcp_tunnel(&mut client, target_addr).await;
+        assert_eq!(
+            context.health().lock().expect("health lock").tcp[0].active_flows,
+            1,
+            "the established logical flow must begin on TCP"
+        );
+
+        probe_client_paths(&context, Duration::from_millis(500)).await;
+        let patterned = Arc::new(
+            (0..4 * 1024 * 1024)
+                .map(|index| ((index * 31 + 7) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (mut response, mut request) = tokio::io::split(client);
+        let request_payload = patterned.clone();
+        let writer = tokio::spawn(async move {
+            request
+                .write_all(request_payload.as_slice())
+                .await
+                .expect("write patterned payload");
+            request.shutdown().await.expect("finish patterned payload");
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), first_abort.wait_attached())
+                .await
+                .expect("initial QUIC attachment timeout"),
+            "the server must own the operation-scoped H3 request stream"
+        );
+        assert!(
+            !writer.is_finished(),
+            "the request tail must remain retained when the QUIC attachment is aborted"
+        );
+        let (tcp_instance, quic_instance, quic_failures) = {
+            let health = context.health().lock().expect("health lock");
+            assert_eq!(health.tcp[0].active_flows, 1);
+            assert_eq!(health.udp[0].active_flows, 1);
+            (
+                context.tcp_sessions[0]
+                    .connection_instance_id()
+                    .expect("live TCP instance"),
+                health.udp[0]
+                    .path_instance_id()
+                    .expect("live QUIC instance"),
+                health.udp[0].consecutive_failures,
+            )
+        };
+        assert_eq!(quic_failures, 0);
+        let physical_socket_count = carrier_network.socket_count();
+        let pto = crate::model::timing::transport_pto_from_snapshot(context.udp_path_snapshot(0));
+        let mut replacement_abort =
+            arm_server_udp_stream_abort_for_test(context.session_id, stream_id);
+        let aborted_at = tokio::time::Instant::now();
+        first_abort.abort();
+        assert!(
+            first_abort.wait_released().await,
+            "the first H3 request-stream lease must be released"
+        );
+
+        tokio::time::timeout(pto, async {
+            loop {
+                let detached = {
+                    let health = context.health().lock().expect("health lock");
+                    assert_eq!(
+                        context.tcp_sessions[0].connection_instance_id(),
+                        Some(tcp_instance),
+                        "TCP must survive the QUIC request-stream failure"
+                    );
+                    assert_eq!(health.tcp[0].active_flows, 1);
+                    health.udp[0].active_flows == 0
+                };
+                if detached {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed QUIC request-stream lease did not detach");
+
+        let pre_pto_deadline = aborted_at + pto.saturating_sub(Duration::from_millis(3));
+        assert!(
+            tokio::time::timeout_at(pre_pto_deadline, replacement_abort.wait_attached())
+                .await
+                .is_err(),
+            "the same failed operation must not spin a replacement before one PTO"
+        );
+        assert!(
+            tokio::time::timeout(
+                pto.saturating_mul(3).max(Duration::from_millis(250)),
+                replacement_abort.wait_attached()
+            )
+            .await
+            .expect("same-carrier QUIC reattachment timeout"),
+            "the same live QUIC carrier must be eligible again after suppression expires"
+        );
+        assert!(
+            aborted_at.elapsed() + Duration::from_millis(3) >= pto,
+            "reattachment occurred before its path-derived PTO"
+        );
+        drop(replacement_abort);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let attached = {
+                    let health = context.health().lock().expect("health lock");
+                    let quic = &health.udp[0];
+                    quic.active_flows == 1
+                        && quic.path_instance_id() == Some(quic_instance)
+                        && quic.accepts_product_commit(quic_instance)
+                        && quic.consecutive_failures == 0
+                };
+                if attached {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement QUIC attachment did not settle");
+        assert_eq!(
+            carrier_network.socket_count(),
+            physical_socket_count,
+            "operation recovery must reuse the physical QUIC connection"
+        );
+        assert_eq!(
+            context.tcp_sessions[0].connection_instance_id(),
+            Some(tcp_instance)
+        );
+
+        target_release_tx.send(()).expect("release target");
+        writer.await.expect("pattern writer join");
+        let received = target_payload_rx.await.expect("target payload result");
+        assert_eq!(received.as_slice(), patterned.as_slice());
+        let mut done = [0_u8; 4];
+        response
+            .read_exact(&mut done)
+            .await
+            .expect("final response");
+        assert_eq!(&done, b"done");
+        drop(response);
+        product
+            .await
+            .expect("product join")
+            .expect("product completion");
+
+        tcp_server.abort();
+        let _ = tcp_server.await;
+        udp_server.abort();
+        let _ = udp_server.await;
+        server_relay.abort();
+        let _ = server_relay.await;
+        target.await.expect("target join");
+    })
+    .await
+    .expect("focused QUIC attachment recovery exceeded three seconds");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

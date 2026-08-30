@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
-use crate::model::path::next_carrier_path_instance_id;
+use crate::model::path::{RelayPathInstance, next_carrier_path_instance_id};
 use crate::protocol::{PathId, PathUsage, TargetAddr};
 use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
@@ -74,6 +74,48 @@ fn bulk_path_opens_do_not_serialize_tcp_and_quic() {
     assert_eq!(
         reliable_relay_available_path_open_candidates(candidates.clone(), &HashMap::new()),
         candidates,
+    );
+}
+
+#[test]
+fn bulk_path_open_does_not_bypass_stream_local_failure_suppression() {
+    let context = ClientPathContext::new(
+        vec![
+            "quic://127.0.0.1:10908"
+                .parse::<PathSpec>()
+                .expect("test path"),
+        ],
+        ClientSecurityConfig::for_test(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+        ),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let failed = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let failed_instance = RelayPathInstance {
+        key: failed,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 1,
+    };
+    context.install_relay_path_instance_for_test(failed_instance);
+    let mut suppressions = ClientRelayPathOpenSuppressions::default();
+    suppressions.suppress(
+        failed_instance,
+        tokio::time::Instant::now() + Duration::from_secs(60),
+    );
+    let candidates = reliable_relay_bulk_path_open_candidates(
+        &context,
+        vec![failed],
+        &suppressions,
+        &HashMap::new(),
+    );
+
+    assert!(
+        candidates.is_empty(),
+        "bulk expansion must consult the same logical-stream retry bound as recovery"
     );
 }
 
@@ -281,7 +323,7 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
         ReliableRelayPathLanes::same(TrafficClass::Latency),
         &remotes,
         &send_stream,
-        &HashSet::new(),
+        &ClientRelayPathOpenSuppressions::default(),
         &mut pending,
         &result_tx,
     ));
@@ -337,7 +379,7 @@ async fn recovery_open_adds_one_unattached_path_to_an_existing_set() {
 }
 
 #[test]
-fn asynchronous_recovery_open_selects_one_non_excluded_path() {
+fn asynchronous_recovery_open_selects_one_non_suppressed_path() {
     let tcp0 = RelayPathKey {
         underlay: UnderlayProtocol::Tcp,
         index: 0,
@@ -351,23 +393,123 @@ fn asynchronous_recovery_open_selects_one_non_excluded_path() {
         index: 0,
     };
     let pending = HashMap::new();
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:10909",
+            "tcp://127.0.0.1:10910",
+            "quic://127.0.0.1:10911",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        ClientSecurityConfig::for_test(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+        ),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let tcp0_instance = RelayPathInstance {
+        key: tcp0,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 1,
+    };
+    context.install_relay_path_instance_for_test(tcp0_instance);
+    let mut suppressions = ClientRelayPathOpenSuppressions::default();
+    suppressions.suppress(
+        tcp0_instance,
+        tokio::time::Instant::now() + Duration::from_secs(60),
+    );
 
     assert_eq!(
         reliable_relay_recovery_path_open_candidates(
+            &context,
             vec![tcp0, tcp1, udp0],
-            &HashSet::new(),
+            &ClientRelayPathOpenSuppressions::default(),
             &pending,
         ),
         vec![tcp0],
     );
     assert_eq!(
         reliable_relay_recovery_path_open_candidates(
+            &context,
             vec![tcp0, tcp1, udp0],
-            &HashSet::from([tcp0]),
+            &suppressions,
             &pending,
         ),
         vec![tcp1],
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn disconnected_path_open_waits_for_exact_suppression_deadline() {
+    let context = ClientPathContext::new(
+        vec![
+            "quic://127.0.0.1:10912"
+                .parse::<PathSpec>()
+                .expect("test path"),
+        ],
+        ClientSecurityConfig::for_test(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+        ),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let stream_id = StreamId(908);
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    let opened = OpenedRemoteStream::pending(
+        test_stream(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            commands,
+            TrafficClass::Latency,
+        ),
+        0,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let failed = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(failed);
+    drop(
+        remotes
+            .remove_path_instance(failed)
+            .expect("remove failed attachment"),
+    );
+    let retry_delay = Duration::from_secs(1);
+    let mut suppressions = ClientRelayPathOpenSuppressions::default();
+    suppressions.suppress(failed, tokio::time::Instant::now() + retry_delay);
+    let spec = ReliableRelayOpenSpec::new(
+        TargetAddr::Ip("127.0.0.1:9".parse().expect("test target")),
+        TrafficClass::Latency,
+    );
+    let send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let mut attempted = HashSet::new();
+    let mut pending = HashMap::new();
+    let (result_tx, _result_rx) = mpsc::channel(1);
+
+    assert!(!spawn_reliable_relay_disconnected_path_open(
+        &context,
+        &spec,
+        ReliableRelayPathLanes::same(TrafficClass::Latency),
+        &remotes,
+        &send_stream,
+        &suppressions,
+        &mut attempted,
+        &mut pending,
+        &result_tx,
+    ));
+    tokio::time::advance(retry_delay).await;
+    assert!(spawn_reliable_relay_disconnected_path_open(
+        &context,
+        &spec,
+        ReliableRelayPathLanes::same(TrafficClass::Latency),
+        &remotes,
+        &send_stream,
+        &suppressions,
+        &mut attempted,
+        &mut pending,
+        &result_tx,
+    ));
+    cancel_pending_additional_path_opens(stream_id, &mut pending);
 }
 
 #[tokio::test]

@@ -10,7 +10,6 @@ use crate::runtime::path::commands::{
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
 use bytes::Bytes;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -28,15 +27,31 @@ fn test_opened_remote_stream(
     commands: crate::runtime::path::commands::ReliablePathCommandSender,
     frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
 ) -> OpenedRemoteStream {
+    test_opened_remote_stream_on(
+        stream_id,
+        path_index,
+        UnderlayProtocol::Tcp,
+        commands,
+        frames,
+    )
+}
+
+fn test_opened_remote_stream_on(
+    stream_id: StreamId,
+    path_index: usize,
+    underlay: UnderlayProtocol,
+    commands: crate::runtime::path::commands::ReliablePathCommandSender,
+    frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+) -> OpenedRemoteStream {
     OpenedRemoteStream::pending(
         ReliablePathStream {
             stream_id,
             max_offset: MuxLimits::default().max_stream_window_bytes,
             lane: TrafficClass::Latency,
-            underlay: UnderlayProtocol::Tcp,
+            underlay,
             max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
             output: ReliablePathStreamOutput::fixed(
-                UnderlayProtocol::Tcp,
+                underlay,
                 PathId(path_index as u16),
                 commands,
                 MuxLimits::default(),
@@ -124,27 +139,27 @@ async fn stale_path_failure_does_not_blacklist_same_key_successor() {
     assert_ne!(successor, stale);
 
     let mut sender = RequestSenderService::new(stream_id);
-    let mut excluded = HashSet::new();
+    let mut suppressions = ClientRelayPathOpenSuppressions::default();
     resolve_client_relay_path_error(
         &mut sender,
         &context,
         &mut remotes,
-        &mut excluded,
+        &mut suppressions,
         stale,
-        false,
+        &RuntimeError::ReliablePathSessionClosed,
     )
     .await;
 
     assert_eq!(remotes.paths.len(), 1);
     assert_eq!(remotes.paths[0].instance(), successor);
     assert!(
-        !excluded.contains(&successor.key),
+        !suppressions.blocks(&context, successor.key, tokio::time::Instant::now()),
         "a delayed exact-instance miss must not blacklist the live same-key successor"
     );
 }
 
 #[tokio::test]
-async fn matching_path_failure_still_removes_and_excludes_the_failed_key() {
+async fn matching_path_failure_still_removes_and_suppresses_the_failed_instance() {
     let stream_id = StreamId(906);
     let path = "tcp://127.0.0.1:10906"
         .parse::<PathSpec>()
@@ -160,22 +175,83 @@ async fn matching_path_failure_still_removes_and_excludes_the_failed_key() {
     let failed = remotes.paths[0].instance();
     context.install_relay_path_instance_for_test(failed);
     let mut sender = RequestSenderService::new(stream_id);
-    let mut excluded = HashSet::new();
+    let mut suppressions = ClientRelayPathOpenSuppressions::default();
 
     resolve_client_relay_path_error(
         &mut sender,
         &context,
         &mut remotes,
-        &mut excluded,
+        &mut suppressions,
         failed,
-        false,
+        &RuntimeError::ReliablePathSessionClosed,
     )
     .await;
 
     assert!(remotes.is_empty());
-    assert!(excluded.contains(&failed.key));
+    assert!(suppressions.blocks(&context, failed.key, tokio::time::Instant::now()));
     let health = context.health().lock().expect("path health");
     assert_eq!(health.tcp[0].consecutive_failures, 1);
+}
+
+#[tokio::test]
+async fn quic_request_stream_abandonment_detaches_only_its_logical_attachment() {
+    let stream_id = StreamId(907);
+    let path = "quic://127.0.0.1:10907"
+        .parse::<PathSpec>()
+        .expect("test QUIC path");
+    let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
+        .expect("client context");
+    let (commands, _command_receivers) = reliable_path_command_channels(8);
+    let (frames_tx, frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream_on(stream_id, 0, UnderlayProtocol::Udp, commands, frames_rx),
+        8,
+    );
+    let attached = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(attached);
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut suppressions = ClientRelayPathOpenSuppressions::default();
+    frames_tx
+        .send(Err(RuntimeError::QuicCarrier(
+            crate::transport::quic::QuicCarrierError::H3Stream(
+                h3::error::StreamError::RemoteTerminate {
+                    code: h3::error::Code::from(0_u64),
+                },
+            ),
+        )))
+        .await
+        .expect("publish request-stream abandonment");
+    wait_for_buffered_remote_frame(&remotes).await;
+    let ReliableRelayRemoteFrame { instance, frame } = remotes
+        .recv_frame()
+        .await
+        .expect("forwarded request-stream abandonment");
+    let error = frame.expect_err("request stream must report its abandonment");
+    assert!(reliable_path_error_is_migratable(&error));
+
+    resolve_client_relay_path_error(
+        &mut sender,
+        &context,
+        &mut remotes,
+        &mut suppressions,
+        instance,
+        &error,
+    )
+    .await;
+
+    assert!(remotes.is_empty(), "only the abandoned attachment retires");
+    assert!(
+        suppressions.blocks(&context, attached.key, tokio::time::Instant::now()),
+        "the failed logical stream must not immediately reopen the same QUIC request path"
+    );
+    let health = context.health().lock().expect("QUIC path health");
+    let record = &health.udp[0];
+    assert_eq!(record.path_instance_id(), Some(attached.path_instance_id));
+    assert!(
+        record.accepts_product_commit(attached.path_instance_id),
+        "a request-stream reset must leave the shared QUIC carrier eligible"
+    );
+    assert_eq!(record.consecutive_failures, 0);
 }
 
 #[tokio::test]

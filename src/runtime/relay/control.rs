@@ -1,7 +1,7 @@
 use super::client::{
-    ClientRelayDisconnectedState, ClientRelayState, ClientStreamAckContext,
-    apply_client_stream_ack, apply_client_stream_data_state, evaluate_client_data_ack_reinjection,
-    update_request_path_staleness,
+    ClientRelayDisconnectedState, ClientRelayPathOpenSuppressions, ClientRelayState,
+    ClientStreamAckContext, apply_client_stream_ack, apply_client_stream_data_state,
+    evaluate_client_data_ack_reinjection, update_request_path_staleness,
 };
 use super::diagnostics::log_unexpected_stream_relay_frame;
 use super::flow::{
@@ -14,7 +14,7 @@ use super::io::{
     stream_data_range_already_delivered, stream_terminal_fin_replay_required,
 };
 use super::lifecycle::{
-    attach_reliable_relay_paths_with_recovery_exclusions, cancel_pending_additional_path_opens,
+    attach_reliable_relay_paths_with_suppressions, cancel_pending_additional_path_opens,
     drain_completed_additional_path_opens, handle_additional_path_open_result,
     recover_reliable_relay_after_path_failure, reliable_relay_can_send_pending_fin,
     reliable_relay_disconnected_retry_delay, reliable_relay_lane_changed,
@@ -36,7 +36,7 @@ use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_relay_buffer_len,
     reliable_relay_sender_dispatch_budget, reliable_stream_initial_advertised_window_bytes,
 };
-use crate::model::timing::sender_service_retry_delay;
+use crate::model::timing::{sender_service_retry_delay, transport_pto_from_snapshot};
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::performance::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
@@ -44,6 +44,7 @@ use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, ResetReason};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
+use crate::runtime::path::quic::client::ClientUdpErrorDisposition;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::product_lifecycle::{ProductFlowActivity, ProductFlowActivityIo};
 use crate::runtime::sender::{
@@ -119,20 +120,68 @@ async fn resolve_client_relay_path_error(
     sender: &mut RequestSenderService,
     context: &ClientPathContext,
     remotes: &mut ReliableRelayRemoteSet,
-    recovery_excluded_paths: &mut std::collections::HashSet<crate::model::path::RelayPathKey>,
+    path_open_suppressions: &mut ClientRelayPathOpenSuppressions,
     instance: crate::model::path::RelayPathInstance,
-    planned_retirement: bool,
+    source: &RuntimeError,
 ) {
-    if planned_retirement {
+    if matches!(source, RuntimeError::ReliablePathRetired) {
         remotes.retire_path_instance(instance).await;
-    } else {
-        let removed = sender
-            .fail_client_path_instance(context, remotes, instance)
-            .await;
-        if removed {
-            recovery_excluded_paths.insert(instance.key);
-        }
+        return;
     }
+
+    let retry_at = tokio::time::Instant::now()
+        + transport_pto_from_snapshot(context.reliable_path_snapshot_for_instance(instance));
+    let removed = if instance.key.underlay == crate::protocol::UnderlayProtocol::Udp {
+        // Operation-local evidence does not authorize carrier failure, but
+        // settlement also observes an independently closed exact owner so a
+        // concurrently dead connection cannot remain published.
+        let disposition = context.udp_sessions[instance.key.index]
+            .settle_established_error(instance.path_instance_id, source)
+            .await;
+        match disposition {
+            ClientUdpErrorDisposition::Session => {
+                debug_assert!(
+                    false,
+                    "session-terminal QUIC error must bypass path-local recovery"
+                );
+                return;
+            }
+            ClientUdpErrorDisposition::CarrierLifetime | ClientUdpErrorDisposition::Operation => {}
+        }
+        // This exact-instance PTO suppression belongs only to the affected
+        // logical Product stream. It bounds immediate recovery retries without
+        // fencing sibling streams; after the deadline, the same live carrier
+        // may own a fresh attachment incarnation as RFC 8.1 permits.
+        remotes.retire_path_instance(instance).await
+    } else {
+        sender
+            .fail_client_path_instance(context, remotes, instance)
+            .await
+    };
+    if removed {
+        path_open_suppressions.suppress(instance, retry_at);
+    }
+}
+
+#[cfg(test)]
+pub(in crate::runtime) async fn resolve_client_relay_path_error_for_test(
+    sender: &mut RequestSenderService,
+    context: &ClientPathContext,
+    remotes: &mut ReliableRelayRemoteSet,
+    instance: crate::model::path::RelayPathInstance,
+    source: &RuntimeError,
+) -> bool {
+    let mut path_open_suppressions = ClientRelayPathOpenSuppressions::default();
+    resolve_client_relay_path_error(
+        sender,
+        context,
+        remotes,
+        &mut path_open_suppressions,
+        instance,
+        source,
+    )
+    .await;
+    path_open_suppressions.blocks(context, instance.key, tokio::time::Instant::now())
 }
 
 fn record_final_recv_progress_enqueue(
@@ -359,6 +408,10 @@ where
         if remotes.is_empty() {
             let now = Instant::now();
             let now_async = tokio::time::Instant::now();
+            let path_open_suppression_retry_at = state
+                .recovery
+                .path_open_suppressions
+                .next_retry_at(context, now_async);
             let disconnected = state
                 .recovery
                 .disconnected
@@ -380,12 +433,16 @@ where
                     ReliableRelayPathLanes::new(topology_lane, request_lane),
                     &remotes,
                     &send_stream,
+                    &state.recovery.path_open_suppressions,
                     &mut disconnected.attempted_paths,
                     &mut state.recovery.pending_additional_path_opens,
                     &additional_path_open_tx,
                 );
                 if !spawned {
-                    disconnected.retry_after(reliable_relay_disconnected_retry_delay());
+                    let ordinary_retry_at = now_async + reliable_relay_disconnected_retry_delay();
+                    disconnected.retry_at = path_open_suppression_retry_at
+                        .map(|suppression_retry_at| suppression_retry_at.min(ordinary_retry_at))
+                        .unwrap_or(ordinary_retry_at);
                 }
             }
 
@@ -696,6 +753,7 @@ where
                 ReliableRelayPathLanes::new(TrafficClass::Throughput, request_lane),
                 &remotes,
                 &send_stream,
+                &state.recovery.path_open_suppressions,
                 &mut state.recovery.pending_additional_path_opens,
                 &additional_path_open_tx,
             ) {
@@ -742,6 +800,7 @@ where
                     ReliableRelayPathLanes::new(topology_lane, request_lane),
                     &remotes,
                     &send_stream,
+                    &state.recovery.path_open_suppressions,
                     &mut state.recovery.pending_additional_path_opens,
                     &additional_path_open_tx,
                 ) {
@@ -755,6 +814,7 @@ where
                 &send_stream,
                 !state.endpoint.local_open,
                 ReliableRelayAttachMode::BulkStriping,
+                &state.recovery.path_open_suppressions,
                 &state.recovery.pending_additional_path_opens,
             )
             .await
@@ -1163,7 +1223,17 @@ where
             }
         }
 
+        let path_open_suppression_retry_at = state
+            .recovery
+            .path_open_suppressions
+            .next_retry_at(context, tokio::time::Instant::now());
+
         tokio::select! {
+            _ = wait_for_optional_deadline(path_open_suppression_retry_at), if path_open_suppression_retry_at.is_some() => {
+                // Re-enter serialized demand/recovery decisions exactly when
+                // the failed attachment's path-derived retry bound expires.
+                continue;
+            }
             _ = async move {
                 if let Some(publication) = data_ack_path_model_publication {
                     publication.await;
@@ -1234,7 +1304,7 @@ where
                     ReliableRelayPathLanes::new(response_lane, request_lane),
                     &remotes,
                     &send_stream,
-                    &state.recovery.excluded_paths,
+                    &state.recovery.path_open_suppressions,
                     &mut state.recovery.pending_additional_path_opens,
                     &additional_path_open_tx,
                 );
@@ -1307,7 +1377,7 @@ where
                         ReliableRelayPathLanes::new(topology_lane, request_lane),
                         &remotes,
                         &send_stream,
-                        &state.recovery.excluded_paths,
+                        &state.recovery.path_open_suppressions,
                         &mut state.recovery.pending_additional_path_opens,
                         &additional_path_open_tx,
                     );
@@ -1365,7 +1435,7 @@ where
                         ReliableRelayPathLanes::new(topology_lane, request_lane),
                         &remotes,
                         &send_stream,
-                        &state.recovery.excluded_paths,
+                        &state.recovery.path_open_suppressions,
                         &mut state.recovery.pending_additional_path_opens,
                         &additional_path_open_tx,
                     );
@@ -1409,7 +1479,7 @@ where
                         if remotes.is_empty() {
                             continue;
                         }
-                        match attach_reliable_relay_paths_with_recovery_exclusions(
+                        match attach_reliable_relay_paths_with_suppressions(
                             context,
                             &spec,
                             ReliableRelayPathLanes::new(response_lane, request_lane),
@@ -1417,7 +1487,7 @@ where
                             &send_stream,
                             !state.endpoint.local_open,
                             ReliableRelayAttachMode::Any,
-                            &mut state.recovery.excluded_paths,
+                            &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
                         .await
@@ -1492,7 +1562,7 @@ where
                         if remotes.is_empty() {
                             continue;
                         }
-                        match attach_reliable_relay_paths_with_recovery_exclusions(
+                        match attach_reliable_relay_paths_with_suppressions(
                             context,
                             &spec,
                             ReliableRelayPathLanes::new(response_lane, request_lane),
@@ -1500,7 +1570,7 @@ where
                             &send_stream,
                             !state.endpoint.local_open,
                             ReliableRelayAttachMode::Any,
-                            &mut state.recovery.excluded_paths,
+                            &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
                         .await
@@ -1536,7 +1606,7 @@ where
                         if remotes.is_empty() {
                             continue;
                         }
-                        match attach_reliable_relay_paths_with_recovery_exclusions(
+                        match attach_reliable_relay_paths_with_suppressions(
                             context,
                             &spec,
                             ReliableRelayPathLanes::new(request_lane, request_lane),
@@ -1544,7 +1614,7 @@ where
                             &send_stream,
                             true,
                             ReliableRelayAttachMode::Any,
-                            &mut state.recovery.excluded_paths,
+                            &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
                         .await
@@ -1598,7 +1668,7 @@ where
                         if remotes.is_empty() {
                             continue;
                         }
-                        match attach_reliable_relay_paths_with_recovery_exclusions(
+                        match attach_reliable_relay_paths_with_suppressions(
                             context,
                             &spec,
                             ReliableRelayPathLanes::new(request_lane, request_lane),
@@ -1606,7 +1676,7 @@ where
                             &send_stream,
                             true,
                             ReliableRelayAttachMode::Any,
-                            &mut state.recovery.excluded_paths,
+                            &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
                         .await
@@ -1680,7 +1750,7 @@ where
                                 state.progress.sender_retry_at = None;
                                 break;
                             }
-                            match attach_reliable_relay_paths_with_recovery_exclusions(
+                            match attach_reliable_relay_paths_with_suppressions(
                                 context,
                                 &spec,
                                 ReliableRelayPathLanes::new(request_lane, request_lane),
@@ -1688,7 +1758,7 @@ where
                                 &send_stream,
                                 !state.endpoint.local_open,
                                 ReliableRelayAttachMode::Any,
-                                &mut state.recovery.excluded_paths,
+                                &state.recovery.path_open_suppressions,
                                 &state.recovery.pending_additional_path_opens,
                             )
                             .await
@@ -1970,7 +2040,7 @@ where
                 let ReliableRelayRemoteFrame { instance, frame } = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
-                        match attach_reliable_relay_paths_with_recovery_exclusions(
+                        match attach_reliable_relay_paths_with_suppressions(
                             context,
                             &spec,
                             ReliableRelayPathLanes::new(topology_lane, request_lane),
@@ -1978,7 +2048,7 @@ where
                             &send_stream,
                             !state.endpoint.local_open,
                             ReliableRelayAttachMode::Any,
-                            &mut state.recovery.excluded_paths,
+                            &state.recovery.path_open_suppressions,
                             &state.recovery.pending_additional_path_opens,
                         )
                         .await
@@ -2012,7 +2082,6 @@ where
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
-                        let planned_retirement = matches!(&err, RuntimeError::ReliablePathRetired);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "client_path_frame_error",
@@ -2030,9 +2099,9 @@ where
                             &mut sender,
                             context,
                             &mut remotes,
-                            &mut state.recovery.excluded_paths,
+                            &mut state.recovery.path_open_suppressions,
                             instance,
-                            planned_retirement,
+                            &err,
                         )
                         .await;
                         match recover_reliable_relay_after_path_failure(
@@ -2210,7 +2279,7 @@ where
                                 if remotes.is_empty() {
                                     continue;
                                 }
-                                match attach_reliable_relay_paths_with_recovery_exclusions(
+                                match attach_reliable_relay_paths_with_suppressions(
                                     context,
                                     &spec,
                                     ReliableRelayPathLanes::new(response_lane, request_lane),
@@ -2218,7 +2287,7 @@ where
                                     &send_stream,
                                     !state.endpoint.local_open,
                                     ReliableRelayAttachMode::Any,
-                                    &mut state.recovery.excluded_paths,
+                                    &state.recovery.path_open_suppressions,
                                     &state.recovery.pending_additional_path_opens,
                                 )
                                 .await
@@ -2315,7 +2384,7 @@ where
                                     if remotes.is_empty() {
                                         continue;
                                     }
-                                    match attach_reliable_relay_paths_with_recovery_exclusions(
+                                    match attach_reliable_relay_paths_with_suppressions(
                                         context,
                                         &spec,
                                         ReliableRelayPathLanes::new(request_lane, request_lane),
@@ -2323,7 +2392,7 @@ where
                                         &send_stream,
                                         true,
                                         ReliableRelayAttachMode::Any,
-                                        &mut state.recovery.excluded_paths,
+                                        &state.recovery.path_open_suppressions,
                                         &state.recovery.pending_additional_path_opens,
                                     )
                                     .await

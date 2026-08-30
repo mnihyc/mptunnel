@@ -26,6 +26,9 @@ use crate::transport::PathSpec;
 use crate::transport::quic::QuicCarrierError;
 use tokio::sync::OwnedSemaphorePermit;
 
+#[cfg(test)]
+pub(in crate::runtime) use super::server_stream::arm_server_udp_stream_abort_for_test;
+
 pub(in crate::runtime) async fn bind_server_udp_endpoint(
     path: &PathSpec,
     context: &ServerPathContext,

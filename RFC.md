@@ -2484,6 +2484,17 @@ credit is retained against the new bound, but a larger `B` does not itself
 mint credit. Negative debt is not retained, so the first recovered
 below-boundary round stops repeated multiplicative reductions.
 
+While `p0 > 0`, Startup MAY use an aligned compensated `round_high` as the
+high-loss leg of its native exit only if the exact completed epoch was
+application-limited in its delivery sample and the connection is still
+application-limited when the completing ACK transaction closes. Both
+predicates are REQUIRED; a stale send-time application-limited watermark MUST
+NOT terminate newly backlogged acquisition. A non-application-limited Startup
+MUST instead use its compensated full-bandwidth plateau unless a raw-authority
+decision applies. This gate supplements, and does not replace, the native
+full-round recovery and discontiguous loss-event criteria. It does not alter
+ProbeBW or `p0 = 0` behavior.
+
 Startup's loss-event criterion counts discontiguous packet-number ranges from
 the canonical records independently in each QUIC packet-number space; callback
 interleaving across spaces is not a range boundary. If missing evidence ends
@@ -2516,27 +2527,29 @@ The long delay close to `theta` is deliberate: loss-only observations cannot
 distinguish such a small excess from allowed placement or correlation.
 
 ECN, RFC 9002 persistent congestion, and missing or unalignable evidence
-bypass the envelope and retain raw native authority. The exempt record cohort
-is the same cohort consumed by that raw decision, so a missing snapshot or
-persistent batch cannot receive a native response and later be charged again
-as ordinary loss. Persistent congestion unconditionally terminates an active
-ProbeBW Up once per batch; its authority cannot be diluted by whichever packet
-callback happened last. ECN without actual loss exempts no bytes. A valid
-late-ACK proof reclassifies only records owned by that exact recovery
-transaction; newer or unrelated same-ACK evidence remains intact. Native BBR
-state rollback remains limited to the exact current transaction and is refused
-when its snapshot predates an older still-open decision cohort or any newer raw
-authority. Final older state already represented by the snapshot is preserved.
-Bucket replay remains exact and independent of that conservative native-undo
-gate. NAT rebinding retains the controller and its envelope; a genuinely new
-path starts fresh. With `p0 = 0`, none of this state participates and draft BBR
-behavior remains bit-for-bit authoritative.
+bypass the envelope and the compensated Startup gate, retaining whatever raw
+native Startup authority applies. The exempt record cohort is the same cohort
+consumed by that raw decision, so a missing snapshot or persistent batch cannot
+receive a native response and later be charged again as ordinary loss.
+Persistent congestion unconditionally terminates an active ProbeBW Up once per
+batch; its authority cannot be diluted by whichever packet callback happened
+last. ECN without actual loss exempts no bytes. A valid late-ACK proof
+reclassifies only records owned by that exact recovery transaction; newer or
+unrelated same-ACK evidence remains intact. Native BBR state rollback remains
+limited to the exact current transaction and is refused when its snapshot
+predates an older still-open decision cohort or any newer raw authority. Final
+older state already represented by the snapshot is preserved. Bucket replay
+remains exact and independent of that conservative native-undo gate. NAT
+rebinding retains the controller and its envelope; a genuinely new path starts
+fresh. With `p0 = 0`, none of this state participates and draft BBR behavior
+remains bit-for-bit authoritative.
 
-Changing `q` is not a substitute for changing `p0`: `q` controls when the
-native controller reacts to the residual loss, whereas `p0` repairs the
-delivery and inflight evidence that would otherwise ratchet downward under
-sustained post-service erasure. The preferred MPTUNNEL profile uses `p0 = 10%`
-and retains the BBR draft's `q = 2%`, producing an aggregate boundary of
+Changing `q` is not a substitute for changing `p0`: `q` controls the residual
+loss boundary where the current controller state grants that decision
+authority, whereas `p0` repairs the delivery and inflight evidence that would
+otherwise ratchet downward under sustained post-service erasure. It does not
+override the Startup gate above. The preferred MPTUNNEL profile uses `p0 =
+10%` and retains the BBR draft's `q = 2%`, producing an aggregate boundary of
 11.8%. A sender may select `p0 = 0` for unmodified draft behavior. ECN,
 persistent congestion, and unknown aggregate evidence continue to require the
 controller's ordinary congestion response; the allowance does not create a

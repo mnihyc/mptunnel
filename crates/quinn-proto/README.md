@@ -86,7 +86,10 @@ deviations from upstream 0.11.17 are:
   boundaries, so correlated placement cannot repeatedly turn a population
   allowance into per-round false congestion. Unknown evidence stays
   conservative, and ECN and persistent congestion retain their native response
-  authority;
+  authority. In Startup, an aligned compensated crossing retains the high-loss
+  exit only for an exact epoch that was and remains application-limited;
+  backlogged acquisition uses the compensated full-bandwidth plateau, while
+  raw signals, zero policy, and ProbeBW retain native behavior;
 - an opt-in controller hook lets a genuinely new network path start fresh
   congestion state while retaining a connection-scoped instrumentation owner;
   controllers that do not implement the hook retain Quinn's factory-reset

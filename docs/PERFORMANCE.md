@@ -53,11 +53,13 @@ ranking.
   the first exact data range ahead of a qualified lower-completion QUIC
   frontier, while bounded liveness fallback and ordinary reinjection behavior
   remain intact.
-- QUIC Startup under an authorized erasure contract now requires raw congestion
-  authority before high-loss exit. Immediate randomized loss no longer ends
-  Startup before representative bandwidth acquisition; the accepted recovery
-  gate remains green, and draft loss exit, persistent congestion, and ECN
-  authority tests remain unchanged.
+- QUIC Startup under an authorized erasure contract keeps backlogged capacity
+  acquisition on the compensated full-bandwidth plateau. An aligned
+  compensated high-loss exit remains available only when the exact completed
+  epoch was and remains application-limited; raw congestion authority and
+  zero-policy draft behavior are unchanged. Immediate randomized loss no
+  longer ends backlogged Startup before representative bandwidth acquisition,
+  while sustained app-limited excess loss retains its native escape.
 
 ## Historical accepted fixed-profile evidence (v0.2.1–v0.2.2)
 

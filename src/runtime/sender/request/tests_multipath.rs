@@ -5,7 +5,9 @@ use super::super::test_support::{
 use super::*;
 use crate::model::capacity::{PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS};
 use crate::model::path::{PathPolicy, next_carrier_path_instance_id};
+use crate::model::requalification::StreamPathQualification;
 use crate::model::request_evidence::RequestPerFlowRateModel;
+use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{PathId, PathUsage};
 use crate::runtime::path::commands::{
@@ -153,7 +155,7 @@ async fn ordinary_data_does_not_borrow_a_successor_carriers_health() {
         TrafficClass::Latency,
         4096,
         false,
-        &HashSet::new(),
+        &StreamPathRequalification::default(),
     );
     let predecessor_observation = observation
         .path_by_instance(predecessor)
@@ -185,7 +187,7 @@ async fn exact_current_unmeasured_attachment_keeps_startup_admission() {
         TrafficClass::Latency,
         4096,
         false,
-        &HashSet::new(),
+        &StreamPathRequalification::default(),
     );
     let current_observation = observation
         .path_by_instance(current)
@@ -1326,19 +1328,100 @@ async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
 }
 
 #[tokio::test]
-async fn product_ack_returns_the_exact_path_that_made_progress() {
-    let (context, remotes, tcp, _udp) = mixed_remote_set().await;
+async fn request_requalification_needs_exact_probe_then_fresh_original_ack() {
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
     let stream_id = StreamId(18);
     let payload_bytes = 4096;
-    let frame = data_frame(stream_id, 0, payload_bytes);
-    let mut controller = RequestMultipathController::new(stream_id);
-    assert!(controller.mark_path_stale(tcp));
-    controller
-        .request
-        .flights
-        .record_original_frame_instance(tcp, &frame);
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
+    let tcp = remotes.paths[0].instance();
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        udp_commands,
+    ));
+    let udp = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("healthy UDP attachment")
+        .instance();
+    consume_client_path_proof_for_test(&mut tcp_receivers);
+    consume_client_path_proof_for_test(&mut udp_receivers);
+    context.install_relay_path_instance_for_test(tcp);
+    context.install_relay_path_instance_for_test(udp);
 
-    let data_ack_progress_paths = controller.apply_product_ack(
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let old = send_stream
+        .send_data(Bytes::from(vec![0x31; payload_bytes]))
+        .expect("pre-stale candidate data");
+    let healthy = send_stream
+        .send_data(Bytes::from(vec![0x32; payload_bytes]))
+        .expect("healthy retained probe source");
+    let fresh = send_stream
+        .send_data(Bytes::from(vec![0x33; payload_bytes]))
+        .expect("post-probe candidate data");
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(tcp, &old);
+    controller.record_original_frame_for_test(udp, &healthy);
+    assert!(controller.mark_path_stale(tcp));
+    assert!(matches!(
+        controller.try_enqueue_requalification_probe(
+            &context,
+            &remotes,
+            &send_stream,
+            TrafficClass::Throughput,
+            payload_bytes,
+        ),
+        Ok(Some(bytes)) if bytes == payload_bytes
+    ));
+    let probe = match try_recv_reliable_path_command(&mut tcp_receivers) {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamRequalifyData {
+            probe_id,
+            offset,
+            payload,
+            ..
+        })) => StreamRequalificationProbe {
+            id: probe_id,
+            offset,
+            payload_bytes: payload.len() as u32,
+        },
+        _ => panic!("stale exact attachment receives the requalification probe"),
+    };
+    assert_eq!(probe.offset, 0);
+    assert_eq!(
+        controller.latest_unacked_ranges_for_path_instance(tcp),
+        vec![OffsetRange {
+            start: 0,
+            end: payload_bytes as u64,
+        }],
+        "a same-owner probe never becomes an alternate DSN owner"
+    );
+    assert_eq!(
+        controller.latest_unacked_ranges_for_path_instance(udp),
+        vec![OffsetRange {
+            start: payload_bytes as u64,
+            end: (payload_bytes * 2) as u64,
+        }]
+    );
+
+    assert!(!controller.acknowledge_requalification_probe(udp, probe,));
+    assert!(!controller.acknowledge_requalification_probe(
+        tcp,
+        StreamRequalificationProbe {
+            id: probe.id + 1,
+            ..probe
+        },
+    ));
+    assert!(controller.path_is_stale(tcp));
+    assert!(controller.acknowledge_requalification_probe(tcp, probe));
+    assert!(controller.request.requalification.state(tcp).acquiring());
+
+    let old_progress = controller.apply_product_ack(
         &context,
         &remotes,
         &[OffsetRange {
@@ -1347,12 +1430,254 @@ async fn product_ack_returns_the_exact_path_that_made_progress() {
         }],
         Instant::now(),
     );
+    assert!(old_progress.is_empty());
+    assert!(controller.request.requalification.state(tcp).acquiring());
+    assert!(
+        !controller
+            .request
+            .path_states
+            .get(tcp)
+            .is_some_and(|state| state.has_product_evidence()),
+        "pre-stale ACK releases credit but cannot rebuild acquisition authority"
+    );
+    assert!(!controller.acknowledge_requalification_probe(tcp, probe));
 
-    assert_eq!(data_ack_progress_paths.as_slice(), &[tcp]);
+    controller.record_original_frame_for_test(tcp, &fresh);
+    let fresh_progress = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: (payload_bytes * 2) as u64,
+            end: (payload_bytes * 3) as u64,
+        }],
+        Instant::now(),
+    );
+    assert_eq!(fresh_progress.as_slice(), &[tcp]);
     assert!(
         !controller.path_is_stale(tcp),
-        "exact Data ACK progress makes the path schedulable again"
+        "only post-probe uniquely owned OriginalData qualifies the attachment"
     );
+    assert_eq!(
+        controller.request.requalification.state(tcp),
+        StreamPathQualification::Qualified
+    );
+}
+
+#[tokio::test]
+async fn quic_only_stale_fallback_can_requalify_without_a_qualified_source() {
+    let context = client_test_context_with_paths(&["quic://127.0.0.1:10252"]);
+    let stream_id = StreamId(181);
+    let payload_bytes = 4096;
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+    let remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
+        8,
+    );
+    let quic = remotes.paths[0].instance();
+    consume_client_path_proof_for_test(&mut receivers);
+    context.install_relay_path_instance_for_test(quic);
+
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let fallback = send_stream
+        .send_data(Bytes::from(vec![0x51; payload_bytes]))
+        .expect("sole-stale fallback Product data");
+    let mut controller = RequestMultipathController::new(stream_id);
+    assert!(controller.mark_path_stale(quic));
+    controller.record_original_frame_for_test(quic, &fallback);
+    assert!(controller.path_is_stale(quic));
+
+    assert!(matches!(
+        controller.try_enqueue_requalification_probe(
+            &context,
+            &remotes,
+            &send_stream,
+            TrafficClass::Throughput,
+            payload_bytes,
+        ),
+        Ok(Some(bytes)) if bytes == payload_bytes
+    ));
+    let probe = match try_recv_reliable_path_command(&mut receivers) {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamRequalifyData {
+            probe_id,
+            offset,
+            payload,
+            ..
+        })) => StreamRequalificationProbe {
+            id: probe_id,
+            offset,
+            payload_bytes: payload.len() as u32,
+        },
+        _ => panic!("sole stale QUIC attachment receives the exact probe"),
+    };
+    assert_eq!(probe.offset, 0);
+    assert_eq!(
+        controller.latest_unacked_ranges_for_path_instance(quic),
+        vec![OffsetRange {
+            start: 0,
+            end: payload_bytes as u64,
+        }],
+        "the probe adds no alternate DSN owner"
+    );
+    assert!(controller.acknowledge_requalification_probe(quic, probe));
+    assert!(controller.request.requalification.state(quic).acquiring());
+
+    let fresh = send_stream
+        .send_data(Bytes::from(vec![0x52; payload_bytes]))
+        .expect("post-probe fresh Product data");
+    controller.record_original_frame_for_test(quic, &fresh);
+    assert_eq!(
+        controller
+            .apply_product_ack(
+                &context,
+                &remotes,
+                &[OffsetRange {
+                    start: payload_bytes as u64,
+                    end: (payload_bytes * 2) as u64,
+                }],
+                Instant::now(),
+            )
+            .as_slice(),
+        &[quic]
+    );
+    assert_eq!(
+        controller.request.requalification.state(quic),
+        StreamPathQualification::Qualified
+    );
+}
+
+#[tokio::test]
+async fn requalification_skips_draining_and_full_stale_attachments() {
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10251",
+        "tcp://127.0.0.1:10252",
+        "tcp://127.0.0.1:10253",
+    ]);
+    let stream_id = StreamId(182);
+    let (draining_commands, mut draining_receivers) = reliable_path_command_channels(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream(stream_id, 0, draining_commands.clone()),
+        8,
+    );
+    let draining = remotes.paths[0].instance();
+    let (full_commands, mut full_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_test_relay_stream(
+        stream_id,
+        1,
+        full_commands.clone(),
+    ));
+    let full = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("full attachment")
+        .instance();
+    let (ready_commands, mut ready_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, ready_commands));
+    let ready = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("ready attachment")
+        .instance();
+    consume_client_path_proof_for_test(&mut draining_receivers);
+    consume_client_path_proof_for_test(&mut full_receivers);
+    consume_client_path_proof_for_test(&mut ready_receivers);
+    draining_commands.begin_path_drain();
+    full_commands
+        .try_enqueue_reinjection_frame(data_frame(StreamId(999), 0, 4096), TrafficClass::Throughput)
+        .expect("fill first active candidate reinjection queue");
+
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let source = send_stream
+        .send_data(Bytes::from(vec![0x71; 4096]))
+        .expect("retained fallback source");
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(ready, &source);
+    assert!(controller.mark_path_stale(draining));
+    assert!(controller.mark_path_stale(full));
+    assert!(controller.mark_path_stale(ready));
+
+    assert!(matches!(
+        controller.try_enqueue_requalification_probe(
+            &context,
+            &remotes,
+            &send_stream,
+            TrafficClass::Throughput,
+            4096,
+        ),
+        Ok(Some(4096))
+    ));
+    assert!(try_recv_reliable_path_command(&mut draining_receivers).is_none());
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut full_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: StreamId(999),
+            ..
+        }))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut ready_receivers),
+        Some(ReliablePathCommand::SendFrame(
+            Frame::StreamRequalifyData { .. }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn all_full_stale_requalification_returns_bounded_backpressure() {
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
+    let stream_id = StreamId(183);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream(stream_id, 0, first_commands.clone()),
+        8,
+    );
+    let first = remotes.paths[0].instance();
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_test_relay_stream(
+        stream_id,
+        1,
+        second_commands.clone(),
+    ));
+    let second = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("second attachment")
+        .instance();
+    consume_client_path_proof_for_test(&mut first_receivers);
+    consume_client_path_proof_for_test(&mut second_receivers);
+    for (commands, filler_stream) in [(&first_commands, 991), (&second_commands, 992)] {
+        commands
+            .try_enqueue_reinjection_frame(
+                data_frame(StreamId(filler_stream), 0, 4096),
+                TrafficClass::Throughput,
+            )
+            .expect("fill stale reinjection queue");
+    }
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let source = send_stream
+        .send_data(Bytes::from(vec![0x72; 4096]))
+        .expect("retained fallback source");
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(first, &source);
+    assert!(controller.mark_path_stale(first));
+    assert!(controller.mark_path_stale(second));
+
+    assert!(matches!(
+        controller.try_enqueue_requalification_probe(
+            &context,
+            &remotes,
+            &send_stream,
+            TrafficClass::Throughput,
+            4096,
+        ),
+        Err(crate::runtime::RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(controller.requalification_deadline().is_none());
+    assert!(controller.path_is_stale(first));
+    assert!(controller.path_is_stale(second));
 }
 
 #[tokio::test]
@@ -1394,7 +1719,7 @@ async fn stale_path_is_not_selected_for_new_request_data() {
         TrafficClass::Latency,
         4096,
         false,
-        &controller.request.stale_paths,
+        &controller.request.requalification,
     );
     assert!(
         !observation
@@ -1452,7 +1777,7 @@ async fn stale_path_is_not_selected_for_new_request_data() {
         TrafficClass::Latency,
         4096,
         false,
-        &controller.request.stale_paths,
+        &controller.request.requalification,
     );
     assert!(
         fallback_observation
@@ -1477,6 +1802,10 @@ async fn stale_path_is_not_selected_for_new_request_data() {
         )
         .expect("a Product-inactive drain restores the stale active fallback");
     assert_eq!(fallback.target().1, tcp);
+    assert!(
+        controller.path_is_stale(tcp),
+        "sole-survivor scheduling must not erase stale evidence"
+    );
 }
 
 #[tokio::test]
@@ -1560,11 +1889,11 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
     let stream_id = StreamId(21);
     let context =
         client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
-    let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
     let tcp = remotes.paths[0].instance();
-    let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
     remotes.attach_candidate(opened_test_relay_stream_with_underlay(
         stream_id,
         UnderlayProtocol::Udp,
@@ -1577,7 +1906,12 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
         .find(|path| path.key().underlay == UnderlayProtocol::Udp)
         .expect("UDP attachment")
         .instance();
-    let frame = data_frame(stream_id, 0, 4096);
+    consume_client_path_proof_for_test(&mut tcp_receivers);
+    consume_client_path_proof_for_test(&mut udp_receivers);
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let frame = send_stream
+        .send_data(Bytes::from(vec![0x5b; 4096]))
+        .expect("retained original data");
     let mut controller = RequestMultipathController::new(stream_id);
     controller
         .request
@@ -1617,10 +1951,26 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
     drop(remotes.remove_path_instance(udp));
     controller.reconcile_request_path_state(&context, &remotes);
     assert!(
-        !controller.path_is_stale(tcp),
-        "staleness is removed when the original attachment becomes the sole survivor"
+        controller.path_is_stale(tcp),
+        "sole-survivor scheduling keeps stale evidence until exact requalification"
     );
     assert!(!controller.has_reinjection_path(&remotes, tcp));
+    assert!(matches!(
+        controller.try_enqueue_requalification_probe(
+            &context,
+            &remotes,
+            &send_stream,
+            TrafficClass::Throughput,
+            4096,
+        ),
+        Ok(Some(4096))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut tcp_receivers),
+        Some(ReliablePathCommand::SendFrame(
+            Frame::StreamRequalifyData { .. }
+        ))
+    ));
 }
 
 #[tokio::test]

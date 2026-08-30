@@ -614,16 +614,26 @@ where
             request_range_recovery_deadline = request_recovery.retry_deadline;
             request_recovery_dirty = false;
         }
+        match sender.try_send_requalification_probe(context, &remotes, &send_stream, request_lane) {
+            Ok(true) => state.progress.sender_retry_at = None,
+            Ok(false) => {}
+            Err(RuntimeError::SenderServiceBlocked) => {
+                state.progress.sender_retry_at =
+                    Some(tokio::time::Instant::now() + sender_service_retry_delay(path_snapshot));
+            }
+            Err(err) if reliable_path_error_is_migratable(&err) => {}
+            Err(err) => break Err(err),
+        }
         let request_range_reinjection_deadline =
             request_range_recovery_deadline.map(tokio::time::Instant::from_std);
-        let request_path_recovery_deadline = match (
-            request_path_staleness_deadline,
-            request_range_reinjection_deadline,
-        ) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        };
+        let request_requalification_deadline = sender
+            .requalification_deadline()
+            .map(tokio::time::Instant::from_std);
+        let request_path_recovery_deadline = request_path_staleness_deadline
+            .into_iter()
+            .chain(request_range_reinjection_deadline)
+            .chain(request_requalification_deadline)
+            .min();
         if reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane) {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -1019,6 +1029,23 @@ where
         }
         let stream_ack_publication_blocked = remotes.has_pending_stream_ack_publication();
         let has_stream_ack_capacity_wait = stream_ack_capacity_wait.is_some();
+        let requalification_ack_pending = remotes.has_pending_requalification_ack();
+        let requalification_ack_capacity_wait = requalification_ack_pending
+            .then(|| {
+                arm_carrier_capacity_notifies(
+                    remotes.pending_requalification_ack_capacity_notifies(),
+                )
+            })
+            .flatten();
+        if requalification_ack_pending {
+            match remotes.retry_pending_requalification_ack() {
+                Ok(_) => {}
+                Err(error) if reliable_path_error_is_migratable(&error) => {}
+                Err(error) => break Err(error),
+            }
+        }
+        let requalification_ack_blocked = remotes.has_pending_requalification_ack();
+        let has_requalification_ack_capacity_wait = requalification_ack_capacity_wait.is_some();
         let max_data_publication_pending = remotes.has_pending_max_data_publication();
         let max_data_capacity_wait = max_data_publication_pending
             .then(|| arm_carrier_capacity_notifies(remotes.pending_max_data_capacity_notifies()))
@@ -1736,6 +1763,13 @@ where
                 continue;
             }
             _ = async move {
+                if let Some(wait) = requalification_ack_capacity_wait {
+                    wait.await;
+                }
+            }, if requalification_ack_blocked && has_requalification_ack_capacity_wait => {
+                continue;
+            }
+            _ = async move {
                 if let Some(wait) = max_data_capacity_wait {
                     wait.await;
                 }
@@ -2033,6 +2067,46 @@ where
                 };
                 state.progress.sender_retry_at = None;
                 match frame {
+                    Frame::StreamRequalifyData {
+                        stream_id: received_stream_id,
+                        probe_id,
+                        offset,
+                        payload,
+                    } if received_stream_id == stream_id && state.endpoint.remote_open => {
+                        // This duplicate deliberately owns no DSN range and is
+                        // never delivered. Exact same-attachment receipt is
+                        // the only authority carried by its ACK.
+                        let payload_bytes = u32::try_from(payload.len())
+                            .map_err(|_| RuntimeError::Protocol("requalification payload overflow"))?;
+                        match remotes.publish_requalification_ack(
+                            instance,
+                            Frame::StreamRequalifyAck {
+                                stream_id,
+                                probe_id,
+                                offset,
+                                payload_bytes,
+                            },
+                        ) {
+                            Ok(_) => {}
+                            Err(err) if reliable_path_error_is_migratable(&err) => {}
+                            Err(err) => break Err(err),
+                        }
+                    }
+                    Frame::StreamRequalifyAck {
+                        stream_id: ack_stream_id,
+                        probe_id,
+                        offset,
+                        payload_bytes,
+                    } if ack_stream_id == stream_id => {
+                        if sender.acknowledge_requalification_probe(
+                            instance,
+                            probe_id,
+                            offset,
+                            payload_bytes,
+                        ) {
+                            state.progress.sender_retry_at = None;
+                        }
+                    }
                     Frame::StreamData {
                         stream_id: received_stream_id,
                         offset,

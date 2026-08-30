@@ -70,12 +70,12 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 
 ## Performance
 
-The scalar tables below are accepted historical evidence for v0.2.1–v0.2.2;
-they do not characterize v0.4.4 or the current tree. The chart is a pre-release
-two-run comparison; it is not a final-v0.4.4 ranking. See the
-[performance methodology](docs/PERFORMANCE.md) for measurement details.
+The scalar tables below are accepted historical evidence for the releases
+identified with each cohort; they do not characterize the current tree. The
+chart is a historical two-run diagnostic series, not a current-release ranking.
+See the [performance methodology](docs/PERFORMANCE.md) for measurement details.
 
-### Pre-release diagnostic series
+### Historical diagnostic series
 
 [![Receiver goodput and persistent application-echo latency over 40 seconds for MPTUNNEL TCP, QUIC, default TCP+QUIC, Xray, and Hysteria2](docs/assets/performance/diagnostic-random-internet-series.svg)](docs/assets/performance/diagnostic-random-internet-series.svg)
 

@@ -461,8 +461,24 @@ impl ServerTcpPathSession {
             Frame::IpTunnelReady { .. } => Err(RuntimeError::Protocol(
                 "TCP server received IP tunnel readiness",
             )),
+            frame @ Frame::StreamRequalifyData { stream_id, .. } => {
+                match self.streams.try_route_frame(
+                    &self.context,
+                    &self.path_registration,
+                    self.path_id,
+                    stream_id,
+                    frame,
+                )? {
+                    ServerStreamFrameRoute::Routed => {}
+                    ServerStreamFrameRoute::Backpressured(frame) => {
+                        self.deferred_input = Some(frame);
+                    }
+                }
+                Ok(ServerTcpFrameDisposition::Continue)
+            }
             frame @ (Frame::StreamData { stream_id, .. }
             | Frame::StreamAck { stream_id, .. }
+            | Frame::StreamRequalifyAck { stream_id, .. }
             | Frame::StreamMaxData { stream_id, .. }
             | Frame::StreamFin { stream_id, .. }
             | Frame::StreamReset { stream_id, .. }) => {
@@ -732,7 +748,7 @@ impl ServerTcpPathSession {
                     sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                     sent_items = sent_items.saturating_add(1);
                     if matches!(
-                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
                             .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
@@ -746,7 +762,7 @@ impl ServerTcpPathSession {
                 }
                 ReliablePathCommand::CloseStream(stream_id) => {
                     if matches!(
-                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
                             .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
@@ -768,7 +784,7 @@ impl ServerTcpPathSession {
                 | ReliablePathCommand::SendDatagramFrame { .. }
                 | ReliablePathCommand::CloseDatagramAttachment { .. } => {
                     if matches!(
-                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
                             .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
@@ -780,7 +796,7 @@ impl ServerTcpPathSession {
                 }
                 ReliablePathCommand::CancelTcpOpen { .. } => {
                     if matches!(
-                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
                             .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
@@ -796,14 +812,25 @@ impl ServerTcpPathSession {
             }
         }
 
-        if self.deferred_input.is_none()
-            && matches!(
-                self.write_batch_interlocked(&mut writer_pending_bytes)
+        if self.deferred_input.is_none() {
+            if matches!(
+                self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
                     .await?,
                 ServerTcpSessionDisposition::Stop
-            )
-        {
-            return Ok(ServerTcpSessionDisposition::Stop);
+            ) {
+                return Ok(ServerTcpSessionDisposition::Stop);
+            }
+        } else if wrote_frame {
+            // The exact probe retained in `deferred_input` already owns the
+            // sole carrier-input slot, so write this bounded batch without
+            // the receive interlock and leave that input untouched.
+            if matches!(
+                self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
+                    .await?,
+                ServerTcpSessionDisposition::Stop
+            ) {
+                return Ok(ServerTcpSessionDisposition::Stop);
+            }
         }
 
         #[cfg(feature = "lab-diagnostics")]
@@ -826,6 +853,38 @@ impl ServerTcpPathSession {
             return Ok(ServerTcpSessionDisposition::Stop);
         }
         Ok(ServerTcpSessionDisposition::Continue)
+    }
+
+    /// Flushes the current writer batch without polling the carrier input when
+    /// that exact input slot already retains a backpressured frame.
+    async fn write_batch_respecting_deferred_input(
+        &mut self,
+        writer_pending_bytes: &mut usize,
+    ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
+        if self.deferred_input.is_none() {
+            return self.write_batch_interlocked(writer_pending_bytes).await;
+        }
+        let write_result = self.writer.write_batch(&mut self.evidence).await;
+        let pending_bytes = std::mem::take(writer_pending_bytes);
+        let wrote = match write_result {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                self.commands_rx
+                    .release_pending_command_bytes(pending_bytes);
+                return Err(error);
+            }
+        };
+        if wrote && pending_bytes > 0 {
+            self.evidence
+                .observe_after_write(&self.context, &self.path_registration, self.path_id);
+        }
+        self.commands_rx
+            .release_pending_command_bytes(pending_bytes);
+        Ok(if wrote {
+            ServerTcpSessionDisposition::Continue
+        } else {
+            ServerTcpSessionDisposition::Stop
+        })
     }
 
     async fn write_batch_interlocked(
@@ -853,6 +912,8 @@ impl ServerTcpPathSession {
                         let stream_id = match &frame {
                             Frame::StreamData { stream_id, .. }
                             | Frame::StreamAck { stream_id, .. }
+                            | Frame::StreamRequalifyData { stream_id, .. }
+                            | Frame::StreamRequalifyAck { stream_id, .. }
                             | Frame::StreamMaxData { stream_id, .. }
                             | Frame::StreamFin { stream_id, .. }
                             | Frame::StreamReset { stream_id, .. } => Some(*stream_id),

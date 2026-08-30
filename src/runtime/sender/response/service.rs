@@ -128,6 +128,31 @@ pub(in crate::runtime) struct StaleResponseRecoveryOutcome {
 }
 
 impl ServerResponseSenderService {
+    pub(in crate::runtime) fn try_send_requalification_probe(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &ReliableSendStream,
+        lane: TrafficClass,
+        mux_limits: MuxLimits,
+    ) -> Result<bool, RuntimeError> {
+        let budget = self.optional_reinjection.budget(
+            sender_optional_reinjection_startup_floor_bytes(mux_limits),
+            self.performance,
+        );
+        let minimum = sender_reinjection_minimum_useful_attempt_bytes(mux_limits);
+        let byte_limit = minimum.min(budget.remaining_bytes().max(minimum));
+        let Some(bytes) = path_stream.try_enqueue_response_requalification_probe(
+            send_stream,
+            lane,
+            byte_limit,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.optional_reinjection.record_reinjection(bytes);
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) fn new(session_id: SessionId, stream_id: StreamId) -> Self {
         Self::new_with_performance(session_id, stream_id, MppPerformanceConfig::default())

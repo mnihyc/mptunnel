@@ -6,11 +6,11 @@ workload, host capacity, and the native TCP or QUIC implementation.
 
 ## Current evidence publication gate
 
-No final-v0.4.4 time-series ranking is published. Publication requires matched
-repetitions that pass the complete measurement gate; individual diagnostic
-runs do not update the historical scalar tables below.
+No current-release time-series ranking is published. Publication requires
+matched repetitions that pass the complete measurement gate; individual
+diagnostic runs do not update the historical scalar tables below.
 
-## Pre-release ordered diagnostic series
+## Historical ordered diagnostic series
 
 [![Receiver goodput and persistent application-echo latency over 40 seconds](assets/performance/diagnostic-random-internet-series.svg)](assets/performance/diagnostic-random-internet-series.svg)
 
@@ -22,13 +22,40 @@ Hysteria2 received the measured directional capacities. Missing echo values
 remain gaps rather than zeroes; clipped display outliers retain their exact
 values in hover text.
 
+## v0.4.5 accepted recovery evidence
+
+Focused correctness gates establish the following bounded corrections. They
+are not throughput or latency measurements and do not establish a product
+ranking.
+
+- Exact stream-attachment requalification uses a non-owning data-bearing probe,
+  an exact attachment ACK, and fresh uniquely owned Product data to restore
+  authority. Focused state-machine tests cover stale, acquiring, and qualified
+  transitions plus sole-survivor handling in both directions; separate
+  transport-dispatch tests cover the exact recovery frames while TCP and QUIC
+  paths are idle. The focused Quinn runtime gate proves that a live QUIC
+  response attachment requalifies in place without replacing its carrier
+  connection, path instance, or incarnation: a pre-stale ACK restores no
+  authority, and only a fresh uniquely owned OriginalData ACK returns the
+  attachment to `Qualified`.
+- Initial OPEN separates carrier admission from remote target settlement while
+  retaining one logical stream ID and one target owner. Focused tests prove
+  zero-credit admission precedes validation, retries preserve that identity,
+  later target credit reaches live attachments, and target denial remains
+  stream-scoped.
+- QUIC full-bandwidth growth now compares the plateau baseline and growth sample
+  in the same loss-compensated service-rate unit. A production-path red/green
+  sequence proves the former mixed-unit plateau; zero-loss, 10x step-down, and
+  token-policer controls preserve the existing behavior.
+
 ## Historical accepted fixed-profile evidence (v0.2.1–v0.2.2)
 
 The fixed-profile tables in this section, through local processing capacity,
 are accepted measurements of the exact v0.2.1–v0.2.2 binaries and
 configurations used for those runs. They remain useful historical controls,
-but they do not characterize v0.4.4 or its defaults. A `default` label in this
-section means the default of the measured historical release and profile.
+but they do not characterize the current tree or its defaults. A `default`
+label in this section means the default of the measured historical release and
+profile.
 
 ### Test conditions
 
@@ -293,10 +320,10 @@ window/RTT ceiling of 5.37 Gbps and must be raised for line rate. See the
 
 Each table or time-series figure establishes only its exact recorded cohort:
 binary revision, configuration, carrier mix, direction, workload, duration,
-network profile, and accepted host and source provenance. A v0.4.4 time-series
-figure is therefore evidence only for its own cohort. It does not update the
-historical tables above, establish behavior outside its observation window, or
-prove the cause of a rate or latency change by itself.
+network profile, and accepted host and source provenance. A historical
+time-series figure is therefore evidence only for its own cohort. It does not
+update the historical tables above, establish behavior outside its observation
+window, or prove the cause of a rate or latency change by itself.
 
 Interpret samples at the interval recorded by their cohort. The historical
 fixed-profile runs used 200 ms delivery samples and one-second management-rate
@@ -313,7 +340,7 @@ cap. Production contains no fixed Mbps target or fixed percentage threshold.
 
 These measurements do not establish:
 
-- v0.4.4 performance from the historical v0.2.1–v0.2.2 tables;
+- current-release performance from the historical v0.2.1–v0.2.2 tables;
 - performance outside any cohort's exact conditions or after its measured
   observation window;
 - causality from a throughput or latency trace alone;

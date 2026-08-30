@@ -9,6 +9,7 @@ use crate::lab_diagnostics::lab_diagnostic;
 #[cfg(test)]
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
+use crate::model::requalification::StreamPathQualification;
 use crate::model::response::ResponsePathObservation;
 #[cfg(test)]
 use crate::protocol::PathId;
@@ -146,7 +147,7 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) original_data_in_flight_bytes: u64,
     /// Data-ACK recovery may withdraw an output from new OriginalData placement
     /// without closing it or interfering with native carrier recovery.
-    pub(super) stale_for_original_data: bool,
+    pub(super) qualification: StreamPathQualification,
     pub(super) bytes_in_flight: u64,
     /// Exact OriginalData ACK goodput. It is per-flow evidence, not carrier
     /// capacity, and its immutable deadline owns all placement authority.
@@ -185,27 +186,10 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
     pub(super) data_level_queue_bytes: u64,
     /// Retained idempotent receive grant shared by every attachment.
     pub(super) desired_max_data_offset: u64,
-}
-
-impl ResponseStreamOutputs {
-    /// Restores stale outputs when no distinct live non-stale attachment
-    /// remains. Staleness is relative placement state, not a permanent health
-    /// verdict on a carrier that becomes the sole survivor.
-    pub(super) fn reconcile_stale_output_eligibility(&mut self) -> bool {
-        if self.entries.iter().any(|entry| {
-            entry.commands.product_admission_active() && !entry.stale_for_original_data
-        }) {
-            return false;
-        }
-        let mut changed = false;
-        for entry in &mut self.entries {
-            if entry.commands.product_admission_active() && entry.stale_for_original_data {
-                entry.stale_for_original_data = false;
-                changed = true;
-            }
-        }
-        changed
-    }
+    pub(super) next_requalification_probe_id: Option<u64>,
+    /// Fair round-robin start for the next stale requalification attempt.
+    /// Output order remains stable for every other scheduling decision.
+    pub(super) next_requalification_candidate_index: usize,
 }
 
 fn publish_pending_max_data(
@@ -559,7 +543,7 @@ impl ResponseStreamBinding {
                 entry.commands = commands;
                 entry.load_registration = entry.commands.register_flow(lane);
                 entry.original_data_in_flight_bytes = 0;
-                entry.stale_for_original_data = false;
+                entry.qualification = StreamPathQualification::Qualified;
                 entry.bytes_in_flight = 0;
                 entry.product_rate_epoch = None;
                 entry.tcp_product_rate_evidence = None;
@@ -606,7 +590,7 @@ impl ResponseStreamBinding {
                 commands,
                 load_registration,
                 original_data_in_flight_bytes: 0,
-                stale_for_original_data: false,
+                qualification: StreamPathQualification::Qualified,
                 bytes_in_flight: 0,
                 product_rate_epoch: None,
                 tcp_product_rate_evidence: None,

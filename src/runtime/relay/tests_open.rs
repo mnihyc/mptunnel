@@ -47,6 +47,89 @@ fn pending_stream_for_test(
     )
 }
 
+fn unsettled_initial_stream_for_test(
+    stream_id: StreamId,
+) -> (
+    ReliablePathStream,
+    mpsc::Sender<Result<Frame, RuntimeError>>,
+    ReliablePathCommandReceivers,
+) {
+    let mux_limits = MuxLimits::default();
+    let (commands, command_rx) = reliable_path_command_channels(4);
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    (
+        ReliablePathStream {
+            stream_id,
+            max_offset: 0,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Udp,
+                PathId(0),
+                commands,
+                mux_limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        frames_tx,
+        command_rx,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_zero_credit_waits_beyond_carrier_pto_for_target_acceptance() {
+    let stream_id = StreamId(90);
+    let (mut stream, frames, _commands) = unsettled_initial_stream_for_test(stream_id);
+    let settlement = tokio::spawn(async move {
+        await_reliable_initial_target_acceptance(&mut stream)
+            .await
+            .map(|()| stream.max_offset)
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(
+        !settlement.is_finished(),
+        "target establishment must not inherit a second carrier-PTO deadline",
+    );
+
+    frames
+        .send(Ok(Frame::StreamMaxData {
+            stream_id,
+            max_offset: 4096,
+        }))
+        .await
+        .expect("publish target-established credit");
+    assert_eq!(
+        settlement
+            .await
+            .expect("settlement task")
+            .expect("logical target acceptance"),
+        4096,
+    );
+}
+
+#[tokio::test]
+async fn initial_target_reset_is_terminal_after_zero_credit_admission() {
+    let stream_id = StreamId(91);
+    let (mut stream, frames, _commands) = unsettled_initial_stream_for_test(stream_id);
+    frames
+        .send(Ok(Frame::StreamReset {
+            stream_id,
+            reason: crate::protocol::ResetReason::Refused,
+        }))
+        .await
+        .expect("publish target failure");
+
+    assert!(matches!(
+        await_reliable_initial_target_acceptance(&mut stream).await,
+        Err(RuntimeError::RemoteReset(
+            crate::protocol::ResetReason::Refused
+        ))
+    ));
+}
+
 #[tokio::test]
 async fn relay_attach_open_timeout_bounds_pending_connection_setup() {
     let result = relay_path_open_with_deadline(
@@ -128,8 +211,12 @@ fn dropping_initial_open_attempt_rolls_back_scheduler_load() {
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
     let mut attempted = Vec::new();
+    let stream_id = context
+        .allocate_reliable_stream_id()
+        .expect("allocate logical stream ID");
     let attempt = reserve_reliable_initial_open_attempt(
         &context,
+        stream_id,
         TrafficClass::Throughput,
         PATH_OPEN_SCORE_BYTES,
         &mut attempted,
@@ -178,7 +265,7 @@ fn dropping_pending_attachment_releases_load_before_stream_cleanup() {
 }
 
 #[test]
-fn initial_open_retry_uses_fresh_stream_id() {
+fn initial_open_retry_reuses_one_logical_stream_id() {
     let context = ClientPathContext::new(
         vec![
             "tcp://127.0.0.1:10132?initial-srtt-s=0.02&initial-rate-mbps=100"
@@ -193,8 +280,12 @@ fn initial_open_retry_uses_fresh_stream_id() {
     )
     .expect("context");
     let mut attempted = Vec::new();
+    let stream_id = context
+        .allocate_reliable_stream_id()
+        .expect("allocate logical stream ID");
     let first = reserve_reliable_initial_open_attempt(
         &context,
+        stream_id,
         TrafficClass::Latency,
         PATH_OPEN_SCORE_BYTES,
         &mut attempted,
@@ -207,12 +298,13 @@ fn initial_open_retry_uses_fresh_stream_id() {
 
     let second = reserve_reliable_initial_open_attempt(
         &context,
+        stream_id,
         TrafficClass::Latency,
         PATH_OPEN_SCORE_BYTES,
         &mut attempted,
     )
     .expect("second attempt")
     .expect("second candidate");
-    assert_ne!(first_stream_id, second.stream_id);
+    assert_eq!(first_stream_id, second.stream_id);
     assert_ne!(first_key, second.key);
 }

@@ -9,11 +9,12 @@ mod data_commit;
 mod delivery;
 mod diagnostics;
 mod evidence;
+mod requalification;
 mod session;
 mod snapshot;
 
-use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
+use crate::model::requalification::StreamPathQualification;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
@@ -176,8 +177,6 @@ impl ResponseStreamBinding {
         let key = CarrierPathKey { underlay, path_id };
         let session_registration = ServerSessionRegistration::try_new(session_tracker, session_id)?;
         let load_registration = commands.register_flow(lane);
-        let initial_max_data_offset =
-            reliable_stream_initial_advertised_window_bytes(underlay, lane, mux_limits);
         Ok(Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
@@ -197,16 +196,16 @@ impl ResponseStreamBinding {
                     commands,
                     load_registration,
                     original_data_in_flight_bytes: 0,
-                    stale_for_original_data: false,
+                    qualification: StreamPathQualification::Qualified,
                     bytes_in_flight: 0,
                     product_rate_epoch: None,
                     tcp_product_rate_evidence: None,
                     srtt_ms: None,
                     delivery_samples: 0,
                     original_data_acked_bytes: 0,
-                    // Opening acceptance already queued this exact grant on
-                    // the initial attachment before supervision begins.
-                    published_max_data_offset: initial_max_data_offset,
+                    // Carrier admission starts at zero. Target establishment
+                    // later publishes the retained logical receive grant.
+                    published_max_data_offset: 0,
                     ack_publication: Default::default(),
                     local_path_metrics: None,
                     peer_path_metrics: None,
@@ -215,7 +214,9 @@ impl ResponseStreamBinding {
                     path_proof: None,
                 }],
                 data_level_queue_bytes: 0,
-                desired_max_data_offset: initial_max_data_offset,
+                desired_max_data_offset: 0,
+                next_requalification_probe_id: Some(1),
+                next_requalification_candidate_index: 0,
             }),
             request_feedback_ingress: Mutex::new(Some(RequestFeedbackIngress {
                 key,

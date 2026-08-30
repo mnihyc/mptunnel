@@ -49,6 +49,7 @@ pub(in crate::runtime) struct ReliableInitialOpenAttempt {
 
 pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
     context: &ClientPathContext,
+    stream_id: StreamId,
     lane: TrafficClass,
     payload_bytes: usize,
     attempted: &mut Vec<RelayPathKey>,
@@ -67,17 +68,12 @@ pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
         return Ok(None);
     };
     let key = load_lease.key();
-    match context.allocate_reliable_stream_id() {
-        Ok(stream_id) => {
-            attempted.push(key);
-            Ok(Some(ReliableInitialOpenAttempt {
-                key,
-                stream_id,
-                load_lease,
-            }))
-        }
-        Err(err) => Err(err),
-    }
+    attempted.push(key);
+    Ok(Some(ReliableInitialOpenAttempt {
+        key,
+        stream_id,
+        load_lease,
+    }))
 }
 
 async fn open_reliable_initial_attempt(
@@ -175,6 +171,42 @@ async fn open_reliable_initial_attempt(
     }
 }
 
+/// Completes the logical half of a two-phase initial OPEN.
+///
+/// Carrier admission is the first `STREAM_MAX_DATA`, which may carry zero
+/// credit while the server resolves and connects the Product target. Only a
+/// later nonzero grant establishes an initial logical stream. Attachments do
+/// not call this helper: zero remains their complete admission response.
+async fn await_reliable_initial_target_acceptance(
+    stream: &mut ReliablePathStream,
+) -> Result<(), RuntimeError> {
+    if stream.max_offset > 0 {
+        return Ok(());
+    }
+    loop {
+        match stream.recv_frame().await? {
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset,
+            } if stream_id == stream.stream_id => {
+                if max_offset == 0 {
+                    continue;
+                }
+                stream.max_offset = stream.max_offset.max(max_offset);
+                return Ok(());
+            }
+            Frame::StreamReset { stream_id, reason } if stream_id == stream.stream_id => {
+                return Err(RuntimeError::RemoteReset(reason));
+            }
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "unexpected frame before reliable target establishment",
+                ));
+            }
+        }
+    }
+}
+
 pub(in crate::runtime) async fn open_remote_stream(
     context: &ClientPathContext,
     target: TargetAddr,
@@ -190,29 +222,50 @@ async fn open_remote_stream_active(
     target: TargetAddr,
     lane: TrafficClass,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
+    let stream_id = context.allocate_reliable_stream_id()?;
     let mut attempted = Vec::new();
     let mut last_retryable_error = None;
-    while let Some(attempt) =
-        reserve_reliable_initial_open_attempt(context, lane, PATH_OPEN_SCORE_BYTES, &mut attempted)?
-    {
+    while let Some(attempt) = reserve_reliable_initial_open_attempt(
+        context,
+        stream_id,
+        lane,
+        PATH_OPEN_SCORE_BYTES,
+        &mut attempted,
+    )? {
         let key = attempt.key;
         let has_unattempted_alternative = context
             .ordered_reliable_path_keys(lane, PATH_OPEN_SCORE_BYTES)
             .into_iter()
             .any(|candidate| !attempted.contains(&candidate));
-        match open_reliable_initial_attempt(
+        let open = open_reliable_initial_attempt(
             context,
             attempt,
             target.clone(),
             lane,
             has_unattempted_alternative,
         )
-        .await
-        {
+        .await;
+        let open = match open {
+            Ok(mut opened) => {
+                match await_reliable_initial_target_acceptance(opened.stream_mut()).await {
+                    Ok(()) => Ok(opened),
+                    Err(err) => {
+                        opened.close().await;
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        };
+        match open {
             Ok(opened) => return Ok(opened),
-            Err(err @ RuntimeError::ReliablePathAttachmentRefused) => {
-                // Refusal is scoped to this stream attachment. Try another
-                // candidate without withdrawing the healthy carrier.
+            Err(
+                err @ (RuntimeError::ReliablePathAttachmentRefused
+                | RuntimeError::ReliablePathRetired),
+            ) => {
+                // Refusal or retirement is scoped to this exact attachment.
+                // Preserve the logical ID and try another carrier without
+                // turning target-establishment delay into path failure.
                 last_retryable_error = Some(err);
             }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {

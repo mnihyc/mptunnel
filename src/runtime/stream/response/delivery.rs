@@ -8,6 +8,7 @@ use super::{ResponseStreamBinding, ResponseStreamOutputs};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
+use crate::model::requalification::StreamPathQualification;
 use crate::model::response::CarrierPathFlightDebt;
 use crate::model::work::{
     CarrierWorkKind, RangeRecoveryState, ambiguous_flight_intervals, flight_interval_bytes,
@@ -98,6 +99,7 @@ pub(in crate::runtime) struct CarrierPathAckedHole {
     pub(super) output_incarnation: u64,
     pub(super) end: u64,
     pub(super) bytes: u64,
+    pub(super) sent_at: Instant,
     pub(super) kind: CarrierWorkKind,
     pub(super) path_proving: bool,
 }
@@ -135,6 +137,7 @@ impl ResponseAckOrderingState {
                 output_incarnation: flight.output_incarnation,
                 end: flight.end,
                 bytes: flight.bytes as u64,
+                sent_at: flight.sent_at,
                 kind: flight.kind,
                 path_proving: release.path_proving,
             };
@@ -275,7 +278,9 @@ impl ResponseStreamBinding {
         let mut live_outputs = outputs
             .entries
             .iter()
-            .filter(|entry| !entry.commands.is_closed() && !entry.stale_for_original_data)
+            .filter(|entry| {
+                !entry.commands.is_closed() && !entry.qualification.stale_for_original_data()
+            })
             .map(|entry| ((entry.key, entry.incarnation), false))
             .collect::<SmallVec<[_; 4]>>();
         if live_outputs.is_empty() {
@@ -344,7 +349,7 @@ impl ResponseStreamBinding {
             .iter()
             .any(|entry| {
                 !entry.commands.is_closed()
-                    && !entry.stale_for_original_data
+                    && !entry.qualification.stale_for_original_data()
                     && (entry.key != candidate.key || entry.incarnation != candidate.incarnation)
             })
     }
@@ -359,7 +364,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         let has_nonstale_alternative = outputs.entries.iter().any(|entry| {
             !entry.commands.is_closed()
-                && !entry.stale_for_original_data
+                && !entry.qualification.stale_for_original_data()
                 && (entry.key != identity.key || entry.incarnation != identity.incarnation)
         });
         if !has_nonstale_alternative {
@@ -369,19 +374,28 @@ impl ResponseStreamBinding {
             if entry.key == identity.key
                 && entry.incarnation == identity.incarnation
                 && !entry.commands.is_closed()
-                && !entry.stale_for_original_data
+                && !entry.qualification.stale_for_original_data()
             {
-                entry.stale_for_original_data = true;
+                entry.qualification = StreamPathQualification::Stale {
+                    retry_at: Instant::now(),
+                };
+                entry.product_rate_epoch = None;
+                entry.tcp_product_rate_evidence = None;
+                entry.delivery_samples = 0;
+                entry.original_data_acked_bytes = 0;
                 true
             } else {
                 false
             }
         });
         if changed {
+            drop(outputs);
+            self.invalidate_path_flight_evidence(identity.key, identity.incarnation);
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
+        } else {
+            drop(outputs);
         }
-        drop(outputs);
         if changed {
             self.notify_update();
         }
@@ -402,7 +416,7 @@ impl ResponseStreamBinding {
                 entry.key == identity.key
                     && entry.incarnation == identity.incarnation
                     && !entry.commands.is_closed()
-                    && entry.stale_for_original_data
+                    && entry.qualification.stale_for_original_data()
             })
     }
 
@@ -416,11 +430,13 @@ impl ResponseStreamBinding {
         let stale_outputs = outputs
             .entries
             .iter()
-            .filter(|entry| !entry.commands.is_closed() && entry.stale_for_original_data)
+            .filter(|entry| {
+                !entry.commands.is_closed() && entry.qualification.stale_for_original_data()
+            })
             .filter(|stale| {
                 outputs.entries.iter().any(|entry| {
                     !entry.commands.is_closed()
-                        && !entry.stale_for_original_data
+                        && !entry.qualification.stale_for_original_data()
                         && (entry.key != stale.key || entry.incarnation != stale.incarnation)
                 })
             })
@@ -463,7 +479,7 @@ impl ResponseStreamBinding {
             entry.key == identity.key
                 && entry.incarnation == identity.incarnation
                 && !entry.commands.is_closed()
-                && entry.stale_for_original_data
+                && entry.qualification.stale_for_original_data()
         });
         if !owner_is_stale {
             return RangeRecoveryState::default();
@@ -473,7 +489,7 @@ impl ResponseStreamBinding {
             .iter()
             .filter(|entry| {
                 !entry.commands.reinjection_frame_queue_is_closed()
-                    && !entry.stale_for_original_data
+                    && !entry.qualification.stale_for_original_data()
             })
             .map(|entry| (entry.key, entry.incarnation))
             .collect::<Vec<_>>();
@@ -785,7 +801,11 @@ impl ResponseStreamBinding {
                         .original_data_in_flight_bytes
                         .saturating_sub(flight.bytes as u64);
                 }
-                if release.path_proving {
+                let product_evidence_eligible = release.path_proving
+                    && entry
+                        .qualification
+                        .observe_unique_original_progress(flight.sent_at);
+                if product_evidence_eligible {
                     let progress_identity = ServerReinjectionOutputIdentity {
                         key: flight.key,
                         incarnation: flight.output_incarnation,
@@ -793,7 +813,6 @@ impl ResponseStreamBinding {
                     if !data_ack_progress_outputs.contains(&progress_identity) {
                         data_ack_progress_outputs.push(progress_identity);
                     }
-                    entry.stale_for_original_data = false;
                     entry.original_data_acked_bytes = entry
                         .original_data_acked_bytes
                         .saturating_add(flight.bytes as u64);
@@ -821,6 +840,9 @@ impl ResponseStreamBinding {
                 .iter_mut()
                 .find(|entry| entry.key == hole.key && entry.incarnation == hole.output_incarnation)
                 && hole.end <= ordering_update.contiguous_frontier
+                && entry
+                    .qualification
+                    .observe_unique_original_progress(hole.sent_at)
             {
                 entry.delivery_samples = entry.delivery_samples.saturating_add(1);
                 changed = true;
@@ -848,7 +870,7 @@ impl ResponseStreamBinding {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };
-        let (key, output_incarnation) = {
+        let (key, output_incarnation, evidence_eligible) = {
             let entry = outputs
                 .entries
                 .get_mut(target_index)
@@ -857,7 +879,11 @@ impl ResponseStreamBinding {
                 .original_data_in_flight_bytes
                 .saturating_add(bytes as u64);
             entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
-            (entry.key, entry.incarnation)
+            (
+                entry.key,
+                entry.incarnation,
+                !entry.qualification.stale_for_original_data(),
+            )
         };
         self.flights
             .lock()
@@ -871,7 +897,7 @@ impl ResponseStreamBinding {
                 bytes,
                 sent_at: Instant::now(),
                 kind: CarrierWorkKind::OriginalData,
-                evidence_eligible: true,
+                evidence_eligible,
             });
         // Keep path counters and the exact range ledger in one published model
         // generation so a concurrent measurement plan cannot mix the views.
@@ -1035,7 +1061,12 @@ impl ResponseStreamBinding {
                     .saturating_add(bytes as u64);
             }
             entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
-            (entry.incarnation, incarnation_matches)
+            (
+                entry.incarnation,
+                incarnation_matches
+                    && (!kind.is_original_transmission()
+                        || !entry.qualification.stale_for_original_data()),
+            )
         } else {
             (output_incarnation, false)
         };
@@ -1072,6 +1103,21 @@ impl ResponseStreamBinding {
                 flight.key == key && flight.output_incarnation == output_incarnation
             }) {
                 flight.evidence_eligible = false;
+            }
+        }
+        drop(flights);
+        let mut ordering = self
+            .ack_ordering
+            .lock()
+            .expect("server response ACK ordering lock");
+        for holes in ordering.acked_holes.values_mut() {
+            for hole in holes
+                .iter_mut()
+                .filter(|hole| hole.key == key && hole.output_incarnation == output_incarnation)
+            {
+                // Ordering ownership remains exact; only stale Product
+                // evidence authority is revoked.
+                hole.path_proving = false;
             }
         }
     }

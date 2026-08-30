@@ -68,6 +68,10 @@ impl OpenedRemoteStream {
         self.stream.as_ref().expect("pending remote stream")
     }
 
+    pub(in crate::runtime) fn stream_mut(&mut self) -> &mut ReliablePathStream {
+        self.stream.as_mut().expect("pending remote stream")
+    }
+
     pub(in crate::runtime) fn path_index(&self) -> usize {
         self.path_index
     }
@@ -344,9 +348,90 @@ pub(in crate::runtime) struct ReliableRelayRemoteSet {
     desired_max_data_offset: u64,
     desired_stream_ack_generation: u64,
     desired_stream_ack_frames: Vec<Frame>,
+    /// One exact response-direction probe receipt retained independently from
+    /// Product processing while its carrying attachment's control queue is
+    /// full. A newer probe supersedes an unqueued expired receipt.
+    pending_requalification_ack: Option<(RelayPathInstance, Frame)>,
 }
 
 impl ReliableRelayRemoteSet {
+    pub(in crate::runtime) fn publish_requalification_ack(
+        &mut self,
+        instance: RelayPathInstance,
+        frame: Frame,
+    ) -> Result<bool, RuntimeError> {
+        let Frame::StreamRequalifyAck {
+            probe_id: incoming_probe_id,
+            ..
+        } = &frame
+        else {
+            return Err(RuntimeError::Protocol(
+                "pending requalification ACK must be STREAM_REQUALIFY_ACK",
+            ));
+        };
+        if let Some((pending_instance, pending_frame)) = &self.pending_requalification_ack {
+            let Frame::StreamRequalifyAck {
+                probe_id: pending_probe_id,
+                ..
+            } = pending_frame
+            else {
+                unreachable!("pending requalification ACK frame kind")
+            };
+            if incoming_probe_id < pending_probe_id
+                || (incoming_probe_id == pending_probe_id
+                    && (*pending_instance != instance || *pending_frame != frame))
+            {
+                // Probe IDs are monotonic in one response direction. A delayed
+                // or mismatched replay cannot displace newer exact liveness
+                // work; opportunistically retry that retained work instead.
+                return self.retry_pending_requalification_ack();
+            }
+        }
+        self.pending_requalification_ack = Some((instance, frame));
+        self.retry_pending_requalification_ack()
+    }
+
+    pub(in crate::runtime) fn retry_pending_requalification_ack(
+        &mut self,
+    ) -> Result<bool, RuntimeError> {
+        let Some((instance, frame)) = self.pending_requalification_ack.clone() else {
+            return Ok(false);
+        };
+        let Some(path) = self.paths.iter().find(|path| path.instance() == instance) else {
+            self.pending_requalification_ack = None;
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        };
+        match path.stream.try_enqueue_request_control_frame(frame) {
+            Ok(()) => {
+                self.pending_requalification_ack = None;
+                Ok(true)
+            }
+            Err(RuntimeError::SenderServiceBlocked) => Ok(false),
+            Err(error) => {
+                self.pending_requalification_ack = None;
+                Err(error)
+            }
+        }
+    }
+
+    pub(in crate::runtime) fn has_pending_requalification_ack(&self) -> bool {
+        self.pending_requalification_ack.is_some()
+    }
+
+    pub(in crate::runtime) fn pending_requalification_ack_capacity_notifies(
+        &self,
+    ) -> Vec<std::sync::Arc<tokio::sync::Notify>> {
+        let Some((instance, _)) = &self.pending_requalification_ack else {
+            return Vec::new();
+        };
+        self.paths
+            .iter()
+            .find(|path| path.instance() == *instance)
+            .and_then(|path| path.stream.request_control_capacity_notify())
+            .into_iter()
+            .collect()
+    }
+
     pub(in crate::runtime) fn new(opened: OpenedRemoteStream, frame_queue: usize) -> Self {
         let stream_id = opened.stream().stream_id;
         let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
@@ -360,6 +445,7 @@ impl ReliableRelayRemoteSet {
             desired_max_data_offset: 0,
             desired_stream_ack_generation: 0,
             desired_stream_ack_frames: Vec::new(),
+            pending_requalification_ack: None,
         };
         set.attach(opened);
         set

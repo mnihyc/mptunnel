@@ -10,7 +10,6 @@ use super::response::{
 use super::send_buffer::SessionSendBuffer;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
-use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::mux::MuxLimits;
 #[cfg(test)]
@@ -25,8 +24,10 @@ use crate::protocol::{
 use crate::runtime::RuntimeError;
 #[cfg(test)]
 use crate::runtime::path::ServerCarrierPathRegistration;
+#[cfg(test)]
+use crate::runtime::path::commands::ReliablePathCommand;
 use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
+    ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::proof::PathProofObservation;
 use crate::runtime::path::{
@@ -471,24 +472,26 @@ impl AcceptedServerReliableStream {
         self.session_send_buffer.clone()
     }
 
-    /// Publishes OPEN acceptance and then the path-proof challenge on the same
-    /// ordered command channel. A QUIC product stream must never observe the
-    /// challenge while it is still waiting for STREAM_MAX_DATA.
-    pub(in crate::runtime) async fn accept_opening_path(&self) -> Result<(), RuntimeError> {
+    /// Publishes carrier admission before target establishment is submitted.
+    /// Zero credit keeps an initial logical OPEN pending without charging
+    /// remote routing, DNS, or target connect time to this carrier.
+    pub(in crate::runtime) fn admit_opening_path(&self) -> Result<(), RuntimeError> {
         let stream = self.stream();
-        self.opening
-            .commands
-            .send_control(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+        self.opening.commands.try_enqueue_admitted_frame(
+            Frame::StreamMaxData {
                 stream_id: stream.stream_id,
-                max_offset: reliable_stream_initial_advertised_window_bytes(
-                    stream.underlay,
-                    stream.lane,
-                    self.opening.mux_limits,
-                ),
-            }))
-            .await
-            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+                max_offset: 0,
+            },
+            TrafficClass::Control,
+        )
+    }
 
+    /// Queues the optional opening-carrier proof from the independent target
+    /// task. Once zero-credit admission committed, proof backpressure or
+    /// carrier loss cannot revoke the logical owner or create a second target.
+    pub(in crate::runtime) async fn publish_opening_path_validation(
+        &self,
+    ) -> Result<(), RuntimeError> {
         let Some(challenge) = self
             .opening
             .path_validation
@@ -498,10 +501,8 @@ impl AcceptedServerReliableStream {
         };
         self.opening
             .commands
-            .send_control(ReliablePathCommand::SendFrame(challenge))
+            .enqueue_admitted_frame(challenge, TrafficClass::Control)
             .await
-            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
-        Ok(())
     }
 
     pub(in crate::runtime) fn supervise(&mut self) -> AcceptedServerReliableStreamRetirement {
@@ -1379,6 +1380,12 @@ impl ServerReliableStreamRegistry {
                 CarrierPathKey { underlay, path_id },
                 path_instance_id,
             );
+            // Attachment acceptance remains zero-credit and carrier-local.
+            // If the target is already established, immediately replay the
+            // retained logical grant on this newly attached output as a later
+            // cumulative update. The carrier actor writes its direct zero ACK
+            // before polling this ordered command queue.
+            entry.binding.retry_pending_max_data(stream_id);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_stream_open",
@@ -1946,6 +1953,49 @@ impl ServerReliableStreamRegistry {
             );
             return Ok(());
         };
+        let key = CarrierPathKey {
+            underlay: identity.underlay,
+            path_id: identity.path_id,
+        };
+        match &frame {
+            Frame::StreamRequalifyData {
+                probe_id,
+                offset,
+                payload,
+                ..
+            } => {
+                let payload_bytes = u32::try_from(payload.len())
+                    .map_err(|_| RuntimeError::Protocol("requalification payload overflow"))?;
+                return target.binding.accept_request_requalification_probe(
+                    key,
+                    identity.path_instance_id,
+                    stream_id,
+                    crate::model::requalification::StreamRequalificationProbe {
+                        id: *probe_id,
+                        offset: *offset,
+                        payload_bytes,
+                    },
+                );
+            }
+            Frame::StreamRequalifyAck {
+                probe_id,
+                offset,
+                payload_bytes,
+                ..
+            } => {
+                target.binding.acknowledge_response_requalification_probe(
+                    key,
+                    identity.path_instance_id,
+                    crate::model::requalification::StreamRequalificationProbe {
+                        id: *probe_id,
+                        offset: *offset,
+                        payload_bytes: *payload_bytes,
+                    },
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
         Self::record_request_feedback_ingress_from_path_target(identity, &frame, &target);
         Self::route_frame_to_target(frame, target).await
     }
@@ -1969,6 +2019,55 @@ impl ServerReliableStreamRegistry {
             );
             return Ok(ServerStreamFrameRoute::Routed);
         };
+        let key = CarrierPathKey {
+            underlay: identity.underlay,
+            path_id: identity.path_id,
+        };
+        match &frame {
+            Frame::StreamRequalifyData {
+                probe_id,
+                offset,
+                payload,
+                ..
+            } => {
+                let payload_bytes = u32::try_from(payload.len())
+                    .map_err(|_| RuntimeError::Protocol("requalification payload overflow"))?;
+                return match target.binding.accept_request_requalification_probe(
+                    key,
+                    identity.path_instance_id,
+                    stream_id,
+                    crate::model::requalification::StreamRequalificationProbe {
+                        id: *probe_id,
+                        offset: *offset,
+                        payload_bytes,
+                    },
+                ) {
+                    Ok(()) => Ok(ServerStreamFrameRoute::Routed),
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        Ok(ServerStreamFrameRoute::Backpressured(frame))
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            Frame::StreamRequalifyAck {
+                probe_id,
+                offset,
+                payload_bytes,
+                ..
+            } => {
+                target.binding.acknowledge_response_requalification_probe(
+                    key,
+                    identity.path_instance_id,
+                    crate::model::requalification::StreamRequalificationProbe {
+                        id: *probe_id,
+                        offset: *offset,
+                        payload_bytes: *payload_bytes,
+                    },
+                );
+                return Ok(ServerStreamFrameRoute::Routed);
+            }
+            _ => {}
+        }
         Self::record_request_feedback_ingress_from_path_target(identity, &frame, &target);
         Self::try_route_frame_to_target(frame, target)
     }
@@ -2057,6 +2156,14 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
                     let accepted = *accepted;
                     match new_stream_policy {
                         ServerNewStreamPolicy::Submit => {
+                            if let Err(error) = accepted.admit_opening_path() {
+                                // This backend may execute inside the carrier
+                                // actor that owns the command receiver. Drop
+                                // schedules cleanup without awaiting its own
+                                // full queue.
+                                drop(accepted);
+                                return Err(error);
+                            }
                             if let Err(accepted) = registry.submit_accepted(accepted) {
                                 accepted.close().await;
                                 return Err(RuntimeError::Protocol(

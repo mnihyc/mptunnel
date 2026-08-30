@@ -14,7 +14,7 @@ use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamDemandHint
 use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
-    try_recv_reliable_path_command,
+    reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::{
@@ -221,6 +221,20 @@ async fn assert_post_resolution_denial_is_logical_stream_local(
             ServerStreamOpenOutcome::New(_)
         ));
     }
+    for expected_stream_id in [denied_stream_id, sibling_stream_id] {
+        let admission = recv_reliable_path_command(&mut command_rx)
+            .await
+            .expect("zero-credit carrier admission");
+        let pending_bytes = reliable_path_command_pending_bytes(&admission);
+        assert!(matches!(
+            admission,
+            ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                stream_id,
+                max_offset: 0,
+            }) if stream_id == expected_stream_id
+        ));
+        command_rx.release_pending_command_bytes(pending_bytes);
+    }
     let denied = accepted_rx.recv().await.expect("denied accepted stream");
     let sibling = accepted_rx.recv().await.expect("sibling accepted stream");
     assert_eq!(registry.management_snapshot().active_streams, 2);
@@ -228,13 +242,30 @@ async fn assert_post_resolution_denial_is_logical_stream_local(
     relay_accepted_stream(context, denied)
         .await
         .expect("apply post-resolution denial");
-    let terminal = tokio::time::timeout(
+    let first = tokio::time::timeout(
         Duration::from_secs(1),
         recv_reliable_path_command(&mut command_rx),
     )
     .await
     .expect("logical denial command timeout")
     .expect("logical denial command");
+    let terminal = if silently_dropped {
+        first
+    } else {
+        let pending_bytes = reliable_path_command_pending_bytes(&first);
+        assert!(matches!(
+            first,
+            ReliablePathCommand::SendFrame(Frame::PathProofData {
+                path_id: proof_path_id,
+                payload,
+                ..
+            }) if proof_path_id == PathId(0) && !payload.is_empty()
+        ));
+        command_rx.release_pending_command_bytes(pending_bytes);
+        recv_reliable_path_command(&mut command_rx)
+            .await
+            .expect("logical rejection terminal command")
+    };
     if silently_dropped {
         assert!(
             matches!(

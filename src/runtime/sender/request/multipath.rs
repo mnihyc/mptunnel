@@ -21,12 +21,14 @@ use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
+use crate::model::requalification::{StreamPathRequalification, StreamRequalificationProbe};
 use crate::model::request_evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidenceUpdate, RequestPerFlowRateModel,
     request_path_rate_coverage_floor_bytes,
 };
-use crate::model::timing::reliable_relay_tail_reinjection_delay;
+use crate::model::timing::{reliable_path_stale_interval, reliable_relay_tail_reinjection_delay};
 use crate::model::work::RangeRecoveryState;
+use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::path::ClientPathContext;
@@ -49,7 +51,7 @@ pub(super) fn observe_request_relay_scheduling(
     lane: TrafficClass,
     payload_bytes: usize,
     include_bulk_admission: bool,
-    stale_paths: &HashSet<RelayPathInstance>,
+    requalification: &StreamPathRequalification<RelayPathInstance>,
 ) -> RequestRelaySchedulingObservation {
     let path_evidence = context.observe_reliable_request_paths(
         remote_paths.iter().map(|path| {
@@ -71,7 +73,7 @@ pub(super) fn observe_request_relay_scheduling(
             .zip(path_evidence.paths.iter())
             .any(|(path, evidence)| {
                 path.stream.product_admission_active()
-                    && !stale_paths.contains(&path.instance())
+                    && !requalification.stale_for_original_data(path.instance())
                     && evidence.shared_snapshot.is_some_and(|snapshot| {
                         scheduler::score_path(snapshot, lane, payload_bytes).is_some()
                     })
@@ -84,7 +86,7 @@ pub(super) fn observe_request_relay_scheduling(
             debug_assert_eq!(instance, evidence.instance);
             let exact_instance_live = evidence.shared_snapshot.is_some();
             let original_data_eligible =
-                !stale_paths.contains(&instance) || !has_nonstale_product_output;
+                !requalification.stale_for_original_data(instance) || !has_nonstale_product_output;
             RequestRelayPathObservation {
                 instance,
                 can_enqueue_frame: exact_instance_live
@@ -586,7 +588,12 @@ impl RequestMultipathController {
             .unacked_original_paths_before(horizon)
             .into_iter()
             .filter(|instance| remotes.contains_path_instance(*instance))
-            .filter(|instance| !self.request.stale_paths.contains(instance))
+            .filter(|instance| {
+                !self
+                    .request
+                    .requalification
+                    .stale_for_original_data(*instance)
+            })
             .collect()
     }
 
@@ -613,18 +620,160 @@ impl RequestMultipathController {
             .paths
             .iter()
             .filter(|path| path.instance() != original_path)
-            .filter(|path| !self.request.stale_paths.contains(&path.instance()))
+            .filter(|path| {
+                !self
+                    .request
+                    .requalification
+                    .stale_for_original_data(path.instance())
+            })
             .filter(|path| path.stream.product_admission_active())
             .map(|path| path.instance())
             .collect()
     }
 
     pub(super) fn mark_path_stale(&mut self, instance: RelayPathInstance) -> bool {
-        self.request.stale_paths.insert(instance)
+        let changed = self
+            .request
+            .requalification
+            .mark_stale(instance, Instant::now());
+        if changed {
+            self.request.flights.invalidate_original_evidence(instance);
+            self.request
+                .path_states
+                .get_mut(instance)
+                .reset_for_requalification();
+            if self
+                .request
+                .ack_clock_operation
+                .is_some_and(|operation| operation.candidate() == instance)
+            {
+                self.request.ack_clock_operation = None;
+            }
+        }
+        changed
     }
 
     pub(super) fn path_is_stale(&self, instance: RelayPathInstance) -> bool {
-        self.request.stale_paths.contains(&instance)
+        self.request
+            .requalification
+            .stale_for_original_data(instance)
+    }
+
+    pub(super) fn requalification_deadline(&self) -> Option<Instant> {
+        self.request.requalification.next_deadline()
+    }
+
+    pub(super) fn try_enqueue_requalification_probe(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        lane: TrafficClass,
+        byte_limit: usize,
+    ) -> Result<Option<usize>, crate::runtime::RuntimeError> {
+        let now = Instant::now();
+        // Attachment membership can change while no new Product placement is
+        // planned. Reconcile here so a detached pending candidate cannot own
+        // the only wake deadline and starve another live stale attachment.
+        self.request
+            .requalification
+            .retain_live(|instance| remotes.contains_path_instance(instance));
+        let candidates = self
+            .request
+            .requalification
+            .eligible_probe_candidates_where(now, |instance| {
+                remotes.paths.iter().any(|path| {
+                    path.instance() == instance && path.stream.product_admission_active()
+                })
+            });
+        let mut queue_blocked = false;
+        for candidate in candidates {
+            let Some(source_range) = self
+                .request
+                .flights
+                .requalification_source_range(byte_limit)
+            else {
+                continue;
+            };
+            let Some(Frame::StreamData {
+                stream_id,
+                offset,
+                payload,
+            }) = send_stream
+                .retransmission_frames_for_ranges(&[source_range], byte_limit)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            let Some(path) = remotes
+                .paths
+                .iter()
+                .find(|path| path.instance() == candidate)
+            else {
+                continue;
+            };
+            let preview = Frame::StreamRequalifyData {
+                stream_id,
+                probe_id: 1,
+                offset,
+                payload: payload.clone(),
+            };
+            if !path.stream.can_enqueue_reinjection_frame_now(&preview) {
+                queue_blocked = true;
+                continue;
+            }
+            let retry_after = reliable_path_stale_interval(
+                Some(candidate.key.underlay),
+                context.reliable_path_snapshot_for_instance(candidate),
+            );
+            let Some(probe) = self.request.requalification.start_probe(
+                candidate,
+                offset,
+                payload.len(),
+                retry_after,
+                now,
+            ) else {
+                continue;
+            };
+            let frame = Frame::StreamRequalifyData {
+                stream_id,
+                probe_id: probe.id,
+                offset,
+                payload,
+            };
+            match path.stream.try_enqueue_requalification_frame(frame, lane) {
+                Ok(()) => return Ok(Some(probe.payload_bytes as usize)),
+                Err(crate::runtime::RuntimeError::SenderServiceBlocked)
+                | Err(crate::runtime::RuntimeError::ReliablePathSessionClosed) => {
+                    queue_blocked = true;
+                    self.request
+                        .requalification
+                        .cancel_unpublished_probe(candidate, probe, now);
+                }
+                Err(error) => {
+                    self.request
+                        .requalification
+                        .cancel_unpublished_probe(candidate, probe, now);
+                    return Err(error);
+                }
+            }
+        }
+        if queue_blocked {
+            Err(crate::runtime::RuntimeError::SenderServiceBlocked)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn acknowledge_requalification_probe(
+        &mut self,
+        instance: RelayPathInstance,
+        probe: StreamRequalificationProbe,
+    ) -> bool {
+        self.request
+            .requalification
+            .acknowledge_probe(instance, probe, Instant::now())
     }
 
     pub(super) fn has_reinjection_path(
@@ -634,7 +783,10 @@ impl RequestMultipathController {
     ) -> bool {
         remotes.paths.iter().any(|path| {
             path.instance() != candidate
-                && !self.request.stale_paths.contains(&path.instance())
+                && !self
+                    .request
+                    .requalification
+                    .stale_for_original_data(path.instance())
                 && path.stream.product_admission_active()
         })
     }
@@ -650,7 +802,12 @@ impl RequestMultipathController {
                 .paths
                 .iter()
                 .filter(|path| !excluded.contains(&path.instance()))
-                .filter(|path| !self.request.stale_paths.contains(&path.instance()))
+                .filter(|path| {
+                    !self
+                        .request
+                        .requalification
+                        .stale_for_original_data(path.instance())
+                })
                 .filter(|path| path.stream.product_admission_active())
                 .filter_map(|path| context.reliable_path_snapshot_for_instance(path.instance()))
                 .filter(|snapshot| allow_backup || !scheduler::path_is_backup(*snapshot))
@@ -669,9 +826,8 @@ impl RequestMultipathController {
         remotes: &ReliableRelayRemoteSet,
     ) -> Vec<RelayPathInstance> {
         self.request
-            .stale_paths
-            .iter()
-            .copied()
+            .requalification
+            .stale_candidates()
             .filter(|instance| remotes.contains_path_instance(*instance))
             .filter(|instance| {
                 self.request
@@ -692,9 +848,13 @@ impl RequestMultipathController {
                 .flights
                 .record_reinjection_frame_instance(instance, frame)
         } else {
+            let evidence_eligible = !self
+                .request
+                .requalification
+                .stale_for_original_data(instance);
             self.request
                 .flights
-                .record_original_frame_instance(instance, frame)
+                .record_original_frame_instance_with_evidence(instance, frame, evidence_eligible)
         }
     }
 
@@ -857,7 +1017,7 @@ impl RequestMultipathController {
             lane,
             scoring_payload_bytes,
             observe_bulk_admission,
-            &self.request.stale_paths,
+            &self.request.requalification,
         );
         if let Some(payload_bytes) = prepared.unique_data_payload_bytes {
             self.reconcile_request_path_state(context, remotes);
@@ -1404,17 +1564,8 @@ impl RequestMultipathController {
             let live_instances = remotes.path_instances().into_iter().collect::<HashSet<_>>();
             self.request.path_states.retain_live(&live_instances);
             self.request
-                .stale_paths
-                .retain(|instance| live_instances.contains(instance));
-            if !live_instances
-                .iter()
-                .any(|instance| !self.request.stale_paths.contains(instance))
-            {
-                // Staleness only withdraws OriginalData while a distinct
-                // non-stale attachment can own it. Restoring the sole
-                // surviving set is one membership reconciliation.
-                self.request.stale_paths.clear();
-            }
+                .requalification
+                .retain_live(|instance| live_instances.contains(&instance));
             self.request.membership_generation = Some(membership_generation);
         }
         let now = Instant::now();
@@ -1519,14 +1670,10 @@ impl RequestMultipathController {
     ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
         let released = self.request.flights.release_normalized_acked_ranges(ranges);
         let delivered_data = self.apply_released_data_at(context, released, acked_at);
-        let data_ack_progress_paths = delivered_data
+        delivered_data
             .iter()
             .map(|progress| progress.instance)
-            .collect::<smallvec::SmallVec<[_; 4]>>();
-        for instance in &data_ack_progress_paths {
-            self.request.stale_paths.remove(instance);
-        }
-        data_ack_progress_paths
+            .collect::<smallvec::SmallVec<[_; 4]>>()
     }
 
     fn apply_released_data_at(
@@ -1541,7 +1688,12 @@ impl RequestMultipathController {
             smallvec::SmallVec::<[RequestOwnerAckProgress<RelayPathInstance>; 4]>::new();
         for release in released {
             context.release_relay_path_inflight(release.instance, release.bytes);
-            if release.path_proving {
+            let product_evidence_eligible = release.path_proving
+                && self
+                    .request
+                    .requalification
+                    .observe_unique_original_progress(release.instance, release.sent_at);
+            if product_evidence_eligible {
                 if let Some(progress) = delivered_data
                     .iter_mut()
                     .find(|progress| progress.instance == release.instance)
@@ -1554,7 +1706,7 @@ impl RequestMultipathController {
                     });
                 }
             }
-            if release.path_proving {
+            if product_evidence_eligible {
                 let sample = ordinary_owner_samples.entry(release.instance).or_insert((
                     0,
                     release.sent_at,
@@ -1733,7 +1885,12 @@ impl RequestMultipathController {
             .paths
             .iter()
             .map(ReliableRelayRemotePath::instance)
-            .filter(|instance| !self.request.stale_paths.contains(instance))
+            .filter(|instance| {
+                !self
+                    .request
+                    .requalification
+                    .stale_for_original_data(*instance)
+            })
             .collect()
     }
 
@@ -1762,9 +1919,13 @@ impl RequestMultipathController {
         instance: RelayPathInstance,
         frame: &Frame,
     ) {
+        let evidence_eligible = !self
+            .request
+            .requalification
+            .stale_for_original_data(instance);
         self.request
             .flights
-            .record_original_frame_instance(instance, frame);
+            .record_original_frame_instance_with_evidence(instance, frame, evidence_eligible);
     }
 
     /// Drained-carrier preference for ordinary periodic repair. Recovery that
@@ -1840,7 +2001,10 @@ impl RequestMultipathController {
         let requires_distinct_output = live_tail_recovery || ack_gap_reinjection;
         let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
         let operation_path_in_scope = |path: &ReliableRelayRemotePath| {
-            !self.request.stale_paths.contains(&path.instance())
+            !self
+                .request
+                .requalification
+                .stale_for_original_data(path.instance())
                 && !invalid_persistent_target
                 && required_client_target.is_none_or(|required| path.instance() == required)
                 && (!requires_distinct_output || !avoid_instances.contains(&path.instance()))

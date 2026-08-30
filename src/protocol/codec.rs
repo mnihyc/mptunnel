@@ -8,7 +8,7 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 116;
@@ -122,6 +122,7 @@ pub fn encoded_frame_capacity_hint(frame: &Frame) -> usize {
 fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
     match frame {
         Frame::StreamData { payload, .. }
+        | Frame::StreamRequalifyData { payload, .. }
         | Frame::DatagramData { payload, .. }
         | Frame::IpPacket { payload, .. } => payload.len().saturating_add(32),
         Frame::PathProofData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
@@ -391,6 +392,40 @@ fn encode_payload(
             }
             Ok(FrameKind::StreamAck)
         }
+        Frame::StreamRequalifyData {
+            stream_id,
+            probe_id,
+            offset,
+            payload,
+        } => {
+            encode_payload_bytes_len(payload.len(), limits)?;
+            if *probe_id == 0 || payload.is_empty() {
+                return Err(CodecError::InvalidRange);
+            }
+            validate_stream_data_extent(*offset, payload.len())?;
+            put_u64(out, stream_id.0);
+            put_u64(out, *probe_id);
+            put_u64(out, *offset);
+            put_u32(out, payload.len() as u32);
+            out.extend_from_slice(payload);
+            Ok(FrameKind::StreamRequalifyData)
+        }
+        Frame::StreamRequalifyAck {
+            stream_id,
+            probe_id,
+            offset,
+            payload_bytes,
+        } => {
+            if *probe_id == 0 || *payload_bytes == 0 {
+                return Err(CodecError::InvalidRange);
+            }
+            validate_stream_data_extent(*offset, *payload_bytes as usize)?;
+            put_u64(out, stream_id.0);
+            put_u64(out, *probe_id);
+            put_u64(out, *offset);
+            put_u32(out, *payload_bytes);
+            Ok(FrameKind::StreamRequalifyAck)
+        }
         Frame::StreamMaxData {
             stream_id,
             max_offset,
@@ -657,6 +692,38 @@ fn decode_payload(
                 stream_id,
                 complete,
                 ranges,
+            })
+        }
+        FrameKind::StreamRequalifyData => {
+            let stream_id = StreamId(reader.get_u64()?);
+            let probe_id = reader.get_u64()?;
+            let offset = reader.get_u64()?;
+            let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
+            if probe_id == 0 || payload.is_empty() {
+                return Err(CodecError::InvalidRange);
+            }
+            validate_stream_data_extent(offset, payload.len())?;
+            Ok(Frame::StreamRequalifyData {
+                stream_id,
+                probe_id,
+                offset,
+                payload,
+            })
+        }
+        FrameKind::StreamRequalifyAck => {
+            let stream_id = StreamId(reader.get_u64()?);
+            let probe_id = reader.get_u64()?;
+            let offset = reader.get_u64()?;
+            let payload_bytes = reader.get_u32()?;
+            if probe_id == 0 || payload_bytes == 0 {
+                return Err(CodecError::InvalidRange);
+            }
+            validate_stream_data_extent(offset, payload_bytes as usize)?;
+            Ok(Frame::StreamRequalifyAck {
+                stream_id,
+                probe_id,
+                offset,
+                payload_bytes,
             })
         }
         FrameKind::StreamMaxData => Ok(Frame::StreamMaxData {
@@ -1277,6 +1344,8 @@ enum FrameKind {
     IpTunnelReady = 39,
     IpPacket = 40,
     IpTunnelClose = 41,
+    StreamRequalifyData = 42,
+    StreamRequalifyAck = 43,
 }
 
 impl FrameKind {
@@ -1315,6 +1384,8 @@ impl FrameKind {
             39 => Ok(Self::IpTunnelReady),
             40 => Ok(Self::IpPacket),
             41 => Ok(Self::IpTunnelClose),
+            42 => Ok(Self::StreamRequalifyData),
+            43 => Ok(Self::StreamRequalifyAck),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }

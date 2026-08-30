@@ -99,7 +99,7 @@ pub enum PathUsage {
     Backup,
 }
 
-/// Largest remaining delivery-rate authority representable by protocol v8.
+/// Largest remaining delivery-rate authority representable by protocol v9.
 ///
 /// This is the three-PTO horizon at the maximum wire RTT and RTT variance:
 /// `(u32::MAX + 4 * u32::MAX + 25_000us) * 3`. A receiver rejects larger
@@ -275,6 +275,21 @@ pub enum Frame {
         complete: bool,
         ranges: Vec<OffsetRange>,
     },
+    /// Bounded non-delivering duplicate used to requalify one exact stream
+    /// attachment. It carries retained Product bytes but owns no stream range.
+    StreamRequalifyData {
+        stream_id: StreamId,
+        probe_id: u64,
+        offset: u64,
+        payload: Bytes,
+    },
+    /// Exact receipt for `STREAM_REQUALIFY_DATA` on the carrying attachment.
+    StreamRequalifyAck {
+        stream_id: StreamId,
+        probe_id: u64,
+        offset: u64,
+        payload_bytes: u32,
+    },
     StreamMaxData {
         stream_id: StreamId,
         max_offset: u64,
@@ -386,6 +401,8 @@ impl Frame {
             Self::OpenStream { .. } => "OPEN_STREAM",
             Self::StreamData { .. } => "STREAM_DATA",
             Self::StreamAck { .. } => "STREAM_ACK",
+            Self::StreamRequalifyData { .. } => "STREAM_REQUALIFY_DATA",
+            Self::StreamRequalifyAck { .. } => "STREAM_REQUALIFY_ACK",
             Self::StreamMaxData { .. } => "STREAM_MAX_DATA",
             Self::StreamFin { .. } => "STREAM_FIN",
             Self::StreamDetach { .. } => "STREAM_DETACH",

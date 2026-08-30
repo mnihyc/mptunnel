@@ -13,6 +13,7 @@ use crate::model::capacity::{
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::work::{CarrierWorkKind, RangeRecoveryState, ReliableWorkClass};
 use crate::mux::MuxLimits;
+use crate::mux::stream::ReliableSendStream;
 #[cfg(test)]
 use crate::protocol::PathId;
 use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_extent};
@@ -536,6 +537,29 @@ impl ReliablePathStream {
         }
     }
 
+    pub(in crate::runtime) fn try_enqueue_response_requalification_probe(
+        &self,
+        send_stream: &ReliableSendStream,
+        lane: TrafficClass,
+        byte_limit: usize,
+    ) -> Result<Option<usize>, RuntimeError> {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.try_enqueue_response_requalification_probe(send_stream, lane, byte_limit)
+            }
+            ReliablePathStreamOutput::Fixed(_) => Ok(None),
+        }
+    }
+
+    pub(in crate::runtime) fn response_requalification_deadline(&self) -> Option<Instant> {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.response_requalification_deadline()
+            }
+            ReliablePathStreamOutput::Fixed(_) => None,
+        }
+    }
+
     pub(in crate::runtime) fn set_lane(&mut self, lane: TrafficClass) {
         self.lane = lane;
         self.output.set_lane(lane);
@@ -666,6 +690,25 @@ impl ReliablePathStreamHandle {
             ReliablePathStreamOutput::Switchable(_) => {
                 Err(RuntimeError::Protocol("request relay path is not fixed"))
             }
+        }
+    }
+
+    /// Enqueues a data-bearing, non-DSN-owning requalification probe on this
+    /// exact fixed attachment. It shares the bounded reinjection lane but is
+    /// deliberately absent from Product flight ledgers.
+    pub(in crate::runtime) fn try_enqueue_requalification_frame(
+        &self,
+        frame: Frame,
+        lane: TrafficClass,
+    ) -> Result<(), RuntimeError> {
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed) => fixed
+                .commands()
+                .try_reserve_reinjection_frame(frame, lane)
+                .map(|reservation| reservation.commit()),
+            ReliablePathStreamOutput::Switchable(_) => Err(RuntimeError::Protocol(
+                "request requalification requires a fixed attachment",
+            )),
         }
     }
 

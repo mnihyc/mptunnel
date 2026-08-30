@@ -993,9 +993,14 @@ impl Bbr3 {
             if rate_sample.is_app_limited {
                 return;
             }
-            if rate_sample.delivery_rate >= self.full_bw * FULL_BW_GROWTH {
+            // Loss compensation changed max_bw/bw_latest into serviced-rate estimates. Keep the
+            // plateau baseline in that same unit; comparing raw delivery here would make a clean
+            // 1.25x probe look smaller solely because authorized erasure occurred. With a zero
+            // floor, model_delivery_rate is bit-for-bit the draft's raw sample.
+            let model_delivery_rate = self.model_delivery_rate(rate_sample);
+            if model_delivery_rate >= self.full_bw * FULL_BW_GROWTH {
                 self.reset_full_bw();
-                self.full_bw = rate_sample.delivery_rate;
+                self.full_bw = model_delivery_rate;
                 return;
             }
         }
@@ -1317,7 +1322,7 @@ impl Bbr3 {
         if cwnd_limited_by_inflight_longterm {
             self.reset_full_bw();
             if let Some(rate_sample) = self.rs {
-                self.full_bw = rate_sample.delivery_rate;
+                self.full_bw = self.model_delivery_rate(rate_sample);
             }
         } else if self.full_bw_now {
             return true;
@@ -1526,7 +1531,7 @@ impl Bbr3 {
         self.start_round();
         self.reset_full_bw();
         if let Some(rate_sample) = self.rs {
-            self.full_bw = rate_sample.delivery_rate;
+            self.full_bw = self.model_delivery_rate(rate_sample);
         }
         self.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
         self.pacing_gain = self.probe_bw_up_pacing_gain;
@@ -4951,6 +4956,160 @@ mod test {
         let mut config = Bbr3Config::default();
         config.loss_compensation_floor(0.10);
         config
+    }
+
+    #[test]
+    fn full_bandwidth_growth_uses_the_loss_compensated_delivery_model() {
+        const MSS: u64 = 1_000;
+        const HELD_DELIVERED: u64 = 119;
+        const HELD_LOST: u64 = 13;
+        const SEED_DELIVERED: u64 = 100;
+        let base = Instant::now();
+        let at = |millis| base + Duration::from_millis(millis);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut bbr = Bbr3::new(Arc::new(mptunnel_loss_profile_config()), MSS as u16);
+
+        // This is a reachable ProbeBW refill snapshot with enough window for the deliberately
+        // reordered flight below. The seed ACK enters ProbeUP through the production state path.
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Refill);
+        bbr.ack_phase = AckPhase::Refilling;
+        bbr.full_bw_reached = true;
+        bbr.cwnd = 512 * MSS;
+
+        // Keep one older Handshake-space flight outstanding. A later Handshake ACK will deliver
+        // most of it and loss detection will run only after that ACK transaction, exactly as
+        // Connection::on_ack_received orders on_end_acks before detect_lost_packets. The separate
+        // packet-number space keeps the held flight independent from the Data ACKs used below.
+        for packet_number in 0..HELD_LOST + HELD_DELIVERED {
+            bbr.on_packet_sent(
+                base,
+                MSS as u16,
+                packet_number,
+                SpaceId::Handshake,
+            );
+        }
+        for packet_number in 0..SEED_DELIVERED {
+            bbr.on_packet_sent(base, MSS as u16, packet_number, SpaceId::Data);
+        }
+        for packet_number in 0..SEED_DELIVERED {
+            bbr.on_ack(
+                at(100),
+                base,
+                MSS,
+                packet_number,
+                SpaceId::Data,
+                false,
+                &rtt,
+            );
+        }
+        bbr.on_end_acks(
+            at(100),
+            (HELD_LOST + HELD_DELIVERED) * MSS,
+            false,
+            Some(SEED_DELIVERED - 1),
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+        assert_eq!(bbr.full_bw, 1_000_000.0);
+
+        // Two clean, internally generated 100,000-byte/100ms epochs approach the ordinary
+        // three-round plateau boundary. A configured allowance cannot alter either clean epoch.
+        for epoch in 1..=2 {
+            let first_packet = epoch * SEED_DELIVERED;
+            let sent = at(epoch * 100);
+            let acked = at((epoch + 1) * 100);
+            for packet_number in first_packet..first_packet + SEED_DELIVERED {
+                bbr.on_packet_sent(sent, MSS as u16, packet_number, SpaceId::Data);
+            }
+            for packet_number in first_packet..first_packet + SEED_DELIVERED {
+                bbr.on_ack(
+                    acked,
+                    sent,
+                    MSS,
+                    packet_number,
+                    SpaceId::Data,
+                    false,
+                    &rtt,
+                );
+            }
+            bbr.on_end_acks(
+                acked,
+                (HELD_LOST + HELD_DELIVERED) * MSS,
+                false,
+                Some(first_packet + SEED_DELIVERED - 1),
+                SpaceId::Data,
+            );
+            assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+            assert_eq!(bbr.full_bw_count, epoch);
+            assert_eq!(bbr.full_bw, 1_000_000.0);
+        }
+
+        // This packet starts the deciding round after the clean plateau epochs, but is retained
+        // until the held flight resolves. It therefore snapshots both the current round boundary
+        // and the pre-loss cumulative counter.
+        let deciding_packet = 3 * SEED_DELIVERED;
+        bbr.on_packet_sent(at(300), MSS as u16, deciding_packet, SpaceId::Data);
+
+        // The Handshake ACK first delivers 119,000 bytes. Its old send snapshot cannot start the
+        // current packet-timed round. Loss detection then declares 13,000 bytes from the same held
+        // flight, leaving a genuine sub-threshold 9.77% aligned erasure observation.
+        for packet_number in HELD_LOST..HELD_LOST + HELD_DELIVERED {
+            bbr.on_ack(
+                at(350),
+                base,
+                MSS,
+                packet_number,
+                SpaceId::Handshake,
+                false,
+                &rtt,
+            );
+        }
+        bbr.on_end_acks(
+            at(350),
+            (HELD_LOST + 1) * MSS,
+            false,
+            Some(HELD_LOST + HELD_DELIVERED - 1),
+            SpaceId::Handshake,
+        );
+        assert_eq!(bbr.full_bw_count, MAX_FULL_BW_COUNT - 1);
+        for packet_number in 0..HELD_LOST {
+            bbr.on_packet_lost(MSS as u16, packet_number, SpaceId::Handshake, at(350));
+        }
+        bbr.on_congestion_event(
+            at(350),
+            base,
+            false,
+            false,
+            HELD_LOST * MSS,
+            HELD_LOST - 1,
+            SpaceId::Handshake,
+        );
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+
+        // The deciding ACK completes a production-generated 120,000-byte/100ms sample carrying
+        // those 13,000 aligned lost bytes. Raw delivery grew only 1.20x, while serviced rate grew
+        // 1.33x. Mixing those units would declare a false plateau and leave ProbeUP prematurely.
+        bbr.on_ack(
+            at(400),
+            at(300),
+            MSS,
+            deciding_packet,
+            SpaceId::Data,
+            false,
+            &rtt,
+        );
+        bbr.on_end_acks(at(400), 0, false, Some(deciding_packet), SpaceId::Data);
+
+        let deciding_sample = bbr.rs.expect("deciding production sample");
+        assert_eq!(deciding_sample.delivered, 120 * MSS);
+        assert_eq!(deciding_sample.interval, Duration::from_millis(100));
+        assert_eq!(deciding_sample.delivery_rate, 1_200_000.0);
+        assert_eq!(bbr.lost, HELD_LOST * MSS);
+        assert_eq!(bbr.full_bw_count, 0);
+        assert!(!bbr.full_bw_now);
+        assert!(bbr.full_bw_reached);
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+        assert!((bbr.full_bw - 1_330_000.0).abs() < 1.0);
     }
 
     fn send_test_flight(bbr: &mut Bbr3, base: Instant, packets: u64) {

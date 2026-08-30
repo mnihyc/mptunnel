@@ -34,12 +34,48 @@ pub(in crate::runtime) struct RequestFlightLedger {
 }
 
 impl RequestFlightLedger {
+    /// One retained OriginalData range for a non-owning requalification copy.
+    ///
+    /// The owner need not itself be Qualified: when every attachment is stale,
+    /// an evidence-ineligible sole-survivor fallback is the only available
+    /// payload source.  The copy never enters this ledger, so the existing
+    /// OriginalData owner remains authoritative regardless of probe arrival or
+    /// loss.
+    pub(in crate::runtime) fn requalification_source_range(
+        &self,
+        byte_limit: usize,
+    ) -> Option<OffsetRange> {
+        if byte_limit == 0 {
+            return None;
+        }
+        self.flights.iter().find_map(|(start, flights)| {
+            let owner = latest_original_transmission(flights)?;
+            let end = owner.end.min(start.saturating_add(byte_limit as u64));
+            OffsetRange::new(*start, end)
+        })
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn record_original_frame_instance(
         &mut self,
         instance: RelayPathInstance,
         frame: &Frame,
     ) -> usize {
-        self.record_product_frame(instance, frame, CarrierWorkKind::OriginalData)
+        self.record_original_frame_instance_with_evidence(instance, frame, true)
+    }
+
+    pub(in crate::runtime) fn record_original_frame_instance_with_evidence(
+        &mut self,
+        instance: RelayPathInstance,
+        frame: &Frame,
+        evidence_eligible: bool,
+    ) -> usize {
+        self.record_product_frame(
+            instance,
+            frame,
+            CarrierWorkKind::OriginalData,
+            evidence_eligible,
+        )
     }
 
     pub(in crate::runtime) fn record_reinjection_frame_instance(
@@ -47,7 +83,7 @@ impl RequestFlightLedger {
         instance: RelayPathInstance,
         frame: &Frame,
     ) -> usize {
-        self.record_product_frame(instance, frame, CarrierWorkKind::ReinjectedData)
+        self.record_product_frame(instance, frame, CarrierWorkKind::ReinjectedData, false)
     }
 
     fn record_product_frame(
@@ -55,6 +91,7 @@ impl RequestFlightLedger {
         instance: RelayPathInstance,
         frame: &Frame,
         kind: CarrierWorkKind,
+        evidence_eligible: bool,
     ) -> usize {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return 0;
@@ -65,8 +102,21 @@ impl RequestFlightLedger {
             bytes,
             sent_at: Instant::now(),
             kind,
+            evidence_eligible,
         });
         bytes
+    }
+
+    /// Revokes every assignment from the pre-stale Product authority epoch.
+    /// The flights remain live for exact ACK release and recovery ownership.
+    pub(in crate::runtime) fn invalidate_original_evidence(&mut self, instance: RelayPathInstance) {
+        for flights in self.flights.values_mut() {
+            for flight in flights.iter_mut().filter(|flight| {
+                flight.instance == instance && flight.kind.is_original_transmission()
+            }) {
+                flight.evidence_eligible = false;
+            }
+        }
     }
 
     pub(in crate::runtime) fn release_normalized_acked_ranges(
@@ -95,7 +145,8 @@ impl RequestFlightLedger {
                 if bytes == 0 {
                     continue;
                 }
-                let path_proving = flight.kind.is_original_transmission()
+                let path_proving = flight.evidence_eligible
+                    && flight.kind.is_original_transmission()
                     && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end);
                 released.push(RequestPathRelease {
                     instance: flight.instance,
@@ -644,6 +695,7 @@ struct RequestFlight {
     bytes: usize,
     sent_at: Instant,
     kind: CarrierWorkKind,
+    evidence_eligible: bool,
 }
 
 #[cfg(test)]

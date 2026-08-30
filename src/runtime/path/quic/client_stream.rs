@@ -261,6 +261,14 @@ async fn handle_client_udp_stream_input(
             stream_id: received_stream_id,
             ..
         }
+        | Frame::StreamRequalifyData {
+            stream_id: received_stream_id,
+            ..
+        }
+        | Frame::StreamRequalifyAck {
+            stream_id: received_stream_id,
+            ..
+        }
         | Frame::StreamMaxData {
             stream_id: received_stream_id,
             ..

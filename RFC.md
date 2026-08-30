@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 8
+# MPTunnel Multipath Proxy Protocol (MPP) Version 9
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 8: its wire format, carrier profiles,
+This document specifies MPP version 9: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 8 is identified by the frame header in Section 12. A peer MUST
+Wire version 9 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -384,7 +384,7 @@ two frames before `PATH_JOIN`.
 The `SESSION_AUTH` transcript is:
 
 ```text
-"mptunnel session auth v8" ||
+"mptunnel session auth v9" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 nonce:16B ||
@@ -407,7 +407,7 @@ issued_at_unix_secs:u64
 The common `PATH_JOIN` transcript is:
 
 ```text
-"mptunnel path join v8" ||
+"mptunnel path join v9" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 path_id:u16 || underlay:u8 ||
@@ -1059,10 +1059,42 @@ No flight, proof, rate, feedback, queue, or load state from the old incarnation
 may be inherited merely because `StreamId` and `PathId` are unchanged.
 
 Each sender begins without implicit MPP credit and waits for
-`STREAM_MAX_DATA` from that direction's receiver. A receiver that refuses only
-the pending attachment sends `STREAM_DETACH` on that carrier. `STREAM_RESET`
-is reserved for terminating the logical MPP stream and MUST NOT be used to
-refuse an additional attachment.
+`STREAM_MAX_DATA` from that direction's receiver. The first logical open has
+two distinct phases: exact-carrier attachment admission and Product-target
+establishment. After accepting a new stream identity, the receiver MUST enqueue
+`STREAM_MAX_DATA(stream_id, 0)` on the opening carrier before submitting DNS,
+routing, or target-connect work. Once that admission commits, the independent
+target owner queues any required path-validation challenge on the same ordered
+carrier output before beginning that work. Ordinary bounded-queue backpressure
+may delay the challenge, but MUST NOT revoke the admitted attachment, discard
+the target owner, or allocate another `StreamId`. Carrier-local failure while
+queuing the challenge remains attachment-local; path validation retains its
+ordinary carrier lifecycle and retry semantics.
+
+For the initial open, the zero grant acknowledges only the carrier attachment;
+the logical open remains pending. It is not evidence that routing or target
+connect succeeded. After receiving it, the sender MUST NOT charge subsequent
+target-establishment delay to that carrier's PTO or publish carrier failure
+because that logical work is slow. The endpoint's logical Product-open deadline
+still bounds the operation. A concrete attachment refusal or carrier failure
+MAY select another carrier, but every retry MUST reuse the same `StreamId`.
+
+The receiver owns exactly one target-establishment operation for one
+`(SessionId, StreamId)`. The original target, initial demand, authenticated
+principal, and opening ingress remain immutable. A matching repeated
+`OPEN_STREAM` while establishment is pending adds an attachment and MUST NOT
+create a second target connection. When target establishment succeeds, the
+receiver advances the retained grant to a nonzero value and publishes it to
+every live attachment. An attachment added after establishment receives its
+credit-neutral zero admission followed by the retained nonzero grant. A target
+failure terminates the logical stream once across all attachments; an explicit
+silent-drop policy MAY instead retire it without a refusal frame.
+
+For an additional attachment, the zero grant is itself a complete attachment
+acceptance because the sender retains the greatest logical grant already seen.
+A receiver that refuses only the pending attachment sends `STREAM_DETACH` on
+that carrier. `STREAM_RESET` is reserved for terminating the logical MPP stream
+and MUST NOT be used to refuse an additional attachment.
 
 Expiry, cancellation, or local rejection of a pending `OPEN_STREAM` settles
 only that exact attachment attempt. If the open may already have entered the
@@ -1701,7 +1733,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        8
+4      version        9
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -1751,6 +1783,9 @@ frames.
 | 39 | `IP_TUNNEL_READY` | `tunnel_id:u64, mtu:u16, address_count:u8, addresses[address_count]` |
 | 40 | `IP_PACKET` | `tunnel_id:u64, packet_id:u64, length:u32, bytes` |
 | 41 | `IP_TUNNEL_CLOSE` | `tunnel_id:u64, reason:u8` |
+| 42 | `STREAM_REQUALIFY_DATA` | `stream_id:u64, probe_id:u64, offset:u64, length:u32, bytes` |
+| 43 | `STREAM_REQUALIFY_ACK` | `stream_id:u64, probe_id:u64, offset:u64, payload_bytes:u32` |
+
 Kinds 5, 6, 15, 19, 25, 26, 28, and 29 are reserved and MUST NOT be sent.
 
 `SESSION_HELLO` and `SESSION_AUTH` are QUIC carrier-admission frames; TCP uses
@@ -1762,6 +1797,10 @@ server-to-client only and requires a matching `PATH_DRAIN`.
 Kinds 38 through 41 are valid only when the endpoint has enabled the IP packet
 service. `OPEN_IP_TUNNEL` is client-to-server, `IP_TUNNEL_READY` is
 server-to-client, and `IP_PACKET` and `IP_TUNNEL_CLOSE` are bidirectional.
+
+Kinds 42 and 43 are the stream-directional requalification transaction from
+Section 15.2. They are valid on TCP and QUIC and MUST name the stream attached
+to the carrying authenticated carrier instance.
 
 ### 12.3 Common field encodings
 
@@ -2147,9 +2186,55 @@ survivor need only remain distinct from the stale original attachment. The
 earliest current range expiry is an actor wake deadline. Thus every range is
 retried no more than once per owning path's MPP recovery interval until MPP
 Data ACK covers it, while the existing queue, flight, repair, and extra-traffic
-bounds limit aggregate work. Exact unambiguous MPP Data ACK progress on the
-stale attachment makes it eligible for original placement again. The carrier
-remains connected and native recovery continues throughout.
+bounds limit aggregate work.
+
+The directional stream-attachment lifecycle is
+`Qualified -> Stale -> Requalifying -> Acquiring -> Qualified`. A stale
+attachment remains a sole-survivor fallback when no qualified or acquiring
+attachment is schedulable, but fallback use MUST NOT clear or rewrite its
+stale evidence. The carrier remains connected and native recovery continues
+throughout.
+
+Re-entry uses `STREAM_REQUALIFY_DATA` and `STREAM_REQUALIFY_ACK`. At most one
+requalification transaction may be pending in one stream direction. The
+sender copies one bounded retained Product quantum and transmits that copy on
+the selected stale attachment. The quantum MAY have any retained OriginalData
+owner, including an evidence-ineligible sole-survivor fallback owned by the
+selected attachment itself. Owner qualification is not a safety input: the
+probe remains non-owning and the exact probe ACK still enters only
+`Acquiring`. The probe carries its stream ID, a nonzero
+monotonically allocated probe ID, the copied range offset, and the bytes. It is
+data-bearing for reachability, pacing, queue admission, and extra-traffic
+accounting, but it does not own or deliver that Product range: it is not
+inserted in the receive map, does not advance a Data ACK horizon, and does not
+enter Product flight or delivery evidence. OriginalData therefore remains the
+only Product owner, and a lost or reordered probe cannot create Product
+head-of-line blocking or make its OriginalData owner's ACK ambiguous.
+
+The receiver authenticates the frame under the ordinary carrier session and
+returns `STREAM_REQUALIFY_ACK` on the exact carrying attachment, echoing the
+stream ID, probe ID, offset, and payload length. A different attachment,
+mismatched field, reused or replayed ID, `PATH_PROOF`, or generic `STREAM_ACK`
+does not change qualification state. An exact probe receipt proves only
+bidirectional attachment reachability and moves `Requalifying` to
+`Acquiring`; it MUST NOT restore the stale attachment's prior Product delivery
+rate or placement capacity. Before entering `Acquiring`, the implementation
+revokes stream-local pre-stale Product authority and applies the existing
+bounded new-attachment acquisition envelope. Only exact unique OriginalData
+progress for work assigned to that attachment after the exact probe ACK moves
+`Acquiring` to `Qualified` and rebuilds normal Product authority.
+
+Loss of the probe leaves Product ownership unchanged. A pending transaction
+expires no sooner than the existing stale-attachment recovery interval and
+returns to `Stale`; that deadline is an actor wake deadline. The next attempt
+uses a fresh probe ID. Probe bytes consume the existing optional extra-traffic
+budget and remain charged. Budget exhaustion MUST NOT permanently prevent
+re-entry: one minimum useful recovery quantum may be sent per exact stale
+interval as critical recovery debt, still subject to the single-pending,
+retained-range, queue, pacing, and flight bounds. Thus one stream direction
+can add at most one recovery quantum instantaneously and, under persistent
+probe loss, at most one quantum per stale interval over time, excluding frame
+headers. Later optional reinjection authority remains reduced by that debt.
 
 The persistence clock is independent for every exact attachment incarnation
 that owns OriginalData omitted below the authoritative Data ACK horizon.
@@ -2341,6 +2426,18 @@ and retains the BBR draft's `q = 2%`, producing an aggregate boundary of
 persistent congestion, and unknown aggregate evidence continue to require the
 controller's ordinary congestion response; the allowance does not create a
 second MPP congestion controller.
+
+A BBR-family implementation that uses this compensated serviced-rate estimate
+should also use it for the full-bandwidth growth baseline. Retaining raw
+delivered-rate samples only for that baseline makes its growth ratio depend on
+changes in authorized erasure between rounds: a genuinely growing ProbeBW
+round can then look like a plateau. The full-bandwidth baseline and its
+existing 1.25 growth comparison therefore use compensated serviced rate
+whenever the allowance has aligned loss evidence. A zero allowance preserves
+the unmodified raw-rate comparison exactly. This alignment changes no
+pacing/window gain, configured probe timer, or congestion threshold; by
+preventing a false full-bandwidth plateau, it can change the loss-informed
+timing of the current ProbeUP-to-ProbeDOWN transition.
 
 This allowance is local traffic policy, not a measured path fact and not an
 MPP protocol field. Each endpoint applies its own value only to its sending

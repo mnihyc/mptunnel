@@ -1259,3 +1259,87 @@ fn client_critical_reinjection_closes_tail_after_optional_budget_exhaustion() {
     );
     assert_eq!(sender.optional_reinjection_budget_remaining(mux_limits), 0);
 }
+
+#[tokio::test]
+async fn exhausted_optional_budget_still_allows_one_charged_requalification_quantum() {
+    let mux_limits = MuxLimits::default();
+    let stream_id = StreamId(96);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
+    let (stale_commands, mut stale_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, stale_commands), 8);
+    let stale = remotes.paths[0].instance();
+    let (healthy_commands, mut healthy_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        healthy_commands,
+    ));
+    let healthy = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("healthy attachment")
+        .instance();
+    consume_client_path_proof_for_test(&mut stale_receivers);
+    consume_client_path_proof_for_test(&mut healthy_receivers);
+    context.install_relay_path_instance_for_test(stale);
+    context.install_relay_path_instance_for_test(healthy);
+
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    let source = send_stream
+        .send_data(Bytes::from(vec![0x61; 4096]))
+        .expect("retained healthy source");
+    let mut sender = RequestSenderService::new_with_performance(
+        stream_id,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 1,
+        },
+    );
+    sender.record_original_frame_for_test(healthy, &source);
+    assert!(sender.mark_request_path_stale(&remotes, stale));
+
+    let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
+    sender
+        .optional_reinjection
+        .record_reinjection(startup_floor);
+    assert_eq!(sender.optional_reinjection_budget_remaining(mux_limits), 0);
+    let charged_before = sender.optional_reinjection.reinjected_bytes();
+    assert!(
+        sender
+            .try_send_requalification_probe(
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .expect("critical requalification attempt")
+    );
+    assert_eq!(
+        sender.optional_reinjection.reinjected_bytes(),
+        charged_before + 4096,
+        "critical liveness remains charged as optional-traffic debt"
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut stale_receivers),
+        Some(ReliablePathCommand::SendFrame(
+            Frame::StreamRequalifyData { .. }
+        ))
+    ));
+    assert!(
+        !sender
+            .try_send_requalification_probe(
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .expect("one pending transaction is not an error")
+    );
+    assert_eq!(
+        sender.optional_reinjection.reinjected_bytes(),
+        charged_before + 4096
+    );
+}

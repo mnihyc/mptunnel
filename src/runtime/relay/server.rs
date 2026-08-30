@@ -56,6 +56,7 @@ use crate::protocol::frame::{
 };
 use crate::protocol::{Frame, OffsetRange, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
+use crate::runtime::error::reliable_path_error_is_migratable;
 use crate::runtime::outbound_registry::{OpenedTcpOutbound, finish_gateway_flow};
 use crate::runtime::path::PathDeliveryStats;
 use crate::runtime::product_lifecycle::{ProductFlowActivity, ProductFlowActivityIo};
@@ -222,6 +223,12 @@ async fn relay_accepted_stream(
     let ingress = accepted.ingress().ok_or(RuntimeError::Protocol(
         "accepted MPP stream is missing its authenticated opening carrier peer",
     ))?;
+    // Zero-credit admission already committed in the carrier actor. Queue the
+    // optional proof here, where ordinary async carrier backpressure cannot
+    // self-deadlock that actor. A carrier-local failure does not revoke this
+    // exactly-once target owner; a surviving or later attachment remains able
+    // to establish the same logical stream.
+    let _ = accepted.publish_opening_path_validation().await;
     let outbound_stream = match context.router.route_mpp_tcp_with_ingress(
         &target,
         accepted.principal_permit().principal().clone(),
@@ -262,19 +269,17 @@ async fn relay_accepted_stream(
         stream_id,
         target.clone(),
     );
-    if accepted.accept_opening_path().await.is_err() {
-        // The opening carrier may disappear or its bounded control queue may
-        // close after admission. Retain shared receive credit in the logical
-        // stream so an existing or later attachment can publish it; opening
-        // settlement is not a stream-terminal error.
-        accepted
-            .stream()
-            .publish_max_data(reliable_stream_initial_advertised_window_bytes(
-                accepted.stream().underlay,
-                accepted.stream().lane,
-                context.mux_limits,
-            ));
-    }
+    // Carrier admission was acknowledged before this target task was
+    // submitted. Establish the logical OPEN by retaining and publishing one
+    // nonzero receive grant across every currently live attachment. A later
+    // attachment inherits the same cumulative grant.
+    accepted
+        .stream()
+        .publish_max_data(reliable_stream_initial_advertised_window_bytes(
+            accepted.stream().underlay,
+            accepted.stream().lane,
+            context.mux_limits,
+        ));
 
     let session_send_buffer = accepted.session_send_buffer();
     let stream = accepted.take_stream();
@@ -1893,6 +1898,22 @@ where
             response_data_ack_progress_outputs.clear();
             response_path_staleness_dirty = false;
         }
+        match response_sender.try_send_requalification_probe(
+            path_stream,
+            &send_stream,
+            response_lane,
+            mux_limits,
+        ) {
+            Ok(true) => response_sender_retry_at = None,
+            Ok(false) => {}
+            Err(RuntimeError::SenderServiceBlocked) => {
+                response_sender_retry_at = Some(
+                    tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot),
+                );
+            }
+            Err(err) if reliable_path_error_is_migratable(&err) => {}
+            Err(err) => break Err(err),
+        }
         let response_recovery_generation = response_sender.stale_response_recovery_generation();
         if response_recovery_generation != observed_response_recovery_generation {
             observed_response_recovery_generation = response_recovery_generation;
@@ -2019,12 +2040,16 @@ where
             || max_data_publication_blocked
             || ack_gap_missing_target_wait_active;
         let has_request_ack_capacity_wait = request_ack_capacity_wait.is_some();
+        let response_requalification_deadline = path_stream
+            .response_requalification_deadline()
+            .map(tokio::time::Instant::from_std);
         let response_path_recovery_deadline = response_path_staleness
             .next_deadline()
+            .map(tokio::time::Instant::from_std)
             .into_iter()
-            .chain(response_range_recovery_deadline)
-            .min()
-            .map(tokio::time::Instant::from_std);
+            .chain(response_range_recovery_deadline.map(tokio::time::Instant::from_std))
+            .chain(response_requalification_deadline)
+            .min();
         let data_ack_recovery_candidate =
             path_stream.data_ack_recovery_candidate(last_send_ack_frontier);
         let data_ack_recovery_candidate =

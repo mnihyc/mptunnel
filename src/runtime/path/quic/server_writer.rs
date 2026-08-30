@@ -2,6 +2,7 @@
 
 use super::io::{
     UdpPathSendStream, flush_udp_frame_batch_with_path_proofs_interlocked, udp_path_finish_stream,
+    udp_path_write_frame,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -19,6 +20,99 @@ use crate::runtime::path::{ServerCarrierPathRegistration, ServerStreamFrameRoute
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// Drains one path-local command without borrowing the carrier input slot.
+///
+/// The caller uses this only while that slot already retains a backpressured
+/// `STREAM_REQUALIFY_DATA`.  Interlocked batch writing cannot be used because
+/// it requires an empty deferred slot; a direct one-command write releases the
+/// exact ACK queue while preserving the retained input unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn drain_one_server_udp_command_while_input_deferred(
+    command: ReliablePathCommand,
+    commands: &mut ReliablePathCommandReceivers,
+    send: &mut UdpPathSendStream,
+    context: &ServerPathContext,
+    stream_id: StreamId,
+    path_registration: &ServerCarrierPathRegistration,
+    path_proofs: &mut PathProofTracker,
+) -> Result<bool, RuntimeError> {
+    let pending_bytes = reliable_path_command_pending_bytes(&command);
+    match command {
+        ReliablePathCommand::SendFrame(frame) => {
+            if reliable_path_frame_requires_capacity_command(&frame) {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC path received an untyped capacity frame",
+                ));
+            }
+            let result = udp_path_write_frame(send, &frame, context.codec_limits).await;
+            commands.release_pending_command_bytes(pending_bytes);
+            result?;
+            path_proofs.record_sent_frame(&frame);
+            Ok(false)
+        }
+        ReliablePathCommand::SendTcpCapacityProbe(_) => {
+            commands.release_pending_command_bytes(pending_bytes);
+            Err(RuntimeError::Protocol(
+                "server QUIC path received TCP capacity command",
+            ))
+        }
+        ReliablePathCommand::ResetAndCloseStream {
+            stream_id: reset_stream_id,
+            reason,
+        } => {
+            if reset_stream_id != stream_id {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC terminal command stream does not match writer",
+                ));
+            }
+            let frame = Frame::StreamReset {
+                stream_id: reset_stream_id,
+                reason,
+            };
+            let result = udp_path_write_frame(send, &frame, context.codec_limits).await;
+            commands.release_pending_command_bytes(pending_bytes);
+            result?;
+            context
+                .reliable_streams
+                .detach_path(path_registration, stream_id)?;
+            let _ = udp_path_finish_stream(send).await;
+            Ok(true)
+        }
+        ReliablePathCommand::CloseStream(close_stream_id) => {
+            commands.release_pending_command_bytes(pending_bytes);
+            if close_stream_id != stream_id {
+                return Ok(false);
+            }
+            context
+                .reliable_streams
+                .detach_path(path_registration, stream_id)?;
+            if !send.cancel_pending_response() {
+                let _ = udp_path_finish_stream(send).await;
+            }
+            Ok(true)
+        }
+        ReliablePathCommand::PrepareConnection { .. }
+        | ReliablePathCommand::OpenStream { .. }
+        | ReliablePathCommand::OpenDatagramAttachment { .. }
+        | ReliablePathCommand::OpenDatagramFlow { .. }
+        | ReliablePathCommand::SendDatagramFrame { .. }
+        | ReliablePathCommand::CloseDatagramAttachment { .. } => {
+            commands.release_pending_command_bytes(pending_bytes);
+            Err(RuntimeError::Protocol(
+                "server QUIC UDP path stream received client TCP session command",
+            ))
+        }
+        ReliablePathCommand::CancelTcpOpen { .. } => {
+            commands.release_pending_command_bytes(pending_bytes);
+            Err(RuntimeError::Protocol(
+                "server QUIC UDP path stream received TCP open cancellation",
+            ))
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_server_udp_reliable_commands(
@@ -372,6 +466,8 @@ fn try_route_server_udp_stream_frame_during_write(
     let received_stream_id = match &frame {
         Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamRequalifyData { stream_id, .. }
+        | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamMaxData { stream_id, .. }
         | Frame::StreamFin { stream_id, .. }
         | Frame::StreamReset { stream_id, .. } => *stream_id,

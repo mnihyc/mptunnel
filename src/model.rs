@@ -10,6 +10,7 @@ pub(crate) mod capacity;
 pub(crate) mod datagram;
 pub(crate) mod multipath;
 pub(crate) mod path;
+pub(crate) mod requalification;
 pub(crate) mod request_capacity;
 pub(crate) mod request_evidence;
 pub(crate) mod response;

@@ -98,7 +98,11 @@ pub(crate) fn reliable_stream_frame_extent(frame: &Frame) -> Option<(u64, u64, u
 /// Charges reliable-stream sender queues for product data or one control unit.
 pub(crate) fn reliable_stream_frame_accounted_bytes(frame: &Frame) -> usize {
     match frame {
-        Frame::StreamData { payload, .. } if !payload.is_empty() => payload.len(),
+        Frame::StreamData { payload, .. } | Frame::StreamRequalifyData { payload, .. }
+            if !payload.is_empty() =>
+        {
+            payload.len()
+        }
         _ => 1,
     }
 }
@@ -107,10 +111,12 @@ pub(crate) fn reliable_stream_frame_accounted_bytes(frame: &Frame) -> usize {
 pub(crate) fn reliable_path_frame_pacing_bytes(frame: &Frame) -> usize {
     match frame {
         Frame::StreamData { payload, .. }
+        | Frame::StreamRequalifyData { payload, .. }
         | Frame::PathCapacityData { payload, .. }
         | Frame::IpPacket { payload, .. } => payload.len().max(1),
         Frame::StreamFin { .. }
         | Frame::StreamAck { .. }
+        | Frame::StreamRequalifyAck { .. }
         | Frame::StreamMaxData { .. }
         | Frame::StreamReset { .. }
         | Frame::StreamDetach { .. } => 1,

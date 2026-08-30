@@ -17,7 +17,8 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
-    ReliablePathCarrierTerminalCause, recv_reliable_path_command, reliable_path_command_channels,
+    ClientTcpOpenAttemptId, ReliablePathCarrierTerminalCause, ReliablePathCommand,
+    recv_reliable_path_command, reliable_path_command_channels,
 };
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, PathProofObservation, ServerDatagramOpenError,
@@ -450,7 +451,30 @@ async fn server_tcp_route_denials_are_flow_local_and_drop_is_silent() {
         })
         .await
         .expect("open allowed sibling stream");
-
+    let admission = recv_reliable_path_command(&mut session.commands_rx)
+        .await
+        .expect("dequeue allowed sibling zero-credit admission");
+    assert!(matches!(
+        &admission,
+        ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            stream_id,
+            max_offset: 0,
+        }) if *stream_id == sibling_stream_id
+    ));
+    assert!(matches!(
+        session
+            .drain_commands(admission)
+            .await
+            .expect("write allowed sibling admission"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(
+        client.read_frame().await.expect("sibling zero admission"),
+        Frame::StreamMaxData {
+            stream_id: sibling_stream_id,
+            max_offset: 0,
+        }
+    );
     let rejected_stream_id = StreamId(81);
     session
         .handle_frame(Frame::OpenStream {
@@ -868,6 +892,40 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         );
     }
 
+    let mut admissions = Vec::new();
+    for expected_stream_id in [terminal_stream_id, sibling_stream_id] {
+        let admission = recv_reliable_path_command(&mut session.commands_rx)
+            .await
+            .expect("dequeue zero-credit TCP carrier admission");
+        assert!(matches!(
+            &admission,
+            ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                stream_id,
+                max_offset: 0,
+            }) if *stream_id == expected_stream_id
+        ));
+        admissions.push((expected_stream_id, admission));
+    }
+    for (expected_stream_id, admission) in admissions {
+        assert!(matches!(
+            session
+                .drain_commands(admission)
+                .await
+                .expect("write zero-credit TCP carrier admission"),
+            ServerTcpSessionDisposition::Continue
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+                .await
+                .expect("zero-credit TCP carrier admission timeout")
+                .expect("read zero-credit TCP carrier admission"),
+            Frame::StreamMaxData {
+                stream_id: expected_stream_id,
+                max_offset: 0,
+            }
+        );
+    }
+
     commands_for_streams
         .send_stream_ordered_reset_and_close(
             terminal_stream_id,
@@ -879,6 +937,12 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
     let terminal = recv_reliable_path_command(&mut session.commands_rx)
         .await
         .expect("dequeue terminal TCP command");
+    session.deferred_input = Some(Frame::StreamRequalifyData {
+        stream_id: terminal_stream_id,
+        probe_id: 301,
+        offset: 0,
+        payload: Bytes::from_static(b"deferred-terminal-probe"),
+    });
     assert!(matches!(
         session
             .drain_commands(terminal)
@@ -902,6 +966,10 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
     );
     assert_eq!(commands_for_streams.pending_bytes(), 0);
     assert_eq!(commands_for_streams.writer_pending_bytes(), 0);
+    assert!(matches!(
+        session.deferred_input,
+        Some(Frame::StreamRequalifyData { probe_id: 301, .. })
+    ));
 
     let sibling_frame = Frame::StreamMaxData {
         stream_id: sibling_stream_id,
@@ -930,19 +998,91 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
     );
     assert_eq!(commands_for_streams.writer_pending_bytes(), 0);
 
-    let detach_context = session.context.clone();
-    session
-        .streams
-        .detach(
-            &detach_context,
-            &session.path_registration,
-            sibling_stream_id,
-        )
-        .expect("detach sibling TCP stream");
+    commands_for_streams
+        .send_stream_ordered_close(sibling_stream_id, TrafficClass::Throughput)
+        .await
+        .expect("queue close while exact probe input remains deferred");
+    let close = recv_reliable_path_command(&mut session.commands_rx)
+        .await
+        .expect("dequeue close while exact probe input remains deferred");
+    assert!(matches!(
+        session
+            .drain_commands(close)
+            .await
+            .expect("close without consuming deferred input"),
+        ServerTcpSessionDisposition::Continue
+    ));
     assert!(
         session.streams.is_empty(),
         "the terminal command must have removed only its own TCP attachment"
     );
+    assert!(matches!(
+        session.deferred_input,
+        Some(Frame::StreamRequalifyData { probe_id: 301, .. })
+    ));
+}
+
+#[tokio::test]
+async fn server_tcp_deferred_probe_drain_releases_dequeued_command_accounting() {
+    let stream_id = StreamId(304);
+    let (mut session, mut client, commands, _path_frames, _relay) =
+        server_tcp_test_session(SessionId(304), PathId(0)).await;
+    // PING has zero queue-debt bytes but still occupies the writer batch. The
+    // deferred-input path must flush actual frames rather than using debt as
+    // a proxy for batch emptiness.
+    let filler = Frame::Ping { nonce: 304 };
+    commands
+        .try_enqueue_admitted_frame(filler.clone(), TrafficClass::Control)
+        .expect("queue exact ACK-lane filler");
+    let command = recv_reliable_path_command(&mut session.commands_rx)
+        .await
+        .expect("dequeue exact ACK-lane filler");
+    session.deferred_input = Some(Frame::StreamRequalifyData {
+        stream_id,
+        probe_id: 1,
+        offset: 0,
+        payload: Bytes::from_static(b"deferred"),
+    });
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), session.drain_commands(command))
+            .await
+            .expect("deferred-input writer timeout")
+            .expect("flush one command without consuming deferred input"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.read_frame())
+            .await
+            .expect("flushed filler timeout")
+            .expect("read flushed filler"),
+        filler
+    );
+    assert!(session.deferred_input.is_some());
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
+
+    let invalid = ReliablePathCommand::CancelTcpOpen {
+        stream_id,
+        attempt_id: ClientTcpOpenAttemptId(1),
+    };
+    let invalid_result =
+        tokio::time::timeout(Duration::from_secs(5), session.drain_commands(invalid))
+            .await
+            .expect("invalid-command drain timeout");
+    match invalid_result {
+        Err(RuntimeError::Protocol(message)) => {
+            assert_eq!(message, "server TCP path received client open cancellation")
+        }
+        Err(error) => panic!("unexpected invalid-command error: {error}"),
+        Ok(ServerTcpSessionDisposition::Continue) => {
+            panic!("invalid command unexpectedly continued")
+        }
+        Ok(ServerTcpSessionDisposition::Stop) => panic!("invalid command stopped the carrier"),
+    }
+    assert!(session.deferred_input.is_some());
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
 }
 
 #[tokio::test]

@@ -78,7 +78,7 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .filter(|entry| {
-                !entry.stale_for_original_data
+                !entry.qualification.stale_for_original_data()
                     && !entry.commands.reinjection_frame_queue_is_closed()
             })
             .map(|entry| entry.commands.capacity_notify())
@@ -105,11 +105,10 @@ impl ResponseStreamBinding {
         lane: TrafficClass,
         _payload_bytes: usize,
     ) -> Vec<ResponseSenderPathTarget> {
-        let mut outputs = self
+        let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let eligibility_changed = outputs.reconcile_stale_output_eligibility();
         let request_feedback_ingress = *self
             .request_feedback_ingress
             .lock()
@@ -143,7 +142,7 @@ impl ResponseStreamBinding {
                             ingress.key == entry.key
                                 && ingress.path_instance_id == entry.path_instance_id
                         }),
-                        stale_for_original_data: entry.stale_for_original_data,
+                        stale_for_original_data: entry.qualification.stale_for_original_data(),
                         #[cfg(test)]
                         has_path_proof_evidence: entry.path_proof.is_some(),
                         has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(
@@ -158,11 +157,6 @@ impl ResponseStreamBinding {
             })
             .collect();
         drop(outputs);
-        if eligibility_changed {
-            self.response_model_generation
-                .fetch_add(1, Ordering::AcqRel);
-            self.notify_update();
-        }
         targets
     }
 
@@ -233,7 +227,7 @@ impl ResponseStreamOutputs {
                         mux_limits,
                         now,
                     ),
-                    stale: entry.stale_for_original_data,
+                    stale: entry.qualification.stale_for_original_data(),
                 }),
             lane,
             payload_bytes,
@@ -260,7 +254,7 @@ impl ResponseStreamOutputs {
                         mux_limits,
                         now,
                     ),
-                    stale: entry.stale_for_original_data,
+                    stale: entry.qualification.stale_for_original_data(),
                 }),
             lane,
             payload_bytes,

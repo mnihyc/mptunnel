@@ -19,6 +19,7 @@ use crate::model::capacity::{
 };
 use crate::model::multipath::OptionalReinjectionLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::requalification::StreamRequalificationProbe;
 use crate::model::timing::{
     reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
 };
@@ -68,6 +69,8 @@ fn sender_service_frame_kind(frame: &Frame) -> &'static str {
     match frame {
         Frame::StreamData { .. } => "stream_data",
         Frame::StreamAck { .. } => "stream_ack",
+        Frame::StreamRequalifyData { .. } => "stream_requalify_data",
+        Frame::StreamRequalifyAck { .. } => "stream_requalify_ack",
         Frame::StreamMaxData { .. } => "stream_max_data",
         Frame::StreamFin { .. } => "stream_fin",
         Frame::StreamReset { .. } => "stream_reset",
@@ -329,6 +332,57 @@ impl RequestSenderService {
 
     pub(in crate::runtime) fn request_path_is_stale(&self, instance: RelayPathInstance) -> bool {
         self.multipath.path_is_stale(instance)
+    }
+
+    pub(in crate::runtime) fn requalification_deadline(&self) -> Option<Instant> {
+        self.multipath.requalification_deadline()
+    }
+
+    pub(in crate::runtime) fn try_send_requalification_probe(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        lane: TrafficClass,
+    ) -> Result<bool, RuntimeError> {
+        let budget = self.optional_reinjection.budget(
+            sender_optional_reinjection_startup_floor_bytes(context.mux_limits),
+            self.performance,
+        );
+        let minimum = sender_reinjection_minimum_useful_attempt_bytes(context.mux_limits);
+        // Requalification normally consumes optional credit. Once exhausted,
+        // one minimum quantum per exact stale interval remains critical
+        // liveness authority and is still charged as debt.
+        let byte_limit = minimum.min(budget.remaining_bytes().max(minimum));
+        let Some(bytes) = self.multipath.try_enqueue_requalification_probe(
+            context,
+            remotes,
+            send_stream,
+            lane,
+            byte_limit,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.optional_reinjection.record_reinjection(bytes);
+        Ok(true)
+    }
+
+    pub(in crate::runtime) fn acknowledge_requalification_probe(
+        &mut self,
+        instance: RelayPathInstance,
+        probe_id: u64,
+        offset: u64,
+        payload_bytes: u32,
+    ) -> bool {
+        self.multipath.acknowledge_requalification_probe(
+            instance,
+            StreamRequalificationProbe {
+                id: probe_id,
+                offset,
+                payload_bytes,
+            },
+        )
     }
 
     pub(in crate::runtime) fn unacked_original_paths_before(

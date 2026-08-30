@@ -5,7 +5,9 @@ use super::io::{
     udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_write_frame,
     udp_reliable_stream_frame_queue,
 };
-use super::server_writer::drain_server_udp_reliable_commands;
+use super::server_writer::{
+    drain_one_server_udp_command_while_input_deferred, drain_server_udp_reliable_commands,
+};
 use crate::model::capacity::RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET;
 use crate::protocol::{Frame, PathId, SessionId, StreamDemandHint, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
@@ -266,8 +268,25 @@ async fn run_server_udp_reliable_stream_loop(
                         .await?;
                 }
                 Ok(Some(Ok(
+                    Frame::StreamRequalifyData {
+                        stream_id: received_stream_id,
+                        ..
+                    }
+                    | Frame::StreamRequalifyAck {
+                        stream_id: received_stream_id,
+                        ..
+                    },
+                ))) if received_stream_id == stream_id => {
+                    // The exact response half is already finished and
+                    // detached. A delayed receipt has no current authority,
+                    // and a new probe cannot be acknowledged on this exact
+                    // attachment; tolerate either until peer detach.
+                }
+                Ok(Some(Ok(
                     Frame::StreamData { .. }
                     | Frame::StreamAck { .. }
+                    | Frame::StreamRequalifyData { .. }
+                    | Frame::StreamRequalifyAck { .. }
                     | Frame::StreamMaxData { .. }
                     | Frame::StreamFin { .. }
                     | Frame::StreamReset { .. },
@@ -338,23 +357,38 @@ async fn run_server_udp_reliable_stream_loop(
             }
         }
         let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
-        if deferred_input.is_none()
-            && let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx)
-        {
-            let result = drain_server_udp_reliable_commands(
-                command,
-                &mut commands_rx,
-                &mut send,
-                &context,
-                stream_id,
-                path_id,
-                &path_registration,
-                &mut pending_frames,
-                &mut path_proofs,
-                &mut carrier_frames,
-                &mut deferred_input,
-            )
-            .await;
+        // A deferred exact requalification probe can itself be waiting for a
+        // priority-queue slot for its ACK.  Drain that queue before retrying
+        // the input; otherwise the stream loop would repeatedly retry the
+        // same frame while being the only task able to release its slot.
+        if let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx) {
+            let result = if deferred_input.is_some() {
+                drain_one_server_udp_command_while_input_deferred(
+                    command,
+                    &mut commands_rx,
+                    &mut send,
+                    &context,
+                    stream_id,
+                    &path_registration,
+                    &mut path_proofs,
+                )
+                .await
+            } else {
+                drain_server_udp_reliable_commands(
+                    command,
+                    &mut commands_rx,
+                    &mut send,
+                    &context,
+                    stream_id,
+                    path_id,
+                    &path_registration,
+                    &mut pending_frames,
+                    &mut path_proofs,
+                    &mut carrier_frames,
+                    &mut deferred_input,
+                )
+                .await
+            };
             if result? {
                 terminal_drain_deadline =
                     Some(tokio::time::Instant::now() + context.mux_limits.quic_path_idle_timeout);
@@ -370,8 +404,24 @@ async fn run_server_udp_reliable_stream_loop(
                 }
             } => {
                 match frame {
+                    Some(Ok(frame @ Frame::StreamRequalifyData {
+                        stream_id: received_stream_id,
+                        ..
+                    })) if received_stream_id == stream_id => {
+                        match context.reliable_streams.try_route_frame(
+                            &path_registration,
+                            stream_id,
+                            frame,
+                        )? {
+                            crate::runtime::path::ServerStreamFrameRoute::Routed => {}
+                            crate::runtime::path::ServerStreamFrameRoute::Backpressured(frame) => {
+                                deferred_input = Some(Ok(frame));
+                            }
+                        }
+                    }
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
+                        | Frame::StreamRequalifyAck { stream_id: received_stream_id, .. }
                         | Frame::StreamMaxData { stream_id: received_stream_id, .. }
                         | Frame::StreamFin { stream_id: received_stream_id, .. }
                         | Frame::StreamReset { stream_id: received_stream_id, .. })))

@@ -20,6 +20,7 @@ use crate::model::capacity::{
     reliable_bulk_carrier_feed_quantum_bytes, reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::{CarrierPathKey, PathPolicy};
+use crate::model::requalification::StreamPathQualification;
 use crate::mux::MuxLimits;
 use crate::protocol::{
     PathId, PathMetricDirection, PathMetrics, PathUsage, SessionId, UnderlayProtocol,
@@ -45,7 +46,7 @@ fn output_entry(
         commands,
         load_registration,
         original_data_in_flight_bytes: 0,
-        stale_for_original_data: false,
+        qualification: StreamPathQualification::Qualified,
         bytes_in_flight: 0,
         product_rate_epoch: None,
         tcp_product_rate_evidence: None,
@@ -609,6 +610,8 @@ fn sole_quic_output_retains_live_cwnd_source_admission_after_rate_expiry() {
         entries: vec![entry],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
+        next_requalification_probe_id: Some(1),
+        next_requalification_candidate_index: 0,
     };
 
     let admission =
@@ -667,6 +670,8 @@ fn continuous_udp_product_acks_cross_native_expiry_without_shrinking_live_cwnd_f
         entries: vec![entry],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
+        next_requalification_probe_id: Some(1),
+        next_requalification_candidate_index: 0,
     };
 
     for offset_ms in [100_u64, 200, 300, 400] {
@@ -858,6 +863,8 @@ fn best_live_path_uses_completion_score_including_command_queue() {
         entries: vec![queued, clear],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
+        next_requalification_probe_id: Some(1),
+        next_requalification_candidate_index: 0,
     };
 
     let best = outputs
@@ -894,6 +901,8 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
         entries: vec![backup, available],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
+        next_requalification_probe_id: Some(1),
+        next_requalification_candidate_index: 0,
     };
 
     let best = outputs
@@ -968,6 +977,8 @@ fn closed_and_draining_outputs_are_excluded_from_new_product_selection() {
         entries: vec![closed, draining, live],
         data_level_queue_bytes: 0,
         desired_max_data_offset: 0,
+        next_requalification_probe_id: Some(1),
+        next_requalification_candidate_index: 0,
     };
 
     assert!(

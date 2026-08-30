@@ -80,6 +80,18 @@ fn stream_frames_round_trip() {
             OffsetRange::new(10, 12).expect("range"),
         ],
     });
+    round_trip(Frame::StreamRequalifyData {
+        stream_id: StreamId(7),
+        probe_id: 19,
+        offset: 1024,
+        payload: Bytes::from_static(b"probe-data"),
+    });
+    round_trip(Frame::StreamRequalifyAck {
+        stream_id: StreamId(7),
+        probe_id: 19,
+        offset: 1024,
+        payload_bytes: 10,
+    });
     round_trip(Frame::StreamFin {
         stream_id: StreamId(7),
         final_offset: 1234,
@@ -90,7 +102,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v8_has_no_attachment_role_field() {
+fn open_stream_v9_has_no_attachment_role_field() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -143,19 +155,19 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_v7_frames_after_v8_wire_cut() {
+fn decoder_rejects_v8_frames_after_v9_wire_cut() {
     let mut encoded =
         encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
-    encoded[4] = 7;
+    encoded[4] = 8;
 
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
-        Err(CodecError::UnsupportedVersion(7))
+        Err(CodecError::UnsupportedVersion(8))
     );
 }
 
 #[test]
-fn path_metrics_v8_presence_bits_distinguish_absence_from_observed_zero() {
+fn path_metrics_v9_presence_bits_distinguish_absence_from_observed_zero() {
     let mut absent = peer_status_metrics(
         7,
         UnderlayProtocol::Tcp,
@@ -175,7 +187,7 @@ fn path_metrics_v8_presence_bits_distinguish_absence_from_observed_zero() {
         absent_wire.len(),
         FRAME_HEADER_LEN + PATH_METRICS_ENCODED_LEN
     );
-    assert_eq!(absent_wire[4], 8);
+    assert_eq!(absent_wire[4], 9);
     assert_eq!(
         &absent_wire[FRAME_HEADER_LEN + 64..FRAME_HEADER_LEN + 66],
         &[0, 0]
@@ -219,7 +231,7 @@ fn path_metrics_v8_presence_bits_distinguish_absence_from_observed_zero() {
 }
 
 #[test]
-fn path_metrics_v8_rate_authority_budget_is_bounded_canonically() {
+fn path_metrics_v9_rate_authority_budget_is_bounded_canonically() {
     let mut metrics = peer_status_metrics(
         7,
         UnderlayProtocol::Udp,

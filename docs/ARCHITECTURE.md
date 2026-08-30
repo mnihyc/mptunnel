@@ -71,12 +71,24 @@ outbound. The authenticated principal selects a server-configured address
 allocation. Host routing, forwarding, DNS, firewall policy, and NAT are outside
 the packet-copy boundary.
 
-## MPP v8 model
+## MPP v9 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
 or attaching a stream does not assign a persistent primary, validation, or
 recovery role to the path. Every accepted attachment is neutral membership in
 the connection's path set.
+
+Initial open is a two-phase transaction. The server first publishes
+`STREAM_MAX_DATA(0)` on the exact carrier, before DNS, routing, or target
+connect begins. The client treats that zero as carrier admission but keeps the
+logical open pending; carrier PTO no longer owns remote target latency. A
+concrete attachment failure may retry another carrier with the same
+`StreamId`, so the server retains one immutable opening identity and one target
+task. That task queues the optional path proof after zero on the same bounded
+carrier lane; proof backpressure or carrier-local failure cannot undo the
+admission or duplicate the target. Target success publishes one retained
+nonzero grant to every live attachment. Later attachments use zero as their
+complete carrier acceptance and then inherit that retained grant.
 
 `PATH_STATUS` carries a sequenced, directional `PathUsage` value:
 
@@ -129,10 +141,11 @@ MPP ranges and flight but grants no new offset. `STREAM_MAX_DATA` grants a
 new maximum offset but acknowledges no byte. Its receiver-advertised window is
 shared by all attachments in one stream direction; the opposite direction has
 an independent maximum. Carrier windows and congestion windows remain separate
-limits. Initial open publishes the logical receive owner's starting credit.
-Later TCP or QUIC attachments are accepted with a zero maximum, which is
-credit-neutral because senders retain the greatest advertised offset; path
-demand can never widen the shared window.
+limits. Initial carrier admission publishes zero; target establishment then
+publishes the logical receive owner's nonzero starting credit. Later TCP or
+QUIC attachments are accepted with a zero maximum, which is credit-neutral
+because senders retain the greatest advertised offset; path demand can never
+widen the shared window.
 
 Ordinary reinjection consumes a cumulative extra-traffic budget. Critical
 path-failure, persistent authoritative Data ACK gap, and bounded live-tail
@@ -152,6 +165,14 @@ may send one bounded probe per recovery interval without progress. A request
 carrier with no exact Data ACK progress becomes stale for new placement after
 four TCP RTOs or three QUIC PTOs when an alternative exists, without stopping
 its native recovery.
+
+Version 9 gives a stale exact attachment a bounded requalification lifecycle:
+`Qualified -> Stale -> Requalifying -> Acquiring -> Qualified`. A non-owning
+copy of retained Product bytes and its exact attachment ACK prove only that
+attachment's reachability. Only fresh, uniquely owned OriginalData acknowledged
+after that proof restores Product authority. The probe never delivers or owns a
+Data Sequence range; retry remains bounded by retained data, queue, pacing,
+flight, and the existing optional-work budget.
 
 ## Scheduling contract
 

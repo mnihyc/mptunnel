@@ -4,7 +4,8 @@ use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
 use crate::protocol::{CloseReason, OffsetRange, PathMetricDirection, PathUsage, StreamDemandHint};
 use crate::runtime::path::commands::{
-    reliable_path_command_channels, try_recv_reliable_path_priority_command,
+    reliable_path_command_channels, reliable_path_command_pending_bytes,
+    try_recv_reliable_path_priority_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::{
@@ -974,18 +975,21 @@ async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
         "OPEN_STREAM alone must not manufacture reverse-direction send credit"
     );
     accepted
-        .accept_opening_path()
-        .await
-        .expect("publish opening acceptance and validation");
+        .admit_opening_path()
+        .expect("publish opening admission and validation");
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(crate::runtime::path::commands::ReliablePathCommand::SendFrame(
             Frame::StreamMaxData {
                 stream_id: accepted_stream_id,
-                ..
+                max_offset: 0,
             }
         )) if accepted_stream_id == stream_id
     ));
+    accepted
+        .publish_opening_path_validation()
+        .await
+        .expect("publish opening validation after admission");
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(crate::runtime::path::commands::ReliablePathCommand::SendFrame(
@@ -996,6 +1000,264 @@ async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
             }
         )) if proof_path_id == path_id && !payload.is_empty()
     ));
+}
+
+#[tokio::test]
+async fn new_stream_publishes_zero_admission_before_target_owner_runs() {
+    let mux_limits = MuxLimits::default();
+    let (registry, mut accepted_rx) =
+        ServerReliableStreamRegistry::new_accepting(mux_limits.max_streams);
+    let port = registry.path_port();
+    let session_id = SessionId(701);
+    let stream_id = StreamId(9);
+    let registration = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    port.record_path_proof_success(
+        &registration,
+        PathProofObservation {
+            proof_id: 1,
+            elapsed: Duration::from_millis(1),
+            sent_at: Instant::now() - Duration::from_millis(1),
+        },
+    );
+    let (commands, mut receivers) = reliable_path_command_channels(8);
+
+    assert!(matches!(
+        port.open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            initial_demand: StreamDemandHint::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .await
+        .expect("admit new logical stream"),
+        ServerStreamOpenOutcome::New(TrafficClass::Latency)
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            stream_id: accepted_stream_id,
+            max_offset: 0,
+        })) if accepted_stream_id == stream_id
+    ));
+    let accepted = accepted_rx
+        .recv()
+        .await
+        .expect("one target-establishment owner");
+    assert_eq!(accepted.stream().stream_id, stream_id);
+    assert_eq!(
+        accepted.stream().capacity_notifies().len(),
+        1,
+        "opening output remains live before reattachment",
+    );
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "carrier admission must create exactly one target-establishment owner",
+    );
+
+    let alternate = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(1),
+        ServerLocalPathProperties {
+            config_ordinal: 1,
+            ..ServerLocalPathProperties::default()
+        },
+    );
+    let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        port.open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            initial_demand: StreamDemandHint::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: alternate.clone(),
+                commands: alternate_commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .await
+        .expect("reattach the same logical stream"),
+        ServerStreamOpenOutcome::Existing(TrafficClass::Latency)
+    ));
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "reattachment must not create a second target-establishment owner",
+    );
+    assert_eq!(
+        accepted.stream().capacity_notifies().len(),
+        2,
+        "reattachment adds a live output without replacing the opening output",
+    );
+
+    accepted.stream().publish_max_data(4096);
+    for (label, output) in [
+        ("opening", &mut receivers),
+        ("alternate", &mut alternate_receivers),
+    ] {
+        let mut established = false;
+        for _ in 0..2 {
+            match try_recv_reliable_path_priority_command(output) {
+                Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                    stream_id: accepted_stream_id,
+                    max_offset: 4096,
+                })) if accepted_stream_id == stream_id => {
+                    established = true;
+                    break;
+                }
+                Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. })) => {}
+                Some(_) => panic!("unexpected {label} target-establishment command variant"),
+                None => panic!("{label} target-establishment command was not queued"),
+            }
+        }
+        assert!(
+            established,
+            "{label} live attachment receives nonzero credit"
+        );
+    }
+
+    let late = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(2),
+        ServerLocalPathProperties {
+            config_ordinal: 2,
+            ..ServerLocalPathProperties::default()
+        },
+    );
+    let (late_commands, mut late_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        port.open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            initial_demand: StreamDemandHint::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: late.clone(),
+                commands: late_commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .await
+        .expect("attach after target establishment"),
+        ServerStreamOpenOutcome::Existing(TrafficClass::Latency)
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut late_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            stream_id: accepted_stream_id,
+            max_offset: 4096,
+        })) if accepted_stream_id == stream_id
+    ));
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "late attachment must reuse the established target owner",
+    );
+
+    accepted.close().await;
+    assert_eq!(
+        registry.management_snapshot().active_streams,
+        0,
+        "closing the sole target owner releases the logical stream registry entry",
+    );
+}
+
+#[tokio::test]
+async fn capacity_one_path_proof_backpressure_preserves_admitted_target_owner() {
+    for (ordinal, underlay) in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp]
+        .into_iter()
+        .enumerate()
+    {
+        let mux_limits = MuxLimits::default();
+        let (registry, mut accepted_rx) =
+            ServerReliableStreamRegistry::new_accepting(mux_limits.max_streams);
+        let port = registry.path_port();
+        let session_id = SessionId(710 + ordinal as u64);
+        let stream_id = StreamId(20 + ordinal as u64);
+        let registration = port.register_test_carrier_path(
+            session_id,
+            underlay,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+        );
+        let (commands, mut receivers) = reliable_path_command_channels(1);
+
+        assert!(matches!(
+            port.open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                initial_demand: StreamDemandHint::Latency,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: registration.clone(),
+                    commands,
+                    max_frame_payload_bytes: mux_limits.max_payload_bytes,
+                },
+                mux_limits,
+            })
+            .await
+            .expect("capacity-one carrier admission remains nonterminal"),
+            ServerStreamOpenOutcome::New(TrafficClass::Latency)
+        ));
+        let accepted = accepted_rx
+            .recv()
+            .await
+            .expect("exactly one target-establishment owner");
+        assert_eq!(accepted.stream().stream_id, stream_id);
+        assert!(accepted_rx.try_recv().is_err());
+
+        let mut validation = Box::pin(accepted.publish_opening_path_validation());
+        assert!(matches!(
+            futures::poll!(validation.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            registry.management_snapshot().active_streams,
+            1,
+            "proof backpressure cannot retire the admitted logical owner",
+        );
+        let admission = try_recv_reliable_path_priority_command(&mut receivers)
+            .expect("zero-credit admission remains queued");
+        let pending_bytes = reliable_path_command_pending_bytes(&admission);
+        assert!(matches!(
+            admission,
+            ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                stream_id: admitted_stream_id,
+                max_offset: 0,
+            }) if admitted_stream_id == stream_id
+        ));
+        receivers.release_pending_command_bytes(pending_bytes);
+
+        validation
+            .await
+            .expect("proof publication resumes after zero admission drains");
+        let proof = try_recv_reliable_path_priority_command(&mut receivers)
+            .expect("opening proof follows zero admission");
+        let pending_bytes = reliable_path_command_pending_bytes(&proof);
+        assert!(matches!(
+            proof,
+            ReliablePathCommand::SendFrame(Frame::PathProofData {
+                path_id: PathId(0),
+                payload,
+                ..
+            }) if !payload.is_empty()
+        ));
+        receivers.release_pending_command_bytes(pending_bytes);
+        accepted.close().await;
+    }
 }
 
 #[test]
@@ -1510,6 +1772,104 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
         port.try_route_frame(&registration, stream_id, backpressured),
         Ok(ServerStreamFrameRoute::Routed)
     ));
+}
+
+#[tokio::test]
+async fn exact_requalification_ack_queue_backpressure_is_retryable_for_tcp_and_quic() {
+    for (ordinal, underlay) in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp]
+        .into_iter()
+        .enumerate()
+    {
+        let registry = Arc::new(ServerReliableStreamRegistry::new(4));
+        let port = registry.path_port();
+        let session_id = SessionId(910 + ordinal as u64);
+        let stream_id = StreamId(40 + ordinal as u64);
+        let registration = port.register_test_carrier_path(
+            session_id,
+            underlay,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+        );
+        let (commands, mut receivers) = reliable_path_command_channels(1);
+        let mut accepted = match registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                initial_demand: StreamDemandHint::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: registration.clone(),
+                    commands: commands.clone(),
+                    max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                },
+                mux_limits: MuxLimits::default(),
+            })
+            .expect("open response stream")
+        {
+            ServerReliableStreamOpen::New(accepted, _) => accepted,
+            _ => panic!("expected new response stream"),
+        };
+        let mut product_stream = accepted.take_stream();
+        commands
+            .try_enqueue_admitted_frame(
+                Frame::Ping {
+                    nonce: ordinal as u64,
+                },
+                TrafficClass::Control,
+            )
+            .expect("fill exact control queue");
+        let probe = Frame::StreamRequalifyData {
+            stream_id,
+            probe_id: 71,
+            offset: 4096,
+            payload: bytes::Bytes::from(vec![0x5a; 256]),
+        };
+        let deferred = match port
+            .try_route_frame(&registration, stream_id, probe.clone())
+            .expect("try exact probe route")
+        {
+            ServerStreamFrameRoute::Backpressured(frame) => frame,
+            ServerStreamFrameRoute::Routed => {
+                panic!("a full exact ACK queue must retain the probe for retry")
+            }
+        };
+
+        let healthy = Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: bytes::Bytes::from_static(b"healthy"),
+        };
+        assert!(matches!(
+            port.try_route_frame(&registration, stream_id, healthy.clone()),
+            Ok(ServerStreamFrameRoute::Routed)
+        ));
+        assert_eq!(
+            product_stream
+                .recv_frame()
+                .await
+                .expect("healthy Product frame"),
+            healthy,
+            "retaining an exact ACK must not block Product actor progress"
+        );
+
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::Ping { .. }))
+        ));
+        assert!(matches!(
+            port.try_route_frame(&registration, stream_id, deferred),
+            Ok(ServerStreamFrameRoute::Routed)
+        ));
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamRequalifyAck {
+                stream_id: ack_stream,
+                probe_id: 71,
+                offset: 4096,
+                payload_bytes: 256,
+            })) if ack_stream == stream_id
+        ));
+    }
 }
 
 #[test]

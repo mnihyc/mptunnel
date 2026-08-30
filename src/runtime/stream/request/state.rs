@@ -5,6 +5,7 @@
 
 use super::flight::RequestFlightLedger;
 use crate::model::path::RelayPathInstance;
+use crate::model::requalification::StreamPathRequalification;
 use crate::model::request_evidence::{RequestPathRateEvidence, RequestPerFlowRateModel};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -48,6 +49,12 @@ pub(in crate::runtime) struct RequestPathState {
 }
 
 impl RequestPathState {
+    /// Starts the same bounded Product acquisition used by a fresh attachment.
+    /// Historical flow capacity cannot authorize post-stale placement.
+    pub(in crate::runtime) fn reset_for_requalification(&mut self) {
+        *self = Self::default();
+    }
+
     pub(in crate::runtime) fn rate_evidence_mut(
         &mut self,
         observed_at: Instant,
@@ -196,7 +203,7 @@ pub(in crate::runtime) struct RequestStreamState {
     pub(in crate::runtime) path_states: RequestPathStates,
     pub(in crate::runtime) ack_clock_operation: Option<RequestAckClockOperation>,
     pub(in crate::runtime) membership_generation: Option<u64>,
-    /// Exact paths with outstanding data but no Data ACK progress over the
-    /// connection-level persistence interval. Native path recovery continues.
-    pub(in crate::runtime) stale_paths: HashSet<RelayPathInstance>,
+    /// Directional Product qualification for every exact attachment. Native
+    /// path recovery remains independent of these stream-local transitions.
+    pub(in crate::runtime) requalification: StreamPathRequalification<RelayPathInstance>,
 }

@@ -490,6 +490,44 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
             )
             .await
         }
+        Frame::StreamRequalifyData {
+            stream_id,
+            probe_id,
+            offset,
+            payload,
+        } => {
+            route_client_tcp_stream_frame(
+                streams,
+                closed_streams,
+                stream_id,
+                Frame::StreamRequalifyData {
+                    stream_id,
+                    probe_id,
+                    offset,
+                    payload,
+                },
+            )
+            .await
+        }
+        Frame::StreamRequalifyAck {
+            stream_id,
+            probe_id,
+            offset,
+            payload_bytes,
+        } => {
+            route_client_tcp_stream_frame(
+                streams,
+                closed_streams,
+                stream_id,
+                Frame::StreamRequalifyAck {
+                    stream_id,
+                    probe_id,
+                    offset,
+                    payload_bytes,
+                },
+            )
+            .await
+        }
         Frame::StreamFin {
             stream_id,
             final_offset,

@@ -1096,6 +1096,26 @@ impl ReliablePathCommandSender {
         self.try_reserve_admitted_frame_with_effective_lane(frame, lane, None)
     }
 
+    /// Waits for ordinary capacity on the frame's effective bounded lane.
+    /// The prearmed notification closes the release-before-wait race; carrier
+    /// retirement still terminates admission through the normal lifecycle.
+    pub(in crate::runtime) async fn enqueue_admitted_frame(
+        &self,
+        frame: Frame,
+        lane: TrafficClass,
+    ) -> Result<(), RuntimeError> {
+        loop {
+            let mut capacity_wait = Box::pin(self.capacity_notify().notified_owned());
+            capacity_wait.as_mut().enable();
+
+            match self.try_enqueue_admitted_frame(frame.clone(), lane) {
+                Ok(()) => return Ok(()),
+                Err(RuntimeError::SenderServiceBlocked) => capacity_wait.await,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Waits for bounded queue capacity without extending the product deadline.
     /// Registering the wakeup before each admission attempt prevents a queue
     /// release from being lost between the two.
@@ -1442,6 +1462,7 @@ pub(in crate::runtime) fn reliable_path_effective_frame_lane(
 ) -> TrafficClass {
     match frame {
         Frame::StreamData { .. }
+        | Frame::StreamRequalifyData { .. }
         | Frame::PathCapacityData { .. }
         | Frame::PathCapacityFinish { .. } => stream_lane,
         Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } | Frame::IpPacket { .. } => {
@@ -1466,6 +1487,8 @@ fn reliable_path_frame_requires_product_admission(frame: &Frame) -> bool {
         frame,
         Frame::OpenStream { .. }
             | Frame::StreamData { .. }
+            | Frame::StreamRequalifyData { .. }
+            | Frame::StreamRequalifyAck { .. }
             | Frame::StreamFin { .. }
             | Frame::OpenDatagramFlow { .. }
             | Frame::DatagramData { .. }
@@ -1975,6 +1998,8 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> Option<StreamId> {
         Frame::OpenStream { stream_id, .. }
         | Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamRequalifyData { stream_id, .. }
+        | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamMaxData { stream_id, .. }
         | Frame::StreamFin { stream_id, .. }
         | Frame::StreamDetach { stream_id }
@@ -2019,6 +2044,8 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::OpenStream { .. } => "open_stream",
         Frame::StreamData { .. } => "stream_data",
         Frame::StreamAck { .. } => "stream_ack",
+        Frame::StreamRequalifyData { .. } => "stream_requalify_data",
+        Frame::StreamRequalifyAck { .. } => "stream_requalify_ack",
         Frame::StreamMaxData { .. } => "stream_max_data",
         Frame::StreamFin { .. } => "stream_fin",
         Frame::StreamDetach { .. } => "stream_detach",

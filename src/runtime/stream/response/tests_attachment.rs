@@ -132,6 +132,7 @@ fn neutral_attach_adds_one_output_without_publishing_protocol_frames() {
 #[test]
 fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
     let stream_id = StreamId(7);
+    let established_max_offset = 4096;
     let (binding, initial, mut initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let initial_entry = output_entry_for_key(&binding, initial);
     for nonce in 0..8 {
@@ -140,6 +141,10 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
             .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
             .expect("fill initial output priority queue");
     }
+    let blocked = binding.publish_max_data(stream_id, established_max_offset);
+    assert_eq!(blocked.published_offset, None);
+    assert!(blocked.pending);
+
     let alternate = alternate_key(UnderlayProtocol::Udp);
     let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
     assert_eq!(
@@ -152,13 +157,14 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
         ResponseStreamAttachOutcome::Attached
     );
 
-    let first = binding.retry_pending_max_data(stream_id);
-    let published = first
+    let replay = binding.retry_pending_max_data(stream_id);
+    let published = replay
         .published_offset
-        .expect("available output publishes retained initial credit");
+        .expect("available output publishes retained target-established credit");
+    assert_eq!(published, established_max_offset);
     assert!(
-        !first.pending,
-        "the opening attachment already accepted the initial grant"
+        replay.pending,
+        "the blocked opening attachment still needs the retained grant"
     );
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut alternate_receivers),
@@ -172,9 +178,6 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
         try_recv_reliable_path_priority_command(&mut initial_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 0 }))
     ));
-    let retry = binding.retry_pending_max_data(stream_id);
-    assert_eq!(retry.published_offset, None);
-    assert!(!retry.pending);
     for nonce in 1..8 {
         assert!(matches!(
             try_recv_reliable_path_priority_command(&mut initial_receivers),
@@ -183,14 +186,26 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
             })) if received == nonce
         ));
     }
+    let retry = binding.retry_pending_max_data(stream_id);
+    assert_eq!(retry.published_offset, Some(established_max_offset));
+    assert!(!retry.pending);
     assert!(
-        try_recv_reliable_path_priority_command(&mut initial_receivers).is_none(),
-        "the initial attachment must not receive its already accepted opening grant again"
+        matches!(
+            try_recv_reliable_path_priority_command(&mut initial_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                stream_id: received_stream_id,
+                max_offset,
+            })) if received_stream_id == stream_id && max_offset == established_max_offset
+        ),
+        "the opening attachment receives the retained grant after capacity returns"
     );
     assert!(
         try_recv_reliable_path_priority_command(&mut alternate_receivers).is_none(),
         "an already-published output must not receive an unchanged duplicate"
     );
+    let settled = binding.retry_pending_max_data(stream_id);
+    assert_eq!(settled.published_offset, None);
+    assert!(!settled.pending);
 }
 
 #[test]
@@ -228,8 +243,8 @@ fn sole_surviving_response_output_is_restored_from_stale_placement() {
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].observation.key, initial);
     assert!(
-        !targets[0].observation.stale_for_original_data,
-        "the sole live survivor regains OriginalData and reinjection eligibility"
+        targets[0].observation.stale_for_original_data,
+        "sole-survivor fallback must not erase stale evidence"
     );
 }
 

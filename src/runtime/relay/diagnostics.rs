@@ -79,6 +79,27 @@ fn frame_subject(frame: &Frame) -> String {
             complete,
             ranges.len()
         ),
+        Frame::StreamRequalifyData {
+            stream_id,
+            probe_id,
+            offset,
+            payload,
+        } => format!(
+            "stream_id={} probe_id={} offset={} bytes={}",
+            stream_id.0,
+            probe_id,
+            offset,
+            payload.len()
+        ),
+        Frame::StreamRequalifyAck {
+            stream_id,
+            probe_id,
+            offset,
+            payload_bytes,
+        } => format!(
+            "stream_id={} probe_id={} offset={} bytes={}",
+            stream_id.0, probe_id, offset, payload_bytes
+        ),
         Frame::StreamMaxData {
             stream_id,
             max_offset,

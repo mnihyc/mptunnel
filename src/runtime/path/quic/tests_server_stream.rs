@@ -13,8 +13,10 @@ use crate::mux::MuxLimits;
 use crate::outbound::OutboundConfig;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, PathId, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    Frame, OffsetRange, PathId, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
+    UnderlayProtocol,
 };
+use crate::runtime::ReliableSendStream;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
@@ -31,7 +33,9 @@ use crate::runtime::path::quic::io::{
     udp_path_write_frame,
 };
 use crate::runtime::path::quic::server::handle_server_udp_bidi_stream;
-use crate::runtime::path::quic::server_writer::drain_server_udp_reliable_commands;
+use crate::runtime::path::quic::server_writer::{
+    drain_one_server_udp_command_while_input_deferred, drain_server_udp_reliable_commands,
+};
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, ClientPathHealth, ClientPathHealthRecord, ClientPathState,
@@ -42,6 +46,7 @@ use crate::runtime::path::{
     ServerTargetAdmission,
 };
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
+use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::runtime::stream::{
     AcceptedServerReliableStream, ReliablePathStreamOutput, ServerReliableStreamRegistry,
 };
@@ -393,6 +398,334 @@ impl ServerUdpTerminalWriterFixture {
             .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
             .len()
     }
+
+    async fn drain_zero_credit_admission(&mut self) {
+        let admission = recv_reliable_path_command(
+            self.commands_rx
+                .as_mut()
+                .expect("server QUIC command receivers"),
+        )
+        .await
+        .expect("dequeue zero-credit QUIC carrier admission");
+        assert!(matches!(
+            &admission,
+            ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                stream_id,
+                max_offset: 0,
+            }) if *stream_id == self.stream_id
+        ));
+        let mut path_proofs = PathProofTracker::default();
+        assert!(
+            !drain_one_server_udp_command_while_input_deferred(
+                admission,
+                self.commands_rx
+                    .as_mut()
+                    .expect("server QUIC command receivers"),
+                self.server_send.as_mut().expect("server QUIC sender"),
+                &self.context,
+                self.stream_id,
+                &self._path_registration,
+                &mut path_proofs,
+            )
+            .await
+            .expect("write zero-credit QUIC carrier admission")
+        );
+        assert_eq!(
+            udp_path_read_frame(
+                self.client_recv.as_mut().expect("client QUIC receiver"),
+                self.context.codec_limits,
+            )
+            .await
+            .expect("read zero-credit QUIC carrier admission"),
+            Frame::StreamMaxData {
+                stream_id: self.stream_id,
+                max_offset: 0,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_quic_drains_exact_ack_without_consuming_deferred_probe_slot() {
+    let stream_id = StreamId(405);
+    let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    let ack = Frame::StreamRequalifyAck {
+        stream_id,
+        probe_id: 23,
+        offset: 4096,
+        payload_bytes: 256,
+    };
+    fixture
+        .commands_tx
+        .try_enqueue_admitted_frame(ack.clone(), TrafficClass::Control)
+        .expect("queue exact requalification ACK");
+    let initial_grant = recv_reliable_path_command(
+        fixture
+            .commands_rx
+            .as_mut()
+            .expect("server QUIC command receivers"),
+    )
+    .await
+    .expect("dequeue pre-admission receive grant");
+    let deferred_input: Option<Result<Frame, RuntimeError>> =
+        Some(Ok(Frame::StreamRequalifyData {
+            stream_id,
+            probe_id: 24,
+            offset: 8192,
+            payload: Bytes::from(vec![0x5c; 256]),
+        }));
+    let mut path_proofs = PathProofTracker::default();
+
+    assert!(
+        !drain_one_server_udp_command_while_input_deferred(
+            initial_grant,
+            fixture
+                .commands_rx
+                .as_mut()
+                .expect("server QUIC command receivers"),
+            fixture.server_send.as_mut().expect("server QUIC sender"),
+            &fixture.context,
+            stream_id,
+            &fixture._path_registration,
+            &mut path_proofs,
+        )
+        .await
+        .expect("drain receive grant while probe is retained")
+    );
+    assert_eq!(
+        udp_path_read_frame(
+            fixture.client_recv.as_mut().expect("client QUIC receiver"),
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("read pre-admission receive grant"),
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset: 0,
+        }
+    );
+    let ack_command = recv_reliable_path_command(
+        fixture
+            .commands_rx
+            .as_mut()
+            .expect("server QUIC command receivers"),
+    )
+    .await
+    .expect("dequeue exact ACK command");
+    assert!(
+        !drain_one_server_udp_command_while_input_deferred(
+            ack_command,
+            fixture
+                .commands_rx
+                .as_mut()
+                .expect("server QUIC command receivers"),
+            fixture.server_send.as_mut().expect("server QUIC sender"),
+            &fixture.context,
+            stream_id,
+            &fixture._path_registration,
+            &mut path_proofs,
+        )
+        .await
+        .expect("drain exact ACK while probe is retained")
+    );
+    assert!(matches!(
+        deferred_input,
+        Some(Ok(Frame::StreamRequalifyData { probe_id: 24, .. }))
+    ));
+    assert_eq!(
+        udp_path_read_frame(
+            fixture.client_recv.as_mut().expect("client QUIC receiver"),
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("read exact requalification ACK"),
+        ack
+    );
+}
+
+#[tokio::test]
+async fn server_quic_live_attachment_requalifies_without_replacement() {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let stream_id = StreamId(415);
+        let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+        fixture.drain_zero_credit_admission().await;
+        let binding = match &fixture.accepted.stream().output {
+            ReliablePathStreamOutput::Switchable(binding) => binding.clone(),
+            _ => panic!("expected switchable server response output"),
+        };
+        let initial = binding
+            .sender_path_targets(TrafficClass::Throughput, 64)
+            .into_iter()
+            .find(|target| target.observation.key.underlay == UnderlayProtocol::Udp)
+            .expect("live QUIC response attachment")
+            .observation;
+        let identity = ServerReinjectionOutputIdentity {
+            key: initial.key,
+            incarnation: initial.incarnation,
+        };
+        assert_eq!(
+            initial.path_instance_id,
+            fixture._path_registration.path_instance_id()
+        );
+        assert!(!binding.output_is_stale(identity), "starts Qualified");
+        let connection_owner = fixture._server_connection.delivery_activity_notify();
+
+        let (alternate, alternate_rx) = reliable_path_command_channels(8);
+        let _ = binding.attach(
+            UnderlayProtocol::Tcp,
+            PathId(1),
+            alternate,
+            TrafficClass::Throughput,
+        );
+        let mut send_stream = ReliableSendStream::new(stream_id, fixture.context.mux_limits);
+        let old = send_stream
+            .send_data(Bytes::from_static(b"qualified-before-stale"))
+            .expect("prepare old original data");
+        binding.record_original_flight(initial.key, &old);
+        assert!(binding.mark_output_stale(identity));
+        assert!(binding.output_is_stale(identity), "becomes Stale");
+        drop(alternate_rx);
+        assert_eq!(
+            binding
+                .try_enqueue_response_requalification_probe(
+                    &send_stream,
+                    TrafficClass::Throughput,
+                    64,
+                )
+                .expect("queue response probe"),
+            Some(22),
+        );
+        assert!(
+            binding.response_requalification_deadline().is_some(),
+            "becomes Requalifying"
+        );
+
+        let mut product_stream = fixture.accepted.take_stream();
+        let actor = tokio::spawn(run_server_udp_reliable_stream_loop(
+            fixture.server_send.take().expect("server QUIC sender"),
+            fixture.server_recv.take().expect("server QUIC receiver"),
+            ServerUdpReliableStreamLoop {
+                context: fixture.context.clone(),
+                session_id: fixture.session_id,
+                path_id: fixture.path_id,
+                path_registration: fixture._path_registration.clone(),
+                stream_id,
+                target: fixture.target.clone(),
+                commands_tx: fixture.commands_tx.clone(),
+                commands_rx: fixture.commands_rx.take().expect("server QUIC commands"),
+                path_proofs: PathProofTracker::default(),
+            },
+        ));
+        let client_recv = fixture.client_recv.as_mut().expect("client QUIC receiver");
+        let (probe_id, offset, payload_bytes) = loop {
+            let frame = udp_path_read_frame(client_recv, fixture.context.codec_limits)
+                .await
+                .expect("read response probe");
+            if let Frame::StreamRequalifyData {
+                probe_id,
+                offset,
+                payload,
+                ..
+            } = frame
+            {
+                assert_eq!(payload, Bytes::from_static(b"qualified-before-stale"));
+                break (probe_id, offset, payload.len() as u32);
+            }
+        };
+        let client_send = fixture.client_send.as_mut().expect("client QUIC sender");
+        udp_path_write_frame(
+            client_send,
+            &Frame::StreamRequalifyAck {
+                stream_id,
+                probe_id,
+                offset,
+                payload_bytes,
+            },
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("return exact response probe ACK");
+        while binding.response_requalification_deadline().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !binding.output_is_stale(identity),
+            "Acquiring admits fresh original data"
+        );
+        let old_range = OffsetRange::new(0, payload_bytes as u64).expect("old range");
+        assert!(
+            binding
+                .release_normalized_acked_ranges(&[old_range])
+                .path_progress_outputs
+                .is_empty()
+        );
+
+        let fresh = send_stream
+            .send_data(Bytes::from_static(b"fresh-after-probe"))
+            .expect("prepare fresh original data");
+        let Frame::StreamData {
+            offset,
+            ref payload,
+            ..
+        } = fresh
+        else {
+            panic!("expected STREAM_DATA");
+        };
+        let fresh_range =
+            OffsetRange::new(offset, offset + payload.len() as u64).expect("fresh range");
+        binding.record_original_flight(initial.key, &fresh);
+        fixture
+            .commands_tx
+            .send_stream_ordered_frame(fresh.clone(), TrafficClass::Throughput)
+            .await
+            .expect("send fresh data on same attachment");
+        while udp_path_read_frame(client_recv, fixture.context.codec_limits)
+            .await
+            .expect("read fresh data")
+            != fresh
+        {}
+        udp_path_write_frame(
+            client_send,
+            &Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: vec![fresh_range],
+            },
+            fixture.context.codec_limits,
+        )
+        .await
+        .expect("return fresh ACK");
+        let Frame::StreamAck { ranges, .. } =
+            product_stream.recv_frame().await.expect("route fresh ACK")
+        else {
+            panic!("expected routed fresh STREAM_ACK");
+        };
+        assert_eq!(
+            binding
+                .release_normalized_acked_ranges(&ranges)
+                .path_progress_outputs
+                .as_slice(),
+            &[identity]
+        );
+        assert!(!binding.output_is_stale(identity), "restores Qualified");
+        let final_state = binding
+            .sender_path_targets(TrafficClass::Throughput, 64)
+            .into_iter()
+            .find(|target| target.observation.key == identity.key)
+            .expect("same live QUIC attachment")
+            .observation;
+        assert_eq!(final_state.path_instance_id, initial.path_instance_id);
+        assert_eq!(final_state.incarnation, initial.incarnation);
+        assert!(Arc::ptr_eq(
+            &connection_owner,
+            &fixture._server_connection.delivery_activity_notify()
+        ));
+        assert!(!fixture._server_connection.is_closed());
+        actor.abort();
+        let _ = actor.await;
+    })
+    .await
+    .expect("live same-carrier requalification must finish within one second");
 }
 
 #[tokio::test]
@@ -474,6 +807,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
 async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_stream() {
     let stream_id = StreamId(402);
     let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    fixture.drain_zero_credit_admission().await;
     assert_eq!(fixture.attached_output_count(), 1);
     fixture
         .commands_tx
@@ -576,6 +910,7 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     let stream_id = StreamId(403);
     let mismatched_stream_id = StreamId(404);
     let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    fixture.drain_zero_credit_admission().await;
     fixture
         .commands_tx
         .send_stream_ordered_reset_and_close(
@@ -740,6 +1075,86 @@ async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
             ..
         }) if ack_stream_id == stream_id
     ));
+    commands_tx
+        .send_stream_ordered_close(stream_id, TrafficClass::Throughput)
+        .await
+        .expect("close retained client writer");
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .expect("client actor close timeout")
+        .expect("client actor join");
+    assert!(!fixture._client_connection.is_closed());
+}
+
+#[tokio::test]
+async fn client_quic_idle_writer_routes_both_requalification_frames() {
+    let stream_id = StreamId(410);
+    let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    let client_send = fixture.client_send.take().expect("client QUIC sender");
+    let client_recv = fixture.client_recv.take().expect("client QUIC receiver");
+    let mut server_send = fixture.server_send.take().expect("server QUIC sender");
+    let mut server_recv = fixture.server_recv.take().expect("server QUIC receiver");
+    let (commands_tx, commands_rx) = reliable_path_command_channels(8);
+    let (frames_tx, mut frames_rx) = mpsc::channel(8);
+    let state = ClientPathState::new(ClientPathHealth::new(
+        Vec::new(),
+        vec![ClientPathHealthRecord::default()],
+    ));
+    let codec_limits = fixture.context.codec_limits;
+    let actor = tokio::spawn(run_client_udp_stream(
+        client_send,
+        client_recv,
+        stream_id,
+        0,
+        next_carrier_path_instance_id(),
+        codec_limits,
+        fixture.context.mux_limits,
+        8,
+        state,
+        commands_rx,
+        frames_tx,
+    ));
+
+    assert_eq!(
+        udp_path_read_frame(&mut server_recv, codec_limits)
+            .await
+            .expect("read client opener"),
+        Frame::Ping { nonce: 1 },
+    );
+    let probe = Frame::StreamRequalifyData {
+        stream_id,
+        probe_id: 41,
+        offset: 1024,
+        payload: Bytes::from_static(b"idle-probe"),
+    };
+    let ack = Frame::StreamRequalifyAck {
+        stream_id,
+        probe_id: 42,
+        offset: 2048,
+        payload_bytes: 512,
+    };
+    for frame in [&probe, &ack] {
+        udp_path_write_frame(&mut server_send, frame, codec_limits)
+            .await
+            .expect("write requalification frame while client writer is idle");
+    }
+    assert_eq!(
+        frames_rx
+            .recv()
+            .await
+            .expect("probe route")
+            .expect("probe frame"),
+        probe,
+    );
+    assert_eq!(
+        frames_rx
+            .recv()
+            .await
+            .expect("ACK route")
+            .expect("ACK frame"),
+        ack,
+    );
+
     commands_tx
         .send_stream_ordered_close(stream_id, TrafficClass::Throughput)
         .await
@@ -1789,6 +2204,7 @@ async fn server_quic_attachment_refusal_is_stream_local_during_ordered_detach() 
 async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
     let stream_id = StreamId(406);
     let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    fixture.drain_zero_credit_admission().await;
     let mut product_stream = fixture.accepted.take_stream();
     let server_send = fixture.server_send.take().expect("server QUIC sender");
     let server_recv = fixture.server_recv.take().expect("server QUIC receiver");
@@ -1877,6 +2293,24 @@ async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
             ..
         })) if ack_stream_id == stream_id
     ));
+    for frame in [
+        Frame::StreamRequalifyData {
+            stream_id,
+            probe_id: 71,
+            offset: 0,
+            payload: Bytes::from_static(b"late-probe"),
+        },
+        Frame::StreamRequalifyAck {
+            stream_id,
+            probe_id: 72,
+            offset: 0,
+            payload_bytes: 10,
+        },
+    ] {
+        udp_path_write_frame(client_send, &frame, fixture.context.codec_limits)
+            .await
+            .expect("terminal drain tolerates delayed requalification frame");
+    }
     udp_path_write_frame(
         client_send,
         &Frame::StreamDetach { stream_id },

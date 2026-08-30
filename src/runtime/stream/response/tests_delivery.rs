@@ -173,8 +173,68 @@ fn stale_response_output_recovery_preserves_exact_ack_authority() {
     );
 
     let exact = binding.release_normalized_acked_ranges(&[range(4096, 8192)]);
-    assert_eq!(exact.path_progress_outputs.as_slice(), &[original_identity]);
-    assert!(!binding.output_is_stale(original_identity));
+    assert!(
+        exact.path_progress_outputs.is_empty(),
+        "pre-stale assignment ACK releases flight but cannot restore authority"
+    );
+    assert!(binding.output_is_stale(original_identity));
+}
+
+#[test]
+fn pre_stale_acked_hole_cannot_rebuild_post_requalification_confidence() {
+    let (binding, candidate, _candidate_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let healthy = key(UnderlayProtocol::Udp, 9);
+    let (healthy_commands, _healthy_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        healthy.underlay,
+        healthy.path_id,
+        healthy_commands,
+        TrafficClass::Throughput,
+    );
+    let identity = server_output_identity(&binding, candidate);
+
+    binding.record_original_flight(healthy, &stream_data_frame_at(0, 4096));
+    binding.record_original_flight(candidate, &stream_data_frame_at(4096, 4096));
+    binding.release_normalized_acked_ranges(&[range(4096, 8192)]);
+    assert!(binding.mark_output_stale(identity));
+    let acquired_at = Instant::now();
+    {
+        let mut outputs = binding.outputs.lock().expect("response outputs");
+        outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == candidate)
+            .expect("candidate output")
+            .qualification = StreamPathQualification::Acquiring {
+            started_at: acquired_at,
+        };
+    }
+    binding.record_original_flight(candidate, &stream_data_frame_at(8192, 4096));
+    binding.release_normalized_acked_ranges(&[range(8192, 12288)]);
+    assert_eq!(
+        binding
+            .outputs
+            .lock()
+            .expect("response outputs")
+            .entries
+            .iter()
+            .find(|entry| entry.key == candidate)
+            .expect("candidate output")
+            .qualification,
+        StreamPathQualification::Qualified
+    );
+
+    binding.release_normalized_acked_ranges(&[range(0, 12288)]);
+    let outputs = binding.outputs.lock().expect("response outputs");
+    let candidate = outputs
+        .entries
+        .iter()
+        .find(|entry| entry.key == candidate)
+        .expect("candidate output");
+    assert_eq!(
+        candidate.delivery_samples, 1,
+        "only the fresh post-probe hole may establish current delivery confidence"
+    );
 }
 
 #[test]

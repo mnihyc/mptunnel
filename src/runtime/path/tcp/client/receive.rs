@@ -15,6 +15,20 @@ use crate::runtime::path::proof::path_proof_ack_frame;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
 
+fn client_tcp_inbound_frame_is_product_stream(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::StreamMaxData { .. }
+            | Frame::StreamReset { .. }
+            | Frame::StreamData { .. }
+            | Frame::StreamAck { .. }
+            | Frame::StreamRequalifyData { .. }
+            | Frame::StreamRequalifyAck { .. }
+            | Frame::StreamFin { .. }
+            | Frame::StreamDetach { .. }
+    )
+}
+
 pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
     frame: Frame,
     connection: &mut ClientTcpPathConnection,
@@ -39,12 +53,7 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
         _ => runtime.observe_sender_transport_state(connection, false),
     }
     match frame {
-        frame @ (Frame::StreamMaxData { .. }
-        | Frame::StreamReset { .. }
-        | Frame::StreamData { .. }
-        | Frame::StreamAck { .. }
-        | Frame::StreamFin { .. }
-        | Frame::StreamDetach { .. }) => {
+        frame if client_tcp_inbound_frame_is_product_stream(&frame) => {
             handle_client_tcp_stream_frame(frame, connection, streams, closed_streams, runtime)
                 .await
         }
@@ -172,5 +181,32 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
             "TCP client received IP tunnel open request",
         )),
         _ => Err(RuntimeError::Protocol("unexpected TCP path session frame")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn idle_tcp_receive_classifies_both_requalification_frames_as_product_stream_work() {
+        let stream_id = StreamId(73);
+        assert!(client_tcp_inbound_frame_is_product_stream(
+            &Frame::StreamRequalifyData {
+                stream_id,
+                probe_id: 61,
+                offset: 0,
+                payload: Bytes::from_static(b"probe"),
+            }
+        ));
+        assert!(client_tcp_inbound_frame_is_product_stream(
+            &Frame::StreamRequalifyAck {
+                stream_id,
+                probe_id: 61,
+                offset: 0,
+                payload_bytes: 5,
+            }
+        ));
     }
 }

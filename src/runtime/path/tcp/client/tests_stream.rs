@@ -269,3 +269,49 @@ async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
         Frame::StreamData { offset: 4, payload, .. } if &payload[..] == b"tail"
     ));
 }
+
+#[tokio::test]
+async fn client_tcp_idle_writer_routes_both_requalification_frames() {
+    let stream_id = StreamId(71);
+    let (frames_tx, mut frames_rx) = mpsc::channel(4);
+    let mut streams = HashMap::from([(
+        stream_id,
+        ClientTcpPathStreamState {
+            open_attempt_id: ClientTcpOpenAttemptId(3),
+            frames: frames_tx,
+            pending_open: None,
+        },
+    )]);
+    let mut closed_streams = RecentIdCache::new(8);
+    let probe = Frame::StreamRequalifyData {
+        stream_id,
+        probe_id: 51,
+        offset: 4096,
+        payload: Bytes::from_static(b"idle-probe"),
+    };
+    let ack = Frame::StreamRequalifyAck {
+        stream_id,
+        probe_id: 52,
+        offset: 8192,
+        payload_bytes: 1024,
+    };
+
+    for frame in [probe.clone(), ack.clone()] {
+        let stream_id = match &frame {
+            Frame::StreamRequalifyData { stream_id, .. }
+            | Frame::StreamRequalifyAck { stream_id, .. } => *stream_id,
+            _ => unreachable!("test frames are requalification frames"),
+        };
+        route_client_tcp_stream_frame(&mut streams, &mut closed_streams, stream_id, frame)
+            .await
+            .expect("route requalification frame");
+    }
+    assert_eq!(
+        frames_rx.recv().await.expect("probe route").expect("probe"),
+        probe,
+    );
+    assert_eq!(
+        frames_rx.recv().await.expect("ACK route").expect("ACK"),
+        ack
+    );
+}

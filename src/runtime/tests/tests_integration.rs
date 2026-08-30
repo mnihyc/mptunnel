@@ -546,7 +546,6 @@ struct RangedTcpCarrierServer {
     first_port: u16,
     paths: crate::runtime::path::ServerPathContext,
     active: Arc<std::sync::atomic::AtomicUsize>,
-    maximum_active: Arc<std::sync::atomic::AtomicUsize>,
     accepted: Arc<[std::sync::atomic::AtomicUsize; 2]>,
     carriers: tokio::task::JoinHandle<()>,
     relay: tokio::task::JoinHandle<Result<(), RuntimeError>>,
@@ -570,14 +569,12 @@ impl RangedTcpCarrierServer {
                 .run(),
         );
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let maximum_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accepted = Arc::new([
             std::sync::atomic::AtomicUsize::new(0),
             std::sync::atomic::AtomicUsize::new(0),
         ]);
         let carriers = {
             let active = active.clone();
-            let maximum_active = maximum_active.clone();
             let accepted = accepted.clone();
             let server_context = paths.clone();
             tokio::spawn(async move {
@@ -593,12 +590,10 @@ impl RangedTcpCarrierServer {
                     };
                     accepted[listener_index].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     let active = active.clone();
-                    let maximum_active = maximum_active.clone();
                     let local_path = local_path.clone();
                     let server_context = server_context.clone();
                     sessions.spawn(async move {
-                        let current = active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-                        maximum_active.fetch_max(current, std::sync::atomic::Ordering::AcqRel);
+                        active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         let result = handle_server_path(stream, local_path, server_context).await;
                         active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         result
@@ -611,7 +606,6 @@ impl RangedTcpCarrierServer {
             first_port,
             paths,
             active,
-            maximum_active,
             accepted,
             carriers,
             relay,
@@ -1317,10 +1311,8 @@ async fn ranged_tcp_bounded_pool_rotates_active_members_one_successor_at_a_time(
         "persistent Product ownership must not postpone every group member rotation"
     );
     assert_eq!(
-        carrier_server
-            .maximum_active
-            .load(std::sync::atomic::Ordering::Acquire),
-        4,
+        context.tcp_carrier_groups.maximum_occupied(0),
+        Some(4),
         "a three-member group permits exactly one transient successor"
     );
 
@@ -1583,10 +1575,8 @@ async fn ranged_tcp_maximum_one_replaces_before_drain_without_breaking_active_pr
         "terminal predecessor release must restore the configured current-member count"
     );
     assert_eq!(
-        carrier_server
-            .maximum_active
-            .load(std::sync::atomic::Ordering::Acquire),
-        2,
+        context.tcp_carrier_groups.maximum_occupied(0),
+        Some(2),
         "maximum-one replacement must authenticate its successor before predecessor drain"
     );
     assert_eq!(

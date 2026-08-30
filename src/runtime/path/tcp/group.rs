@@ -115,6 +115,8 @@ pub(in crate::runtime) struct ClientTcpCarrierGroups {
 #[derive(Debug)]
 struct ClientTcpCarrierResourceState {
     occupied_by_group: Box<[usize]>,
+    #[cfg(test)]
+    maximum_occupied_by_group: Box<[usize]>,
     replacement_overlap_by_group: Box<[Option<ClientTcpReplacementOverlap>]>,
     occupied_path_ids: BTreeSet<u16>,
     next_path_id: u16,
@@ -209,11 +211,15 @@ impl ClientTcpCarrierGroups {
     pub(in crate::runtime) fn new(groups: Vec<ClientTcpCarrierGroup>) -> Arc<Self> {
         let (changes, _) = watch::channel(());
         let occupied_by_group = vec![0; groups.len()].into_boxed_slice();
+        #[cfg(test)]
+        let maximum_occupied_by_group = vec![0; groups.len()].into_boxed_slice();
         let replacement_overlap_by_group = vec![None; groups.len()].into_boxed_slice();
         Arc::new(Self {
             groups: groups.into_boxed_slice(),
             resources: Mutex::new(ClientTcpCarrierResourceState {
                 occupied_by_group,
+                #[cfg(test)]
+                maximum_occupied_by_group,
                 replacement_overlap_by_group,
                 occupied_path_ids: BTreeSet::new(),
                 next_path_id: 0,
@@ -288,6 +294,11 @@ impl ClientTcpCarrierGroups {
                 });
         }
         resources.occupied_by_group[config_index] = next_occupied;
+        #[cfg(test)]
+        {
+            resources.maximum_occupied_by_group[config_index] =
+                resources.maximum_occupied_by_group[config_index].max(next_occupied);
+        }
         drop(resources);
 
         Some(ClientTcpCarrierReservation {
@@ -302,6 +313,16 @@ impl ClientTcpCarrierGroups {
             .lock()
             .expect("TCP carrier resource lock")
             .occupied_by_group
+            .get(config_index)
+            .copied()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn maximum_occupied(&self, config_index: usize) -> Option<usize> {
+        self.resources
+            .lock()
+            .expect("TCP carrier resource lock")
+            .maximum_occupied_by_group
             .get(config_index)
             .copied()
     }

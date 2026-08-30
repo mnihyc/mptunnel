@@ -352,6 +352,14 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("return stale ? \"~\" + formatted : formatted;"));
     assert!(DASHBOARD_JS.contains("function effectivePeerMetricAgeMs(path, result)"));
     assert!(DASHBOARD_JS.contains("function peerResultResidenceMs(result)"));
+    assert!(DASHBOARD_JS.contains("function observedDeliveryRate(path)"));
+    assert!(DASHBOARD_JS.contains("path.delivery_rate_observed !== true"));
+    assert!(DASHBOARD_JS.contains("function pathQualities(paths, result)"));
+    assert!(DASHBOARD_JS.contains("QUALITY_PAYLOAD_BYTES * 8 / rate * 1000"));
+    assert!(
+        DASHBOARD_JS
+            .contains("quality.sharePpm = Math.round(quality.rate / group.totalRate * 1000000);")
+    );
     assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.lastReceivedAt)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.peerResultReceivedAt)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, generatedAt - receivedAt)"));
@@ -394,7 +402,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     }
     assert!(DASHBOARD_HTML.contains(r#"<th scope="col">Source</th>"#));
     assert!(!DASHBOARD_HTML.contains("Queue / native / MPP / cap"));
-    assert!(DASHBOARD_CSS.contains("min-width: 1540px;"));
+    assert!(DASHBOARD_CSS.contains("min-width: 1640px;"));
     assert_eq!(
         DASHBOARD_HTML
             .matches("records-table--peer records-table--paths-complete")
@@ -404,10 +412,21 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     let dashboard_css_lf = DASHBOARD_CSS.replace("\r\n", "\n");
     assert!(
         dashboard_css_lf
-            .contains(".records-table--peer {\n  min-width: 1050px;\n  table-layout: fixed;\n}")
+            .contains(".records-table--peer {\n  min-width: 1140px;\n  table-layout: fixed;\n}")
     );
+    for width in [
+        ".peer-col--path { width: 19%; }",
+        ".peer-col--rate { width: 11%; }",
+        ".peer-col--quality { width: 10%; }",
+    ] {
+        assert!(
+            DASHBOARD_CSS.contains(width),
+            "peer column width drift: {width}"
+        );
+    }
     for peer_column in [
-        "state", "path", "carrier", "use", "latency", "rate", "loss", "flight", "evidence",
+        "state", "path", "carrier", "use", "latency", "rate", "loss", "quality", "flight",
+        "evidence",
     ] {
         assert_eq!(
             DASHBOARD_HTML
@@ -480,14 +499,14 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains(r#""cell-primary", flow.inbound"#));
     assert!(!DASHBOARD_JS.contains("flow.inbound ||"));
     let local_row = DASHBOARD_JS
-        .split_once("function createPathRow(pathValue)")
+        .split_once("function createPathRow(pathValue, qualityValue)")
         .expect("local path row renderer")
         .1
         .split_once("function renderPathRows")
         .expect("end of local path row renderer")
         .0;
     let peer_row = DASHBOARD_JS
-        .split_once("function appendPeerPathRow(body, pathValue, result)")
+        .split_once("function appendPeerPathRow(body, pathValue, result, qualityValue)")
         .expect("peer path row renderer")
         .1
         .split_once("function renderPeerPaths")
@@ -497,14 +516,15 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         (
             local_row,
             &[
-                "State", "Path", "Service", "Carrier", "Use", "Latency", "Rate", "Loss", "Flight",
-                "Evidence", "Flows",
+                "State", "Path", "Service", "Carrier", "Use", "Latency", "Rate", "Loss", "Quality",
+                "Flight", "Evidence", "Flows",
             ][..],
         ),
         (
             peer_row,
             &[
-                "State", "Path", "Carrier", "Use", "Latency", "Rate", "Loss", "Flight", "Evidence",
+                "State", "Path", "Carrier", "Use", "Latency", "Rate", "Loss", "Quality", "Flight",
+                "Evidence",
             ][..],
         ),
     ] {

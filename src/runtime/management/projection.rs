@@ -476,6 +476,7 @@ pub(super) fn peer_status_result(
                     jitter_us: latency_observed.then_some(path.metrics.jitter_us),
                     latency_source: "peer_advisory",
                     delivery_rate_bps: Some(path.metrics.delivery_rate_bps.to_string()),
+                    delivery_rate_observed: path.metrics.rate_observed,
                     delivery_rate_source: "peer_advisory",
                     delivery_rate_scope: "advisory",
                     pacing_rate_bps: path
@@ -788,7 +789,11 @@ fn client_path_status(
     let tcp_endpoint = (underlay == UnderlayProtocol::Tcp)
         .then(|| context.tcp_endpoint_for_path(index))
         .flatten();
-    let active_port = observed_client_active_port(context, underlay, index);
+    let active_port_path_id = match underlay {
+        UnderlayProtocol::Tcp => observation.wire_path_id,
+        UnderlayProtocol::Udp => Some(snapshot.id),
+    };
+    let active_port = observed_client_active_port(context, underlay, active_port_path_id);
     let rate = client_rate_projection(spec, snapshot, observation, rate_diagnostics);
     let pacing = client_native_pacing_projection(rate, rate_diagnostics);
     let authoritative_pacing_rate_bps = client_authoritative_pacing_rate_bps(rate, pacing, now);
@@ -842,6 +847,7 @@ fn client_path_status(
             .or_else(|| spec.metadata.initial_jitter_ms.map(f64::from)),
         latency_source: Some(client_latency_source(spec, observation)),
         delivery_rate_bps: Some((rate.delivery_rate_bps.round() as u64).to_string()),
+        delivery_rate_observed: Some(rate.observed_at.is_some()),
         delivery_rate_source: Some(rate.source),
         delivery_rate_scope: Some(rate.scope),
         pacing_rate_bps: pacing.map(|(rate, _)| (rate.round() as u64).to_string()),
@@ -922,6 +928,7 @@ fn collect_server(
             jitter_ms: None,
             latency_source: None,
             delivery_rate_bps: None,
+            delivery_rate_observed: None,
             delivery_rate_source: None,
             delivery_rate_scope: None,
             pacing_rate_bps: None,
@@ -1041,6 +1048,8 @@ fn collect_server(
             delivery_rate_bps: carrier_rate_sample
                 .map(|sample| sample.delivery_rate_bps.to_string())
                 .or_else(|| metrics.map(|metrics| metrics.delivery_rate_bps.to_string())),
+            delivery_rate_observed: metrics
+                .map(|metrics| carrier_rate_sample.is_some() || metrics.rate_observed),
             delivery_rate_source: metrics.and(rate_source),
             delivery_rate_scope: metrics.map(|_| {
                 if path.source == Some("peer_hint") {
@@ -1399,15 +1408,18 @@ fn client_latency_source(spec: &PathSpec, observation: ClientPathObservation) ->
 fn observed_client_active_port(
     context: &ClientPathContext,
     underlay: UnderlayProtocol,
-    index: usize,
+    path_id: Option<crate::protocol::PathId>,
 ) -> Option<u16> {
-    // The authenticated peer-status assignment is the single local authority
-    // for both tables. In particular, Quinn retains its canonical peer locator
-    // while the mapped UDP socket migrates across a forwarded port range; the
-    // generation-fenced assignment is updated only after migration receipt.
+    // The exact authenticated peer-status assignment is the common authority
+    // for both tables. TCP make-before-break may keep two live PathIds in one
+    // configured slot, while Quinn retains its canonical peer locator as the
+    // mapped UDP socket migrates. Joining by the health record's real wire
+    // PathId keeps both cases generation-coherent; an unconnected TCP slot's
+    // synthetic display ID is deliberately not eligible.
+    let path_id = path_id?;
     context
         .peer_status
-        .live_path_active_port(context.session_id, underlay, index)
+        .live_path_active_port(context.session_id, underlay, path_id)
 }
 
 const fn rate_scope_name(scope: PathRateScope) -> &'static str {

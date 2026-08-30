@@ -379,14 +379,18 @@ async fn retired_and_live_generations_in_one_slot_keep_their_own_ports() {
         broker.register_path(session_id, UnderlayProtocol::Tcp, PathId(0), 0, None);
     let predecessor =
         broker.register_path(session_id, UnderlayProtocol::Tcp, PathId(41), 2, Some(7443));
-    drop(predecessor);
     let successor =
         broker.register_path(session_id, UnderlayProtocol::Tcp, PathId(42), 2, Some(7444));
 
     assert_eq!(
-        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, 2),
+        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, PathId(41)),
+        Some(7443),
+        "a draining predecessor retains its exact live port during overlap"
+    );
+    assert_eq!(
+        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, PathId(42)),
         Some(7444),
-        "management must read only the live generation in a reused slot"
+        "a current successor must resolve by exact PathId during overlap"
     );
 
     let request = {
@@ -415,8 +419,8 @@ async fn retired_and_live_generations_in_one_slot_keep_their_own_ports() {
     );
     assert_eq!(
         result.local_path_retired(UnderlayProtocol::Tcp, PathId(41)),
-        Some(true),
-        "a retained predecessor port must be marked historical"
+        Some(false),
+        "the overlapping predecessor is still an exact live assignment"
     );
     assert_eq!(
         result.local_path_index(UnderlayProtocol::Tcp, PathId(42)),
@@ -433,16 +437,22 @@ async fn retired_and_live_generations_in_one_slot_keep_their_own_ports() {
         "the authenticated successor is live at request dispatch"
     );
 
-    drop(successor);
+    drop(predecessor);
     assert_eq!(
-        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, 2),
+        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, PathId(41)),
         None,
-        "a retired tombstone cannot be presented as a live active port"
+        "a retired predecessor tombstone cannot be presented as live"
     );
+    assert_eq!(
+        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, PathId(42)),
+        Some(7444),
+        "retiring the predecessor cannot erase the live successor"
+    );
+    drop(successor);
     let _reused =
         broker.register_path(session_id, UnderlayProtocol::Tcp, PathId(43), 2, Some(7445));
     assert_eq!(
-        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, 2),
+        broker.live_path_active_port(session_id, UnderlayProtocol::Tcp, PathId(43)),
         Some(7445),
         "a newly authenticated generation owns its own live port"
     );

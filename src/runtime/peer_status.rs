@@ -365,15 +365,15 @@ impl PeerStatusBroker {
             .map(|assignment| assignment.local_path_index)
     }
 
-    /// Return the destination port owned by the currently authenticated
-    /// carrier in one endpoint-local path slot. Retired assignments are
-    /// deliberately excluded: their ports remain useful only for correlating
-    /// a peer snapshot that still reports the retired wire identity.
+    /// Return the destination port owned by one exact currently authenticated
+    /// carrier. Retired assignments are deliberately excluded: their ports
+    /// remain useful only for correlating a peer snapshot that still reports
+    /// the retired wire identity.
     pub(in crate::runtime) fn live_path_active_port(
         &self,
         session_id: SessionId,
         underlay: UnderlayProtocol,
-        local_path_index: usize,
+        path_id: PathId,
     ) -> Option<u16> {
         self.inner
             .state
@@ -382,13 +382,8 @@ impl PeerStatusBroker {
             .sessions
             .get(&session_id)?
             .local_path_assignments
-            .iter()
-            .find_map(|((assignment_underlay, _), assignment)| {
-                (*assignment_underlay == underlay
-                    && assignment.local_path_index == local_path_index)
-                    .then_some(assignment.active_port)
-                    .flatten()
-            })
+            .get(&(underlay, path_id))
+            .and_then(|assignment| assignment.active_port)
     }
 
     pub(in crate::runtime) fn session_ids(&self) -> Vec<SessionId> {

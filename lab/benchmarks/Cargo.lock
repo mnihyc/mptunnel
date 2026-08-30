@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "mptunnel"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64",
  "bytes",

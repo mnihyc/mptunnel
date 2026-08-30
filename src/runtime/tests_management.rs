@@ -405,6 +405,16 @@ fn client_status_exposes_named_inventory_without_credentials() {
         health.tcp[0].carrier_rttvar_ms = Some(5.0);
         health.tcp[0].carrier_inflight_limit_bytes = 512 * 1024;
     }
+    // A configured-but-unconnected TCP slot has only a synthetic display
+    // PathId. It must not borrow a live port from an unrelated authenticated
+    // carrier that happens to own the same numeric wire PathId.
+    let _unrelated_path = context.peer_status.register_path(
+        context.session_id,
+        crate::protocol::UnderlayProtocol::Tcp,
+        crate::protocol::PathId(0),
+        1,
+        Some(7444),
+    );
     let product_admission = ProductAdmission::default();
     let _private_flow = product_admission
         .try_admit_flow(
@@ -492,6 +502,7 @@ fn client_status_exposes_named_inventory_without_credentials() {
         Some("scheduler_default")
     );
     assert_eq!(status.paths[0].delivery_rate_scope, Some("path_capacity"));
+    assert_eq!(status.paths[0].delivery_rate_observed, Some(false));
     assert_eq!(status.paths[0].pacing_rate_bps, None);
     assert_eq!(status.paths[0].queue_bytes, None);
     assert_eq!(status.paths[0].bytes_in_flight, None);
@@ -594,6 +605,7 @@ fn client_status_retains_stale_raw_rate_with_provenance_without_reentering_sched
     assert_eq!(path.delivery_rate_bps.as_deref(), Some("123000"));
     assert_eq!(path.delivery_rate_source, Some("native_carrier"));
     assert_eq!(path.delivery_rate_scope, Some("path_capacity"));
+    assert_eq!(path.delivery_rate_observed, Some(true));
     assert_eq!(path.pacing_rate_bps.as_deref(), Some("200000"));
     assert_eq!(path.pacing_rate_source, Some("native_carrier"));
     assert_eq!(path.delivery_samples, Some(2));
@@ -984,6 +996,7 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
     assert_eq!(encoded["paths"][0]["direction"], "server_to_client");
     assert_eq!(encoded["paths"][0]["delivery_rate_source"], "peer_advisory");
     assert_eq!(encoded["paths"][0]["delivery_rate_scope"], "advisory");
+    assert_eq!(encoded["paths"][0]["delivery_rate_observed"], false);
     assert!(encoded["paths"][0]["pacing_rate_bps"].is_null());
     assert!(encoded["paths"][0]["pacing_rate_source"].is_null());
     assert!(encoded["paths"][0]["freshness_horizon_ms"].is_null());
@@ -1012,6 +1025,7 @@ fn peer_status_projects_local_path_identity_for_a_draining_authenticated_assignm
     assert_eq!(absent["paths"][0]["pacing_rate_bps"], "10000000");
     assert_eq!(absent["paths"][0]["pacing_rate_source"], "peer_advisory");
     assert_eq!(absent["paths"][0]["freshness_horizon_ms"], 4);
+    assert_eq!(absent["paths"][0]["delivery_rate_observed"], true);
 }
 
 #[test]

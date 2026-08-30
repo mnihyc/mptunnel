@@ -40,7 +40,7 @@ async fn request_and_assert_server_path(
     let expected_active_port =
         context
             .peer_status
-            .live_path_active_port(context.session_id, expected_underlay, 0);
+            .live_path_active_port(context.session_id, expected_underlay, PathId(0));
     assert_eq!(
         result.local_active_port(expected_underlay, PathId(0)),
         expected_active_port,

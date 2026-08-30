@@ -184,7 +184,7 @@ async fn server_quic_observed_ingress_captures_the_real_authenticated_carrier_pe
         fixture.session.runtime.peer_status.live_path_active_port(
             fixture.session.runtime.session_id,
             UnderlayProtocol::Udp,
-            fixture.session.runtime.config_index,
+            PathId(fixture.session.runtime.path_index as u16),
         ),
         Some(
             fixture

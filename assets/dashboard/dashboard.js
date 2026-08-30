@@ -16,6 +16,7 @@
   const DEFAULT_CHART_WINDOW_MS = 900000;
   const REQUEST_TIMEOUT_MS = 8000;
   const MIN_STALE_AFTER_MS = 6500;
+  const QUALITY_PAYLOAD_BYTES = 64 * 1024;
 
   const elements = {
     notice: byId("notice"),
@@ -582,6 +583,75 @@
   function metricIsStale(ageMs, horizonMs) {
     return metricAvailable(ageMs) && metricAvailable(horizonMs) &&
       finiteNumber(ageMs) >= finiteNumber(horizonMs);
+  }
+
+  function observedDeliveryRate(path) {
+    if (path.delivery_rate_observed !== true || !metricAvailable(path.delivery_rate_bps)) {
+      return null;
+    }
+    const rate = finiteNumber(path.delivery_rate_bps, Number.NaN);
+    return Number.isFinite(rate) && rate > 0 ? rate : null;
+  }
+
+  function qualityGroupKey(path, result) {
+    return [
+      result ? result.service : path.service,
+      result ? result.service_index : path.service_index,
+      result ? result.session_id : path.session_id,
+      path.direction,
+      path.delivery_rate_scope
+    ].map(function (value) { return String(value === undefined || value === null ? "" : value); })
+      .join("\u001f");
+  }
+
+  function pathQuality(path, result) {
+    const rate = observedDeliveryRate(path);
+    const peer = Boolean(result);
+    const ageMs = peer ? effectivePeerMetricAgeMs(path, result) : effectivePathMetricAgeMs(path);
+    const snapshotStale = peer
+      ? peerResultResidenceMs(result) >= staleAfterMs()
+      : statusResidenceMs() >= staleAfterMs();
+    const stale = snapshotStale || metricIsStale(ageMs, path.freshness_horizon_ms);
+    const srttMs = peer
+      ? (metricAvailable(path.srtt_us) ? finiteNumber(path.srtt_us) / 1000 : null)
+      : (metricAvailable(path.srtt_ms) ? finiteNumber(path.srtt_ms) : null);
+    const jitterMs = peer
+      ? (metricAvailable(path.jitter_us) ? finiteNumber(path.jitter_us) / 1000 : 0)
+      : (metricAvailable(path.jitter_ms) ? finiteNumber(path.jitter_ms) : 0);
+    const etaMs = rate !== null && srttMs !== null && srttMs > 0
+      ? srttMs / 2 + Math.max(0, jitterMs) + QUALITY_PAYLOAD_BYTES * 8 / rate * 1000
+      : null;
+    return {
+      group: qualityGroupKey(path, result),
+      rate: rate,
+      stale: stale,
+      etaMs: etaMs,
+      sharePpm: null,
+      peers: 0
+    };
+  }
+
+  function pathQualities(paths, result) {
+    const qualities = paths.map(function (pathValue) {
+      return pathQuality(asObject(pathValue), result);
+    });
+    const groups = new Map();
+    qualities.forEach(function (quality) {
+      if (quality.rate === null) return;
+      const group = groups.get(quality.group) || { totalRate: 0, stale: false, count: 0 };
+      group.totalRate += quality.rate;
+      group.stale = group.stale || quality.stale;
+      group.count += 1;
+      groups.set(quality.group, group);
+    });
+    qualities.forEach(function (quality) {
+      const group = groups.get(quality.group);
+      if (quality.rate === null || !group || group.totalRate <= 0) return;
+      quality.sharePpm = Math.round(quality.rate / group.totalRate * 1000000);
+      quality.stale = quality.stale || group.stale;
+      quality.peers = group.count;
+    });
+    return qualities;
   }
 
   function formatIdentifier(value) {
@@ -1540,8 +1610,9 @@
     return restrictions.join(", ") || "default";
   }
 
-  function createPathRow(pathValue) {
+  function createPathRow(pathValue, qualityValue) {
     const path = asObject(pathValue);
+    const qualityValueObject = asObject(qualityValue);
     const effectiveAgeMs = effectivePathMetricAgeMs(path);
     const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
     const pacingStale = metricIsStale(
@@ -1640,6 +1711,7 @@
       "Metric direction: " + directionLabel(path.direction),
       "Delivery source: " + (path.delivery_rate_source ? titleCase(path.delivery_rate_source) : "-"),
       "Delivery scope: " + (path.delivery_rate_scope ? titleCase(path.delivery_rate_scope) : "-"),
+      "Measured delivery epoch: " + formatOptionalFlag(path.delivery_rate_observed),
       "Pacing source: " + (path.pacing_rate_source ? titleCase(path.pacing_rate_source) : "-"),
       "Delivery age: " + formatOptionalMetric(effectiveAgeMs, formatDuration, false),
       "Pacing age: " + formatOptionalMetric(effectivePathPacingAgeMs(path), formatDuration, false),
@@ -1656,6 +1728,32 @@
       "Evidence: " + (snapshotStale ? "stale" : "current")
     ].join("\n");
     appendCell(row, "Loss", loss);
+
+    const quality = createElement("div");
+    quality.append(createElement(
+      "span",
+      "cell-primary",
+      formatOptionalMetric(qualityValueObject.sharePpm, formatPpm, qualityValueObject.stale)
+    ));
+    const completionEta = formatOptionalMetric(
+      qualityValueObject.etaMs,
+      formatRtt,
+      qualityValueObject.stale
+    );
+    quality.append(createElement(
+      "span",
+      "cell-secondary",
+      completionEta === "-" ? "-" : "64K / " + completionEta
+    ));
+    quality.title = [
+      "Observed delivery-rate share / unloaded 64 KiB completion ETA",
+      "Comparable paths: " + formatCount(qualityValueObject.peers),
+      "Metric direction: " + directionLabel(path.direction),
+      "Rate scope: " + (path.delivery_rate_scope ? titleCase(path.delivery_rate_scope) : "-"),
+      "ETA = RTT / 2 + observed jitter + 64 KiB serialization at the observed delivery rate",
+      "Unavailable until the sender reports a measured delivery epoch"
+    ].join("\n");
+    appendCell(row, "Quality", quality);
 
     const flight = createElement("div");
     flight.append(createElement("span", "cell-primary", formatOptionalMetric(path.queue_bytes, formatBytes, snapshotStale)));
@@ -1705,7 +1803,8 @@
   function renderPathRows(body, empty, paths) {
     body.replaceChildren();
     empty.hidden = paths.length !== 0;
-    paths.forEach(function (path) { body.append(createPathRow(path)); });
+    const qualities = pathQualities(paths, null);
+    paths.forEach(function (path, index) { body.append(createPathRow(path, qualities[index])); });
   }
 
   function renderOverviewPaths() {
@@ -1889,8 +1988,9 @@
     renderOverviewPeerResult(result, selectedSession);
   }
 
-  function appendPeerPathRow(body, pathValue, result) {
+  function appendPeerPathRow(body, pathValue, result, qualityValue) {
     const path = asObject(pathValue);
+    const qualityValueObject = asObject(qualityValue);
     const effectiveAgeMs = effectivePeerMetricAgeMs(path, result);
     const rateStale = metricIsStale(effectiveAgeMs, path.freshness_horizon_ms);
     const snapshotStale = peerResultResidenceMs(result) >= staleAfterMs();
@@ -1962,6 +2062,7 @@
       "Metric direction: " + directionLabel(path.direction),
       "Delivery source: " + (path.delivery_rate_source ? titleCase(path.delivery_rate_source) : "-"),
       "Delivery scope: " + (path.delivery_rate_scope ? titleCase(path.delivery_rate_scope) : "-"),
+      "Measured delivery epoch: " + formatOptionalFlag(path.delivery_rate_observed),
       "Pacing source: " + (path.pacing_rate_source ? titleCase(path.pacing_rate_source) : "-"),
       "Effective age: " + formatOptionalMetric(effectiveAgeMs, formatDuration, false),
       "Freshness window: " + formatOptionalMetric(path.freshness_horizon_ms, formatDuration, false)
@@ -1979,6 +2080,32 @@
       "ECN observed: " + formatOptionalFlag(path.ecn_observed)
     ].join("\n");
     appendCell(row, "Loss", loss);
+
+    const quality = createElement("div");
+    quality.append(createElement(
+      "span",
+      "cell-primary",
+      formatOptionalMetric(qualityValueObject.sharePpm, formatPpm, qualityValueObject.stale)
+    ));
+    const completionEta = formatOptionalMetric(
+      qualityValueObject.etaMs,
+      formatRtt,
+      qualityValueObject.stale
+    );
+    quality.append(createElement(
+      "span",
+      "cell-secondary",
+      completionEta === "-" ? "-" : "64K / " + completionEta
+    ));
+    quality.title = [
+      "Peer-observed delivery-rate share / unloaded 64 KiB completion ETA",
+      "Comparable paths: " + formatCount(qualityValueObject.peers),
+      "Metric direction: " + directionLabel(path.direction),
+      "Rate scope: " + (path.delivery_rate_scope ? titleCase(path.delivery_rate_scope) : "-"),
+      "ETA = RTT / 2 + observed jitter + 64 KiB serialization at the observed delivery rate",
+      "Unavailable until the peer reports a measured delivery epoch"
+    ].join("\n");
+    appendCell(row, "Quality", quality);
 
     const flight = createElement("div");
     flight.append(createElement("span", "cell-primary", formatOptionalMetric(path.queue_bytes, formatBytes, snapshotStale)));
@@ -2023,7 +2150,10 @@
     const paths = result ? asArray(result.paths) : [];
     body.replaceChildren();
     empty.hidden = paths.length !== 0;
-    paths.forEach(function (path) { appendPeerPathRow(body, path, result); });
+    const qualities = pathQualities(paths, result);
+    paths.forEach(function (path, index) {
+      appendPeerPathRow(body, path, result, qualities[index]);
+    });
   }
 
   function renderOverviewPeerResult(result, selectedSession) {

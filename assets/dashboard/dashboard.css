@@ -830,7 +830,7 @@ h3 {
 }
 
 .records-table--paths-complete {
-  min-width: 1540px;
+  min-width: 1640px;
 }
 
 .overview-connections {
@@ -948,19 +948,20 @@ tbody tr:hover td {
 }
 
 .records-table--peer {
-  min-width: 1050px;
+  min-width: 1140px;
   table-layout: fixed;
 }
 
-.records-table--peer .peer-col--state { width: 7%; }
-.records-table--peer .peer-col--path { width: 18%; }
-.records-table--peer .peer-col--carrier { width: 7%; }
-.records-table--peer .peer-col--use { width: 10%; }
+.records-table--peer .peer-col--state { width: 6%; }
+.records-table--peer .peer-col--path { width: 19%; }
+.records-table--peer .peer-col--carrier { width: 6%; }
+.records-table--peer .peer-col--use { width: 9%; }
 .records-table--peer .peer-col--latency { width: 10%; }
-.records-table--peer .peer-col--rate { width: 15%; }
-.records-table--peer .peer-col--loss { width: 8%; }
-.records-table--peer .peer-col--flight { width: 10%; }
-.records-table--peer .peer-col--evidence { width: 15%; }
+.records-table--peer .peer-col--rate { width: 11%; }
+.records-table--peer .peer-col--loss { width: 7%; }
+.records-table--peer .peer-col--quality { width: 10%; }
+.records-table--peer .peer-col--flight { width: 9%; }
+.records-table--peer .peer-col--evidence { width: 13%; }
 
 .cell-primary,
 .cell-secondary,

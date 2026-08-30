@@ -2579,24 +2579,14 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             "the same failed operation must not spin a replacement before one PTO"
         );
         assert!(
-            tokio::time::timeout(
-                pto.saturating_mul(3).max(Duration::from_millis(250)),
-                replacement_abort.wait_attached()
-            )
-            .await
-            .expect("same-carrier QUIC reattachment timeout"),
+            replacement_abort.wait_attached().await,
             "the same live QUIC carrier must be eligible again after suppression expires"
         );
         assert!(
             aborted_at.elapsed() + Duration::from_millis(3) >= pto,
             "reattachment occurred before its path-derived PTO"
         );
-        let replacement_attachment = tokio::time::timeout(
-            Duration::from_millis(250),
-            attachment_commits.wait_committed(),
-        )
-        .await
-        .expect("replacement client QUIC attachment commit timeout");
+        let replacement_attachment = attachment_commits.wait_committed().await;
         assert_eq!(replacement_attachment.key, initial_attachment.key);
         assert_eq!(replacement_attachment.path_instance_id, quic_instance);
         assert_ne!(

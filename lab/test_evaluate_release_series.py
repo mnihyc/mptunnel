@@ -11,6 +11,7 @@ from derive_performance_series import CASE_SERIES  # noqa: E402
 from evaluate_release_series import RAW_CASE, main as evaluate_main  # noqa: E402
 from result_enrichment import (  # noqa: E402
     MPTUNNEL_CARRIER_PRESENTATION,
+    MPTUNNEL_PROTOCOL_VERSION,
     RUN_MANIFEST_SCHEMA_VERSION,
 )
 import test_performance_series as performance_fixtures  # noqa: E402
@@ -63,7 +64,7 @@ def product_record(series_id, case):
         host_snapshot_sha256=HOST_SNAPSHOT,
         mptunnel_build_features=[],
         mptunnel_build_profile="release",
-        mptunnel_protocol_version=8,
+        mptunnel_protocol_version=MPTUNNEL_PROTOCOL_VERSION,
         mptunnel_carrier_presentation=MPTUNNEL_CARRIER_PRESENTATION,
         mptunnel_client_runtime=CLIENT_RUNTIME,
         mptunnel_client_runtime_version=CLIENT_RUNTIME_VERSION,
@@ -109,7 +110,7 @@ def raw_record():
         host_snapshot_sha256=HOST_SNAPSHOT,
         mptunnel_build_features=[],
         mptunnel_build_profile="release",
-        mptunnel_protocol_version=8,
+        mptunnel_protocol_version=MPTUNNEL_PROTOCOL_VERSION,
         mptunnel_carrier_presentation=MPTUNNEL_CARRIER_PRESENTATION,
         mptunnel_client_runtime=CLIENT_RUNTIME,
         mptunnel_client_runtime_version=CLIENT_RUNTIME_VERSION,
@@ -153,7 +154,7 @@ def release_manifest():
     manifest["product"] = {
         "mptunnel_build_profile": "release",
         "mptunnel_build_features": [],
-        "mptunnel_protocol_version": 8,
+        "mptunnel_protocol_version": MPTUNNEL_PROTOCOL_VERSION,
         "mptunnel_transport_profile": "shared-secret",
         "mptunnel_carrier_presentation": MPTUNNEL_CARRIER_PRESENTATION,
     }
@@ -503,7 +504,7 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
                 self.assertEqual(status, 2)
                 self.assertEqual(verdict["status"], "invalid")
                 self.assertEqual(verdict["repetitions"], [])
-                self.assertIn("frozen v0.4.4 release profile", verdict["errors"][0])
+                self.assertIn("frozen v0.4.7 release profile", verdict["errors"][0])
 
     def test_release_profile_rejects_missing_build_provenance(self):
         for flag in ("build_product", "build_lab_images"):
@@ -522,7 +523,7 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
                 self.assertEqual(status, 2)
                 self.assertEqual(verdict["status"], "invalid")
                 self.assertEqual(verdict["repetitions"], [])
-                self.assertIn("frozen v0.4.4 release profile", verdict["errors"][0])
+                self.assertIn("frozen v0.4.7 release profile", verdict["errors"][0])
 
     def test_release_profile_rejects_stale_or_missing_manifest_schema(self):
         for schema_version in (3, None):

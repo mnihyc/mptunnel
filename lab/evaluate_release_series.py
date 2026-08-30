@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate the fixed v0.4.4 two-repetition performance release gate."""
+"""Evaluate the fixed v0.4.7 two-repetition performance release gate."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from result_enrichment import (
     RUN_MANIFEST_SCHEMA_VERSION,
 )
 
-RELEASE = "v0.4.4"
+RELEASE = "v0.4.7"
 SCHEMA_VERSION = 1
 RAW_CASE = "baseline_raw_tcp_bulk_interactive_balanced"
 REPETITIONS = 2
@@ -154,7 +154,7 @@ def _release_manifest_image_identity(path):
         and overrides.get("MPTUNNEL_LAB_INTERNET_SEED")
         == "mptunnel-random-internet-v1"
         and overrides.get("MPTUNNEL_LAB_INTERNET_INCLUDE_OUTAGES") == "0",
-        f"{manifest_path} does not use the frozen v0.4.4 release profile",
+        f"{manifest_path} does not use the frozen v0.4.7 release profile",
     )
     identity = tuple(
         containers.get(role, {}).get("image_id")

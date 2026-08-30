@@ -348,7 +348,7 @@ def validate_dataset(dataset):
             and isinstance(verdict.get("sha256"), str)
             and re.fullmatch(r"[0-9a-f]{64}", verdict["sha256"]) is not None
             and verdict.get("status") == "pass"
-            and verdict.get("release") == "v0.4.4"
+            and verdict.get("release") == "v0.4.7"
             and verdict.get("candidate_commit") == candidate_commit,
             "raw_tcp release-verdict provenance is invalid",
         )

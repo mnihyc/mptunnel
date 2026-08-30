@@ -51,6 +51,7 @@ from derive_performance_series import (  # noqa: E402
 )
 from result_enrichment import (  # noqa: E402
     BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION,
+    MPTUNNEL_PROTOCOL_VERSION,
     validate_bulk_interactive_dynamic_loss_metadata,
     validate_bulk_interactive_probe_route,
 )
@@ -373,7 +374,7 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             record.update(
                 {
                     "performance_comparable": True,
-                    "mptunnel_protocol_version": 8,
+                    "mptunnel_protocol_version": MPTUNNEL_PROTOCOL_VERSION,
                     "mptunnel_build_profile": "release",
                 }
             )
@@ -579,7 +580,7 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
 
         record.update(
             performance_comparable=True,
-            mptunnel_protocol_version=8,
+            mptunnel_protocol_version=MPTUNNEL_PROTOCOL_VERSION,
             mptunnel_build_profile="release",
         )
         with self.assertRaisesRegex(DerivationError, "MPP echo continuity"):

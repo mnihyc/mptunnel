@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive the separate two-run raw-TCP context trajectory for v0.4.4."""
+"""Derive the separate two-run raw-TCP context trajectory for v0.4.7."""
 
 from __future__ import annotations
 

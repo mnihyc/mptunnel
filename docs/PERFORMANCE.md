@@ -22,7 +22,7 @@ Hysteria2 received the measured directional capacities. Missing echo values
 remain gaps rather than zeroes; clipped display outliers retain their exact
 values in hover text.
 
-## v0.4.5-v0.4.6 accepted correctness evidence
+## v0.4.5-v0.4.7 accepted correctness evidence
 
 Focused correctness gates establish the following bounded corrections. They
 are not throughput or latency measurements and do not establish a product

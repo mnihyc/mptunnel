@@ -2056,6 +2056,8 @@ fn relay_path_snapshot_for_bulk_choice(
         let local_model = request_state
             .and_then(|request| request.path_state(instance))
             .and_then(RequestPathState::per_flow_rate);
+        let has_fresh_native_capacity = path.has_fresh_native_carrier_rate_evidence
+            && snapshot.rate_scope == PathRateScope::PathCapacity;
         if local_model.is_none() && snapshot.rate_scope == PathRateScope::PerFlowGoodput {
             // Shared TCP product samples belong to whichever logical flow
             // produced them. Until this flow has exact local evidence, fall
@@ -2069,10 +2071,13 @@ fn relay_path_snapshot_for_bulk_choice(
             snapshot.carrier_inflight_limit_bytes = startup.carrier_inflight_limit_bytes;
             snapshot.confidence = startup.confidence;
         }
-        if let Some(model) = local_model {
+        if let Some(model) = local_model
+            && !has_fresh_native_capacity
+        {
             // A product ACK clock measures this logical flow's delivered share.
-            // Keep it local and do not combine it with a carrier-capacity pacing
-            // estimate or divide it by the shared active-flow count again.
+            // It is the fallback when fresh qualified native carrier capacity is
+            // unavailable; otherwise placement-limited Product completion must
+            // not replace the native rate or its shared active-flow accounting.
             let mature = product_delivery_samples_override_startup_prior(model.delivery_samples);
             // This preserves the existing rate-prior gate exactly. Other path
             // metadata is intentionally not collapsed into this observation.

@@ -407,9 +407,10 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
 }
 
 #[test]
-fn immature_per_flow_rate_does_not_replace_durable_tcp_capacity() {
+fn tcp_product_rate_remains_fallback_without_fresh_native_capacity() {
     let path_instance = instance(UnderlayProtocol::Tcp, 0, 35);
     let mut path = observed_path(path_instance, 180.0, 200_000_000.0);
+    path.has_fresh_native_carrier_rate_evidence = false;
     path.tcp
         .as_mut()
         .expect("TCP evidence")
@@ -444,7 +445,76 @@ fn immature_per_flow_rate_does_not_replace_durable_tcp_capacity() {
     assert_eq!(measured.delivery_rate_bps, 3_000_000.0);
     assert_eq!(
         measured.rate_scope,
-        crate::scheduler::PathRateScope::PerFlowGoodput
+        crate::scheduler::PathRateScope::PerFlowGoodput,
+        "a mature Product ACK clock remains the fallback when native rate is unavailable",
+    );
+}
+
+#[test]
+fn fresh_native_tcp_capacity_outweighs_mature_product_fallback() {
+    let path_instance = instance(UnderlayProtocol::Tcp, 0, 37);
+    let mut path = observed_path(path_instance, 100.0, 200_000_000.0);
+    path.has_fresh_native_carrier_rate_evidence = true;
+    path.shared_snapshot
+        .as_mut()
+        .expect("shared snapshot")
+        .active_flows = 4;
+    let native_window = path
+        .shared_snapshot
+        .expect("shared snapshot")
+        .carrier_inflight_limit_bytes;
+    let observation = scheduling_observation([path]);
+    let mature = RequestEvidence::default().with_per_flow_rate(path_instance, 3_000_000.0, 10);
+
+    let projected = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(mature.state()),
+        true,
+    )
+    .expect("fresh native capacity snapshot");
+
+    assert_eq!(projected.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(
+        projected.rate_scope,
+        crate::scheduler::PathRateScope::PathCapacity,
+        "a placement-limited Product sample must remain fallback to fresh native capacity",
+    );
+    assert_eq!(
+        projected.data_level_limit_bytes,
+        native_window + reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64,
+        "rate provenance must not alter the native TCP Product service window",
+    );
+
+    let projected_score = scheduler::score_path(projected, TrafficClass::Throughput, PAYLOAD_BYTES)
+        .expect("projected score");
+    let mut divided_capacity = projected;
+    divided_capacity.delivery_rate_bps = 50_000_000.0;
+    divided_capacity.active_flows = 1;
+    let divided_score =
+        scheduler::score_path(divided_capacity, TrafficClass::Throughput, PAYLOAD_BYTES)
+            .expect("active-flow divided score");
+    assert_eq!(
+        projected_score.eta_ms, divided_score.eta_ms,
+        "PathCapacity must retain the existing active-flow division",
+    );
+
+    let alternative = PathSnapshot::new(
+        PathId(1),
+        UnderlayProtocol::Tcp,
+        projected.srtt_ms,
+        40_000_000.0,
+    );
+    assert_eq!(
+        scheduler::choose_path(
+            &[projected, alternative],
+            TrafficClass::Throughput,
+            4 * 1024 * 1024,
+        )
+        .map(|score| score.path_id),
+        Some(projected.id),
+        "the 200 Mbps native carrier divided among four flows still outranks a 40 Mbps path",
     );
 }
 

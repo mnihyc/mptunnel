@@ -113,7 +113,7 @@ fn open_stream_v9_has_no_attachment_role_field() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 8, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 9, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2,
         ]
     );

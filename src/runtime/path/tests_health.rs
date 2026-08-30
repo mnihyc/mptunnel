@@ -500,7 +500,7 @@ fn first_product_sample_after_a_stale_gap_starts_a_new_evidence_epoch() {
 }
 
 #[test]
-fn quic_native_loss_remains_diagnostic_without_becoming_product_feedback() {
+fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback() {
     use crate::runtime::path::model::{path_metrics_from_snapshot, path_snapshot};
     use crate::transport::PathSpec;
 
@@ -514,20 +514,36 @@ fn quic_native_loss_remains_diagnostic_without_becoming_product_feedback() {
     record.install_peer_usage(instance, 0, PathUsage::Available);
     let mut metrics = request_quic_path_metrics(now, deadline);
     metrics.loss_ppm = Some(125_000);
+    metrics.ecn_ppm = Some(25_000);
     record.mark_quic_path_metrics(instance, metrics);
 
     let observation = record.observation_at(now);
     assert_eq!(observation.carrier_loss_rate, Some(0.125));
+    assert_eq!(observation.carrier_ecn_rate, Some(0.025));
     let snapshot = path_snapshot(&path, 0, observation);
     assert_eq!(snapshot.loss_rate, 0.0);
     let published =
         path_metrics_from_snapshot(snapshot, observation, PathMetricDirection::ClientToServer);
-    assert!(!published.loss_observed);
-    assert_eq!(published.loss_ppm, 0);
+    assert!(published.loss_observed);
+    assert_eq!(published.loss_ppm, 125_000);
+    assert!(published.ecn_observed);
+    assert_eq!(published.ecn_ppm, 25_000);
 
     metrics.loss_ppm = None;
+    metrics.ecn_ppm = None;
     record.mark_quic_path_metrics(instance, metrics);
-    assert_eq!(record.observation_at(now).carrier_loss_rate, Some(0.125));
+    let retained_observation = record.observation_at(now);
+    assert_eq!(retained_observation.carrier_loss_rate, Some(0.125));
+    assert_eq!(retained_observation.carrier_ecn_rate, Some(0.025));
+    let retained_published = path_metrics_from_snapshot(
+        path_snapshot(&path, 0, retained_observation),
+        retained_observation,
+        PathMetricDirection::ClientToServer,
+    );
+    assert!(retained_published.loss_observed);
+    assert_eq!(retained_published.loss_ppm, 125_000);
+    assert!(retained_published.ecn_observed);
+    assert_eq!(retained_published.ecn_ppm, 25_000);
 
     let unknown_instance = crate::model::path::next_carrier_path_instance_id();
     let mut unknown = ClientPathHealthRecord::default();
@@ -540,9 +556,12 @@ fn quic_native_loss_remains_diagnostic_without_becoming_product_feedback() {
         PathMetricDirection::ClientToServer,
     );
     assert_eq!(unknown_observation.carrier_loss_rate, None);
+    assert_eq!(unknown_observation.carrier_ecn_rate, None);
     assert!(!unknown_published.loss_observed);
+    assert!(!unknown_published.ecn_observed);
 
     metrics.loss_ppm = Some(0);
+    metrics.ecn_ppm = Some(0);
     unknown.mark_quic_path_metrics(unknown_instance, metrics);
     let zero_observation = unknown.observation_at(now);
     let zero_published = path_metrics_from_snapshot(
@@ -551,8 +570,11 @@ fn quic_native_loss_remains_diagnostic_without_becoming_product_feedback() {
         PathMetricDirection::ClientToServer,
     );
     assert_eq!(zero_observation.carrier_loss_rate, Some(0.0));
-    assert!(!zero_published.loss_observed);
+    assert_eq!(zero_observation.carrier_ecn_rate, Some(0.0));
+    assert!(zero_published.loss_observed);
     assert_eq!(zero_published.loss_ppm, 0);
+    assert!(zero_published.ecn_observed);
+    assert_eq!(zero_published.ecn_ppm, 0);
 }
 
 #[test]

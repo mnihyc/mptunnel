@@ -575,6 +575,7 @@ fn client_status_retains_stale_raw_rate_with_provenance_without_reentering_sched
         record.carrier_srtt_ms = Some(10.0);
         record.carrier_rttvar_ms = Some(1.0);
         record.carrier_loss_rate = Some(0.0);
+        record.carrier_ecn_rate = Some(0.025);
         record.carrier_delivery_rate_bps = Some(123_000.0);
         record.carrier_pacing_rate_bps = Some(200_000.0);
         record.carrier_delivery_samples = 2;
@@ -622,6 +623,9 @@ fn client_status_retains_stale_raw_rate_with_provenance_without_reentering_sched
     assert_eq!(path.metric_age_scope, Some("delivery"));
     assert_eq!(path.loss_ppm, Some(0));
     assert_eq!(path.loss_source, Some("native_carrier"));
+    assert_eq!(path.ecn_ppm, Some(25_000));
+    assert_eq!(path.ecn_observed, Some(true));
+    assert_eq!(path.ecn_source, Some("native_carrier"));
     assert_eq!(path.native_delivery_observed, Some(true));
     assert_eq!(path.ack_derived_data_observed, Some(true));
     assert_ne!(status.summary.path_delivery_rate_bps, "123000");

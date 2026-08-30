@@ -54,6 +54,7 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) carrier_srtt_ms: Option<f64>,
     pub(in crate::runtime) carrier_rttvar_ms: Option<f64>,
     pub(in crate::runtime) carrier_loss_rate: Option<f64>,
+    pub(in crate::runtime) carrier_ecn_rate: Option<f64>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_pacing_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_bytes_in_flight: u64,
@@ -170,6 +171,7 @@ impl Default for ClientPathHealthRecord {
             carrier_srtt_ms: None,
             carrier_rttvar_ms: None,
             carrier_loss_rate: None,
+            carrier_ecn_rate: None,
             carrier_delivery_rate_bps: None,
             carrier_pacing_rate_bps: None,
             carrier_bytes_in_flight: 0,
@@ -691,6 +693,7 @@ impl ClientPathHealthRecord {
             carrier_srtt_ms: self.carrier_srtt_ms,
             carrier_rttvar_ms: self.carrier_rttvar_ms,
             carrier_loss_rate: self.carrier_loss_rate,
+            carrier_ecn_rate: self.carrier_ecn_rate,
             carrier_delivery_rate_bps: proof_rate_bps.or(fresh_carrier_rate),
             carrier_pacing_rate_bps: fresh_carrier_pacing,
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
@@ -1058,6 +1061,11 @@ impl ClientPathHealthRecord {
             // capability and must not erase an earlier same-instance sample.
             self.carrier_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
         }
+        if let Some(ecn_ppm) = metrics.ecn_ppm {
+            // ECN has the same partial-capability semantics as native loss:
+            // retain a same-instance observation across unavailable polls.
+            self.carrier_ecn_rate = Some(f64::from(ecn_ppm) / 1_000_000.0);
+        }
         match (
             metrics.last_delivery_sample_at,
             metrics.bulk_proof_expires_at,
@@ -1167,6 +1175,7 @@ impl ClientPathHealthRecord {
         self.carrier_srtt_ms = None;
         self.carrier_rttvar_ms = None;
         self.carrier_loss_rate = None;
+        self.carrier_ecn_rate = None;
         self.carrier_bytes_in_flight = 0;
         self.carrier_bytes_in_flight_observed = false;
         self.carrier_queue_bytes = 0;

@@ -806,6 +806,16 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     } else {
         snapshot.delivery_rate_bps
     };
+    // Diagnostic publication is deliberately broader than scheduler loss
+    // authority. In particular, native QUIC congestion observations remain
+    // excluded from `PathSnapshot::loss_rate` (and therefore Product pruning)
+    // while still being visible to the peer diagnostics consumer.
+    let diagnostic_loss_rate = observation
+        .carrier_loss_rate
+        .or(observation.measured_loss_rate);
+    let diagnostic_ecn_rate = (snapshot.underlay == UnderlayProtocol::Udp)
+        .then_some(observation.carrier_ecn_rate)
+        .flatten();
     PathMetrics {
         path_id: snapshot.id,
         underlay: snapshot.underlay,
@@ -820,15 +830,14 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         delivery_rate_bps: snapshot.delivery_rate_bps.max(1.0).round() as u64,
         pacing_rate_bps: pacing_rate_bps.max(1.0).round() as u64,
         pacing_rate_observed,
-        loss_ppm: (snapshot.loss_rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32,
-        ecn_ppm: 0,
-        loss_observed: match snapshot.underlay {
-            UnderlayProtocol::Tcp => {
-                observation.carrier_loss_rate.is_some() || observation.measured_loss_rate.is_some()
-            }
-            UnderlayProtocol::Udp => observation.measured_loss_rate.is_some(),
-        },
-        ecn_observed: false,
+        loss_ppm: diagnostic_loss_rate
+            .map(|rate| (rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32)
+            .unwrap_or(0),
+        ecn_ppm: diagnostic_ecn_rate
+            .map(|rate| (rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32)
+            .unwrap_or(0),
+        loss_observed: diagnostic_loss_rate.is_some(),
+        ecn_observed: diagnostic_ecn_rate.is_some(),
         bytes_in_flight_observed: observation.carrier_bytes_in_flight_observed,
         queue_observed: observation.carrier_queue_bytes_observed,
         bytes_in_flight: snapshot.bytes_in_flight,
@@ -1153,6 +1162,7 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) carrier_srtt_ms: Option<f64>,
     pub(in crate::runtime) carrier_rttvar_ms: Option<f64>,
     pub(in crate::runtime) carrier_loss_rate: Option<f64>,
+    pub(in crate::runtime) carrier_ecn_rate: Option<f64>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_pacing_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_bytes_in_flight: u64,
@@ -1195,6 +1205,7 @@ impl Default for ClientPathObservation {
             carrier_srtt_ms: None,
             carrier_rttvar_ms: None,
             carrier_loss_rate: None,
+            carrier_ecn_rate: None,
             carrier_delivery_rate_bps: None,
             carrier_pacing_rate_bps: None,
             carrier_bytes_in_flight: 0,

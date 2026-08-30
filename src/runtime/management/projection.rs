@@ -805,6 +805,9 @@ fn client_path_status(
                 .measured_loss_rate
                 .map(|loss| (loss, "mpp_datagram_feedback"))
         });
+    let ecn = (underlay == UnderlayProtocol::Udp)
+        .then_some(observation.carrier_ecn_rate)
+        .flatten();
     summary.add_path(
         snapshot,
         observation.manual_disabled,
@@ -853,11 +856,11 @@ fn client_path_status(
         pacing_rate_bps: pacing.map(|(rate, _)| (rate.round() as u64).to_string()),
         pacing_rate_source: pacing.map(|_| "native_carrier"),
         loss_ppm: loss.map(|(loss, _)| fraction_to_ppm(loss)),
-        ecn_ppm: None,
+        ecn_ppm: ecn.map(fraction_to_ppm),
         loss_observed: Some(loss.is_some()),
-        ecn_observed: Some(false),
+        ecn_observed: Some(ecn.is_some()),
         loss_source: loss.map(|(_, source)| source),
-        ecn_source: None,
+        ecn_source: ecn.map(|_| "native_carrier"),
         queue_bytes: observation
             .carrier_queue_bytes_observed
             .then(|| snapshot.queue_bytes.to_string()),

@@ -2937,18 +2937,29 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     let low_latency_path =
         reserve_tcp_path_with_query("initial-srtt-s=0.01&initial-rate-mbps=50&max-tcp-carriers=1")
             .await;
+    let ServerIdentityRuntime {
+        paths: server_context,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
-    let high_latency_server = spawn_notified_server_path(
+    let high_latency_server = spawn_notified_server_path_with_context(
         high_latency_path.clone(),
         0,
-        OutboundConfig::Direct,
+        0,
+        server_context.clone(),
         accepted_tx.clone(),
     )
     .await;
-    let low_latency_server = spawn_notified_server_path(
+    let low_latency_server = spawn_notified_server_path_with_context(
         low_latency_path.clone(),
         1,
-        OutboundConfig::Direct,
+        1,
+        server_context,
         accepted_tx,
     )
     .await;
@@ -3032,6 +3043,8 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
         .await
         .expect("high latency server join")
         .expect("high latency server");
+    server_relay.abort();
+    let _ = server_relay.await;
     target.await.expect("target join");
 }
 
@@ -3045,18 +3058,29 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let bulk_allowed_path =
         reserve_tcp_path_with_query("initial-srtt-s=0.12&initial-rate-mbps=100&max-tcp-carriers=1")
             .await;
+    let ServerIdentityRuntime {
+        paths: server_context,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_relay = tokio::spawn(
+        reliable_relay
+            .expect("L4 test server has a reliable relay")
+            .run(),
+    );
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
-    let low_latency_server = spawn_notified_server_path(
+    let low_latency_server = spawn_notified_server_path_with_context(
         no_bulk_low_latency_path.clone(),
         0,
-        OutboundConfig::Direct,
+        0,
+        server_context.clone(),
         accepted_tx.clone(),
     )
     .await;
-    let bulk_allowed_server = spawn_notified_server_path(
+    let bulk_allowed_server = spawn_notified_server_path_with_context(
         bulk_allowed_path.clone(),
         1,
-        OutboundConfig::Direct,
+        1,
+        server_context,
         accepted_tx,
     )
     .await;
@@ -3130,6 +3154,8 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
         .await
         .expect("bulk allowed server join")
         .expect("bulk allowed server");
+    server_relay.abort();
+    let _ = server_relay.await;
     target.await.expect("target join");
 }
 

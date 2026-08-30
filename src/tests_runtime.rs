@@ -1189,6 +1189,22 @@ async fn spawn_notified_server_path(
     })
 }
 
+async fn spawn_notified_server_path_with_context(
+    path: PathSpec,
+    config_ordinal: usize,
+    marker: u8,
+    paths: crate::runtime::path::ServerPathContext,
+    accepted: mpsc::Sender<u8>,
+) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
+    let listener = bind_listener(&path).await.expect("bind");
+    let local_path = ServerLocalPath::new(config_ordinal, path);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let _ = accepted.send(marker).await;
+        handle_server_path(stream, local_path, paths).await
+    })
+}
+
 async fn reserve_udp_path() -> PathSpec {
     let port = reserve_process_unique_udp_port().await;
     format!("quic://127.0.0.1:{port}").parse().expect("path")

@@ -664,7 +664,7 @@ fn blocked_frontier_owner_allows_only_bounded_cold_path_startup() {
 }
 
 #[test]
-fn native_tcp_shape_does_not_turn_fallback_rate_into_ecf_evidence() {
+fn unqualified_fallback_rate_remains_completion_ranked_against_live_frontier() {
     let owner_flight = 16 * 1024 * 1024;
     let mut owner = response_target(
         0,
@@ -691,14 +691,18 @@ fn native_tcp_shape_does_not_turn_fallback_rate_into_ecf_evidence() {
     }];
 
     assert_eq!(
-        select(&[owner, cold.clone()], &lower, owner_flight as usize),
-        Some(cold.observation.key),
-        "native control ACKs must not make the fallback rate suppress capacity acquisition",
+        select(
+            &[owner.clone(), cold.clone()],
+            &lower,
+            owner_flight as usize
+        ),
+        Some(owner.observation.key),
+        "bounded acquisition is not priority over a lower-completion live frontier",
     );
 }
 
 #[test]
-fn established_unmeasured_path_gets_one_real_data_sample() {
+fn unmeasured_path_uses_completion_ranking_without_losing_bounded_liveness() {
     let mut measured = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 16 * 1024 * 1024, true);
     measured.observation.snapshot.product_progress_rate_bps = Some(500_000_000.0);
     let mut unmeasured =
@@ -712,8 +716,26 @@ fn established_unmeasured_path_gets_one_real_data_sample() {
 
     assert_eq!(
         select(&[measured.clone(), unmeasured.clone()], &[], 0),
+        Some(measured.observation.key),
+        "lack of Product evidence does not override ordinary completion ranking"
+    );
+
+    let mut unavailable_measured = measured.clone();
+    block_data_queue(&mut unavailable_measured);
+    assert_eq!(
+        select(&[unavailable_measured, unmeasured.clone()], &[], 0),
         Some(unmeasured.observation.key),
-        "an established path must acquire one actual-data sample before fallback-rate ranking"
+        "an unmeasured output remains a bounded liveness fallback when the qualified output cannot enqueue",
+    );
+
+    let mut faster_unmeasured = unmeasured.clone();
+    faster_unmeasured.observation.snapshot.srtt_ms = 1.0;
+    faster_unmeasured.observation.snapshot.delivery_rate_bps = 1_000_000_000.0;
+    faster_unmeasured.observation.snapshot.pacing_rate_bps = 1_000_000_000.0;
+    assert_eq!(
+        select(&[measured.clone(), faster_unmeasured.clone()], &[], 0),
+        Some(faster_unmeasured.observation.key),
+        "an unmeasured output that genuinely has the lower modeled completion remains discoverable",
     );
 
     unmeasured.observation.original_data_in_flight_bytes = payload_bytes as u64;
@@ -721,7 +743,7 @@ fn established_unmeasured_path_gets_one_real_data_sample() {
     assert_eq!(
         select(&[measured.clone(), unmeasured.clone()], &[], 0),
         Some(measured.observation.key),
-        "only one bounded startup chunk is placed before product feedback"
+        "the bounded startup cap does not grant another acquisition priority"
     );
 
     unmeasured.observation.original_data_in_flight_bytes = 0;
@@ -731,6 +753,83 @@ fn established_unmeasured_path_gets_one_real_data_sample() {
         select(&[measured.clone(), unmeasured], &[], 0),
         Some(measured.observation.key),
         "after the first product sample, ordinary completion-time ranking resumes"
+    );
+}
+
+#[test]
+fn slow_unmeasured_acquisition_cannot_own_the_first_dsn_ahead_of_qualified_quic() {
+    const OBJECT_BYTES: usize = 100_000;
+    const FIRST_QUANTUM_BYTES: usize = 64 * 1024;
+
+    let mut qualified_quic =
+        response_target(0, UnderlayProtocol::Udp, 20.0, 0, 16 * 1024 * 1024, true);
+    qualified_quic
+        .observation
+        .snapshot
+        .product_progress_rate_bps = Some(500_000_000.0);
+
+    // This is the exact post-idle/direction-switch state at issue: the TCP
+    // attachment remains established but its directional Product evidence has
+    // expired, so only the conservative startup prior remains.
+    let mut unmeasured_tcp =
+        response_target(1, UnderlayProtocol::Tcp, 800.0, 0, 16 * 1024 * 1024, false);
+    unmeasured_tcp.observation.has_bulk_rate_evidence = false;
+    unmeasured_tcp
+        .observation
+        .snapshot
+        .has_durable_product_progress = false;
+    unmeasured_tcp
+        .observation
+        .snapshot
+        .product_progress_rate_bps = None;
+    unmeasured_tcp.observation.snapshot.delivery_rate_bps = 351_000.0;
+    unmeasured_tcp.observation.snapshot.pacing_rate_bps = 351_000.0;
+
+    let selected = select_response_data_path(
+        &[qualified_quic.clone(), unmeasured_tcp.clone()],
+        TrafficClass::Throughput,
+        FIRST_QUANTUM_BYTES,
+        MuxLimits::default(),
+        &[],
+        0,
+    )
+    .expect("the qualified QUIC output is schedulable");
+
+    // Committing this decision assigns offset zero to the selected exact
+    // output. Any faster suffix then remains above this owner in Data-ACK order.
+    let lower = [CarrierPathFlightDebt {
+        key: selected.observation.key,
+        output_incarnation: selected.observation.incarnation,
+        bytes: FIRST_QUANTUM_BYTES as u64,
+    }];
+    assert_eq!(
+        response_oldest_lower_flight_owner(&lower),
+        Some((selected.observation.key, selected.observation.incarnation)),
+    );
+
+    let tcp_prefix_eta_ms = crate::scheduler::score_path(
+        response_completion_snapshot(&unmeasured_tcp),
+        TrafficClass::Throughput,
+        FIRST_QUANTUM_BYTES,
+    )
+    .expect("unmeasured TCP startup prior is scoreable")
+    .eta_ms;
+    let qualified_only_object_eta_ms = crate::scheduler::score_path(
+        response_completion_snapshot(&qualified_quic),
+        TrafficClass::Throughput,
+        OBJECT_BYTES,
+    )
+    .expect("qualified QUIC control is scoreable")
+    .eta_ms;
+
+    assert!(
+        selected.observation.key != unmeasured_tcp.observation.key
+            || tcp_prefix_eta_ms <= qualified_only_object_eta_ms,
+        "unique offset-zero acquisition creates deterministic HOL: the unmeasured TCP prefix completes in {tcp_prefix_eta_ms:.3} ms, after the qualified-only QUIC control's whole 100 kB object in {qualified_only_object_eta_ms:.3} ms",
+    );
+    assert_eq!(
+        selected.observation.key, qualified_quic.observation.key,
+        "lack of directional evidence is an acquisition state, not authority to preempt a qualified lower-completion output",
     );
 }
 

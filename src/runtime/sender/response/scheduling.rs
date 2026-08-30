@@ -275,29 +275,8 @@ pub(super) fn select_response_data_path_with_payload(
             })
             .collect::<Vec<_>>();
 
-        if lane.is_bulk()
-            && let Some((target, _, _, _, payload_bytes)) = admitted
-                .iter()
-                .filter(|(target, snapshot, _, _, _)| {
-                    !target.observation.has_bulk_rate_evidence
-                        && snapshot.product_progress_rate_bps.is_none()
-                        && target.observation.original_data_in_flight_bytes == 0
-                })
-                .min_by(|left, right| {
-                    left.2.total_cmp(&right.2).then_with(|| {
-                        carrier_path_key_order(left.0.observation.key, right.0.observation.key)
-                    })
-                })
-        {
-            // An established subflow needs one bounded real-data sample before
-            // a fallback rate can rank it. Native TCP/QUIC congestion control
-            // owns this flight; later placement returns to completion time.
-            return Some(ResponseDataPathSelection {
-                target: (*target).clone(),
-                payload_bytes: *payload_bytes,
-            });
-        }
-
+        // The startup-flight bound limits acquisition resources; it does not
+        // grant placement priority over a lower-completion qualified output.
         admitted
             .into_iter()
             .min_by(|left, right| {

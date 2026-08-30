@@ -433,6 +433,53 @@ fn request_ack_clock_measurement_reference_reservoir_has_credit(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn request_ack_clock_measurement_start_suppression(
+    observation: &RequestRelaySchedulingObservation,
+    lane: TrafficClass,
+    offset: u64,
+    payload_bytes: usize,
+    reference_path: &RequestRelayPathObservation,
+    candidate_path: &RequestRelayPathObservation,
+    candidate_snapshot: PathSnapshot,
+    candidate_eta_ms: f64,
+    flights: &RequestFlightLedger,
+    request_state: RequestSchedulingState<'_>,
+) -> Option<&'static str> {
+    // A byte bound is not a completion-time bound: a slow calibration owner
+    // would otherwise place a finite but arbitrarily late hole below faster
+    // Product data. Compare only at entry; a committed exact-instance
+    // transaction must drain under the authority that admitted it.
+    if request_state.transaction_candidate().is_some() || !reference_path.can_enqueue_frame {
+        return None;
+    }
+    let (reference_snapshot, reference_eta_ms) = scored_relay_path_snapshot_for_bulk_choice(
+        observation,
+        reference_path.instance(),
+        Some(reference_path.key()),
+        lane,
+        payload_bytes,
+        Some(request_state),
+        reference_path.load_owned,
+    )?;
+    let ordering_debt = flights.ordering_debt_bytes_before_offset(candidate_path.key(), offset);
+    let completion_backlog = flights.original_transmission_bytes_before_offset(offset);
+    bulk_candidate_admission_suppression_with_completion_backlog(
+        BulkAdmissionCheck {
+            best_snapshot: reference_snapshot,
+            best_eta_ms: reference_eta_ms,
+            candidate_snapshot,
+            candidate_eta_ms,
+            payload_bytes,
+            mux_limits: observation.mux_limits,
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: ordering_debt,
+        },
+        completion_backlog,
+        candidate_path.has_bulk_model_evidence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn choose_request_ack_clock_measurement_with_rates(
     observation: &RequestRelaySchedulingObservation,
     lane: TrafficClass,
@@ -693,7 +740,28 @@ fn choose_request_ack_clock_measurement_with_rates(
             {
                 return None;
             }
-            let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
+            let scoring_payload_bytes = if lane.is_bulk() {
+                bulk_scheduling_horizon_bytes(payload_bytes, observation.mux_limits)
+            } else {
+                payload_bytes
+            };
+            let score = scheduler::score_path(snapshot, lane, scoring_payload_bytes)?;
+            if request_ack_clock_measurement_start_suppression(
+                observation,
+                lane,
+                offset,
+                payload_bytes,
+                reference_path,
+                path,
+                snapshot,
+                score.eta_ms,
+                flights,
+                request_state,
+            )
+            .is_some()
+            {
+                return None;
+            }
             let spent = spent(path.instance());
             Some((
                 position,

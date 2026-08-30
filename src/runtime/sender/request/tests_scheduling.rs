@@ -5,6 +5,7 @@ use super::{
     choose_observed_ordinary_data_path, observed_request_ack_clock_measurement_transaction,
     relay_path_snapshot_for_bulk_choice,
 };
+use crate::model::ack_clock::reliable_request_ack_clock_measurement_target_bytes;
 use crate::model::admission::BulkPathCandidate;
 use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
 use crate::model::path::{
@@ -201,6 +202,24 @@ impl RequestEvidence {
         let state = self.path_states.get_mut(candidate);
         state.mark_capacity_admitted();
         state.mark_ack_clock_first_window();
+        self
+    }
+
+    fn own_ack_clock_candidate(
+        mut self,
+        candidate: RelayPathInstance,
+        target_bytes: u64,
+        spent_bytes: u64,
+    ) -> Self {
+        self.operation = Some(RequestAckClockOperation::Owner {
+            candidate,
+            target_bytes,
+        });
+        let state = self.path_states.get_mut(candidate);
+        state.mark_capacity_admitted();
+        state.mark_ack_clock_first_window();
+        state.set_ack_clock_measurement_target(target_bytes);
+        state.set_ack_clock_measurement_bytes(spent_bytes);
         self
     }
 
@@ -759,6 +778,130 @@ fn tcp_product_ack_clock_is_only_a_native_capacity_fallback() {
         BulkRelayPathChoice::Selected(candidate),
         "native TCP delivery evidence must suppress redundant product calibration",
     );
+}
+
+#[test]
+fn slow_tcp_ack_clock_acquisition_cannot_preempt_a_qualified_quic_frontier() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 164);
+    let candidate = instance(UnderlayProtocol::Tcp, 0, 165);
+    let reference_path = observed_path(reference, 20.0, 500_000_000.0);
+    let candidate_path = observed_path(candidate, 800.0, 351_000.0);
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let target = reliable_request_ack_clock_measurement_target_bytes(MuxLimits::default());
+
+    let entry = RequestEvidence::default()
+        .prove_rate([reference])
+        .admit_ack_clock_candidate(candidate);
+    let entry_choice = choose_bulk(&observation, &flights, Some(&entry));
+    let entry_preempts = matches!(
+        entry_choice,
+        BulkRelayPathChoice::SelectedAckClockMeasurement {
+            candidate: selected,
+            target_bytes,
+            ..
+        } if selected == candidate && target_bytes == target
+    );
+
+    // Prove that this is a cumulative transaction rather than a one-quantum
+    // sample: even the final quantum remains forced onto the same slow TCP
+    // owner after almost the complete target has already been committed.
+    let nearly_spent = target.saturating_sub(PAYLOAD_BYTES as u64);
+    let continuing = RequestEvidence::default()
+        .prove_rate([reference])
+        .own_ack_clock_candidate(candidate, target, nearly_spent);
+    let continuation_preempts = matches!(
+        choose_bulk(&observation, &flights, Some(&continuing)),
+        BulkRelayPathChoice::SelectedAckClockMeasurement {
+            candidate: selected,
+            target_bytes,
+            ..
+        } if selected == candidate && target_bytes == target
+    );
+
+    let candidate_completion_ms = 800.0 / 2.0 + (target as f64 * 8.0 / 351_000.0) * 1_000.0;
+    let qualified_completion_ms = 20.0 / 2.0 + (target as f64 * 8.0 / 500_000_000.0) * 1_000.0;
+
+    assert_eq!(
+        entry_choice,
+        BulkRelayPathChoice::Selected(reference),
+        "the {target}-byte unique-DSN ACK-clock transaction must not preempt its qualified QUIC frontier: projected TCP completion {candidate_completion_ms:.3} ms versus qualified control {qualified_completion_ms:.3} ms",
+    );
+    assert!(!entry_preempts);
+    assert!(
+        continuation_preempts,
+        "once admitted, the exact ACK-clock owner must remain stable through its final quantum",
+    );
+}
+
+#[test]
+fn begun_tcp_ack_clock_transaction_keeps_its_exact_owner_across_later_rate_change() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 166);
+    let candidate = instance(UnderlayProtocol::Tcp, 0, 167);
+    let reference_path = observed_path(reference, 20.0, 500_000_000.0);
+    let candidate_path = observed_path(candidate, 800.0, 351_000.0);
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let target = reliable_request_ack_clock_measurement_target_bytes(MuxLimits::default());
+    let begun = RequestEvidence::default()
+        .prove_rate([reference])
+        .own_ack_clock_candidate(candidate, target, PAYLOAD_BYTES as u64);
+
+    assert!(matches!(
+        choose_bulk(&observation, &flights, Some(&begun)),
+        BulkRelayPathChoice::SelectedAckClockMeasurement {
+            candidate: selected,
+            target_bytes,
+            ..
+        } if selected == candidate && target_bytes == target
+    ));
+}
+
+#[test]
+fn tcp_ack_clock_acquisition_remains_fallback_when_reference_cannot_enqueue() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 168);
+    let candidate = instance(UnderlayProtocol::Tcp, 0, 169);
+    let mut reference_path = observed_path(reference, 20.0, 500_000_000.0);
+    reference_path.can_enqueue_frame = false;
+    let candidate_path = observed_path(candidate, 800.0, 351_000.0);
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .admit_ack_clock_candidate(candidate);
+
+    assert!(matches!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::SelectedAckClockMeasurement {
+            candidate: selected,
+            ..
+        } if selected == candidate
+    ));
+}
+
+#[test]
+fn equal_or_faster_tcp_capacity_can_start_ack_clock_acquisition() {
+    for (ordinal, candidate_srtt_ms, candidate_rate_bps) in
+        [(0_u64, 20.0, 500_000_000.0), (1, 10.0, 1_000_000_000.0)]
+    {
+        let reference = instance(UnderlayProtocol::Udp, 0, 170 + ordinal * 2);
+        let candidate = instance(UnderlayProtocol::Tcp, 0, 171 + ordinal * 2);
+        let reference_path = observed_path(reference, 20.0, 500_000_000.0);
+        let candidate_path = observed_path(candidate, candidate_srtt_ms, candidate_rate_bps);
+        let observation = scheduling_observation([reference_path, candidate_path]);
+        let flights = original_flights(reference);
+        let evidence = RequestEvidence::default()
+            .prove_rate([reference])
+            .admit_ack_clock_candidate(candidate);
+
+        assert!(matches!(
+            choose_bulk(&observation, &flights, Some(&evidence)),
+            BulkRelayPathChoice::SelectedAckClockMeasurement {
+                candidate: selected,
+                ..
+            } if selected == candidate
+        ));
+    }
 }
 
 #[test]

@@ -22,7 +22,7 @@ Hysteria2 received the measured directional capacities. Missing echo values
 remain gaps rather than zeroes; clipped display outliers retain their exact
 values in hover text.
 
-## v0.4.5 accepted recovery evidence
+## v0.4.5-v0.4.6 accepted correctness evidence
 
 Focused correctness gates establish the following bounded corrections. They
 are not throughput or latency measurements and do not establish a product
@@ -47,6 +47,17 @@ ranking.
   in the same loss-compensated service-rate unit. A production-path red/green
   sequence proves the former mixed-unit plateau; zero-loss, 10x step-down, and
   token-policer controls preserve the existing behavior.
+- Response scheduling now keeps delivery evidence direction-scoped and keeps
+  mixed-path acquisition completion-ranked. Focused request and response
+  regressions prove that a direction-unmeasured slower TCP path cannot claim
+  the first exact data range ahead of a qualified lower-completion QUIC
+  frontier, while bounded liveness fallback and ordinary reinjection behavior
+  remain intact.
+- QUIC Startup under an authorized erasure contract now requires raw congestion
+  authority before high-loss exit. Immediate randomized loss no longer ends
+  Startup before representative bandwidth acquisition; the accepted recovery
+  gate remains green, and draft loss exit, persistent congestion, and ECN
+  authority tests remain unchanged.
 
 ## Historical accepted fixed-profile evidence (v0.2.1–v0.2.2)
 

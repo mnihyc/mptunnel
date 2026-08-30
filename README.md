@@ -73,7 +73,8 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 The scalar tables below are accepted historical evidence for the releases
 identified with each cohort; they do not characterize the current tree. The
 chart is a historical two-run diagnostic series, not a current-release ranking.
-See the [performance methodology](docs/PERFORMANCE.md) for measurement details.
+See the [performance methodology](docs/PERFORMANCE.md) for measurement details
+and the accepted v0.4.6 startup and mixed-path corrections.
 
 ### Historical diagnostic series
 

@@ -927,6 +927,36 @@ th {
   white-space: nowrap;
 }
 
+.table-sort-button {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-weight: inherit;
+  text-align: left;
+  white-space: nowrap;
+  background: transparent;
+  border: 0;
+}
+
+.table-sort-button:hover,
+th.is-sorted .table-sort-button {
+  color: var(--blue-dark);
+}
+
+.table-sort-arrow {
+  margin-left: 3px;
+  color: var(--blue);
+  font-size: 0.62rem;
+  line-height: 1;
+}
+
+.table-sort-arrow:empty {
+  display: none;
+}
+
 td {
   color: var(--text);
 }

@@ -593,6 +593,92 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
 }
 
 #[test]
+fn dashboard_path_sorting_is_numeric_stable_and_table_local() {
+    for table_key in [
+        "overview-paths",
+        "path-inventory",
+        "overview-peer-paths",
+        "peer-path-status",
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(&format!(r#""{table_key}""#)),
+            "missing independent sort state for {table_key}"
+        );
+    }
+    for contract in [
+        "tableSorts: new Map()",
+        "function bindSortableTable(body, tableKey, columns, render)",
+        "function cycleTableSort(tableKey, column, label)",
+        r#"state.tableSorts.set(tableKey, { column: column, direction: "asc" });"#,
+        r#"state.tableSorts.set(tableKey, { column: column, direction: "desc" });"#,
+        "state.tableSorts.delete(tableKey);",
+        "const selected = state.tableSorts.get(tableKey);",
+        "return compared || left.defaultIndex - right.defaultIndex;",
+        r#"return leftMissing ? 1 : -1;"#,
+        r#"heading.setAttribute("aria-sort", direction === "asc" ? "ascending" : "descending");"#,
+        r#"button.type = "button";"#,
+        r#"arrow.textContent = direction === "asc" ? "\u2191" : "\u2193";"#,
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(contract),
+            "missing path-sort behavior: {contract}"
+        );
+    }
+
+    let local_accessor = DASHBOARD_JS
+        .split_once("function localPathSortValue(column, entry)")
+        .expect("local path sort accessor")
+        .1
+        .split_once("function peerPathSortValue")
+        .expect("end of local path sort accessor")
+        .0;
+    let peer_accessor = DASHBOARD_JS
+        .split_once("function peerPathSortValue(column, entry)")
+        .expect("peer path sort accessor")
+        .1
+        .split_once("function sortedPathEntries")
+        .expect("end of peer path sort accessor")
+        .0;
+    for accessor in [local_accessor, peer_accessor] {
+        for raw_metric in [
+            "srtt_",
+            "delivery_rate_bps",
+            "loss_ppm",
+            "sharePpm",
+            "queue_bytes",
+            "confidence_ppm",
+            "data_sample_bytes",
+        ] {
+            assert!(
+                accessor.contains(raw_metric),
+                "sort accessor must use canonical metric {raw_metric}"
+            );
+        }
+        for formatter in ["formatBitRate", "formatPpm", "formatBytes", "textContent"] {
+            assert!(
+                !accessor.contains(formatter),
+                "sort accessor must not parse formatted display text: {formatter}"
+            );
+        }
+    }
+    assert!(local_accessor.contains("active_flows"));
+    assert!(local_accessor.contains("effectivePathMetricAgeMs(path)"));
+    assert!(peer_accessor.contains("effectivePeerMetricAgeMs(path, entry.result)"));
+
+    for style in [
+        ".table-sort-button {",
+        ".table-sort-button:hover,",
+        ".table-sort-arrow {",
+        ".table-sort-arrow:empty {",
+    ] {
+        assert!(
+            DASHBOARD_CSS.contains(style),
+            "missing path-sort style: {style}"
+        );
+    }
+}
+
+#[test]
 fn dashboard_charts_select_real_retained_samples_without_viewport_controls() {
     for surface in [
         r#"id="traffic-chart" tabindex="0""#,

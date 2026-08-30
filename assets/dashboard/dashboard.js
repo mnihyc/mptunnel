@@ -17,6 +17,18 @@
   const REQUEST_TIMEOUT_MS = 8000;
   const MIN_STALE_AFTER_MS = 6500;
   const QUALITY_PAYLOAD_BYTES = 64 * 1024;
+  const LOCAL_PATH_SORT_COLUMNS = [
+    "state", "path", "service", "carrier", "use", "latency", "rate", "loss",
+    "quality", "flight", "evidence", "flows"
+  ];
+  const PEER_PATH_SORT_COLUMNS = [
+    "state", "path", "carrier", "use", "latency", "rate", "loss", "quality",
+    "flight", "evidence"
+  ];
+  const NATURAL_SORT_COLLATOR = new Intl.Collator("en", {
+    numeric: true,
+    sensitivity: "base"
+  });
 
   const elements = {
     notice: byId("notice"),
@@ -147,8 +159,11 @@
     peerResult: null,
     peerResultReceivedAt: 0,
     selectedPeerSessionKey: "",
-    selectedTab: "overview"
+    selectedTab: "overview",
+    tableSorts: new Map()
   };
+
+  const sortableTableGroups = new Map();
 
   class HttpError extends Error {
     constructor(status, message, body) {
@@ -306,6 +321,158 @@
     const description = createElement("dd", "", value);
     if (title) description.title = title;
     list.append(createElement("dt", "", label), description);
+  }
+
+  function sortValueMissing(value) {
+    return value === undefined || value === null || value === "" || value === "-" ||
+      value === "--" || (typeof value === "number" && !Number.isFinite(value));
+  }
+
+  function sortableNumeric(value) {
+    if (typeof value === "bigint") return { kind: "bigint", value: value };
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? { kind: "number", value: value } : null;
+    }
+    if (typeof value !== "string") return null;
+    const normalized = value.trim();
+    if (/^[+-]?\d+$/.test(normalized)) {
+      try {
+        return { kind: "bigint", value: BigInt(normalized) };
+      } catch (_error) {
+        return null;
+      }
+    }
+    if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(normalized)) return null;
+    const number = Number(normalized);
+    return Number.isFinite(number) ? { kind: "number", value: number } : null;
+  }
+
+  function compareSortableNumbers(left, right) {
+    if (left.kind === "bigint" && right.kind === "bigint") {
+      return left.value < right.value ? -1 : left.value > right.value ? 1 : 0;
+    }
+    const leftNumber = Number(left.value);
+    const rightNumber = Number(right.value);
+    return leftNumber < rightNumber ? -1 : leftNumber > rightNumber ? 1 : 0;
+  }
+
+  function compareTableSortScalars(left, right, direction) {
+    const leftMissing = sortValueMissing(left);
+    const rightMissing = sortValueMissing(right);
+    if (leftMissing || rightMissing) {
+      if (leftMissing && rightMissing) return 0;
+      return leftMissing ? 1 : -1;
+    }
+
+    const leftNumeric = sortableNumeric(left);
+    const rightNumeric = sortableNumeric(right);
+    const compared = leftNumeric && rightNumeric
+      ? compareSortableNumbers(leftNumeric, rightNumeric)
+      : NATURAL_SORT_COLLATOR.compare(String(left), String(right));
+    return direction === "desc" ? -compared : compared;
+  }
+
+  function compareTableSortValues(left, right, direction) {
+    const leftValues = Array.isArray(left) ? left : [left];
+    const rightValues = Array.isArray(right) ? right : [right];
+    const length = Math.max(leftValues.length, rightValues.length);
+    for (let index = 0; index < length; index += 1) {
+      const compared = compareTableSortScalars(leftValues[index], rightValues[index], direction);
+      if (compared !== 0) return compared;
+    }
+    return 0;
+  }
+
+  function sortTableEntries(entries, tableKey, valueForColumn) {
+    const selected = state.tableSorts.get(tableKey);
+    if (!selected) return entries;
+    return entries.slice().sort(function (left, right) {
+      const compared = compareTableSortValues(
+        valueForColumn(selected.column, left),
+        valueForColumn(selected.column, right),
+        selected.direction
+      );
+      return compared || left.defaultIndex - right.defaultIndex;
+    });
+  }
+
+  function updateTableSortHeaders(tableKey) {
+    const group = sortableTableGroups.get(tableKey);
+    if (!group) return;
+    const selected = state.tableSorts.get(tableKey);
+    group.surfaces.forEach(function (surface) {
+      surface.headings.forEach(function (heading, index) {
+        const column = surface.columns[index];
+        const active = Boolean(selected) && selected.column === column;
+        const direction = active ? selected.direction : "";
+        const button = heading.querySelector(".table-sort-button");
+        const arrow = heading.querySelector(".table-sort-arrow");
+        if (!button || !arrow) return;
+        heading.classList.toggle("is-sorted", active);
+        if (active) {
+          heading.setAttribute("aria-sort", direction === "asc" ? "ascending" : "descending");
+          arrow.textContent = direction === "asc" ? "\u2191" : "\u2193";
+          button.setAttribute(
+            "aria-label",
+            surface.labels[index] + ", sorted " +
+              (direction === "asc" ? "ascending; activate for descending" :
+                "descending; activate to restore default order")
+          );
+        } else {
+          heading.removeAttribute("aria-sort");
+          arrow.textContent = "";
+          button.setAttribute("aria-label", "Sort by " + surface.labels[index] + " ascending");
+        }
+      });
+    });
+  }
+
+  function cycleTableSort(tableKey, column, label) {
+    const current = state.tableSorts.get(tableKey);
+    let announcement;
+    if (!current || current.column !== column) {
+      state.tableSorts.set(tableKey, { column: column, direction: "asc" });
+      announcement = label + " sorted ascending";
+    } else if (current.direction === "asc") {
+      state.tableSorts.set(tableKey, { column: column, direction: "desc" });
+      announcement = label + " sorted descending";
+    } else {
+      state.tableSorts.delete(tableKey);
+      announcement = label + " restored to default order";
+    }
+    updateTableSortHeaders(tableKey);
+    const group = sortableTableGroups.get(tableKey);
+    if (group && group.render) group.render();
+    announce(announcement);
+  }
+
+  function bindSortableTable(body, tableKey, columns, render) {
+    const table = body ? body.closest("table") : null;
+    const headings = table ? Array.from(table.querySelectorAll("thead th")) : [];
+    if (headings.length !== columns.length) return;
+
+    const group = sortableTableGroups.get(tableKey) || { surfaces: [], render: render };
+    group.render = render;
+    const labels = headings.map(function (heading, index) {
+      const label = heading.textContent.trim();
+      const button = createElement("button", "table-sort-button");
+      const arrow = createElement("span", "table-sort-arrow");
+      button.type = "button";
+      button.dataset.sortColumn = columns[index];
+      arrow.setAttribute("aria-hidden", "true");
+      button.append(
+        createElement("span", "table-sort-label", label),
+        arrow
+      );
+      button.addEventListener("click", function () {
+        cycleTableSort(tableKey, columns[index], label);
+      });
+      heading.replaceChildren(button);
+      return label;
+    });
+    group.surfaces.push({ headings: headings, columns: columns, labels: labels });
+    sortableTableGroups.set(tableKey, group);
+    updateTableSortHeaders(tableKey);
   }
 
   function asArray(value) {
@@ -652,6 +819,102 @@
       quality.peers = group.count;
     });
     return qualities;
+  }
+
+  function localPathSortValue(column, entry) {
+    const path = entry.path;
+    const quality = entry.quality;
+    switch (column) {
+      case "state":
+        return pathEffectiveState(path);
+      case "path":
+        return [path.path, path.endpoint, path.active_port, path.path_id, path.path_instance_id];
+      case "service":
+        return [path.service_name, path.service, path.service_index, path.session_id];
+      case "carrier":
+        return [path.underlay, path.tcp_carrier_ordinal, path.max_tcp_carriers];
+      case "use":
+        return [
+          path.usage,
+          path.usage_direction,
+          asObject(path.policy).backup,
+          asObject(path.policy).expensive,
+          asObject(path.policy).control_only
+        ];
+      case "latency":
+        return [path.srtt_ms, path.jitter_ms];
+      case "rate":
+        return [path.delivery_rate_bps, path.pacing_rate_bps];
+      case "loss":
+        return [path.loss_ppm, path.ecn_ppm];
+      case "quality":
+        return [quality.sharePpm, quality.etaMs];
+      case "flight":
+        return [
+          path.queue_bytes,
+          path.bytes_in_flight,
+          path.data_level_bytes_in_flight,
+          path.inflight_limit_bytes
+        ];
+      case "evidence":
+        return [
+          path.confidence_ppm,
+          path.delivery_samples,
+          path.data_sample_bytes,
+          effectivePathMetricAgeMs(path)
+        ];
+      case "flows":
+        return [path.active_flows, path.active_latency_sensitive_flows];
+      default:
+        return null;
+    }
+  }
+
+  function peerPathSortValue(column, entry) {
+    const path = entry.path;
+    const quality = entry.quality;
+    switch (column) {
+      case "state":
+        return path.state;
+      case "path":
+        return [path.path, path.endpoint, path.active_port, path.path_id, path.metric_epoch];
+      case "carrier":
+        return path.underlay;
+      case "use":
+        return [path.usage, path.usage_direction];
+      case "latency":
+        return [path.srtt_us, path.rttvar_us, path.jitter_us];
+      case "rate":
+        return [path.delivery_rate_bps, path.pacing_rate_bps];
+      case "loss":
+        return [path.loss_ppm, path.ecn_ppm];
+      case "quality":
+        return [quality.sharePpm, quality.etaMs];
+      case "flight":
+        return [path.queue_bytes, path.bytes_in_flight, path.inflight_limit_bytes];
+      case "evidence":
+        return [
+          path.confidence_ppm,
+          path.data_sample_count,
+          path.data_sample_bytes,
+          effectivePeerMetricAgeMs(path, entry.result)
+        ];
+      default:
+        return null;
+    }
+  }
+
+  function sortedPathEntries(paths, result, tableKey, valueForColumn) {
+    const qualities = pathQualities(paths, result);
+    const entries = paths.map(function (pathValue, index) {
+      return {
+        path: asObject(pathValue),
+        quality: qualities[index],
+        result: result,
+        defaultIndex: index
+      };
+    });
+    return sortTableEntries(entries, tableKey, valueForColumn);
   }
 
   function formatIdentifier(value) {
@@ -1800,16 +2063,22 @@
     return row;
   }
 
-  function renderPathRows(body, empty, paths) {
+  function renderPathRows(body, empty, paths, tableKey) {
     body.replaceChildren();
     empty.hidden = paths.length !== 0;
-    const qualities = pathQualities(paths, null);
-    paths.forEach(function (path, index) { body.append(createPathRow(path, qualities[index])); });
+    sortedPathEntries(paths, null, tableKey, localPathSortValue).forEach(function (entry) {
+      body.append(createPathRow(entry.path, entry.quality));
+    });
   }
 
   function renderOverviewPaths() {
     const paths = asArray(state.status.paths);
-    renderPathRows(elements.overviewPathsBody, elements.overviewPathsEmpty, paths);
+    renderPathRows(
+      elements.overviewPathsBody,
+      elements.overviewPathsEmpty,
+      paths,
+      "overview-paths"
+    );
     elements.overviewPathsCount.textContent = formatCount(paths.length) + " paths";
   }
 
@@ -1821,7 +2090,7 @@
       const stateMatches = stateFilter === "all" || pathEffectiveState(path) === stateFilter;
       return underlayMatches && stateMatches;
     });
-    renderPathRows(elements.pathsBody, elements.pathsEmpty, paths);
+    renderPathRows(elements.pathsBody, elements.pathsEmpty, paths, "path-inventory");
   }
 
   function createSessionRow(sessionValue) {
@@ -2146,13 +2415,12 @@
     body.append(row);
   }
 
-  function renderPeerPaths(body, empty, result) {
+  function renderPeerPaths(body, empty, result, tableKey) {
     const paths = result ? asArray(result.paths) : [];
     body.replaceChildren();
     empty.hidden = paths.length !== 0;
-    const qualities = pathQualities(paths, result);
-    paths.forEach(function (path, index) {
-      appendPeerPathRow(body, path, result, qualities[index]);
+    sortedPathEntries(paths, result, tableKey, peerPathSortValue).forEach(function (entry) {
+      appendPeerPathRow(body, entry.path, result, entry.quality);
     });
   }
 
@@ -2163,7 +2431,12 @@
       elements.overviewPeerContext.textContent = selectedSession
         ? serviceLabel(selectedSession) + " / " + formatSessionId(selectedSession.session_id)
         : "No connected peer";
-      renderPeerPaths(elements.overviewPeerPathsBody, elements.overviewPeerPathsEmpty, null);
+      renderPeerPaths(
+        elements.overviewPeerPathsBody,
+        elements.overviewPeerPathsEmpty,
+        null,
+        "overview-peer-paths"
+      );
       return;
     }
     const ok = String(result.code) === "ok";
@@ -2172,7 +2445,12 @@
     elements.overviewPeerContext.textContent =
       serviceLabel(result) + " / " + formatSessionId(result.session_id) + " / " +
       formatResidenceRelative(peerResultResidenceMs(result));
-    renderPeerPaths(elements.overviewPeerPathsBody, elements.overviewPeerPathsEmpty, result);
+    renderPeerPaths(
+      elements.overviewPeerPathsBody,
+      elements.overviewPeerPathsEmpty,
+      result,
+      "overview-peer-paths"
+    );
   }
 
   function renderPeerResult(result) {
@@ -2194,7 +2472,7 @@
       formatResidenceRelative(peerResultResidenceMs(result))
     );
 
-    renderPeerPaths(elements.peerPathsBody, elements.peerPathsEmpty, result);
+    renderPeerPaths(elements.peerPathsBody, elements.peerPathsEmpty, result, "peer-path-status");
   }
 
   async function requestPeerStatus(source, coordinated) {
@@ -2813,7 +3091,35 @@
     announce(state.trafficChartMode === "speed" ? "Showing transfer speed" : "Showing total traffic");
   }
 
+  function bindPathTableSorting() {
+    bindSortableTable(
+      elements.overviewPathsBody,
+      "overview-paths",
+      LOCAL_PATH_SORT_COLUMNS,
+      function () { if (state.status) renderOverviewPaths(); }
+    );
+    bindSortableTable(
+      elements.pathsBody,
+      "path-inventory",
+      LOCAL_PATH_SORT_COLUMNS,
+      function () { if (state.status) renderPaths(); }
+    );
+    bindSortableTable(
+      elements.overviewPeerPathsBody,
+      "overview-peer-paths",
+      PEER_PATH_SORT_COLUMNS,
+      function () { if (state.status) renderSelectedPeerResult(); }
+    );
+    bindSortableTable(
+      elements.peerPathsBody,
+      "peer-path-status",
+      PEER_PATH_SORT_COLUMNS,
+      function () { if (state.status) renderSelectedPeerResult(); }
+    );
+  }
+
   function bindEvents() {
+    bindPathTableSorting();
     Array.from(document.querySelectorAll("[role='tab'][data-tab]")).forEach(function (tab) {
       tab.addEventListener("click", function () { switchTab(tab.dataset.tab, false); });
       tab.addEventListener("keydown", handleTabKeydown);

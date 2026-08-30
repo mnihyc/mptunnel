@@ -19,6 +19,7 @@ use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     ClientTcpOpenAttemptId, ReliablePathCarrierTerminalCause, ReliablePathCommand,
     recv_reliable_path_command, reliable_path_command_channels,
+    reliable_path_command_pending_bytes,
 };
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, PathProofObservation, ServerDatagramOpenError,
@@ -1083,6 +1084,83 @@ async fn server_tcp_deferred_probe_drain_releases_dequeued_command_accounting() 
     assert!(session.deferred_input.is_some());
     assert_eq!(commands.pending_bytes(), 0);
     assert_eq!(commands.writer_pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn server_tcp_zero_debt_batch_wakes_retained_control_publication() {
+    let stream_id = StreamId(305);
+    let (mut session, mut client, _commands, _path_frames, _relay) =
+        server_tcp_test_session(SessionId(305), PathId(0)).await;
+    let (commands, receivers) = reliable_path_command_channels(1);
+    session.commands_tx = commands.clone();
+    session.commands_rx = receivers;
+
+    let proof = Frame::PathProofData {
+        path_id: PathId(0),
+        proof_id: 1,
+        payload: Bytes::from_static(b"proof"),
+    };
+    commands
+        .try_enqueue_admitted_frame(proof.clone(), TrafficClass::Control)
+        .expect("fill the capacity-one control queue with opening proof");
+
+    let established = Frame::StreamMaxData {
+        stream_id,
+        max_offset: 4096,
+    };
+    let mut publication =
+        Box::pin(commands.enqueue_admitted_frame(established.clone(), TrafficClass::Control));
+    assert!(matches!(
+        futures::poll!(publication.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    let proof_command = recv_reliable_path_command(&mut session.commands_rx)
+        .await
+        .expect("dequeue opening proof");
+    assert_eq!(
+        reliable_path_command_pending_bytes(&proof_command),
+        0,
+        "opening proof deliberately carries no pacing debt"
+    );
+    assert!(matches!(
+        futures::poll!(publication.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    assert!(matches!(
+        session
+            .drain_commands(proof_command)
+            .await
+            .expect("write zero-debt opening proof"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    tokio::time::timeout(Duration::from_secs(1), publication)
+        .await
+        .expect("zero-debt write must wake retained control publication")
+        .expect("publish retained nonzero credit");
+    assert_eq!(
+        client.read_frame().await.expect("read opening proof"),
+        proof
+    );
+
+    let established_command = recv_reliable_path_command(&mut session.commands_rx)
+        .await
+        .expect("dequeue retained nonzero credit");
+    assert!(matches!(
+        session
+            .drain_commands(established_command)
+            .await
+            .expect("write retained nonzero credit"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(
+        client
+            .read_frame()
+            .await
+            .expect("read retained nonzero credit"),
+        established
+    );
 }
 
 #[tokio::test]

@@ -940,11 +940,17 @@ impl ServerTcpPathSession {
                 }
             }
         };
-        if write_result && *writer_pending_bytes > 0 {
-            self.evidence
-                .observe_after_write(&self.context, &self.path_registration, self.path_id);
+        if write_result {
+            let pending_bytes = std::mem::take(writer_pending_bytes);
+            if pending_bytes > 0 {
+                self.evidence.observe_after_write(
+                    &self.context,
+                    &self.path_registration,
+                    self.path_id,
+                );
+            }
             self.commands_rx
-                .release_pending_command_bytes(std::mem::take(writer_pending_bytes));
+                .release_pending_command_bytes(pending_bytes);
         }
         #[cfg(feature = "lab-diagnostics")]
         if routed_frames > 0 || self.deferred_input.is_some() {

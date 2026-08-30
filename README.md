@@ -71,10 +71,18 @@ TUN-L3 packet device -> authenticated IP packets -> the same carrier set
 ## Performance
 
 The scalar tables below are accepted historical evidence for v0.2.1–v0.2.2;
-they do not characterize v0.4.4 or the current source tree. No current-release
-time-series figure or ranking is published until at least two
-matched repetitions pass the host, source, workload, isolation, and provenance
-gates described in the [performance methodology](docs/PERFORMANCE.md).
+they do not characterize v0.4.4 or the current tree. The chart is a pre-release
+two-run comparison; it is not a final-v0.4.4 ranking. See the
+[performance methodology](docs/PERFORMANCE.md) for measurement details.
+
+### Pre-release diagnostic series
+
+[![Receiver goodput and persistent application-echo latency over 40 seconds for MPTUNNEL TCP, QUIC, default TCP+QUIC, Xray, and Hysteria2](docs/assets/performance/diagnostic-random-internet-series.svg)](docs/assets/performance/diagnostic-random-internet-series.svg)
+
+The figure compares TCP, QUIC, default TCP+QUIC, Xray, and Hysteria2 using
+one-second receiver-goodput samples and concurrent application-echo latency.
+Lines show the two-run median; bands show the measured range. Open the chart
+and hover a point for its exact value.
 
 These historical results are receiver-delivered goodput from controlled Linux
 tests, rounded to the nearest Mbps. Xray-core 26.3.27 uses VMess/TCP; Hysteria2

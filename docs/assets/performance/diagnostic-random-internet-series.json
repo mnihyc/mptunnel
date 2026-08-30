@@ -1,0 +1,3866 @@
+{
+  "schema_version": 1,
+  "figure": {
+    "title": "Sustained proxy performance over a variable Internet path",
+    "subtitle": "Five implementations · 40 s bulk download + persistent application echo",
+    "condition_note": "Autonomous MPP · measured-rate Hysteria2 · two repetitions",
+    "variability_note": "Line: pointwise median; band: measured min–max. Missing echo attempts remain gaps; clipped outliers keep exact hover values."
+  },
+  "provenance": {
+    "cohort_id": "diagnostic-five-series-ca7-two-run",
+    "evidence_tier": "diagnostic",
+    "host_valid": false,
+    "host_invalid_reason": "external_containers_running=1",
+    "source_commit": "ca7c6fee4e5e9971987547dd7e422467bb113ce8",
+    "source_runs": [
+      {
+        "id": "repetition-1",
+        "result_dirs": [
+          "diagnostic-five-series-ca7-r1-mpp-tcp",
+          "diagnostic-five-series-ca7-r1-mpp-quic",
+          "diagnostic-five-series-ca7-r1-mpp-default",
+          "diagnostic-five-series-ca7-r1-xray",
+          "diagnostic-five-series-ca7-r1-h2"
+        ]
+      },
+      {
+        "id": "repetition-2",
+        "result_dirs": [
+          "diagnostic-five-series-ca7-r2-mpp-tcp",
+          "diagnostic-five-series-ca7-r2-mpp-quic",
+          "diagnostic-five-series-ca7-r2-mpp-default",
+          "diagnostic-five-series-ca7-r2-xray",
+          "diagnostic-five-series-ca7-r2-h2"
+        ]
+      }
+    ],
+    "valid_repetitions": 2,
+    "aggregation": "pointwise_median_min_max",
+    "goodput_source": "bulk_interval_goodput_mbps",
+    "goodput_window_s": 1.0,
+    "goodput_window_alignment": "symmetric_full_windows",
+    "latency_source": "interactive_attempt_series",
+    "latency_alignment": "one_second_start_time_bins",
+    "condition": {
+      "netem_mode": "internet-five-path-epoch-0",
+      "internet_seed": "sustained-collapse-5552",
+      "include_outages": "0",
+      "mpp_path_hints": "0",
+      "hysteria_client_rate": "844465kbit",
+      "hysteria_server_rate": "130963kbit",
+      "load_duration_s": 40.0,
+      "bulk_connections": 1,
+      "object_mib": 1024,
+      "case_isolation": true,
+      "container_isolation": true,
+      "probe": {
+        "mode": "socks5",
+        "target": "172.31.40.30:8080",
+        "tcp_echo_target": "172.31.40.30:10022",
+        "test_duration_s": 40.0,
+        "bulk_load_duration_s": 40.0,
+        "bulk_interval_seconds": 0.2,
+        "bulk_interval_trim_discard_each_end": 3,
+        "interactive_interval_ms": 500,
+        "interactive_timeout_ms": 5000,
+        "interactive_payload_bytes": 64
+      }
+    }
+  },
+  "series": [
+    {
+      "id": "mpp_tcp",
+      "label": "MPP TCP",
+      "valid_repetitions": 2,
+      "implementation": {
+        "tool": "mptunnel",
+        "carrier": "MPP/TCP",
+        "protocol_version": 8,
+        "build_profile": "release"
+      },
+      "goodput": [
+        {
+          "time_s": 1.5,
+          "low": 21.069,
+          "median": 29.144,
+          "high": 37.219,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 2.5,
+          "low": 47.186,
+          "median": 84.895,
+          "high": 122.605,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 3.5,
+          "low": 104.858,
+          "median": 114.819,
+          "high": 124.781,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 4.5,
+          "low": 116.392,
+          "median": 119.8,
+          "high": 123.208,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 5.5,
+          "low": 109.052,
+          "median": 115.868,
+          "high": 122.683,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 6.5,
+          "low": 124.256,
+          "median": 130.548,
+          "high": 136.839,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 7.5,
+          "low": 117.965,
+          "median": 121.635,
+          "high": 125.305,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 8.5,
+          "low": 119.538,
+          "median": 121.635,
+          "high": 123.732,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 9.5,
+          "low": 119.013,
+          "median": 119.275,
+          "high": 119.538,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 10.5,
+          "low": 122.159,
+          "median": 123.276,
+          "high": 124.394,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 11.5,
+          "low": 73.4,
+          "median": 78.905,
+          "high": 84.41,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 12.5,
+          "low": 123.732,
+          "median": 130.81,
+          "high": 137.888,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 13.5,
+          "low": 117.441,
+          "median": 124.781,
+          "high": 132.12,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 14.5,
+          "low": 125.829,
+          "median": 126.878,
+          "high": 127.926,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 15.5,
+          "low": 123.208,
+          "median": 123.47,
+          "high": 123.732,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 16.5,
+          "low": 113.77,
+          "median": 116.916,
+          "high": 120.062,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 17.5,
+          "low": 117.441,
+          "median": 123.47,
+          "high": 129.499,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 18.5,
+          "low": 111.149,
+          "median": 117.441,
+          "high": 123.732,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 19.5,
+          "low": 121.111,
+          "median": 123.732,
+          "high": 126.354,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 20.5,
+          "low": 110.625,
+          "median": 116.392,
+          "high": 122.159,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 21.5,
+          "low": 77.07,
+          "median": 94.771,
+          "high": 112.471,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 22.5,
+          "low": 106.43,
+          "median": 114.819,
+          "high": 123.208,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 23.5,
+          "low": 125.305,
+          "median": 138.674,
+          "high": 152.044,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 24.5,
+          "low": 102.761,
+          "median": 113.508,
+          "high": 124.256,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 25.5,
+          "low": 120.586,
+          "median": 122.684,
+          "high": 124.781,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 26.5,
+          "low": 50.332,
+          "median": 87.556,
+          "high": 124.781,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 27.5,
+          "low": 111.149,
+          "median": 137.005,
+          "high": 162.862,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 28.5,
+          "low": 100.139,
+          "median": 109.576,
+          "high": 119.013,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 29.5,
+          "low": 113.246,
+          "median": 119.275,
+          "high": 125.305,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 30.5,
+          "low": 85.459,
+          "median": 105.644,
+          "high": 125.829,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 31.5,
+          "low": 94.896,
+          "median": 105.644,
+          "high": 116.392,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 32.5,
+          "low": 82.313,
+          "median": 92.275,
+          "high": 102.236,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 33.5,
+          "low": 89.653,
+          "median": 107.217,
+          "high": 124.781,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 34.5,
+          "low": 81.265,
+          "median": 103.285,
+          "high": 125.305,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 35.5,
+          "low": 81.789,
+          "median": 94.372,
+          "high": 106.955,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 36.5,
+          "low": 41.943,
+          "median": 80.74,
+          "high": 119.538,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 37.5,
+          "low": 101.188,
+          "median": 112.984,
+          "high": 124.781,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 38.5,
+          "low": 93.848,
+          "median": 109.576,
+          "high": 125.305,
+          "available": 2,
+          "repetitions": 2
+        }
+      ],
+      "latency": [
+        {
+          "time_s": 0.5,
+          "low": 120.074,
+          "median": 232.337,
+          "high": 344.601,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 1.5,
+          "low": 188.196,
+          "median": 342.944,
+          "high": 497.692,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 2.5,
+          "low": 147.248,
+          "median": 148.396,
+          "high": 149.543,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 3.5,
+          "low": 167.078,
+          "median": 174.102,
+          "high": 181.125,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 4.5,
+          "low": 187.308,
+          "median": 217.593,
+          "high": 247.878,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 5.5,
+          "low": 180.19,
+          "median": 210.707,
+          "high": 241.223,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 6.5,
+          "low": 185.454,
+          "median": 194.751,
+          "high": 204.047,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 7.5,
+          "low": 220.276,
+          "median": 222.537,
+          "high": 224.799,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 8.5,
+          "low": 190.058,
+          "median": 211.908,
+          "high": 233.758,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 9.5,
+          "low": 169.749,
+          "median": 204.302,
+          "high": 238.855,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 10.5,
+          "low": 190.576,
+          "median": 235.509,
+          "high": 280.442,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 11.5,
+          "low": 146.47,
+          "median": 291.249,
+          "high": 436.028,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 12.5,
+          "low": 183.799,
+          "median": 313.075,
+          "high": 442.352,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 13.5,
+          "low": 175.561,
+          "median": 270.477,
+          "high": 365.393,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 14.5,
+          "low": 141.343,
+          "median": 268.309,
+          "high": 395.275,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 15.5,
+          "low": 149.689,
+          "median": 249.276,
+          "high": 348.863,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 16.5,
+          "low": 172.471,
+          "median": 259.67,
+          "high": 346.869,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 17.5,
+          "low": 168.637,
+          "median": 273.146,
+          "high": 377.655,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 18.5,
+          "low": 160.493,
+          "median": 340.855,
+          "high": 521.216,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 19.5,
+          "low": 181.98,
+          "median": 349.682,
+          "high": 517.383,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 20.5,
+          "low": 184.812,
+          "median": 295.659,
+          "high": 406.506,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 21.5,
+          "low": 152.994,
+          "median": 376.756,
+          "high": 600.518,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 22.5,
+          "low": 196.253,
+          "median": 436.541,
+          "high": 676.829,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 23.5,
+          "low": 221.329,
+          "median": 340.533,
+          "high": 459.738,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 24.5,
+          "low": 227.398,
+          "median": 312.031,
+          "high": 396.665,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 25.5,
+          "low": 218.843,
+          "median": 474.433,
+          "high": 730.023,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 26.5,
+          "low": 216.449,
+          "median": 216.449,
+          "high": 216.449,
+          "available": 1,
+          "repetitions": 2,
+          "outcomes": {
+            "not_recorded": 1,
+            "success": 1
+          }
+        },
+        {
+          "time_s": 27.5,
+          "low": 176.901,
+          "median": 227.174,
+          "high": 277.448,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 28.5,
+          "low": 186.198,
+          "median": 197.326,
+          "high": 208.455,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 29.5,
+          "low": 144.844,
+          "median": 156.345,
+          "high": 167.846,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 30.5,
+          "low": 143.439,
+          "median": 159.374,
+          "high": 175.309,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 31.5,
+          "low": 152.321,
+          "median": 165.24,
+          "high": 178.159,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 32.5,
+          "low": 152.735,
+          "median": 174.172,
+          "high": 195.609,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 33.5,
+          "low": 139.524,
+          "median": 180.744,
+          "high": 221.965,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 34.5,
+          "low": 163.163,
+          "median": 189.356,
+          "high": 215.549,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 35.5,
+          "low": 158.25,
+          "median": 197.289,
+          "high": 236.328,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 36.5,
+          "low": 191.663,
+          "median": 202.464,
+          "high": 213.265,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 37.5,
+          "low": 144.916,
+          "median": 181.743,
+          "high": 218.57,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 38.5,
+          "low": 149.49,
+          "median": 180.829,
+          "high": 212.168,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 39.5,
+          "low": 184.156,
+          "median": 195.468,
+          "high": 206.779,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "mpp_quic",
+      "label": "MPP QUIC",
+      "valid_repetitions": 2,
+      "implementation": {
+        "tool": "mptunnel",
+        "carrier": "MPP/QUIC",
+        "protocol_version": 8,
+        "build_profile": "release"
+      },
+      "goodput": [
+        {
+          "time_s": 1.5,
+          "low": 96.526,
+          "median": 101.659,
+          "high": 106.792,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 2.5,
+          "low": 111.385,
+          "median": 111.91,
+          "high": 112.434,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 3.5,
+          "low": 119.826,
+          "median": 121.613,
+          "high": 123.4,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 4.5,
+          "low": 120.394,
+          "median": 120.87,
+          "high": 121.347,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 5.5,
+          "low": 89.941,
+          "median": 93.231,
+          "high": 96.521,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 6.5,
+          "low": 105.906,
+          "median": 106.666,
+          "high": 107.425,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 7.5,
+          "low": 121.731,
+          "median": 122.635,
+          "high": 123.54,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 8.5,
+          "low": 120.49,
+          "median": 121.614,
+          "high": 122.738,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 9.5,
+          "low": 87.319,
+          "median": 104.905,
+          "high": 122.491,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 10.5,
+          "low": 117.013,
+          "median": 127.595,
+          "high": 138.176,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 11.5,
+          "low": 78.793,
+          "median": 86.701,
+          "high": 94.609,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 12.5,
+          "low": 115.085,
+          "median": 118.67,
+          "high": 122.254,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 13.5,
+          "low": 106.326,
+          "median": 112.033,
+          "high": 117.739,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 14.5,
+          "low": 123.644,
+          "median": 127.882,
+          "high": 132.121,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 15.5,
+          "low": 122.766,
+          "median": 123.295,
+          "high": 123.824,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 16.5,
+          "low": 76.658,
+          "median": 79.685,
+          "high": 82.713,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 17.5,
+          "low": 115.271,
+          "median": 117.571,
+          "high": 119.87,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 18.5,
+          "low": 121.898,
+          "median": 122.145,
+          "high": 122.391,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 19.5,
+          "low": 121.251,
+          "median": 121.801,
+          "high": 122.351,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 20.5,
+          "low": 123.54,
+          "median": 123.566,
+          "high": 123.592,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 21.5,
+          "low": 110.529,
+          "median": 116.839,
+          "high": 123.149,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 22.5,
+          "low": 79.884,
+          "median": 82.635,
+          "high": 85.386,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 23.5,
+          "low": 118.887,
+          "median": 121.095,
+          "high": 123.304,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 24.5,
+          "low": 119.154,
+          "median": 121.299,
+          "high": 123.444,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 25.5,
+          "low": 96.0,
+          "median": 105.243,
+          "high": 114.487,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 26.5,
+          "low": 125.065,
+          "median": 125.568,
+          "high": 126.071,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 27.5,
+          "low": 74.117,
+          "median": 87.823,
+          "high": 101.529,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 28.5,
+          "low": 122.131,
+          "median": 122.669,
+          "high": 123.206,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 29.5,
+          "low": 123.208,
+          "median": 123.296,
+          "high": 123.385,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 30.5,
+          "low": 123.33,
+          "median": 123.387,
+          "high": 123.444,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 31.5,
+          "low": 107.908,
+          "median": 115.772,
+          "high": 123.636,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 32.5,
+          "low": 106.419,
+          "median": 106.927,
+          "high": 107.435,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 33.5,
+          "low": 88.605,
+          "median": 102.57,
+          "high": 116.534,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 34.5,
+          "low": 116.724,
+          "median": 118.275,
+          "high": 119.826,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 35.5,
+          "low": 118.725,
+          "median": 120.992,
+          "high": 123.258,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 36.5,
+          "low": 105.208,
+          "median": 114.254,
+          "high": 123.301,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 37.5,
+          "low": 113.106,
+          "median": 126.9,
+          "high": 140.695,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 38.5,
+          "low": 78.1,
+          "median": 84.091,
+          "high": 90.082,
+          "available": 2,
+          "repetitions": 2
+        }
+      ],
+      "latency": [
+        {
+          "time_s": 0.5,
+          "low": 82.489,
+          "median": 92.106,
+          "high": 101.722,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 1.5,
+          "low": 147.289,
+          "median": 161.847,
+          "high": 176.404,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 2.5,
+          "low": 189.702,
+          "median": 192.685,
+          "high": 195.669,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 3.5,
+          "low": 193.605,
+          "median": 197.9,
+          "high": 202.195,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 4.5,
+          "low": 177.047,
+          "median": 184.804,
+          "high": 192.561,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 5.5,
+          "low": 192.194,
+          "median": 201.689,
+          "high": 211.185,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 6.5,
+          "low": 157.493,
+          "median": 166.123,
+          "high": 174.753,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 7.5,
+          "low": 199.895,
+          "median": 200.679,
+          "high": 201.463,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 8.5,
+          "low": 181.224,
+          "median": 186.213,
+          "high": 191.203,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 9.5,
+          "low": 241.1,
+          "median": 245.257,
+          "high": 249.415,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 10.5,
+          "low": 205.915,
+          "median": 226.479,
+          "high": 247.042,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 11.5,
+          "low": 199.981,
+          "median": 205.454,
+          "high": 210.927,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 12.5,
+          "low": 170.889,
+          "median": 174.725,
+          "high": 178.561,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 13.5,
+          "low": 174.46,
+          "median": 181.073,
+          "high": 187.686,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 14.5,
+          "low": 259.096,
+          "median": 283.756,
+          "high": 308.417,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 15.5,
+          "low": 222.826,
+          "median": 238.867,
+          "high": 254.908,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 16.5,
+          "low": 100.748,
+          "median": 130.582,
+          "high": 160.416,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 17.5,
+          "low": 169.853,
+          "median": 175.478,
+          "high": 181.103,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 18.5,
+          "low": 183.515,
+          "median": 184.506,
+          "high": 185.496,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 19.5,
+          "low": 188.703,
+          "median": 208.952,
+          "high": 229.201,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 20.5,
+          "low": 263.406,
+          "median": 267.745,
+          "high": 272.083,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 21.5,
+          "low": 187.385,
+          "median": 219.928,
+          "high": 252.471,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 22.5,
+          "low": 154.547,
+          "median": 163.023,
+          "high": 171.499,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 23.5,
+          "low": 167.228,
+          "median": 172.113,
+          "high": 176.997,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 24.5,
+          "low": 185.203,
+          "median": 186.101,
+          "high": 186.999,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 25.5,
+          "low": 222.269,
+          "median": 265.202,
+          "high": 308.135,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 26.5,
+          "low": 208.532,
+          "median": 232.709,
+          "high": 256.887,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 27.5,
+          "low": 155.566,
+          "median": 161.635,
+          "high": 167.704,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 28.5,
+          "low": 191.798,
+          "median": 196.619,
+          "high": 201.441,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 29.5,
+          "low": 207.847,
+          "median": 208.93,
+          "high": 210.012,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 30.5,
+          "low": 217.667,
+          "median": 218.255,
+          "high": 218.842,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 31.5,
+          "low": 284.906,
+          "median": 315.6,
+          "high": 346.294,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 32.5,
+          "low": 176.267,
+          "median": 226.613,
+          "high": 276.959,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 33.5,
+          "low": 157.273,
+          "median": 162.152,
+          "high": 167.032,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 34.5,
+          "low": 183.643,
+          "median": 183.809,
+          "high": 183.976,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 35.5,
+          "low": 184.965,
+          "median": 203.606,
+          "high": 222.247,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 36.5,
+          "low": 254.821,
+          "median": 256.083,
+          "high": 257.345,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 37.5,
+          "low": 164.169,
+          "median": 208.792,
+          "high": 253.415,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 38.5,
+          "low": 153.977,
+          "median": 160.314,
+          "high": 166.651,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 39.5,
+          "low": 180.806,
+          "median": 186.172,
+          "high": 191.538,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "mpp_default",
+      "label": "MPP TCP+QUIC (default)",
+      "valid_repetitions": 2,
+      "implementation": {
+        "tool": "mptunnel",
+        "carrier": "MPP/TCP+QUIC (default)",
+        "protocol_version": 8,
+        "build_profile": "release"
+      },
+      "goodput": [
+        {
+          "time_s": 1.5,
+          "low": 15.32,
+          "median": 28.893,
+          "high": 42.467,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 2.5,
+          "low": 2.097,
+          "median": 5.923,
+          "high": 9.749,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 3.5,
+          "low": 177.209,
+          "median": 177.788,
+          "high": 178.367,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 4.5,
+          "low": 13.107,
+          "median": 75.789,
+          "high": 138.47,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 5.5,
+          "low": 116.773,
+          "median": 169.535,
+          "high": 222.298,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 6.5,
+          "low": 0.524,
+          "median": 39.562,
+          "high": 78.599,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 7.5,
+          "low": 1.573,
+          "median": 51.856,
+          "high": 102.14,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 8.5,
+          "low": 68.936,
+          "median": 131.461,
+          "high": 193.987,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 9.5,
+          "low": 46.137,
+          "median": 65.916,
+          "high": 85.695,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 10.5,
+          "low": 42.992,
+          "median": 117.012,
+          "high": 191.033,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 11.5,
+          "low": 48.567,
+          "median": 210.93,
+          "high": 373.293,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 12.5,
+          "low": 79.167,
+          "median": 130.518,
+          "high": 181.868,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 13.5,
+          "low": 22.544,
+          "median": 52.263,
+          "high": 81.981,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 14.5,
+          "low": 41.943,
+          "median": 67.799,
+          "high": 93.656,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 15.5,
+          "low": 157.146,
+          "median": 236.384,
+          "high": 315.621,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 16.5,
+          "low": 117.345,
+          "median": 124.71,
+          "high": 132.076,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 17.5,
+          "low": 101.708,
+          "median": 110.216,
+          "high": 118.725,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 18.5,
+          "low": 76.879,
+          "median": 91.655,
+          "high": 106.43,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 19.5,
+          "low": 86.079,
+          "median": 97.041,
+          "high": 108.003,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 20.5,
+          "low": 47.474,
+          "median": 81.912,
+          "high": 116.349,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 21.5,
+          "low": 15.729,
+          "median": 64.296,
+          "high": 112.862,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 22.5,
+          "low": 229.114,
+          "median": 236.454,
+          "high": 243.794,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 23.5,
+          "low": 38.89,
+          "median": 97.928,
+          "high": 156.966,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 24.5,
+          "low": 38.705,
+          "median": 69.636,
+          "high": 100.567,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 25.5,
+          "low": 25.166,
+          "median": 57.362,
+          "high": 89.557,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 26.5,
+          "low": 12.583,
+          "median": 42.42,
+          "high": 72.256,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 27.5,
+          "low": 180.879,
+          "median": 293.077,
+          "high": 405.275,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 28.5,
+          "low": 18.874,
+          "median": 70.613,
+          "high": 122.351,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 29.5,
+          "low": 105.574,
+          "median": 154.761,
+          "high": 203.948,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 30.5,
+          "low": 15.205,
+          "median": 56.147,
+          "high": 97.089,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 31.5,
+          "low": 93.892,
+          "median": 148.063,
+          "high": 202.235,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 32.5,
+          "low": 93.944,
+          "median": 98.614,
+          "high": 103.285,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 33.5,
+          "low": 106.955,
+          "median": 147.801,
+          "high": 188.648,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 34.5,
+          "low": 78.643,
+          "median": 107.287,
+          "high": 135.931,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 35.5,
+          "low": 99.711,
+          "median": 109.506,
+          "high": 119.301,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 36.5,
+          "low": 92.275,
+          "median": 93.515,
+          "high": 94.756,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 37.5,
+          "low": 100.375,
+          "median": 108.502,
+          "high": 116.628,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 38.5,
+          "low": 98.042,
+          "median": 118.703,
+          "high": 139.364,
+          "available": 2,
+          "repetitions": 2
+        }
+      ],
+      "latency": [
+        {
+          "time_s": 0.5,
+          "low": 119.33,
+          "median": 221.587,
+          "high": 323.844,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 1.5,
+          "low": 289.87,
+          "median": 313.283,
+          "high": 336.696,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 2.5,
+          "low": 237.314,
+          "median": 263.348,
+          "high": 289.383,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 3.5,
+          "low": 362.133,
+          "median": 580.963,
+          "high": 799.794,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 4.5,
+          "low": 289.745,
+          "median": 335.298,
+          "high": 380.851,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 5.5,
+          "low": 254.717,
+          "median": 328.994,
+          "high": 403.27,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 6.5,
+          "low": 281.983,
+          "median": 483.594,
+          "high": 685.204,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 7.5,
+          "low": 282.096,
+          "median": 615.165,
+          "high": 948.235,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 8.5,
+          "low": 192.331,
+          "median": 196.89,
+          "high": 201.448,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 9.5,
+          "low": 295.576,
+          "median": 323.133,
+          "high": 350.691,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 10.5,
+          "low": 144.534,
+          "median": 211.04,
+          "high": 277.546,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 11.5,
+          "low": 168.938,
+          "median": 195.138,
+          "high": 221.338,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 12.5,
+          "low": 444.357,
+          "median": 480.512,
+          "high": 516.667,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 13.5,
+          "low": 315.897,
+          "median": 471.622,
+          "high": 627.347,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 14.5,
+          "low": 421.524,
+          "median": 427.032,
+          "high": 432.54,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 15.5,
+          "low": 281.143,
+          "median": 301.98,
+          "high": 322.817,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 16.5,
+          "low": 314.996,
+          "median": 419.269,
+          "high": 523.541,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 17.5,
+          "low": 227.747,
+          "median": 451.377,
+          "high": 675.007,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 18.5,
+          "low": 307.637,
+          "median": 512.03,
+          "high": 716.423,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 19.5,
+          "low": 397.962,
+          "median": 462.342,
+          "high": 526.721,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 20.5,
+          "low": 208.096,
+          "median": 406.897,
+          "high": 605.697,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 21.5,
+          "low": 147.882,
+          "median": 251.944,
+          "high": 356.006,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 22.5,
+          "low": 229.902,
+          "median": 283.736,
+          "high": 337.569,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 23.5,
+          "low": 273.443,
+          "median": 344.664,
+          "high": 415.885,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 24.5,
+          "low": 318.647,
+          "median": 348.377,
+          "high": 378.107,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 25.5,
+          "low": 374.044,
+          "median": 403.46,
+          "high": 432.876,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 26.5,
+          "low": 303.892,
+          "median": 330.967,
+          "high": 358.042,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 27.5,
+          "low": 179.699,
+          "median": 225.054,
+          "high": 270.41,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 28.5,
+          "low": 199.171,
+          "median": 228.1,
+          "high": 257.029,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 29.5,
+          "low": 287.996,
+          "median": 352.319,
+          "high": 416.642,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 30.5,
+          "low": 406.376,
+          "median": 494.95,
+          "high": 583.525,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 31.5,
+          "low": 327.695,
+          "median": 515.41,
+          "high": 703.124,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 32.5,
+          "low": 308.919,
+          "median": 356.091,
+          "high": 403.263,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 33.5,
+          "low": 295.26,
+          "median": 312.621,
+          "high": 329.983,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 34.5,
+          "low": 166.156,
+          "median": 403.8,
+          "high": 641.445,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 35.5,
+          "low": 277.605,
+          "median": 358.201,
+          "high": 438.797,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 36.5,
+          "low": 159.518,
+          "median": 325.324,
+          "high": 491.13,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 37.5,
+          "low": 278.539,
+          "median": 316.069,
+          "high": 353.599,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 38.5,
+          "low": 261.182,
+          "median": 267.689,
+          "high": 274.196,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 39.5,
+          "low": 174.068,
+          "median": 235.506,
+          "high": 296.945,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "xray_vmess",
+      "label": "Xray VMess/TCP",
+      "valid_repetitions": 2,
+      "implementation": {
+        "tool": "xray",
+        "release": "v26.3.27",
+        "carrier": "VMess/TCP"
+      },
+      "goodput": [
+        {
+          "time_s": 1.5,
+          "low": 7.41,
+          "median": 19.236,
+          "high": 31.063,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 2.5,
+          "low": 7.768,
+          "median": 60.148,
+          "high": 112.527,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 3.5,
+          "low": 9.697,
+          "median": 58.977,
+          "high": 108.258,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 4.5,
+          "low": 10.54,
+          "median": 60.172,
+          "high": 109.804,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 5.5,
+          "low": 11.69,
+          "median": 47.123,
+          "high": 82.555,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 6.5,
+          "low": 11.773,
+          "median": 57.573,
+          "high": 103.373,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 7.5,
+          "low": 12.534,
+          "median": 42.137,
+          "high": 71.74,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 8.5,
+          "low": 12.523,
+          "median": 44.195,
+          "high": 75.866,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 9.5,
+          "low": 14.21,
+          "median": 50.175,
+          "high": 86.139,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 10.5,
+          "low": 8.978,
+          "median": 32.685,
+          "high": 56.392,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 11.5,
+          "low": 13.442,
+          "median": 36.319,
+          "high": 59.195,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 12.5,
+          "low": 13.816,
+          "median": 41.087,
+          "high": 68.357,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 13.5,
+          "low": 14.885,
+          "median": 35.981,
+          "high": 57.077,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 14.5,
+          "low": 15.95,
+          "median": 38.389,
+          "high": 60.828,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 15.5,
+          "low": 16.653,
+          "median": 34.768,
+          "high": 52.883,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 16.5,
+          "low": 15.778,
+          "median": 37.039,
+          "high": 58.299,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 17.5,
+          "low": 18.415,
+          "median": 39.124,
+          "high": 59.834,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 18.5,
+          "low": 18.215,
+          "median": 37.951,
+          "high": 57.687,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 19.5,
+          "low": 19.069,
+          "median": 39.727,
+          "high": 60.384,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 20.5,
+          "low": 17.691,
+          "median": 35.279,
+          "high": 52.867,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 21.5,
+          "low": 8.27,
+          "median": 18.066,
+          "high": 27.863,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 22.5,
+          "low": 8.373,
+          "median": 16.31,
+          "high": 24.247,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 23.5,
+          "low": 7.75,
+          "median": 12.643,
+          "high": 17.535,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 24.5,
+          "low": 6.146,
+          "median": 9.775,
+          "high": 13.404,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 25.5,
+          "low": 6.616,
+          "median": 9.289,
+          "high": 11.962,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 26.5,
+          "low": 5.534,
+          "median": 8.126,
+          "high": 10.717,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 27.5,
+          "low": 4.973,
+          "median": 7.889,
+          "high": 10.805,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 28.5,
+          "low": 4.783,
+          "median": 6.916,
+          "high": 9.048,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 29.5,
+          "low": 4.983,
+          "median": 7.048,
+          "high": 9.113,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 30.5,
+          "low": 4.459,
+          "median": 6.108,
+          "high": 7.757,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 31.5,
+          "low": 3.978,
+          "median": 4.753,
+          "high": 5.528,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 32.5,
+          "low": 5.497,
+          "median": 5.707,
+          "high": 5.918,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 33.5,
+          "low": 5.583,
+          "median": 6.121,
+          "high": 6.66,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 34.5,
+          "low": 4.729,
+          "median": 5.942,
+          "high": 7.156,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 35.5,
+          "low": 5.048,
+          "median": 6.951,
+          "high": 8.853,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 36.5,
+          "low": 5.113,
+          "median": 7.34,
+          "high": 9.567,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 37.5,
+          "low": 5.341,
+          "median": 8.627,
+          "high": 11.913,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 38.5,
+          "low": 4.745,
+          "median": 9.396,
+          "high": 14.047,
+          "available": 2,
+          "repetitions": 2
+        }
+      ],
+      "latency": [
+        {
+          "time_s": 0.5,
+          "low": 136.676,
+          "median": 160.013,
+          "high": 183.351,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 1.5,
+          "low": 90.011,
+          "median": 112.06,
+          "high": 134.108,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 2.5,
+          "low": 99.196,
+          "median": 137.923,
+          "high": 176.649,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 3.5,
+          "low": 127.902,
+          "median": 143.008,
+          "high": 158.115,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 4.5,
+          "low": 137.636,
+          "median": 152.219,
+          "high": 166.802,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 5.5,
+          "low": 109.308,
+          "median": 143.952,
+          "high": 178.595,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 6.5,
+          "low": 127.749,
+          "median": 128.975,
+          "high": 130.201,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 7.5,
+          "low": 127.481,
+          "median": 131.342,
+          "high": 135.202,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 8.5,
+          "low": 142.122,
+          "median": 145.306,
+          "high": 148.49,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 9.5,
+          "low": 117.681,
+          "median": 135.192,
+          "high": 152.703,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 10.5,
+          "low": 115.309,
+          "median": 127.098,
+          "high": 138.887,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 11.5,
+          "low": 140.649,
+          "median": 142.802,
+          "high": 144.955,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 12.5,
+          "low": 124.488,
+          "median": 139.682,
+          "high": 154.876,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 13.5,
+          "low": 129.349,
+          "median": 139.58,
+          "high": 149.81,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 14.5,
+          "low": 129.405,
+          "median": 131.238,
+          "high": 133.07,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 15.5,
+          "low": 121.374,
+          "median": 138.429,
+          "high": 155.484,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 16.5,
+          "low": 138.151,
+          "median": 144.728,
+          "high": 151.305,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 17.5,
+          "low": 132.79,
+          "median": 143.53,
+          "high": 154.271,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 18.5,
+          "low": 127.201,
+          "median": 128.227,
+          "high": 129.253,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 19.5,
+          "low": 118.712,
+          "median": 134.82,
+          "high": 150.927,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 20.5,
+          "low": 125.483,
+          "median": 136.538,
+          "high": 147.593,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 21.5,
+          "low": 119.529,
+          "median": 131.578,
+          "high": 143.628,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 22.5,
+          "low": 111.281,
+          "median": 121.64,
+          "high": 132.0,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 23.5,
+          "low": 125.113,
+          "median": 126.68,
+          "high": 128.247,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 24.5,
+          "low": 116.338,
+          "median": 122.637,
+          "high": 128.935,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 25.5,
+          "low": 119.588,
+          "median": 123.648,
+          "high": 127.707,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 26.5,
+          "low": 124.652,
+          "median": 126.233,
+          "high": 127.814,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 27.5,
+          "low": 109.401,
+          "median": 123.329,
+          "high": 137.258,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 28.5,
+          "low": 120.37,
+          "median": 133.268,
+          "high": 146.165,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 29.5,
+          "low": 94.32,
+          "median": 95.79,
+          "high": 97.261,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 30.5,
+          "low": 110.47,
+          "median": 118.589,
+          "high": 126.708,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 31.5,
+          "low": 89.872,
+          "median": 94.453,
+          "high": 99.035,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 32.5,
+          "low": 101.67,
+          "median": 105.055,
+          "high": 108.439,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 33.5,
+          "low": 110.986,
+          "median": 123.188,
+          "high": 135.39,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 34.5,
+          "low": 107.402,
+          "median": 113.837,
+          "high": 120.272,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 35.5,
+          "low": 127.017,
+          "median": 130.415,
+          "high": 133.814,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 36.5,
+          "low": 123.43,
+          "median": 125.767,
+          "high": 128.104,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 37.5,
+          "low": 96.84,
+          "median": 107.91,
+          "high": 118.98,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 38.5,
+          "low": 119.061,
+          "median": 131.461,
+          "high": 143.861,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 39.5,
+          "low": 128.608,
+          "median": 131.947,
+          "high": 135.285,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "hysteria2",
+      "label": "Hysteria2 Brutal",
+      "valid_repetitions": 2,
+      "implementation": {
+        "tool": "hysteria2",
+        "release": "app/v2.10.0",
+        "carrier": "QUIC/Brutal"
+      },
+      "goodput": [
+        {
+          "time_s": 1.5,
+          "low": 124.136,
+          "median": 124.156,
+          "high": 124.175,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 2.5,
+          "low": 101.37,
+          "median": 112.802,
+          "high": 124.234,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 3.5,
+          "low": 123.96,
+          "median": 134.658,
+          "high": 145.357,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 4.5,
+          "low": 123.974,
+          "median": 124.036,
+          "high": 124.098,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 5.5,
+          "low": 123.858,
+          "median": 124.136,
+          "high": 124.414,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 6.5,
+          "low": 123.859,
+          "median": 124.026,
+          "high": 124.193,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 7.5,
+          "low": 124.003,
+          "median": 124.032,
+          "high": 124.062,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 8.5,
+          "low": 106.202,
+          "median": 115.218,
+          "high": 124.234,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 9.5,
+          "low": 121.362,
+          "median": 122.901,
+          "high": 124.44,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 10.5,
+          "low": 123.325,
+          "median": 123.647,
+          "high": 123.969,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 11.5,
+          "low": 123.732,
+          "median": 124.033,
+          "high": 124.334,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 12.5,
+          "low": 121.635,
+          "median": 122.836,
+          "high": 124.037,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 13.5,
+          "low": 122.512,
+          "median": 123.282,
+          "high": 124.053,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 14.5,
+          "low": 124.263,
+          "median": 124.476,
+          "high": 124.69,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 15.5,
+          "low": 123.366,
+          "median": 123.656,
+          "high": 123.945,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 16.5,
+          "low": 123.836,
+          "median": 123.916,
+          "high": 123.995,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 17.5,
+          "low": 123.485,
+          "median": 123.819,
+          "high": 124.152,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 18.5,
+          "low": 123.574,
+          "median": 123.705,
+          "high": 123.835,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 19.5,
+          "low": 123.411,
+          "median": 123.8,
+          "high": 124.188,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 20.5,
+          "low": 113.815,
+          "median": 118.98,
+          "high": 124.145,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 21.5,
+          "low": 123.346,
+          "median": 126.797,
+          "high": 130.249,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 22.5,
+          "low": 123.248,
+          "median": 123.513,
+          "high": 123.777,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 23.5,
+          "low": 123.23,
+          "median": 123.82,
+          "high": 124.409,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 24.5,
+          "low": 123.663,
+          "median": 123.778,
+          "high": 123.892,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 25.5,
+          "low": 123.685,
+          "median": 124.136,
+          "high": 124.587,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 26.5,
+          "low": 123.368,
+          "median": 123.68,
+          "high": 123.992,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 27.5,
+          "low": 124.143,
+          "median": 124.176,
+          "high": 124.209,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 28.5,
+          "low": 113.019,
+          "median": 118.638,
+          "high": 124.256,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 29.5,
+          "low": 122.376,
+          "median": 123.242,
+          "high": 124.107,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 30.5,
+          "low": 123.997,
+          "median": 124.051,
+          "high": 124.105,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 31.5,
+          "low": 123.71,
+          "median": 123.775,
+          "high": 123.84,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 32.5,
+          "low": 123.773,
+          "median": 123.94,
+          "high": 124.107,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 33.5,
+          "low": 117.475,
+          "median": 120.757,
+          "high": 124.039,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 34.5,
+          "low": 121.007,
+          "median": 122.512,
+          "high": 124.016,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 35.5,
+          "low": 123.664,
+          "median": 123.825,
+          "high": 123.986,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 36.5,
+          "low": 123.709,
+          "median": 123.948,
+          "high": 124.186,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 37.5,
+          "low": 123.743,
+          "median": 123.852,
+          "high": 123.961,
+          "available": 2,
+          "repetitions": 2
+        },
+        {
+          "time_s": 38.5,
+          "low": 123.892,
+          "median": 123.941,
+          "high": 123.99,
+          "available": 2,
+          "repetitions": 2
+        }
+      ],
+      "latency": [
+        {
+          "time_s": 0.5,
+          "low": 93.991,
+          "median": 94.158,
+          "high": 94.325,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 1.5,
+          "low": 198.174,
+          "median": 208.906,
+          "high": 219.639,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 2.5,
+          "low": 230.437,
+          "median": 240.759,
+          "high": 251.081,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 3.5,
+          "low": 216.286,
+          "median": 250.421,
+          "high": 284.555,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 4.5,
+          "low": 197.252,
+          "median": 256.571,
+          "high": 315.89,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 5.5,
+          "low": 224.913,
+          "median": 287.154,
+          "high": 349.394,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 6.5,
+          "low": 256.544,
+          "median": 317.616,
+          "high": 378.688,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 7.5,
+          "low": 278.979,
+          "median": 342.731,
+          "high": 406.482,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 8.5,
+          "low": 268.419,
+          "median": 273.55,
+          "high": 278.682,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 9.5,
+          "low": 177.227,
+          "median": 199.553,
+          "high": 221.88,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 10.5,
+          "low": 196.076,
+          "median": 222.671,
+          "high": 249.267,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 11.5,
+          "low": 216.236,
+          "median": 226.023,
+          "high": 235.81,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 12.5,
+          "low": 195.649,
+          "median": 203.003,
+          "high": 210.356,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 13.5,
+          "low": 198.648,
+          "median": 206.582,
+          "high": 214.517,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 14.5,
+          "low": 209.055,
+          "median": 217.738,
+          "high": 226.421,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 15.5,
+          "low": 224.78,
+          "median": 237.981,
+          "high": 251.183,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 16.5,
+          "low": 245.502,
+          "median": 258.716,
+          "high": 271.93,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 17.5,
+          "low": 237.966,
+          "median": 247.226,
+          "high": 256.486,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 18.5,
+          "low": 243.519,
+          "median": 248.301,
+          "high": 253.083,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 19.5,
+          "low": 211.364,
+          "median": 242.284,
+          "high": 273.205,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 20.5,
+          "low": 231.956,
+          "median": 266.99,
+          "high": 302.023,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 21.5,
+          "low": 250.352,
+          "median": 252.371,
+          "high": 254.389,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 22.5,
+          "low": 201.44,
+          "median": 239.037,
+          "high": 276.635,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 23.5,
+          "low": 239.819,
+          "median": 272.063,
+          "high": 304.308,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 24.5,
+          "low": 267.348,
+          "median": 299.704,
+          "high": 332.061,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 25.5,
+          "low": 288.73,
+          "median": 308.391,
+          "high": 328.052,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 26.5,
+          "low": 261.475,
+          "median": 276.547,
+          "high": 291.619,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 27.5,
+          "low": 177.005,
+          "median": 241.182,
+          "high": 305.358,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 28.5,
+          "low": 199.317,
+          "median": 269.494,
+          "high": 339.67,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 29.5,
+          "low": 188.398,
+          "median": 209.496,
+          "high": 230.593,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 30.5,
+          "low": 219.295,
+          "median": 242.865,
+          "high": 266.434,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 31.5,
+          "low": 244.19,
+          "median": 252.434,
+          "high": 260.679,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 32.5,
+          "low": 249.324,
+          "median": 263.492,
+          "high": 277.66,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 33.5,
+          "low": 250.67,
+          "median": 278.614,
+          "high": 306.558,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 34.5,
+          "low": 189.806,
+          "median": 220.63,
+          "high": 251.453,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 35.5,
+          "low": 190.628,
+          "median": 238.303,
+          "high": 285.978,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 36.5,
+          "low": 203.353,
+          "median": 263.355,
+          "high": 323.356,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 37.5,
+          "low": 229.104,
+          "median": 291.3,
+          "high": 353.496,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 38.5,
+          "low": 263.494,
+          "median": 325.322,
+          "high": 387.149,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        },
+        {
+          "time_s": 39.5,
+          "low": 298.911,
+          "median": 306.154,
+          "high": 313.396,
+          "available": 2,
+          "repetitions": 2,
+          "outcomes": {
+            "success": 2
+          }
+        }
+      ]
+    }
+  ]
+}

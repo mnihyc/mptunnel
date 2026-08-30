@@ -6,10 +6,21 @@ workload, host capacity, and the native TCP or QUIC implementation.
 
 ## Current evidence publication gate
 
-No current-release time-series figure or ranking is published. Publication
-requires at least two matched repetitions with accepted host and source
-provenance under identical isolated conditions; single-repetition and
-diagnostic artifacts do not update the historical scalar tables below.
+No final-v0.4.4 time-series ranking is published. Publication requires matched
+repetitions that pass the complete measurement gate; individual diagnostic
+runs do not update the historical scalar tables below.
+
+## Pre-release ordered diagnostic series
+
+[![Receiver goodput and persistent application-echo latency over 40 seconds](assets/performance/diagnostic-random-internet-series.svg)](assets/performance/diagnostic-random-internet-series.svg)
+
+The chart is the exact pointwise median and measured range of two 40-second
+repetitions. It preserves one-second receiver-goodput and persistent
+application-echo outcomes for MPTUNNEL TCP, QUIC, default TCP+QUIC, Xray
+VMess/TCP, and Hysteria2 Brutal. MPTUNNEL estimated service autonomously while
+Hysteria2 received the measured directional capacities. Missing echo values
+remain gaps rather than zeroes; clipped display outliers retain their exact
+values in hover text.
 
 ## Historical accepted fixed-profile evidence (v0.2.1–v0.2.2)
 

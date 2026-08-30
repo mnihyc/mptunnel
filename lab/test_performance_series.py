@@ -17,6 +17,12 @@ DATASET_PATH = (
 SVG_PATH = (
     ROOT / "docs" / "assets" / "performance" / "sustained-random-internet-series.svg"
 )
+DIAGNOSTIC_DATASET_PATH = (
+    ROOT / "docs" / "assets" / "performance" / "diagnostic-random-internet-series.json"
+)
+DIAGNOSTIC_SVG_PATH = (
+    ROOT / "docs" / "assets" / "performance" / "diagnostic-random-internet-series.svg"
+)
 EXPECTED_IDS = [
     "mpp_tcp",
     "mpp_quic",
@@ -1121,6 +1127,34 @@ class CheckedInPerformanceSeriesTests(unittest.TestCase):
         ]
         self.assertEqual(len(set(result_dirs)), len(result_dirs))
         self.assertTrue(provenance["source_commit"])
+
+
+@unittest.skipUnless(
+    DIAGNOSTIC_DATASET_PATH.exists(), "diagnostic five-series dataset not checked in"
+)
+class CheckedInDiagnosticPerformanceSeriesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dataset = load_dataset(DIAGNOSTIC_DATASET_PATH)
+
+    def test_dataset_keeps_exact_diagnostic_provenance(self):
+        provenance = self.dataset["provenance"]
+        self.assertEqual(
+            [series["id"] for series in self.dataset["series"]], EXPECTED_IDS
+        )
+        self.assertEqual(provenance["evidence_tier"], "diagnostic")
+        self.assertEqual(provenance["valid_repetitions"], 2)
+        self.assertFalse(provenance["host_valid"])
+        self.assertEqual(
+            provenance["source_commit"],
+            "ca7c6fee4e5e9971987547dd7e422467bb113ce8",
+        )
+
+    def test_checked_in_diagnostic_svg_is_exact_renderer_output(self):
+        self.assertTrue(DIAGNOSTIC_SVG_PATH.exists())
+        svg = DIAGNOSTIC_SVG_PATH.read_text(encoding="utf-8")
+        self.assertEqual(svg, render_svg(self.dataset))
+        self.assertIn('class="overflow-marker"', svg)
 
 
 if __name__ == "__main__":

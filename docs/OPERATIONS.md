@@ -399,7 +399,10 @@ seconds, and validate the rebuilt file; do not mix it with an earlier schema.
   or critical path-failure recovery.
 - Omitted `[flow].quic_loss_compensation_percent` is separately 10. It adjusts
   sender-local QUIC delivery/loss evidence without sending bytes or consuming
-  the optional reinjection budget.
+  the optional reinjection budget. Ordinary compensated loss carries a
+  deterministic three-operating-round burst envelope and is classified only
+  at completed packet-timed boundaries; ECN, persistence, and unknown evidence
+  remain immediate.
 - Omitted new-flow admission limits, local-inbound
   connection/association/source/principal limits, and the MPP
   pending-authentication limit default to 4,096. Explicit deployment limits
@@ -563,8 +566,12 @@ carrier or session failed. Direct and MPP egress use the same Product lifecycle.
 payload reinjection; native TCP/QUIC recovery, MPP control and probes, and
 critical path-failure recovery are outside that optional allowance. The latter
 changes sender-local QUIC delivery/loss evidence and does not itself send or
-budget bytes. A matching MPP inbound/outbound `performance` table overrides
-its `[flow]` value. For QUIC loss compensation only, an explicit
+budget bytes. Its nonzero policy includes the RFC's fixed three-round
+authorized-loss burst envelope; this prevents random or correlated placement
+from repeatedly tripping the population boundary while retaining a bounded
+response to sustained excess loss. A matching MPP inbound/outbound
+`performance` table overrides its `[flow]` value. For QUIC loss compensation
+only, an explicit
 `loss-compensation-percent` path URI value has highest precedence. The complete
 loss-policy order is therefore path URI, node performance, `[flow]`, then the
 built-in 10; optional reinjection uses node performance, `[flow]`, then the

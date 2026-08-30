@@ -2423,6 +2423,115 @@ The corresponding high-loss boundary is:
 1 - (1 - p0) * (1 - q)
 ```
 
+That expression is a population-rate policy, not permission to compare every
+finite packet-timed round's point estimate independently with the boundary.
+Doing so makes ordinary placement variance repeatedly look like congestion;
+because the native response is multiplicative, those false decisions can
+ratchet the bandwidth and flight models downward. A fixed-sample confidence
+interval is not a clean repair: repeated looks invalidate its coverage, and
+loss may be correlated rather than Bernoulli.
+
+Loss-only observations also cannot distinguish an arbitrarily correlated
+erasure burst from a drop-only policer. A nonzero `p0` profile therefore needs
+an explicit burst envelope. Let:
+
+```text
+theta = 1 - (1 - p0) * (1 - q)
+H     = 3 packet-timed operating rounds
+E     = resolved volume of the preceding complete non-application-limited round
+A     = H * p0 * E
+B     = (1 - theta) * A
+```
+
+`A` is the product policy's tolerated displacement of authorized lost bytes.
+`B` is the corresponding excess-loss credit: a lost byte also contributes
+`theta` credit as part of resolved volume, and therefore consumes
+`1 - theta` net credit. The first epoch uses the larger of the initial window
+and the earliest-sent aligned lost packet's transmit flight until a complete
+non-application-limited round supplies `E`. Three rounds is an explicit
+MPTUNNEL product risk policy: at `p0 = 10%`, it permits at most `0.3 * E` lost
+bytes to move across neighboring evidence rounds. It is not a BBR draft
+constant, an inferred path property, or a value selected by a benchmark.
+
+The sender maintains `C` in `[0, B]`. Every actual loss declaration has one
+stable record carrying its packet number space, packet number, byte count,
+aligned send evidence when available, and recovery-transaction owner. Its
+class is exactly one of ordinary, raw-authority, or proven-spurious. For one
+immutable epoch, `delta_ordinary_lost` is the sum of records still classified
+ordinary:
+
+```text
+raw = C + theta * delta_delivered
+        - (1 - theta) * delta_ordinary_lost
+round_high = raw < 0
+C = clamp(raw, 0, B)
+```
+
+Exactly once at an ACK-discovered packet-timed boundary, the sender consumes
+the non-overlapping lifetime-counter delta already resolved before that
+callback. QUIC reports losses after ending the ACK batch; those losses
+therefore enter the next boundary's delta rather than an open-round point
+estimate. The deferral is at most one additional packet-timed boundary and no
+byte is omitted or consumed twice.
+
+The native ordinary-loss response may run at most once for that decision. A
+population policy has no authoritative per-packet crossing point, so a
+`round_high` decision during ProbeBW Up uses the native beta-scaled target
+rather than retaining an open-round inflight sample. `E` and `B` are rebased
+only at the same boundary using `delta_delivered +
+max(delta_ordinary_lost, 0)` from a non-application-limited epoch. Earned raw
+credit is retained against the new bound, but a larger `B` does not itself
+mint credit. Negative debt is not retained, so the first recovered
+below-boundary round stops repeated multiplicative reductions.
+
+Startup's loss-event criterion counts discontiguous packet-number ranges from
+the canonical records independently in each QUIC packet-number space; callback
+interleaving across spaces is not a range boundary. If missing evidence ends
+ProbeBW Up before Quinn finishes the current loss callback batch, all later
+declarations in that batch belong to the same raw decision and cannot open or
+charge a second loss round.
+
+QUIC may retain multiple recovery transactions for two PTOs, and a later ACK
+may prove an older or several overlapping transactions spurious. Addition is
+not an exact refund after `C` has clamped or `B` has rebased. The sender
+therefore keeps a bounded chronological journal from the state preceding the
+earliest still-reclassifiable record. Raw attribution or late-ACK proof changes
+the exact record classes and replays the immutable epoch tuples from that
+checkpoint. This produces the same current `C` and `B` as if those records had
+always had their final class, including overlapping transactions and a
+spurious cold-start flight anchor. The journal is discarded once neither the
+open loss-decision cohort nor Quinn's retained evidence can change a recorded
+class.
+
+The envelope bounds loss displacement, not response time. At constant volume
+and sustained loss fraction `r > theta`, a full bucket crosses after:
+
+```text
+floor(B / ((r - theta) * E)) + 1 rounds
+```
+
+With the preferred `p0 = 10%` and `theta = 11.8%`, sustained 20%, 14%, and 12%
+loss cross after approximately 4, 13, and 133 operating rounds respectively.
+The long delay close to `theta` is deliberate: loss-only observations cannot
+distinguish such a small excess from allowed placement or correlation.
+
+ECN, RFC 9002 persistent congestion, and missing or unalignable evidence
+bypass the envelope and retain raw native authority. The exempt record cohort
+is the same cohort consumed by that raw decision, so a missing snapshot or
+persistent batch cannot receive a native response and later be charged again
+as ordinary loss. Persistent congestion unconditionally terminates an active
+ProbeBW Up once per batch; its authority cannot be diluted by whichever packet
+callback happened last. ECN without actual loss exempts no bytes. A valid
+late-ACK proof reclassifies only records owned by that exact recovery
+transaction; newer or unrelated same-ACK evidence remains intact. Native BBR
+state rollback remains limited to the exact current transaction and is refused
+when its snapshot predates an older still-open decision cohort or any newer raw
+authority. Final older state already represented by the snapshot is preserved.
+Bucket replay remains exact and independent of that conservative native-undo
+gate. NAT rebinding retains the controller and its envelope; a genuinely new
+path starts fresh. With `p0 = 0`, none of this state participates and draft BBR
+behavior remains bit-for-bit authoritative.
+
 Changing `q` is not a substitute for changing `p0`: `q` controls when the
 native controller reacts to the residual loss, whereas `p0` repairs the
 delivery and inflight evidence that would otherwise ratchet downward under

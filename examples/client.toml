@@ -16,7 +16,7 @@ level = "info" # all levels are good
 idle_timeout_s = 300
 # Optional reliable MPP payload reinjection; control/probes/native recovery are outside it.
 optional_reinjection_budget_percent = 10
-# Sender-side QUIC loss correction; a path URI value has highest precedence.
+# Sender-side QUIC loss correction with a bounded 3-round burst envelope; path URI wins.
 quic_loss_compensation_percent = 10
 
 [admission]

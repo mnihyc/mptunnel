@@ -137,7 +137,10 @@ idle_timeout_s = 300
 # table may override it; an explicit `loss-compensation-percent` on a QUIC path
 # URI overrides the node and `[flow]` values. Values are numeric 0..99.9999 with
 # at most four decimal places. Zero selects draft BBR3 behavior. TCP paths
-# ignore this setting.
+# ignore this setting. A nonzero value uses the RFC's deterministic
+# three-operating-round burst envelope and classifies ordinary loss only at
+# completed packet-timed boundaries. ECN, persistence, and unknown evidence
+# bypass it immediately; the horizon is fixed and is not another config knob.
 # Client/outbound values govern C-to-S; server/inbound values govern S-to-C.
 # MPP-L3 inherits these `[flow]` defaults because it has no per-node table.
 # quic_loss_compensation_percent = 10
@@ -566,7 +569,9 @@ paths = [
 # - loss-compensation-percent=0..99.9999: sender-local QUIC policy that corrects
 #   aligned delivery/inflight evidence for that loss fraction; omission
 #   inherits the node performance value, then `[flow]`, then built-in 10%.
-#   Overstating it can hide congestion; use 0 for draft BBR3 behavior;
+#   Its fixed three-round envelope tolerates bounded correlated placement;
+#   sustained excess loss still invokes native BBR3. Overstating it can hide
+#   congestion; use 0 for draft BBR3 behavior;
 # - max-datagram-payload-bytes=512..65000: QUIC client only; omission uses the
 #   smaller of `[resources].max_payload_bytes` and 65000;
 # - max-tcp-carriers=1..65535: TCP client only; omission defaults to 3;

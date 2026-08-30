@@ -89,6 +89,13 @@ const PROBE_RTT_INTERVAL_SEC: u64 = 5;
 /// equivalent to BBR.LossThresh: A constant specifying the maximum tolerated per-round-trip packet loss rate when probing for bandwidth (the default is 2%).
 const LOSS_THRESH: f64 = 0.02;
 
+/// MPTUNNEL's explicit compensated-loss burst envelope, in packet-timed operating rounds. Three
+/// nominal rounds is the product risk policy: at `p0 = 10%`, at most `0.3 * E` lost-byte
+/// displacement can be carried between classification boundaries. It bounds authorized burst
+/// placement, not response time. This is not a BBR draft constant and does not affect the generic
+/// zero-compensation controller.
+const COMPENSATED_LOSS_BURST_ROUNDS: f64 = 3.0;
+
 /// equivalent to BBR.Beta: A constant specifying the default multiplicative decrease to make upon each round trip during which the connection detects packet loss (the value is 0.7).
 const BETA: f64 = 0.7;
 
@@ -244,6 +251,56 @@ struct LossRoundEvidenceAnchor {
     send_time: Instant,
     delivered: u64,
     lost: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LossBudgetState {
+    balance: f64,
+    capacity: f64,
+}
+
+/// One actual packet-loss declaration retained long enough to classify it exactly once. The same
+/// record is referenced by the open BBR loss round and by the bounded compensated-loss journal, so
+/// persistent/unknown raw authority and late-ACK proof cannot disagree about cohort ownership.
+#[derive(Debug, Clone)]
+struct LossBudgetRecord {
+    id: u64,
+    transaction: Option<RecoveryTransactionId>,
+    bytes: u64,
+    space: SpaceId,
+    packet_number: u64,
+    send_time: Option<Instant>,
+    delivered: u64,
+    lost: u64,
+    tx_in_flight: u64,
+    exempt: bool,
+    budget_consumed: bool,
+    loss_round_open: bool,
+    raw_explicit: bool,
+    raw_unknown: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LossBudgetExemption {
+    Spurious,
+    Unknown,
+    Explicit,
+}
+
+/// One immutable packet-timed classification tuple. Journaling begins before the earliest loss
+/// that Quinn can still prove spurious and is discarded once neither an open raw-decision cohort
+/// nor a retained recovery transaction can change any recorded byte's class.
+#[derive(Debug, Clone)]
+struct LossBudgetEpoch {
+    delivered: u64,
+    anonymous_lost: u64,
+    record_ids: Vec<u64>,
+    is_app_limited: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LossBudgetUndoTransaction {
+    transaction: RecoveryTransactionId,
 }
 
 /// Description of a per-ack rate sample state that will allow us to determine a short term evolution of the connection
@@ -521,6 +578,47 @@ pub struct Bbr3 {
     /// Operator-authorized loss fraction corrected in aligned delivery and inflight evidence.
     /// Zero restores the draft BBR3 model; the MPTUNNEL default is 10%.
     loss_compensation_floor: f64,
+    /// Nonnegative carry-over credit for the configured aggregate loss boundary. Credit absorbs
+    /// authorized burst placement and clamps at `loss_budget_capacity`; excess loss never creates
+    /// historic debt that could delay later path recovery.
+    loss_budget_balance: f64,
+    /// Frozen excess-loss credit bound for the current aligned evidence epoch.
+    loss_budget_capacity: f64,
+    /// Cumulative controller counters consumed by the carry-over budget.
+    loss_budget_delivered: u64,
+    loss_budget_lost: u64,
+    /// Cumulative actual-loss bytes classified outside the ordinary compensated-loss budget.
+    /// This is diagnostic accounting; exact late reclassification is performed by journal replay
+    /// because token clamping and capacity rebasing are not algebraically invertible.
+    loss_budget_exempt_lost: u64,
+    /// Canonical retained loss records, the immutable budget epochs that reference them, and the
+    /// state immediately before the first retained epoch. This is bounded by Quinn's two-PTO loss
+    /// evidence lifetime plus the currently open BBR loss round.
+    loss_budget_records: VecDeque<LossBudgetRecord>,
+    loss_budget_epochs: VecDeque<LossBudgetEpoch>,
+    loss_budget_checkpoint: Option<LossBudgetState>,
+    loss_budget_next_record_id: u64,
+    /// Record IDs accumulated by the current Quinn loss callback batch. Persistence is learned
+    /// only in the closing callback, after all per-packet declarations.
+    loss_budget_current_batch: Vec<u64>,
+    /// A missing-snapshot loss may consume ProbeUP before the rest of the same Quinn callback
+    /// batch is delivered. Later declarations in that batch are covered by that one raw action
+    /// and must not open or charge a second loss round.
+    loss_budget_batch_raw_action_taken: bool,
+    /// Recovery transactions for which Quinn still retains one or more declared-loss packets.
+    loss_budget_undo_transactions: VecDeque<LossBudgetUndoTransaction>,
+    /// Raw-authority generation and predecessor state captured by the current native BBR undo
+    /// snapshot. Final older evidence is represented by the snapshot; an older cohort still
+    /// awaiting its native response or later explicit/unknown attribution makes restoration unsafe.
+    loss_budget_raw_authority_generation: u64,
+    undo_loss_budget_raw_authority_generation: u64,
+    undo_loss_budget_had_open_predecessor: bool,
+    /// Loss-range evidence aligned to the classification that set
+    /// `completed_loss_round_is_high`; consumed by Startup in the same controller transaction.
+    completed_loss_decision_events: u64,
+    /// Attributable ECN authority is independent of packet-loss records. Validated ambiguous ECN
+    /// abandons undo but does not manufacture exempt loss bytes.
+    ecn_congestion_in_round: bool,
     /// Attributable ECN or persistent congestion observed in the current loss round. Such evidence
     /// keeps congestion-control thresholds and actions raw; it does not disable the configured
     /// delivery-estimate correction.
@@ -530,10 +628,6 @@ pub struct Bbr3 {
     /// At least one loss in the current round could not be aligned to a retained packet snapshot.
     /// Unknown evidence always keeps the draft's conservative congestion response.
     loss_round_evidence_unknown: bool,
-    /// Size of the loss sample most recently evaluated while ProbeUP sampling was active. QUIC
-    /// reports persistent congestion only after per-packet loss callbacks, so this preserves the
-    /// exact sample needed to re-evaluate that batch with the raw threshold.
-    pending_probe_loss_packet_size: Option<u64>,
     /// equivalent to BBR.loss_events_in_round: count of discontiguous loss events
     /// observed in the current round trip, used by the STARTUP high-loss exit
     /// (BBRStartupFullLossCnt criterion). Reset at each loss-round boundary.
@@ -569,6 +663,13 @@ pub struct Bbr3 {
     prior_cwnd: u64,
     /// equivalent to BBR.loss_round_start: flag set to true at the very beginning of a round where loss occurred
     loss_round_start: bool,
+    /// Whether the loss round completed by the current ACK proved high loss after applying the
+    /// configured carry-over policy. This preserves the decision through evidence reset for the
+    /// later Startup check in the same controller transaction.
+    completed_loss_round_is_high: bool,
+    /// Test-only observer at the deterministic classification authority.
+    #[cfg(test)]
+    loss_budget_exhaustions: u64,
     /// equivalent to BBR.drain_start_round: The value of round_count when Drain state started.
     drain_start_round: u64,
     /// Number of ack-eliciting packets the peer may receive before sending an immediate ACK,
@@ -708,14 +809,33 @@ impl Bbr3 {
             loss_round_delivered: 0,
             loss_in_round: false,
             loss_compensation_floor: config.loss_compensation_floor,
+            loss_budget_balance: 0.0,
+            loss_budget_capacity: 0.0,
+            loss_budget_delivered: 0,
+            loss_budget_lost: 0,
+            loss_budget_exempt_lost: 0,
+            loss_budget_records: VecDeque::new(),
+            loss_budget_epochs: VecDeque::new(),
+            loss_budget_checkpoint: None,
+            loss_budget_next_record_id: 1,
+            loss_budget_current_batch: Vec::new(),
+            loss_budget_batch_raw_action_taken: false,
+            loss_budget_undo_transactions: VecDeque::new(),
+            loss_budget_raw_authority_generation: 0,
+            undo_loss_budget_raw_authority_generation: 0,
+            undo_loss_budget_had_open_predecessor: false,
+            completed_loss_decision_events: 0,
+            ecn_congestion_in_round: false,
             explicit_congestion_in_round: false,
             loss_round_evidence_anchor: None,
             loss_round_evidence_unknown: false,
-            pending_probe_loss_packet_size: None,
             probe_rtt_done_stamp: None,
             probe_rtt_round_done: false,
             prior_cwnd: 0,
             loss_round_start: false,
+            completed_loss_round_is_high: false,
+            #[cfg(test)]
+            loss_budget_exhaustions: 0,
             drain_start_round: 0,
             // Conservative defaults that match RFC 9000 §13.2.2 behavior (ACK every other
             // ack-eliciting packet) and the default QUIC `max_ack_delay` of 25ms. Overridden
@@ -728,7 +848,7 @@ impl Bbr3 {
     /// equivalent to BBRUpdateModelAndState <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.2.3>
     fn update_model_and_state(&mut self, p: BbrPacket, now: Instant) {
         self.update_latest_delivery_signals();
-        self.update_congestion_signals(p);
+        self.update_congestion_signals(p, now);
         self.update_ack_aggregation(now);
         self.check_full_bw_reached();
         self.check_startup_done();
@@ -743,12 +863,229 @@ impl Bbr3 {
     /// Loss boundary for bandwidth probing under an explicit sender-local loss policy.
     /// Compensated loss `p0` and the draft congestion objective `q` compose as
     /// `1 - (1 - p0) * (1 - q)`. Explicit ECN or persistent congestion bypasses compensation.
+    fn compensated_loss_boundary(&self) -> f64 {
+        1.0 - (1.0 - self.loss_compensation_floor) * (1.0 - LOSS_THRESH)
+    }
+
     fn effective_probe_loss_thresh(&self) -> f64 {
-        if self.loss_compensation_floor == 0.0 || self.explicit_congestion_in_round {
+        if self.loss_compensation_floor == 0.0
+            || self.explicit_congestion_in_round
+            || self.loss_round_evidence_unknown
+        {
             LOSS_THRESH
         } else {
-            1.0 - (1.0 - self.loss_compensation_floor) * (1.0 - LOSS_THRESH)
+            self.compensated_loss_boundary()
         }
+    }
+
+    fn loss_budget_record(&self, id: u64) -> Option<&LossBudgetRecord> {
+        let first = self.loss_budget_records.front()?.id;
+        let index = usize::try_from(id.checked_sub(first)?).ok()?;
+        self.loss_budget_records
+            .get(index)
+            .filter(|record| record.id == id)
+    }
+
+    fn loss_budget_epoch_loss(&self, epoch: &LossBudgetEpoch) -> Option<u64> {
+        epoch.record_ids.iter().try_fold(epoch.anonymous_lost, |lost, id| {
+            let record = self.loss_budget_record(*id)?;
+            if record.exempt {
+                Some(lost)
+            } else {
+                lost.checked_add(record.bytes)
+            }
+        })
+    }
+
+    fn loss_budget_epoch_initial_reference(&self, epoch: &LossBudgetEpoch) -> u64 {
+        epoch
+            .record_ids
+            .iter()
+            .filter_map(|id| self.loss_budget_record(*id))
+            .filter(|record| !record.exempt)
+            .filter_map(|record| {
+                record
+                    .send_time
+                    .map(|send_time| (send_time, record.delivered, record.lost, record.tx_in_flight))
+            })
+            .min_by_key(|(send_time, delivered, lost, _)| (*send_time, *delivered, *lost))
+            .map_or(self.initial_cwnd, |(_, _, _, tx_in_flight)| {
+                self.initial_cwnd.max(tx_in_flight)
+            })
+    }
+
+    fn advance_loss_budget_state(
+        &self,
+        mut state: LossBudgetState,
+        epoch: &LossBudgetEpoch,
+    ) -> Option<(LossBudgetState, bool)> {
+        let boundary = self.compensated_loss_boundary();
+        let initial_reference = self.loss_budget_epoch_initial_reference(epoch);
+        let initial_capacity = (1.0 - boundary)
+            * COMPENSATED_LOSS_BURST_ROUNDS
+            * self.loss_compensation_floor
+            * initial_reference as f64;
+        if !initial_capacity.is_finite() || initial_capacity <= 0.0 {
+            return None;
+        }
+        if state.capacity == 0.0 {
+            state.capacity = initial_capacity;
+            state.balance = initial_capacity;
+        }
+
+        let ordinary_lost = self.loss_budget_epoch_loss(epoch)?;
+        let raw_balance = state.balance + boundary * epoch.delivered as f64
+            - (1.0 - boundary) * ordinary_lost as f64;
+        let round_high = raw_balance < 0.0;
+        let reference_volume = epoch.delivered.checked_add(ordinary_lost)?;
+        if !epoch.is_app_limited && reference_volume > 0 {
+            let next_capacity = (1.0 - boundary)
+                * COMPENSATED_LOSS_BURST_ROUNDS
+                * self.loss_compensation_floor
+                * reference_volume as f64;
+            if !next_capacity.is_finite() || next_capacity <= 0.0 {
+                return None;
+            }
+            state.capacity = next_capacity;
+        }
+        state.balance = raw_balance.clamp(0.0, state.capacity);
+        Some((state, round_high))
+    }
+
+    fn loss_budget_record_events<'a>(
+        records: impl Iterator<Item = &'a LossBudgetRecord>,
+    ) -> u64 {
+        let mut packets: Vec<(usize, u64)> = records
+            .map(|record| (record.space as usize, record.packet_number))
+            .collect();
+        packets.sort_unstable();
+        packets.dedup();
+        let mut events = 0u64;
+        let mut previous: Option<(usize, u64)> = None;
+        for packet in packets {
+            if previous.is_none_or(|(space, number)| {
+                space != packet.0 || packet.1 != number.saturating_add(1)
+            }) {
+                events = events.saturating_add(1);
+            }
+            previous = Some(packet);
+        }
+        events
+    }
+
+    fn loss_budget_epoch_events(&self, epoch: &LossBudgetEpoch) -> u64 {
+        u64::from(epoch.anonymous_lost > 0)
+            + Self::loss_budget_record_events(
+                epoch
+                    .record_ids
+                    .iter()
+                    .filter_map(|id| self.loss_budget_record(*id))
+                    .filter(|record| !record.exempt),
+            )
+    }
+
+    fn open_loss_round_events(&self) -> u64 {
+        Self::loss_budget_record_events(
+            self.loss_budget_records
+                .iter()
+                .filter(|record| record.loss_round_open),
+        )
+    }
+
+    fn ensure_loss_budget_journal(&mut self) {
+        if self.loss_budget_checkpoint.is_none() {
+            self.loss_budget_checkpoint = Some(LossBudgetState {
+                balance: self.loss_budget_balance,
+                capacity: self.loss_budget_capacity,
+            });
+            self.loss_budget_epochs.clear();
+        }
+    }
+
+    fn replay_loss_budget_journal(&mut self) -> Option<()> {
+        let mut state = self.loss_budget_checkpoint?;
+        for epoch in &self.loss_budget_epochs {
+            state = self.advance_loss_budget_state(state, epoch)?.0;
+        }
+        self.loss_budget_balance = state.balance;
+        self.loss_budget_capacity = state.capacity;
+        Some(())
+    }
+
+    fn maybe_compact_loss_budget_journal(&mut self) {
+        let retained_transaction = !self.loss_budget_undo_transactions.is_empty();
+        let open_round = self
+            .loss_budget_records
+            .iter()
+            .any(|record| record.loss_round_open);
+        if retained_transaction || open_round || !self.loss_budget_current_batch.is_empty() {
+            return;
+        }
+        self.loss_budget_checkpoint = None;
+        self.loss_budget_epochs.clear();
+        self.loss_budget_records
+            .retain(|record| !record.budget_consumed);
+    }
+
+    /// Advance the deterministic carry-over allowance once for one completed, non-overlapping
+    /// packet-timed round. The aggregate boundary earns credit for every resolved byte and a lost
+    /// byte spends one unit. The unclamped value below zero is the exact policy crossing; stored
+    /// credit then clamps at zero, so the first recovered below-boundary round stops repeated
+    /// reductions instead of repaying historic debt.
+    ///
+    /// The public burst allowance is three rounds of `p0 * E` lost bytes, where `E` is frozen from
+    /// the preceding complete non-app-limited operating round. Because each lost byte also earns
+    /// `boundary` credit as part of resolved volume, internal excess-loss capacity is
+    /// `(1 - boundary) * H * p0 * E`. Capacity changes only at this boundary and never mint credit.
+    fn advance_compensated_loss_budget(&mut self, is_app_limited: bool) -> Option<bool> {
+        if self.loss_compensation_floor == 0.0 {
+            return None;
+        }
+        let delivered = self.delivered.checked_sub(self.loss_budget_delivered)?;
+        let lost = self.lost.checked_sub(self.loss_budget_lost)?;
+        let record_ids: Vec<u64> = self
+            .loss_budget_records
+            .iter()
+            .filter(|record| !record.budget_consumed)
+            .map(|record| record.id)
+            .collect();
+        let tracked_lost = record_ids.iter().try_fold(0u64, |total, id| {
+            total.checked_add(self.loss_budget_record(*id)?.bytes)
+        })?;
+        let epoch = LossBudgetEpoch {
+            delivered,
+            anonymous_lost: lost.checked_sub(tracked_lost)?,
+            record_ids: record_ids.clone(),
+            is_app_limited,
+        };
+        let current = LossBudgetState {
+            balance: self.loss_budget_balance,
+            capacity: self.loss_budget_capacity,
+        };
+        let (next, round_high) = self.advance_loss_budget_state(current, &epoch)?;
+        let completed_events = self.loss_budget_epoch_events(&epoch);
+
+        // Commit every cumulative baseline, record-consumption bit, journal tuple, and bucket state
+        // only after all checked arithmetic above succeeded.
+        self.loss_budget_delivered = self.delivered;
+        self.loss_budget_lost = self.lost;
+        for record in &mut self.loss_budget_records {
+            if !record.budget_consumed {
+                record.budget_consumed = true;
+            }
+        }
+        if self.loss_budget_checkpoint.is_some() {
+            self.loss_budget_epochs.push_back(epoch);
+        }
+        self.loss_budget_balance = next.balance;
+        self.loss_budget_capacity = next.capacity;
+        self.completed_loss_decision_events = completed_events;
+        #[cfg(test)]
+        if round_high {
+            self.loss_budget_exhaustions = self.loss_budget_exhaustions.saturating_add(1);
+        }
+        self.maybe_compact_loss_budget_journal();
+        Some(round_high)
     }
 
     /// Return the portion of this rate sample's observed loss that the configured floor can
@@ -819,6 +1156,194 @@ impl Bbr3 {
         self.loss_round_evidence_unknown = false;
     }
 
+    fn begin_loss_budget_transaction(&mut self, transaction: RecoveryTransactionId) {
+        if self.loss_compensation_floor == 0.0
+            || self
+                .loss_budget_undo_transactions
+                .iter()
+                .any(|entry| entry.transaction == transaction)
+        {
+            return;
+        }
+        self.ensure_loss_budget_journal();
+        self.loss_budget_undo_transactions
+            .push_back(LossBudgetUndoTransaction { transaction });
+    }
+
+    fn record_loss_budget_packet(
+        &mut self,
+        packet: Option<BbrPacket>,
+        transaction: Option<RecoveryTransactionId>,
+        bytes: u64,
+        space: SpaceId,
+        packet_number: u64,
+    ) -> u64 {
+        debug_assert!(self.loss_compensation_floor > 0.0);
+        self.ensure_loss_budget_journal();
+        let id = self.loss_budget_next_record_id;
+        self.loss_budget_next_record_id = self
+            .loss_budget_next_record_id
+            .checked_add(1)
+            .expect("BBR3 loss-budget record identity exhausted");
+        let (send_time, delivered, lost, tx_in_flight) = packet.map_or(
+            (None, 0, 0, 0),
+            |packet| {
+                (
+                    Some(packet.send_time),
+                    packet.delivered,
+                    packet.lost,
+                    packet.tx_in_flight,
+                )
+            },
+        );
+        let covered_by_raw_batch = self.loss_budget_batch_raw_action_taken;
+        let raw_explicit = self.explicit_congestion_in_round;
+        let raw_unknown = self.loss_round_evidence_unknown || covered_by_raw_batch;
+        let exempt = raw_explicit || raw_unknown;
+        self.loss_budget_records.push_back(LossBudgetRecord {
+            id,
+            transaction,
+            bytes,
+            space,
+            packet_number,
+            send_time,
+            delivered,
+            lost,
+            tx_in_flight,
+            exempt,
+            budget_consumed: false,
+            loss_round_open: !covered_by_raw_batch,
+            raw_explicit,
+            raw_unknown,
+        });
+        if exempt {
+            self.loss_budget_exempt_lost = self.loss_budget_exempt_lost.saturating_add(bytes);
+        }
+        self.loss_budget_current_batch.push(id);
+        id
+    }
+
+    fn exempt_loss_budget_records(
+        &mut self,
+        record_ids: &[u64],
+        authority: LossBudgetExemption,
+    ) {
+        if self.loss_compensation_floor == 0.0 || record_ids.is_empty() {
+            return;
+        }
+        debug_assert!(record_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut newly_exempt = 0u64;
+        let mut replay = false;
+        let mut raw_authority_changed = false;
+        let mut ids = record_ids.iter().copied().peekable();
+        for record in &mut self.loss_budget_records {
+            while ids.peek().is_some_and(|id| *id < record.id) {
+                ids.next();
+            }
+            if ids.peek().copied() != Some(record.id) {
+                continue;
+            }
+            ids.next();
+            match authority {
+                LossBudgetExemption::Spurious => {}
+                LossBudgetExemption::Unknown => {
+                    raw_authority_changed |= !record.raw_unknown;
+                    record.raw_unknown = true;
+                }
+                LossBudgetExemption::Explicit => {
+                    raw_authority_changed |= !record.raw_explicit;
+                    record.raw_explicit = true;
+                }
+            }
+            if !record.exempt {
+                record.exempt = true;
+                newly_exempt = newly_exempt.saturating_add(record.bytes);
+                replay |= record.budget_consumed;
+            }
+        }
+        if raw_authority_changed {
+            self.loss_budget_raw_authority_generation = self
+                .loss_budget_raw_authority_generation
+                .checked_add(1)
+                .expect("BBR3 raw loss-authority generation exhausted");
+        }
+        self.loss_budget_exempt_lost = self
+            .loss_budget_exempt_lost
+            .saturating_add(newly_exempt);
+        if replay {
+            let replayed = self.replay_loss_budget_journal();
+            debug_assert!(replayed.is_some(), "consumed loss must have a replay checkpoint");
+        }
+    }
+
+    fn exempt_open_loss_round(&mut self, authority: LossBudgetExemption) {
+        let record_ids: Vec<u64> = self
+            .loss_budget_records
+            .iter()
+            .filter(|record| record.loss_round_open)
+            .map(|record| record.id)
+            .collect();
+        self.exempt_loss_budget_records(&record_ids, authority);
+    }
+
+    fn recompute_open_loss_round(&mut self) {
+        if self.loss_compensation_floor == 0.0 {
+            return;
+        }
+        let open: Vec<&LossBudgetRecord> = self
+            .loss_budget_records
+            .iter()
+            .filter(|record| record.loss_round_open)
+            .collect();
+        self.loss_in_round = !open.is_empty();
+        self.loss_round_evidence_unknown = open.iter().any(|record| record.send_time.is_none());
+        self.loss_round_evidence_anchor = open
+            .iter()
+            .filter_map(|record| {
+                record.send_time.map(|send_time| LossRoundEvidenceAnchor {
+                    send_time,
+                    delivered: record.delivered,
+                    lost: record.lost,
+                })
+            })
+            .min_by_key(|anchor| (anchor.send_time, anchor.delivered, anchor.lost));
+        self.explicit_congestion_in_round = self.ecn_congestion_in_round
+            || open.iter().any(|record| record.raw_explicit);
+
+        let mut packets: Vec<(usize, u64)> = open
+            .iter()
+            .map(|record| (record.space as usize, record.packet_number))
+            .collect();
+        packets.sort_unstable();
+        packets.dedup();
+        self.loss_events_in_round = 0;
+        let mut previous: Option<(usize, u64)> = None;
+        for packet in packets {
+            if previous.is_none_or(|(space, number)| {
+                space != packet.0 || packet.1 != number.saturating_add(1)
+            }) {
+                self.loss_events_in_round = self.loss_events_in_round.saturating_add(1);
+            }
+            previous = Some(packet);
+        }
+        self.last_lost_packet = open
+            .iter()
+            .max_by_key(|record| record.id)
+            .map(|record| (record.space, record.packet_number));
+    }
+
+    fn close_open_loss_round(&mut self) {
+        if self.loss_compensation_floor == 0.0 {
+            return;
+        }
+        for record in &mut self.loss_budget_records {
+            record.loss_round_open = false;
+        }
+        self.ecn_congestion_in_round = false;
+        self.recompute_open_loss_round();
+        self.maybe_compact_loss_budget_journal();
+    }
+
     /// Whether the aggregate evidence interval for the current loss round requires a congestion
     /// response. A configured floor composes with the draft objective; explicit congestion and
     /// missing or unalignable evidence retain the conservative draft response. Both ProbeUP and
@@ -834,24 +1359,15 @@ impl Bbr3 {
         let Some(anchor) = self.loss_round_evidence_anchor else {
             return true;
         };
-        let Some(delivered) = self.delivered.checked_sub(anchor.delivered) else {
-            return true;
-        };
-        let Some(lost) = self.lost.checked_sub(anchor.lost) else {
-            return true;
-        };
-        let Some(volume) = delivered.checked_add(lost) else {
-            return true;
-        };
-        if lost == 0 || volume == 0 {
-            return true;
-        }
-        lost as f64 > self.effective_probe_loss_thresh() * volume as f64
+        let aligned = self.delivered >= anchor.delivered && self.lost >= anchor.lost;
+        !aligned
     }
 
     /// equivalent to BBRUpdateLatestDeliverySignals <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
     fn update_latest_delivery_signals(&mut self) {
         self.loss_round_start = false;
+        self.completed_loss_round_is_high = false;
+        self.completed_loss_decision_events = 0;
         if let Some(rate_sample) = self.rs {
             self.bw_latest = [self.bw_latest, self.model_delivery_rate(rate_sample)]
                 .iter()
@@ -868,15 +1384,50 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRUpdateCongestionSignals <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
-    fn update_congestion_signals(&mut self, p: BbrPacket) {
+    fn update_congestion_signals(&mut self, p: BbrPacket, now: Instant) {
         self.update_max_bw(p);
-        if !self.loss_round_start {
-            return;
+        let mut budget_high = false;
+        let mut budget_is_app_limited = false;
+        if self.round_start && self.loss_compensation_floor > 0.0 {
+            budget_is_app_limited = self.rs.is_some_and(|sample| sample.is_app_limited);
+            budget_high = self
+                .advance_compensated_loss_budget(budget_is_app_limited)
+                .unwrap_or(true);
+            self.completed_loss_round_is_high = budget_high;
         }
-        self.adapt_lower_bounds_from_congestion();
-        self.loss_in_round = false;
-        self.explicit_congestion_in_round = false;
-        self.clear_loss_round_evidence();
+        let requires_raw_response = if self.loss_round_start {
+            let raw_loss_round = self.loss_compensation_floor == 0.0
+                || self.explicit_congestion_in_round
+                || self.loss_round_evidence_unknown;
+            self.loss_in_round
+                && raw_loss_round
+                && self.loss_round_requires_congestion_response()
+        } else {
+            false
+        };
+        if requires_raw_response {
+            if self.is_inflight_too_high() {
+                self.completed_loss_round_is_high = true;
+                // Packet-number spaces are independently ordered. Count canonical open records
+                // at the decision boundary instead of treating callback interleaving as ranges.
+                self.completed_loss_decision_events = self.open_loss_round_events();
+            }
+        }
+        if budget_high || requires_raw_response {
+            // One immutable decision tuple produces at most one lower-bound action. Raw authority
+            // takes precedence, while a still-active ProbeUP consumes the completed compensated
+            // decision through its deterministic beta-scaled target.
+            self.adapt_lower_bounds_from_congestion(true);
+        }
+        if budget_high {
+            self.apply_compensated_probe_response(now, budget_is_app_limited);
+        }
+        if self.loss_round_start {
+            self.close_open_loss_round();
+            self.loss_in_round = false;
+            self.explicit_congestion_in_round = false;
+            self.clear_loss_round_evidence();
+        }
     }
 
     /// equivalent to BBRUpdateMaxBw <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.5>
@@ -912,13 +1463,13 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRAdaptLowerBoundsFromCongestion <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
-    fn adapt_lower_bounds_from_congestion(&mut self) {
+    fn adapt_lower_bounds_from_congestion(&mut self, requires_response: bool) {
         match self.state {
             BbrState::ProbeBw(ProbeBwSubstate::Refill)
             | BbrState::ProbeBw(ProbeBwSubstate::Up)
             | BbrState::Startup => {}
             _ => {
-                if self.loss_in_round && self.loss_round_requires_congestion_response() {
+                if requires_response {
                     self.init_lower_bounds();
                     self.loss_lower_bounds();
                 }
@@ -1024,16 +1575,25 @@ impl Bbr3 {
         if self.full_bw_reached {
             return;
         }
+        let decision_events = if self.loss_compensation_floor == 0.0 {
+            self.loss_events_in_round
+        } else {
+            self.completed_loss_decision_events
+        };
+        let decision_is_high = if self.loss_compensation_floor == 0.0 {
+            self.is_inflight_too_high()
+        } else {
+            self.completed_loss_round_is_high
+        };
 
         // All three criteria of section 5.3.1.3 must hold: at least one full packet-timed round
         // trip spent in fast recovery, a round-trip loss rate above `LOSS_THRESH`
         // (`is_inflight_too_high`), and at least `STARTUP_FULL_LOSS_CNT` discontiguous lost
         // sequence ranges within that round trip.
         if self.state == BbrState::Startup
-            && self.loss_round_start
             && self.in_recovery_for_a_full_round()
-            && self.loss_events_in_round >= STARTUP_FULL_LOSS_CNT
-            && self.is_inflight_too_high()
+            && decision_events >= STARTUP_FULL_LOSS_CNT
+            && decision_is_high
         {
             // This marker is deliberately set only for the loss-induced
             // Startup exit. A bandwidth-plateau exit must not be undone by a
@@ -1050,7 +1610,7 @@ impl Bbr3 {
             self.full_bw_now = true;
         }
 
-        if self.loss_round_start {
+        if self.loss_round_start && self.loss_compensation_floor == 0.0 {
             self.loss_events_in_round = 0;
             self.last_lost_packet = None;
         }
@@ -1824,16 +2384,32 @@ impl Bbr3 {
         packet_index: usize,
         space: SpaceId,
         now: Instant,
+        actual_loss: bool,
     ) -> Option<RecoveryTransactionId> {
         let p = self.packets[space as usize][packet_index];
         if self.enter_recovery(now, p.send_time) {
             self.save_state_upon_loss();
         }
+        let transaction = (self.undo_transaction == self.recovery_transaction)
+            .then_some(self.undo_transaction)
+            .flatten();
+        let covered_by_raw_batch =
+            self.loss_compensation_floor > 0.0 && self.loss_budget_batch_raw_action_taken;
+        if self.loss_compensation_floor > 0.0 && actual_loss {
+            self.record_loss_budget_packet(
+                Some(p),
+                transaction,
+                p.size as u64,
+                space,
+                p.packet_number,
+            );
+        }
+        if covered_by_raw_batch {
+            self.packets[space as usize].remove(packet_index);
+            return self.undo_transaction;
+        }
         self.record_loss_round_evidence(p);
         self.note_loss(space, p.packet_number);
-        if self.loss_compensation_floor > 0.0 && self.bw_probe_samples {
-            self.pending_probe_loss_packet_size = Some(p.size as u64);
-        }
         if !self.bw_probe_samples {
             self.packets[space as usize].remove(packet_index);
             return self.undo_transaction;
@@ -1843,10 +2419,16 @@ impl Bbr3 {
             rate_sample.lost = self.lost.saturating_sub(p.lost);
             rate_sample.is_app_limited = p.is_app_limited;
             self.rs = Some(rate_sample);
-            if self.loss_round_requires_congestion_response() && self.is_inflight_too_high() {
-                rate_sample.tx_in_flight = self.inflight_at_loss(p.size as u64);
-                self.rs = Some(rate_sample);
-                self.handle_inflight_too_high(now);
+            if self.is_inflight_too_high() {
+                let inflight_at_loss = self.inflight_at_loss(p.size as u64);
+                let raw_authority = self.loss_compensation_floor == 0.0
+                    || self.explicit_congestion_in_round
+                    || self.loss_round_evidence_unknown;
+                if raw_authority {
+                    rate_sample.tx_in_flight = inflight_at_loss;
+                    self.rs = Some(rate_sample);
+                    self.handle_inflight_too_high(now);
+                }
             }
         }
         self.packets[space as usize].remove(packet_index);
@@ -1887,6 +2469,15 @@ impl Bbr3 {
         self.undo_bw_shortterm = self.bw_shortterm;
         self.undo_inflight_shortterm = self.inflight_shortterm;
         self.undo_inflight_longterm = self.inflight_longterm;
+        self.undo_loss_budget_raw_authority_generation =
+            self.loss_budget_raw_authority_generation;
+        self.undo_loss_budget_had_open_predecessor = self
+            .loss_budget_records
+            .iter()
+            .any(|record| record.loss_round_open);
+        if let Some(transaction) = self.undo_transaction {
+            self.begin_loss_budget_transaction(transaction);
+        }
     }
 
     /// equivalent to IsInflightTooHigh <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-1>
@@ -1896,6 +2487,16 @@ impl Bbr3 {
                 > rate_sample.tx_in_flight as f64 * self.effective_probe_loss_thresh();
         }
         false
+    }
+
+    /// Apply one completed-round compensated-loss decision during ProbeUP. The population policy
+    /// has no authoritative per-packet crossing point, so it uses the draft's beta-scaled target
+    /// rather than retaining an open-round sample that can outlive its evidence epoch.
+    fn apply_compensated_probe_response(&mut self, now: Instant, is_app_limited: bool) {
+        if !self.bw_probe_samples {
+            return;
+        }
+        self.handle_inflight_too_high_with_sample(now, 0, is_app_limited);
     }
 
     /// equivalent to BBRInflightAtLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-11>
@@ -1913,15 +2514,29 @@ impl Bbr3 {
 
     /// equivalent to BBRHandleInflightTooHigh <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-1>
     fn handle_inflight_too_high(&mut self, now: Instant) {
+        let Some(rate_sample) = self.rs else {
+            return;
+        };
+        self.handle_inflight_too_high_with_sample(
+            now,
+            rate_sample.tx_in_flight,
+            rate_sample.is_app_limited,
+        );
+    }
+
+    fn handle_inflight_too_high_with_sample(
+        &mut self,
+        now: Instant,
+        tx_in_flight: u64,
+        is_app_limited: bool,
+    ) {
         self.prev_probe_too_high = true;
         self.bw_probe_samples = false;
-        if let Some(rate_sample) = self.rs {
-            if !rate_sample.is_app_limited {
-                self.inflight_longterm = Ord::max(
-                    rate_sample.tx_in_flight,
-                    (self.target_inflight() as f64 * BETA) as u64,
-                );
-            }
+        if !is_app_limited {
+            self.inflight_longterm = Ord::max(
+                tx_in_flight,
+                (self.target_inflight() as f64 * BETA) as u64,
+            );
         }
 
         if self.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
@@ -1964,6 +2579,7 @@ impl Bbr3 {
         // A ProbeUP decision consumes this loss round. Persistence reported later may re-evaluate
         // its retained probe sample with the raw threshold, but must not resurrect the consumed
         // round and apply a second short-term response.
+        self.close_open_loss_round();
         self.loss_in_round = false;
         self.explicit_congestion_in_round = false;
         self.clear_loss_round_evidence();
@@ -2226,16 +2842,20 @@ impl Controller for Bbr3 {
         largest_lost: u64,
         space: SpaceId,
     ) {
-        let pending_probe_loss_packet_size = self.pending_probe_loss_packet_size.take();
         if self.loss_compensation_floor > 0.0 {
             if is_ecn {
+                self.ecn_congestion_in_round = true;
                 self.explicit_congestion_in_round = true;
+                self.exempt_open_loss_round(LossBudgetExemption::Explicit);
             }
             if is_persistent_congestion {
-                // Quinn reports persistence after all per-packet callbacks. This flag makes the
-                // pending ProbeUP sample use the raw threshold and makes any still-active loss
-                // round undiscounted. It does not recreate a round already consumed by ProbeUP.
+                // Quinn reports persistence after all per-packet callbacks. Make the complete
+                // batch and any still-active loss round undiscounted. A ProbeUP round already
+                // consumed below is not recreated.
                 self.explicit_congestion_in_round = true;
+                let batch = self.loss_budget_current_batch.clone();
+                self.exempt_loss_budget_records(&batch, LossBudgetExemption::Explicit);
+                self.exempt_open_loss_round(LossBudgetExemption::Explicit);
             }
         }
         // only process ecn here, regular packet loss is detected per packet in on_packet_lost.
@@ -2244,22 +2864,15 @@ impl Controller for Bbr3 {
             let p_index_result = self.packets[space as usize]
                 .binary_search_by_key(&largest_lost, |p| p.packet_number);
             if let Ok(p_index) = p_index_result {
-                self.process_lost_packet(p_index, space, now);
+                self.process_lost_packet(p_index, space, now, false);
             }
         }
         if is_persistent_congestion {
-            // QUIC learns persistence after on_packet_lost. Re-evaluate the exact retained ProbeUP
-            // sample with the raw threshold now that this batch cannot be attributed to the floor.
-            if self.loss_compensation_floor > 0.0 {
-                if let Some(packet_size) = pending_probe_loss_packet_size {
-                    if self.is_inflight_too_high() {
-                        if let Some(mut rate_sample) = self.rs {
-                            rate_sample.tx_in_flight = self.inflight_at_loss(packet_size);
-                            self.rs = Some(rate_sample);
-                        }
-                        self.handle_inflight_too_high(now);
-                    }
-                }
+            // RFC 9002 persistence is authoritative independently of the last per-packet sample.
+            // One persistent batch therefore always terminates an active bandwidth probe; using
+            // the last callback's diluted sample would make the outcome callback-order dependent.
+            if self.loss_compensation_floor > 0.0 && self.bw_probe_samples {
+                self.handle_inflight_too_high_with_sample(now, 0, false);
             }
             self.cwnd = self.min_pipe_cwnd;
         }
@@ -2271,11 +2884,16 @@ impl Controller for Bbr3 {
             // a retained packet. The flag was needed only for raw processing in this callback;
             // retaining it would taint an unrelated later loss round.
             self.explicit_congestion_in_round = false;
+            self.ecn_congestion_in_round = false;
             self.clear_loss_round_evidence();
         }
         // Every real loss batch ends with this callback. ECN processing above may have populated a
         // new pending sample, but ECN was already evaluated with the raw threshold.
-        self.pending_probe_loss_packet_size = None;
+        self.loss_budget_current_batch.clear();
+        self.loss_budget_batch_raw_action_taken = false;
+        if !self.loss_in_round {
+            self.maybe_compact_loss_budget_journal();
+        }
     }
 
     fn on_packet_lost(
@@ -2291,14 +2909,26 @@ impl Controller for Bbr3 {
         let p_index_result =
             self.packets[space as usize].binary_search_by_key(&packet_number, |p| p.packet_number);
         if let Ok(p_index) = p_index_result {
-            return self.process_lost_packet(p_index, space, now);
+            return self.process_lost_packet(p_index, space, now, true);
         }
         if self.loss_compensation_floor > 0.0 {
             // The transport owns this loss callback, but BBR no longer retains the packet's paired
             // delivery counters. Start/extend the loss round and force its conservative response;
             // omission of the extension preserves the draft's original missing-packet behavior.
+            self.record_loss_budget_packet(
+                None,
+                None,
+                lost_bytes_64,
+                space,
+                packet_number,
+            );
             self.loss_round_evidence_unknown = true;
             self.note_loss(space, packet_number);
+            self.exempt_open_loss_round(LossBudgetExemption::Unknown);
+            if self.bw_probe_samples {
+                self.loss_budget_batch_raw_action_taken = true;
+                self.handle_inflight_too_high_with_sample(now, 0, false);
+            }
         }
         None
     }
@@ -2306,15 +2936,56 @@ impl Controller for Bbr3 {
     /// equivalent to BBRHandleSpuriousLossDetection:
     /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.5.11.2>
     fn on_spurious_congestion_event(&mut self, transaction: RecoveryTransactionId) -> bool {
-        if self.undo_transaction != Some(transaction) {
+        let budget_transaction = self
+            .loss_budget_undo_transactions
+            .iter()
+            .any(|entry| entry.transaction == transaction);
+        let unrelated_open_evidence = self.loss_budget_records.iter().any(|record| {
+            record.loss_round_open && record.transaction != Some(transaction)
+        });
+        let newer_raw_authority = self.loss_budget_raw_authority_generation
+            != self.undo_loss_budget_raw_authority_generation;
+        if budget_transaction {
+            let record_ids: Vec<u64> = self
+                .loss_budget_records
+                .iter()
+                .filter(|record| record.transaction == Some(transaction))
+                .map(|record| record.id)
+                .collect();
+            self.exempt_loss_budget_records(&record_ids, LossBudgetExemption::Spurious);
+            for record in &mut self.loss_budget_records {
+                if record.transaction == Some(transaction) {
+                    record.transaction = None;
+                    record.loss_round_open = false;
+                }
+            }
+            self.loss_budget_undo_transactions
+                .retain(|entry| entry.transaction != transaction);
+            self.recompute_open_loss_round();
+            self.maybe_compact_loss_budget_journal();
+        }
+
+        if self.undo_transaction != Some(transaction)
+            || unrelated_open_evidence
+            || newer_raw_authority
+            || self.undo_loss_budget_had_open_predecessor
+        {
+            if self.undo_transaction == Some(transaction) {
+                // The proof is valid, but same-ACK loss/unknown evidence now owns newer native
+                // state. Discard the obsolete snapshot without rolling that unrelated response
+                // back; budget reclassification above remains exact and independent.
+                self.undo_transaction = None;
+                self.undo_state = None;
+            }
             return false;
         }
         self.cancel_spurious_max_bw_advance(transaction);
         self.restore_cwnd();
-        self.loss_in_round = false;
-        self.explicit_congestion_in_round = false;
-        self.clear_loss_round_evidence();
-        self.pending_probe_loss_packet_size = None;
+        if self.loss_compensation_floor == 0.0 {
+            self.loss_in_round = false;
+            self.explicit_congestion_in_round = false;
+            self.clear_loss_round_evidence();
+        }
         self.reset_full_bw();
         self.bw_shortterm = [self.bw_shortterm, self.undo_bw_shortterm]
             .iter()
@@ -2346,6 +3017,11 @@ impl Controller for Bbr3 {
     }
 
     fn on_recovery_transaction_abandoned(&mut self, transaction: RecoveryTransactionId) {
+        self.loss_budget_undo_transactions
+            .retain(|entry| entry.transaction != transaction);
+        if !self.loss_in_round {
+            self.maybe_compact_loss_budget_journal();
+        }
         if self.undo_transaction == Some(transaction) {
             self.undo_transaction = None;
             self.undo_state = None;
@@ -2356,6 +3032,10 @@ impl Controller for Bbr3 {
         // CE is genuine congestion evidence, not proof that a packet-loss declaration was
         // spurious. This runs after any attributable ECN loss processing, so it also makes a
         // newly-created CE recovery snapshot ineligible for late-loss undo.
+        self.loss_budget_undo_transactions.clear();
+        if !self.loss_in_round {
+            self.maybe_compact_loss_budget_journal();
+        }
         self.undo_transaction = None;
         self.undo_state = None;
     }
@@ -3627,7 +4307,7 @@ mod test {
 
         assert!(bbr.enter_recovery(now, first_sent));
         bbr.save_state_upon_loss();
-        bbr.handle_inflight_too_high(now);
+        bbr.handle_inflight_too_high_with_sample(now, 0, false);
         assert_eq!(bbr.undo_state, Some(BbrState::ProbeBw(ProbeBwSubstate::Up)));
 
         // A later packet declaration from the same RFC 9002 recovery episode
@@ -5221,6 +5901,9 @@ mod test {
 
         assert_eq!(bbr.rs.expect("boundary rate sample").lost, 0);
         assert_eq!(bbr.bw_shortterm, f64::INFINITY);
+        assert_eq!(bbr.loss_budget_exhaustions, 0);
+        assert_eq!(bbr.loss_budget_delivered, bbr.delivered);
+        assert_eq!(bbr.loss_budget_lost, bbr.lost);
         assert!(!bbr.loss_in_round);
         assert_eq!(bbr.loss_round_evidence_anchor, None);
         assert!(!bbr.loss_round_evidence_unknown);
@@ -5327,7 +6010,7 @@ mod test {
     }
 
     #[test]
-    fn loss_floor_probe_up_responds_after_aligned_round_exceeds_threshold() {
+    fn loss_floor_probe_up_responds_only_after_completed_budget_exhaustion() {
         const PACKETS: u64 = 20;
         let base = Instant::now();
         let ack_at = base + Duration::from_millis(100);
@@ -5354,17 +6037,18 @@ mod test {
         bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
         bbr.bw_probe_samples = true;
         bbr.inflight_longterm = u64::MAX;
+        assert!(bbr.loss_budget_capacity > 0.0);
+        bbr.loss_budget_balance = 0.0;
 
         bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Data, ack_at);
         assert!(!bbr.loss_round_requires_congestion_response());
         assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
 
-        // The second loss makes the aligned interval 2/20=10%, above p_eff=6.9%; only now may
-        // the existing per-P ProbeUP response derive a finite cap and leave Up.
+        // Even though the second loss makes the open interval 2/20=10%, above p_eff=6.9%, the
+        // callback must not act on an open-round point estimate. Classification and the
+        // deterministic beta response belong to the completed non-overlapping budget round.
         bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, ack_at);
-        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
-        assert!(bbr.inflight_longterm < u64::MAX);
-        assert!(bbr.prev_probe_too_high);
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
 
         bbr.on_congestion_event(
             ack_at,
@@ -5375,6 +6059,34 @@ mod test {
             1,
             SpaceId::Data,
         );
+
+        let boundary_packet = PACKETS;
+        let boundary_sent = ack_at + Duration::from_millis(1);
+        bbr.on_packet_sent(
+            boundary_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            boundary_packet,
+            SpaceId::Data,
+        );
+        ack_test_packet(
+            &mut bbr,
+            &rtt,
+            boundary_sent + Duration::from_millis(100),
+            boundary_sent,
+            boundary_packet,
+        );
+        bbr.on_end_acks(
+            boundary_sent + Duration::from_millis(100),
+            0,
+            false,
+            Some(boundary_packet),
+            SpaceId::Data,
+        );
+
+        assert_eq!(bbr.loss_budget_exhaustions, 1);
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert!(bbr.inflight_longterm < u64::MAX);
+        assert!(bbr.prev_probe_too_high);
     }
 
     #[test]
@@ -5449,7 +6161,7 @@ mod test {
     }
 
     #[test]
-    fn loss_floor_persistent_callback_rechecks_raw_probe_without_resurrecting_round() {
+    fn loss_floor_persistent_callback_terminates_probe_without_resurrecting_round() {
         const PACKETS: u64 = 20;
         let base = Instant::now();
         let ack_at = base + Duration::from_millis(100);
@@ -5487,7 +6199,7 @@ mod test {
         assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
         assert!(bbr.loss_in_round);
         assert!(!bbr.loss_round_requires_congestion_response());
-        let relaxed_inflight_at_loss = bbr.rs.expect("relaxed ProbeUP sample").tx_in_flight;
+        let persistent_target = (bbr.target_inflight() as f64 * BETA) as u64;
 
         // Quinn supplies persistence only after the per-packet callbacks and batch response.
         bbr.on_congestion_event(
@@ -5501,14 +6213,10 @@ mod test {
         );
         assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
         assert_eq!(bbr.cwnd, bbr.min_pipe_cwnd);
-        assert!(
-            bbr.rs.expect("raw persistent sample").tx_in_flight < relaxed_inflight_at_loss,
-            "persistence must re-evaluate the retained ProbeUP sample at the raw threshold"
-        );
+        assert_eq!(bbr.inflight_longterm, persistent_target);
         assert!(!bbr.explicit_congestion_in_round);
         assert!(!bbr.loss_in_round);
         assert!(!bbr.loss_round_evidence_unknown);
-        assert_eq!(bbr.pending_probe_loss_packet_size, None);
 
         let boundary_packet = PACKETS;
         let boundary_sent = ack_at + Duration::from_millis(1);
@@ -5544,6 +6252,81 @@ mod test {
     }
 
     #[test]
+    fn loss_floor_persistent_probe_up_is_not_diluted_by_last_sample() {
+        const PACKETS: u64 = 100;
+        let base = Instant::now();
+        let ack_at = base + Duration::from_millis(100);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+        let mut bbr = Bbr3::new(
+            Arc::new(mptunnel_loss_profile_config()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        send_test_flight(&mut bbr, base, PACKETS);
+
+        // Retain packet 9 and packet 99 for one loss callback. Their send snapshots make the
+        // first loss a 1/10 raw-threshold crossing and the final loss only 2/100, exactly at the
+        // strict raw threshold. Both remain below the composed 11.8% ordinary-loss objective.
+        for packet_number in 0..PACKETS - 1 {
+            if packet_number != 9 {
+                ack_test_packet(
+                    &mut bbr,
+                    &rtt,
+                    ack_at,
+                    base + Duration::from_micros(packet_number),
+                    packet_number,
+                );
+            }
+        }
+        bbr.on_end_acks(
+            ack_at,
+            2 * BASE_DATAGRAM_SIZE,
+            false,
+            Some(PACKETS - 2),
+            SpaceId::Data,
+        );
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr.bw_probe_samples = true;
+
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 9, SpaceId::Data, ack_at);
+        let first_sample = bbr.rs.expect("first retained loss sample");
+        assert!(
+            first_sample.lost as f64 > first_sample.tx_in_flight as f64 * LOSS_THRESH,
+            "the first loss must cross the raw ProbeUP threshold"
+        );
+        assert!(
+            !bbr.is_inflight_too_high(),
+            "ordinary loss must remain below the composed objective"
+        );
+
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 99, SpaceId::Data, ack_at);
+        let final_sample = bbr.rs.expect("diluted final loss sample");
+        assert!(
+            final_sample.lost as f64
+                <= final_sample.tx_in_flight as f64 * LOSS_THRESH,
+            "the final sample must not independently cross the raw threshold"
+        );
+        assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+
+        bbr.on_congestion_event(
+            ack_at,
+            base + Duration::from_micros(PACKETS - 1),
+            true,
+            false,
+            2 * BASE_DATAGRAM_SIZE,
+            PACKETS - 1,
+            SpaceId::Data,
+        );
+
+        assert_eq!(
+            bbr.state,
+            BbrState::ProbeBw(ProbeBwSubstate::Down),
+            "persistent authority must terminate ProbeUP for the batch even when its final sample is diluted"
+        );
+        assert!(bbr.prev_probe_too_high);
+        assert!(!bbr.bw_probe_samples);
+    }
+
+    #[test]
     fn loss_floor_explicit_control_stays_raw_while_delivery_model_stays_corrected() {
         let now = Instant::now();
         let mut model = loss_floor_test_controller();
@@ -5559,6 +6342,15 @@ mod test {
         model.update_latest_delivery_signals();
         assert_eq!(model.inflight_latest, 100 * BASE_DATAGRAM_SIZE);
         assert!(model.bw_latest > sample.delivery_rate);
+        model.delivered = sample.delivered;
+        model.lost = sample.lost;
+        assert_eq!(model.advance_compensated_loss_budget(false), Some(false));
+        let composed_boundary = model.compensated_loss_boundary();
+        let expected_capacity = (1.0 - composed_boundary)
+            * COMPENSATED_LOSS_BURST_ROUNDS
+            * model.loss_compensation_floor
+            * (sample.delivered + sample.lost) as f64;
+        assert!((model.loss_budget_capacity - expected_capacity).abs() < f64::EPSILON);
 
         // Quinn reports an attributable ECN event with zero lost bytes. Loss compensation must not
         // manufacture a packet loss or retain an exemption across that native callback. The
@@ -5589,9 +6381,10 @@ mod test {
         assert!(bbr.loss_round_evidence_unknown);
         assert_eq!(bbr.loss_round_evidence_anchor, None);
         assert!(bbr.loss_round_requires_congestion_response());
+        assert_eq!(bbr.effective_probe_loss_thresh(), LOSS_THRESH);
 
         bbr.loss_round_start = true;
-        bbr.update_congestion_signals(max_bw_epoch_sample(now, false).last_packet);
+        bbr.update_congestion_signals(max_bw_epoch_sample(now, false).last_packet, now);
         assert!(bbr.bw_shortterm.is_finite());
         assert!(!bbr.loss_in_round);
         assert!(!bbr.loss_round_evidence_unknown);
@@ -5600,12 +6393,170 @@ mod test {
         unaligned_ecn.on_congestion_event(now, now, false, true, 0, 999, SpaceId::Data);
         assert!(!unaligned_ecn.loss_in_round);
         assert!(!unaligned_ecn.explicit_congestion_in_round);
+        assert!(!unaligned_ecn.ecn_congestion_in_round);
 
         let mut zero = Bbr3::new(Arc::new(draft_bbr3_config()), BASE_DATAGRAM_SIZE as u16);
         zero.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 999, SpaceId::Data, now);
         assert!(!zero.loss_in_round);
         assert!(!zero.loss_round_evidence_unknown);
         assert_eq!(zero.loss_round_evidence_anchor, None);
+    }
+
+    #[test]
+    fn raw_startup_loss_ranges_are_independent_across_packet_number_spaces() {
+        let base = Instant::now();
+        let now = base + Duration::from_millis(100);
+        let mut bbr = loss_floor_test_controller();
+
+        bbr.on_packet_sent(
+            base,
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        bbr.on_packet_sent(
+            base + Duration::from_micros(1),
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Handshake,
+        );
+        bbr.on_packet_sent(
+            base + Duration::from_micros(2),
+            BASE_DATAGRAM_SIZE as u16,
+            2,
+            SpaceId::Data,
+        );
+
+        // Quinn orders declarations within each packet-number space, not across spaces. These
+        // callbacks describe exactly two ranges: Data 1..=2 and Handshake 1.
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now);
+        bbr.on_packet_lost(
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Handshake,
+            now,
+        );
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 2, SpaceId::Data, now);
+
+        bbr.explicit_congestion_in_round = true;
+        bbr.loss_round_start = true;
+        let mut sample = max_bw_epoch_sample(now, false);
+        sample.lost = 3 * BASE_DATAGRAM_SIZE;
+        sample.tx_in_flight = 3 * BASE_DATAGRAM_SIZE;
+        bbr.rs = Some(sample);
+        bbr.update_congestion_signals(sample.last_packet, now);
+
+        assert_eq!(
+            bbr.completed_loss_decision_events, 2,
+            "raw Startup classification must count ranges per packet-number space, not callback interleaving"
+        );
+    }
+
+    #[test]
+    fn probe_up_missing_and_retained_same_batch_is_order_invariant() {
+        fn run_batch(missing_first: bool) -> Bbr3 {
+            let now = Instant::now();
+            let mut bbr = loss_floor_test_controller();
+            bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+            bbr.bw_probe_samples = true;
+
+            let retained_packet = if missing_first { 2 } else { 1 };
+            bbr.on_packet_sent(
+                now - Duration::from_millis(1),
+                BASE_DATAGRAM_SIZE as u16,
+                retained_packet,
+                SpaceId::Data,
+            );
+            for packet_number in 1..=2 {
+                bbr.on_packet_lost(
+                    BASE_DATAGRAM_SIZE as u16,
+                    packet_number,
+                    SpaceId::Data,
+                    now,
+                );
+            }
+            bbr.on_congestion_event(
+                now,
+                now - Duration::from_millis(1),
+                false,
+                false,
+                2 * BASE_DATAGRAM_SIZE,
+                2,
+                SpaceId::Data,
+            );
+            bbr
+        }
+
+        let missing_then_retained = run_batch(true);
+        let retained_then_missing = run_batch(false);
+        for bbr in [&missing_then_retained, &retained_then_missing] {
+            assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+            assert_eq!(bbr.loss_budget_records.len(), 2);
+            assert!(bbr.loss_budget_records.iter().all(|record| record.exempt));
+            assert!(bbr
+                .loss_budget_records
+                .iter()
+                .all(|record| !record.loss_round_open));
+            assert!(!bbr.loss_in_round);
+            assert_eq!(
+                bbr.loss_budget_exempt_lost,
+                2 * BASE_DATAGRAM_SIZE
+            );
+        }
+    }
+
+    #[test]
+    fn loss_floor_missing_persistent_batch_exempts_each_byte_once() {
+        let now = Instant::now();
+        let mut bbr = loss_floor_test_controller();
+
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 999, SpaceId::Data, now);
+        assert_eq!(bbr.loss_budget_exempt_lost, BASE_DATAGRAM_SIZE);
+        assert_eq!(bbr.loss_budget_current_batch.len(), 1);
+        assert!(bbr.loss_budget_records.front().is_some_and(|record| record.exempt));
+
+        bbr.on_congestion_event(
+            now,
+            now,
+            true,
+            false,
+            BASE_DATAGRAM_SIZE,
+            999,
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.loss_budget_exempt_lost, BASE_DATAGRAM_SIZE);
+        assert!(bbr.loss_budget_current_batch.is_empty());
+    }
+
+    #[test]
+    fn loss_floor_spurious_persistent_transaction_is_not_exempted_twice() {
+        let now = Instant::now();
+        let mut bbr = loss_floor_test_controller();
+        bbr.on_packet_sent(
+            now - Duration::from_millis(1),
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let transaction = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("loss transaction");
+        bbr.on_congestion_event(
+            now,
+            now - Duration::from_millis(1),
+            true,
+            false,
+            BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.loss_budget_exempt_lost, BASE_DATAGRAM_SIZE);
+        assert!(bbr.loss_budget_records.front().is_some_and(|record| record.exempt));
+
+        // The packet bytes are reclassified exactly once, but genuine persistent authority is
+        // newer than the recovery snapshot and must not be rolled back with the late loss proof.
+        assert!(!bbr.on_spurious_congestion_event(transaction));
+        assert_eq!(bbr.loss_budget_exempt_lost, BASE_DATAGRAM_SIZE);
     }
 
     #[test]
@@ -5622,6 +6573,14 @@ mod test {
         assert_eq!(bbr.effective_probe_loss_thresh(), LOSS_THRESH);
         assert_eq!(bbr.model_delivery_rate(sample), sample.delivery_rate);
         assert!(bbr.loss_round_requires_congestion_response());
+        assert_eq!(bbr.advance_compensated_loss_budget(false), None);
+        assert_eq!(bbr.loss_budget_balance, 0.0);
+        assert_eq!(bbr.loss_budget_capacity, 0.0);
+        assert_eq!(bbr.loss_budget_delivered, 0);
+        assert_eq!(bbr.loss_budget_lost, 0);
+        assert_eq!(bbr.loss_budget_exempt_lost, 0);
+        assert!(bbr.loss_budget_records.is_empty());
+        assert!(bbr.loss_budget_checkpoint.is_none());
 
         // The extension's delayed explicit-congestion latch is unnecessary when the floor is
         // disabled. Preserve the draft reset transition even if QUIC reports persistence after
@@ -5664,24 +6623,505 @@ mod test {
         assert!((bbr.effective_probe_loss_thresh() - 0.118).abs() < f64::EPSILON);
         assert!((bbr.sample_explained_loss(sample) - 0.10).abs() < f64::EPSILON);
         assert_eq!(bbr.model_delivered(sample), 100 * BASE_DATAGRAM_SIZE);
+        assert_eq!(bbr.advance_compensated_loss_budget(false), Some(false));
         assert!(!bbr.loss_round_requires_congestion_response());
 
+        // Prime a stable 100-packet operating round and fill its explicit three-round burst
+        // envelope. This capacity is carry-over credit, not a raised loss boundary.
         let mut above = Bbr3::new(
             Arc::new(mptunnel_loss_profile_config()),
             BASE_DATAGRAM_SIZE as u16,
         );
-        above.delivered = 88 * BASE_DATAGRAM_SIZE;
-        above.lost = 12 * BASE_DATAGRAM_SIZE;
-        above.loss_in_round = true;
-        above.loss_round_evidence_anchor = Some(LossRoundEvidenceAnchor {
-            send_time: now,
-            delivered: 0,
-            lost: 0,
-        });
-        assert!(
-            above.loss_round_requires_congestion_response(),
-            "12% aggregate loss must exceed the 11.8% production boundary"
+        for _ in 0..3 {
+            above.delivered += 100 * BASE_DATAGRAM_SIZE;
+            assert_eq!(above.advance_compensated_loss_budget(false), Some(false));
+        }
+        assert_eq!(above.loss_budget_balance, above.loss_budget_capacity);
+
+        // Fourteen percent is above the 11.8% default boundary but below the 16.7% boundary a
+        // disguised 15% policy lift would create. Sustained evidence must therefore exhaust the
+        // finite envelope and retain the real congestion response.
+        let boundary = above.compensated_loss_boundary();
+        let round_deficit = (1.0 - boundary) * (14 * BASE_DATAGRAM_SIZE) as f64
+            - boundary * (86 * BASE_DATAGRAM_SIZE) as f64;
+        let expected_response_round =
+            (above.loss_budget_balance / round_deficit).floor() as u64 + 1;
+        let mut response_round = None;
+        for round in 1..=expected_response_round {
+            above.delivered += 86 * BASE_DATAGRAM_SIZE;
+            above.lost += 14 * BASE_DATAGRAM_SIZE;
+            if above.advance_compensated_loss_budget(false) == Some(true) {
+                response_round = Some(round);
+                break;
+            }
+        }
+        assert_eq!(
+            response_round,
+            Some(expected_response_round),
+            "14% sustained loss must exhaust at the exact credit-derived round"
         );
+        assert_eq!(above.loss_budget_exhaustions, 1);
+    }
+
+    #[test]
+    fn spurious_loss_refunds_only_its_transaction_bytes() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(mptunnel_loss_profile_config()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+
+        bbr.delivered = 100 * BASE_DATAGRAM_SIZE;
+        assert_eq!(bbr.advance_compensated_loss_budget(false), Some(false));
+        bbr.loss_budget_balance = bbr.loss_budget_capacity / 2.0;
+        let balance_before_loss = bbr.loss_budget_balance;
+
+        bbr.on_packet_sent(
+            now - Duration::from_millis(1),
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let transaction = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("loss transaction");
+        assert!(bbr.loss_budget_records.iter().any(|record| {
+            record.transaction == Some(transaction) && record.bytes == BASE_DATAGRAM_SIZE
+        }));
+
+        // Consume the declaration before its late-ACK proof arrives. App-limited here freezes the
+        // reference volume so the assertion isolates balance accounting from capacity rebasing.
+        assert_eq!(bbr.advance_compensated_loss_budget(true), Some(false));
+        let boundary = bbr.compensated_loss_boundary();
+        let charged_balance =
+            balance_before_loss - (1.0 - boundary) * BASE_DATAGRAM_SIZE as f64;
+        assert!((bbr.loss_budget_balance - charged_balance).abs() < f64::EPSILON);
+
+        assert!(bbr.on_spurious_congestion_event(transaction));
+        assert_eq!(bbr.loss_budget_exempt_lost, BASE_DATAGRAM_SIZE);
+        assert_eq!(bbr.advance_compensated_loss_budget(true), Some(false));
+        assert!((bbr.loss_budget_balance - balance_before_loss).abs() < f64::EPSILON);
+
+        // A later authorized round remains ordinary evidence; undo refunded no unrelated epoch.
+        bbr.delivered += 90 * BASE_DATAGRAM_SIZE;
+        bbr.lost += 10 * BASE_DATAGRAM_SIZE;
+        assert_eq!(bbr.advance_compensated_loss_budget(false), Some(false));
+        assert!(bbr.loss_budget_balance > balance_before_loss);
+        assert_eq!(bbr.loss_budget_exhaustions, 0);
+    }
+
+    #[test]
+    fn overlapping_spurious_transactions_replay_without_clamp_overcredit() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(mptunnel_loss_profile_config()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+        bbr.delivered = 100 * BASE_DATAGRAM_SIZE;
+        assert_eq!(bbr.advance_compensated_loss_budget(false), Some(false));
+        let debit = (1.0 - bbr.compensated_loss_boundary()) * BASE_DATAGRAM_SIZE as f64;
+        let original_balance = 1.5 * debit;
+        bbr.loss_budget_balance = original_balance;
+
+        let first_sent = now - Duration::from_millis(1);
+        bbr.on_packet_sent(
+            first_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let first = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("first retained transaction");
+        bbr.on_congestion_event(
+            now,
+            first_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+        assert_eq!(bbr.advance_compensated_loss_budget(true), Some(false));
+        assert!((bbr.loss_budget_balance - 0.5 * debit).abs() < f64::EPSILON);
+
+        let second_sent = now + Duration::from_millis(1);
+        bbr.check_recovery_done(second_sent);
+        bbr.on_packet_sent(
+            second_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            2,
+            SpaceId::Data,
+        );
+        let second = bbr
+            .on_packet_lost(
+                BASE_DATAGRAM_SIZE as u16,
+                2,
+                SpaceId::Data,
+                now + Duration::from_millis(2),
+            )
+            .expect("second retained transaction");
+        bbr.on_congestion_event(
+            now + Duration::from_millis(2),
+            second_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            2,
+            SpaceId::Data,
+        );
+        assert_ne!(first, second);
+        assert_eq!(bbr.advance_compensated_loss_budget(true), Some(true));
+        assert_eq!(bbr.loss_budget_balance, 0.0);
+
+        // The older proof cannot roll back the newer native BBR snapshot, but replay removes its
+        // exact loss from both epochs and leaves the newer transaction's single debit.
+        assert!(!bbr.on_spurious_congestion_event(first));
+        assert!((bbr.loss_budget_balance - 0.5 * debit).abs() < f64::EPSILON);
+
+        // Removing the second transaction composes with the first removal. Native rollback stays
+        // conservative because T1 was still an open predecessor at T2's snapshot, while the
+        // independent bucket journal still returns the exact pre-loss state after the clamp.
+        assert!(!bbr.on_spurious_congestion_event(second));
+        assert!((bbr.loss_budget_balance - original_balance).abs() < f64::EPSILON);
+        assert!(bbr.loss_budget_checkpoint.is_none());
+    }
+
+    #[test]
+    fn spurious_cold_anchor_replays_from_next_real_loss() {
+        let now = Instant::now();
+        let mut bbr = Bbr3::new(
+            Arc::new(mptunnel_loss_profile_config()),
+            BASE_DATAGRAM_SIZE as u16,
+        );
+
+        // The earliest declaration carries a much larger transmit flight than the later real loss
+        // and therefore owns the cold envelope only while its evidence remains valid.
+        bbr.inflight = 100 * BASE_DATAGRAM_SIZE;
+        let first_sent = now;
+        bbr.on_packet_sent(
+            first_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let first = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("high-flight cold transaction");
+        bbr.on_congestion_event(
+            now,
+            first_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+
+        let second_sent = now + Duration::from_millis(1);
+        bbr.check_recovery_done(second_sent);
+        bbr.inflight = 0;
+        bbr.on_packet_sent(
+            second_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            2,
+            SpaceId::Data,
+        );
+        let second = bbr
+            .on_packet_lost(
+                BASE_DATAGRAM_SIZE as u16,
+                2,
+                SpaceId::Data,
+                now + Duration::from_millis(2),
+            )
+            .expect("ordinary cold transaction");
+        bbr.on_congestion_event(
+            now + Duration::from_millis(2),
+            second_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            2,
+            SpaceId::Data,
+        );
+        assert_ne!(first, second);
+        assert_eq!(bbr.advance_compensated_loss_budget(true), Some(false));
+
+        assert!(!bbr.on_spurious_congestion_event(first));
+        let boundary = bbr.compensated_loss_boundary();
+        let expected_capacity = (1.0 - boundary)
+            * COMPENSATED_LOSS_BURST_ROUNDS
+            * bbr.loss_compensation_floor
+            * bbr.initial_cwnd as f64;
+        let expected_balance =
+            expected_capacity - (1.0 - boundary) * BASE_DATAGRAM_SIZE as f64;
+        assert!((bbr.loss_budget_capacity - expected_capacity).abs() < f64::EPSILON);
+        assert!((bbr.loss_budget_balance - expected_balance).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn older_spurious_proof_preserves_same_ack_missing_loss_authority() {
+        let now = Instant::now();
+        let mut bbr = loss_floor_test_controller();
+        let old_sent = now - Duration::from_millis(1);
+        bbr.on_packet_sent(
+            old_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let old = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("old retained transaction");
+        bbr.on_congestion_event(
+            now,
+            old_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+
+        // Connection callback order permits a new missing-snapshot loss before the same ACK proves
+        // the old transaction. Missing evidence has no transaction ID and must survive old undo.
+        bbr.on_packet_lost(
+            BASE_DATAGRAM_SIZE as u16,
+            999,
+            SpaceId::Data,
+            now + Duration::from_millis(1),
+        );
+        bbr.on_congestion_event(
+            now + Duration::from_millis(1),
+            now,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            999,
+            SpaceId::Data,
+        );
+        assert!(!bbr.on_spurious_congestion_event(old));
+        assert!(bbr.loss_in_round);
+        assert!(bbr.loss_round_evidence_unknown);
+        assert!(bbr.loss_round_requires_congestion_response());
+        assert!(bbr
+            .loss_budget_records
+            .iter()
+            .any(|record| record.packet_number == 999 && record.exempt));
+    }
+
+    #[test]
+    fn preconsumption_spurious_record_compacts_after_its_budget_epoch() {
+        let now = Instant::now();
+        let mut bbr = loss_floor_test_controller();
+        let sent = now - Duration::from_millis(1);
+        bbr.on_packet_sent(
+            sent,
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let transaction = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("retained transaction");
+        bbr.on_congestion_event(
+            now,
+            sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+
+        // A late ACK may prove the declaration spurious before the next packet-timed budget
+        // boundary. The record must remain until that boundary consumes the lifetime-counter
+        // delta, then disappear immediately rather than burdening every later clean round.
+        assert!(bbr.on_spurious_congestion_event(transaction));
+        assert_eq!(bbr.loss_budget_records.len(), 1);
+        assert!(bbr
+            .loss_budget_records
+            .front()
+            .is_some_and(|record| record.exempt && !record.budget_consumed));
+        assert_eq!(bbr.advance_compensated_loss_budget(true), Some(false));
+        assert!(bbr.loss_budget_records.is_empty());
+        assert!(bbr.loss_budget_epochs.is_empty());
+        assert!(bbr.loss_budget_checkpoint.is_none());
+    }
+
+    #[test]
+    fn current_spurious_undo_cannot_erase_deferred_open_predecessor_response() {
+        let now = Instant::now();
+        let mut bbr = loss_floor_test_controller();
+
+        // Prime a finite envelope, then exhaust its available balance so either one of the losses
+        // below independently requires the completed-boundary native response.
+        bbr.delivered = 100 * BASE_DATAGRAM_SIZE;
+        assert_eq!(bbr.advance_compensated_loss_budget(false), Some(false));
+        bbr.loss_budget_balance = 0.0;
+        bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr.cwnd = 240_000;
+        bbr.bw_shortterm = 8_000_000.0;
+        bbr.inflight_shortterm = 220_000;
+        bbr.inflight_longterm = 230_000;
+
+        let older_sent = now - Duration::from_millis(1);
+        bbr.on_packet_sent(
+            older_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let older = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("older retained transaction");
+        bbr.on_congestion_event(
+            now,
+            older_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+        assert!(bbr.loss_in_round, "the older native response must still be pending");
+
+        // A packet sent after T1's recovery start can be declared lost by a later timer before an
+        // ACK closes T1's BBR loss round. T2 therefore snapshots model values that do not yet
+        // contain T1's deferred lower-bound response.
+        let current_sent = now + Duration::from_millis(1);
+        bbr.on_packet_sent(
+            current_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            2,
+            SpaceId::Data,
+        );
+        let current = bbr
+            .on_packet_lost(
+                BASE_DATAGRAM_SIZE as u16,
+                2,
+                SpaceId::Data,
+                now + Duration::from_millis(2),
+            )
+            .expect("current retained transaction");
+        assert_ne!(older, current);
+        bbr.on_congestion_event(
+            now + Duration::from_millis(2),
+            current_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            2,
+            SpaceId::Data,
+        );
+        assert!(bbr.undo_loss_budget_had_open_predecessor);
+
+        // The next ACK is the production decision boundary: it applies a response still required
+        // by T1 alone, then closes the cohort before connection-level late-ACK processing invokes
+        // T2's spurious callback.
+        let mut sample = max_bw_epoch_sample(now + Duration::from_millis(100), false);
+        sample.prior_delivered = bbr.delivered;
+        sample.last_packet.delivered = bbr.delivered;
+        bbr.delivered += BASE_DATAGRAM_SIZE;
+        bbr.rs = Some(sample);
+        bbr.update_latest_delivery_signals();
+        assert!(bbr.loss_round_start);
+        bbr.update_congestion_signals(sample.last_packet, now + Duration::from_millis(100));
+        assert!(!bbr.loss_in_round);
+        let responded_bw = bbr.bw_shortterm;
+        let responded_inflight = bbr.inflight_shortterm;
+        assert!(responded_bw < 8_000_000.0);
+        assert!(responded_inflight < 220_000);
+
+        assert!(
+            !bbr.on_spurious_congestion_event(current),
+            "T2 proof must not restore a snapshot predating T1's native response"
+        );
+        assert_eq!(bbr.bw_shortterm, responded_bw);
+        assert_eq!(bbr.inflight_shortterm, responded_inflight);
+        assert!(bbr.loss_budget_records.iter().any(|record| {
+            record.transaction == Some(older) && !record.exempt
+        }));
+    }
+
+    #[test]
+    fn current_spurious_undo_preserves_final_older_evidence_captured_by_its_snapshot() {
+        let now = Instant::now();
+        let mut bbr = loss_floor_test_controller();
+        let older_sent = now - Duration::from_millis(1);
+        bbr.on_packet_sent(
+            older_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            1,
+            SpaceId::Data,
+        );
+        let older = bbr
+            .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
+            .expect("older retained transaction");
+        bbr.on_congestion_event(
+            now,
+            older_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            1,
+            SpaceId::Data,
+        );
+        // Model an older decision that is final before the next recovery snapshot. Its retained
+        // record may still await a late ACK, but no older native response remains pending.
+        bbr.close_open_loss_round();
+        assert!(!bbr.loss_in_round);
+
+        // A packet sent after the first recovery start opens a new transaction. Its native undo
+        // snapshot already contains the final older state, so undoing only this newer proof is
+        // safe and must not be rejected merely because older late-ACK evidence remains retained.
+        let current_sent = now + Duration::from_millis(1);
+        bbr.check_recovery_done(current_sent);
+        bbr.cwnd = 240_000;
+        bbr.bw_shortterm = 8_000_000.0;
+        bbr.inflight_shortterm = 220_000;
+        bbr.inflight_longterm = 230_000;
+        bbr.on_packet_sent(
+            current_sent,
+            BASE_DATAGRAM_SIZE as u16,
+            2,
+            SpaceId::Data,
+        );
+        let current = bbr
+            .on_packet_lost(
+                BASE_DATAGRAM_SIZE as u16,
+                2,
+                SpaceId::Data,
+                now + Duration::from_millis(2),
+            )
+            .expect("current retained transaction");
+        assert_ne!(older, current);
+        bbr.on_congestion_event(
+            now + Duration::from_millis(2),
+            current_sent,
+            false,
+            false,
+            BASE_DATAGRAM_SIZE,
+            2,
+            SpaceId::Data,
+        );
+        bbr.cwnd = 40_000;
+        bbr.bw_shortterm = 1_000_000.0;
+        bbr.inflight_shortterm = 20_000;
+        bbr.inflight_longterm = 30_000;
+
+        assert!(bbr.on_spurious_congestion_event(current));
+        assert_eq!(bbr.cwnd, 240_000);
+        assert_eq!(bbr.bw_shortterm, 8_000_000.0);
+        assert_eq!(bbr.inflight_shortterm, 220_000);
+        assert_eq!(bbr.inflight_longterm, 230_000);
+        assert!(!bbr.loss_in_round);
+        assert!(bbr.loss_budget_records.iter().any(|record| {
+            record.transaction == Some(older) && !record.loss_round_open && !record.exempt
+        }));
+        assert!(!bbr.loss_budget_records.iter().any(|record| {
+            record.transaction == Some(current) && record.loss_round_open
+        }));
     }
 
     /// A.1: Exiting STARTUP on a bandwidth plateau.
@@ -8682,20 +10122,45 @@ mod test {
 
     #[derive(Clone, Copy, Debug)]
     enum ExogenousLossPattern {
-        Independent,
+        Periodic,
         Burst,
+        Randomized,
+        BlockBalanced(u64),
     }
 
     impl ExogenousLossPattern {
         fn drops(self, packet_number: u64, percent: u64) -> bool {
             assert!((1..100).contains(&percent));
             match self {
-                Self::Independent => {
+                Self::Periodic => {
                     assert_eq!(100 % percent, 0);
                     let period = 100 / percent;
                     packet_number % period == period - 1
                 }
                 Self::Burst => packet_number % 100 >= 100 - percent,
+                Self::Randomized => {
+                    // Deterministic SplitMix64 output gives the simulator an independent-looking
+                    // Bernoulli sequence without introducing a second RNG or a flaky test seed.
+                    let mut sample = packet_number.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    sample = (sample ^ (sample >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    sample = (sample ^ (sample >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    sample ^= sample >> 31;
+                    sample % 10_000 < percent * 100
+                }
+                Self::BlockBalanced(seed) => {
+                    // Each 100-packet block contains exactly `percent` losses, while an affine
+                    // permutation and per-block SplitMix rotation vary their local round placement.
+                    let block = packet_number / 100;
+                    let mut rotation = block
+                        .wrapping_add(seed)
+                        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    rotation = (rotation ^ (rotation >> 30))
+                        .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    rotation = (rotation ^ (rotation >> 27))
+                        .wrapping_mul(0x94d0_49bb_1331_11eb);
+                    rotation ^= rotation >> 31;
+                    ((packet_number % 100) * 37 + rotation % 100) % 100 < percent
+                }
             }
         }
     }
@@ -8707,28 +10172,41 @@ mod test {
         pacing_rate: f64,
         max_bw: f64,
         cwnd: u64,
+        lost_packets: u64,
+        resolved_packets: u64,
     }
 
     #[derive(Debug)]
     struct ExogenousLossRun {
         points: Vec<ExogenousLossPoint>,
         observed_loss: f64,
+        budget_exhaustions: u64,
     }
 
     /// Drive the real controller through a constant-rate FIFO followed by a deterministic erasure
     /// stage. Lost packets consume bottleneck service before erasure, so neither pattern changes
     /// capacity, queue service, or RTT. Loss starts after an eight-second clean warm-up.
     fn run_sustained_exogenous_loss(
-        mut config: Bbr3Config,
+        config: Bbr3Config,
         pattern: ExogenousLossPattern,
         loss_percent: u64,
     ) -> ExogenousLossRun {
+        run_sustained_exogenous_loss_scenario(config, pattern, loss_percent, None, 40)
+    }
+
+    fn run_sustained_exogenous_loss_scenario(
+        mut config: Bbr3Config,
+        pattern: ExogenousLossPattern,
+        loss_percent: u64,
+        service_step: Option<(u64, f64)>,
+        total_seconds: u64,
+    ) -> ExogenousLossRun {
         const MSS: u64 = 1200;
-        const BW: f64 = 1_250_000.0; // 10 Mbit/s in bytes/sec; scale only reduces test runtime
+        const INITIAL_BW: f64 = 1_250_000.0; // 10 Mbit/s in bytes/sec
         const RTT_NS: u64 = 100_000_000;
         const LOSS_START_NS: u64 = 8_000_000_000;
-        const TOTAL_NS: u64 = 40_000_000_000;
         const SAMPLE_NS: u64 = 1_000_000_000;
+        let total_ns = total_seconds.saturating_mul(SAMPLE_NS);
 
         struct InFlight {
             pn: u64,
@@ -8743,7 +10221,6 @@ mod test {
         let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
         let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
         let mut flight: VecDeque<InFlight> = VecDeque::new();
-        let service_ns = (MSS as f64 / BW * 1e9).round() as u64;
         let mut btl_free_ns = 0u64;
         let mut now_ns = 0u64;
         let mut next_send_ns = 0u64;
@@ -8756,7 +10233,7 @@ mod test {
         let mut points = Vec::new();
 
         for _ in 0..5_000_000u64 {
-            if now_ns >= TOTAL_NS {
+            if now_ns >= total_ns {
                 break;
             }
             let can_send = inflight + MSS <= bbr.window();
@@ -8770,6 +10247,10 @@ mod test {
                 now_ns = send_ns;
                 let arrival_ns = send_ns + RTT_NS / 2;
                 let service_start_ns = arrival_ns.max(btl_free_ns);
+                let service_bw = service_step
+                    .filter(|(at_second, _)| send_ns >= at_second.saturating_mul(SAMPLE_NS))
+                    .map_or(INITIAL_BW, |(_, bandwidth)| bandwidth);
+                let service_ns = (MSS as f64 / service_bw * 1e9).round() as u64;
                 let finish_ns = service_start_ns + service_ns;
                 btl_free_ns = finish_ns;
                 let lost = send_ns >= LOSS_START_NS && pattern.drops(pn, loss_percent);
@@ -8787,9 +10268,14 @@ mod test {
             } else if let Some(packet) = flight.pop_front() {
                 now_ns = now_ns.max(packet.event_ns);
                 inflight -= MSS;
-                resolved_packets += 1;
+                let loss_stage = packet.send_ns >= LOSS_START_NS;
+                if loss_stage {
+                    resolved_packets += 1;
+                }
                 if packet.lost {
-                    lost_packets += 1;
+                    if loss_stage {
+                        lost_packets += 1;
+                    }
                     bbr.on_packet_lost(MSS as u16, packet.pn, SpaceId::Data, at(now_ns));
                 } else {
                     rtt_est.update(
@@ -8819,15 +10305,18 @@ mod test {
                     pacing_rate: bbr.pacing_rate,
                     max_bw: bbr.max_bw,
                     cwnd: bbr.cwnd,
+                    lost_packets,
+                    resolved_packets,
                 });
                 sample_delivered = delivered;
                 next_sample_ns += SAMPLE_NS;
             }
         }
-        assert!(now_ns >= TOTAL_NS);
+        assert!(now_ns >= total_ns);
         ExogenousLossRun {
             points,
             observed_loss: lost_packets as f64 / resolved_packets.max(1) as f64,
+            budget_exhaustions: bbr.loss_budget_exhaustions,
         }
     }
 
@@ -8842,10 +10331,56 @@ mod test {
         selected.iter().sum::<f64>() / selected.len() as f64
     }
 
+    fn observed_loss_between(
+        run: &ExogenousLossRun,
+        start_second: u64,
+        end_second: u64,
+    ) -> f64 {
+        let end = run
+            .points
+            .iter()
+            .find(|point| point.second == end_second)
+            .expect("loss window end");
+        let before = run
+            .points
+            .iter()
+            .find(|point| point.second == start_second.saturating_sub(1))
+            .expect("loss window beginning");
+        let lost = end.lost_packets.saturating_sub(before.lost_packets);
+        let resolved = end
+            .resolved_packets
+            .saturating_sub(before.resolved_packets);
+        lost as f64 / resolved.max(1) as f64
+    }
+
+    fn exogenous_goodput_model_floor(
+        observed_loss: f64,
+        service_bytes_per_second: f64,
+    ) -> f64 {
+        let probe_rtt_duty = 1.0
+            - (PROBE_RTT_DURATION_MS as f64 / 1_000.0) / PROBE_RTT_INTERVAL_SEC as f64;
+        let pacing_duty = 1.0 - PACING_MARGIN_PERCENT / 100.0;
+        service_bytes_per_second * (1.0 - observed_loss) * probe_rtt_duty * pacing_duty
+    }
+
+    fn assert_exogenous_goodput_model(
+        goodput: f64,
+        observed_loss: f64,
+        service_bytes_per_second: f64,
+        window_quantum: f64,
+    ) {
+        let floor = exogenous_goodput_model_floor(observed_loss, service_bytes_per_second);
+        let ceiling = service_bytes_per_second * (1.0 - observed_loss);
+        assert!(
+            goodput + window_quantum >= floor && goodput <= ceiling + window_quantum,
+            "goodput {goodput} outside physical/model interval [{floor}, {ceiling}]",
+        );
+    }
+
     #[test]
     fn sustained_exogenous_loss_reproduces_progressive_decline_without_a_floor() {
         for pattern in [
-            ExogenousLossPattern::Independent,
+            ExogenousLossPattern::Periodic,
             ExogenousLossPattern::Burst,
         ] {
             let run = run_sustained_exogenous_loss(draft_bbr3_config(), pattern, 5);
@@ -8872,9 +10407,9 @@ mod test {
     }
 
     #[test]
-    fn explicit_loss_floor_sustains_independent_and_burst_erasure() {
+    fn explicit_loss_floor_sustains_periodic_and_burst_erasure() {
         for pattern in [
-            ExogenousLossPattern::Independent,
+            ExogenousLossPattern::Periodic,
             ExogenousLossPattern::Burst,
         ] {
             let mut config = Bbr3Config::default();
@@ -8898,16 +10433,20 @@ mod test {
                     ))
                     .collect::<Vec<_>>()
             );
-            assert!(late >= 0.85 * early);
-            assert!(late * 8.0 >= 8_000_000.0);
+            let late_loss = observed_loss_between(&run, 36, 40);
+            let window_quantum = 2.0 * BASE_DATAGRAM_SIZE as f64 / 5.0;
+            assert_exogenous_goodput_model(late, late_loss, 1_250_000.0, window_quantum);
+            assert_eq!(run.budget_exhaustions, 0);
         }
     }
 
     #[test]
     fn mptunnel_default_ten_percent_compensation_sustains_ten_percent_erasure() {
         for pattern in [
-            ExogenousLossPattern::Independent,
+            ExogenousLossPattern::Periodic,
             ExogenousLossPattern::Burst,
+            ExogenousLossPattern::Randomized,
+            ExogenousLossPattern::BlockBalanced(0),
         ] {
             let run =
                 run_sustained_exogenous_loss(mptunnel_loss_profile_config(), pattern, 10);
@@ -8919,67 +10458,136 @@ mod test {
                 early * 8.0 / 1e6,
                 late * 8.0 / 1e6,
             );
-            assert!(late >= 0.85 * early);
-            assert!(late * 8.0 >= 7_500_000.0);
+            let late_loss = observed_loss_between(&run, 36, 40);
+            let window_quantum = 2.0 * BASE_DATAGRAM_SIZE as f64 / 5.0;
+            assert_exogenous_goodput_model(late, late_loss, 1_250_000.0, window_quantum);
+            assert_eq!(run.budget_exhaustions, 0);
         }
     }
 
-    /// A.16: Decreasing bandwidth 10x and ensuring max bandwidth adapts down.
-    /// Exercises the short-term loss response (`loss_lower_bounds`) and the windowed `max_bw`
-    /// filter expiry (`advance_max_bw_filter`, `BBR.MaxBwFilterLen`):
-    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.10>
-    ///
-    /// After PROBE_BW is reached at a high link rate, the bottleneck bandwidth drops 10x. The
-    /// flow is still carrying ~BDP of the *old* (high) rate, so once the link slows the standing
-    /// queue overflows the bottleneck buffer and packets are lost. Two things must happen:
-    ///
-    ///  1. The short-term model reacts within the current probe cycle. A loss round runs
-    ///     `loss_lower_bounds`, decaying `BBR.bw_shortterm` by `BETA` (0.7) toward the freshly
-    ///     measured `bw_latest`. Because `bw = min(max_bw, bw_shortterm)`, this throttles
-    ///     pacing/cwnd immediately, long before the long-term `max_bw` moves. (Each PROBE_BW
-    ///     refill resets `bw_shortterm` and re-seeds it from the still-stale-high `max_bw`, so per
-    ///     cycle it only steps down ~one `BETA`; the full collapse to the new rate is the filter's
-    ///     job, below.)
-    ///  2. The long-term `max_bw` is a max filter over `RS.delivery_rate` keyed on `cycle_count`
-    ///     with a window of `MAX_BW_FILTER_LEN` (2). The stale high sample only expires once
-    ///     `cycle_count` has advanced past the window, i.e. after ~2 PROBE_BW cycles
-    ///     (`advance_max_bw_filter` ticks once per cycle at `ProbeStopping`). Then `get_max()`
-    ///     returns the recent ~low-rate samples and `max_bw` drops to the new 10 Mbit/s limit.
-    ///
-    /// Same bespoke single-bottleneck FIFO loop as A.15 (bandwidth changes mid-flight, which the
-    /// shared `Sim` can't express), inverted: start at 100 Mbit/s, then cut to 10 Mbit/s. A finite
-    /// bottleneck buffer (~1 BDP of the high rate) makes the 10x cut produce real tail-drop loss:
-    /// the flow runs cleanly at 100 Mbit/s but overflows the moment the link slows.
-    ///  1. `BW_HI` = 100 Mbit/s. Ramp cleanly into PROBE_BW with `max_bw` ~= `BW_HI`.
-    ///  2. Cut the bottleneck rate 10x (`BW_LO` = 10 Mbit/s). The overflowing queue drives loss;
-    ///     track the minimum `bw_shortterm` seen afterwards and the `cycle_count` at which `max_bw`
-    ///     first collapses to the new rate.
-    ///
-    /// Asserts:
-    ///  - at the cut the flow was in the high-rate regime (`max_bw` ~= `BW_HI`);
-    ///  - `bw_shortterm` adapts down rapidly after the cut: its post-cut minimum falls at least one
-    ///    `BETA` step below `BW_HI`, throttling the flow within the cycle;
-    ///  - `max_bw` collapses to the new `BW_LO` (within ~15%) once the filter window expires, and
-    ///    does so within a small number of PROBE_BW cycles (`MAX_BW_FILTER_LEN` + headroom).
+    #[test]
+    fn mptunnel_default_budget_rejects_sustained_twenty_percent_loss() {
+        let run = run_sustained_exogenous_loss(
+            mptunnel_loss_profile_config(),
+            ExogenousLossPattern::BlockBalanced(20),
+            20,
+        );
+        assert!(run.budget_exhaustions > 0);
+    }
+
+    #[test]
+    fn mptunnel_default_compensation_sustains_randomized_eleven_percent_erasure() {
+        let run = run_sustained_exogenous_loss(
+            mptunnel_loss_profile_config(),
+            ExogenousLossPattern::Randomized,
+            11,
+        );
+        let early = mean_goodput(&run, 9, 13);
+        let late = mean_goodput(&run, 36, 40);
+        eprintln!(
+            "default/Randomized: loss={:.4}, exhaustions={}, early={:.3}Mbps, late={:.3}Mbps, trace={:?}",
+            run.observed_loss,
+            run.budget_exhaustions,
+            early * 8.0 / 1e6,
+            late * 8.0 / 1e6,
+            run.points
+                .iter()
+                .map(|point| (
+                    point.second,
+                    point.goodput * 8.0 / 1e6,
+                    point.pacing_rate * 8.0 / 1e6,
+                    point.max_bw * 8.0 / 1e6,
+                    point.cwnd,
+                ))
+                .collect::<Vec<_>>()
+        );
+        let late_loss = observed_loss_between(&run, 36, 40);
+        let window_quantum = 2.0 * BASE_DATAGRAM_SIZE as f64 / 5.0;
+        let boundary = 1.0 - (1.0 - 0.10) * (1.0 - LOSS_THRESH);
+        assert!(
+            late_loss > 0.10 && late_loss < boundary,
+            "randomized late loss {late_loss} did not exercise residual headroom (0.10, {boundary})",
+        );
+        assert_exogenous_goodput_model(late, late_loss, 1_250_000.0, window_quantum);
+        assert_eq!(run.budget_exhaustions, 0);
+    }
+
+    #[test]
+    fn mptunnel_default_rediscovers_bandwidth_with_randomized_loss() {
+        let run = run_sustained_exogenous_loss_scenario(
+            mptunnel_loss_profile_config(),
+            ExogenousLossPattern::Randomized,
+            11,
+            Some((20, 12_500_000.0)),
+            60,
+        );
+        let before = mean_goodput(&run, 16, 20);
+        let recovered = mean_goodput(&run, 56, 60);
+        eprintln!(
+            "step/Randomized: loss={:.4}, exhaustions={}, before={:.3}Mbps, recovered={:.3}Mbps, trace={:?}",
+            run.observed_loss,
+            run.budget_exhaustions,
+            before * 8.0 / 1e6,
+            recovered * 8.0 / 1e6,
+            run.points
+                .iter()
+                .map(|point| (
+                    point.second,
+                    point.goodput * 8.0 / 1e6,
+                    point.pacing_rate * 8.0 / 1e6,
+                    point.max_bw * 8.0 / 1e6,
+                    point.cwnd,
+                ))
+                .collect::<Vec<_>>()
+        );
+        const STEPPED_SERVICE_BYTES_PER_SECOND: f64 = 12_500_000.0;
+        const ONE_MSS_PER_RTT: f64 = 1200.0 / 0.1;
+        let final_max_bw = run.points.last().map_or(0.0, |point| point.max_bw);
+        assert!(
+            final_max_bw + ONE_MSS_PER_RTT >= STEPPED_SERVICE_BYTES_PER_SECOND
+                && final_max_bw <= STEPPED_SERVICE_BYTES_PER_SECOND + ONE_MSS_PER_RTT,
+            "controller failed to rediscover recovered service: max_bw {final_max_bw}"
+        );
+        let late_loss = observed_loss_between(&run, 56, 60);
+        let window_quantum = 2.0 * BASE_DATAGRAM_SIZE as f64 / 5.0;
+        assert!(
+            late_loss > 0.10 && late_loss < 1.0 - (1.0 - 0.10) * (1.0 - LOSS_THRESH),
+            "stepped randomized late loss {late_loss} did not exercise residual headroom",
+        );
+        assert_exogenous_goodput_model(
+            recovered,
+            late_loss,
+            STEPPED_SERVICE_BYTES_PER_SECOND,
+            window_quantum,
+        );
+        assert_eq!(run.budget_exhaustions, 0);
+    }
+
+    /// A.16: Genuine congestion response followed by capacity recovery without restart.
+    /// One always-backlogged controller runs over a finite FIFO at 100 Mbit/s, is cut to 10 Mbit/s
+    /// until real tail drop drives both the short- and long-term models down, then has the original
+    /// service restored without resetting the controller, queue, packet sequence, or flight.
+    /// The low-rate compensated estimate may rise to service/(1-p0), while the clean restored
+    /// window must remain within one MSS/RTT of physical service on every observation. Recovered
+    /// goodput is bounded by the configured ProbeRTT/pacing duty and physical service.
     fn run_max_bw_adapts_down_after_10x_decrease(loss_compensation_floor: Option<f64>) {
-        /// packet size in bytes
         const MSS: u64 = 1200;
-        /// simulated propagation round-trip time (100ms), matching A.1
         const RTT_NS: u64 = 100_000_000;
-        /// high link rate before the cut: 100 Mbit/s in bytes/sec
         const BW_HI: f64 = 12_500_000.0;
-        /// low link rate after the cut: 10 Mbit/s in bytes/sec (1/10th)
         const BW_LO: f64 = 1_250_000.0;
         const FWD_NS: u64 = RTT_NS / 2;
         const RET_NS: u64 = RTT_NS / 2;
-        /// bottleneck buffer, in bytes. Sized at ~1 BDP of the high rate so the 100 Mbit/s flow
-        /// runs loss-free (BBR holds ~1 BDP inflight with only a small standing queue), but the
-        /// instant the rate is cut 10x the ~1 BDP still in flight drains at a tenth the rate: the
-        /// queue overflows this buffer and packets are tail-dropped. That loss is the signal that
-        /// drives `bw_shortterm` down and, once the max-bw filter window expires, `max_bw`.
+        const RECOVERY_WINDOW_NS: u64 = PROBE_RTT_INTERVAL_SEC * 1_000_000_000;
         const BUFFER_BYTES: f64 = BW_HI * (RTT_NS as f64 / 1e9);
+        let high_service_ns = (MSS as f64 / BW_HI * 1e9).round() as u64;
+        let low_service_ns = (MSS as f64 / BW_LO * 1e9).round() as u64;
+        let high_service = MSS as f64 * 1e9 / high_service_ns as f64;
+        let low_service = MSS as f64 * 1e9 / low_service_ns as f64;
+        let rate_quantum = MSS as f64 / (RTT_NS as f64 / 1e9);
+        let delivery_correction = 1.0 - loss_compensation_floor.unwrap_or(0.0);
+        let high_model_ceiling = high_service / delivery_correction;
+        let low_model_ceiling = low_service / delivery_correction;
 
-        // Seed the probe RNG so the PROBE_BW cycle timing is deterministic.
         let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let mut config = Bbr3Config {
             probe_rng_seed: Some(seed),
@@ -9002,6 +10610,7 @@ mod test {
             // loss is detected.
             event_ns: u64,
             lost: bool,
+            post_restore: bool,
         }
         let mut flight: VecDeque<InFlight> = VecDeque::new();
 
@@ -9012,17 +10621,23 @@ mod test {
         let mut inflight: u64 = 0;
         let mut pn: u64 = 0;
 
-        // bottleneck serialization time for one MSS-sized packet; raised 10x at the cut.
-        let mut btl_service_ns: u64 = (MSS as f64 / BW_HI * 1e9).round() as u64;
-        // The 10x cut fires once PROBE_BW has been reached at the high rate (max_bw ~= BW_HI).
+        let mut btl_service_ns = high_service_ns;
         let mut cut = false;
-        // max_bw / cycle_count captured at the cut (the high-rate operating point).
+        let mut restored = false;
         let mut cut_max_bw = 0.0f64;
-        let mut cut_cycle: u64 = 0;
-        // Minimum finite bw_shortterm seen after the cut: the short-term model's rapid descent.
+        let mut cut_round: u64 = 0;
+        let mut cut_delivered: u64 = 0;
+        let mut exhaustions_at_cut: u64 = 0;
         let mut min_shortterm_after = f64::INFINITY;
-        // PROBE_BW cycles (cycle_count advances) elapsed when max_bw first collapses to ~BW_LO.
-        let mut adapt_cycles: Option<u64> = None;
+        let mut post_cut_tail_drop_bytes: u64 = 0;
+        let mut low_max_bw: Option<f64> = None;
+        let mut restore_round: u64 = 0;
+        let mut restore_delivered: u64 = 0;
+        let mut recovery_window_start: Option<(u64, u64, u64)> = None;
+        let mut recovery_window_end_delivered: Option<u64> = None;
+        let mut recovery_window_tail_drop_bytes: u64 = 0;
+        let mut recovery_window_min_bw = f64::INFINITY;
+        let mut recovery_window_max_bw = 0.0f64;
 
         for _ in 0..5_000_000 {
             let cwnd = bbr.window();
@@ -9046,6 +10661,13 @@ mod test {
                     / btl_service_ns as f64
                     * MSS as f64;
                 let lost = queue_bytes > BUFFER_BYTES;
+                if lost && cut && !restored {
+                    post_cut_tail_drop_bytes = post_cut_tail_drop_bytes.saturating_add(MSS);
+                }
+                if lost && recovery_window_start.is_some() {
+                    recovery_window_tail_drop_bytes =
+                        recovery_window_tail_drop_bytes.saturating_add(MSS);
+                }
 
                 let event_ns = if lost {
                     // Dropped: never served, so the bottleneck is not advanced. Its loss is detected
@@ -9064,6 +10686,7 @@ mod test {
                     send_ns,
                     event_ns,
                     lost,
+                    post_restore: restored,
                 });
                 // pace the next send at BBR's chosen pacing rate
                 let pacing = bbr.pacing_rate.max(1.0);
@@ -9073,7 +10696,24 @@ mod test {
                 now_ns = now_ns.max(p.event_ns);
                 inflight -= MSS;
                 if p.lost {
-                    bbr.on_packet_lost(MSS as u16, p.pn, SpaceId::Data, at(now_ns));
+                    let transaction = bbr.on_packet_lost(
+                        MSS as u16,
+                        p.pn,
+                        SpaceId::Data,
+                        at(now_ns),
+                    );
+                    bbr.on_congestion_event(
+                        at(now_ns),
+                        at(p.send_ns),
+                        false,
+                        false,
+                        MSS,
+                        p.pn,
+                        SpaceId::Data,
+                    );
+                    if let Some(transaction) = transaction {
+                        bbr.on_recovery_transaction_abandoned(transaction);
+                    }
                 } else {
                     rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
                     bbr.on_ack(
@@ -9088,25 +10728,65 @@ mod test {
                     bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn), SpaceId::Data);
                 }
 
-                // Phase 1 -> 2: once settled in PROBE_BW at the high rate (max_bw ~= BW_HI), cut the
-                // link 10x. The ~1 BDP still in flight now overflows the buffer -> loss.
-                if !cut && matches!(bbr.state, BbrState::ProbeBw(_)) && bbr.max_bw >= 0.9 * BW_HI {
+                if !cut
+                    && matches!(bbr.state, BbrState::ProbeBw(_))
+                    && (high_service - rate_quantum..=high_model_ceiling + rate_quantum)
+                        .contains(&bbr.max_bw)
+                {
                     cut = true;
                     cut_max_bw = bbr.max_bw;
-                    cut_cycle = bbr.cycle_count;
-                    btl_service_ns = (MSS as f64 / BW_LO * 1e9).round() as u64;
+                    cut_round = bbr.round_count;
+                    cut_delivered = bbr.delivered;
+                    exhaustions_at_cut = bbr.loss_budget_exhaustions;
+                    btl_service_ns = low_service_ns;
                 }
 
-                // After the cut, watch the short-term model descend and the long-term filter expire.
-                if cut {
+                if cut && !restored {
                     if bbr.bw_shortterm.is_finite() {
                         min_shortterm_after = min_shortterm_after.min(bbr.bw_shortterm);
                     }
-                    // max_bw collapses to the new rate once the stale high sample ages out of the
-                    // MAX_BW_FILTER_LEN-wide window (keyed on cycle_count).
-                    if adapt_cycles.is_none() && bbr.max_bw <= 1.15 * BW_LO {
-                        adapt_cycles = Some(bbr.cycle_count - cut_cycle);
-                        break;
+                    let genuine_response = post_cut_tail_drop_bytes > 0
+                        && min_shortterm_after < cut_max_bw
+                        && (loss_compensation_floor.is_none()
+                            || bbr.loss_budget_exhaustions > exhaustions_at_cut);
+                    if genuine_response
+                        && (low_service - rate_quantum..=low_model_ceiling + rate_quantum)
+                            .contains(&bbr.max_bw)
+                    {
+                        low_max_bw = Some(bbr.max_bw);
+                        restored = true;
+                        restore_round = bbr.round_count;
+                        restore_delivered = bbr.delivered;
+                        btl_service_ns = high_service_ns;
+                    }
+                }
+
+                if restored {
+                    let high_rediscovered =
+                        (high_service - rate_quantum..=high_service + rate_quantum)
+                            .contains(&bbr.max_bw);
+                    let old_flight_drained = flight
+                        .iter()
+                        .all(|packet| packet.post_restore && !packet.lost);
+                    if recovery_window_start.is_none()
+                        && high_rediscovered
+                        && old_flight_drained
+                    {
+                        recovery_window_start = Some((
+                            now_ns,
+                            bbr.delivered,
+                            bbr.loss_budget_exhaustions,
+                        ));
+                    }
+                    if recovery_window_start.is_some() {
+                        recovery_window_min_bw = recovery_window_min_bw.min(bbr.max_bw);
+                        recovery_window_max_bw = recovery_window_max_bw.max(bbr.max_bw);
+                    }
+                    if let Some((start_ns, _, _)) = recovery_window_start {
+                        if now_ns >= start_ns.saturating_add(RECOVERY_WINDOW_NS) {
+                            recovery_window_end_delivered = Some(bbr.delivered);
+                            break;
+                        }
                     }
                 }
             } else {
@@ -9114,40 +10794,52 @@ mod test {
             }
         }
 
-        // The link was cut 10x while genuinely in the high-rate regime (max_bw ~= BW_HI).
         assert!(cut, "flow never reached PROBE_BW at the high rate to cut");
+        assert!(post_cut_tail_drop_bytes > 0, "the cut produced no genuine tail drop");
+        assert!(min_shortterm_after < cut_max_bw, "short-term loss response never engaged");
+        if loss_compensation_floor.is_some() {
+            assert!(
+                bbr.loss_budget_exhaustions > exhaustions_at_cut,
+                "the compensated budget never classified the genuine congestion"
+            );
+        }
+        let low_max_bw = low_max_bw.expect("controller never converged to reduced service");
         assert!(
-            cut_max_bw >= 0.9 * BW_HI,
-            "at the cut the flow should be in the high-rate regime, got max_bw {cut_max_bw}"
+            (low_service - rate_quantum..=low_model_ceiling + rate_quantum)
+                .contains(&low_max_bw),
+            "low-service estimate {low_max_bw} is outside the corrected service model"
         );
+        assert!(restore_delivered > cut_delivered && restore_round > cut_round);
+        let (window_start_ns, window_start_delivered, exhaustions_at_recovery) =
+            recovery_window_start.expect("controller never rediscovered restored service");
+        let window_end_delivered =
+            recovery_window_end_delivered.expect("recovered observation window did not finish");
+        assert!(bbr.delivered > restore_delivered && bbr.round_count > restore_round);
+        let recovered_bw = high_service - rate_quantum..=high_service + rate_quantum;
+        assert!(
+            recovered_bw.contains(&recovery_window_min_bw)
+                && recovered_bw.contains(&recovery_window_max_bw),
+            "recovered max_bw left the physical-service band: [{recovery_window_min_bw}, {recovery_window_max_bw}]",
+        );
+        if loss_compensation_floor.is_some() {
+            assert_eq!(recovery_window_tail_drop_bytes, 0);
+            assert_eq!(bbr.loss_budget_exhaustions, exhaustions_at_recovery);
+        }
 
-        // The short-term model reacted to the loss immediately: bw_shortterm was pulled below the
-        // high operating point by at least one BETA (0.7) decay of loss_lower_bounds. This is the
-        // *rapid* response: `bw = min(max_bw, bw_shortterm)` so this throttles sending within the
-        // current cycle, long before max_bw moves. It only steps down ~one BETA per cycle because
-        // each PROBE_BW refill resets bw_shortterm to INFINITY and re-seeds it from the (still
-        // stale-high) max_bw; the deep collapse all the way to BW_LO is delivered by the max_bw
-        // filter expiry below, not by bw_shortterm alone.
+        let window_seconds = RECOVERY_WINDOW_NS as f64 / 1e9;
+        let recovered_goodput =
+            window_end_delivered.saturating_sub(window_start_delivered) as f64 / window_seconds;
+        let probe_rtt_duty = 1.0
+            - (PROBE_RTT_DURATION_MS as f64 / 1_000.0) / PROBE_RTT_INTERVAL_SEC as f64;
+        let pacing_duty = 1.0 - PACING_MARGIN_PERCENT / 100.0;
+        let goodput_floor = high_service * probe_rtt_duty * pacing_duty;
+        let window_quantum = MSS as f64 / window_seconds;
         assert!(
-            min_shortterm_after <= 0.75 * BW_HI,
-            "bw_shortterm should adapt down (>=1 BETA step) after the cut; min seen {min_shortterm_after}"
+            recovered_goodput + window_quantum >= goodput_floor
+                && recovered_goodput <= high_service + window_quantum,
+            "recovered goodput {recovered_goodput} outside model [{goodput_floor}, {high_service}]"
         );
-
-        // max_bw collapsed to the new 10 Mbit/s limit (matching the path delivery rate) once the
-        // filter window expired, and within a small number of PROBE_BW cycles (MAX_BW_FILTER_LEN
-        // is 2; the bound leaves headroom for the cycle in which the cut was recorded).
-        let adapt_cycles = adapt_cycles.expect("max_bw never collapsed to the new BW_LO");
-        assert!(
-            adapt_cycles <= (MAX_BW_FILTER_LEN as u64) + 2,
-            "expected max_bw to adapt within ~MAX_BW_FILTER_LEN PROBE_BW cycles, took {adapt_cycles}"
-        );
-        // The break fired on max_bw <= 1.15*BW_LO, so only the lower bound informs here:
-        // confirm the estimate collapsed to (not below) the new rate.
-        assert!(
-            bbr.max_bw >= 0.85 * BW_LO,
-            "max_bw should track the new path delivery rate BW_LO, got {}",
-            bbr.max_bw
-        );
+        assert!(now_ns >= window_start_ns.saturating_add(RECOVERY_WINDOW_NS));
     }
 
     #[test]

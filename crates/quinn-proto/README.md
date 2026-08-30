@@ -81,8 +81,12 @@ deviations from upstream 0.11.17 are:
   delivered-volume evidence by at most the observed loss. It composes with,
   but does not replace, the draft's 2% residual congestion-loss objective;
   MPTUNNEL selects 10% by default and a path may explicitly select zero for
-  draft behavior. Unknown evidence stays conservative, and ECN and persistent
-  congestion retain their native response authority;
+  draft behavior. Ordinary loss classification uses a deterministic
+  three-operating-round carry-over envelope at completed packet-timed
+  boundaries, so correlated placement cannot repeatedly turn a population
+  allowance into per-round false congestion. Unknown evidence stays
+  conservative, and ECN and persistent congestion retain their native response
+  authority;
 - an opt-in controller hook lets a genuinely new network path start fresh
   congestion state while retaining a connection-scoped instrumentation owner;
   controllers that do not implement the hook retain Quinn's factory-reset

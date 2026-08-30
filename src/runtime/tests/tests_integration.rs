@@ -2390,7 +2390,7 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(ACTOR_SETTLEMENT_TIMEOUT, async {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
         let target_addr = target_listener.local_addr().expect("target address");
         let (target_release_tx, target_release_rx) = oneshot::channel();
@@ -2636,7 +2636,7 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         target.await.expect("target join");
     })
     .await
-    .expect("focused QUIC attachment recovery exceeded three seconds");
+    .expect("focused QUIC attachment recovery exceeded the actor settlement budget");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -13,6 +13,7 @@ use super::work::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record, lab_sender_service_decision};
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{
     QUIC_PERSISTENT_CONGESTION_THRESHOLD, adaptive_reliable_relay_reinjection_bytes,
     reliable_stream_advertised_window_bytes,
@@ -422,13 +423,15 @@ impl RequestSenderService {
         remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
         request_lane: TrafficClass,
+        frontier_state: ReliableDataAckFrontierState,
     ) -> Result<RelaySendOutcome, RuntimeError> {
-        self.send_frame(
+        self.send_frame_at_frontier(
             context,
             remotes,
             frame,
             RelaySendCause::StreamData,
             Some(request_lane),
+            frontier_state,
         )
         .await
     }
@@ -484,6 +487,7 @@ impl RequestSenderService {
         send_stream: &mut ReliableSendStream,
         sender_queue: &mut ReliableRelaySenderQueue,
         data_quantum_bytes: usize,
+        frontier_state: ReliableDataAckFrontierState,
     ) -> Result<ClientQueuedDispatch, RuntimeError> {
         let queued_kind = sender_queue
             .front()
@@ -502,6 +506,7 @@ impl RequestSenderService {
                     sender_queue,
                     payload,
                     data_quantum_bytes,
+                    frontier_state,
                 )
                 .await
             }
@@ -529,6 +534,7 @@ impl RequestSenderService {
         sender_queue: &mut ReliableRelaySenderQueue,
         payload: Bytes,
         data_quantum_bytes: usize,
+        frontier_state: ReliableDataAckFrontierState,
     ) -> Result<ClientQueuedDispatch, RuntimeError> {
         let dispatch_payload_bytes = data_quantum_bytes.min(payload.len()).max(1);
         let dispatch_payload = payload.slice(..dispatch_payload_bytes);
@@ -538,7 +544,13 @@ impl RequestSenderService {
         // Queue priority stays duplex-aware, but request exploration must not
         // borrow bulk classification from reverse-direction response bytes.
         match self
-            .send_stream_data_for_request_lane(context, remotes, frame.clone(), request_lane)
+            .send_stream_data_for_request_lane(
+                context,
+                remotes,
+                frame.clone(),
+                request_lane,
+                frontier_state,
+            )
             .await
         {
             Ok(_outcome) => {
@@ -639,6 +651,26 @@ impl RequestSenderService {
         cause: RelaySendCause,
         request_lane: Option<TrafficClass>,
     ) -> Result<RelaySendOutcome, RuntimeError> {
+        self.send_frame_at_frontier(
+            context,
+            remotes,
+            frame,
+            cause,
+            request_lane,
+            ReliableDataAckFrontierState::Live,
+        )
+        .await
+    }
+
+    async fn send_frame_at_frontier(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        frame: Frame,
+        cause: RelaySendCause,
+        request_lane: Option<TrafficClass>,
+        frontier_state: ReliableDataAckFrontierState,
+    ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
         let avoid_instances =
             self.multipath
@@ -651,6 +683,7 @@ impl RequestSenderService {
                 cause,
                 &avoid_instances,
                 request_lane,
+                frontier_state,
             )
             .await?;
         let path_key = instance.key;
@@ -666,6 +699,7 @@ impl RequestSenderService {
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
         request_lane: Option<TrafficClass>,
+        frontier_state: ReliableDataAckFrontierState,
     ) -> Result<(RelayPathInstance, usize), RuntimeError> {
         let mut last_error = None;
         while !remotes.paths.is_empty() {
@@ -675,13 +709,14 @@ impl RequestSenderService {
                 .map(|path| path.stream.lane)
                 .unwrap_or(TrafficClass::Latency);
             let selection_lane = request_lane.unwrap_or(stream_lane);
-            let plan = match self.multipath.plan_relay_path_send(
+            let plan = match self.multipath.plan_relay_path_send_at_frontier(
                 context,
                 remotes,
                 &frame,
                 selection_lane,
                 cause,
                 avoid_instances,
+                frontier_state,
             ) {
                 Ok(plan) => plan,
                 Err(

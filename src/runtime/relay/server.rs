@@ -24,7 +24,9 @@ use super::io::{
 use crate::lab_diagnostics::{
     lab_assert_server_sender_service_balanced, lab_diagnostic, lab_perf_flush, lab_perf_record,
 };
-use crate::model::admission::reliable_relay_source_staging_headroom;
+use crate::model::admission::{
+    ReliableDataAckFrontierState, reliable_relay_source_staging_headroom,
+};
 use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit,
     adaptive_reliable_relay_reinjection_bytes, relay_lane_startup_chunk_bytes,
@@ -1137,6 +1139,7 @@ fn evaluate_server_data_ack_reinjection(
         send_stream,
         ranges,
         service_limit,
+        base_limit,
         complete,
         has_multipath_alternative,
         true,
@@ -1303,6 +1306,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
             let gap_source_frames = stream_ack_gap_reinjection_frames_normalized(
                 send_stream,
                 last_send_ack_ranges,
+                gap_limit,
                 gap_limit,
                 true,
                 true,
@@ -1492,11 +1496,23 @@ fn enqueue_reliable_tail_reinjection(
     )
 }
 
+fn server_data_ack_frontier_state(
+    last_send_ack: &AuthoritativeStreamAckSnapshot,
+) -> ReliableDataAckFrontierState {
+    ReliableDataAckFrontierState::from_authoritative_gap(
+        stream_ack_ranges_expose_authoritative_gap(
+            last_send_ack.complete(),
+            last_send_ack.ranges(),
+        ),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
     mut data_ack_outstanding_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
     send_stream: &mut ReliableSendStream,
     relay_lane: TrafficClass,
     mux_limits: MuxLimits,
@@ -1513,12 +1529,13 @@ async fn drain_server_response_sender_ready(
         && dispatched_items < sender_dispatch_item_budget
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
-        let dispatch = match response_sender.dispatch_next_with_data_ack_outstanding(
+        let dispatch = match response_sender.dispatch_next_at_frontier(
             path_stream,
             send_stream,
             relay_lane,
             mux_limits,
             data_ack_outstanding_bytes,
+            frontier_state,
         ) {
             Ok(dispatch) => dispatch,
             Err(RuntimeError::SenderServiceBlocked) => {
@@ -2196,14 +2213,14 @@ where
         if response_sender_retry_at.is_some_and(|deadline| deadline <= now) {
             response_sender_retry_at = None;
         }
-        let queued_front_has_carrier_credit = response_sender
-            .front_has_carrier_credit_with_data_ack_outstanding(
-                path_stream,
-                &send_stream,
-                response_lane,
-                mux_limits,
-                data_ack_outstanding_bytes,
-            );
+        let queued_front_has_carrier_credit = response_sender.front_has_carrier_credit_at_frontier(
+            path_stream,
+            &send_stream,
+            response_lane,
+            mux_limits,
+            data_ack_outstanding_bytes,
+            server_data_ack_frontier_state(&last_send_ack),
+        );
         let sender_wait = response_sender_wait_state(
             !response_sender.is_empty(),
             response_sender.queued_send_ready(),
@@ -2305,6 +2322,7 @@ where
                 &mut response_sender,
                 path_stream,
                 data_ack_outstanding_bytes,
+                server_data_ack_frontier_state(&last_send_ack),
                 &mut send_stream,
                 response_lane,
                 mux_limits,
@@ -2777,6 +2795,7 @@ where
                     &mut response_sender,
                 path_stream,
                     data_ack_outstanding_bytes,
+                    server_data_ack_frontier_state(&last_send_ack),
                     &mut send_stream,
                     response_lane,
                 mux_limits,
@@ -2933,6 +2952,7 @@ where
                     &mut response_sender,
                 path_stream,
                     data_ack_outstanding_bytes,
+                    server_data_ack_frontier_state(&last_send_ack),
                     &mut send_stream,
                     response_lane,
                 mux_limits,
@@ -3024,6 +3044,7 @@ where
                     &mut response_sender,
                 path_stream,
                     data_ack_outstanding_bytes,
+                    server_data_ack_frontier_state(&last_send_ack),
                     &mut send_stream,
                     response_lane,
                 mux_limits,
@@ -3057,6 +3078,7 @@ where
                 &mut response_sender,
                 path_stream,
                 data_ack_outstanding_bytes,
+                server_data_ack_frontier_state(&last_send_ack),
                 &mut send_stream,
                 response_lane,
                 mux_limits,
@@ -3081,6 +3103,7 @@ where
                 &mut response_sender,
                 path_stream,
                 data_ack_outstanding_bytes,
+                server_data_ack_frontier_state(&last_send_ack),
                 &mut send_stream,
                 response_lane,
                 mux_limits,
@@ -3231,6 +3254,7 @@ where
                         &mut response_sender,
                 path_stream,
                         data_ack_outstanding_bytes,
+                        server_data_ack_frontier_state(&last_send_ack),
                         &mut send_stream,
                         response_lane,
                 mux_limits,
@@ -3267,6 +3291,7 @@ where
                 &mut response_sender,
                 path_stream,
                 data_ack_outstanding_bytes,
+                server_data_ack_frontier_state(&last_send_ack),
                 &mut send_stream,
                 close.lane,
                 mux_limits,

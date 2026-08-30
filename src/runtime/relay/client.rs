@@ -577,6 +577,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         send_stream,
         authoritative_ack_ranges,
         reinjection_limit,
+        base_reinjection_limit,
         authoritative_ack_complete,
         has_multipath_reinjection_alternative,
         persistent_ack_gap_reinjection_ready,

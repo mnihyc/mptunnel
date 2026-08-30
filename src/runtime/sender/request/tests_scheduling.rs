@@ -6,7 +6,7 @@ use super::{
     relay_path_snapshot_for_bulk_choice,
 };
 use crate::model::ack_clock::reliable_request_ack_clock_measurement_target_bytes;
-use crate::model::admission::BulkPathCandidate;
+use crate::model::admission::{BulkPathCandidate, ReliableDataAckFrontierState};
 use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
 use crate::model::path::{
     CarrierPathInstanceId, RelayPathInstance, RelayPathKey, RelayPathProofEpoch,
@@ -236,6 +236,20 @@ fn choose_bulk(
     flights: &RequestFlightLedger,
     evidence: Option<&RequestEvidence>,
 ) -> BulkRelayPathChoice {
+    choose_bulk_at_frontier(
+        observation,
+        flights,
+        evidence,
+        ReliableDataAckFrontierState::Live,
+    )
+}
+
+fn choose_bulk_at_frontier(
+    observation: &RequestRelaySchedulingObservation,
+    flights: &RequestFlightLedger,
+    evidence: Option<&RequestEvidence>,
+    frontier_state: ReliableDataAckFrontierState,
+) -> BulkRelayPathChoice {
     choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
         observation,
         lane: TrafficClass::Throughput,
@@ -245,6 +259,7 @@ fn choose_bulk(
         avoid_instances: &[],
         path_flights: Some(flights),
         request_state: evidence.map(RequestEvidence::state),
+        frontier_state,
     })
 }
 
@@ -403,6 +418,36 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
         choose_bulk(&observation, &flights, Some(&evidence)),
         BulkRelayPathChoice::Selected(owner),
         "the exact lower-flight owner remains native-work-conserving inside measured jitter",
+    );
+}
+
+#[test]
+fn authoritative_gap_frontier_revokes_only_request_owner_native_bypass() {
+    let owner = instance(UnderlayProtocol::Tcp, 0, 32);
+    let alternate = instance(UnderlayProtocol::Udp, 1, 33);
+    let mut owner_path = observed_path(owner, 10.0, 500_000_000.0);
+    let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("snapshot");
+    owner_snapshot.data_level_bytes_in_flight = MuxLimits::default().max_path_flight_bytes as u64;
+    let mut alternate_path = observed_path(alternate, 8.0, 500_000_000.0);
+    alternate_path.can_enqueue_frame = false;
+    let observation = scheduling_observation([owner_path, alternate_path]);
+    let flights = original_flights(owner);
+    let evidence = RequestEvidence::default().prove_rate([owner, alternate]);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(owner),
+        "without receiver proof of a gap, the same owner remains native-work-conserving",
+    );
+    assert_eq!(
+        choose_bulk_at_frontier(
+            &observation,
+            &flights,
+            Some(&evidence),
+            ReliableDataAckFrontierState::AuthoritativeGap,
+        ),
+        BulkRelayPathChoice::Blocked,
+        "a receiver-proven gap must classify the overcommitted request owner through ordinary Product admission",
     );
 }
 

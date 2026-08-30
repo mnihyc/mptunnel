@@ -202,6 +202,48 @@ async fn exact_current_unmeasured_attachment_keeps_startup_admission() {
 }
 
 #[tokio::test]
+async fn sole_authoritative_gap_owner_keeps_its_proven_product_evidence() {
+    let context = client_test_context_with_paths(&["quic://127.0.0.1:10266?initial-srtt-s=0.02"]);
+    let stream_id = StreamId(177);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
+        8,
+    );
+    let owner = remotes.paths[0].instance();
+    seed_client_bulk_evidence_for_test(&context, owner);
+    let qualified_sample = PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20))
+        .expect("qualified bulk sample");
+    for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
+        context.mark_relay_path_rate_sample_for_test(owner.key, qualified_sample);
+    }
+
+    // This exact owner has more flight than the unproven startup allowance,
+    // but remains inside its measured Product service window. A receiver-
+    // proven gap revokes only its native-only exemption; it must not erase the
+    // capacity evidence needed by ordinary Product admission.
+    let prior_bytes = 1024 * 1024;
+    let prior = data_frame(stream_id, 0, prior_bytes);
+    let next = data_frame(stream_id, prior_bytes as u64, 4096);
+    context.record_relay_path_send(owner, prior_bytes);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(owner, &prior);
+
+    let plan = controller
+        .plan_relay_path_send_at_frontier(
+            &context,
+            &mut remotes,
+            &next,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+            ReliableDataAckFrontierState::AuthoritativeGap,
+        )
+        .expect("measured sole owner remains inside ordinary Product admission");
+    assert_eq!(plan.target().1, owner);
+}
+
+#[tokio::test]
 async fn request_plan_revalidates_exact_health_after_same_key_replacement() {
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10261?initial-srtt-s=0.005",

@@ -1994,6 +1994,17 @@ unambiguous Data ACK coverage for original transmissions, it may own at most
 one bounded startup flight. Native TCP ACK or QUIC packet-ACK evidence alone
 does not unlock mature additional-output placement.
 
+That native-only fresh-data authority applies only while the lowest
+outstanding frontier is live: no retained complete Data ACK proves that its
+lowest range is missing. When a retained complete Data ACK omits that range,
+the frontier becomes an authoritative-gap frontier. Its exact owner remains
+the ordering, completion, hysteresis, and recovery reference, but fresh
+originals on that owner MUST pass the ordinary Product flight and reorder
+admission used by an additional output until Data ACK progress advances or
+resolves the gap. Other eligible outputs are not globally paused. An
+incomplete positive ACK cannot create this state, and this rule neither lowers
+the configured reorder envelope nor changes native TCP or QUIC recovery.
+
 An output does not become the contiguous-frontier owner merely because it is
 the only output that can currently enqueue. While an unresolved lower original
 range belongs to another output, the survivor remains an additional output and
@@ -2049,6 +2060,14 @@ carrier's useful service window; queue, flight, RTT, loss, backup preference,
 or inferior completion time may leave it without new Product work. Carrier
 presence is therefore not payload allocation, and an idle member does not
 cause duplicate transmission.
+
+While the exact lower-range owner remains admitted, both request and response
+placement retain it when another output's estimated completion advantage is
+within current timing uncertainty plus one payload scheduling quantum of queue
+uncertainty. A materially earlier completion or queue growth beyond that
+quantum preempts it. This transport-neutral hysteresis prevents ownership
+flapping on measurement noise without turning ownership into a fixed path
+preference.
 
 The Core does not infer a common bottleneck or condition carrier membership or
 directional authority on transient comparative throughput samples. Such a
@@ -2136,6 +2155,14 @@ completion claim MUST NOT be inherited by its replacement. Without exact
 ownership or a live measured distinct alternate no target-bound repair is
 sent; when an eligible alternate cannot win early, ACK silence waits until the
 one-interval `fallback_at` rather than erasing that fallback.
+
+Recovery target ranking and commitment MUST refer to the same lowest-missing
+frontier quantum. The first committed repair frame on the selected target has
+the exact offset and payload extent whose estimated completion authorized that
+target. After that quantum is committed, the sender may fill the remainder of
+the same bounded target service window behind it. A larger coalesced batch or
+whole-window throughput estimate MUST NOT replace frontier-quantum completion
+as the primary target objective.
 
 When a persistent-gap reinjection attempt is accepted by a selected alternate,
 its repeat deadline is fixed from that alternate's observed MPP recovery

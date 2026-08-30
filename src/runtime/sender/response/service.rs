@@ -9,7 +9,7 @@ use super::dispatch::{
 };
 use super::multipath::{
     plan_response_data_payload_with_data_ack_outstanding_impl,
-    preview_response_data_payload_with_data_ack_outstanding,
+    preview_response_data_payload_with_data_ack_outstanding_at_frontier,
 };
 use super::response_reinjection_avoid_outputs;
 use super::scheduling::{response_completion_snapshot, select_response_frame_path};
@@ -18,6 +18,7 @@ use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
     lab_server_response_stream_data,
 };
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
 use crate::model::multipath::OptionalReinjectionLedger;
 use crate::model::path::CarrierPathKey;
@@ -352,13 +353,14 @@ impl ServerResponseSenderService {
         self.queue.front().is_some()
     }
 
-    pub(in crate::runtime) fn front_has_carrier_credit_with_data_ack_outstanding(
+    pub(in crate::runtime) fn front_has_carrier_credit_at_frontier(
         &self,
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
         relay_lane: TrafficClass,
         mux_limits: MuxLimits,
         data_ack_outstanding_bytes: usize,
+        frontier_state: ReliableDataAckFrontierState,
     ) -> bool {
         let Some((_, queued)) = self.queue.front() else {
             return false;
@@ -383,12 +385,13 @@ impl ServerResponseSenderService {
                 ) else {
                     return false;
                 };
-                preview_response_data_payload_with_data_ack_outstanding(
+                preview_response_data_payload_with_data_ack_outstanding_at_frontier(
                     path_stream,
                     data_lane,
                     send_stream.next_offset(),
                     payload_bytes,
                     data_ack_outstanding_bytes,
+                    frontier_state,
                 )
             }
             ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
@@ -578,12 +581,32 @@ impl ServerResponseSenderService {
         mux_limits: MuxLimits,
         data_ack_outstanding_bytes: usize,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
+        self.dispatch_next_at_frontier(
+            path_stream,
+            send_stream,
+            relay_lane,
+            mux_limits,
+            data_ack_outstanding_bytes,
+            ReliableDataAckFrontierState::Live,
+        )
+    }
+
+    pub(in crate::runtime) fn dispatch_next_at_frontier(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &mut ReliableSendStream,
+        relay_lane: TrafficClass,
+        mux_limits: MuxLimits,
+        data_ack_outstanding_bytes: usize,
+        frontier_state: ReliableDataAckFrontierState,
+    ) -> Result<ServerResponseDispatch, RuntimeError> {
         self.dispatch_next_attempt_with_data_ack_outstanding(
             path_stream,
             send_stream,
             relay_lane,
             mux_limits,
             data_ack_outstanding_bytes,
+            frontier_state,
         )
     }
 
@@ -594,6 +617,7 @@ impl ServerResponseSenderService {
         relay_lane: TrafficClass,
         mux_limits: MuxLimits,
         data_ack_outstanding_bytes: usize,
+        frontier_state: ReliableDataAckFrontierState,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         let (queued_lane, queued) = self
             .queue
@@ -638,6 +662,7 @@ impl ServerResponseSenderService {
                         send_stream.next_offset(),
                         dispatch_payload_bytes,
                         data_ack_outstanding_bytes,
+                        frontier_state,
                     )?;
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 #[cfg(feature = "lab-diagnostics")]

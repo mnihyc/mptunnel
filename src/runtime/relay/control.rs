@@ -31,6 +31,7 @@ use super::open::ReliableRelayOpenSpec;
 use super::remote::{ReliableRelayAttachMode, ReliableRelayPathLanes};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes,
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_relay_buffer_len,
@@ -1720,6 +1721,9 @@ where
                                 adaptive_chunk,
                                 sender_dispatch_byte_budget
                                     .saturating_sub(dispatched_payload_bytes),
+                            ),
+                            ReliableDataAckFrontierState::from_authoritative_gap(
+                                authoritative_data_ack_gap,
                             ),
                         )
                         .await;

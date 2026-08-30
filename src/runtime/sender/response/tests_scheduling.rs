@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
@@ -348,6 +349,56 @@ fn clear_frontier_owner_remains_native_work_conserving_with_two_live_paths() {
 }
 
 #[test]
+fn authoritative_gap_frontier_revokes_only_the_owner_native_bypass() {
+    let mux_limits = MuxLimits::default();
+    let product_flight = 48 * 1024 * 1024_u64;
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        5.0,
+        product_flight,
+        512 * 1024,
+        true,
+    );
+    owner.observation.snapshot.data_level_limit_bytes = 1024 * 1024;
+    owner.observation.snapshot.bytes_in_flight = 0;
+    let mut alternate = response_target(1, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, false);
+    block_data_queue(&mut alternate);
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: product_flight,
+    }];
+
+    assert_eq!(
+        select_response_data_path(
+            &[owner.clone(), alternate.clone()],
+            TrafficClass::Throughput,
+            64 * 1024,
+            mux_limits,
+            &lower,
+            product_flight as usize,
+        )
+        .map(|selected| selected.observation.key),
+        Some(owner.observation.key),
+        "without receiver proof of a gap, the same owner remains native-work-conserving",
+    );
+    assert!(
+        select_response_data_path_at_frontier(
+            &[owner, alternate],
+            TrafficClass::Throughput,
+            64 * 1024,
+            mux_limits,
+            &lower,
+            product_flight as usize,
+            ReliableDataAckFrontierState::AuthoritativeGap,
+        )
+        .is_none(),
+        "a receiver-proven gap must classify the overcommitted owner through ordinary Product admission",
+    );
+}
+
+#[test]
 fn unproven_path_payload_is_not_hard_capped_by_sampled_native_window() {
     let mut target = response_target(0, UnderlayProtocol::Tcp, 800.0, 0, 16 * 1024, true);
     target.observation.has_bulk_rate_evidence = false;
@@ -361,6 +412,7 @@ fn unproven_path_payload_is_not_hard_capped_by_sampled_native_window() {
         MuxLimits::default(),
         &[],
         0,
+        ReliableDataAckFrontierState::Live,
     )
     .expect("unproven path with native credit");
 
@@ -1337,6 +1389,93 @@ fn cross_underlay_path_can_add_capacity_with_bounded_ordering_debt() {
     )
     .expect("bounded cross-underlay work has completion gain");
     assert_eq!(selected.observation.key, quic.observation.key);
+}
+
+#[test]
+fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Udp,
+        10.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    owner.observation.snapshot.jitter_ms = 3.0;
+    let mut challenger = response_target(1, UnderlayProtocol::Tcp, 9.0, 0, 16 * 1024 * 1024, false);
+    challenger.observation.snapshot.jitter_ms = 3.0;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+
+    let selected = select_response_data_path(
+        &[owner.clone(), challenger],
+        TrafficClass::Throughput,
+        64 * 1024,
+        MuxLimits::default(),
+        &lower,
+        64 * 1024,
+    )
+    .expect("both qualified carriers remain schedulable");
+    assert_eq!(
+        selected.observation.key, owner.observation.key,
+        "the exact lower-flight owner must not flap on a sub-jitter completion difference",
+    );
+}
+
+#[test]
+fn material_completion_gain_preempts_lower_flight_owner_hysteresis() {
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Udp,
+        40.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    owner.observation.snapshot.jitter_ms = 3.0;
+    let mut challenger = response_target(1, UnderlayProtocol::Tcp, 9.0, 0, 16 * 1024 * 1024, false);
+    challenger.observation.snapshot.jitter_ms = 3.0;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+
+    assert_eq!(
+        select(&[owner, challenger.clone()], &lower, 64 * 1024),
+        Some(challenger.observation.key),
+        "measured hysteresis must not preserve a materially slower frontier owner",
+    );
+}
+
+#[test]
+fn queue_growth_beyond_one_quantum_preempts_lower_flight_owner_hysteresis() {
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Udp,
+        10.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    owner.observation.snapshot.jitter_ms = 100.0;
+    owner.observation.snapshot.queue_bytes = 2 * 64 * 1024;
+    let mut challenger = response_target(1, UnderlayProtocol::Tcp, 9.0, 0, 16 * 1024 * 1024, false);
+    challenger.observation.snapshot.jitter_ms = 100.0;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+
+    assert_eq!(
+        select(&[owner, challenger.clone()], &lower, 64 * 1024),
+        Some(challenger.observation.key),
+        "hysteresis must not hide more than one scheduling quantum of queue growth",
+    );
 }
 
 #[test]

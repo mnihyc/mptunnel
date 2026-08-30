@@ -12,7 +12,7 @@ use crate::model::ack_clock::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::admission::bulk_completion_horizon_ms_with_ordering_debt;
 use crate::model::admission::{
-    BulkAdmissionCheck, BulkCandidatePosition, BulkPathCandidate,
+    BulkAdmissionCheck, BulkCandidatePosition, BulkPathCandidate, ReliableDataAckFrontierState,
     bulk_candidate_admission_suppression_with_completion_backlog,
     bulk_candidate_admission_suppression_with_ordering_debt, bulk_candidate_pipe_bytes,
     bulk_reorder_window_bytes, bulk_scheduling_horizon_bytes, bulk_scheduling_window_bytes,
@@ -295,6 +295,7 @@ pub(super) struct BulkRelayPathRequest<'a> {
     pub(super) avoid_instances: &'a [RelayPathInstance],
     pub(super) path_flights: Option<&'a RequestFlightLedger>,
     pub(super) request_state: Option<RequestSchedulingState<'a>>,
+    pub(super) frontier_state: ReliableDataAckFrontierState,
 }
 
 pub(super) struct BulkRelayFrameRequest<'a> {
@@ -305,6 +306,7 @@ pub(super) struct BulkRelayFrameRequest<'a> {
     pub(super) avoid_instances: &'a [RelayPathInstance],
     pub(super) path_flights: Option<&'a RequestFlightLedger>,
     pub(super) request_state: Option<RequestSchedulingState<'a>>,
+    pub(super) frontier_state: ReliableDataAckFrontierState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1088,6 +1090,7 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         avoid_instances,
         path_flights,
         request_state,
+        frontier_state,
     } = request;
     let Some((offset, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
         return BulkRelayPathChoice::NotApplicable;
@@ -1101,6 +1104,7 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         avoid_instances,
         path_flights,
         request_state,
+        frontier_state,
     })
 }
 
@@ -1116,6 +1120,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         avoid_instances,
         path_flights,
         request_state,
+        frontier_state,
     } = request;
     let stream_id = observation.stream_id;
     let paths = observation.paths.as_slice();
@@ -1126,7 +1131,12 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         return BulkRelayPathChoice::NotApplicable;
     }
     let normal_bulk_send = avoid_instances.is_empty();
-    if paths.len() <= 1 {
+    let sole_path_authoritative_gap_owner = paths.len() == 1
+        && frontier_state == ReliableDataAckFrontierState::AuthoritativeGap
+        && path_flights
+            .and_then(|flights| flights.oldest_lower_flight_owner_before_offset(offset))
+            .is_some_and(|owner| paths[0].key() == owner);
+    if paths.len() <= 1 && !sole_path_authoritative_gap_owner {
         if normal_bulk_send
             && let Some(flights) = path_flights
             && let Some(owner) = flights.oldest_lower_flight_owner_before_offset(offset)
@@ -1611,7 +1621,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
                 .unwrap_or(0);
             let owns_lower_frontier = lower_flight_owner == Some(key);
-            let position = if owns_lower_frontier {
+            let position = if owns_lower_frontier && frontier_state.owner_uses_native_admission() {
                 BulkCandidatePosition::ContiguousFrontier
             } else if Some(key) == lead_key && cross_path_ordering_debt == 0 {
                 BulkCandidatePosition::FirstPath
@@ -1621,12 +1631,11 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 BulkCandidatePosition::FirstPath
             };
             let admission_ordering_debt = cross_path_ordering_debt;
-            let (best_snapshot, best_eta_ms) =
-                if position == BulkCandidatePosition::ContiguousFrontier {
-                    (snapshot, score.eta_ms)
-                } else {
-                    lead_baseline.unwrap_or((snapshot, score.eta_ms))
-                };
+            let (best_snapshot, best_eta_ms) = if owns_lower_frontier {
+                (snapshot, score.eta_ms)
+            } else {
+                lead_baseline.unwrap_or((snapshot, score.eta_ms))
+            };
             #[cfg(feature = "lab-diagnostics")]
             {
                 let completion_horizon_ms = bulk_completion_horizon_ms_with_ordering_debt(

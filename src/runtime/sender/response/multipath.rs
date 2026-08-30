@@ -5,6 +5,7 @@
 //! flight generation before publishing the carrier command.
 
 use super::scheduling::select_response_data_path_with_payload;
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::path::CarrierPathKey;
 use crate::model::work::ReliableWorkClass;
 use crate::runtime::RuntimeError;
@@ -54,6 +55,7 @@ pub(super) fn plan_response_data_dispatch_with_data_ack_outstanding_impl(
         next_offset,
         payload_bytes,
         data_ack_outstanding_bytes,
+        ReliableDataAckFrontierState::Live,
     )
     .map(|(_, target)| target)
 }
@@ -64,6 +66,7 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
     next_offset: u64,
     payload_bytes: usize,
     data_ack_outstanding_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
 ) -> Result<(usize, ResponseDataDispatchTarget), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
@@ -90,6 +93,7 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
                 binding.mux_limits(),
                 &lower_flights,
                 data_ack_outstanding_bytes,
+                frontier_state,
             )
             .ok_or(RuntimeError::SenderServiceBlocked)?;
             Ok((
@@ -105,6 +109,7 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
 
 /// Readiness observes the same queue and model as apply, but never reserves a
 /// carrier command or advances a connection generation.
+#[cfg(test)]
 pub(super) fn preview_response_data_payload_with_data_ack_outstanding(
     path_stream: &ReliablePathStream,
     relay_lane: TrafficClass,
@@ -112,12 +117,31 @@ pub(super) fn preview_response_data_payload_with_data_ack_outstanding(
     payload_bytes: usize,
     data_ack_outstanding_bytes: usize,
 ) -> bool {
+    preview_response_data_payload_with_data_ack_outstanding_at_frontier(
+        path_stream,
+        relay_lane,
+        next_offset,
+        payload_bytes,
+        data_ack_outstanding_bytes,
+        ReliableDataAckFrontierState::Live,
+    )
+}
+
+pub(super) fn preview_response_data_payload_with_data_ack_outstanding_at_frontier(
+    path_stream: &ReliablePathStream,
+    relay_lane: TrafficClass,
+    next_offset: u64,
+    payload_bytes: usize,
+    data_ack_outstanding_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
+) -> bool {
     plan_response_data_payload_with_data_ack_outstanding_impl(
         path_stream,
         relay_lane,
         next_offset,
         payload_bytes,
         data_ack_outstanding_bytes,
+        frontier_state,
     )
     .is_ok()
 }

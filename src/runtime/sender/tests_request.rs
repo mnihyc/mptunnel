@@ -1,6 +1,7 @@
 use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{adaptive_reliable_relay_inflight_bytes, reliable_relay_buffer_len};
 use crate::model::work::{
     ReliableWorkClass, reliable_critical_tail_reinjection_limit_bytes,
@@ -537,6 +538,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
             &mut send_stream,
             &mut queue,
             4096,
+            ReliableDataAckFrontierState::Live,
         )
         .await
         .expect("stale bound reinjection is cancelled without aborting the stream");
@@ -631,6 +633,7 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
                 &mut send_stream,
                 &mut sender_queue,
                 64,
+                ReliableDataAckFrontierState::Live,
             )
             .await
             .expect("live tail dispatch"),

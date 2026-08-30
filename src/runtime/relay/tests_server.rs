@@ -3806,18 +3806,19 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
         80.0,
         400_000_000.0,
     );
-    let base_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
-        Some(modeled_path),
+    let slow_send_path = PathSnapshot::new(
+        original_key.path_id,
+        original_key.underlay,
+        100.0,
+        1_500_000.0,
+    );
+    let scored_frontier_bytes = adaptive_reliable_relay_reinjection_bytes(
+        Some(slow_send_path),
         TrafficClass::Throughput,
         limits,
-        path_stream.max_frame_payload_bytes,
     )
-    .max(adaptive_reliable_relay_reinjection_bytes(
-        Some(modeled_path),
-        TrafficClass::Throughput,
-        limits,
-    ));
-    assert_eq!(base_limit, quantum);
+    .min(path_stream.max_frame_payload_bytes);
+    assert!(scored_frontier_bytes < quantum);
 
     let mut response_sender = ServerResponseSenderService::new_with_performance(
         SessionId(103),
@@ -3860,18 +3861,18 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
         &authoritative_ack,
         quantum as u64,
         Some(modeled_path),
-        Some(modeled_path),
+        Some(slow_send_path),
         TrafficClass::Throughput,
         limits,
         stream_id,
     );
 
-    assert_eq!(
-        outcome.queued, 4,
-        "a proven recovery-copy timeout may service every exact omitted range within the measured target window"
+    assert!(
+        outcome.queued >= 4,
+        "a proven recovery-copy timeout may fill the measured target window behind the scored frontier quantum"
     );
     assert!(
-        response_sender.bytes() > base_limit,
+        response_sender.bytes() > scored_frontier_bytes,
         "persistent timer service must not collapse back to one liveness quantum"
     );
     assert!(outcome.persistent_ready);
@@ -3893,7 +3894,7 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
             offset,
             payload,
             ..
-        })) if offset == quantum as u64 && payload.len() == quantum
+        })) if offset == quantum as u64 && payload.len() == scored_frontier_bytes
     ));
 }
 

@@ -167,6 +167,7 @@ pub(in crate::runtime) fn stream_ack_gap_reinjection_frames_normalized(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
+    frontier_frame_limit: usize,
     complete: bool,
     has_multipath_reinjection_alternative: bool,
     ack_gap_reinjection_ready: bool,
@@ -178,10 +179,51 @@ pub(in crate::runtime) fn stream_ack_gap_reinjection_frames_normalized(
             ack_gap_reinjection_ready,
         )
     {
-        send_stream.retransmission_frames_for_normalized_ack_gaps(ranges, byte_limit)
+        preserve_reinjection_frontier_quantum(
+            send_stream.retransmission_frames_for_normalized_ack_gaps(ranges, byte_limit),
+            frontier_frame_limit,
+        )
     } else {
         Vec::new()
     }
+}
+
+/// Keeps recovery observe/decide/apply on the same lowest-missing quantum.
+///
+/// Persistent recovery may fill a larger target service window after target
+/// selection. Regenerating that window must not coalesce the first range past
+/// the payload extent whose completion selected and authorized the target.
+fn preserve_reinjection_frontier_quantum(
+    frames: Vec<Frame>,
+    frontier_frame_limit: usize,
+) -> Vec<Frame> {
+    let mut frames = frames.into_iter();
+    let Some(first) = frames.next() else {
+        return Vec::new();
+    };
+    let mut preserved = Vec::with_capacity(frames.len().saturating_add(2));
+    match first {
+        Frame::StreamData {
+            stream_id,
+            offset,
+            payload,
+        } if payload.len() > frontier_frame_limit.max(1) => {
+            let split = frontier_frame_limit.max(1);
+            preserved.push(Frame::StreamData {
+                stream_id,
+                offset,
+                payload: payload.slice(..split),
+            });
+            preserved.push(Frame::StreamData {
+                stream_id,
+                offset: offset.saturating_add(split as u64),
+                payload: payload.slice(split..),
+            });
+        }
+        first => preserved.push(first),
+    }
+    preserved.extend(frames);
+    preserved
 }
 
 pub(in crate::runtime) fn stream_final_offset_tail_reinjection_frames_normalized(

@@ -7,7 +7,7 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
-    BulkAdmissionCheck, BulkCandidatePosition,
+    BulkAdmissionCheck, BulkCandidatePosition, ReliableDataAckFrontierState,
     bulk_candidate_admission_suppression_with_completion_backlog,
 };
 use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
@@ -41,6 +41,27 @@ pub(super) fn select_response_data_path(
     lower_flights: &[CarrierPathFlightDebt],
     connection_ordering_debt_bytes: usize,
 ) -> Option<ResponseSenderPathTarget> {
+    select_response_data_path_at_frontier(
+        targets,
+        lane,
+        payload_bytes,
+        mux_limits,
+        lower_flights,
+        connection_ordering_debt_bytes,
+        ReliableDataAckFrontierState::Live,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn select_response_data_path_at_frontier(
+    targets: &[ResponseSenderPathTarget],
+    lane: TrafficClass,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    connection_ordering_debt_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
+) -> Option<ResponseSenderPathTarget> {
     select_response_data_path_with_payload(
         targets,
         lane,
@@ -48,6 +69,7 @@ pub(super) fn select_response_data_path(
         mux_limits,
         lower_flights,
         connection_ordering_debt_bytes,
+        frontier_state,
     )
     .map(|selection| selection.target)
 }
@@ -59,6 +81,7 @@ pub(super) fn select_response_data_path_with_payload(
     mux_limits: MuxLimits,
     lower_flights: &[CarrierPathFlightDebt],
     connection_ordering_debt_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
 ) -> Option<ResponseDataPathSelection> {
     let nonstale_live_paths = targets
         .iter()
@@ -169,7 +192,9 @@ pub(super) fn select_response_data_path_with_payload(
                 let key = target.observation.key;
                 let owns_lower_frontier =
                     lower_owner == Some((key, target.observation.incarnation));
-                let position = if owns_lower_frontier {
+                let position = if owns_lower_frontier
+                    && frontier_state.owner_uses_native_admission()
+                {
                     BulkCandidatePosition::ContiguousFrontier
                 } else if lower_owner.is_none() && key == lead_key {
                     BulkCandidatePosition::FirstPath
@@ -185,7 +210,8 @@ pub(super) fn select_response_data_path_with_payload(
                 // startup flight until exact Data ACKs prove progress. The
                 // contiguous owner instead remains governed by shared Product
                 // credit and its native carrier.
-                let has_data_level_credit = owns_lower_frontier
+                let has_data_level_credit = (owns_lower_frontier
+                    && frontier_state.owner_uses_native_admission())
                     || snapshot.has_durable_product_progress
                     || target
                         .observation
@@ -277,22 +303,36 @@ pub(super) fn select_response_data_path_with_payload(
 
         // The startup-flight bound limits acquisition resources; it does not
         // grant placement priority over a lower-completion qualified output.
-        admitted
-            .into_iter()
-            .min_by(|left, right| {
-                left.2
-                    .total_cmp(&right.2)
-                    .then_with(|| left.3.cmp(&right.3))
-                    .then_with(|| {
-                        carrier_path_key_order(left.0.observation.key, right.0.observation.key)
-                    })
+        // Retain the exact lower-range owner only while its completion remains
+        // inside measured timing and one-quantum queue uncertainty. This is
+        // the same transport-neutral ECF stability rule used for requests:
+        // it avoids changing ownership on measurement noise, but a blocked or
+        // materially slower owner immediately yields to the best candidate.
+        let best = admitted.iter().min_by(|left, right| {
+            left.2
+                .total_cmp(&right.2)
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| {
+                    carrier_path_key_order(left.0.observation.key, right.0.observation.key)
+                })
+        })?;
+        let selected = lower_owner
+            .and_then(|(owner_key, owner_incarnation)| {
+                admitted.iter().find(|candidate| {
+                    candidate.0.observation.key == owner_key
+                        && candidate.0.observation.incarnation == owner_incarnation
+                })
             })
-            .map(
-                |(target, _, _, _, payload_bytes)| ResponseDataPathSelection {
-                    target: target.clone(),
-                    payload_bytes,
-                },
-            )
+            .filter(|owner| {
+                scheduler::path_within_adaptive_lead_hysteresis(
+                    owner.2, owner.1, best.2, best.1, owner.4,
+                )
+            })
+            .unwrap_or(best);
+        Some(ResponseDataPathSelection {
+            target: selected.0.clone(),
+            payload_bytes: selected.4,
+        })
     };
 
     select(false, false)

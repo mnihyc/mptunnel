@@ -17,6 +17,7 @@ use super::tcp_capacity::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, product_delivery_samples_override_startup_prior,
 };
@@ -985,6 +986,7 @@ impl RequestMultipathController {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn plan_relay_path_send(
         &mut self,
         context: &ClientPathContext,
@@ -993,6 +995,27 @@ impl RequestMultipathController {
         lane: TrafficClass,
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
+    ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
+        self.plan_relay_path_send_at_frontier(
+            context,
+            remotes,
+            frame,
+            lane,
+            cause,
+            avoid_instances,
+            ReliableDataAckFrontierState::Live,
+        )
+    }
+
+    pub(super) fn plan_relay_path_send_at_frontier(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        cause: RelaySendCause,
+        avoid_instances: &[RelayPathInstance],
+        frontier_state: ReliableDataAckFrontierState,
     ) -> Result<RequestMultipathPlan, RequestMultipathPlanError> {
         let prepared = self.prepare_relay_path_decision(context, remotes, frame, lane, cause)?;
         if let Some(target) = cause.completion_tail_target() {
@@ -1006,7 +1029,8 @@ impl RequestMultipathController {
         let scoring_payload_bytes = reliable_stream_frame_accounted_bytes(frame);
         let observe_bulk_admission = prepared.unique_data_payload_bytes.is_some()
             && lane.is_bulk()
-            && remotes.paths.len() > 1
+            && (remotes.paths.len() > 1
+                || frontier_state == ReliableDataAckFrontierState::AuthoritativeGap)
             && avoid_instances.is_empty();
         let relay_observation = observe_request_relay_scheduling(
             context,
@@ -1032,6 +1056,7 @@ impl RequestMultipathController {
                     operation: self.request.ack_clock_operation,
                     path_states: &self.request.path_states,
                 }),
+                frontier_state,
             }) {
                 BulkRelayPathChoice::Selected(instance) => {
                     let mut selection = RequestMultipathPlan::new(

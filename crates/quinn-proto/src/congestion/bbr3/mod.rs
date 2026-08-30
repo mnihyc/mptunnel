@@ -616,6 +616,10 @@ pub struct Bbr3 {
     /// Loss-range evidence aligned to the classification that set
     /// `completed_loss_round_is_high`; consumed by Startup in the same controller transaction.
     completed_loss_decision_events: u64,
+    /// Whether the completed Startup loss decision had congestion authority independent of the
+    /// configured erasure contract (explicit ECN, persistent congestion, or unaligned evidence).
+    /// A compensated budget crossing alone is not such authority.
+    completed_loss_round_raw_authority: bool,
     /// Attributable ECN authority is independent of packet-loss records. Validated ambiguous ECN
     /// abandons undo but does not manufacture exempt loss bytes.
     ecn_congestion_in_round: bool,
@@ -825,6 +829,7 @@ impl Bbr3 {
             undo_loss_budget_raw_authority_generation: 0,
             undo_loss_budget_had_open_predecessor: false,
             completed_loss_decision_events: 0,
+            completed_loss_round_raw_authority: false,
             ecn_congestion_in_round: false,
             explicit_congestion_in_round: false,
             loss_round_evidence_anchor: None,
@@ -1368,6 +1373,7 @@ impl Bbr3 {
         self.loss_round_start = false;
         self.completed_loss_round_is_high = false;
         self.completed_loss_decision_events = 0;
+        self.completed_loss_round_raw_authority = false;
         if let Some(rate_sample) = self.rs {
             self.bw_latest = [self.bw_latest, self.model_delivery_rate(rate_sample)]
                 .iter()
@@ -1399,6 +1405,7 @@ impl Bbr3 {
             let raw_loss_round = self.loss_compensation_floor == 0.0
                 || self.explicit_congestion_in_round
                 || self.loss_round_evidence_unknown;
+            self.completed_loss_round_raw_authority = raw_loss_round;
             self.loss_in_round
                 && raw_loss_round
                 && self.loss_round_requires_congestion_response()
@@ -1573,6 +1580,15 @@ impl Bbr3 {
     /// equivalent to BBRCheckStartupHighLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.1.3>
     fn check_startup_high_loss(&mut self) {
         if self.full_bw_reached {
+            return;
+        }
+        // A configured erasure contract makes ordinary packet loss ambiguous during capacity
+        // acquisition. A short compensated-budget crossing cannot safely distinguish random
+        // erasure from a queue, and using it here can terminate STARTUP before the sender has a
+        // representative bandwidth sample. Keep the draft high-loss shortcut only when the
+        // completed decision has independent raw authority; otherwise the ordinary full-bandwidth
+        // plateau remains STARTUP's congestion authority.
+        if self.loss_compensation_floor > 0.0 && !self.completed_loss_round_raw_authority {
             return;
         }
         let decision_events = if self.loss_compensation_floor == 0.0 {
@@ -10174,6 +10190,8 @@ mod test {
         cwnd: u64,
         lost_packets: u64,
         resolved_packets: u64,
+        state: BbrState,
+        full_bw_reached: bool,
     }
 
     #[derive(Debug)]
@@ -10195,17 +10213,36 @@ mod test {
     }
 
     fn run_sustained_exogenous_loss_scenario(
-        mut config: Bbr3Config,
+        config: Bbr3Config,
         pattern: ExogenousLossPattern,
         loss_percent: u64,
         service_step: Option<(u64, f64)>,
         total_seconds: u64,
     ) -> ExogenousLossRun {
+        run_sustained_exogenous_loss_scenario_with_link(
+            config,
+            pattern,
+            loss_percent,
+            1_250_000.0,
+            8,
+            service_step,
+            total_seconds,
+        )
+    }
+
+    fn run_sustained_exogenous_loss_scenario_with_link(
+        mut config: Bbr3Config,
+        pattern: ExogenousLossPattern,
+        loss_percent: u64,
+        initial_service_bytes_per_second: f64,
+        loss_start_second: u64,
+        service_step: Option<(u64, f64)>,
+        total_seconds: u64,
+    ) -> ExogenousLossRun {
         const MSS: u64 = 1200;
-        const INITIAL_BW: f64 = 1_250_000.0; // 10 Mbit/s in bytes/sec
         const RTT_NS: u64 = 100_000_000;
-        const LOSS_START_NS: u64 = 8_000_000_000;
         const SAMPLE_NS: u64 = 1_000_000_000;
+        let loss_start_ns = loss_start_second.saturating_mul(SAMPLE_NS);
         let total_ns = total_seconds.saturating_mul(SAMPLE_NS);
 
         struct InFlight {
@@ -10249,11 +10286,11 @@ mod test {
                 let service_start_ns = arrival_ns.max(btl_free_ns);
                 let service_bw = service_step
                     .filter(|(at_second, _)| send_ns >= at_second.saturating_mul(SAMPLE_NS))
-                    .map_or(INITIAL_BW, |(_, bandwidth)| bandwidth);
+                    .map_or(initial_service_bytes_per_second, |(_, bandwidth)| bandwidth);
                 let service_ns = (MSS as f64 / service_bw * 1e9).round() as u64;
                 let finish_ns = service_start_ns + service_ns;
                 btl_free_ns = finish_ns;
-                let lost = send_ns >= LOSS_START_NS && pattern.drops(pn, loss_percent);
+                let lost = send_ns >= loss_start_ns && pattern.drops(pn, loss_percent);
                 bbr.on_packet_sent(at(send_ns), MSS as u16, pn, SpaceId::Data);
                 inflight += MSS;
                 flight.push_back(InFlight {
@@ -10268,7 +10305,7 @@ mod test {
             } else if let Some(packet) = flight.pop_front() {
                 now_ns = now_ns.max(packet.event_ns);
                 inflight -= MSS;
-                let loss_stage = packet.send_ns >= LOSS_START_NS;
+                let loss_stage = packet.send_ns >= loss_start_ns;
                 if loss_stage {
                     resolved_packets += 1;
                 }
@@ -10307,6 +10344,8 @@ mod test {
                     cwnd: bbr.cwnd,
                     lost_packets,
                     resolved_packets,
+                    state: bbr.state,
+                    full_bw_reached: bbr.full_bw_reached,
                 });
                 sample_delivered = delivered;
                 next_sample_ns += SAMPLE_NS;
@@ -10510,6 +10549,46 @@ mod test {
         );
         assert_exogenous_goodput_model(late, late_loss, 1_250_000.0, window_quantum);
         assert_eq!(run.budget_exhaustions, 0);
+    }
+
+    #[test]
+    fn mptunnel_default_cold_start_acquires_service_under_authorized_random_loss() {
+        const SERVICE_BYTES_PER_SECOND: f64 = 62_500_000.0;
+        let run = run_sustained_exogenous_loss_scenario_with_link(
+            mptunnel_loss_profile_config(),
+            ExogenousLossPattern::Randomized,
+            11,
+            SERVICE_BYTES_PER_SECOND,
+            0,
+            None,
+            5,
+        );
+        eprintln!(
+            "cold-green: loss={:.4} exhaustions={} points={:?}",
+            run.observed_loss, run.budget_exhaustions, run.points
+        );
+        let boundary = 1.0 - (1.0 - 0.10) * (1.0 - LOSS_THRESH);
+        assert!(
+            run.observed_loss > 0.10 && run.observed_loss < boundary,
+            "cold randomized loss {} did not exercise residual headroom (0.10, {boundary})",
+            run.observed_loss,
+        );
+        assert!(
+            run.points.iter().all(|point| {
+                !point.full_bw_reached || point.max_bw >= 0.8 * SERVICE_BYTES_PER_SECOND
+            }),
+            "authorized startup loss prematurely ended bandwidth acquisition: {:?}",
+            run.points,
+        );
+        let late = mean_goodput(&run, 4, 5);
+        let late_loss = observed_loss_between(&run, 4, 5);
+        let window_quantum = 2.0 * BASE_DATAGRAM_SIZE as f64 / 2.0;
+        assert_exogenous_goodput_model(
+            late,
+            late_loss,
+            SERVICE_BYTES_PER_SECOND,
+            window_quantum,
+        );
     }
 
     #[test]

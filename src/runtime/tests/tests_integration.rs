@@ -7,6 +7,7 @@ use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId, StreamId
 use crate::runtime::path::ServerLocalPath;
 use crate::runtime::path::quic::server::arm_server_udp_stream_abort_for_test;
 use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
+use crate::runtime::stream::arm_client_relay_attachment_commits_for_test;
 use crate::transport::SystemCarrierNetworkProvider;
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2498,6 +2499,11 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         );
 
         probe_client_paths(&context, Duration::from_millis(500)).await;
+        let quic_instance = context.health().lock().expect("health lock").udp[0]
+            .path_instance_id()
+            .expect("live QUIC instance");
+        let mut attachment_commits =
+            arm_client_relay_attachment_commits_for_test(quic_instance, stream_id);
         let patterned = Arc::new(
             (0..4 * 1024 * 1024)
                 .map(|index| ((index * 31 + 7) % 251) as u8)
@@ -2513,12 +2519,20 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             request.shutdown().await.expect("finish patterned payload");
         });
 
+        let initial_attachment_deadline = tokio::time::Instant::now() + Duration::from_millis(750);
         assert!(
-            tokio::time::timeout(Duration::from_millis(750), first_abort.wait_attached())
+            tokio::time::timeout_at(initial_attachment_deadline, first_abort.wait_attached())
                 .await
                 .expect("initial QUIC attachment timeout"),
             "the server must own the operation-scoped H3 request stream"
         );
+        let initial_attachment = tokio::time::timeout_at(
+            initial_attachment_deadline,
+            attachment_commits.wait_committed(),
+        )
+        .await
+        .expect("initial client QUIC attachment commit timeout");
+        assert_eq!(initial_attachment.path_instance_id, quic_instance);
         assert!(
             !writer.is_finished(),
             "the request tail must remain retained when the QUIC attachment is aborted"
@@ -2526,14 +2540,13 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         let (tcp_instance, quic_instance, quic_failures) = {
             let health = context.health().lock().expect("health lock");
             assert_eq!(health.tcp[0].active_flows, 1);
-            assert_eq!(health.udp[0].active_flows, 1);
+            assert_eq!(health.udp[0].path_instance_id(), Some(quic_instance));
+            assert!(health.udp[0].accepts_product_commit(quic_instance));
             (
                 context.tcp_sessions[0]
                     .connection_instance_id()
                     .expect("live TCP instance"),
-                health.udp[0]
-                    .path_instance_id()
-                    .expect("live QUIC instance"),
+                quic_instance,
                 health.udp[0].consecutive_failures,
             )
         };
@@ -2548,27 +2561,15 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             first_abort.wait_released().await,
             "the first H3 request-stream lease must be released"
         );
-
-        tokio::time::timeout(pto, async {
-            loop {
-                let detached = {
-                    let health = context.health().lock().expect("health lock");
-                    assert_eq!(
-                        context.tcp_sessions[0].connection_instance_id(),
-                        Some(tcp_instance),
-                        "TCP must survive the QUIC request-stream failure"
-                    );
-                    assert_eq!(health.tcp[0].active_flows, 1);
-                    health.udp[0].active_flows == 0
-                };
-                if detached {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("failed QUIC request-stream lease did not detach");
+        assert_eq!(
+            context.tcp_sessions[0].connection_instance_id(),
+            Some(tcp_instance),
+            "TCP must survive the QUIC request-stream failure"
+        );
+        assert_eq!(
+            context.health().lock().expect("health lock").tcp[0].active_flows,
+            1
+        );
 
         let pre_pto_deadline = aborted_at + pto.saturating_sub(Duration::from_millis(3));
         assert!(
@@ -2590,26 +2591,26 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             aborted_at.elapsed() + Duration::from_millis(3) >= pto,
             "reattachment occurred before its path-derived PTO"
         );
-        drop(replacement_abort);
-
-        tokio::time::timeout(Duration::from_millis(250), async {
-            loop {
-                let attached = {
-                    let health = context.health().lock().expect("health lock");
-                    let quic = &health.udp[0];
-                    quic.active_flows == 1
-                        && quic.path_instance_id() == Some(quic_instance)
-                        && quic.accepts_product_commit(quic_instance)
-                        && quic.consecutive_failures == 0
-                };
-                if attached {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        let replacement_attachment = tokio::time::timeout(
+            Duration::from_millis(250),
+            attachment_commits.wait_committed(),
+        )
         .await
-        .expect("replacement QUIC attachment did not settle");
+        .expect("replacement client QUIC attachment commit timeout");
+        assert_eq!(replacement_attachment.key, initial_attachment.key);
+        assert_eq!(replacement_attachment.path_instance_id, quic_instance);
+        assert_ne!(
+            replacement_attachment.attachment_id, initial_attachment.attachment_id,
+            "recovery must commit a fresh logical attachment incarnation"
+        );
+        drop(replacement_abort);
+        {
+            let health = context.health().lock().expect("health lock");
+            let quic = &health.udp[0];
+            assert_eq!(quic.path_instance_id(), Some(quic_instance));
+            assert!(quic.accepts_product_commit(quic_instance));
+            assert_eq!(quic.consecutive_failures, 0);
+        }
         assert_eq!(
             carrier_network.socket_count(),
             physical_socket_count,

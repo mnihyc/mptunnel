@@ -7,6 +7,8 @@ mod attachment;
 mod flight;
 mod state;
 
+#[cfg(test)]
+pub(in crate::runtime) use attachment::arm_client_relay_attachment_commits_for_test;
 pub(in crate::runtime) use attachment::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
     ReliableRelayRemotePath, ReliableRelayRemoteSet,

@@ -28,6 +28,8 @@ pub(in crate::runtime) use registry::{
     AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement,
     ServerReliableStreamRegistry,
 };
+#[cfg(test)]
+pub(in crate::runtime) use request::arm_client_relay_attachment_commits_for_test;
 pub(in crate::runtime) use request::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
     ReliableRelayRemotePath, ReliableRelayRemoteSet,

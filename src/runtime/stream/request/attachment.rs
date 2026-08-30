@@ -20,8 +20,99 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+#[cfg(test)]
+type ClientRelayAttachmentCommitRegistry =
+    HashMap<(CarrierPathInstanceId, StreamId), (u64, mpsc::UnboundedSender<RelayPathInstance>)>;
+
+#[cfg(test)]
+static CLIENT_RELAY_ATTACHMENT_COMMITS: OnceLock<Mutex<ClientRelayAttachmentCommitRegistry>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static NEXT_CLIENT_RELAY_ATTACHMENT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Test-only observation of durable client attachment-set commits for one
+/// logical stream on one exact physical carrier lifetime.
+#[cfg(test)]
+pub(in crate::runtime) struct ClientRelayAttachmentCommitHandle {
+    key: (CarrierPathInstanceId, StreamId),
+    id: u64,
+    commits: mpsc::UnboundedReceiver<RelayPathInstance>,
+}
+
+#[cfg(test)]
+impl ClientRelayAttachmentCommitHandle {
+    pub(in crate::runtime) async fn wait_committed(&mut self) -> RelayPathInstance {
+        self.commits
+            .recv()
+            .await
+            .expect("client relay attachment commit observer")
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClientRelayAttachmentCommitHandle {
+    fn drop(&mut self) {
+        let mut observers = CLIENT_RELAY_ATTACHMENT_COMMITS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("client relay attachment commit registry lock");
+        if observers
+            .get(&self.key)
+            .is_some_and(|(registered_id, _)| *registered_id == self.id)
+        {
+            observers.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::runtime) fn arm_client_relay_attachment_commits_for_test(
+    path_instance_id: CarrierPathInstanceId,
+    stream_id: StreamId,
+) -> ClientRelayAttachmentCommitHandle {
+    let key = (path_instance_id, stream_id);
+    let id = NEXT_CLIENT_RELAY_ATTACHMENT_COMMIT_ID.fetch_add(1, Ordering::Relaxed);
+    let (commits_tx, commits_rx) = mpsc::unbounded_channel();
+    let replaced = CLIENT_RELAY_ATTACHMENT_COMMITS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("client relay attachment commit registry lock")
+        .insert(key, (id, commits_tx));
+    assert!(
+        replaced.is_none(),
+        "a client relay attachment commit observer is already armed for this carrier and stream"
+    );
+    ClientRelayAttachmentCommitHandle {
+        key,
+        id,
+        commits: commits_rx,
+    }
+}
+
+#[cfg(test)]
+fn record_client_relay_attachment_commit_for_test(
+    instance: RelayPathInstance,
+    stream_id: StreamId,
+) {
+    if let Some((_, commits)) = CLIENT_RELAY_ATTACHMENT_COMMITS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("client relay attachment commit registry lock")
+        .get(&(instance.path_instance_id, stream_id))
+    {
+        let _ = commits.send(instance);
+    }
+}
 
 /// Open carrier awaiting attachment-set commit.
 ///
@@ -846,6 +937,8 @@ impl ReliableRelayRemoteSet {
         }
         self.paths.push(path);
         self.membership_generation = self.membership_generation.wrapping_add(1);
+        #[cfg(test)]
+        record_client_relay_attachment_commit_for_test(instance, self.stream_id);
         ReliableRelayAttachOutcome::Attached
     }
 

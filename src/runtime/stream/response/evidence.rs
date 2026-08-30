@@ -48,6 +48,18 @@ pub(super) fn server_output_local_path_metrics(
             && path_metrics.metrics.path_id == entry.key.path_id
     })
 }
+
+pub(super) fn server_output_peer_path_metrics(
+    entry: &ResponseStreamOutputEntry,
+) -> Option<ServerPathMetricsEntry> {
+    entry.peer_path_metrics.filter(|path_metrics| {
+        path_metrics.source == ServerPathMetricsSource::PeerHint
+            && path_metrics.metrics.direction == PathMetricDirection::ServerToClient
+            && path_metrics.metrics.underlay == entry.key.underlay
+            && path_metrics.metrics.path_id == entry.key.path_id
+    })
+}
+
 pub(super) fn server_path_metrics_estimate_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
     // Eligibility and value are separate facts. The caller evaluates the
     // sample's frozen deadline once; this accessor must not perform a second

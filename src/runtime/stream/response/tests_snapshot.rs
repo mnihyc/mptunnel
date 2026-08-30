@@ -783,6 +783,34 @@ fn peer_hint_is_used_only_until_local_evidence_arrives() {
 }
 
 #[test]
+fn opposite_direction_peer_hint_is_not_response_rate_authority() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(8),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    let mut request_direction_hint = path_metrics(
+        key,
+        ServerPathMetricsSource::PeerHint,
+        9_000,
+        330_000_000,
+        440_000_000,
+    );
+    request_direction_hint.metrics.direction = PathMetricDirection::ClientToServer;
+    entry.peer_path_metrics = Some(request_direction_hint);
+
+    let response =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+
+    assert_eq!(
+        response.delivery_rate_bps,
+        crate::runtime::path::model::default_path_rate_bps(),
+        "client-to-server peer evidence cannot authorize server-to-client response completion",
+    );
+}
+
+#[test]
 fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,

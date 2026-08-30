@@ -10,8 +10,9 @@ use super::attachment::{
 };
 use super::evidence::{
     server_output_has_bulk_rate_evidence_at, server_output_has_durable_product_ack_progress,
-    server_output_local_path_metrics, server_output_product_rate_epoch_has_bulk_evidence_at,
-    server_path_metrics_estimate_rate_bps, server_path_metrics_has_bulk_rate_evidence_at,
+    server_output_local_path_metrics, server_output_peer_path_metrics,
+    server_output_product_rate_epoch_has_bulk_evidence_at, server_path_metrics_estimate_rate_bps,
+    server_path_metrics_has_bulk_rate_evidence_at,
     server_path_metrics_has_qualified_delivery_history,
     server_path_metrics_rate_evidence_is_fresh_at, server_path_metrics_snapshot_is_fresh_at,
 };
@@ -287,7 +288,7 @@ fn server_bulk_output_snapshot_at(
 ) -> PathSnapshot {
     let local_metrics = server_output_local_path_metrics(entry);
     let peer_hint = (entry.delivery_samples == 0)
-        .then_some(entry.peer_path_metrics)
+        .then(|| server_output_peer_path_metrics(entry))
         .flatten();
     let liveness_metrics = local_metrics.or(peer_hint);
 

@@ -36,13 +36,13 @@ MPTUNNEL_CARRIER_PRESENTATIONS = frozenset(
 )
 BULK_INTERACTIVE_DYNAMIC_LOSS_CONDITION = {
     "schema_version": 4,
-    "condition_id": "balanced-dynamic-loss-8x5-v4",
+    "condition_id": "balanced-dynamic-loss-8x5-v5",
     "application_scope": "protocol-neutral-balanced-egress",
     "profile": {"rate": "500mbit", "delay": "50ms", "jitter": "20ms"},
     "epoch_seconds": 5,
     "duration_seconds": 40,
-    "loss_percent": [1, 4, 2, 3, 5, 1, 2, 6],
-    "mean_loss_percent": 3.0,
+    "loss_percent": [3, 8, 5, 6, 10, 3, 5, 8],
+    "mean_loss_percent": 6.0,
     "dynamic_roles": ["client-egress", "remote-egress"],
     "service_addresses": {
         "client": "172.31.15.10/24",

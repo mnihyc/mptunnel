@@ -297,7 +297,7 @@ class ReleaseSeriesEvaluationTests(unittest.TestCase):
         comparisons = {
             item["id"]: item for item in verdict["repetitions"][0]["comparisons"]
         }
-        recurrence = comparisons["mpp_tcp.loss_1_percent.epoch_5_over_0"]
+        recurrence = comparisons["mpp_tcp.loss_3_percent.epoch_5_over_0"]
         self.assertEqual(recurrence["actual"], 100.0)
         self.assertEqual(recurrence["reference"], 100.0)
         self.assertEqual(recurrence["ratio"], 1.0)

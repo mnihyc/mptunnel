@@ -40,7 +40,7 @@ TRIMMED_INTERVALS = 194
 WINDOWS = 38
 MIN_RATE_RATIO = 0.90
 MAX_LATENCY_RATIO = 1.10
-RECURRENCE_EPOCHS = (("loss_1_percent", 0, 5), ("loss_2_percent", 2, 6))
+RECURRENCE_EPOCHS = (("loss_3_percent", 0, 5), ("loss_5_percent", 2, 6))
 RUNTIME_IDENTITY_FIELDS = (
     "mptunnel_client_runtime",
     "mptunnel_client_runtime_version",

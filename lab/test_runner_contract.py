@@ -402,7 +402,7 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('"$protocol_override"', probe)
 
         self.assertIn("bulk_interactive_epoch_seconds=5", SCRIPT)
-        self.assertIn("bulk_interactive_loss_percent=(1 4 2 3 5 1 2 6)", SCRIPT)
+        self.assertIn("bulk_interactive_loss_percent=(3 8 5 6 10 3 5 8)", SCRIPT)
         self.assertIn('bulk_interactive_rate="500mbit"', SCRIPT)
         self.assertIn('bulk_interactive_delay="50ms"', SCRIPT)
         self.assertIn('bulk_interactive_jitter="20ms"', SCRIPT)

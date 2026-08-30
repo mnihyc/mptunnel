@@ -743,7 +743,10 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
             ("500Mbit", "499Mbit"),
             ("50ms", "51ms"),
             ("20ms", "21ms"),
-            ("loss random 1%", "loss random 6%"),
+            (
+                f"loss random {condition['loss_percent'][0]}%",
+                "loss random 99%",
+            ),
         ):
             wrong_profile = copy.deepcopy(metadata)
             wrong_profile["events"][0]["endpoints"]["client-egress"][
@@ -830,7 +833,7 @@ class PerformanceSeriesDerivationTests(unittest.TestCase):
         balanced_target = condition["service_addresses"]["target"].split("/", 1)[0]
 
         self.assertEqual(condition["schema_version"], 4)
-        self.assertEqual(condition["condition_id"], "balanced-dynamic-loss-8x5-v4")
+        self.assertEqual(condition["condition_id"], "balanced-dynamic-loss-8x5-v5")
         self.assertEqual(proxy_target, "172.31.40.30")
         self.assertEqual(balanced_target, "172.31.15.30")
         self.assertNotEqual(proxy_target, balanced_target)

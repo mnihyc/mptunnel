@@ -1992,10 +1992,14 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     let expected_payload = payload.clone();
     let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
     let target_addr = target_listener.local_addr().expect("target addr");
-    // Keep the logical response alive until the automatically selected path
-    // has crossed TLS, admission, PATH_JOIN, and both readiness frames.
-    // Otherwise a fast loopback EOF can cancel the speculative connection
-    // while its handshake is still in flight.
+    // Seed the synthetic path measurement only after the target has received
+    // the request, immediately before response demand can consume it. Keep the
+    // logical response alive until the automatically selected path has crossed
+    // TLS, admission, PATH_JOIN, and both readiness frames. Otherwise a fast
+    // loopback EOF can cancel the speculative connection while its handshake
+    // is still in flight.
+    let (target_request_ready_tx, target_request_ready_rx) = oneshot::channel();
+    let (release_target_prefix_tx, release_target_prefix_rx) = oneshot::channel();
     let (release_target_tail_tx, release_target_tail_rx) = oneshot::channel();
     let target = tokio::spawn(async move {
         let (mut stream, _) = target_listener.accept().await.expect("target accept");
@@ -2005,6 +2009,12 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
             .await
             .expect("target request");
         assert_eq!(&request, b"ping");
+        target_request_ready_tx
+            .send(())
+            .expect("publish target request readiness");
+        release_target_prefix_rx
+            .await
+            .expect("release target response prefix");
         let tail = payload.len() - 1;
         stream
             .write_all(&payload[..tail])
@@ -2114,17 +2124,6 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     )
     .expect("ctx");
     probe_client_paths(&context, Duration::from_secs(2)).await;
-    // This is a synthetic current delivery measurement used by the selection
-    // under test. Seed it after carrier probing so its frozen rate-evidence
-    // epoch cannot expire while unrelated path setup is still in progress.
-    context.mark_tcp_path_delivery(
-        1,
-        PathDeliveryStats {
-            payload_bytes: 4 * 1024 * 1024,
-            first_payload_at: Some(Instant::now()),
-            last_payload_at: Some(Instant::now() + Duration::from_millis(100)),
-        },
-    );
     let health_context = context.clone();
     let ingress_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -2178,6 +2177,25 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
             .expect("payload read");
         received
     });
+    tokio::time::timeout(Duration::from_secs(2), target_request_ready_rx)
+        .await
+        .expect("target request readiness timeout")
+        .expect("target request readiness");
+    // This is a synthetic current delivery measurement used by the selection
+    // under test. The target cannot publish response demand until this exact
+    // measurement transaction is complete.
+    let sample_started_at = Instant::now();
+    health_context.mark_tcp_path_delivery(
+        1,
+        PathDeliveryStats {
+            payload_bytes: 4 * 1024 * 1024,
+            first_payload_at: Some(sample_started_at),
+            last_payload_at: Some(sample_started_at + Duration::from_millis(100)),
+        },
+    );
+    release_target_prefix_tx
+        .send(())
+        .expect("release target response prefix");
     tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, async {
         loop {
             let attached =

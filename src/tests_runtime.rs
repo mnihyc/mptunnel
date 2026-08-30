@@ -581,6 +581,10 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
         let stream_id = loop {
             match framed.read_frame().await? {
                 Frame::OpenStream { stream_id, .. } => break stream_id,
+                Frame::Ping { nonce } => {
+                    framed.write_frame(&Frame::Pong { nonce }).await?;
+                    framed.flush().await?;
+                }
                 Frame::PathMetrics { .. } => {}
                 _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
             }

@@ -25,6 +25,7 @@ use crate::protocol::{
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::TrafficClass;
+use crate::transport::RateHint;
 #[cfg(test)]
 pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
@@ -199,6 +200,7 @@ impl ResponseStreamBinding {
             session_tracker,
             path_instance_id,
             local_policy,
+            RateHint::Unknown,
             StreamReturnPlan {
                 trigger_bytes: 0,
                 candidate_total: 1,
@@ -222,6 +224,7 @@ impl ResponseStreamBinding {
         session_tracker: Arc<ServerSessionTracker>,
         path_instance_id: CarrierPathInstanceId,
         local_policy: PathPolicy,
+        startup_rate_prior: RateHint,
         return_plan: StreamReturnPlan,
     ) -> Result<Arc<Self>, RuntimeError> {
         let (version, _) = watch::channel(0);
@@ -251,6 +254,7 @@ impl ResponseStreamBinding {
                     key,
                     path_instance_id,
                     local_policy,
+                    startup_rate_prior,
                     incarnation: 1,
                     commands,
                     load_registration,

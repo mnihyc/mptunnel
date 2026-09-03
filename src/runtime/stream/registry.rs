@@ -1421,6 +1421,7 @@ impl ServerReliableStreamRegistry {
             max_frame_payload_bytes,
         } = attachment;
         let initial_metrics = path_registration.initial_metrics();
+        let startup_rate_prior = path_registration.startup_rate_prior();
         let local_policy = path_registration.local_policy();
         let underlay = path_registration.underlay();
         let path_id = path_registration.path_id();
@@ -1475,6 +1476,7 @@ impl ServerReliableStreamRegistry {
                         key: CarrierPathKey { underlay, path_id },
                         path_instance_id,
                         local_policy,
+                        startup_rate_prior,
                         commands,
                         state: ResponseOutputAttachmentState {
                             metrics: initial_metrics,
@@ -1589,6 +1591,7 @@ impl ServerReliableStreamRegistry {
             self.session_tracker.clone(),
             path_instance_id,
             local_policy,
+            startup_rate_prior,
             return_plan,
         )?;
         let session_send_buffer = binding.session_send_buffer();

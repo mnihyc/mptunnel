@@ -15,6 +15,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::TrafficClass;
+use crate::transport::RateHint;
 use std::time::{Duration, Instant};
 
 fn alternate_key(underlay: UnderlayProtocol) -> CarrierPathKey {
@@ -41,6 +42,7 @@ fn output_incarnation_exhaustion_fails_before_new_membership_publication() {
                 key: last_key,
                 path_instance_id: next_server_carrier_path_instance_id(),
                 local_policy: PathPolicy::default(),
+                startup_rate_prior: RateHint::Unknown,
                 commands: last_commands,
                 state: ResponseOutputAttachmentState::default(),
             })
@@ -81,6 +83,7 @@ fn output_incarnation_exhaustion_fails_before_new_membership_publication() {
                 },
                 path_instance_id: next_server_carrier_path_instance_id(),
                 local_policy: PathPolicy::default(),
+                startup_rate_prior: RateHint::Unknown,
                 commands,
                 state: ResponseOutputAttachmentState::default(),
             }),
@@ -130,6 +133,7 @@ fn output_incarnation_exhaustion_preserves_closed_predecessor() {
             key,
             path_instance_id: next_server_carrier_path_instance_id(),
             local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::Unknown,
             commands,
             state: ResponseOutputAttachmentState::default(),
         }),
@@ -234,6 +238,7 @@ fn exact_carrier_cannot_reattach_while_ordered_detach_is_pending() {
             key,
             path_instance_id,
             local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::Unknown,
             commands,
             state: ResponseOutputAttachmentState::default(),
         },),
@@ -272,6 +277,7 @@ fn successor_can_coexist_with_exact_predecessor_detach() {
             key,
             path_instance_id: successor_instance,
             local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::Unknown,
             commands: successor_commands,
             state: ResponseOutputAttachmentState::default(),
         }),
@@ -702,6 +708,88 @@ fn duplicate_live_output_preserves_identity_and_rejects_a_different_channel() {
     assert_eq!(
         with_output_entry_for_key(&binding, key, |entry| entry.incarnation),
         before.1
+    );
+}
+
+#[test]
+fn startup_rate_prior_is_immutable_for_live_channel_and_rebound_on_replacement() {
+    let (binding, _initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let key = alternate_key(UnderlayProtocol::Tcp);
+    let first_instance = next_server_carrier_path_instance_id();
+    let (commands, receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach_output(ResponseOutputAttachment {
+            key,
+            path_instance_id: first_instance,
+            local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::BitsPerSecond(500_000_000),
+            commands: commands.clone(),
+            state: ResponseOutputAttachmentState::default(),
+        }),
+        ResponseStreamAttachOutcome::Attached,
+    );
+
+    assert_eq!(
+        binding.attach_output(ResponseOutputAttachment {
+            key,
+            path_instance_id: first_instance,
+            local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::BitsPerSecond(1),
+            commands,
+            state: ResponseOutputAttachmentState::default(),
+        }),
+        ResponseStreamAttachOutcome::Attached,
+        "a duplicate transaction may refresh evidence but not configuration",
+    );
+    with_output_entry_for_key(&binding, key, |entry| {
+        assert_eq!(
+            entry.startup_rate_prior,
+            RateHint::BitsPerSecond(500_000_000),
+        );
+    });
+    assert_eq!(
+        binding
+            .sender_path_targets(TrafficClass::Throughput, 1)
+            .into_iter()
+            .find(|target| target.observation.key == key)
+            .expect("configured response output")
+            .observation
+            .snapshot
+            .delivery_rate_bps,
+        500_000_000.0,
+    );
+
+    drop(receivers);
+    let second_instance = next_server_carrier_path_instance_id();
+    let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach_output(ResponseOutputAttachment {
+            key,
+            path_instance_id: second_instance,
+            local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::BitsPerSecond(80_000_000),
+            commands: replacement_commands,
+            state: ResponseOutputAttachmentState::default(),
+        }),
+        ResponseStreamAttachOutcome::ReplacedClosedOutput,
+    );
+    with_output_entry_for_key(&binding, key, |entry| {
+        assert_eq!(entry.path_instance_id, second_instance);
+        assert_eq!(
+            entry.startup_rate_prior,
+            RateHint::BitsPerSecond(80_000_000),
+        );
+    });
+    assert_eq!(
+        binding
+            .sender_path_targets(TrafficClass::Throughput, 1)
+            .into_iter()
+            .find(|target| target.observation.key == key)
+            .expect("replacement response output")
+            .observation
+            .snapshot
+            .delivery_rate_bps,
+        80_000_000.0,
     );
 }
 

@@ -8,6 +8,7 @@ use crate::runtime::stream::response::{
     ResponseStreamAttachOutcome,
 };
 use crate::scheduler::TrafficClass;
+use crate::transport::RateHint;
 
 fn exact(path_id: u16, instance: u64, incarnation: u64) -> ResponseAcquisitionOutputId {
     ResponseAcquisitionOutputId {
@@ -268,6 +269,7 @@ fn exact_enrollment_survives_detach_before_final_and_duplicate_is_stable() {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
                     local_policy: PathPolicy::default(),
+                    startup_rate_prior: RateHint::Unknown,
                     commands: alternate_commands,
                     state: ResponseOutputAttachmentState::default(),
                 },
@@ -337,6 +339,7 @@ fn rejected_startup_enrollment_publishes_nothing_and_burns_no_exact_identity() {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
                     local_policy: PathPolicy::default(),
+                    startup_rate_prior: RateHint::Unknown,
                     commands: invalid_commands,
                     state: ResponseOutputAttachmentState::default(),
                 },
@@ -362,6 +365,7 @@ fn rejected_startup_enrollment_publishes_nothing_and_burns_no_exact_identity() {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
                     local_policy: PathPolicy::default(),
+                    startup_rate_prior: RateHint::Unknown,
                     commands: valid_commands,
                     state: ResponseOutputAttachmentState::default(),
                 },
@@ -427,6 +431,7 @@ fn binding_with_enrolled_alternate() -> EnrolledBindingFixture {
                     key: alternate_key,
                     path_instance_id: alternate_instance,
                     local_policy: PathPolicy::default(),
+                    startup_rate_prior: RateHint::Unknown,
                     commands: alternate_commands,
                     state: ResponseOutputAttachmentState::default(),
                 },

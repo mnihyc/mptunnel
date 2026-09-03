@@ -231,9 +231,9 @@ pub(super) fn server_output_has_bulk_rate_evidence_at(
         .is_some_and(|metrics| server_path_metrics_has_bulk_rate_evidence_at(metrics, now));
     match entry.key.underlay {
         UnderlayProtocol::Udp => has_local_carrier_sample,
+        // TCP selects ReceiptMode: kernel ACK telemetry cannot become C.
         UnderlayProtocol::Tcp => {
-            has_local_carrier_sample
-                || server_output_product_rate_epoch_has_bulk_evidence_at(entry, mux_limits, now)
+            server_output_product_rate_epoch_has_bulk_evidence_at(entry, mux_limits, now)
         }
     }
 }

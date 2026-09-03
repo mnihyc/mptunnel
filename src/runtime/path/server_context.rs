@@ -19,8 +19,8 @@ use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier};
 use crate::runtime::recent_ids::ExpiringReplayCache;
 use crate::runtime::telemetry::RuntimeTelemetry;
 use crate::runtime::tun_l3::{ServerIpTunnelDevice, ServerIpTunnelPort};
-use crate::transport::PathSpec;
 use crate::transport::encrypted::TcpServerTlsConfig;
+use crate::transport::{PathSpec, RateHint};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -123,6 +123,10 @@ impl ServerLocalPath {
             path_id,
             ..path_startup_metrics(&self.spec, path_id, PathMetricDirection::ServerToClient)
         }
+    }
+
+    pub(in crate::runtime) fn startup_rate_prior(&self) -> RateHint {
+        self.spec.metadata.initial_rate
     }
 
     pub(in crate::runtime) fn advertised_usage(&self) -> crate::protocol::PathUsage {

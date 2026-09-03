@@ -386,6 +386,7 @@ async fn admit_server_udp_path(
             ServerLocalPathProperties {
                 config_ordinal: local_path.config_ordinal(),
                 policy: local_path.policy(),
+                startup_rate_prior: local_path.startup_rate_prior(),
                 initial_metrics: Some(local_metrics),
             },
             peer_usage,

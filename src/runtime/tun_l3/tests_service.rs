@@ -258,6 +258,7 @@ async fn packet_service_enforces_ownership_and_preserves_packets() {
         ServerLocalPathProperties {
             config_ordinal: 0,
             policy: local.policy(),
+            startup_rate_prior: local.startup_rate_prior(),
             initial_metrics: Some(local.startup_metrics(PathId(0))),
         },
     );

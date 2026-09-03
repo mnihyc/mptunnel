@@ -4589,7 +4589,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
 }
 
 #[test]
-fn server_response_output_inherits_open_path_startup_metrics() {
+fn server_response_output_inherits_open_path_startup_prior_and_metrics() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(
         ResourceLimits::default().max_streams,
     ));
@@ -4606,6 +4606,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         ServerLocalPathProperties {
             config_ordinal: 0,
             policy: path.metadata.policy,
+            startup_rate_prior: path.metadata.initial_rate,
             initial_metrics: Some(initial_metrics),
         },
     );
@@ -4642,7 +4643,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         .send_path_snapshot(TrafficClass::Throughput, 1)
         .expect("switchable output exposes seeded path model");
 
-    assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps());
+    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
     assert_eq!(snapshot.srtt_ms, 20.0);
     assert!(
         adaptive_reliable_relay_chunk_bytes(
@@ -4650,7 +4651,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
             TrafficClass::Throughput,
             MuxLimits::default(),
         ) > MIN_RELIABLE_SERVICE_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
-        "server response bytes keep the bulk feed quantum while startup metrics remain measurement-only rate hints"
+        "server response bytes use the endpoint-local configured startup prior without treating it as measured evidence"
     );
 
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {

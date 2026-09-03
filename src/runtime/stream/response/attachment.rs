@@ -26,6 +26,7 @@ use crate::runtime::stream::feedback::{
     StreamAckPublication, StreamAckPublicationCursor, StreamMaxDataPublication,
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
+use crate::transport::RateHint;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,9 @@ pub(in crate::runtime) struct ResponseOutputAttachment {
     pub(in crate::runtime::stream) key: CarrierPathKey,
     pub(in crate::runtime::stream) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime::stream) local_policy: PathPolicy,
+    /// Endpoint-local configuration bound to this exact carrier incarnation.
+    /// Mutable evidence refreshes cannot rewrite it.
+    pub(in crate::runtime::stream) startup_rate_prior: RateHint,
     pub(in crate::runtime::stream) commands: ReliablePathCommandSender,
     pub(in crate::runtime::stream) state: ResponseOutputAttachmentState,
 }
@@ -148,6 +152,7 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
     pub(super) path_instance_id: CarrierPathInstanceId,
     pub(super) local_policy: PathPolicy,
+    pub(super) startup_rate_prior: RateHint,
     pub(super) incarnation: u64,
     pub(super) commands: ReliablePathCommandSender,
     /// Publishes demand to the exact ordered writer only while this output owns
@@ -484,6 +489,7 @@ impl ResponseStreamBinding {
             key,
             path_instance_id,
             local_policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::Unknown,
             commands,
             state: ResponseOutputAttachmentState::default(),
         })
@@ -514,6 +520,7 @@ impl ResponseStreamBinding {
             key,
             path_instance_id,
             local_policy,
+            startup_rate_prior,
             commands,
             state: attachment_state,
         } = attachment;
@@ -625,6 +632,7 @@ impl ResponseStreamBinding {
                 replaced_incarnation = Some(entry.incarnation);
                 entry.path_instance_id = path_instance_id;
                 entry.local_policy = local_policy;
+                entry.startup_rate_prior = startup_rate_prior;
                 entry.incarnation = allocated_incarnation;
                 entry.load_registration.deactivate();
                 entry.commands = commands;
@@ -678,6 +686,7 @@ impl ResponseStreamBinding {
                 key,
                 path_instance_id,
                 local_policy,
+                startup_rate_prior,
                 incarnation: allocated_incarnation,
                 commands,
                 load_registration,

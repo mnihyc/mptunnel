@@ -167,6 +167,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     let local_properties = ServerLocalPathProperties {
         config_ordinal: local_path.config_ordinal(),
         policy: local_path.policy(),
+        startup_rate_prior: local_path.startup_rate_prior(),
         initial_metrics: Some(local_metrics),
     };
     let path_registration = context

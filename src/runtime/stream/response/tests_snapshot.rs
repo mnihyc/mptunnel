@@ -39,6 +39,7 @@ use crate::runtime::path::{
     CarrierDeliveryRateSample, CarrierNativeWindowSample, PathProofObservation,
 };
 use crate::scheduler::{PathRateScope, TrafficClass};
+use crate::transport::RateHint;
 use std::time::{Duration, Instant};
 
 fn output_entry(
@@ -50,6 +51,7 @@ fn output_entry(
         key,
         path_instance_id: next_server_carrier_path_instance_id(),
         local_policy: PathPolicy::default(),
+        startup_rate_prior: RateHint::Unknown,
         incarnation: 1,
         commands,
         load_registration,
@@ -370,6 +372,101 @@ fn refresh_native_window_sample(entry: &mut ServerPathMetricsEntry) {
     entry.carrier_native_window_sample = (entry.source == ServerPathMetricsSource::LocalSender)
         .then(|| CarrierNativeWindowSample::from_path_metrics_at(entry.metrics, entry.recorded_at))
         .flatten();
+}
+
+#[test]
+fn configured_tcp_startup_prior_survives_response_projection_without_becoming_evidence() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(61),
+    };
+    let path = "tcp://127.0.0.1:14661?initial-rate-mbps=500"
+        .parse::<crate::transport::PathSpec>()
+        .expect("TCP path with explicit startup prior");
+    let startup_metrics = crate::runtime::path::model::path_startup_metrics(
+        &path,
+        key.path_id,
+        PathMetricDirection::ServerToClient,
+    );
+    assert_eq!(startup_metrics.delivery_rate_bps, 500_000_000);
+    assert!(!startup_metrics.rate_observed);
+    assert_eq!(startup_metrics.rate_valid_for_us, 0);
+    assert!(!startup_metrics.has_ack_derived_data_sample);
+
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.startup_rate_prior = path.metadata.initial_rate;
+    entry.local_path_metrics = Some(ServerPathMetricsEntry {
+        metrics: startup_metrics,
+        source: ServerPathMetricsSource::LocalSender,
+        native_drain_observed: false,
+        carrier_native_window_sample: None,
+        carrier_delivery_rate_sample: None,
+        recorded_at: Instant::now(),
+    });
+
+    assert!(!server_output_has_bulk_rate_evidence(
+        &entry,
+        MuxLimits::default(),
+    ));
+    assert!(!entry.product_qualification.qualified());
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(snapshot.carrier_delivery_rate_bps, None);
+    assert_eq!(snapshot.product_progress_rate_bps, None);
+    assert!(!snapshot.has_durable_product_progress);
+    assert_eq!(snapshot.confidence, 0.0);
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
+}
+
+#[test]
+fn tcp_kernel_and_peer_rates_remain_diagnostics_outside_receipt_authority() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(62),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.startup_rate_prior = RateHint::BitsPerSecond(500_000_000);
+
+    for rate_bps in [5_000_000, 900_000_000] {
+        entry.local_path_metrics = Some(path_metrics(
+            key,
+            ServerPathMetricsSource::LocalSender,
+            80_000,
+            rate_bps,
+            rate_bps.saturating_add(1_000_000),
+        ));
+        entry.peer_path_metrics = None;
+        let local =
+            server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+        assert_eq!(local.delivery_rate_bps, 500_000_000.0);
+        assert_eq!(local.carrier_delivery_rate_bps, Some(rate_bps as f64));
+        assert_eq!(local.rate_scope, PathRateScope::PathCapacity);
+        assert!(!server_output_has_bulk_rate_evidence(
+            &entry,
+            MuxLimits::default(),
+        ));
+
+        entry.local_path_metrics = None;
+        entry.peer_path_metrics = Some(path_metrics(
+            key,
+            ServerPathMetricsSource::PeerHint,
+            80_000,
+            rate_bps,
+            rate_bps.saturating_add(1_000_000),
+        ));
+        let peer =
+            server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+        assert_eq!(peer.delivery_rate_bps, 500_000_000.0);
+        assert_eq!(peer.carrier_delivery_rate_bps, None);
+        assert_eq!(peer.rate_scope, PathRateScope::PathCapacity);
+        assert!(!server_output_has_bulk_rate_evidence(
+            &entry,
+            MuxLimits::default(),
+        ));
+    }
 }
 
 #[test]
@@ -778,13 +875,14 @@ fn original_flight_demand_divides_capacity_until_its_unique_ack() {
 }
 
 #[test]
-fn tcp_qualified_native_capacity_precedes_product_goodput() {
+fn tcp_receipt_mode_uses_max_of_startup_prior_and_qualified_product_rate() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
     let (commands, _receivers) = reliable_path_command_channels(8);
     let mut entry = output_entry(key, commands);
+    entry.startup_rate_prior = RateHint::BitsPerSecond(500_000_000);
     install_raw_product_point_rate(&mut entry, 80_000_000.0);
     let mut local_metrics = path_metrics(
         key,
@@ -820,6 +918,23 @@ fn tcp_qualified_native_capacity_precedes_product_goodput() {
         "retained qualified delivery evidence must not overwrite current carrier state",
     );
     assert_eq!(snapshot.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
+
+    install_product_rate(&mut entry, 80_000_000.0);
+    let lower_product =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(lower_product.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(lower_product.product_progress_rate_bps, Some(80_000_000.0));
+    assert_eq!(lower_product.rate_scope, PathRateScope::PathCapacity);
+
+    install_product_rate(&mut entry, 800_000_000.0);
+    let higher_product =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(higher_product.delivery_rate_bps, 800_000_000.0);
+    assert_eq!(
+        higher_product.product_progress_rate_bps,
+        Some(800_000_000.0),
+    );
+    assert_eq!(higher_product.rate_scope, PathRateScope::PerFlowGoodput);
 }
 
 #[test]
@@ -1569,7 +1684,11 @@ fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
     let proof_rtt =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(proof_rtt.srtt_ms, 20.0);
-    assert_eq!(proof_rtt.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(
+        proof_rtt.delivery_rate_bps,
+        crate::runtime::path::model::default_path_rate_bps(),
+    );
+    assert_eq!(proof_rtt.carrier_delivery_rate_bps, Some(500_000_000.0));
     assert_eq!(proof_rtt.pacing_rate_bps, 600_000_000.0);
     assert_eq!(proof_rtt.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
     assert_eq!(
@@ -1586,7 +1705,11 @@ fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
     let newer_native =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
     assert_eq!(newer_native.srtt_ms, 35.0);
-    assert_eq!(newer_native.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(
+        newer_native.delivery_rate_bps,
+        crate::runtime::path::model::default_path_rate_bps(),
+    );
+    assert_eq!(newer_native.carrier_delivery_rate_bps, Some(500_000_000.0));
 }
 
 #[test]

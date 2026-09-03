@@ -17,6 +17,7 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
 use crate::scheduler::{PathSnapshot, TrafficClass};
+use crate::transport::RateHint;
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -647,11 +648,24 @@ pub(in crate::runtime) struct ServerCarrierPathIdentity {
 
 /// Endpoint-local properties bound to one accepted carrier instance.
 /// These values never cross the wire and are not derived from peer `PathId`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ServerLocalPathProperties {
     pub(in crate::runtime) config_ordinal: usize,
     pub(in crate::runtime) policy: PathPolicy,
+    /// Immutable endpoint-local rate prior for this accepted carrier.
+    pub(in crate::runtime) startup_rate_prior: RateHint,
     pub(in crate::runtime) initial_metrics: Option<PathMetrics>,
+}
+
+impl Default for ServerLocalPathProperties {
+    fn default() -> Self {
+        Self {
+            config_ordinal: 0,
+            policy: PathPolicy::default(),
+            startup_rate_prior: RateHint::Unknown,
+            initial_metrics: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -875,6 +889,10 @@ impl ServerCarrierPathRegistration {
 
     pub(in crate::runtime) fn initial_metrics(&self) -> Option<PathMetrics> {
         self.inner.local.initial_metrics
+    }
+
+    pub(in crate::runtime) fn startup_rate_prior(&self) -> RateHint {
+        self.inner.local.startup_rate_prior
     }
 
     pub(in crate::runtime) fn principal_permit(&self) -> &PrincipalPermit {

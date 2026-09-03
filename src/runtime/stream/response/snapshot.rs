@@ -28,7 +28,9 @@ use crate::model::response::ResponsePathObservation;
 use crate::mux::MuxLimits;
 use crate::protocol::SessionId;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
-use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
+use crate::runtime::path::model::{
+    default_path_rate_bps, default_path_srtt_ms, startup_rate_prediction_bps,
+};
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::sync::Arc;
@@ -390,9 +392,14 @@ pub(super) fn server_bulk_output_snapshot_at(
             .flatten();
     // Startup configuration is a prior, not measured carrier capacity. Only
     // ACK-derived evidence may turn local metrics into a scheduling rate.
-    let native_rate = local_metrics
+    let diagnostic_local_rate = local_metrics
         .filter(|metrics| server_path_metrics_has_bulk_rate_evidence_at(*metrics, now))
         .map(server_path_metrics_estimate_rate_bps);
+    // TCP has no named NativeMode adapter. Kernel delivery-rate telemetry is
+    // useful writer shape and diagnostics, but cannot replace ReceiptMode C0.
+    let native_rate = (entry.key.underlay != crate::protocol::UnderlayProtocol::Tcp)
+        .then_some(diagnostic_local_rate)
+        .flatten();
     // A partial native ACK epoch may expose current send intent before it has
     // covered the frozen delivery window. Preserve that value as pacing shape,
     // but never project it into achieved completion service below.
@@ -424,7 +431,7 @@ pub(super) fn server_bulk_output_snapshot_at(
                 },
             )
         });
-    let native_pacing_rate = native_rate
+    let native_pacing_rate = diagnostic_local_rate
         .and_then(|_| {
             local_metrics.and_then(|metrics| {
                 metrics.carrier_delivery_rate_sample.map_or_else(
@@ -441,16 +448,20 @@ pub(super) fn server_bulk_output_snapshot_at(
         })
         .map(|rate| rate.max(1) as f64)
         .or(native_startup_pacing_rate);
-    let peer_rate = peer_hint
-        .filter(|metrics| server_path_metrics_snapshot_is_fresh_at(*metrics, now))
-        .filter(|metrics| !metrics.metrics.app_limited)
-        .map(server_path_metrics_estimate_rate_bps);
+    let peer_rate = (entry.key.underlay != crate::protocol::UnderlayProtocol::Tcp)
+        .then(|| {
+            peer_hint
+                .filter(|metrics| server_path_metrics_snapshot_is_fresh_at(*metrics, now))
+                .filter(|metrics| !metrics.metrics.app_limited)
+                .map(server_path_metrics_estimate_rate_bps)
+        })
+        .flatten();
     // Product completion is a historical lower bound. It may raise the
     // compatible configured/native projection, but a low Product point cannot
     // prove that baseline slower.
     let baseline_rate = native_rate
         .or(peer_rate)
-        .unwrap_or_else(default_path_rate_bps);
+        .unwrap_or_else(|| startup_rate_prediction_bps(entry.startup_rate_prior));
     let (rate_bps, rate_scope) = match qualified_product_completion_rate
         .filter(|product_rate| *product_rate > baseline_rate)
     {
@@ -465,7 +476,9 @@ pub(super) fn server_bulk_output_snapshot_at(
         rate_bps.max(1.0),
     );
     snapshot.rate_scope = rate_scope;
-    snapshot.carrier_delivery_rate_bps = native_rate;
+    // Retain qualified local transport rate for diagnostics and writer-shape
+    // observability. In TCP ReceiptMode it is not the completion-rate basis.
+    snapshot.carrier_delivery_rate_bps = diagnostic_local_rate;
     snapshot.policy = entry.local_policy;
     snapshot.peer_usage = entry.peer_usage;
     let (mut active_flows, mut active_latency_sensitive_flows) =

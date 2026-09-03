@@ -258,6 +258,7 @@ fn carrier_path_statuses_match_management_stable_projection_fields() {
                 backup: true,
                 ..PathPolicy::default()
             },
+            startup_rate_prior: crate::transport::RateHint::Unknown,
             initial_metrics: Some(initial_metrics),
         },
     );
@@ -2464,6 +2465,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
         ServerLocalPathProperties {
             config_ordinal: 4,
             policy: local_policy,
+            startup_rate_prior: crate::transport::RateHint::Unknown,
             initial_metrics: Some(startup_metrics),
         },
     );
@@ -2750,6 +2752,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
                 backup: true,
                 ..PathPolicy::default()
             },
+            startup_rate_prior: crate::transport::RateHint::Unknown,
             initial_metrics: Some(first_metrics),
         },
     );
@@ -2760,6 +2763,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
         ServerLocalPathProperties {
             config_ordinal: 1,
             policy: PathPolicy::default(),
+            startup_rate_prior: crate::transport::RateHint::Unknown,
             initial_metrics: Some(second_metrics),
         },
     );

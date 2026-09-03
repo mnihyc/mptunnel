@@ -624,11 +624,7 @@ pub(in crate::runtime) fn path_snapshot_with_id(
     path_id: PathId,
     observation: ClientPathObservation,
 ) -> PathSnapshot {
-    let hinted_delivery_rate_bps = match path.metadata.initial_rate {
-        RateHint::Unknown => default_path_rate_bps(),
-        RateHint::Unlimited => 1_000_000_000_000.0,
-        RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
-    };
+    let hinted_delivery_rate_bps = startup_rate_prediction_bps(path.metadata.initial_rate);
     // The health record retains the raw Product point for diagnostics and
     // smoothing. Completion/ranking sees it only through the established
     // Product service-quantum qualification boundary.
@@ -708,6 +704,17 @@ pub(in crate::runtime) fn path_snapshot_with_id(
         // delivery-epoch provenance. Unknown capability fails closed for the
         // request-only QUIC acquisition tie-break.
         app_limited: observation.carrier_current_app_limited == Some(true),
+    }
+}
+
+/// Converts an endpoint-local configured rate prior into the common positive
+/// scheduling-rate domain. The value remains a prior; this conversion grants
+/// no measurement provenance or Product qualification.
+pub(in crate::runtime) fn startup_rate_prediction_bps(initial_rate: RateHint) -> f64 {
+    match initial_rate {
+        RateHint::Unknown => default_path_rate_bps(),
+        RateHint::Unlimited => 1_000_000_000_000.0,
+        RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     }
 }
 

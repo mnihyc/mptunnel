@@ -263,6 +263,120 @@ async fn request_planner_and_reservation_preserve_closed_admission_identity() {
 }
 
 #[tokio::test]
+async fn request_all_full_writers_finish_one_finite_production_pass_and_park() {
+    let stream_id = StreamId(714);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10714?initial-srtt-s=0.02&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10715?initial-srtt-s=0.03&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10716?initial-srtt-s=0.04&initial-rate-mbps=100",
+    ]);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream(stream_id, 0, first_commands.clone()),
+        4,
+    );
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_test_relay_stream(
+        stream_id,
+        1,
+        second_commands.clone(),
+    ));
+    let (third_commands, mut third_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_test_relay_stream(
+        stream_id,
+        2,
+        third_commands.clone(),
+    ));
+
+    for receivers in [
+        &mut first_receivers,
+        &mut second_receivers,
+        &mut third_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in remotes.path_instances() {
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+    remotes.retry_pending_path_proofs(&context);
+    for receivers in [
+        &mut first_receivers,
+        &mut second_receivers,
+        &mut third_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+
+    let filler_stream = StreamId(1714);
+    for (ordinal, commands) in [&first_commands, &second_commands, &third_commands]
+        .into_iter()
+        .enumerate()
+    {
+        commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: filler_stream,
+                    offset: (ordinal * 4096) as u64,
+                    payload: Bytes::from(vec![0x31 + ordinal as u8; 4096]),
+                },
+                TrafficClass::Throughput,
+            )
+            .expect("fill each exact data writer once");
+    }
+
+    let pending = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: Bytes::from_static(b"pending Product quantum"),
+    };
+    let mut sender = RequestSenderService::new(stream_id);
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(250),
+        sender.send_frame(
+            &context,
+            &mut remotes,
+            pending,
+            RelaySendCause::StreamData,
+            Some(TrafficClass::Throughput),
+        ),
+    )
+    .await
+    .expect("the finite candidate pass must park without spinning");
+    assert!(matches!(outcome, Err(RuntimeError::SenderServiceBlocked)));
+    assert!(
+        sender
+            .multipath
+            .request_recovery_original_paths(&remotes)
+            .is_empty(),
+        "a zero-commit pass cannot publish Product ownership",
+    );
+
+    for (ordinal, receivers) in [
+        &mut first_receivers,
+        &mut second_receivers,
+        &mut third_receivers,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let command = try_recv_reliable_path_command(receivers)
+            .expect("the one preexisting command remains on each exact writer");
+        assert!(matches!(
+            command,
+            ReliablePathCommand::SendFrame(Frame::StreamData {
+                stream_id: queued_stream,
+                offset,
+                ..
+            }) if queued_stream == filler_stream && offset == (ordinal * 4096) as u64
+        ));
+        assert!(
+            try_recv_reliable_path_command(receivers).is_none(),
+            "the finite pass cannot enqueue or retry an exact writer twice",
+        );
+    }
+}
+
+#[tokio::test]
 async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent() {
     let stream_id = StreamId(712);
     let context =

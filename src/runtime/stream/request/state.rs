@@ -4,7 +4,6 @@
 //! client relay serializes this aggregate, so it remains lock-free.
 
 use super::flight::RequestFlightLedger;
-use crate::model::acquisition_cursor::AcquisitionQualificationIdentity;
 use crate::model::path::RelayPathInstance;
 #[cfg(test)]
 use crate::model::product_qualification::ProductQualificationInvariant;
@@ -129,12 +128,6 @@ impl RequestPathState {
         &self,
     ) -> ProductQualificationAuthority {
         self.product_qualification.authority()
-    }
-
-    pub(in crate::runtime) fn product_qualification_identity(
-        &self,
-    ) -> AcquisitionQualificationIdentity {
-        AcquisitionQualificationIdentity::capture(&self.product_qualification)
     }
 
     pub(in crate::runtime) fn reactivate_product_qualification(

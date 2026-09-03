@@ -812,6 +812,8 @@ impl RequestSenderService {
         reinjection_queue: Option<&ReliableRelaySenderQueue>,
     ) -> Result<(RelayPathInstance, usize, Option<Instant>), RuntimeError> {
         let mut last_error = None;
+        let mut rejected_bulk_original_targets =
+            smallvec::SmallVec::<[RelayPathInstance; 8]>::new();
         while !remotes.paths.is_empty() {
             let stream_lane = remotes
                 .paths
@@ -819,13 +821,20 @@ impl RequestSenderService {
                 .map(|path| path.stream.lane)
                 .unwrap_or(TrafficClass::Latency);
             let selection_lane = request_lane.unwrap_or(stream_lane);
+            let mut decision_avoid_instances =
+                smallvec::SmallVec::<[RelayPathInstance; 8]>::from_slice(avoid_instances);
+            for rejected in &rejected_bulk_original_targets {
+                if !decision_avoid_instances.contains(rejected) {
+                    decision_avoid_instances.push(*rejected);
+                }
+            }
             let plan = match self.multipath.plan_relay_path_send_at_frontier(
                 context,
                 remotes,
                 &frame,
                 selection_lane,
                 cause,
-                avoid_instances,
+                &decision_avoid_instances,
                 frontier_state,
             ) {
                 Ok(plan) => plan,
@@ -840,23 +849,11 @@ impl RequestSenderService {
                 }
             };
             let (_, instance) = plan.target();
-            let acquisition_snapshot = match self.multipath.validate_request_acquisition_attempt(
-                context,
-                remotes,
-                &plan,
-                &frame,
-                selection_lane,
-                frontier_state,
-                avoid_instances,
-            ) {
-                Ok(snapshot) => snapshot,
-                Err(()) => return Err(RuntimeError::SenderServiceBlocked),
-            };
             let Some(position) = plan.target_position_for_apply(remotes, selection_lane) else {
-                if self
-                    .multipath
-                    .fail_request_acquisition_attempt(&plan, acquisition_snapshot.as_ref())
-                {
+                if plan.reject_failed_bulk_original_target(
+                    selection_lane,
+                    &mut rejected_bulk_original_targets,
+                ) {
                     continue;
                 }
                 return Err(RuntimeError::SenderServiceBlocked);
@@ -875,10 +872,10 @@ impl RequestSenderService {
                         instance.attachment_id,
                     ),
                 );
-                if self
-                    .multipath
-                    .fail_request_acquisition_attempt(&plan, acquisition_snapshot.as_ref())
-                {
+                if plan.reject_failed_bulk_original_target(
+                    selection_lane,
+                    &mut rejected_bulk_original_targets,
+                ) {
                     continue;
                 }
                 return Err(RuntimeError::SenderServiceBlocked);
@@ -913,10 +910,10 @@ impl RequestSenderService {
                                 instance.attachment_id,
                             ),
                         );
-                        if self
-                            .multipath
-                            .fail_request_acquisition_attempt(&plan, acquisition_snapshot.as_ref())
-                        {
+                        if plan.reject_failed_bulk_original_target(
+                            selection_lane,
+                            &mut rejected_bulk_original_targets,
+                        ) {
                             continue;
                         }
                         return Err(RuntimeError::SenderServiceBlocked);
@@ -943,10 +940,10 @@ impl RequestSenderService {
                 match fixed_request_output_commands(&remotes.paths[position].stream.output) {
                     Ok(commands) => commands.clone(),
                     Err(error) => {
-                        if self
-                            .multipath
-                            .fail_request_acquisition_attempt(&plan, acquisition_snapshot.as_ref())
-                        {
+                        if plan.reject_failed_bulk_original_target(
+                            selection_lane,
+                            &mut rejected_bulk_original_targets,
+                        ) {
                             continue;
                         }
                         return Err(error);
@@ -985,9 +982,9 @@ impl RequestSenderService {
                                         instance.attachment_id,
                                     ),
                                 );
-                                if self.multipath.fail_request_acquisition_attempt(
-                                    &plan,
-                                    acquisition_snapshot.as_ref(),
+                                if plan.reject_failed_bulk_original_target(
+                                    selection_lane,
+                                    &mut rejected_bulk_original_targets,
                                 ) {
                                     continue;
                                 }
@@ -1005,9 +1002,9 @@ impl RequestSenderService {
                                     instance.attachment_id,
                                 ),
                             );
-                            if self.multipath.fail_request_acquisition_attempt(
-                                &plan,
-                                acquisition_snapshot.as_ref(),
+                            if plan.reject_failed_bulk_original_target(
+                                selection_lane,
+                                &mut rejected_bulk_original_targets,
                             ) {
                                 continue;
                             }
@@ -1027,9 +1024,9 @@ impl RequestSenderService {
                                     instance.attachment_id,
                                 ),
                             );
-                            if self.multipath.fail_request_acquisition_attempt(
-                                &plan,
-                                acquisition_snapshot.as_ref(),
+                            if plan.reject_failed_bulk_original_target(
+                                selection_lane,
+                                &mut rejected_bulk_original_targets,
                             ) {
                                 continue;
                             }
@@ -1037,9 +1034,9 @@ impl RequestSenderService {
                         }
                         if cause.is_reinjection() {
                             let Some(snapshot) = reinjection_authority.flatten() else {
-                                if self.multipath.fail_request_acquisition_attempt(
-                                    &plan,
-                                    acquisition_snapshot.as_ref(),
+                                if plan.reject_failed_bulk_original_target(
+                                    selection_lane,
+                                    &mut rejected_bulk_original_targets,
                                 ) {
                                     continue;
                                 }
@@ -1074,9 +1071,9 @@ impl RequestSenderService {
                                         exact_service,
                                     ),
                                 );
-                                if self.multipath.fail_request_acquisition_attempt(
-                                    &plan,
-                                    acquisition_snapshot.as_ref(),
+                                if plan.reject_failed_bulk_original_target(
+                                    selection_lane,
+                                    &mut rejected_bulk_original_targets,
                                 ) {
                                     continue;
                                 }
@@ -1093,19 +1090,15 @@ impl RequestSenderService {
                         {
                             Ok(recorded) => recorded,
                             Err(_) => {
-                                if self.multipath.fail_request_acquisition_attempt(
-                                    &plan,
-                                    acquisition_snapshot.as_ref(),
+                                if plan.reject_failed_bulk_original_target(
+                                    selection_lane,
+                                    &mut rejected_bulk_original_targets,
                                 ) {
                                     continue;
                                 }
                                 return Err(RuntimeError::SenderServiceBlocked);
                             }
                         };
-                        self.multipath.commit_request_acquisition_attempt(
-                            &plan,
-                            acquisition_snapshot.as_ref(),
-                        );
                         if let Some(claim) = request_load_claim {
                             let remote = &mut remotes.paths[position];
                             // The exact path owns the lease after queue
@@ -1147,19 +1140,15 @@ impl RequestSenderService {
                     RequestFrameAdmissionError::ServiceBlocked
                     | RequestFrameAdmissionError::OrderedTerminalPending,
                 ) => {
-                    if self
-                        .multipath
-                        .fail_request_acquisition_attempt(&plan, acquisition_snapshot.as_ref())
-                    {
+                    if plan.reject_failed_bulk_original_target(
+                        selection_lane,
+                        &mut rejected_bulk_original_targets,
+                    ) {
                         continue;
                     }
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
                 Err(RequestFrameAdmissionError::Runtime(err)) => {
-                    let _ = self
-                        .multipath
-                        .fail_request_acquisition_attempt(&plan, acquisition_snapshot.as_ref());
-                    self.multipath.abandon_request_acquisition_continuation();
                     last_error = Some(err);
                     self.fail_client_path_instance(context, remotes, instance);
                     self.multipath.normalize_cursor(remotes.paths.len());

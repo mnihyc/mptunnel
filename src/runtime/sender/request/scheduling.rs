@@ -538,6 +538,56 @@ pub(super) fn choose_request_ack_clock_measurement_with_rates(
     path_flights: Option<&RequestFlightLedger>,
     request_state: Option<RequestSchedulingState<'_>>,
 ) -> Option<BulkRelayPathChoice> {
+    choose_request_ack_clock_measurement_with_rates_impl(
+        observation,
+        lane,
+        offset,
+        payload_bytes,
+        cursor,
+        reference_key,
+        path_flights,
+        request_state,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn request_ack_clock_measurement_for_ordinary_target(
+    observation: &RequestRelaySchedulingObservation,
+    lane: TrafficClass,
+    offset: u64,
+    payload_bytes: usize,
+    cursor: usize,
+    reference_key: Option<RelayPathKey>,
+    path_flights: Option<&RequestFlightLedger>,
+    request_state: Option<RequestSchedulingState<'_>>,
+    ordinary_target: RelayPathInstance,
+) -> Option<BulkRelayPathChoice> {
+    choose_request_ack_clock_measurement_with_rates_impl(
+        observation,
+        lane,
+        offset,
+        payload_bytes,
+        cursor,
+        reference_key,
+        path_flights,
+        request_state,
+        Some(ordinary_target),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_request_ack_clock_measurement_with_rates_impl(
+    observation: &RequestRelaySchedulingObservation,
+    lane: TrafficClass,
+    offset: u64,
+    payload_bytes: usize,
+    cursor: usize,
+    reference_key: Option<RelayPathKey>,
+    path_flights: Option<&RequestFlightLedger>,
+    request_state: Option<RequestSchedulingState<'_>>,
+    ordinary_target: Option<RelayPathInstance>,
+) -> Option<BulkRelayPathChoice> {
     let paths = observation.paths.as_slice();
     #[cfg(feature = "lab-diagnostics")]
     let stream_id = observation.stream_id;
@@ -729,6 +779,7 @@ pub(super) fn choose_request_ack_clock_measurement_with_rates(
     paths
         .iter()
         .enumerate()
+        .filter(|(_, path)| ordinary_target.is_none_or(|target| path.instance() == target))
         .filter(|(_, path)| path.key().underlay == UnderlayProtocol::Tcp)
         .filter(|(_, path)| path.key() != reference_key)
         .filter(|(_, path)| {
@@ -1135,8 +1186,18 @@ fn log_request_flow_local_admission_shadow(
     );
 }
 
-pub(super) fn choose_bulk_relay_path_avoiding(
+/// Re-runs ordinary bulk ECF after a target-local apply race. Avoided exact
+/// instances remain excluded, but the decision retains ordinary Product,
+/// ordering, and hysteresis semantics rather than becoming a repair choice.
+pub(super) fn choose_ordinary_bulk_relay_path_avoiding(
     request: BulkRelayFrameRequest<'_>,
+) -> BulkRelayPathChoice {
+    choose_bulk_relay_path_with_mode(request, true)
+}
+
+fn choose_bulk_relay_path_with_mode(
+    request: BulkRelayFrameRequest<'_>,
+    normal_bulk_send: bool,
 ) -> BulkRelayPathChoice {
     let BulkRelayFrameRequest {
         observation,
@@ -1151,21 +1212,32 @@ pub(super) fn choose_bulk_relay_path_avoiding(
     let Some((offset, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
         return BulkRelayPathChoice::NotApplicable;
     };
-    choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-        observation,
-        lane,
-        offset,
-        payload_bytes,
-        cursor,
-        avoid_instances,
-        path_flights,
-        request_state,
-        frontier_state,
-    })
+    choose_bulk_relay_path_for_extent_with_mode(
+        BulkRelayPathRequest {
+            observation,
+            lane,
+            offset,
+            payload_bytes,
+            cursor,
+            avoid_instances,
+            path_flights,
+            request_state,
+            frontier_state,
+        },
+        normal_bulk_send,
+    )
 }
 
 pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     request: BulkRelayPathRequest<'_>,
+) -> BulkRelayPathChoice {
+    let normal_bulk_send = request.avoid_instances.is_empty();
+    choose_bulk_relay_path_for_extent_with_mode(request, normal_bulk_send)
+}
+
+fn choose_bulk_relay_path_for_extent_with_mode(
+    request: BulkRelayPathRequest<'_>,
+    normal_bulk_send: bool,
 ) -> BulkRelayPathChoice {
     let BulkRelayPathRequest {
         observation,
@@ -1186,7 +1258,6 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     if !lane.is_bulk() || payload_bytes == 0 {
         return BulkRelayPathChoice::NotApplicable;
     }
-    let normal_bulk_send = avoid_instances.is_empty();
     let quic_unused_credit_order = |left_eta_ms, left, right_eta_ms, right| {
         if normal_bulk_send {
             compare_request_quic_native_window_utilization(left_eta_ms, left, right_eta_ms, right)

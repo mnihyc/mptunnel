@@ -10,19 +10,15 @@ use super::RequestDataAckGapObservation;
 use super::scheduling::{
     BulkRelayFrameRequest, BulkRelayPathChoice, ObservedBulkPathCandidate,
     ObservedOrdinaryPathChoice, RequestRelayPathObservation, RequestRelaySchedulingObservation,
-    RequestSchedulingState, choose_bulk_relay_path_avoiding, choose_observed_ordinary_data_path,
-    choose_request_ack_clock_measurement_with_rates, request_original_data_authority_snapshot,
+    RequestSchedulingState, choose_observed_ordinary_data_path,
+    choose_ordinary_bulk_relay_path_avoiding, request_ack_clock_measurement_for_ordinary_target,
+    request_original_data_authority_snapshot,
 };
 use super::tcp_capacity::{
     RequestTcpCapacityController, RequestTcpCapacityEvent, RequestTcpCapacityRetirement,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::acquisition_cursor::{
-    AcquisitionApplyOutcome, AcquisitionAttempt, AcquisitionAttemptResolution,
-    AcquisitionCandidate, AcquisitionDispatchStart, AcquisitionReadiness, AcquisitionSnapshot,
-    AcquisitionTier, DirectionLocalAcquisitionCursor,
-};
 use crate::model::admission::{
     BulkCandidatePosition, BulkOriginalDataAssignmentAuthority, ReliableDataAckFrontierState,
     bulk_original_data_assignment_authority,
@@ -191,44 +187,6 @@ fn observed_request_load_expectation(
     )))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn choose_guarded_observed_ordinary_data_path(
-    observation: &RequestRelaySchedulingObservation,
-    lane: TrafficClass,
-    payload_bytes: usize,
-    cursor: usize,
-    avoid_instances: &[RelayPathInstance],
-    request_state: Option<RequestSchedulingState<'_>>,
-    acquisition: Option<&AcquisitionSnapshot<RelayPathInstance>>,
-) -> ObservedOrdinaryPathChoice {
-    let mut rejected = SmallVec::<[RelayPathInstance; 8]>::from_slice(avoid_instances);
-    loop {
-        match choose_observed_ordinary_data_path(
-            observation,
-            lane,
-            payload_bytes,
-            cursor,
-            &rejected,
-            request_state,
-        ) {
-            ObservedOrdinaryPathChoice::Selected(instance)
-                if acquisition.is_none_or(|snapshot| {
-                    snapshot.ordinary_target_preserves_acquisition(&instance)
-                }) =>
-            {
-                return ObservedOrdinaryPathChoice::Selected(instance);
-            }
-            ObservedOrdinaryPathChoice::Selected(instance) => {
-                if rejected.contains(&instance) {
-                    return ObservedOrdinaryPathChoice::Blocked;
-                }
-                rejected.push(instance);
-            }
-            outcome => return outcome,
-        }
-    }
-}
-
 /// Why one serialized request decision produced no carrier intent.
 ///
 /// `OutputUnavailable` is a definitive Product/recovery result. In contrast,
@@ -395,8 +353,6 @@ pub(super) struct RequestMultipathPlan {
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
     request_proof_expectation: Option<RelayPathProofEpoch>,
     path_eligibility_expectation: SmallVec<[RequestPathEligibilityExpectation; 4]>,
-    acquisition_attempt: Option<AcquisitionAttempt<RelayPathInstance>>,
-    acquisition_guarded_quantum: bool,
 }
 
 /// Preparation may enqueue control evidence but never publishes unique data.
@@ -445,8 +401,6 @@ impl RequestMultipathPlan {
             request_load_expectation: None,
             request_proof_expectation: None,
             path_eligibility_expectation: SmallVec::new(),
-            acquisition_attempt: None,
-            acquisition_guarded_quantum: false,
         }
     }
 
@@ -466,14 +420,22 @@ impl RequestMultipathPlan {
         self.product_mutation.assigns_original_data()
     }
 
-    fn with_acquisition_attempt(mut self, attempt: AcquisitionAttempt<RelayPathInstance>) -> Self {
-        self.acquisition_attempt = Some(attempt);
-        self
-    }
-
-    fn with_acquisition_guard(mut self) -> Self {
-        self.acquisition_guarded_quantum = true;
-        self
+    /// Records one target-local apply failure for a finite same-quantum
+    /// ordinary replan. This owns no scheduling order: the next attempt is
+    /// selected again by ordinary ECF with this exact incarnation excluded.
+    pub(super) fn reject_failed_bulk_original_target(
+        &self,
+        lane: TrafficClass,
+        rejected: &mut SmallVec<[RelayPathInstance; 8]>,
+    ) -> bool {
+        if !lane.is_bulk()
+            || !self.assigns_original_data()
+            || rejected.contains(&self.target.instance)
+        {
+            return false;
+        }
+        rejected.push(self.target.instance);
+        true
     }
 
     /// Resolves the exact planned output at apply. Bulk OriginalData refreshes
@@ -578,8 +540,6 @@ pub(super) struct RequestMultipathController {
     request: RequestStreamState,
     tcp_capacity: RequestTcpCapacityController,
     next_send_index: usize,
-    acquisition_cursor: DirectionLocalAcquisitionCursor<RelayPathInstance>,
-    continue_acquisition_dispatch: bool,
 }
 
 /// Both accounting views removed by one request Product ACK transaction.
@@ -608,8 +568,6 @@ impl RequestMultipathController {
             request: RequestStreamState::default(),
             tcp_capacity: RequestTcpCapacityController::default(),
             next_send_index: 0,
-            acquisition_cursor: DirectionLocalAcquisitionCursor::default(),
-            continue_acquisition_dispatch: false,
         }
     }
 
@@ -762,282 +720,6 @@ impl RequestMultipathController {
                 .original_data_in_flight_bytes(plan.target.instance),
             output,
         })
-    }
-
-    /// Builds the cursor's complete authority projection for one exact fresh
-    /// OriginalData quantum. Candidate order is attachment order; transient
-    /// writer/load/resource blockage changes only `legal_whole_quantum` and
-    /// never removes structural Regular membership.
-    #[allow(clippy::too_many_arguments)]
-    fn request_acquisition_snapshot(
-        &mut self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        observation: &RequestRelaySchedulingObservation,
-        frame: &Frame,
-        lane: TrafficClass,
-        frontier_state: ReliableDataAckFrontierState,
-        _avoid_instances: &[RelayPathInstance],
-    ) -> Option<AcquisitionSnapshot<RelayPathInstance>> {
-        if !lane.is_bulk() {
-            return None;
-        }
-        let (start, end, payload_bytes) = reliable_stream_frame_extent(frame)?;
-        let pending_range = OffsetRange { start, end };
-        let quantum_bytes = u64::try_from(payload_bytes).ok()?;
-        if quantum_bytes == 0 || pending_range.len() != quantum_bytes {
-            return None;
-        }
-        let max_quantum_bytes =
-            u64::try_from(reliable_relay_buffer_len(context.mux_limits)).ok()?;
-        let stream_outstanding_bytes = self.request.flights.total_original_data_in_flight_bytes();
-        let ordinary_owner_established = stream_outstanding_bytes > 0;
-        let lower_owner = self
-            .request
-            .flights
-            .oldest_lower_flight_owner_instance_before_offset(start);
-        let windows = reliable_bulk_product_windows(context.mux_limits);
-
-        // Every current attachment needs an explicit active-empty ledger: its
-        // epoch and authority are part of the immutable cursor projection even
-        // before it has produced qualification evidence.
-        for remote in &remotes.paths {
-            self.request.path_states.get_mut(remote.instance());
-        }
-        let request_state = RequestSchedulingState {
-            operation: self.request.ack_clock_operation,
-            path_states: &self.request.path_states,
-            flights: Some(&self.request.flights),
-        };
-        let candidates = observation
-            .paths
-            .iter()
-            .map(|path| {
-                let instance = path.instance;
-                let remote = remotes
-                    .paths
-                    .iter()
-                    .find(|remote| remote.instance() == instance);
-                let eligibility = request_path_eligibility(path.shared_snapshot, lane);
-                let tier = if eligibility == RequestPathEligibility::Backup {
-                    AcquisitionTier::Backup
-                } else {
-                    AcquisitionTier::Regular
-                };
-                let stale = self
-                    .request
-                    .requalification
-                    .stale_for_original_data(instance);
-                let state = self
-                    .request
-                    .path_states
-                    .get(instance)
-                    .expect("current attachments were initialized above");
-                let authority = state.product_qualification_authority();
-                let qualified = state.product_assignment_qualified();
-                let generation_deficit_bytes = state.product_qualification_deficit_bytes();
-                let locally_eligible = remote.is_some_and(|remote| {
-                    remote.stream.product_admission_active()
-                        && eligibility != RequestPathEligibility::Unavailable
-                });
-                let position = if !ordinary_owner_established {
-                    BulkCandidatePosition::FirstPath
-                } else if lower_owner == Some(instance)
-                    && frontier_state.owner_has_live_contiguous_frontier()
-                {
-                    BulkCandidatePosition::ContiguousFrontier
-                } else {
-                    BulkCandidatePosition::AdditionalPath
-                };
-                let additional = position == BulkCandidatePosition::AdditionalPath;
-                let load_authorized = path.load_owned
-                    || observed_request_load_expectation(observation, instance)
-                        .is_ok_and(|expectation| expectation.is_some());
-                let exact_authority = request_original_data_authority_snapshot(
-                    observation,
-                    instance,
-                    lower_owner.map(|owner| owner.key),
-                    TrafficClass::Throughput,
-                    Some(request_state),
-                    path.load_owned,
-                )
-                .map(|snapshot| {
-                    let output = bulk_original_data_assignment_authority(
-                        snapshot,
-                        payload_bytes,
-                        context.mux_limits,
-                        position,
-                        qualified,
-                    );
-                    RequestOriginalDataApplyAuthority {
-                        position,
-                        stream_outstanding_bytes,
-                        stream_limit_bytes: windows.stream_resource_limit_bytes,
-                        output_outstanding_bytes: self
-                            .request
-                            .flights
-                            .original_data_in_flight_bytes(instance),
-                        output,
-                    }
-                });
-                let legal_whole_quantum = locally_eligible
-                    && !stale
-                    && authority == ProductQualificationAuthority::Active
-                    && additional
-                    && quantum_bytes <= max_quantum_bytes
-                    && path.can_enqueue_frame
-                    && load_authorized
-                    && exact_authority.is_some_and(RequestOriginalDataApplyAuthority::has_headroom);
-                AcquisitionCandidate {
-                    exact_id: instance,
-                    qualification_identity: state.product_qualification_identity(),
-                    tier,
-                    locally_eligible,
-                    stale,
-                    additional,
-                    qualified,
-                    generation_deficit_bytes,
-                    legal_whole_quantum,
-                }
-            })
-            .collect();
-        Some(AcquisitionSnapshot {
-            pending_range,
-            quantum_bytes,
-            ordinary_owner_established,
-            candidates,
-        })
-    }
-
-    fn next_request_acquisition_attempt(
-        &mut self,
-        snapshot: &AcquisitionSnapshot<RelayPathInstance>,
-    ) -> Result<Option<AcquisitionAttempt<RelayPathInstance>>, RequestMultipathPlanError> {
-        match snapshot.acquisition_readiness() {
-            AcquisitionReadiness::InvalidSnapshot => {
-                return Err(RequestMultipathPlanError::ServiceBlocked);
-            }
-            AcquisitionReadiness::OrdinaryFirstOwner
-            | AcquisitionReadiness::OrdinaryOnly
-            | AcquisitionReadiness::Blocked(_) => return Ok(None),
-            AcquisitionReadiness::Ready(_) => {}
-        }
-        if self.continue_acquisition_dispatch {
-            self.continue_acquisition_dispatch = false;
-        } else {
-            match self.acquisition_cursor.begin_dispatch(snapshot.clone()) {
-                AcquisitionDispatchStart::Started => {}
-                AcquisitionDispatchStart::PendingAttempt => {
-                    return Err(RequestMultipathPlanError::ServiceBlocked);
-                }
-                AcquisitionDispatchStart::InvalidSnapshot
-                | AcquisitionDispatchStart::CounterExhausted => {
-                    return Err(RequestMultipathPlanError::ServiceBlocked);
-                }
-            }
-        }
-        Ok(self.acquisition_cursor.advisory_attempt())
-    }
-
-    /// Rebuilds the same-N semantic projection before any load or writer
-    /// reservation. A replay or structural change consumes the old attempt as
-    /// invalid and cannot be retargeted to a replacement attachment.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn validate_request_acquisition_attempt(
-        &mut self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        plan: &RequestMultipathPlan,
-        frame: &Frame,
-        lane: TrafficClass,
-        frontier_state: ReliableDataAckFrontierState,
-        avoid_instances: &[RelayPathInstance],
-    ) -> Result<Option<AcquisitionSnapshot<RelayPathInstance>>, ()> {
-        if !plan.acquisition_guarded_quantum {
-            return Ok(None);
-        }
-        let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
-        let observation = observe_request_relay_scheduling(
-            context,
-            self.stream_id,
-            remotes.membership_generation(),
-            &remotes.paths,
-            Some(frame),
-            lane,
-            payload_bytes,
-            true,
-            &self.request.requalification,
-        );
-        let Some(snapshot) = self.request_acquisition_snapshot(
-            context,
-            remotes,
-            &observation,
-            frame,
-            lane,
-            frontier_state,
-            avoid_instances,
-        ) else {
-            self.continue_acquisition_dispatch = false;
-            return Err(());
-        };
-        if let Some(attempt) = plan.acquisition_attempt.as_ref() {
-            if !self
-                .acquisition_cursor
-                .attempt_is_current(attempt, &snapshot)
-            {
-                let _ = self.acquisition_cursor.resolve_attempt(
-                    attempt,
-                    AcquisitionApplyOutcome::Failed,
-                    &snapshot,
-                );
-                self.continue_acquisition_dispatch = false;
-                return Err(());
-            }
-        } else if !snapshot.ordinary_target_preserves_acquisition(&plan.target.instance) {
-            self.continue_acquisition_dispatch = false;
-            return Err(());
-        }
-        Ok(Some(snapshot))
-    }
-
-    pub(super) fn fail_request_acquisition_attempt(
-        &mut self,
-        plan: &RequestMultipathPlan,
-        snapshot: Option<&AcquisitionSnapshot<RelayPathInstance>>,
-    ) -> bool {
-        let (Some(attempt), Some(snapshot)) = (plan.acquisition_attempt.as_ref(), snapshot) else {
-            self.continue_acquisition_dispatch = false;
-            return false;
-        };
-        self.continue_acquisition_dispatch = self.acquisition_cursor.resolve_attempt(
-            attempt,
-            AcquisitionApplyOutcome::Failed,
-            snapshot,
-        ) == AcquisitionAttemptResolution::Skipped;
-        self.continue_acquisition_dispatch
-    }
-
-    pub(super) fn commit_request_acquisition_attempt(
-        &mut self,
-        plan: &RequestMultipathPlan,
-        snapshot: Option<&AcquisitionSnapshot<RelayPathInstance>>,
-    ) {
-        let Some(attempt) = plan.acquisition_attempt.as_ref() else {
-            return;
-        };
-        let resolution = snapshot.map(|snapshot| {
-            self.acquisition_cursor.resolve_attempt(
-                attempt,
-                AcquisitionApplyOutcome::Committed,
-                snapshot,
-            )
-        });
-        debug_assert_eq!(resolution, Some(AcquisitionAttemptResolution::Committed));
-        self.continue_acquisition_dispatch = false;
-    }
-
-    pub(super) fn abandon_request_acquisition_continuation(&mut self) {
-        self.continue_acquisition_dispatch = false;
     }
 
     #[cfg(feature = "lab-diagnostics")]
@@ -1951,6 +1633,77 @@ impl RequestMultipathController {
         })
     }
 
+    /// Keeps the ReceiptMode ACK-clock transaction subordinate to ordinary
+    /// placement. The ordinary ECF decision owns the target; this function may
+    /// only annotate that same target's useful Product commit with measurement
+    /// authority.
+    fn ordinary_request_product_mutation(
+        &self,
+        observation: &RequestRelaySchedulingObservation,
+        lane: TrafficClass,
+        frame: &Frame,
+        payload_bytes: usize,
+        target: RelayPathInstance,
+    ) -> Result<(RequestProductSendMutation, Option<RelayPathProofEpoch>), RequestMultipathPlanError>
+    {
+        let entry_offset = reliable_stream_frame_extent(frame)
+            .map(|(offset, _, _)| offset)
+            .ok_or(RequestMultipathPlanError::ServiceBlocked)?;
+        let reference_key = self
+            .request
+            .flights
+            .oldest_lower_flight_owner_before_offset(entry_offset)
+            .unwrap_or(target.key);
+        let measurement = request_ack_clock_measurement_for_ordinary_target(
+            observation,
+            lane,
+            entry_offset,
+            payload_bytes,
+            self.next_send_index,
+            Some(reference_key),
+            Some(&self.request.flights),
+            Some(RequestSchedulingState {
+                operation: self.request.ack_clock_operation,
+                path_states: &self.request.path_states,
+                flights: Some(&self.request.flights),
+            }),
+            target,
+        )
+        .and_then(|choice| match choice {
+            BulkRelayPathChoice::SelectedAckClockMeasurement {
+                candidate,
+                target_bytes,
+                proof,
+            } if candidate == target => Some((target_bytes, proof)),
+            _ => None,
+        });
+        let Some((target_bytes, proof)) = measurement else {
+            return Ok((RequestProductSendMutation::Data, None));
+        };
+        let (foreign_optional_ranges, foreign_optional_bytes) = if !matches!(
+            self.request.ack_clock_operation,
+            Some(RequestAckClockOperation::Owner { .. })
+        ) {
+            self.request
+                .flights
+                .foreign_original_transmission_debt_before_offset(entry_offset, &[reference_key])
+        } else {
+            (0, 0)
+        };
+        Ok((
+            RequestProductSendMutation::OriginalData {
+                candidate: target,
+                target_bytes,
+                payload_bytes: u64::try_from(payload_bytes)
+                    .map_err(|_| RequestMultipathPlanError::ServiceBlocked)?,
+                entry_offset,
+                foreign_optional_ranges,
+                foreign_optional_bytes,
+            },
+            Some(proof),
+        ))
+    }
+
     #[cfg(test)]
     pub(super) fn plan_relay_path_send(
         &mut self,
@@ -1996,8 +1749,7 @@ impl RequestMultipathController {
         let observe_bulk_admission = prepared.unique_data_payload_bytes.is_some()
             && lane.is_bulk()
             && (remotes.paths.len() > 1
-                || frontier_state == ReliableDataAckFrontierState::AuthoritativeGap)
-            && avoid_instances.is_empty();
+                || frontier_state == ReliableDataAckFrontierState::AuthoritativeGap);
         let relay_observation = observe_request_relay_scheduling(
             context,
             remotes.stream_id(),
@@ -2011,122 +1763,12 @@ impl RequestMultipathController {
         );
         if let Some(payload_bytes) = prepared.unique_data_payload_bytes {
             self.reconcile_request_path_state(context, remotes);
-            let acquisition_snapshot = lane.is_bulk().then(|| {
-                self.request_acquisition_snapshot(
-                    context,
-                    remotes,
-                    &relay_observation,
-                    frame,
-                    lane,
-                    frontier_state,
-                    avoid_instances,
-                )
-            });
-            let acquisition_snapshot = acquisition_snapshot.flatten();
-            if lane.is_bulk() && acquisition_snapshot.is_none() {
-                return Err(RequestMultipathPlanError::ServiceBlocked);
-            }
-            if let Some(acquisition_snapshot) = acquisition_snapshot.as_ref() {
-                let mut attempt = self.next_request_acquisition_attempt(acquisition_snapshot)?;
-                while let Some(selected_attempt) = attempt {
-                    let candidate = selected_attempt.exact_id;
-                    let entry_offset = reliable_stream_frame_extent(frame)
-                        .map(|(offset, _, _)| offset)
-                        .unwrap_or(0);
-                    let reference_key = self
-                        .request
-                        .flights
-                        .oldest_lower_flight_owner_before_offset(entry_offset)
-                        .unwrap_or(candidate.key);
-                    let measurement = choose_request_ack_clock_measurement_with_rates(
-                        &relay_observation,
-                        lane,
-                        entry_offset,
-                        payload_bytes,
-                        self.next_send_index,
-                        Some(reference_key),
-                        Some(&self.request.flights),
-                        Some(RequestSchedulingState {
-                            operation: self.request.ack_clock_operation,
-                            path_states: &self.request.path_states,
-                            flights: Some(&self.request.flights),
-                        }),
-                    )
-                    .and_then(|choice| match choice {
-                        BulkRelayPathChoice::SelectedAckClockMeasurement {
-                            candidate: measured,
-                            target_bytes,
-                            proof,
-                        } if measured == candidate => Some((target_bytes, proof)),
-                        _ => None,
-                    });
-                    let product_mutation = if let Some((target_bytes, _)) = measurement {
-                        let (foreign_optional_ranges, foreign_optional_bytes) = if !matches!(
-                            self.request.ack_clock_operation,
-                            Some(RequestAckClockOperation::Owner { .. })
-                        ) {
-                            self.request
-                                .flights
-                                .foreign_original_transmission_debt_before_offset(
-                                    entry_offset,
-                                    &[reference_key],
-                                )
-                        } else {
-                            (0, 0)
-                        };
-                        RequestProductSendMutation::OriginalData {
-                            candidate,
-                            target_bytes,
-                            payload_bytes: u64::try_from(payload_bytes)
-                                .map_err(|_| RequestMultipathPlanError::ServiceBlocked)?,
-                            entry_offset,
-                            foreign_optional_ranges,
-                            foreign_optional_bytes,
-                        }
-                    } else {
-                        RequestProductSendMutation::Data
-                    };
-                    let mut selection = RequestMultipathPlan::new(
-                        RequestMultipathTarget {
-                            membership_generation: relay_observation.membership_generation,
-                            instance: candidate,
-                        },
-                        product_mutation,
-                    )
-                    .with_acquisition_guard()
-                    .with_acquisition_attempt(selected_attempt.clone());
-                    let planned = observed_request_load_expectation(&relay_observation, candidate)
-                        .and_then(|expectation| {
-                            selection.request_load_expectation = expectation;
-                            selection.request_proof_expectation =
-                                measurement.map(|(_, proof)| proof);
-                            selection.with_eligibility_expectation(
-                                &relay_observation,
-                                lane,
-                                Some(RequestSchedulingState {
-                                    operation: self.request.ack_clock_operation,
-                                    path_states: &self.request.path_states,
-                                    flights: Some(&self.request.flights),
-                                }),
-                            )
-                        });
-                    match planned {
-                        Ok(selection) => return Ok(selection),
-                        Err(error) => {
-                            let resolution = self.acquisition_cursor.resolve_attempt(
-                                &selected_attempt,
-                                AcquisitionApplyOutcome::Failed,
-                                acquisition_snapshot,
-                            );
-                            if resolution != AcquisitionAttemptResolution::Skipped {
-                                return Err(error);
-                            }
-                            attempt = self.acquisition_cursor.advisory_attempt();
-                        }
-                    }
-                }
-            }
-            match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+            let request_state = RequestSchedulingState {
+                operation: self.request.ack_clock_operation,
+                path_states: &self.request.path_states,
+                flights: Some(&self.request.flights),
+            };
+            let ordinary = choose_ordinary_bulk_relay_path_avoiding(BulkRelayFrameRequest {
                 observation: &relay_observation,
                 lane,
                 frame,
@@ -2139,74 +1781,21 @@ impl RequestMultipathController {
                     flights: Some(&self.request.flights),
                 }),
                 frontier_state,
-            }) {
-                BulkRelayPathChoice::Selected(selected_instance) => {
-                    let instance = if acquisition_snapshot.as_ref().is_none_or(|snapshot| {
-                        snapshot.ordinary_target_preserves_acquisition(&selected_instance)
-                    }) {
-                        selected_instance
-                    } else {
-                        match choose_guarded_observed_ordinary_data_path(
-                            &relay_observation,
-                            lane,
-                            payload_bytes,
-                            self.next_send_index,
-                            avoid_instances,
-                            Some(RequestSchedulingState {
-                                operation: self.request.ack_clock_operation,
-                                path_states: &self.request.path_states,
-                                flights: Some(&self.request.flights),
-                            }),
-                            acquisition_snapshot.as_ref(),
-                        ) {
-                            ObservedOrdinaryPathChoice::Selected(instance) => instance,
-                            ObservedOrdinaryPathChoice::Blocked => {
-                                return Err(blocked_attachment_set_error(remotes));
-                            }
-                            ObservedOrdinaryPathChoice::NoLivePath => {
-                                return Err(RequestMultipathPlanError::OutputUnavailable);
-                            }
-                        }
-                    };
-                    let mut selection = RequestMultipathPlan::new(
-                        RequestMultipathTarget {
-                            membership_generation: relay_observation.membership_generation,
-                            instance,
-                        },
-                        RequestProductSendMutation::Data,
-                    );
-                    if acquisition_snapshot.is_some() {
-                        selection = selection.with_acquisition_guard();
-                    }
-                    selection.request_load_expectation =
-                        observed_request_load_expectation(&relay_observation, instance)?;
-                    return selection.with_eligibility_expectation(
-                        &relay_observation,
-                        lane,
-                        Some(RequestSchedulingState {
-                            operation: self.request.ack_clock_operation,
-                            path_states: &self.request.path_states,
-                            flights: Some(&self.request.flights),
-                        }),
-                    );
-                }
+            });
+            let instance = match ordinary {
+                BulkRelayPathChoice::Selected(instance) => instance,
                 BulkRelayPathChoice::Blocked => {
                     return Err(blocked_attachment_set_error(remotes));
                 }
                 BulkRelayPathChoice::SelectedAckClockMeasurement { .. }
                 | BulkRelayPathChoice::NotApplicable => {
-                    let instance = match choose_guarded_observed_ordinary_data_path(
+                    match choose_observed_ordinary_data_path(
                         &relay_observation,
                         lane,
                         payload_bytes,
                         self.next_send_index,
                         avoid_instances,
-                        Some(RequestSchedulingState {
-                            operation: self.request.ack_clock_operation,
-                            path_states: &self.request.path_states,
-                            flights: Some(&self.request.flights),
-                        }),
-                        acquisition_snapshot.as_ref(),
+                        Some(request_state),
                     ) {
                         ObservedOrdinaryPathChoice::Selected(instance) => instance,
                         ObservedOrdinaryPathChoice::Blocked => {
@@ -2215,30 +1804,31 @@ impl RequestMultipathController {
                         ObservedOrdinaryPathChoice::NoLivePath => {
                             return Err(RequestMultipathPlanError::OutputUnavailable);
                         }
-                    };
-                    let mut selection = RequestMultipathPlan::new(
-                        RequestMultipathTarget {
-                            membership_generation: relay_observation.membership_generation,
-                            instance,
-                        },
-                        RequestProductSendMutation::Data,
-                    );
-                    if acquisition_snapshot.is_some() {
-                        selection = selection.with_acquisition_guard();
                     }
-                    selection.request_load_expectation =
-                        observed_request_load_expectation(&relay_observation, instance)?;
-                    return selection.with_eligibility_expectation(
-                        &relay_observation,
-                        lane,
-                        Some(RequestSchedulingState {
-                            operation: self.request.ack_clock_operation,
-                            path_states: &self.request.path_states,
-                            flights: Some(&self.request.flights),
-                        }),
-                    );
                 }
-            }
+            };
+            let (product_mutation, proof) = self.ordinary_request_product_mutation(
+                &relay_observation,
+                lane,
+                frame,
+                payload_bytes,
+                instance,
+            )?;
+            let mut selection = RequestMultipathPlan::new(
+                RequestMultipathTarget {
+                    membership_generation: relay_observation.membership_generation,
+                    instance,
+                },
+                product_mutation,
+            );
+            selection.request_load_expectation =
+                observed_request_load_expectation(&relay_observation, instance)?;
+            selection.request_proof_expectation = proof;
+            return selection.with_eligibility_expectation(
+                &relay_observation,
+                lane,
+                Some(request_state),
+            );
         }
         let position = self.choose_lowest_eta_relay_path(
             context,

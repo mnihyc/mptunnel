@@ -1,3 +1,4 @@
+use super::super::scheduling::choose_request_ack_clock_measurement_with_rates;
 use super::super::test_support::{
     client_test_context_with_paths, consume_client_path_proof_for_test,
     mark_client_path_proof_fresh_for_test, opened_test_relay_stream,
@@ -320,8 +321,6 @@ fn original_data_apply_plan(
         request_load_expectation: None,
         request_proof_expectation: None,
         path_eligibility_expectation: SmallVec::new(),
-        acquisition_attempt: None,
-        acquisition_guarded_quantum: false,
     }
 }
 
@@ -461,7 +460,7 @@ async fn request_product_acquisition_does_not_preempt_ordinary_completion_order(
         true,
         &controller.request.requalification,
     );
-    let ordinary = choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+    let ordinary = choose_ordinary_bulk_relay_path_avoiding(BulkRelayFrameRequest {
         observation: &observation,
         lane: TrafficClass::Throughput,
         frame: &pending,
@@ -496,21 +495,223 @@ async fn request_product_acquisition_does_not_preempt_ordinary_completion_order(
     assert_eq!(
         planned.target().1,
         ordinary_target,
-        "an acquisition cursor may bound eligibility, but cannot preempt ordinary ECF plus owner hysteresis",
+        "qualification may bound Product eligibility, but cannot preempt ordinary ECF plus owner hysteresis",
     );
 }
 
 #[tokio::test]
-async fn request_acquisition_writer_failure_skips_only_a_and_commits_same_tier_b() {
+async fn request_ack_clock_annotation_cannot_retarget_the_ordinary_ecf_choice() {
+    let stream_id = StreamId(379);
+    let context = client_test_context_with_paths(&[
+        "quic://127.0.0.1:10381?initial-srtt-s=0.02&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10382?initial-srtt-s=0.08&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10383?initial-srtt-s=0.005&initial-rate-mbps=1000",
+    ]);
+    let (reference_commands, mut reference_receivers) = reliable_path_command_channels(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            reference_commands.clone(),
+        ),
+        8,
+    );
+    let reference = remotes.paths[0].instance();
+
+    let (cursor_first_commands, mut cursor_first_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Tcp,
+        0,
+        cursor_first_commands,
+    ));
+    let cursor_first = remotes
+        .paths
+        .iter()
+        .find(|path| {
+            path.key()
+                == RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: 0,
+                }
+        })
+        .expect("cursor-first TCP candidate")
+        .instance();
+
+    let (ordinary_commands, mut ordinary_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Tcp,
+        1,
+        ordinary_commands,
+    ));
+    let ordinary_target = remotes
+        .paths
+        .iter()
+        .find(|path| {
+            path.key()
+                == RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: 1,
+                }
+        })
+        .expect("fast ordinary TCP candidate")
+        .instance();
+
+    for receivers in [
+        &mut reference_receivers,
+        &mut cursor_first_receivers,
+        &mut ordinary_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [reference, cursor_first, ordinary_target] {
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+    remotes.retry_pending_path_proofs(&context);
+    for receivers in [
+        &mut reference_receivers,
+        &mut cursor_first_receivers,
+        &mut ordinary_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for candidate in [cursor_first, ordinary_target] {
+        mark_client_path_proof_fresh_for_test(
+            &context,
+            &remotes,
+            candidate,
+            Duration::from_millis(20),
+        );
+    }
+
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .path_states
+        .get_mut(reference)
+        .mark_product_path_use_proven();
+    for candidate in [cursor_first, ordinary_target] {
+        let state = controller.request.path_states.get_mut(candidate);
+        state.mark_capacity_admitted();
+        state.mark_ack_clock_first_window();
+    }
+    controller.record_original_frame_for_test(reference, &data_frame(stream_id, 0, 4096));
+    let pending = data_frame(stream_id, 4096, 4096);
+
+    // The reference still defines the lower Product frontier, but cannot own
+    // the next native reservation. Both TCP candidates remain valid receipt
+    // measurements, so the legacy acquisition ordering would choose the first
+    // cursor candidate even though ordinary completion order prefers the fast
+    // second candidate.
+    reference_commands
+        .try_enqueue_admitted_frame(
+            data_frame(StreamId(1379), 0, 4096),
+            TrafficClass::Throughput,
+        )
+        .expect("fill only the reference writer");
+    let observation = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&pending),
+        TrafficClass::Throughput,
+        4096,
+        true,
+        &controller.request.requalification,
+    );
+    let request_state = RequestSchedulingState {
+        operation: controller.request.ack_clock_operation,
+        path_states: &controller.request.path_states,
+        flights: Some(&controller.request.flights),
+    };
+    let reference_observation = observation
+        .path_by_instance(reference)
+        .expect("reference observation");
+    assert!(reference_observation.has_bulk_model_evidence);
+    assert!(!observation.latency_pressure);
+    for candidate in [cursor_first, ordinary_target] {
+        let candidate_observation = observation
+            .path_by_instance(candidate)
+            .expect("candidate observation");
+        assert!(candidate_observation.has_bulk_model_evidence);
+        assert!(!candidate_observation.has_fresh_native_carrier_rate_evidence);
+        assert!(candidate_observation.fresh_proof.is_some());
+        assert!(candidate_observation.can_enqueue_frame);
+        let state = controller
+            .request
+            .path_states
+            .get(candidate)
+            .expect("candidate state");
+        assert!(state.capacity_admitted());
+        assert!(state.ack_clock_first_window());
+        assert!(!state.ack_clock_proven());
+    }
+    let old_arbitration = choose_request_ack_clock_measurement_with_rates(
+        &observation,
+        TrafficClass::Throughput,
+        4096,
+        4096,
+        0,
+        Some(reference.key),
+        Some(&controller.request.flights),
+        Some(request_state),
+    );
+    assert!(
+        matches!(
+            old_arbitration,
+            Some(BulkRelayPathChoice::SelectedAckClockMeasurement { candidate, .. })
+                if candidate == cursor_first
+        ),
+        "legacy arbitration fixture selected {old_arbitration:?}"
+    );
+    assert_eq!(
+        choose_ordinary_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+            observation: &observation,
+            lane: TrafficClass::Throughput,
+            frame: &pending,
+            cursor: 0,
+            avoid_instances: &[],
+            path_flights: Some(&controller.request.flights),
+            request_state: Some(request_state),
+            frontier_state: ReliableDataAckFrontierState::Live,
+        }),
+        BulkRelayPathChoice::Selected(ordinary_target),
+    );
+
+    let planned = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &pending,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("ordinary target can carry its own receipt annotation");
+    assert_eq!(planned.target().1, ordinary_target);
+    assert!(matches!(
+        planned.product_mutation,
+        RequestProductSendMutation::OriginalData { candidate, .. }
+            if candidate == ordinary_target
+    ));
+}
+
+#[tokio::test]
+async fn request_ordinary_writer_failure_replans_around_a_and_commits_same_tier_b() {
     let stream_id = StreamId(378);
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10378?initial-srtt-s=0.02",
         "tcp://127.0.0.1:10379?initial-srtt-s=0.02",
         "tcp://127.0.0.1:10380?initial-srtt-s=0.02",
     ]);
-    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
-    let mut remotes =
-        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream(stream_id, 0, owner_commands.clone()),
+        8,
+    );
     let owner = remotes.paths[0].instance();
 
     let (a_commands, mut a_receivers) = reliable_path_command_channels(1);
@@ -538,6 +739,16 @@ async fn request_acquisition_writer_failure_skips_only_a_and_commits_same_tier_b
         seed_client_bulk_evidence_for_test(&context, instance);
     }
 
+    // Keep the established owner structurally Regular but transiently unable
+    // to accept this quantum. Ordinary ECF must therefore choose between the
+    // two independently writable additional outputs.
+    owner_commands
+        .try_enqueue_admitted_frame(
+            data_frame(StreamId(1377), 0, 4096),
+            TrafficClass::Throughput,
+        )
+        .expect("concurrent carrier work fills the owner's one-slot writer");
+
     let mut controller = RequestMultipathController::new(stream_id);
     controller.record_original_frame_for_test(owner, &data_frame(stream_id, 0, 4096));
     let pending = data_frame(stream_id, 4096, 4096);
@@ -551,24 +762,13 @@ async fn request_acquisition_writer_failure_skips_only_a_and_commits_same_tier_b
             RelaySendCause::StreamData,
             &[],
         )
-        .expect("cursor selects the first legal additional output");
+        .expect("ordinary ECF selects the first legal additional output");
     assert_eq!(plan_a.target().1, a);
-    let apply_a = controller
-        .validate_request_acquisition_attempt(
-            &context,
-            &remotes,
-            &plan_a,
-            &pending,
-            TrafficClass::Throughput,
-            ReliableDataAckFrontierState::Live,
-            &[],
-        )
-        .expect("A token is current before writer reservation")
-        .expect("fresh Product acquisition has an apply snapshot");
 
     // Another producer fills A's shared carrier writer after observation. The
-    // real reservation now fails, but this must invalidate only exact A; it
-    // cannot erase the already-bounded opportunity to try independent B.
+    // real reservation now fails. The retry records only exact A as locally
+    // rejected and runs ordinary ECF again; it owns no persistent acquisition
+    // turn and cannot change the relative order of the remaining candidates.
     a_commands
         .try_enqueue_admitted_frame(
             data_frame(StreamId(1378), 0, 4096),
@@ -580,10 +780,9 @@ async fn request_acquisition_writer_failure_skips_only_a_and_commits_same_tier_b
         a_commands.try_reserve_admitted_frame(pending.clone(), TrafficClass::Throughput),
         Err(crate::runtime::RuntimeError::SenderServiceBlocked)
     ));
-    assert!(
-        controller.fail_request_acquisition_attempt(&plan_a, Some(&apply_a)),
-        "recoverable A failure keeps the finite dispatch open for its sibling",
-    );
+    let mut rejected = SmallVec::<[RelayPathInstance; 8]>::new();
+    assert!(plan_a.reject_failed_bulk_original_target(TrafficClass::Throughput, &mut rejected,));
+    assert_eq!(rejected.as_slice(), &[a]);
 
     let plan_b = controller
         .plan_relay_path_send(
@@ -592,22 +791,10 @@ async fn request_acquisition_writer_failure_skips_only_a_and_commits_same_tier_b
             &pending,
             TrafficClass::Throughput,
             RelaySendCause::StreamData,
-            &[],
+            &rejected,
         )
-        .expect("same dispatch advances past failed A");
+        .expect("ordinary ECF remains work-conserving after exact A fails");
     assert_eq!(plan_b.target().1, b);
-    let apply_b = controller
-        .validate_request_acquisition_attempt(
-            &context,
-            &remotes,
-            &plan_b,
-            &pending,
-            TrafficClass::Throughput,
-            ReliableDataAckFrontierState::Live,
-            &[],
-        )
-        .expect("A's changed writer legality is irrelevant to exact B authority")
-        .expect("B retains the dispatch's Product acquisition snapshot");
     let command_b = b_commands
         .try_reserve_admitted_frame(pending.clone(), TrafficClass::Throughput)
         .expect("independent B writer remains available");
@@ -640,7 +827,6 @@ async fn request_acquisition_writer_failure_skips_only_a_and_commits_same_tier_b
     controller
         .record_emitted_frame(&context, b, &pending, RelaySendCause::StreamData)
         .expect("B receipt and flight commit before carrier publication");
-    controller.commit_request_acquisition_attempt(&plan_b, Some(&apply_b));
     let b_position = remotes
         .paths
         .iter()
@@ -1224,8 +1410,6 @@ async fn active_ack_clock_original_data_rechecks_downshifted_product_window_and_
         request_load_expectation: None,
         request_proof_expectation: None,
         path_eligibility_expectation: SmallVec::new(),
-        acquisition_attempt: None,
-        acquisition_guarded_quantum: false,
     }
     .with_eligibility_expectation(
         &observation,

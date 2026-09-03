@@ -5,7 +5,6 @@
 //! inputs and apply their outputs.
 
 pub(crate) mod ack_clock;
-pub(crate) mod acquisition_cursor;
 pub(crate) mod admission;
 pub(crate) mod capacity;
 pub(crate) mod carrier_rate_authority;

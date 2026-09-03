@@ -811,7 +811,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             context.mark_relay_path_rate_sample_for_test(
                 alternate.key,
                 PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20))
-                    .expect("fast alternate rate sample"),
+                    .expect("measured alternate rate sample"),
             );
         }
     }
@@ -924,6 +924,20 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
     );
     assert_eq!(zero_sender.live_owner_frontier_floor_deadline(), None);
 
+    for _ in 0..10 {
+        context.mark_relay_path_rate_sample_for_test(
+            owner.key,
+            PathRateSample::new(4 * 1024 * 1024, Duration::from_secs(1))
+                .expect("slow owner rate sample"),
+        );
+        for alternate in [first_alternate, second_alternate] {
+            context.mark_relay_path_rate_sample_for_test(
+                alternate.key,
+                PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20))
+                    .expect("fast alternate rate sample"),
+            );
+        }
+    }
     let mut early_sender = RequestSenderService::new_with_performance(
         stream_id,
         crate::performance::MppPerformanceConfig {
@@ -948,6 +962,13 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         TrafficClass::Throughput,
     );
     assert!(early_observation.reinjection_target.is_some());
+    assert!(
+        early_observation
+            .reinjection_completion
+            .zip(early_observation.owner_completion)
+            .is_some_and(|(alternate, owner)| alternate < owner),
+        "the integration fixture requires a measured completion-winning alternate",
+    );
     let early_assignment_at = early_observation
         .original_assignment_at
         .expect("early live request owner assignment");
@@ -964,7 +985,8 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
                 loss_at: Some(early_assignment_at),
                 fallback_at: early_observed_at + Duration::from_secs(60),
             }),
-            Some(Duration::ZERO),
+            early_observation.reinjection_completion,
+            early_observation.owner_completion,
             early_observed_at,
         );
     assert!(
@@ -1031,6 +1053,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
                 fallback_at,
             }),
             Some(Duration::ZERO),
+            None,
             fallback_at,
         );
     let fallback = evaluate_client_data_ack_reinjection(
@@ -1065,6 +1088,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
                     fallback_at: original_assignment_at,
                 }),
                 Some(Duration::ZERO),
+                None,
                 observed_at,
             )
             .is_some_and(|deadline| deadline <= observed_at)
@@ -1115,6 +1139,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
                     fallback_at: exhausted_assignment_at,
                 }),
                 Some(Duration::ZERO),
+                None,
                 exhausted_observed_at,
             )
             .is_some_and(|deadline| deadline <= exhausted_observed_at)
@@ -1211,6 +1236,7 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
                     fallback_at: partial_assignment_at,
                 }),
                 Some(Duration::ZERO),
+                None,
                 partial_observed_at,
             )
             .is_some_and(|deadline| deadline <= partial_observed_at)

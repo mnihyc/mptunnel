@@ -60,6 +60,7 @@ fn observed_path(
         instance,
         can_enqueue_frame: true,
         can_enqueue_stream_lane: true,
+        carrier_pending_bytes: None,
         load_owned: true,
         shared_snapshot: Some(snapshot),
         startup_snapshot: Some(snapshot),

@@ -6,7 +6,8 @@
 use super::dispatch::{
     ResponseReinjectionServiceModel, emit_planned_response_data_frame,
     emit_response_frame_from_sender_service, response_frame_has_carrier_credit,
-    select_switchable_response_target, select_switchable_response_target_for_extent,
+    select_observed_switchable_response_target_for_extent, select_switchable_response_target,
+    select_switchable_response_target_for_extent,
 };
 use super::multipath::plan_response_data_payload_with_data_ack_outstanding_impl;
 use super::response_reinjection_avoid_outputs;
@@ -229,6 +230,7 @@ pub(in crate::runtime) struct ServerAckGapReinjectionTarget {
 pub(in crate::runtime) struct ServerAckGapReinjectionObservation {
     pub(in crate::runtime) uniform_frontier_extent_bytes: usize,
     pub(in crate::runtime) owner_recovery_timing: ReliableDataAckGapTiming,
+    pub(in crate::runtime) owner_completion: Option<Duration>,
     pub(in crate::runtime) target: Option<ServerAckGapReinjectionTarget>,
 }
 
@@ -389,9 +391,11 @@ impl ServerResponseSenderService {
         let preview = scoring_frames
             .first()
             .expect("non-empty exact cache prefix");
-        let target = select_switchable_response_target_for_extent(
+        let lane = path_stream.current_lane();
+        let targets = binding.sender_path_targets(lane, scoring_payload_bytes);
+        let target = select_observed_switchable_response_target_for_extent(
             path_stream,
-            path_stream.current_lane(),
+            lane,
             preview,
             CarrierEmitMode::Classified,
             &response_reinjection_avoid_outputs(
@@ -402,14 +406,26 @@ impl ServerResponseSenderService {
             Some(RelaySendCause::PersistentAckGapReinjection),
             Some(self.reinjection_service_model(send_stream, false, false)),
             scoring_payload_bytes,
+            &targets,
         );
-        let lane = path_stream.current_lane();
+        let exact_owner = uniform_frontier.owners[0];
+        let owner_snapshot = targets
+            .iter()
+            .find(|candidate| {
+                candidate.observation.key == exact_owner.key
+                    && candidate.observation.incarnation == exact_owner.incarnation
+            })
+            .map(response_completion_snapshot);
+        let owner_completion = owner_snapshot
+            .and_then(|snapshot| scheduler::score_path(snapshot, lane, scoring_payload_bytes))
+            .filter(|score| score.eta_ms.is_finite())
+            .map(|score| Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0));
         let owner_recovery_timing = reliable_data_ack_gap_timing_for_assignments(
             &scoring_frontier.owner_assignments,
             |owner| {
                 (
                     owner.key.underlay,
-                    path_stream.response_output_snapshot(owner, lane),
+                    (owner == exact_owner).then_some(owner_snapshot).flatten(),
                 )
             },
         )?;
@@ -435,6 +451,7 @@ impl ServerResponseSenderService {
         Some(ServerAckGapReinjectionObservation {
             uniform_frontier_extent_bytes,
             owner_recovery_timing,
+            owner_completion,
             target,
         })
     }

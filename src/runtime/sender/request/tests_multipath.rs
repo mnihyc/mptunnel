@@ -122,6 +122,41 @@ async fn bounded_ack_gap_uses_an_active_unmeasured_alternate() {
         ),
         Err(RequestMultipathPlanError::OutputUnavailable)
     ));
+
+    let mut recovery_observation = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        None,
+        TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
+        true,
+        &StreamPathRequalification::default(),
+    );
+    recovery_observation
+        .paths
+        .iter_mut()
+        .find(|path| path.instance == udp)
+        .expect("frozen alternate observation")
+        .has_bulk_model_evidence = true;
+    assert!(
+        !context.relay_path_instance_has_bulk_model_evidence(udp),
+        "the live context must disagree with the deliberately frozen evidence batch",
+    );
+    let selected = controller
+        .choose_lowest_eta_relay_path_for_extent(
+            &context,
+            &remotes,
+            &frame,
+            TrafficClass::Throughput,
+            RelaySendCause::PersistentAckGapReinjection,
+            &[tcp],
+            reliable_stream_frame_accounted_bytes(&frame),
+            Some(&recovery_observation),
+        )
+        .expect("persistent repair must use its one immutable evidence batch");
+    assert_eq!(remotes.paths[selected].instance(), udp);
 }
 
 #[tokio::test]
@@ -2068,6 +2103,10 @@ async fn persistent_ack_gap_does_not_time_a_predecessor_with_successor_evidence(
     assert!(
         observation.original_path_timing.is_none(),
         "a predecessor attachment must not inherit its same-key successor's recovery clock",
+    );
+    assert_eq!(
+        observation.owner_completion, None,
+        "a predecessor attachment cannot contribute a current owner completion projection",
     );
 }
 

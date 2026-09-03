@@ -545,6 +545,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             has_multipath_reinjection_alternative,
             None,
             None,
+            None,
             Instant::now(),
         );
         state.progress.data_ack_reinjection_at = None;
@@ -618,6 +619,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         has_multipath_reinjection_alternative,
         observed_gap_timing,
         reinjection.reinjection_completion,
+        reinjection.owner_completion,
         observed_at,
     );
     let measured_reinjection_ready =

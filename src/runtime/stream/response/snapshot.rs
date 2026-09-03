@@ -120,6 +120,7 @@ impl ResponseStreamBinding {
             .request_feedback_ingress
             .lock()
             .expect("server reliable stream request feedback ingress lock");
+        let now = Instant::now();
 
         let targets =
             outputs
@@ -127,7 +128,6 @@ impl ResponseStreamBinding {
                 .iter()
                 .filter(|entry| !entry.commands.is_closed())
                 .map(|entry| {
-                    let now = Instant::now();
                     let snapshot = server_bulk_output_snapshot_at(
                         entry,
                         outputs.data_level_queue_bytes,

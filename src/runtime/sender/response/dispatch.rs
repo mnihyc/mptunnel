@@ -111,31 +111,62 @@ pub(super) fn select_switchable_response_target_for_extent(
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         return None;
     };
-    let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
     let mut exhausted_outputs = Vec::<ResponseOutputIdentity>::new();
     loop {
         let targets = binding.sender_path_targets(lane, scoring_payload_bytes);
-        if targets.is_empty() {
-            return None;
-        }
-        let targets = targets
-            .into_iter()
-            .filter(|target| {
-                !exhausted_outputs
-                    .contains(&(target.observation.key, target.observation.incarnation))
-            })
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return None;
-        }
-        let target = select_response_frame_path_for_extent(
-            &targets,
+        let target = select_observed_switchable_response_target_for_extent_once(
             lane,
             frame,
             emit_mode,
             avoid_outputs,
             reinjection_cause,
             scoring_payload_bytes,
+            &targets,
+            &exhausted_outputs,
+        )?;
+        if matches!(frame, Frame::StreamData { .. })
+            && let Some(service_model) = reinjection_service_model
+            && !response_reinjection_target_has_service_credit(
+                stream,
+                &target,
+                service_model,
+                reliable_stream_frame_accounted_bytes(frame),
+            )
+        {
+            exhausted_outputs.push((target.observation.key, target.observation.incarnation));
+            continue;
+        }
+        return Some(target);
+    }
+}
+
+/// Selects one reinjection target from a caller-captured immutable set of all
+/// completion competitors. Exact service state is checked at this decision,
+/// then revalidated again by Apply.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_observed_switchable_response_target_for_extent(
+    stream: &ReliablePathStream,
+    lane: TrafficClass,
+    frame: &Frame,
+    emit_mode: CarrierEmitMode,
+    avoid_outputs: &[ResponseOutputIdentity],
+    reinjection_cause: Option<RelaySendCause>,
+    reinjection_service_model: Option<ResponseReinjectionServiceModel<'_>>,
+    scoring_payload_bytes: usize,
+    targets: &[ResponseSenderPathTarget],
+) -> Option<ResponseSenderPathTarget> {
+    let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
+    let mut exhausted_outputs = Vec::<ResponseOutputIdentity>::new();
+    loop {
+        let target = select_observed_switchable_response_target_for_extent_once(
+            lane,
+            frame,
+            emit_mode,
+            avoid_outputs,
+            reinjection_cause,
+            scoring_payload_bytes,
+            targets,
+            &exhausted_outputs,
         )?;
         if matches!(frame, Frame::StreamData { .. })
             && let Some(service_model) = reinjection_service_model
@@ -151,6 +182,38 @@ pub(super) fn select_switchable_response_target_for_extent(
         }
         return Some(target);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_observed_switchable_response_target_for_extent_once(
+    lane: TrafficClass,
+    frame: &Frame,
+    emit_mode: CarrierEmitMode,
+    avoid_outputs: &[ResponseOutputIdentity],
+    reinjection_cause: Option<RelaySendCause>,
+    scoring_payload_bytes: usize,
+    targets: &[ResponseSenderPathTarget],
+    exhausted_outputs: &[ResponseOutputIdentity],
+) -> Option<ResponseSenderPathTarget> {
+    let targets = targets
+        .iter()
+        .filter(|target| {
+            !exhausted_outputs.contains(&(target.observation.key, target.observation.incarnation))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return None;
+    }
+    select_response_frame_path_for_extent(
+        &targets,
+        lane,
+        frame,
+        emit_mode,
+        avoid_outputs,
+        reinjection_cause,
+        scoring_payload_bytes,
+    )
 }
 
 #[cfg(feature = "lab-diagnostics")]

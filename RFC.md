@@ -4639,17 +4639,29 @@ absolute deadlines, as specified below. The thresholds are:
 - `5/4 * SRTT` for TCP; or
 - `9/8 * SRTT` for QUIC;
 
-Before `fallback_at`, bounded repair on a currently measured alternate is
-authorized no earlier than `loss_at` only when, at serialized evaluation time
-`now`, `now + S_c(k,M_c) < fallback_at` for the exact frontier command and
-captured shared carrier-ledger generation. If the alternate cannot win that
-absolute comparison, the
-retained gap waits until `fallback_at`. At or after `fallback_at`, an eligible
-distinct alternate may perform bounded optional repair without a completion
-gain. Crossing `fallback_at` makes the first shared live-owner attempt token
-eligible without a completion gain. It neither proves native failure nor
-waives optional credit beyond the exact frontier floor defined below. Later
-attempts follow the same shared-token rule.
+Before `fallback_at`, score the exact live owner `o` and each currently
+measured alternate `t` from one immutable observation, using the same frontier
+payload `M_s`. At serialized evaluation time `now`, an alternate is a
+completion-winning repair candidate no earlier than `loss_at` only when:
+
+```text
+max(now, loss_at) + S_t(M_s) < now + S_o(M_s)
+```
+
+The owner fallback is an independent authority epoch, not an owner-delivery
+estimate, and therefore MUST NOT replace the right-hand completion term. A
+missing or non-finite owner projection supplies no early-race evidence, so a
+measured target retains `fallback_at` as its next evaluation. Without a
+measured target there is no target-bound candidate deadline; the independent
+owner fallback epoch remains retained for a later target observation and actor
+wake calculation.
+These loss, fallback, and completion comparisons are scheduling hints; they do
+not cap native rate, ordinary Product placement, or path capacity. At or after
+`fallback_at`, an eligible distinct alternate may perform bounded optional
+repair without a completion gain. Crossing `fallback_at` makes the first
+shared live-owner attempt token eligible without a completion gain. It neither
+proves native failure nor waives optional credit beyond the exact frontier
+floor defined below. Later attempts follow the same shared-token rule.
 
 The repair uses exact target `t`'s current published Product envelope `P_t`,
 already bounded by shared `W` and the configured repair and path-flight
@@ -4787,7 +4799,7 @@ captured payload `M_s`; after selection, Apply may shrink the ranked frontier
 floor only to exact `F_t`. A separately funded suffix may extend total service
 to `L_t` only under the rules below.
 The first committed repair frame has the same lowest offset, normalized
-frontier identity, and shared carrier-ledger generation whose `S_c` rank
+frontier identity, and shared carrier-ledger generation whose `S_t` rank
 authorized that target, and its payload MUST NOT exceed `M_s`. If that frame
 cannot be committed because it overlaps queued or recent
 repair work, the evaluation MUST stop without publishing later omitted ranges.

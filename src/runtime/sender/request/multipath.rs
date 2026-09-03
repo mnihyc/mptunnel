@@ -125,6 +125,7 @@ pub(super) fn observe_request_relay_scheduling(
                     && frame
                         .map(|frame| path.stream.can_enqueue_frame_now(frame, path.stream.lane))
                         .unwrap_or(true),
+                carrier_pending_bytes: path.stream.carrier_pending_bytes(),
                 load_owned: path.has_load_reservation(),
                 shared_snapshot: evidence.shared_snapshot,
                 startup_snapshot: evidence.startup_snapshot,
@@ -811,10 +812,31 @@ impl RequestMultipathController {
             .request
             .flights
             .original_transmission_underlay_for_frame(preview);
+        let recovery_observation = observe_request_relay_scheduling(
+            context,
+            self.stream_id,
+            remotes.membership_generation(),
+            &remotes.paths,
+            None,
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            true,
+            &self.request.requalification,
+        );
         // A replacement carrier with the same numeric path key must not lend
-        // its RTT or congestion evidence to an older attachment's flight.
-        let original_path_timing = original_path
-            .and_then(|instance| context.reliable_path_snapshot_for_instance(instance));
+        // its RTT or congestion evidence to an older attachment's flight. The
+        // owner and alternate below are both projected from this one immutable
+        // observation and the same exact frontier payload.
+        let original_path_timing = original_path.and_then(|instance| {
+            self.request_reinjection_target_snapshot_from_observation(
+                &recovery_observation,
+                instance,
+            )
+        });
+        let owner_completion = original_path_timing
+            .and_then(|snapshot| scheduler::score_path(snapshot, lane, scoring_payload_bytes))
+            .filter(|score| score.eta_ms.is_finite())
+            .map(|score| Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0));
         let live_instances = remotes.path_instances();
         let mut avoid_instances = self.request.flights.sent_instances_for_frame(preview);
         avoid_instances.retain(|instance| live_instances.contains(instance));
@@ -826,9 +848,14 @@ impl RequestMultipathController {
                     .request
                     .requalification
                     .stale_for_original_data(instance)
-                && (!context.relay_path_instance_has_bulk_model_evidence(instance)
+                && (!recovery_observation
+                    .path_by_instance(instance)
+                    .is_some_and(|observed| observed.has_bulk_model_evidence)
                     || self
-                        .request_reinjection_target_snapshot(context, remotes, path)
+                        .request_reinjection_target_snapshot_from_observation(
+                            &recovery_observation,
+                            instance,
+                        )
                         .is_none())
         });
         let mut target_service_exhausted = false;
@@ -841,6 +868,7 @@ impl RequestMultipathController {
                 RelaySendCause::PersistentAckGapReinjection,
                 &avoid_instances,
                 scoring_payload_bytes,
+                Some(&recovery_observation),
             ) {
                 Ok(position) => position,
                 Err(RequestMultipathPlanError::ServiceBlocked) => {
@@ -855,11 +883,16 @@ impl RequestMultipathController {
             };
             let path = &remotes.paths[position];
             let instance = path.instance();
-            if !context.relay_path_instance_has_bulk_model_evidence(instance) {
+            if !recovery_observation
+                .path_by_instance(instance)
+                .is_some_and(|observed| observed.has_bulk_model_evidence)
+            {
                 break None;
             }
-            let Some(snapshot) = self.request_reinjection_target_snapshot(context, remotes, path)
-            else {
+            let Some(snapshot) = self.request_reinjection_target_snapshot_from_observation(
+                &recovery_observation,
+                instance,
+            ) else {
                 break None;
             };
             let accepted_reinjection_bytes = self
@@ -906,6 +939,7 @@ impl RequestMultipathController {
             reinjection_target_flight_bytes: reinjection_path
                 .map_or(0, |(_, _, _, accepted)| accepted),
             reinjection_completion: reinjection_path.map(|(_, _, completion, _)| completion),
+            owner_completion,
             target_service_exhausted: target_service_exhausted && reinjection_path.is_none(),
             target_model_pending: target_model_pending && reinjection_path.is_none(),
             uniform_frontier_extent_bytes: 0,
@@ -1527,31 +1561,38 @@ impl RequestMultipathController {
             false,
             &self.request.requalification,
         );
+        self.request_reinjection_target_snapshot_from_observation(&observation, path.instance())
+    }
+
+    fn request_reinjection_target_snapshot_from_observation(
+        &self,
+        observation: &RequestRelaySchedulingObservation,
+        instance: RelayPathInstance,
+    ) -> Option<PathSnapshot> {
+        let path = observation.path_by_instance(instance)?;
         let request_state = RequestSchedulingState {
             operation: self.request.ack_clock_operation,
             path_states: &self.request.path_states,
             flights: Some(&self.request.flights),
         };
         let mut snapshot = request_original_data_authority_snapshot(
-            &observation,
-            path.instance(),
+            observation,
+            instance,
             None,
             TrafficClass::Throughput,
             Some(request_state),
-            path.has_load_reservation(),
+            path.load_owned,
         )?;
         if snapshot.data_level_limit_bytes == 0 {
             return None;
         }
-        if let Some(command_pending_bytes) = path.stream.carrier_pending_bytes() {
+        if let Some(command_pending_bytes) = path.carrier_pending_bytes {
             snapshot.queue_bytes = snapshot.queue_bytes.max(command_pending_bytes);
         }
         snapshot.data_level_queue_bytes = 0;
         debug_assert_eq!(
             snapshot.data_level_bytes_in_flight,
-            self.request
-                .flights
-                .original_data_in_flight_bytes(path.instance()),
+            self.request.flights.original_data_in_flight_bytes(instance),
         );
         Some(snapshot)
     }
@@ -2933,6 +2974,7 @@ impl RequestMultipathController {
             cause,
             avoid_instances,
             reliable_stream_frame_accounted_bytes(frame),
+            None,
         )
     }
 
@@ -2946,6 +2988,7 @@ impl RequestMultipathController {
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
         payload_bytes: usize,
+        recovery_observation: Option<&RequestRelaySchedulingObservation>,
     ) -> Result<usize, RequestMultipathPlanError> {
         let ack_gap_reinjection = cause.is_ack_gap_reinjection();
         let completion_tail_target = cause.completion_tail_target();
@@ -2974,16 +3017,33 @@ impl RequestMultipathController {
         };
         let path_snapshot = |path: &ReliableRelayRemotePath| {
             if cause.is_reinjection() {
-                self.request_reinjection_target_snapshot(context, remotes, path)
+                recovery_observation.map_or_else(
+                    || self.request_reinjection_target_snapshot(context, remotes, path),
+                    |observation| {
+                        self.request_reinjection_target_snapshot_from_observation(
+                            observation,
+                            path.instance(),
+                        )
+                    },
+                )
             } else {
                 context.reliable_path_snapshot_for_instance(path.instance())
             }
         };
         let ordinary_path_allowed = |path: &ReliableRelayRemotePath| {
+            let has_measured_reinjection_evidence = || {
+                recovery_observation.map_or_else(
+                    || context.relay_path_instance_has_bulk_model_evidence(path.instance()),
+                    |observation| {
+                        observation
+                            .path_by_instance(path.instance())
+                            .is_some_and(|observed| observed.has_bulk_model_evidence)
+                    },
+                )
+            };
             operation_path_in_scope(path)
                 && path_snapshot(path).is_some()
-                && (!requires_measured_reinjection_target
-                    || context.relay_path_instance_has_bulk_model_evidence(path.instance()))
+                && (!requires_measured_reinjection_target || has_measured_reinjection_evidence())
         };
         // Native queue/flight remains completion-time evidence inside the path
         // score. It is not repair admission authority: the bounded reinjection

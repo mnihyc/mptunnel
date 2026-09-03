@@ -1522,12 +1522,13 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
             true,
             Some(timing),
             Some(Duration::from_millis(50)),
+            Some(Duration::from_millis(200)),
             now,
         ),
         timing.loss_at,
     );
     assert_eq!(
-        progress.observe_recovery_timing(true, &first, false, None, None, now),
+        progress.observe_recovery_timing(true, &first, false, None, None, None, now),
         None,
         "temporary absence of an alternate cannot authorize repair",
     );
@@ -1543,6 +1544,7 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
             true,
             Some(later_observation),
             Some(Duration::from_millis(50)),
+            Some(Duration::from_millis(200)),
             now,
         ),
         timing.loss_at,
@@ -1555,13 +1557,14 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
             true,
             Some(later_observation),
             Some(Duration::from_millis(150)),
+            Some(Duration::from_millis(200)),
             now,
         ),
         Some(timing.fallback_at),
         "a slower replacement target must not inherit an earlier target's deadline",
     );
     assert_eq!(
-        progress.observe_recovery_timing(true, &first, true, Some(timing), None, now,),
+        progress.observe_recovery_timing(true, &first, true, Some(timing), None, None, now,),
         None,
         "without a current target there is no target-bound repair deadline",
     );
@@ -1577,6 +1580,7 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
             true,
             Some(advanced_timing),
             Some(Duration::from_millis(50)),
+            Some(Duration::from_millis(200)),
             now,
         ),
         advanced_timing.loss_at,

@@ -5235,6 +5235,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         )
         .expect("exact-M owner timing remains observable with a target");
     assert!(present.target.is_some());
+    assert!(present.owner_completion.is_some());
     let mut clock_progress = ReliableAckGapReinjectionProgress::default();
     let clock_observed_at = Instant::now();
     let _ = clock_progress.observe_recovery_timing(
@@ -5243,6 +5244,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         true,
         Some(present.owner_recovery_timing),
         present.target.map(|target| target.completion),
+        present.owner_completion,
         clock_observed_at,
     );
     let retained_owner_deadline = clock_progress
@@ -5274,6 +5276,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         true,
         Some(absent.owner_recovery_timing),
         None,
+        absent.owner_completion,
         Instant::now(),
     );
     assert_eq!(
@@ -5300,6 +5303,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         true,
         Some(reappeared.owner_recovery_timing),
         reappeared.target.map(|target| target.completion),
+        reappeared.owner_completion,
         Instant::now(),
     );
     assert_eq!(
@@ -5339,6 +5343,52 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         assert_eq!(zero_sender.live_owner_frontier_floor_deadline(), None);
     }
 
+    let mut early_response_sender = ServerResponseSenderService::new_with_performance(
+        SessionId(103),
+        stream_id,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 100,
+        },
+    );
+    let mut early_progress = ReliableAckGapReinjectionProgress::default();
+    let early_observation = early_response_sender
+        .ack_gap_reinjection_path_snapshot(
+            &path_stream,
+            &send_stream,
+            authoritative_ack.ranges(),
+            scored_frontier_bytes,
+        )
+        .expect("live response owner and measured alternate");
+    assert!(
+        early_observation
+            .target
+            .map(|target| target.completion)
+            .zip(early_observation.owner_completion)
+            .is_some_and(|(alternate, owner)| alternate < owner),
+        "the response integration fixture requires a completion-winning alternate",
+    );
+    let early = evaluate_server_data_ack_reinjection(
+        &mut early_response_sender,
+        &path_stream,
+        &send_stream,
+        &mut early_progress,
+        &authoritative_ack,
+        ack_frontier,
+        Some(modeled_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+    assert!(
+        early.queued > 0,
+        "a completion-winning response alternate must not wait for fallback firing",
+    );
+    assert_eq!(
+        early_response_sender.live_owner_frontier_floor_deadline(),
+        None,
+        "a pre-fallback response race remains optional and must not consume the frontier floor",
+    );
+
     let mut response_sender = ServerResponseSenderService::new_with_performance(
         SessionId(103),
         stream_id,
@@ -5347,28 +5397,6 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         },
     );
     let mut progress = ReliableAckGapReinjectionProgress::default();
-    let assignment_at = path_stream
-        .data_ack_recovery_candidate(ack_frontier)
-        .expect("exact original assignment")
-        .sent_at;
-    let stale_pre_selection_epoch = assignment_at + Duration::from_millis(100);
-    assert!(Instant::now() > stale_pre_selection_epoch);
-    let early = evaluate_server_data_ack_reinjection(
-        &mut response_sender,
-        &path_stream,
-        &send_stream,
-        &mut progress,
-        &authoritative_ack,
-        ack_frontier,
-        Some(modeled_path),
-        TrafficClass::Throughput,
-        limits,
-        stream_id,
-    );
-    assert_eq!(
-        early.queued, 0,
-        "a caller epoch sampled before target selection must not authorize loss-boundary repair when the current observation can no longer finish before fallback",
-    );
 
     binding.age_original_flights_for_test(Duration::from_secs(1));
 
@@ -5406,6 +5434,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
                     fallback_at: expired,
                 }),
                 Some(Duration::ZERO),
+                None,
                 observed_at,
             )
             .is_some_and(|deadline| deadline <= observed_at)

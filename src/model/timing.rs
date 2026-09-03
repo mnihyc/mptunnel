@@ -25,21 +25,27 @@ pub(crate) struct ReliableDataAckGapTiming {
 
 impl ReliableDataAckGapTiming {
     /// Selects the next evaluation epoch for the currently measured target.
-    /// A target may race at the loss boundary only when a copy launched from
-    /// the current observation can finish before the owner fallback. Once the
-    /// fallback expires, completion gain is no longer a liveness condition.
+    /// A target may race at the loss boundary only when its current completion
+    /// projection beats the live owner's comparable projection. The fallback
+    /// is an authority epoch, not an owner-delivery estimate.
     pub(crate) fn target_deadline(
         self,
         alternate_completion: Option<Duration>,
+        owner_completion: Option<Duration>,
         observed_at: Instant,
     ) -> Option<Instant> {
         let alternate_completion = alternate_completion?;
-        if let Some(loss_at) = self.loss_at {
+        if observed_at >= self.fallback_at {
+            return Some(self.fallback_at);
+        }
+        if let (Some(loss_at), Some(owner_completion)) = (self.loss_at, owner_completion) {
             let launch_at = observed_at.max(loss_at);
-            let alternate_wins_before_fallback = launch_at
-                .checked_add(alternate_completion)
-                .is_some_and(|completion_at| completion_at < self.fallback_at);
-            if alternate_wins_before_fallback {
+            let alternate_delivery = launch_at.checked_add(alternate_completion);
+            let owner_delivery = observed_at.checked_add(owner_completion);
+            let alternate_wins = alternate_delivery
+                .zip(owner_delivery)
+                .is_some_and(|(alternate, owner)| alternate < owner);
+            if alternate_wins {
                 return Some(loss_at);
             }
         }
@@ -153,18 +159,22 @@ pub(crate) fn reliable_data_ack_gap_timing_for_assignments<I: Copy>(
 
 /// An authoritative later Data ACK may start bounded repair at the owner's
 /// time-threshold loss boundary when the currently measured alternate can
-/// still finish before the owner's absolute recovery boundary. Otherwise that
-/// exact recovery boundary remains the bounded liveness fallback.
+/// finish before the live owner's comparable projected delivery. Otherwise
+/// the independent owner-recovery epoch remains the bounded liveness fallback.
 #[cfg(test)]
 pub(crate) fn reliable_data_ack_gap_reinjection_deadline(
     original_assignment_at: Option<std::time::Instant>,
     underlay: Option<UnderlayProtocol>,
     original_path: Option<PathSnapshot>,
     alternate_completion: Option<Duration>,
+    owner_completion: Option<Duration>,
     observed_at: std::time::Instant,
 ) -> Option<std::time::Instant> {
-    reliable_data_ack_gap_timing(original_assignment_at, underlay, original_path)?
-        .target_deadline(alternate_completion, observed_at)
+    reliable_data_ack_gap_timing(original_assignment_at, underlay, original_path)?.target_deadline(
+        alternate_completion,
+        owner_completion,
+        observed_at,
+    )
 }
 
 /// Without a later ACK, connection-level recovery waits for the owning
@@ -188,6 +198,7 @@ pub(crate) fn reliable_data_ack_gap_reinjection_ready(
     underlay: Option<UnderlayProtocol>,
     original_path: Option<PathSnapshot>,
     alternate_completion: Option<Duration>,
+    owner_completion: Option<Duration>,
     now: std::time::Instant,
 ) -> bool {
     reliable_data_ack_gap_reinjection_deadline(
@@ -195,6 +206,7 @@ pub(crate) fn reliable_data_ack_gap_reinjection_ready(
         underlay,
         original_path,
         alternate_completion,
+        owner_completion,
         now,
     )
     .is_some_and(|deadline| now >= deadline)

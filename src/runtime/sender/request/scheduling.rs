@@ -65,6 +65,8 @@ pub(super) struct RequestRelayPathObservation {
     pub(super) instance: RelayPathInstance,
     pub(super) can_enqueue_frame: bool,
     pub(super) can_enqueue_stream_lane: bool,
+    /// Exact command work captured with the rest of this observation.
+    pub(super) carrier_pending_bytes: Option<u64>,
     pub(super) load_owned: bool,
     pub(super) shared_snapshot: Option<PathSnapshot>,
     pub(super) startup_snapshot: Option<PathSnapshot>,

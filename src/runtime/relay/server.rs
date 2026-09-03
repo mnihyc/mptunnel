@@ -1487,11 +1487,10 @@ fn evaluate_server_data_ack_reinjection(
             ranges,
             ack_frontier,
         );
-    let observed_at = Instant::now();
     if base_limit == 0 || mux_limits.max_repair_bytes == 0 || mux_limits.max_path_flight_bytes == 0
     {
         return ServerDataAckReinjectionOutcome {
-            observed_at,
+            observed_at: Instant::now(),
             frame_count: 0,
             queued: 0,
             persistent_ready: false,
@@ -1517,6 +1516,9 @@ fn evaluate_server_data_ack_reinjection(
             )
         })
         .flatten();
+    // The evaluation epoch follows the complete immutable target batch. It
+    // must not precede the evidence whose completion race it serializes.
+    let observed_at = Instant::now();
     let target = observation.and_then(|observation| observation.target);
     let target_reinjection_quantum = target.map_or(base_limit, |target| {
         adaptive_reliable_relay_reinjection_bytes(Some(target.snapshot), relay_lane, mux_limits)
@@ -1581,6 +1583,7 @@ fn evaluate_server_data_ack_reinjection(
         has_multipath_alternative,
         observed_gap_timing,
         target.map(|target| target.completion),
+        observation.and_then(|observation| observation.owner_completion),
         observed_at,
     );
     let measured_ready = candidate_gap_deadline.is_some_and(|deadline| observed_at >= deadline);

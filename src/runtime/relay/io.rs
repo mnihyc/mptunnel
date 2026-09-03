@@ -484,6 +484,7 @@ impl ReliableAckGapReinjectionProgress {
         has_multipath_reinjection_alternative: bool,
         observed_timing: Option<ReliableDataAckGapTiming>,
         alternate_completion: Option<Duration>,
+        owner_completion: Option<Duration>,
         observed_at: Instant,
     ) -> Option<Instant> {
         if !self.retain_gap_identity(
@@ -521,7 +522,7 @@ impl ReliableAckGapReinjectionProgress {
                 loss_at: self.loss_at,
                 fallback_at,
             }
-            .target_deadline(alternate_completion, observed_at)
+            .target_deadline(alternate_completion, owner_completion, observed_at)
         });
         self.candidate_deadline
     }

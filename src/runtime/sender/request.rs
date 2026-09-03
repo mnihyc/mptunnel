@@ -152,6 +152,7 @@ pub(in crate::runtime) struct RequestDataAckGapObservation {
         Option<(ClientReinjectionOutputIdentity, PathSnapshot)>,
     pub(in crate::runtime) reinjection_target_flight_bytes: usize,
     pub(in crate::runtime) reinjection_completion: Option<Duration>,
+    pub(in crate::runtime) owner_completion: Option<Duration>,
     pub(in crate::runtime) target_service_exhausted: bool,
     pub(in crate::runtime) target_model_pending: bool,
     pub(in crate::runtime) uniform_frontier_extent_bytes: usize,
@@ -677,15 +678,6 @@ impl RequestSenderService {
         let preview = scoring_frames
             .first()
             .expect("non-empty exact cache prefix");
-        let owner_recovery_timing = reliable_data_ack_gap_timing_for_assignments(
-            &scoring_frontier.owner_assignments,
-            |instance| {
-                (
-                    instance.key.underlay,
-                    context.reliable_path_snapshot_for_instance(instance),
-                )
-            },
-        );
         let mut model = self
             .multipath
             .data_ack_gap_reinjection_service_model_for_extent(
@@ -698,6 +690,19 @@ impl RequestSenderService {
                 context.mux_limits,
                 scoring_payload_bytes,
             );
+        let exact_owner = uniform_frontier.owners[0];
+        let owner_snapshot = model.original_path_timing;
+        let owner_recovery_timing = reliable_data_ack_gap_timing_for_assignments(
+            &scoring_frontier.owner_assignments,
+            |instance| {
+                (
+                    instance.key.underlay,
+                    (instance == exact_owner)
+                        .then_some(owner_snapshot)
+                        .flatten(),
+                )
+            },
+        );
         if model
             .reinjection_target
             .is_some_and(|(target, _)| uniform_frontier.avoid.contains(&target.instance))

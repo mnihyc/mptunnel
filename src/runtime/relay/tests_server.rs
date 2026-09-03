@@ -5683,7 +5683,10 @@ fn draining_response_owner_retains_one_distinct_ack_gap_recovery_target() {
         path_id: PathId(0),
     };
     let reinjection_key = CarrierPathKey {
-        underlay: UnderlayProtocol::Tcp,
+        // UDP accepts the local sender sample below as completion evidence.
+        // A TCP target would require Product-derived receipt evidence and
+        // would therefore contradict this test's measured-target premise.
+        underlay: UnderlayProtocol::Udp,
         path_id: PathId(1),
     };
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);

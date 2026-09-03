@@ -2,19 +2,96 @@ use super::{
     MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT,
     RELIABLE_PIPE_WINDOW_BDPS, ReliableOriginalDataOutput, TcpCapacityProofCandidate,
     adaptive_reliable_relay_chunk_bytes, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
-    adaptive_reliable_relay_inflight_bytes, min_reliable_pipe_bytes,
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
+    min_reliable_pipe_bytes, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_bulk_product_windows, reliable_bulk_unproven_exploration_limit_bytes,
+    reliable_product_feedback_window_bytes, reliable_product_measurement_session_envelope_bytes,
+    reliable_product_recovery_window_bytes, reliable_relay_buffer_len,
     reliable_relay_scheduler_quantum_cap, reliable_relay_sender_dispatch_budget,
     reliable_startup_bdp_bytes, reliable_startup_send_quantum_bytes,
     reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
     reliable_stream_initial_advertised_window_bytes, reliable_stream_max_data_update_bytes,
-    reliable_stream_source_admission, valid_tcp_capacity_proof_candidate_at,
+    reliable_stream_source_admission, reliable_unproven_path_startup_flight_limit_bytes,
+    valid_tcp_capacity_proof_candidate_at,
 };
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{PathId, UnderlayProtocol};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::time::{Duration, Instant};
+
+#[test]
+fn bulk_product_authority_is_the_resource_envelope_not_a_native_feedback_clock() {
+    let mux_limits = MuxLimits::default();
+    let expected = reliable_product_measurement_session_envelope_bytes(mux_limits) as usize;
+    let mut constrained = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 100.0, 5_242_880.0);
+    constrained.carrier_inflight_limit_bytes = 64 * 1024;
+    constrained.carrier_delivery_rate_bps = Some(5_242_880.0);
+    constrained.product_progress_rate_bps = Some(5_242_880.0);
+    constrained.has_durable_product_progress = true;
+
+    let constrained_product = reliable_product_feedback_window_bytes(
+        Some(constrained),
+        TrafficClass::Throughput,
+        mux_limits,
+    );
+
+    let mut recovered = constrained;
+    recovered.carrier_inflight_limit_bytes = 6_250_000;
+    recovered.carrier_delivery_rate_bps = Some(500_000_000.0);
+    recovered.product_progress_rate_bps = Some(500_000_000.0);
+    let recovered_product = reliable_product_feedback_window_bytes(
+        Some(recovered),
+        TrafficClass::Throughput,
+        mux_limits,
+    );
+
+    assert_eq!(constrained_product, expected);
+    assert_eq!(recovered_product, expected);
+    assert_eq!(
+        constrained_product, recovered_product,
+        "native C/R may rank and pace a carrier, but cannot revoke or grant stream Product bytes",
+    );
+}
+
+#[test]
+fn custom_low_limits_define_exact_w_p_e_geometry_and_source_aggregation() {
+    let mux_limits = MuxLimits {
+        max_stream_window_bytes: 12 * 1024,
+        max_repair_bytes: 10 * 1024,
+        max_reorder_bytes: 8 * 1024,
+        max_path_flight_bytes: 4 * 1024,
+        max_reliable_relay_chunk_bytes: 1024,
+        max_payload_bytes: 1024,
+        ..MuxLimits::default()
+    };
+    let windows = reliable_bulk_product_windows(mux_limits);
+    assert_eq!(windows.stream_resource_limit_bytes, 8 * 1024);
+    assert_eq!(windows.per_output_product_limit_bytes, 4 * 1024);
+
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_000_000.0);
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits),
+        4 * 1024,
+        "E is always clamped by custom-low P",
+    );
+    path.data_level_limit_bytes = windows.per_output_product_limit_bytes;
+    let output = ReliableOriginalDataOutput {
+        snapshot: path,
+        stale: false,
+    };
+    for (outputs, expected) in [
+        (vec![output], 4 * 1024),
+        (vec![output, output], 8 * 1024),
+        (vec![output, output, output], 8 * 1024),
+    ] {
+        assert_eq!(
+            reliable_stream_source_admission(outputs, TrafficClass::Throughput, 1024, mux_limits,)
+                .window_bytes,
+            expected,
+            "the chosen source tier sums exact P and caps the sum at W",
+        );
+    }
+}
 
 #[test]
 fn data_level_budgets_expand_for_bulk_without_second_congestion_feedback() {
@@ -41,18 +118,18 @@ fn data_level_budgets_expand_for_bulk_without_second_congestion_feedback() {
     );
 
     let interactive_inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(stable), TrafficClass::Latency, mux_limits);
+        reliable_product_feedback_window_bytes(Some(stable), TrafficClass::Latency, mux_limits);
     let bulk_inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(stable), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(stable), TrafficClass::Throughput, mux_limits);
     let mut stable_with_flight = stable;
     stable_with_flight.bytes_in_flight =
         ((stable.delivery_rate_bps / 8.0) * (stable.srtt_ms / 1000.0)).ceil() as u64;
-    let bulk_inflight_with_flight = adaptive_reliable_relay_inflight_bytes(
+    let bulk_inflight_with_flight = reliable_product_feedback_window_bytes(
         Some(stable_with_flight),
         TrafficClass::Throughput,
         mux_limits,
     );
-    let unstable_bulk_inflight = adaptive_reliable_relay_inflight_bytes(
+    let unstable_bulk_inflight = reliable_product_feedback_window_bytes(
         Some(unstable),
         TrafficClass::Throughput,
         mux_limits,
@@ -115,7 +192,7 @@ fn reliable_bulk_quantum_keeps_tcp_and_quic_streams_fed_without_rate_prior() {
 fn unknown_path_startup_inflight_uses_default_bdp_not_configured_ceiling() {
     let mux_limits = MuxLimits::default();
     let startup =
-        adaptive_reliable_relay_inflight_bytes(None, TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(None, TrafficClass::Throughput, mux_limits);
     let default_service_window = (reliable_startup_bdp_bytes() * RELIABLE_PIPE_WINDOW_BDPS)
         .max(reliable_startup_send_quantum_bytes() as f64)
         .max(min_reliable_pipe_bytes(mux_limits) as f64)
@@ -132,56 +209,233 @@ fn unknown_path_startup_inflight_uses_default_bdp_not_configured_ceiling() {
 }
 
 #[test]
-fn unproven_portable_tcp_keeps_bounded_startup_service() {
+fn exact_bulk_output_uses_product_p_while_unproven_exploration_stays_bounded() {
     let mux_limits = MuxLimits::default();
     let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 360.0, 3_200_000.0);
 
     let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
 
-    assert!(inflight < mux_limits.max_path_flight_bytes);
-    assert_eq!(inflight, reliable_relay_buffer_len(mux_limits));
+    assert_eq!(
+        inflight,
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
+    );
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits),
+        reliable_unproven_path_startup_flight_limit_bytes(mux_limits),
+        "the separate unproven-additional-path envelope E retains portable startup",
+    );
 }
 
 #[test]
-fn proven_portable_tcp_uses_product_resource_ceiling() {
+fn durable_product_proof_without_native_shape_uses_configured_writer_bounded_window() {
     let mux_limits = MuxLimits::default();
-    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 360.0, 3_200_000.0);
-    path.product_progress_rate_bps = Some(3_200_000.0);
-    path.has_durable_product_progress = true;
-    path.app_limited = true;
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let mut path = PathSnapshot::new(PathId(0), underlay, 100.0, 10_000_000.0);
+        path.product_progress_rate_bps = Some(10_000_000.0);
+        path.has_durable_product_progress = true;
+        path.app_limited = true;
+
+        let constrained = reliable_product_feedback_window_bytes(
+            Some(path),
+            TrafficClass::Throughput,
+            mux_limits,
+        );
+        path.product_progress_rate_bps = Some(500_000_000.0);
+        let recovered = reliable_product_feedback_window_bytes(
+            Some(path),
+            TrafficClass::Throughput,
+            mux_limits,
+        );
+
+        assert_eq!(constrained, mux_limits.max_path_flight_bytes);
+        assert_eq!(recovered, constrained);
+    }
+}
+
+#[test]
+fn reliable_product_assignment_authority_is_class_and_underlay_independent() {
+    let mux_limits = MuxLimits::default();
+    let expected = reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let path = PathSnapshot::new(PathId(0), underlay, 100.0, 500_000_000.0);
+        let latency =
+            reliable_product_feedback_window_bytes(Some(path), TrafficClass::Latency, mux_limits);
+        let throughput = reliable_product_feedback_window_bytes(
+            Some(path),
+            TrafficClass::Throughput,
+            mux_limits,
+        );
+
+        assert_eq!(latency as u64, expected);
+        assert_eq!(throughput as u64, expected);
+    }
+}
+
+#[test]
+fn quic_product_window_is_independent_of_native_flight_and_feedback_delay() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 100.0, 500_000_000.0);
+    path.carrier_inflight_limit_bytes = 6_250_000;
+    path.carrier_delivery_rate_bps = Some(500_000_000.0);
+    path.data_level_bytes_in_flight = 32 * 1024 * 1024;
 
     let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
 
+    let expected = reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
+    assert_eq!(inflight, expected as usize);
+    assert!(inflight > path.carrier_inflight_limit_bytes as usize);
     assert_eq!(inflight, mux_limits.max_path_flight_bytes);
+    path.data_level_limit_bytes = inflight as u64;
+    let source = reliable_stream_source_admission(
+        [ReliableOriginalDataOutput {
+            snapshot: path,
+            stale: false,
+        }],
+        TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
+        mux_limits,
+    );
+    assert_eq!(
+        source.window_bytes, inflight,
+        "source staging uses P while later output assignment independently revalidates N",
+    );
 }
 
 #[test]
-fn portable_tcp_latency_service_remains_bounded() {
+fn quic_native_window_downshift_does_not_revoke_product_p() {
     let mux_limits = MuxLimits::default();
-    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 360.0, 3_200_000.0);
-    path.has_durable_product_progress = true;
-
-    let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Latency, mux_limits);
-
-    assert!(inflight < mux_limits.max_path_flight_bytes);
-}
-
-#[test]
-fn carrier_inflight_evidence_does_not_cap_product_source_read_horizon() {
-    let mux_limits = MuxLimits::default();
-    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 80.0, 4_000_000_000.0);
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 100.0, 500_000_000.0);
+    path.carrier_delivery_rate_bps = Some(500_000_000.0);
     path.carrier_inflight_limit_bytes = 1024 * 1024;
 
-    let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits),
+        1_114_112,
+        "fresh exact C plus the bounded acquisition quantum shapes E",
+    );
+    assert_eq!(
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits,),
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
+        "native C owns writer admission; it is not authority to revoke Product P",
+    );
+}
 
-    assert!(inflight > path.carrier_inflight_limit_bytes as usize);
+#[test]
+fn native_rate_changes_do_not_change_product_p() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 100.0, 10_000_000.0);
+    path.carrier_inflight_limit_bytes = 1024 * 1024;
+    path.product_progress_rate_bps = Some(10_000_000.0);
+    path.has_durable_product_progress = true;
+    let exploration = reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits);
+
+    let low_rate =
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
     assert!(
-        inflight <= mux_limits.max_path_flight_bytes,
-        "carrier cwnd is a carrier emission gate, not a product source-read cap"
+        low_rate as u64 >= exploration,
+        "bounded C-derived acquisition remains inside Product P"
+    );
+
+    path.product_progress_rate_bps = Some(500_000_000.0);
+    let newer_high_rate =
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    assert_eq!(newer_high_rate, low_rate);
+    assert_eq!(
+        newer_high_rate,
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
+    );
+
+    path.data_level_limit_bytes = newer_high_rate as u64;
+    let source = reliable_stream_source_admission(
+        [ReliableOriginalDataOutput {
+            snapshot: path,
+            stale: false,
+        }],
+        TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
+        mux_limits,
+    );
+    assert_eq!(
+        source.window_bytes, newer_high_rate,
+        "source staging consumes the exact runtime-published Product authority",
+    );
+}
+
+#[test]
+fn exact_output_without_published_product_authority_fails_closed() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 100.0, 500_000_000.0);
+    path.carrier_inflight_limit_bytes = 6_250_000;
+    path.carrier_delivery_rate_bps = Some(500_000_000.0);
+    path.product_progress_rate_bps = Some(500_000_000.0);
+    path.has_durable_product_progress = true;
+    path.data_level_limit_bytes = 0;
+
+    let source = reliable_stream_source_admission(
+        [ReliableOriginalDataOutput {
+            snapshot: path,
+            stale: false,
+        }],
+        TrafficClass::Throughput,
+        PATH_OPEN_SCORE_BYTES,
+        mux_limits,
+    );
+    assert_eq!(
+        source.window_bytes, 0,
+        "an exact consumer cannot reconstruct timestamp-less Product authority when its owner publishes P=0",
+    );
+    assert_eq!(
+        reliable_product_recovery_window_bytes(Some(path), TrafficClass::Throughput, mux_limits,),
+        0,
+        "recovery consumes the same published Product authority and must also fail closed",
+    );
+}
+
+#[test]
+fn unqualified_pacing_cannot_enlarge_native_or_exploration_authority() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 100.0, 500_000_000.0);
+    path.pacing_rate_bps = 900_000_000.0;
+    path.carrier_inflight_limit_bytes = 1024 * 1024;
+    path.app_limited = false;
+
+    let expected_exploration = path
+        .carrier_inflight_limit_bytes
+        .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits) as u64);
+    let product =
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    assert_eq!(
+        product,
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
+    );
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits),
+        expected_exploration,
+        "E may use fresh C+Q, but pacing intent and app-limited state cannot enlarge it",
+    );
+}
+
+#[test]
+fn tcp_native_cwnd_shrink_retains_debt_without_renewing_forward_credit() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 80.0, 4_000_000_000.0);
+    path.carrier_inflight_limit_bytes = 1024 * 1024;
+    path.data_level_bytes_in_flight = 8 * 1024 * 1024;
+    let forward_ceiling = path.carrier_inflight_limit_bytes as usize
+        + reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+    path.data_level_limit_bytes = forward_ceiling as u64;
+
+    assert_eq!(
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits,),
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
+        "a native cwnd shrink does not rewrite configured Product P",
+    );
+    assert_eq!(
+        reliable_product_recovery_window_bytes(Some(path), TrafficClass::Throughput, mux_limits,),
+        forward_ceiling,
+        "retained debt cannot enlarge the exact target Product envelope; K supplies only its separately bounded emergency quantum",
     );
 }
 
@@ -194,7 +448,7 @@ fn product_progress_does_not_downshift_source_read_below_carrier_evidence() {
     path.product_progress_rate_bps = Some(160_000_000.0);
 
     let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
 
     assert_eq!(inflight, mux_limits.max_path_flight_bytes);
     assert_eq!(
@@ -204,7 +458,7 @@ fn product_progress_does_not_downshift_source_read_below_carrier_evidence() {
 }
 
 #[test]
-fn quic_source_read_window_preserves_native_congestion_window_authority() {
+fn quic_product_p_and_native_exploration_authorities_remain_separate() {
     let mux_limits = MuxLimits::default();
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 425.0, 25_000_000.0);
     path.pacing_rate_bps = 175_000_000.0;
@@ -212,87 +466,113 @@ fn quic_source_read_window_preserves_native_congestion_window_authority() {
     path.app_limited = true;
 
     let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
 
-    let modeled = ((path.delivery_rate_bps / 8.0) * (path.srtt_ms / 1000.0) * 2.0) as usize;
-    let expected = (path.carrier_inflight_limit_bytes as usize)
+    let native_exploration = (path.carrier_inflight_limit_bytes as usize)
         .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
-    assert_eq!(inflight, expected);
-    assert!(
-        inflight > modeled.saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits)),
-        "an app-limited product sample must not become a second QUIC congestion window",
+    assert_eq!(
+        inflight,
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
     );
-    assert!(inflight < mux_limits.max_path_flight_bytes);
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits),
+        native_exploration as u64,
+    );
+    assert!(
+        inflight > native_exploration,
+        "Product memory authority must not become a duplicate QUIC congestion window",
+    );
 }
 
 #[test]
-fn cold_quic_path_gets_one_service_quantum_beyond_native_window() {
+fn cold_quic_product_p_does_not_replace_its_bounded_exploration_e() {
     let mux_limits = MuxLimits::default();
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 360.0, 1_000_000.0);
     path.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
 
     let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
 
     assert_eq!(
         inflight,
-        2 * 1024 * 1024 + reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
-        "startup can keep Quinn fed without exposing the configured 64 MiB ceiling",
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
+    );
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits),
+        (2 * 1024 * 1024 + reliable_bulk_carrier_feed_quantum_bytes(mux_limits)) as u64,
+        "unqualified additional-path acquisition remains bounded by fresh C+Q",
     );
 }
 
 #[test]
-fn tcp_source_read_window_preserves_native_congestion_window_authority() {
+fn tcp_product_p_is_invariant_while_exploration_tracks_native_credit() {
     let mux_limits = MuxLimits::default();
     let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 425.0, 25_000_000.0);
     let modeled =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
     let mut with_cached_native_window = path;
     with_cached_native_window.carrier_inflight_limit_bytes = 32 * 1024 * 1024;
 
-    let with_headroom = adaptive_reliable_relay_inflight_bytes(
+    let with_headroom = reliable_product_feedback_window_bytes(
         Some(with_cached_native_window),
         TrafficClass::Throughput,
         mux_limits,
     );
-    let expected = (with_cached_native_window.carrier_inflight_limit_bytes as usize)
+    let expected_exploration = (with_cached_native_window.carrier_inflight_limit_bytes as usize)
         .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
+    assert_eq!(with_headroom, modeled);
     assert_eq!(
-        with_headroom, expected,
-        "TCP_INFO supplies feed geometry while the socket retains native send authority",
+        with_headroom,
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
     );
-    assert!(with_headroom > modeled);
-    assert!(with_headroom < mux_limits.max_path_flight_bytes);
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(with_cached_native_window, mux_limits),
+        expected_exploration as u64,
+    );
 }
 
 #[test]
-fn tcp_product_service_window_cannot_enlarge_native_congestion_credit() {
+fn tcp_product_p_cannot_enlarge_exploration_e() {
     let mux_limits = MuxLimits::default();
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 800.0, 4_000_000_000.0);
     path.product_progress_rate_bps = Some(4_000_000_000.0);
     path.has_durable_product_progress = true;
     path.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
 
-    let inflight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
-    let expected = (path.carrier_inflight_limit_bytes as usize)
+    let product_window =
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    let native_window = (path.carrier_inflight_limit_bytes as usize)
         .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
         .max(reliable_relay_buffer_len(mux_limits));
 
-    assert_eq!(inflight, expected);
-    assert!(inflight < mux_limits.max_path_flight_bytes);
+    assert_eq!(
+        reliable_bulk_unproven_exploration_limit_bytes(path, mux_limits),
+        native_window as u64,
+    );
+    assert_eq!(
+        product_window,
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes as usize,
+    );
+    assert!(product_window > native_window);
 }
 
 #[test]
 fn shared_source_staging_sums_exact_live_output_windows() {
-    let mux_limits = MuxLimits::default();
+    let mux_limits = MuxLimits {
+        max_path_flight_bytes: 2 * 1024 * 1024,
+        max_repair_bytes: 8 * 1024 * 1024,
+        max_reorder_bytes: 8 * 1024 * 1024,
+        max_stream_window_bytes: 8 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 800.0, 4_000_000_000.0);
     path.product_progress_rate_bps = Some(4_000_000_000.0);
     path.has_durable_product_progress = true;
     path.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
 
     let path_limit =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    path.data_level_limit_bytes = path_limit as u64;
     let output = ReliableOriginalDataOutput {
         snapshot: path,
         stale: false,
@@ -315,11 +595,10 @@ fn shared_source_staging_sums_exact_live_output_windows() {
         one_output.selected_path.map(|selected| selected.id),
         Some(path.id)
     );
-    assert_eq!(
-        two_outputs.window_bytes,
-        path_limit
-            .saturating_mul(2)
-            .min(mux_limits.max_path_flight_bytes)
+    assert_eq!(two_outputs.window_bytes, path_limit.saturating_mul(2));
+    assert!(
+        two_outputs.window_bytes > mux_limits.max_path_flight_bytes,
+        "a per-path cap cannot suppress the sum of two exact output windows",
     );
     assert_eq!(
         reliable_stream_source_admission(
@@ -338,6 +617,9 @@ fn source_admission_uses_one_schedulable_precedence_set() {
     let mux_limits = MuxLimits::default();
     let mut regular = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 40.0, 100_000_000.0);
     regular.carrier_inflight_limit_bytes = 256 * 1024;
+    regular.data_level_limit_bytes =
+        reliable_product_feedback_window_bytes(Some(regular), TrafficClass::Throughput, mux_limits)
+            as u64;
     let mut backup = regular;
     backup.id = PathId(1);
     backup.policy.backup = true;
@@ -372,7 +654,7 @@ fn source_admission_uses_one_schedulable_precedence_set() {
     );
     assert_eq!(
         admission.window_bytes,
-        adaptive_reliable_relay_inflight_bytes(Some(backup), TrafficClass::Throughput, mux_limits)
+        reliable_product_feedback_window_bytes(Some(backup), TrafficClass::Throughput, mux_limits)
     );
 }
 
@@ -472,38 +754,24 @@ fn reliable_relay_chunking_uses_product_payload_envelope() {
 }
 
 #[test]
-fn bulk_product_window_is_configured_memory_authority_not_path_proof() {
+fn reliable_product_window_is_configured_authority_not_class_or_underlay_policy() {
     let mux_limits = MuxLimits::default();
-    let tcp_initial = reliable_stream_initial_advertised_window_bytes(
-        UnderlayProtocol::Tcp,
-        TrafficClass::Throughput,
-        mux_limits,
-    );
-    let udp_initial = reliable_stream_initial_advertised_window_bytes(
-        UnderlayProtocol::Udp,
-        TrafficClass::Throughput,
-        mux_limits,
-    );
-
-    assert_eq!(tcp_initial, mux_limits.max_stream_window_bytes);
-    assert_eq!(udp_initial, mux_limits.max_stream_window_bytes);
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        for lane in [TrafficClass::Latency, TrafficClass::Throughput] {
+            assert_eq!(
+                reliable_stream_initial_advertised_window_bytes(underlay, lane, mux_limits),
+                mux_limits.max_stream_window_bytes,
+            );
+        }
+    }
 
     let snapshot = PathSnapshot::new(PathId(7), UnderlayProtocol::Udp, 40.0, 200_000_000.0);
-    let measured_window = reliable_stream_advertised_window_bytes(
-        Some(snapshot),
-        TrafficClass::Throughput,
-        mux_limits,
-    );
-
-    assert_eq!(measured_window, mux_limits.max_stream_window_bytes);
-    assert!(
-        reliable_stream_initial_advertised_window_bytes(
-            UnderlayProtocol::Udp,
-            TrafficClass::Latency,
-            mux_limits,
-        ) < udp_initial,
-        "latency QUIC retains its bounded startup product window"
-    );
+    for lane in [TrafficClass::Latency, TrafficClass::Throughput] {
+        assert_eq!(
+            reliable_stream_advertised_window_bytes(Some(snapshot), lane, mux_limits),
+            mux_limits.max_stream_window_bytes,
+        );
+    }
 }
 
 #[test]

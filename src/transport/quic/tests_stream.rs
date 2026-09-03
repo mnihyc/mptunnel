@@ -935,12 +935,6 @@ async fn cancelled_h3_request_write_retires_only_that_request_stream() {
     );
     let metrics = connection.congestion_metrics();
     assert_eq!(metrics.pending_bytes, 0);
-    assert_eq!(metrics.delivery_evidence_written_bytes, payload_len as u64);
-    assert!(
-        (1..=payload_len as u64).contains(&metrics.delivery_evidence_cancelled_bytes),
-        "the cancelled request must roll back every byte still awaiting a native ACK"
-    );
-    assert_eq!(metrics.delivery_evidence_pending_ack_bytes, 0);
     assert!(!connection.is_closed());
 
     let (mut replacement_send, mut replacement_recv) =

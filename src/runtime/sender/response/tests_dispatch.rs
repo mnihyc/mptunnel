@@ -1,6 +1,6 @@
 use super::*;
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, PathId, SessionId, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, OffsetRange, PathId, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_channels,
     try_recv_reliable_path_command,
@@ -107,6 +107,42 @@ fn fixed_data_commit_records_flight_before_publishing_command() {
 }
 
 #[test]
+fn fixed_data_commit_rechecks_product_headroom_after_plan() {
+    let (commands, mut receivers) = reliable_path_command_channels(2);
+    let stream = stream_with_output(ReliablePathStreamOutput::fixed(
+        UnderlayProtocol::Tcp,
+        PathId(4),
+        commands,
+        MuxLimits::default(),
+    ));
+    let plan = plan_response_data_dispatch(&stream, TrafficClass::Throughput, 0, 1024)
+        .expect("initial Product window has headroom");
+    let ReliablePathStreamOutput::Fixed(fixed) = &stream.output else {
+        panic!("expected fixed output");
+    };
+    let product_limit = stream
+        .output
+        .send_path_snapshot(TrafficClass::Throughput, 1024)
+        .expect("fixed output snapshot")
+        .data_level_limit_bytes;
+    fixed.record_original_flight(&data_frame(
+        0,
+        usize::try_from(product_limit).expect("test Product limit"),
+    ));
+
+    assert!(matches!(
+        emit_planned_response_data_frame(
+            &stream,
+            plan,
+            data_frame(product_limit, 1024),
+            TrafficClass::Throughput,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+}
+
+#[test]
 fn fixed_latency_data_dispatch_overtakes_queued_bulk() {
     let (commands, mut receivers) = reliable_path_command_channels(1);
     commands
@@ -126,6 +162,65 @@ fn fixed_latency_data_dispatch_overtakes_queued_bulk() {
         .expect("dispatch latency response data");
 
     assert_data_command(&mut receivers, 0);
+    assert_data_command(&mut receivers, 4096);
+}
+
+#[test]
+fn fixed_reinjection_remains_charged_after_queue_drain_until_data_ack() {
+    let mux_limits = MuxLimits {
+        max_repair_bytes: 4096,
+        max_path_flight_bytes: 4096,
+        ..MuxLimits::default()
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let stream = stream_with_output(ReliablePathStreamOutput::fixed(
+        UnderlayProtocol::Tcp,
+        PathId(4),
+        commands,
+        mux_limits,
+    ));
+    let ReliablePathStreamOutput::Fixed(fixed) = &stream.output else {
+        panic!("expected fixed output");
+    };
+    fixed.record_reinjected_flight(&data_frame(0, 4096));
+    let identity = fixed.reinjection_output_identity();
+    assert_eq!(
+        fixed.accepted_reinjected_data_in_flight_bytes_at(identity),
+        4096,
+    );
+
+    // The sender queue has already drained this accepted repair. Its exact
+    // fixed output still owns K until Product DataACK releases the range.
+    let queue = ReliableRelaySenderQueue::default();
+    let retry = data_frame(4096, 1);
+    let emit = || {
+        emit_response_frame_from_sender_service(
+            &stream,
+            retry.clone(),
+            TrafficClass::Throughput,
+            CarrierEmitMode::Classified,
+            "tail_reinjection",
+            Some(RelaySendCause::TailReinjection),
+            Some(ResponseReinjectionServiceModel {
+                queue: &queue,
+                exclude_front_work: false,
+                reinjection_debt_bytes: 1,
+            }),
+        )
+    };
+
+    assert!(matches!(emit(), Err(RuntimeError::SenderServiceBlocked)));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+
+    stream.release_normalized_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: 4096,
+    }]);
+    assert_eq!(
+        fixed.accepted_reinjected_data_in_flight_bytes_at(identity),
+        0,
+    );
+    emit().expect("DataACK releases fixed-output recovery authority");
     assert_data_command(&mut receivers, 4096);
 }
 
@@ -190,6 +285,73 @@ fn stale_model_generation_rejects_without_carrier_publication() {
 }
 
 #[test]
+fn response_acquisition_observation_cannot_retarget_a_replacement_incarnation() {
+    let fixture = switchable_fixture();
+    let old_target = fixture
+        .binding
+        .sender_path_targets(TrafficClass::Throughput, 1024)
+        .into_iter()
+        .find(|target| target.observation.key == fixture.initial)
+        .expect("old exact response output");
+    let old_plan = plan_response_data_dispatch(&fixture.stream, TrafficClass::Throughput, 0, 1024)
+        .expect("observe old exact response acquisition candidate");
+    drop(fixture.initial_receivers);
+
+    let (replacement_commands, mut replacement_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        fixture.binding.attach(
+            fixture.initial.underlay,
+            fixture.initial.path_id,
+            replacement_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::ReplacedClosedOutput,
+    );
+    let replacement = fixture
+        .binding
+        .sender_path_targets(TrafficClass::Throughput, 1024)
+        .into_iter()
+        .find(|target| target.observation.key == fixture.initial)
+        .expect("replacement exact response output");
+    assert_ne!(
+        replacement.observation.path_instance_id,
+        old_target.observation.path_instance_id
+    );
+    assert_ne!(
+        replacement.observation.incarnation,
+        old_target.observation.incarnation
+    );
+
+    let frame = data_frame(0, 1024);
+    assert!(matches!(
+        emit_planned_response_data_frame(
+            &fixture.stream,
+            old_plan,
+            frame.clone(),
+            TrafficClass::Throughput,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(
+        fixture
+            .binding
+            .original_flight_outputs_overlapping_frame(&frame)
+            .is_empty(),
+        "an old response acquisition observation cannot publish ownership on its successor",
+    );
+    assert!(try_recv_reliable_path_command(&mut replacement_receivers).is_none());
+
+    let fresh = plan_response_data_dispatch(&fixture.stream, TrafficClass::Throughput, 0, 1024)
+        .expect("replacement receives a fresh exact observation");
+    assert!(matches!(
+        fresh,
+        ResponseDataDispatchTarget::Switchable { target, .. }
+            if target.path_instance_id == replacement.observation.path_instance_id
+                && target.incarnation == replacement.observation.incarnation
+    ));
+}
+
+#[test]
 fn closed_carrier_queue_cannot_overtake_ordered_detach() {
     let fixture = switchable_fixture();
     let alternate = crate::model::path::CarrierPathKey {
@@ -219,6 +381,7 @@ fn closed_carrier_queue_cannot_overtake_ordered_detach() {
     let plan = ResponseDataDispatchTarget::Switchable {
         target: ResponseDispatchTarget::from(&initial_target),
         expected_model_generation: fixture.binding.response_model_generation(),
+        position: crate::model::admission::BulkCandidatePosition::ContiguousFrontier,
     };
 
     drop(fixture.initial_receivers);
@@ -261,6 +424,7 @@ fn reinjection_prefers_a_path_without_the_original_range() {
     fixture
         .binding
         .record_original_flight(fixture.initial, &frame);
+    let queue = crate::runtime::sender::ReliableRelaySenderQueue::default();
 
     let selected = emit_response_frame_from_sender_service(
         &fixture.stream,
@@ -269,10 +433,16 @@ fn reinjection_prefers_a_path_without_the_original_range() {
         CarrierEmitMode::Classified,
         "tail_reinjection",
         Some(RelaySendCause::TailReinjection),
+        Some(ResponseReinjectionServiceModel {
+            queue: &queue,
+            exclude_front_work: false,
+            reinjection_debt_bytes: 4096,
+        }),
     )
     .expect("alternate accepts reinjection");
 
-    assert_eq!(selected, Some(alternate));
+    assert_eq!(selected.selected_path, Some(alternate));
+    assert!(selected.accepted_copy_deadline.is_some());
     let mut outputs = fixture.binding.flight_outputs_overlapping_frame(&frame);
     outputs.sort_by_key(|(key, _)| key.path_id.0);
     assert_eq!(
@@ -287,7 +457,7 @@ fn reinjection_prefers_a_path_without_the_original_range() {
 }
 
 #[test]
-fn aged_repair_history_on_every_alternate_does_not_block_ack_gap_retry() {
+fn timer_expiry_does_not_retry_an_unresolved_range_on_the_same_outputs() {
     let mut fixture = switchable_fixture();
     let first_alternate = crate::model::path::CarrierPathKey {
         underlay: UnderlayProtocol::Udp,
@@ -331,12 +501,72 @@ fn aged_repair_history_on_every_alternate_does_not_block_ack_gap_retry() {
     fixture
         .binding
         .age_reinjected_flights_for_test(Duration::from_secs(1));
-    assert!(
-        !fixture
-            .binding
-            .has_recent_reinjection_overlap(&frame, Duration::from_millis(100),)
+    assert!(!fixture.binding.has_recent_reinjection_overlap(&frame));
+
+    let queue = crate::runtime::sender::ReliableRelaySenderQueue::default();
+    let result = emit_response_frame_from_sender_service(
+        &fixture.stream,
+        frame,
+        TrafficClass::Throughput,
+        CarrierEmitMode::Classified,
+        "ack_gap_reinjection",
+        Some(RelaySendCause::AckGapReinjection),
+        Some(ResponseReinjectionServiceModel {
+            queue: &queue,
+            exclude_front_work: false,
+            reinjection_debt_bytes: 4096,
+        }),
     );
 
+    assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
+    assert!(try_recv_reliable_path_command(&mut first_receivers).is_none());
+    assert!(try_recv_reliable_path_command(&mut second_receivers).is_none());
+    assert!(try_recv_reliable_path_command(&mut fixture.initial_receivers).is_none());
+}
+
+#[test]
+fn timer_expiry_can_move_unresolved_repair_to_a_different_exact_output() {
+    let mut fixture = switchable_fixture();
+    let first_alternate = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let second_alternate = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(2),
+    };
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
+    fixture.binding.attach(
+        first_alternate.underlay,
+        first_alternate.path_id,
+        first_commands,
+        TrafficClass::Throughput,
+    );
+    fixture.binding.attach(
+        second_alternate.underlay,
+        second_alternate.path_id,
+        second_commands,
+        TrafficClass::Throughput,
+    );
+    fixture
+        .binding
+        .mark_output_path_proven_for_test(first_alternate);
+    fixture
+        .binding
+        .mark_output_path_proven_for_test(second_alternate);
+
+    let frame = data_frame(0, 4096);
+    fixture
+        .binding
+        .record_original_flight(fixture.initial, &frame);
+    fixture
+        .binding
+        .record_reinjected_flight(first_alternate, &frame);
+    fixture
+        .binding
+        .age_reinjected_flights_for_test(Duration::from_secs(1));
+    let queue = crate::runtime::sender::ReliableRelaySenderQueue::default();
     let selected = emit_response_frame_from_sender_service(
         &fixture.stream,
         frame,
@@ -344,12 +574,17 @@ fn aged_repair_history_on_every_alternate_does_not_block_ack_gap_retry() {
         CarrierEmitMode::Classified,
         "ack_gap_reinjection",
         Some(RelaySendCause::AckGapReinjection),
+        Some(ResponseReinjectionServiceModel {
+            queue: &queue,
+            exclude_front_work: false,
+            reinjection_debt_bytes: 4096,
+        }),
     )
-    .expect("aged repair history must leave an alternate eligible");
+    .expect("a distinct exact output remains eligible after the recovery interval");
 
-    assert_eq!(selected, Some(first_alternate));
-    assert_data_command(&mut first_receivers, 0);
-    assert!(try_recv_reliable_path_command(&mut second_receivers).is_none());
+    assert_eq!(selected.selected_path, Some(second_alternate));
+    assert!(try_recv_reliable_path_command(&mut first_receivers).is_none());
+    assert_data_command(&mut second_receivers, 0);
     assert!(try_recv_reliable_path_command(&mut fixture.initial_receivers).is_none());
 }
 

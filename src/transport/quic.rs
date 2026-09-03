@@ -15,6 +15,10 @@ mod socket;
 mod stream;
 
 pub use congestion::CongestionMetrics;
+pub(crate) use congestion::{
+    NativeControllerAuthoritySnapshot, NativeControllerObservationKind,
+    NativeControllerShapeSnapshot,
+};
 pub use endpoint::{Connection, Endpoint};
 pub use stream::IpPacketSender;
 pub use stream::{

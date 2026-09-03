@@ -2,10 +2,10 @@ use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
 use crate::model::admission::ReliableDataAckFrontierState;
-use crate::model::capacity::{adaptive_reliable_relay_inflight_bytes, reliable_relay_buffer_len};
+use crate::model::capacity::{reliable_product_feedback_window_bytes, reliable_relay_buffer_len};
 use crate::model::work::{
-    ReliableWorkClass, reliable_critical_tail_reinjection_limit_bytes,
-    reliable_reinjection_service_limit_bytes,
+    ReliableReinjectionTargetWork, ReliableWorkClass,
+    reliable_critical_tail_reinjection_limit_bytes, reliable_reinjection_service_limit_bytes,
 };
 use crate::protocol::{PathId, SessionId};
 use crate::runtime::path::commands::{
@@ -75,6 +75,7 @@ fn request_handle(output: ReliablePathStreamOutput) -> ReliablePathStreamHandle 
 
 fn opened_request_stream_with_retained_input(
     stream_id: StreamId,
+    path_index: usize,
     commands: crate::runtime::path::commands::ReliablePathCommandSender,
 ) -> (
     OpenedRemoteStream,
@@ -92,13 +93,13 @@ fn opened_request_stream_with_retained_input(
                 max_frame_payload_bytes: reliable_relay_buffer_len(limits),
                 output: ReliablePathStreamOutput::fixed(
                     UnderlayProtocol::Tcp,
-                    PathId(0),
+                    PathId(path_index as u16),
                     commands,
                     limits,
                 ),
                 frames: frames_rx.into(),
             },
-            0,
+            path_index,
         ),
         frames_tx,
     )
@@ -182,7 +183,7 @@ async fn request_planner_and_reservation_preserve_closed_admission_identity() {
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10711"]);
     let (commands, mut receivers) = reliable_path_command_channels(1);
     let (opened, _frames_tx) =
-        opened_request_stream_with_retained_input(stream_id, commands.clone());
+        opened_request_stream_with_retained_input(stream_id, 0, commands.clone());
     let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
     consume_client_path_proof_for_test(&mut receivers);
     let instance = remotes.paths[0].instance();
@@ -250,7 +251,7 @@ async fn request_planner_and_reservation_preserve_closed_admission_identity() {
     assert!(matches!(
         reserve_request_frame_with_mode(
             selected_commands,
-            frame,
+            frame.clone(),
             TrafficClass::Throughput,
             CarrierEmitMode::Classified,
             false,
@@ -264,62 +265,105 @@ async fn request_planner_and_reservation_preserve_closed_admission_identity() {
 #[tokio::test]
 async fn bound_recovery_waits_for_registered_terminal_then_cancels_when_absent() {
     let stream_id = StreamId(712);
-    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10712"]);
-    let (commands, mut receivers) = reliable_path_command_channels(4);
-    let (opened, _frames_tx) =
-        opened_request_stream_with_retained_input(stream_id, commands.clone());
-    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
-    consume_client_path_proof_for_test(&mut receivers);
-    let instance = remotes.paths[0].instance();
-    context.install_relay_path_instance_for_test(instance);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10712", "tcp://127.0.0.1:10713"]);
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(4);
+    let (target_opened, _target_frames_tx) =
+        opened_request_stream_with_retained_input(stream_id, 0, target_commands.clone());
+    let mut remotes = ReliableRelayRemoteSet::new(target_opened, 4);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(4);
+    let (owner_opened, _owner_frames_tx) =
+        opened_request_stream_with_retained_input(stream_id, 1, owner_commands);
+    remotes.attach_candidate(owner_opened);
+    consume_client_path_proof_for_test(&mut target_receivers);
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        })
+        .expect("bound recovery target");
+    let owner = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        })
+        .expect("distinct retained OriginalData owner");
+    context.install_relay_path_instance_for_test(target);
+    context.install_relay_path_instance_for_test(owner);
     let snapshot = context
-        .reliable_path_snapshot_for_instance(instance)
+        .reliable_path_snapshot_for_instance(target)
         .expect("installed exact path evidence");
     let cause = RelaySendCause::persistent_client_ack_gap_reinjection(
-        ClientReinjectionOutputIdentity { instance },
+        ClientReinjectionOutputIdentity { instance: target },
         snapshot,
     );
-    let frame = Frame::StreamData {
-        stream_id,
-        offset: 0,
-        payload: Bytes::from_static(b"repair"),
-    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let frame = send_stream
+        .send_data(Bytes::from_static(b"repair"))
+        .expect("retained OriginalData debt");
     let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &frame);
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    sender.enqueue_critical_reinjection_frame(&mut sender_queue, frame, cause);
 
-    commands.begin_path_drain();
-    receivers.close_for_path_drain();
+    target_commands.begin_path_drain();
+    target_receivers.close_for_path_drain();
     assert!(matches!(
         sender
-            .send_reinjection_frame(&context, &mut remotes, frame.clone(), cause)
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut sender_queue,
+                6,
+                ReliableDataAckFrontierState::Live,
+            )
             .await,
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert!(
-        remotes.contains_path_instance(instance),
+        remotes.contains_path_instance(target),
         "closed admission cannot remove ahead of the ordered terminal"
     );
+    assert_eq!(
+        sender_queue.reinjection_bytes(),
+        6,
+        "blocked production dispatch retains exact queued recovery debt"
+    );
 
-    assert!(receivers.finish_planned_path_retirement());
+    assert!(target_receivers.finish_planned_path_retirement());
     let terminal = tokio::time::timeout(Duration::from_secs(1), remotes.recv_frame())
         .await
         .expect("ordered terminal deadline")
         .expect("ordered terminal frame");
-    assert_eq!(terminal.instance, instance);
+    assert_eq!(terminal.instance, target);
     assert!(matches!(
         terminal.frame,
         Err(RuntimeError::ReliablePathRetired)
     ));
     drop(
         remotes
-            .remove_path_instance(instance)
+            .remove_path_instance(target)
             .expect("terminal receiver removes the exact attachment"),
     );
     assert!(matches!(
         sender
-            .send_reinjection_frame(&context, &mut remotes, frame, cause)
-            .await,
-        Err(RuntimeError::ReliablePathSessionClosed)
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut sender_queue,
+                6,
+                ReliableDataAckFrontierState::Live,
+            )
+            .await
+            .expect("absent exact target cancels the retained queued batch"),
+        ClientQueuedDispatch::PersistentReinjectionCancelled
     ));
+    assert!(sender_queue.is_empty());
 }
 
 #[tokio::test]
@@ -386,6 +430,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         .send_data(Bytes::from(vec![0x42; 4096]))
         .expect("later delivered data");
     let mut sender = RequestSenderService::new(stream_id);
+    let sender_queue = ReliableRelaySenderQueue::default();
     sender.record_original_frame_for_test(tcp, &blocked);
     let ranges = [OffsetRange {
         start: 4096,
@@ -399,6 +444,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         &context,
         &remotes,
         &send_stream,
+        &sender_queue,
         &ranges,
         64 * 1024,
         TrafficClass::Throughput,
@@ -428,6 +474,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         &context,
         &remotes,
         &send_stream,
+        &sender_queue,
         &ranges,
         64 * 1024,
         TrafficClass::Throughput,
@@ -449,14 +496,13 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     let (reinjection_target, reinjection_path) =
         reinjection_path.expect("distinct reinjection path");
     let persistent_service_limit = reliable_reinjection_service_limit_bytes(
-        Some(reinjection_path),
-        0,
+        ReliableReinjectionTargetWork::new(Some(reinjection_path), 0, 0),
         limits.max_repair_bytes,
         limits,
     );
     assert_eq!(
         persistent_service_limit,
-        adaptive_reliable_relay_inflight_bytes(
+        reliable_product_feedback_window_bytes(
             Some(reinjection_path),
             TrafficClass::Throughput,
             limits,
@@ -499,10 +545,22 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         .expect("ordered writer accepts unrelated carrier work");
     let bound_cause =
         RelaySendCause::persistent_client_ack_gap_reinjection(reinjection_target, reinjection_path);
-    sender
-        .send_reinjection_frame(&context, &mut remotes, blocked.clone(), bound_cause)
+    let mut queue = ReliableRelaySenderQueue::default();
+    sender.enqueue_critical_reinjection_frame(&mut queue, blocked.clone(), bound_cause);
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut queue,
+            4096,
+            ReliableDataAckFrontierState::Live,
+        )
         .await
-        .expect("bound repair uses headroom independent of shared writer work");
+        .expect("queued bound repair uses headroom independent of shared writer work");
+    assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
+    assert!(queue.is_empty());
     udp_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&unrelated));
     assert!(matches!(
         try_recv_reliable_path_command(&mut udp_receivers),
@@ -522,14 +580,12 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         .find(|path| path.instance() == reinjection_target.instance)
         .expect("modeled reinjection attachment remains present");
     replacement.attachment_id = replacement.attachment_id.saturating_add(1);
-    assert!(matches!(
-        sender
-            .send_reinjection_frame(&context, &mut remotes, blocked.clone(), bound_cause)
-            .await,
-        Err(RuntimeError::ReliablePathSessionClosed)
-    ));
-    let mut queue = ReliableRelaySenderQueue::default();
-    queue.push_critical_reinjection_with_cause(blocked, bound_cause);
+    sender.enqueue_critical_reinjection_frame(&mut queue, blocked, bound_cause);
+    assert_eq!(
+        queue.reinjection_bytes(),
+        4096,
+        "bound repair must retain exact recovery debt while queued",
+    );
     let dispatch = sender
         .dispatch_client_queued_work(
             &context,
@@ -547,6 +603,119 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         ClientQueuedDispatch::PersistentReinjectionCancelled
     ));
     assert!(queue.is_empty());
+    assert_eq!(queue.reinjection_bytes(), 0);
+}
+
+#[tokio::test]
+async fn disappeared_bound_path_recovery_target_is_cancelled_and_reselected() {
+    let stream_id = StreamId(232);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10321?initial-srtt-s=0.08&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10322?initial-srtt-s=0.005&initial-rate-mbps=1000",
+        "tcp://127.0.0.1:10323?initial-srtt-s=0.04&initial-rate-mbps=200",
+    ]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, first_commands));
+    let first = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("initial recovery target")
+        .instance();
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, second_commands));
+    let second = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("second recovery target")
+        .instance();
+    for receivers in [
+        &mut owner_receivers,
+        &mut first_receivers,
+        &mut second_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, first, second] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let original = send_stream
+        .send_data(Bytes::from(vec![0x6e; 4096]))
+        .expect("retained original data");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &original);
+    assert!(sender.multipath.mark_path_stale(owner));
+    let mut queue = ReliableRelaySenderQueue::default();
+    assert!(
+        sender
+            .drive_request_path_recovery(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+
+    drop(remotes.remove_path_instance(first));
+    let cancelled = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut queue,
+            4096,
+            ReliableDataAckFrontierState::Live,
+        )
+        .await
+        .expect("lost exact target cancels only its bound recovery work");
+    assert!(matches!(
+        cancelled,
+        ClientQueuedDispatch::PathRecoveryReinjectionCancelled
+    ));
+    assert!(queue.is_empty());
+
+    assert!(
+        sender
+            .drive_request_path_recovery(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued,
+        "the uncovered range remains immediately eligible",
+    );
+    assert!(matches!(
+        sender
+            .dispatch_client_queued_work(
+                &context,
+                TrafficClass::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut queue,
+                4096,
+                ReliableDataAckFrontierState::Live,
+            )
+            .await
+            .expect("replacement target dispatch"),
+        ClientQueuedDispatch::Reinjection { .. }
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut second_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
 }
 
 #[tokio::test]
@@ -637,7 +806,10 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
             )
             .await
             .expect("live tail dispatch"),
-        ClientQueuedDispatch::Reinjection { payload_bytes: 64 }
+        ClientQueuedDispatch::Reinjection {
+            payload_bytes: 64,
+            ..
+        }
     ));
     udp_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&unrelated));
     assert!(matches!(
@@ -683,6 +855,170 @@ async fn request_product_ack_preserves_exact_data_ack_progress_path() {
 
     assert_eq!(outcome.data_ack_progress_paths.as_slice(), &[owner]);
     assert_eq!(outcome.mux.released_bytes, 4096);
+
+    let replay = sender
+        .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
+        .expect("replayed ACK remains within the frozen send extent");
+    assert_eq!(replay.mux.released_bytes, 0);
+}
+
+#[tokio::test]
+async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timing() {
+    let stream_id = StreamId(191);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10361", "quic://127.0.0.1:10362"]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
+        8,
+    );
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    let (copy_commands, mut copy_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            copy_commands,
+        )),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut copy_receivers);
+    let copy = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("recovery target")
+        .instance();
+    seed_client_bulk_evidence_for_test(&context, owner);
+    seed_client_bulk_evidence_for_test(&context, copy);
+
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let frame = send_stream
+        .send_data(Bytes::from(vec![0x6d; 4096]))
+        .expect("retained original data");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &frame);
+    assert!(sender.multipath.mark_path_stale(owner));
+    let committed_target_interval = crate::model::timing::reliable_data_retransmission_interval(
+        Some(copy.key.underlay),
+        context.reliable_path_snapshot_for_instance(copy),
+    );
+    let owner_interval_before_commit = crate::model::timing::reliable_data_retransmission_interval(
+        Some(owner.key.underlay),
+        context.reliable_path_snapshot_for_instance(owner),
+    );
+    assert_ne!(
+        owner_interval_before_commit, committed_target_interval,
+        "the fixture must distinguish the stale owner clock from the selected-copy clock",
+    );
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    assert!(
+        sender
+            .drive_request_path_recovery(
+                &mut sender_queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued,
+        "stale retained OriginalData must enter the production recovery queue",
+    );
+    let accepted_before = Instant::now();
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut sender_queue,
+            4096,
+            ReliableDataAckFrontierState::Live,
+        )
+        .await
+        .expect("actual queued carrier command commitment");
+    let accepted_after = Instant::now();
+    let ClientQueuedDispatch::Reinjection {
+        payload_bytes: 4096,
+        accepted_copy_deadline: committed_deadline,
+    } = dispatch
+    else {
+        panic!("queued path recovery must commit one exact reinjection: {dispatch:?}");
+    };
+    assert!(sender_queue.is_empty());
+    assert!(
+        committed_deadline >= accepted_before + committed_target_interval
+            && committed_deadline <= accepted_after + committed_target_interval,
+        "the accepted deadline must use the selected exact carrier snapshot at commitment",
+    );
+
+    let committed =
+        sender
+            .multipath
+            .path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput);
+    assert_eq!(committed.retry_deadline, Some(committed_deadline));
+    let accepted_at = committed_deadline
+        .checked_sub(committed_target_interval)
+        .expect("committed deadline retains its accepted-copy epoch");
+    context.mark_relay_path_proof_observation(
+        owner.key.underlay,
+        owner.key.index,
+        owner.path_instance_id,
+        crate::runtime::path::PathProofObservation {
+            proof_id: u64::MAX - 1,
+            elapsed: Duration::from_secs(5),
+            sent_at: Instant::now(),
+        },
+    );
+    let later_owner_interval = crate::model::timing::reliable_data_retransmission_interval(
+        Some(owner.key.underlay),
+        context.reliable_path_snapshot_for_instance(owner),
+    );
+    assert_ne!(
+        later_owner_interval, owner_interval_before_commit,
+        "the stale owner's actual timing model must change",
+    );
+    assert_ne!(
+        Some(accepted_at + later_owner_interval),
+        committed.retry_deadline,
+        "the legacy stale-owner dynamic clock would move away from the committed selected-copy deadline",
+    );
+    assert_eq!(
+        sender
+            .multipath
+            .path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput)
+            .retry_deadline,
+        committed.retry_deadline,
+        "later stale-owner timing cannot move an accepted copy's absolute deadline",
+    );
+    context.mark_relay_path_proof_observation(
+        copy.key.underlay,
+        copy.key.index,
+        copy.path_instance_id,
+        crate::runtime::path::PathProofObservation {
+            proof_id: u64::MAX,
+            elapsed: Duration::from_secs(5),
+            sent_at: Instant::now(),
+        },
+    );
+    let later_dynamic_interval = crate::model::timing::reliable_data_retransmission_interval(
+        Some(copy.key.underlay),
+        context.reliable_path_snapshot_for_instance(copy),
+    );
+    assert!(
+        later_dynamic_interval > committed_target_interval,
+        "the selected carrier's actual RTT model must change enough to expose dynamic recomputation",
+    );
+    let after_timing_growth =
+        sender
+            .multipath
+            .path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput);
+    assert_eq!(
+        after_timing_growth.retry_deadline, committed.retry_deadline,
+        "later RTT/jitter/model growth cannot postpone an accepted copy's absolute deadline",
+    );
 }
 
 #[tokio::test]
@@ -1032,7 +1368,75 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
 }
 
 #[tokio::test]
-async fn client_path_failure_releases_path_load_before_cleanup_waits() {
+async fn first_nonempty_request_data_acquires_load_but_empty_data_does_not() {
+    let stream_id = StreamId(123);
+    let context = client_test_context();
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let opening_lease = context
+        .reserve_relay_path_load(key, TrafficClass::Throughput)
+        .expect("prospective initial-open load");
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream(stream_id, 0, commands).with_load_lease(opening_lease),
+        8,
+    );
+    let instance = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(instance);
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        0,
+        "attachment membership is idle after the open transaction commits",
+    );
+    let mut sender = RequestSenderService::new(stream_id);
+
+    sender
+        .send_frame(
+            &context,
+            &mut remotes,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::new(),
+            },
+            RelaySendCause::StreamData,
+            Some(TrafficClass::Throughput),
+        )
+        .await
+        .expect("empty stream data remains harmless carrier work");
+    assert!(!remotes.paths[0].has_load_reservation());
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        0,
+        "empty StreamData has no OriginalData extent and cannot leak active demand",
+    );
+
+    sender
+        .send_frame(
+            &context,
+            &mut remotes,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"first-original"),
+            },
+            RelaySendCause::StreamData,
+            Some(TrafficClass::Throughput),
+        )
+        .await
+        .expect("first OriginalData assignment");
+    assert!(remotes.paths[0].has_load_reservation());
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        1,
+        "the existing CAS/reservation transaction publishes first active demand",
+    );
+}
+
+#[tokio::test]
+async fn client_path_failure_releases_path_load_without_cleanup_queue_wait() {
     let stream_id = StreamId(124);
     let context = Arc::new(client_test_context());
     let (commands, mut receivers) = reliable_path_command_channels(1);
@@ -1054,38 +1458,30 @@ async fn client_path_failure_releases_path_load_before_cleanup_waits() {
         1,
     );
     let instance = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(instance);
+    assert_eq!(
+        context.health().lock().expect("path health lock").tcp[0].active_flows,
+        0,
+        "attachment commit must end the prospective open reservation"
+    );
+    let product_lease = context
+        .try_reserve_relay_path_load_if_unchanged(instance, TrafficClass::Throughput, 0, 0)
+        .expect("reserve active OriginalData demand");
+    remotes.commit_path_instance_load_claim(instance, product_lease);
     assert_eq!(
         context.health().lock().expect("path health lock").tcp[0].active_flows,
         1
     );
     let mut sender = RequestSenderService::new(stream_id);
 
-    let task_context = context.clone();
-    let failure = tokio::spawn(async move {
-        let removed = sender
-            .fail_client_path_instance(&task_context, &mut remotes, instance)
-            .await;
-        (removed, sender, remotes)
-    });
-    tokio::task::yield_now().await;
+    assert!(sender.fail_client_path_instance(&context, &mut remotes, instance));
 
     assert_eq!(
         context.health().lock().expect("path health lock").tcp[0].active_flows,
         0,
-        "a detached path must release its load before cleanup can await"
+        "a detached path must release its load synchronously"
     );
-    assert!(
-        !failure.is_finished(),
-        "the full control queue must keep detach cleanup pending for the race assertion"
-    );
-    assert!(matches!(
-        recv_reliable_path_command(&mut receivers).await,
-        Some(ReliablePathCommand::CloseStream(StreamId(999)))
-    ));
-    assert!(matches!(
-        recv_reliable_path_command(&mut receivers).await,
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
+    assert!(remotes.is_empty());
     assert!(matches!(
         recv_reliable_path_command(&mut receivers).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id }))
@@ -1095,13 +1491,18 @@ async fn client_path_failure_releases_path_load_before_cleanup_waits() {
         recv_reliable_path_command(&mut receivers).await,
         Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
     ));
-    let (removed, _, remotes) = failure.await.expect("path failure task");
-    assert!(removed);
-    assert!(remotes.is_empty());
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::CloseStream(StreamId(999)))
+    ));
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
 }
 
 #[tokio::test]
-async fn client_path_failure_releases_optional_load_before_cleanup_waits() {
+async fn client_path_failure_releases_optional_load_without_cleanup_queue_wait() {
     let stream_id = StreamId(125);
     let context = Arc::new(client_test_context_with_paths(&[
         "tcp://127.0.0.1:10331?initial-srtt-s=0.02&initial-rate-mbps=500",
@@ -1122,48 +1523,33 @@ async fn client_path_failure_releases_optional_load_before_cleanup_waits() {
             index: 1,
         })
         .expect("additional candidate");
+    context.install_relay_path_instance_for_test(candidate);
     let lease = context
-        .try_reserve_relay_path_load_if_unchanged(candidate.key, TrafficClass::Throughput, 0, 0)
+        .try_reserve_relay_path_load_if_unchanged(candidate, TrafficClass::Throughput, 0, 0)
         .expect("reserve optional path load");
     remotes.commit_path_instance_load_claim(candidate, lease);
     let mut sender = RequestSenderService::new(stream_id);
 
-    let task_context = context.clone();
-    let failure = tokio::spawn(async move {
-        let removed = sender
-            .fail_client_path_instance(&task_context, &mut remotes, candidate)
-            .await;
-        (removed, sender, remotes)
-    });
-    tokio::task::yield_now().await;
+    assert!(sender.fail_client_path_instance(&context, &mut remotes, candidate));
 
     assert_eq!(
         context.health().lock().expect("path health lock").tcp[1].active_flows,
         0,
-        "a removed optional path must release load before detach can block"
+        "a removed optional path must release load synchronously"
     );
-    assert!(!failure.is_finished());
     assert!(matches!(
         recv_reliable_path_command(&mut candidate_rx).await,
-        Some(ReliablePathCommand::CloseStream(StreamId(999)))
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id }))
+            if id == stream_id
     ));
-    loop {
-        match recv_reliable_path_command(&mut candidate_rx).await {
-            Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id }))
-                if id == stream_id =>
-            {
-                break;
-            }
-            Some(_) => continue,
-            None => panic!("candidate command channel closed before detach"),
-        }
-    }
     assert!(matches!(
         recv_reliable_path_command(&mut candidate_rx).await,
         Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
     ));
-    let (removed, _, _) = failure.await.expect("path failure task");
-    assert!(removed);
+    assert!(matches!(
+        recv_reliable_path_command(&mut candidate_rx).await,
+        Some(ReliablePathCommand::CloseStream(StreamId(999)))
+    ));
 }
 
 #[test]
@@ -1264,6 +1650,39 @@ fn client_critical_reinjection_closes_tail_after_optional_budget_exhaustion() {
 }
 
 #[tokio::test]
+async fn equal_expiry_request_candidates_preserve_one_nonstale_survivor() {
+    let stream_id = StreamId(197);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "tcp://127.0.0.1:10252"]);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, first_commands), 8);
+    let first = remotes.paths[0].instance();
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, second_commands));
+    let second = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("second request attachment")
+        .instance();
+    consume_client_path_proof_for_test(&mut first_receivers);
+    consume_client_path_proof_for_test(&mut second_receivers);
+    for instance in [first, second] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    let mut sender = RequestSenderService::new(stream_id);
+
+    assert!(sender.mark_request_path_stale(&context, &remotes, first, TrafficClass::Throughput,));
+    assert!(
+        !sender.mark_request_path_stale(&context, &remotes, second, TrafficClass::Throughput,),
+        "request candidates returned at one deadline are revalidated serially, so the last live attachment survives",
+    );
+    assert!(sender.request_path_is_stale(first));
+    assert!(!sender.request_path_is_stale(second));
+}
+
+#[tokio::test]
 async fn exhausted_optional_budget_still_allows_one_charged_requalification_quantum() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(96);
@@ -1302,7 +1721,7 @@ async fn exhausted_optional_budget_still_allows_one_charged_requalification_quan
         },
     );
     sender.record_original_frame_for_test(healthy, &source);
-    assert!(sender.mark_request_path_stale(&remotes, stale));
+    assert!(sender.mark_request_path_stale(&context, &remotes, stale, TrafficClass::Throughput,));
 
     let startup_floor = sender_optional_reinjection_startup_floor_bytes(mux_limits);
     sender
@@ -1319,6 +1738,8 @@ async fn exhausted_optional_budget_still_allows_one_charged_requalification_quan
                 TrafficClass::Throughput,
             )
             .expect("critical requalification attempt")
+            .published_payload_bytes()
+            .is_some()
     );
     assert_eq!(
         sender.optional_reinjection.reinjected_bytes(),
@@ -1331,16 +1752,11 @@ async fn exhausted_optional_budget_still_allows_one_charged_requalification_quan
             Frame::StreamRequalifyData { .. }
         ))
     ));
-    assert!(
-        !sender
-            .try_send_requalification_probe(
-                &context,
-                &remotes,
-                &send_stream,
-                TrafficClass::Throughput,
-            )
-            .expect("one pending transaction is not an error")
-    );
+    let pending = sender
+        .try_send_requalification_probe(&context, &remotes, &send_stream, TrafficClass::Throughput)
+        .expect("one pending transaction is not an error");
+    assert!(pending.published_payload_bytes().is_none());
+    assert!(!pending.is_capacity_blocked());
     assert_eq!(
         sender.optional_reinjection.reinjected_bytes(),
         charged_before + 4096

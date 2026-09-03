@@ -4,6 +4,7 @@ use crate::model::capacity::reliable_path_startup_sample_limit_bytes;
 use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathMetricDirection, PathMetrics};
+use crate::runtime::path::CarrierNativeWindowSample;
 use crate::runtime::stream::response::attachment::ResponseProductRateEpoch;
 use crate::runtime::stream::response::evidence::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_output_has_bulk_rate_evidence_at,
@@ -35,41 +36,47 @@ fn local_timing_metrics(
     srtt: Duration,
     rttvar: Duration,
 ) -> ServerPathMetricsEntry {
+    let recorded_at = Instant::now();
+    let metrics = PathMetrics {
+        path_id: key.path_id,
+        underlay: key.underlay,
+        direction: PathMetricDirection::ServerToClient,
+        metric_epoch: 1,
+        metric_age_us: 0,
+        rate_valid_for_us: 1_000_000,
+        rate_observed: true,
+        srtt_us: srtt.as_micros().try_into().expect("test SRTT"),
+        rttvar_us: rttvar.as_micros().try_into().expect("test RTTVAR"),
+        jitter_us: rttvar.as_micros().try_into().expect("test jitter"),
+        delivery_rate_bps: 100_000_000,
+        pacing_rate_bps: 100_000_000,
+        pacing_rate_observed: true,
+        loss_ppm: 0,
+        ecn_ppm: 0,
+        loss_observed: false,
+        ecn_observed: false,
+        bytes_in_flight_observed: false,
+        queue_observed: false,
+        bytes_in_flight: 0,
+        queue_bytes: 0,
+        inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
+        inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+        confidence_ppm: 1_000_000,
+        app_limited: false,
+        has_ack_derived_data_sample: true,
+        data_sample_count: 1,
+        data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
+    };
     ServerPathMetricsEntry {
-        metrics: PathMetrics {
-            path_id: key.path_id,
-            underlay: key.underlay,
-            direction: PathMetricDirection::ServerToClient,
-            metric_epoch: 1,
-            metric_age_us: 0,
-            rate_valid_for_us: 1_000_000,
-            rate_observed: true,
-            srtt_us: srtt.as_micros().try_into().expect("test SRTT"),
-            rttvar_us: rttvar.as_micros().try_into().expect("test RTTVAR"),
-            jitter_us: rttvar.as_micros().try_into().expect("test jitter"),
-            delivery_rate_bps: 100_000_000,
-            pacing_rate_bps: 100_000_000,
-            pacing_rate_observed: true,
-            loss_ppm: 0,
-            ecn_ppm: 0,
-            loss_observed: false,
-            ecn_observed: false,
-            bytes_in_flight_observed: false,
-            queue_observed: false,
-            bytes_in_flight: 0,
-            queue_bytes: 0,
-            inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
-            inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
-            confidence_ppm: 1_000_000,
-            app_limited: false,
-            has_ack_derived_data_sample: true,
-            data_sample_count: 1,
-            data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
-        },
+        metrics,
         source: ServerPathMetricsSource::LocalSender,
         native_drain_observed: false,
+        carrier_native_window_sample: CarrierNativeWindowSample::from_path_metrics_at(
+            metrics,
+            recorded_at,
+        ),
         carrier_delivery_rate_sample: None,
-        recorded_at: Instant::now(),
+        recorded_at,
     }
 }
 

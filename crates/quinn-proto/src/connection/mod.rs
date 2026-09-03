@@ -18,8 +18,8 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
-    congestion::RecoveryTransactionId,
     config::{ServerConfig, TransportConfig},
+    congestion::{self, RecoveryTransactionId},
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -104,11 +104,7 @@ fn sample_keep_alive_interval(config: &TransportConfig, rng: &mut StdRng) -> Opt
     Some(bounded_renewal_delay(minimum, maximum, rng.random::<u64>()))
 }
 
-pub(crate) fn bounded_renewal_delay(
-    minimum: Duration,
-    maximum: Duration,
-    sample: u64,
-) -> Duration {
+pub(crate) fn bounded_renewal_delay(minimum: Duration, maximum: Duration, sample: u64) -> Duration {
     debug_assert!(minimum <= maximum);
     let minimum_nanos = minimum.as_nanos();
     let maximum_nanos = maximum.as_nanos();
@@ -277,6 +273,28 @@ pub struct Connection {
     version: u32,
 }
 
+/// Coherent snapshot of the exact active transmission path.
+///
+/// This deliberately returns the active controller clone together with the
+/// path fields that controller does not own. Runtime adapters that need to
+/// bind controller identity or authority to RTT and flight must consume this
+/// snapshot instead of joining separate [`Connection::stats`] and
+/// [`Connection::congestion_state`] reads across a possible path transition.
+pub struct ActivePathSnapshot {
+    /// Smoothed RTT used by the active path's recovery model.
+    pub smoothed_rtt: Duration,
+    /// RTT variation used by the active path's recovery model.
+    pub rtt_variance: Duration,
+    /// Exact ack-eliciting bytes currently in flight on the active path.
+    pub bytes_in_flight: u64,
+    /// Current MTU owned by this exact active path.
+    pub current_mtu: u16,
+    /// Whether the connection is currently application limited.
+    pub app_limited: bool,
+    /// Clone of the exact controller installed on this active path.
+    pub congestion: Box<dyn congestion::Controller>,
+}
+
 impl Connection {
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
@@ -395,6 +413,12 @@ impl Connection {
             stats: ConnectionStats::default(),
             version,
         };
+        if this.path.activate_initial().is_err() {
+            this.kill(
+                TransportError::INTERNAL_ERROR("congestion-controller activation failed").into(),
+            );
+            return this;
+        }
         if path_validated {
             this.on_path_validated();
         }
@@ -725,13 +749,7 @@ impl Connection {
                         builder.pad_to(segment_size as u16);
                     }
 
-                    builder.finish_and_track(
-                        now,
-                        transmit_ecn,
-                        self,
-                        sent_frames.take(),
-                        buf,
-                    );
+                    builder.finish_and_track(now, transmit_ecn, self, sent_frames.take(), buf);
 
                     if num_datagrams == 1 {
                         // Set the segment size for this GSO batch to the size of the first UDP
@@ -799,13 +817,7 @@ impl Connection {
                 // datagram.
                 // Finish current packet without adding extra padding
                 if let Some(builder) = builder_storage.take() {
-                    builder.finish_and_track(
-                        now,
-                        transmit_ecn,
-                        self,
-                        sent_frames.take(),
-                        buf,
-                    );
+                    builder.finish_and_track(now, transmit_ecn, self, sent_frames.take(), buf);
                 }
             }
 
@@ -1048,13 +1060,7 @@ impl Connection {
                 non_retransmits: true,
                 ..Default::default()
             };
-            builder.finish_and_track(
-                now,
-                transmit_ecn,
-                self,
-                Some(sent_frames),
-                buf,
-            );
+            builder.finish_and_track(now, transmit_ecn, self, Some(sent_frames), buf);
 
             self.stats.path.sent_plpmtud_probes += 1;
             num_datagrams = 1;
@@ -1273,7 +1279,15 @@ impl Connection {
                 Timer::PathValidation => {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
-                        self.path = prev;
+                        if self.path.replace_with_activated(prev).is_err() {
+                            self.kill(
+                                TransportError::INTERNAL_ERROR(
+                                    "congestion-controller activation failed",
+                                )
+                                .into(),
+                            );
+                            return;
+                        }
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -1459,6 +1473,28 @@ impl Connection {
         self.path.congestion.as_ref()
     }
 
+    /// Snapshot the exact active path and its controller in one state read.
+    ///
+    /// This is narrower than general connection statistics: it exists so a
+    /// controller activation identity cannot be fused with RTT or flight from
+    /// the predecessor/successor `PathData` during migration or rollback.
+    pub fn active_path_snapshot(&self) -> ActivePathSnapshot {
+        ActivePathSnapshot {
+            smoothed_rtt: self.path.rtt.get(),
+            rtt_variance: self.path.rtt.variance(),
+            bytes_in_flight: self.path.in_flight.bytes,
+            current_mtu: self.path.mtud.current_mtu(),
+            app_limited: self.app_limited,
+            congestion: self.path.congestion.clone_box(),
+        }
+    }
+
+    /// Notify the active congestion controller that authenticated application
+    /// traffic may now be offered on this connection.
+    pub fn mark_application_ready(&mut self) {
+        self.path.congestion.on_application_ready();
+    }
+
     /// Resets path-specific settings.
     ///
     /// This will force-reset several subsystems related to a specific network path.
@@ -1471,7 +1507,15 @@ impl Connection {
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
         self.path_counter = self.path_counter.wrapping_add(1);
-        self.path.reset(now, &self.config, self.path_counter);
+        if self
+            .path
+            .reset(now, &self.config, self.path_counter)
+            .is_err()
+        {
+            self.kill(
+                TransportError::INTERNAL_ERROR("congestion-controller activation failed").into(),
+            );
+        }
     }
 
     /// Modify the number of remotely initiated streams that may be concurrently open
@@ -1548,13 +1592,7 @@ impl Connection {
             // identity that the current controller can consume.
             if new_largest && self.path.sending_ecn {
                 if let Some(ecn) = ack.ecn {
-                    self.process_ecn(
-                        now,
-                        space,
-                        retained_ack.ecn_marked_packets,
-                        ecn,
-                        None,
-                    );
+                    self.process_ecn(now, space, retained_ack.ecn_marked_packets, ecn, None);
                 } else if retained_ack.ecn_marked_packets != 0 {
                     debug!("ECN not acknowledged by peer");
                     self.path.sending_ecn = false;
@@ -1586,11 +1624,8 @@ impl Connection {
                     // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
                     self.spaces[space].pending_acks.subtract_below(acked);
                 }
-                if path_owns_rtt_sample(
-                    &info,
-                    self.path.generation(),
-                    self.path.controller_epoch(),
-                ) {
+                if path_owns_rtt_sample(&info, self.path.generation(), self.path.controller_epoch())
+                {
                     largest_current_rtt_acked = Some((packet, info.time_sent));
                 }
 
@@ -1714,11 +1749,7 @@ impl Connection {
     fn finish_spurious_loss_detection(&mut self, detection: &SpuriousLossDetection) {
         let controller_epoch = self.path.controller_epoch();
         for &transaction in &detection.matched_transactions {
-            if has_retained_loss_for_transaction(
-                &self.spaces,
-                controller_epoch,
-                transaction,
-            ) {
+            if has_retained_loss_for_transaction(&self.spaces, controller_epoch, transaction) {
                 continue;
             }
             if self
@@ -1726,11 +1757,8 @@ impl Connection {
                 .congestion
                 .on_spurious_congestion_event(transaction)
             {
-                self.stats.path.spurious_congestion_events = self
-                    .stats
-                    .path
-                    .spurious_congestion_events
-                    .saturating_add(1);
+                self.stats.path.spurious_congestion_events =
+                    self.stats.path.spurious_congestion_events.saturating_add(1);
             }
         }
     }
@@ -1739,12 +1767,8 @@ impl Connection {
     fn drain_lost_packets(&mut self, now: Instant) {
         let two_pto = 2 * self.path.rtt.pto_base();
         let controller_epoch = self.path.controller_epoch();
-        let abandoned = expire_retained_losses_in_spaces(
-            &mut self.spaces,
-            now,
-            two_pto,
-            controller_epoch,
-        );
+        let abandoned =
+            expire_retained_losses_in_spaces(&mut self.spaces, now, two_pto, controller_epoch);
         for transaction in abandoned {
             self.path
                 .congestion
@@ -1802,13 +1826,8 @@ impl Connection {
                     // after an attributable controller response so even a CE-created snapshot is
                     // ineligible, while invalid ECN feedback above does not taint anything.
                     let controller_epoch = self.path.controller_epoch();
-                    abandon_retained_transactions_for_epoch(
-                        &mut self.spaces,
-                        controller_epoch,
-                    );
-                    self.path
-                        .congestion
-                        .on_validated_ecn_congestion_event();
+                    abandon_retained_transactions_for_epoch(&mut self.spaces, controller_epoch);
+                    self.path.congestion.on_validated_ecn_congestion_event();
                 }
             }
         }
@@ -1825,10 +1844,8 @@ impl Connection {
     ) -> Option<Instant> {
         let time_sent = info.time_sent;
         self.remove_in_flight(&info);
-        let current_controller_owned = controller_owns_packet(
-            &info,
-            self.path.controller_epoch(),
-        ) && self.path.challenge.is_none();
+        let current_controller_owned = controller_owns_packet(&info, self.path.controller_epoch())
+            && self.path.challenge.is_none();
         if current_controller_owned {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
@@ -3356,7 +3373,12 @@ impl Connection {
         new_path.challenge_pending = true;
         let prev_pto = self.pto(SpaceId::Data);
 
-        let mut prev = mem::replace(&mut self.path, new_path);
+        let Ok(mut prev) = self.path.replace_with_activated(new_path) else {
+            self.kill(
+                TransportError::INTERNAL_ERROR("congestion-controller activation failed").into(),
+            );
+            return;
+        };
         // Don't clobber the original path if the previous one hasn't been validated yet
         if prev.challenge.is_none() {
             prev.challenge = Some(self.rng.random());
@@ -3726,6 +3748,8 @@ impl Connection {
 
     fn close_common(&mut self) {
         trace!("connection closed");
+        self.path
+            .terminalize_activation(congestion::ControllerActivationTerminal::ConnectionClosed);
         for &timer in &Timer::VALUES {
             self.timers.stop(timer);
         }
@@ -3924,6 +3948,12 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn total_recvd(&self) -> u64 {
         self.path.total_recvd
+    }
+
+    /// Identity of the controller attached to the currently active path.
+    #[cfg(test)]
+    pub(crate) fn active_controller_epoch(&self) -> u64 {
+        self.path.controller_epoch()
     }
 
     #[cfg(test)]
@@ -4353,13 +4383,8 @@ struct SpuriousLossDetection {
     ecn_marked_noncurrent_epoch: bool,
 }
 
-fn path_owns_rtt_sample(
-    packet: &SentPacket,
-    path_generation: u64,
-    controller_epoch: u64,
-) -> bool {
-    controller_owns_packet(packet, controller_epoch)
-        && packet.path_generation == path_generation
+fn path_owns_rtt_sample(packet: &SentPacket, path_generation: u64, controller_epoch: u64) -> bool {
+    controller_owns_packet(packet, controller_epoch) && packet.path_generation == path_generation
 }
 
 fn acknowledge_retained_losses(
@@ -4407,12 +4432,8 @@ fn detect_spurious_loss_in_spaces(
 ) -> SpuriousLossDetection {
     // Expiry must precede matching in the same ACK transaction. Any expired member makes the
     // transaction unproven, while younger records remain available for transport ECN accounting.
-    let abandoned_transactions = expire_retained_losses_in_spaces(
-        spaces,
-        now,
-        retention,
-        current_controller_epoch,
-    );
+    let abandoned_transactions =
+        expire_retained_losses_in_spaces(spaces, now, retention, current_controller_epoch);
     let acknowledged = acknowledge_retained_losses(
         &mut spaces[space].lost_packets,
         ack,
@@ -4440,10 +4461,7 @@ fn has_retained_loss_for_transaction(
     })
 }
 
-fn abandon_retained_transactions_for_epoch(
-    spaces: &mut [PacketSpace; 3],
-    controller_epoch: u64,
-) {
+fn abandon_retained_transactions_for_epoch(spaces: &mut [PacketSpace; 3], controller_epoch: u64) {
     for space in SpaceId::iter() {
         for info in spaces[space].lost_packets.values_mut() {
             if info.controller_epoch == controller_epoch {
@@ -4777,10 +4795,7 @@ mod tests {
         let validation = packet_space.detect_ecn(0, ecn).unwrap();
         assert_eq!(validation.total_increase, 1);
         assert_eq!(packet_space.ecn_feedback, ecn);
-        assert_eq!(
-            ecn_congestion_controller_ack(validation, 0, None),
-            None
-        );
+        assert_eq!(ecn_congestion_controller_ack(validation, 0, None), None);
     }
 
     #[test]

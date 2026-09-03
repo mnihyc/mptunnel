@@ -12,7 +12,9 @@ use super::io::{
 use super::ip_tunnel::handle_server_udp_ip_tunnel;
 use super::metrics::run_server_quic_path_metrics;
 use super::server_stream::{ServerUdpReliableStreamContext, handle_server_udp_reliable_stream};
-use crate::protocol::{Frame, PathId, PeerPathState, SessionId, UnderlayProtocol};
+use crate::protocol::{
+    Frame, PathId, PathMetricDirection, PeerPathState, SessionId, UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
@@ -105,17 +107,49 @@ pub(in crate::runtime) async fn run_server_udp_listener(
     }
 }
 
+struct ServerUdpConnectionCloseGuard<'a> {
+    connection: &'a UdpPathConnection,
+}
+
+impl Drop for ServerUdpConnectionCloseGuard<'_> {
+    fn drop(&mut self) {
+        self.connection.close();
+    }
+}
+
 async fn handle_server_udp_connection(
     connection: UdpPathConnection,
     local_path: ServerLocalPath,
     context: ServerPathContext,
     authentication_slot: OwnedSemaphorePermit,
 ) -> Result<(), RuntimeError> {
+    // The Native authority publisher retains a connection clone. Explicitly
+    // close on every return *and cancellation* of this owner task so a failed
+    // or aborted pre-ready lifetime cannot leave that publisher detached.
+    let _connection_close_guard = ServerUdpConnectionCloseGuard {
+        connection: &connection,
+    };
     let (path_registration, control_send, control_recv) =
-        accept_server_udp_path_handshake(&connection, &local_path, &context).await?;
+        match accept_server_udp_path_handshake(&connection, &local_path, &context).await {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                // Native authority binding can spawn a connection-owned
+                // publisher before the readiness transaction completes. An
+                // explicit close makes every failed pre-ready lifetime
+                // terminal so that publisher cannot retain the connection.
+                connection.close();
+                return Err(error);
+            }
+        };
     drop(authentication_slot);
     let session_id = path_registration.session_id();
     let path_id = path_registration.path_id();
+    let Some(native_rate_authority) = connection.native_rate_authority() else {
+        connection.close();
+        return Err(RuntimeError::Protocol(
+            "server QUIC connection admitted before native rate authority binding",
+        ));
+    };
     let peer_status = context.register_peer_status(&path_registration);
     let control = run_server_udp_control_stream(
         control_send,
@@ -195,14 +229,16 @@ async fn handle_server_udp_connection(
                 };
                 let context = context.clone();
                 let path_registration = path_registration.clone();
+                let native_rate_authority = native_rate_authority.clone();
                 streams.spawn(async move {
-                    if let Err(err) = handle_server_udp_bidi_stream(
+                    if let Err(err) = handle_server_udp_bidi_stream_with_native_rate_authority(
                         send,
                         recv,
                         context,
                         session_id,
                         path_id,
                         path_registration,
+                        native_rate_authority,
                     )
                     .await
                     {
@@ -343,7 +379,7 @@ async fn admit_server_udp_path(
     let observed = connection.clone();
     let path_registration = context
         .reliable_streams
-        .register_carrier_path_with_observed_peer(
+        .register_carrier_path_with_observed_peer_and_authority(
             session_id,
             UnderlayProtocol::Udp,
             path_id,
@@ -352,14 +388,31 @@ async fn admit_server_udp_path(
                 policy: local_path.policy(),
                 initial_metrics: Some(local_metrics),
             },
+            peer_usage,
+            connection.native_capacity_epoch(),
             path_join.principal_permit,
             ServerCarrierPeer::observed(move || observed.remote_address()),
             context.configured_path_name(local_path.config_ordinal()),
         )?;
+    let native_scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        path_registration.path_instance_id(),
+        PathMetricDirection::ServerToClient,
+    );
+    let native_authority = connection
+        .bind_native_rate_authority(native_scope, local_metrics.delivery_rate_bps)
+        .await
+        .map_err(|_| RuntimeError::Protocol("failed to bind server QUIC native rate authority"))?;
+    let initial_native_shape = stage_current_server_native_scheduling_shape(
+        &context,
+        &path_registration,
+        &native_authority,
+        native_scope,
+    )
+    .await?;
+    context
+        .reliable_streams
+        .fanout_native_scheduling_shape(&path_registration, initial_native_shape);
     fence_server_carrier_readiness(path_registration.session_retirement(), async {
-        context
-            .reliable_streams
-            .record_peer_path_usage(&path_registration, 0, peer_usage);
         context.reliable_streams.record_local_path_metrics(
             &path_registration,
             local_metrics,
@@ -380,6 +433,45 @@ async fn admit_server_udp_path(
     })
     .await?;
     Ok(path_registration)
+}
+
+async fn stage_current_server_native_scheduling_shape(
+    context: &ServerPathContext,
+    path_registration: &ServerCarrierPathRegistration,
+    native_authority: &std::sync::Arc<
+        crate::runtime::path::authority::NativeCarrierRateAuthorityHandle,
+    >,
+    native_scope: crate::model::carrier_rate_authority::CarrierRateAuthorityScope,
+) -> Result<crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot, RuntimeError> {
+    loop {
+        let shape = match native_authority.refresh_scheduling_shape(native_scope) {
+            Ok(shape) => shape,
+            Err(error) if error.is_retryable_publication() => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(_) => {
+                return Err(RuntimeError::Protocol(
+                    "failed to read server QUIC native scheduling shape",
+                ));
+            }
+        };
+        match native_authority.commit_if_current(shape.stamp(), || {
+            context
+                .reliable_streams
+                .stage_native_scheduling_shape(path_registration, shape)
+        }) {
+            Ok(_) => return Ok(shape),
+            Err(error) if error.is_retryable_publication() => {
+                tokio::task::yield_now().await;
+            }
+            Err(_) => {
+                return Err(RuntimeError::Protocol(
+                    "server QUIC native scheduling shape failed before readiness",
+                ));
+            }
+        }
+    }
 }
 
 enum ServerUdpControlEvent {
@@ -443,13 +535,60 @@ async fn run_server_udp_control_stream(
     }
 }
 
+async fn handle_server_udp_bidi_stream_with_native_rate_authority(
+    send: UdpPathSendStream,
+    recv: UdpPathRecvStream,
+    context: ServerPathContext,
+    session_id: SessionId,
+    path_id: PathId,
+    path_registration: ServerCarrierPathRegistration,
+    native_rate_authority: std::sync::Arc<
+        crate::runtime::path::authority::NativeCarrierRateAuthorityHandle,
+    >,
+) -> Result<(), RuntimeError> {
+    handle_server_udp_bidi_stream_inner(
+        send,
+        recv,
+        context,
+        session_id,
+        path_id,
+        path_registration,
+        Some(native_rate_authority),
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(super) async fn handle_server_udp_bidi_stream(
+    send: UdpPathSendStream,
+    recv: UdpPathRecvStream,
+    context: ServerPathContext,
+    session_id: SessionId,
+    path_id: PathId,
+    path_registration: ServerCarrierPathRegistration,
+) -> Result<(), RuntimeError> {
+    handle_server_udp_bidi_stream_inner(
+        send,
+        recv,
+        context,
+        session_id,
+        path_id,
+        path_registration,
+        None,
+    )
+    .await
+}
+
+async fn handle_server_udp_bidi_stream_inner(
     mut send: UdpPathSendStream,
     mut recv: UdpPathRecvStream,
     context: ServerPathContext,
     session_id: SessionId,
     path_id: PathId,
     path_registration: ServerCarrierPathRegistration,
+    native_rate_authority: Option<
+        std::sync::Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
+    >,
 ) -> Result<(), RuntimeError> {
     match udp_path_read_frame(&mut recv, context.codec_limits).await? {
         Frame::OpenStream { stream_id, .. }
@@ -469,7 +608,7 @@ pub(super) async fn handle_server_udp_bidi_stream(
             stream_id,
             target,
             demand,
-            ..
+            return_plan,
         } => {
             handle_server_udp_reliable_stream(
                 send,
@@ -482,6 +621,8 @@ pub(super) async fn handle_server_udp_bidi_stream(
                     stream_id,
                     target,
                     initial_demand: demand,
+                    return_plan,
+                    native_rate_authority,
                 },
             )
             .await
@@ -522,7 +663,18 @@ pub(super) async fn handle_server_udp_bidi_stream(
             .await
         }
         Frame::OpenIpTunnel { tunnel_id } => {
-            handle_server_udp_ip_tunnel(send, recv, context, path_registration, tunnel_id).await
+            let native_rate_authority = native_rate_authority.ok_or(RuntimeError::Protocol(
+                "server QUIC IP tunnel stream missing native rate authority",
+            ))?;
+            handle_server_udp_ip_tunnel(
+                send,
+                recv,
+                context,
+                path_registration,
+                tunnel_id,
+                native_rate_authority,
+            )
+            .await
         }
         Frame::Ping { nonce } => {
             send.set_traffic_class(TrafficClass::Control)?;

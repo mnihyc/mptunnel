@@ -1,12 +1,14 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::reliable_relay_buffer_len;
+use crate::model::path::{RelayPathInstance, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::protocol::PathId;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels, try_recv_reliable_path_command,
 };
+use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
 use crate::runtime::stream::ReliablePathStreamOutput;
 use crate::transport::PathSpec;
 use tokio::sync::mpsc;
@@ -75,6 +77,158 @@ fn unsettled_initial_stream_for_test(
         frames_tx,
         command_rx,
     )
+}
+
+#[test]
+fn return_plan_freezes_active_and_pending_configured_slots() {
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11101?max-tcp-carriers=1",
+            "quic://127.0.0.1:11102",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let tcp = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let tcp_instance = RelayPathInstance {
+        key: tcp,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 0,
+    };
+    context.install_relay_path_instance_for_test(tcp_instance);
+
+    let plan = freeze_reliable_relay_return_plan(&context, TrafficClass::Throughput)
+        .expect("configured return slots");
+
+    assert_eq!(plan.candidates().len(), 2);
+    assert_eq!(plan.trigger_bytes(), 58_400);
+    assert_eq!(plan.candidate_tier(), PathUsage::Available);
+    assert_eq!(plan.candidates()[0].key, tcp);
+    assert_eq!(
+        plan.candidates()[0].path_instance_id,
+        Some(tcp_instance.path_instance_id),
+    );
+    assert_eq!(
+        plan.candidates()[1].key,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+    );
+    assert_eq!(
+        plan.candidates()[1].path_instance_id,
+        None,
+        "a configured pending slot remains in the immutable candidate total",
+    );
+}
+
+#[test]
+fn expensive_policy_adds_cost_without_removing_return_membership() {
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11103?max-tcp-carriers=1",
+            "quic://127.0.0.1:11104?expensive=true",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let plan = freeze_reliable_relay_return_plan(&context, TrafficClass::Throughput)
+        .expect("configured return slots");
+
+    assert_eq!(plan.candidates().len(), 2);
+    assert_eq!(plan.trigger_bytes(), 58_400);
+}
+
+#[test]
+fn backup_only_config_freezes_a_backup_singleton() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11105?backup=true&max-tcp-carriers=1"
+                .parse::<PathSpec>()
+                .expect("backup path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let plan = freeze_reliable_relay_return_plan(&context, TrafficClass::Throughput)
+        .expect("backup return slot");
+
+    assert_eq!(plan.candidates().len(), 1);
+    assert_eq!(plan.trigger_bytes(), 0);
+    assert_eq!(plan.candidate_tier(), PathUsage::Backup);
+}
+
+#[tokio::test]
+async fn manually_disabled_slot_is_excluded_while_suspect_pending_slot_remains() {
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11106?max-tcp-carriers=1",
+            "quic://127.0.0.1:11107",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Disabled);
+
+    let plan = freeze_reliable_relay_return_plan(&context, TrafficClass::Throughput)
+        .expect("pending QUIC slot remains eligible");
+
+    assert_eq!(plan.candidates().len(), 1);
+    assert_eq!(plan.trigger_bytes(), 0);
+    assert_eq!(
+        plan.candidates()[0],
+        ReliableRelayReturnCandidate {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            path_instance_id: None,
+            ordinal: 0,
+        },
+    );
+}
+
+#[tokio::test]
+async fn disabled_available_slot_falls_back_to_configured_backup_tier() {
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11108?max-tcp-carriers=1",
+            "quic://127.0.0.1:11109?backup=true",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Disabled);
+
+    let plan = freeze_reliable_relay_return_plan(&context, TrafficClass::Throughput)
+        .expect("enabled backup slot remains eligible");
+
+    assert_eq!(plan.candidate_tier(), PathUsage::Backup);
+    assert_eq!(plan.candidates().len(), 1);
+    assert_eq!(plan.candidates()[0].key.underlay, UnderlayProtocol::Udp);
+    assert_eq!(plan.candidates()[0].path_instance_id, None);
 }
 
 #[tokio::test(start_paused = true)]

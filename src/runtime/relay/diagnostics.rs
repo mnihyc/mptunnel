@@ -104,6 +104,14 @@ fn frame_subject(frame: &Frame) -> String {
             stream_id,
             max_offset,
         } => format!("stream_id={} max_offset={max_offset}", stream_id.0),
+        Frame::StreamReturnPlanFinal {
+            stream_id,
+            retained_ordinals,
+        } => format!(
+            "stream_id={} retained_ordinals={}",
+            stream_id.0,
+            retained_ordinals.len()
+        ),
         Frame::StreamFin { stream_id, .. } | Frame::StreamDetach { stream_id } => {
             format!("stream_id={}", stream_id.0)
         }

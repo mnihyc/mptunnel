@@ -21,12 +21,12 @@ use crate::runtime::path::{
     ServerLocalPathProperties, ServerStreamOpenOutcome, ServerStreamOpenRequest,
     ServerStreamPathAttachment,
 };
-use crate::runtime::relay::io::stream_ack_ranges_expose_authoritative_gap;
 use crate::runtime::stream::ReliablePathStreamOutput;
 use crate::runtime::stream::response::{
     ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsSource,
 };
 use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn tail_recovery_candidate(start: u64, sent_at: Instant) -> ReliableRelayTailRecoveryCandidate {
     ReliableRelayTailRecoveryCandidate::Untracked {
@@ -102,6 +102,353 @@ async fn prearmed_server_ack_gap_capacity_wait_retains_release_before_select_pol
     tokio::time::timeout(Duration::from_millis(50), wait)
         .await
         .expect("a pre-armed server ACK-gap capacity release must not be lost");
+}
+
+#[tokio::test]
+async fn prearmed_server_response_capacity_wait_retains_release_before_credit_check() {
+    let capacity = Arc::new(tokio::sync::Notify::new());
+    let wait = arm_response_sender_capacity_wait(vec![capacity.clone()])
+        .expect("one server response carrier-capacity notification");
+
+    // This is the exact response-writer race: the actor has armed the edge,
+    // synchronous credit revalidation observes a full handoff, and the writer
+    // releases it before `select!` polls the retained waiter.
+    capacity.notify_waiters();
+
+    tokio::time::timeout(Duration::from_millis(50), wait)
+        .await
+        .expect("a pre-armed response-writer release must not fall back to the retry timer");
+}
+
+#[tokio::test]
+async fn stream_owned_requalification_ack_capacity_release_wakes_an_idle_response_actor() {
+    let limits = MuxLimits::default();
+    let session_id = SessionId(714);
+    let stream_id = StreamId(714);
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let binding = ResponseStreamBinding::new_with_limits(
+        session_id,
+        key.underlay,
+        key.path_id,
+        commands.clone(),
+        TrafficClass::Throughput,
+        limits,
+    );
+    let path_instance_id = binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .first()
+        .expect("initial response attachment")
+        .observation
+        .path_instance_id;
+    commands
+        .try_enqueue_admitted_frame(Frame::Ping { nonce: 714 }, TrafficClass::Control)
+        .expect("fill the only return control queue");
+
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: key.underlay,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames_rx.into(),
+    };
+    let outbound_id = crate::product::OutboundId::parse("test-direct").expect("outbound ID");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: outbound_id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("outbound registry");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(outbound_id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
+        outbound_registry,
+    )
+    .expect("router");
+    let context = Arc::new(ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
+        session_retention_timeout: Duration::from_secs(60),
+        flow_idle_timeout: None,
+        telemetry: RuntimeTelemetry::new(1),
+    });
+    let (application, relay_side) = tokio::io::duplex(4096);
+    let relay_context = context.clone();
+    let relay = tokio::spawn(async move {
+        relay_reliable_stream(
+            relay_side,
+            path_stream,
+            &relay_context,
+            session_id,
+            crate::runtime::stream::SessionSendBuffer::from_limits(limits),
+        )
+        .await
+    });
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    let probe = crate::model::requalification::StreamRequalificationProbe {
+        id: 1,
+        offset: 4096,
+        payload_bytes: 512,
+    };
+    binding
+        .accept_request_requalification_probe(key, path_instance_id, stream_id, probe)
+        .expect("the idle response actor owns the blocked exact ACK");
+    assert!(binding.has_pending_request_requalification_ack());
+
+    let filler = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("queued filler command");
+    let filler_bytes = reliable_path_command_pending_bytes(&filler);
+    assert!(matches!(
+        filler,
+        ReliablePathCommand::SendFrame(Frame::Ping { nonce: 714 })
+    ));
+    receivers.release_pending_command_bytes(filler_bytes);
+
+    tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let command = recv_reliable_path_command(&mut receivers)
+                .await
+                .expect("live return command queue");
+            let pending_bytes = reliable_path_command_pending_bytes(&command);
+            let exact_ack = matches!(
+                command,
+                ReliablePathCommand::SendFrame(Frame::StreamRequalifyAck {
+                    stream_id: ack_stream_id,
+                    probe_id: 1,
+                    offset: 4096,
+                    payload_bytes: 512,
+                }) if ack_stream_id == stream_id
+            );
+            receivers.release_pending_command_bytes(pending_bytes);
+            if exact_ack {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("capacity release wakes the idle actor's stream-owned ACK retry");
+    assert!(!binding.has_pending_request_requalification_ack());
+
+    relay.abort();
+    let _ = relay.await;
+    drop(application);
+    drop(frames_tx);
+}
+
+#[tokio::test]
+async fn exact_requalification_capacity_release_wakes_an_open_idle_source() {
+    let limits = MuxLimits::default();
+    let session_id = SessionId(713);
+    let stream_id = StreamId(713);
+    let tcp = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let quic = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits(
+        session_id,
+        tcp.underlay,
+        tcp.path_id,
+        tcp_commands,
+        TrafficClass::Throughput,
+        limits,
+    );
+    let (quic_commands, mut quic_receivers) = reliable_path_command_channels(1);
+    assert_eq!(
+        binding.attach(
+            quic.underlay,
+            quic.path_id,
+            quic_commands.clone(),
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let quic_identity = binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == quic)
+        .map(|target| ServerReinjectionOutputIdentity {
+            key: quic,
+            incarnation: target.observation.incarnation,
+        })
+        .expect("attached QUIC response target");
+    assert!(binding.mark_output_stale(quic_identity, TrafficClass::Throughput,));
+    quic_commands
+        .try_enqueue_reinjection_frame(
+            Frame::StreamData {
+                stream_id: StreamId(999),
+                offset: 0,
+                payload: Bytes::from_static(b"fill-stale-quic"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("fill the exact stale target queue");
+
+    let (_frames_tx, frames_rx) = mpsc::channel(4);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding),
+        frames: frames_rx.into(),
+    };
+    let outbound_id = crate::product::OutboundId::parse("test-direct").expect("outbound ID");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: outbound_id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("outbound registry");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(outbound_id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
+        outbound_registry,
+    )
+    .expect("router");
+    let context = Arc::new(ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
+        session_retention_timeout: Duration::from_secs(60),
+        flow_idle_timeout: None,
+        telemetry: RuntimeTelemetry::new(1),
+    });
+    let (mut application, relay_side) = tokio::io::duplex(4096);
+    let relay_context = context.clone();
+    let relay = tokio::spawn(async move {
+        relay_reliable_stream(
+            relay_side,
+            path_stream,
+            &relay_context,
+            session_id,
+            crate::runtime::stream::SessionSendBuffer::from_limits(limits),
+        )
+        .await
+    });
+
+    application
+        .write_all(b"retained response source")
+        .await
+        .expect("seed one retained response range");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let command = recv_reliable_path_command(&mut tcp_receivers)
+                .await
+                .expect("healthy TCP command queue");
+            let pending_bytes = reliable_path_command_pending_bytes(&command);
+            let original = matches!(
+                command,
+                ReliablePathCommand::SendFrame(Frame::StreamData { ref payload, .. })
+                    if payload == &Bytes::from_static(b"retained response source")
+            );
+            tcp_receivers.release_pending_command_bytes(pending_bytes);
+            if original {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("healthy TCP must accept the retained source");
+
+    // Let the actor observe the full stale queue and enter its idle read wait.
+    // The application endpoint deliberately stays open but sends no more data.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    loop {
+        let command = recv_reliable_path_command(&mut quic_receivers)
+            .await
+            .expect("stale QUIC command queue");
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let filler = matches!(
+            command,
+            ReliablePathCommand::SendFrame(Frame::StreamData {
+                stream_id: StreamId(999),
+                ..
+            })
+        );
+        quic_receivers.release_pending_command_bytes(pending_bytes);
+        if filler {
+            break;
+        }
+    }
+
+    let probe = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let command = recv_reliable_path_command(&mut quic_receivers)
+                .await
+                .expect("stale QUIC command queue remains live");
+            let pending_bytes = reliable_path_command_pending_bytes(&command);
+            let probe = matches!(
+                command,
+                ReliablePathCommand::SendFrame(Frame::StreamRequalifyData { .. })
+            );
+            quic_receivers.release_pending_command_bytes(pending_bytes);
+            if probe {
+                break;
+            }
+        }
+    })
+    .await;
+
+    relay.abort();
+    let _ = relay.await;
+    drop(application);
+    assert!(
+        probe.is_ok(),
+        "the exact stale-target capacity release must wake requalification while the open local source is idle",
+    );
 }
 
 #[test]
@@ -209,6 +556,7 @@ async fn assert_post_resolution_denial_is_logical_stream_local(
                 stream_id,
                 target,
                 initial_demand: StreamDemandHint::Latency,
+                return_plan: Default::default(),
                 attachment: ServerStreamPathAttachment {
                     path_registration: registration.clone(),
                     commands: commands.clone(),
@@ -383,6 +731,167 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
     drop(frames_tx);
 }
 
+#[tokio::test]
+async fn server_relay_applies_path_detach_after_request_half_close_without_response_flight() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(612);
+    let session_id = SessionId(612);
+    let path_id = PathId(0);
+    let id = crate::product::OutboundId::parse("test-direct").expect("outbound");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("registry");
+    let router = ClientIngressRouter::new(
+        &ProductPolicyConfig {
+            generation: 1,
+            routes: vec![RouteRuleSpec::new(
+                RuleId::parse("default").expect("route ID"),
+                RouteMatchSpec::default(),
+                RouteAction::allow_restricted(
+                    EgressAction::Outbound(id),
+                    None,
+                    InitialDemand::Automatic,
+                ),
+            )],
+        },
+        outbound_registry,
+    )
+    .expect("router");
+    let context = Arc::new(ServerReliableRelayContext {
+        router,
+        inbound: InboundId::parse("test-inbound").expect("inbound ID"),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
+        // This test must observe lifecycle progress without relying on Product
+        // expiry to close the actor's ordered event receiver.
+        session_retention_timeout: Duration::from_secs(60),
+        flow_idle_timeout: None,
+        telemetry: RuntimeTelemetry::new(1),
+    });
+    let (registry, mut accepted_rx) = ServerReliableStreamRegistry::new_accepting_with_limits(
+        limits,
+        crate::performance::ResourceLimits::default().max_paths,
+    );
+    let port = registry.path_port();
+    let registration = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        path_id,
+        ServerLocalPathProperties::default(),
+    );
+    let path_instance_id = registration.path_instance_id();
+    let (commands, mut command_rx) = reliable_path_command_channels(8);
+    assert!(matches!(
+        port.open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip("127.0.0.1:443".parse().expect("target")),
+            initial_demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands,
+                max_frame_payload_bytes: limits.max_payload_bytes,
+            },
+            mux_limits: limits,
+        })
+        .await
+        .expect("open logical stream"),
+        ServerStreamOpenOutcome::New(_)
+    ));
+    let admission = recv_reliable_path_command(&mut command_rx)
+        .await
+        .expect("zero-credit carrier admission");
+    let admission_bytes = reliable_path_command_pending_bytes(&admission);
+    assert!(matches!(
+        admission,
+        ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            stream_id: admitted_stream,
+            max_offset: 0,
+        }) if admitted_stream == stream_id
+    ));
+    command_rx.release_pending_command_bytes(admission_bytes);
+
+    let mut accepted = accepted_rx.recv().await.expect("accepted stream");
+    let stream_retirement = accepted.supervise();
+    let session_send_buffer = accepted.session_send_buffer();
+    let path_stream = accepted.take_stream();
+    let binding = match &path_stream.output {
+        ReliablePathStreamOutput::Switchable(binding) => binding.clone(),
+        ReliablePathStreamOutput::Fixed(_) => panic!("server relay output must be switchable"),
+    };
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id,
+    };
+    let output_incarnation = binding
+        .sender_path_targets(TrafficClass::Latency, 1)
+        .into_iter()
+        .find(|target| target.observation.path_instance_id == path_instance_id)
+        .expect("opening output")
+        .observation
+        .incarnation;
+    drop(accepted);
+
+    let (mut application, relay_side) = tokio::io::duplex(4096);
+    let relay_context = context.clone();
+    let relay = tokio::spawn(async move {
+        relay_reliable_stream(
+            relay_side,
+            path_stream,
+            &relay_context,
+            session_id,
+            session_send_buffer,
+        )
+        .await
+    });
+    port.route_frame(
+        &registration,
+        stream_id,
+        Frame::StreamFin {
+            stream_id,
+            final_offset: 0,
+        },
+    )
+    .await
+    .expect("route request FIN");
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), application.read(&mut byte))
+            .await
+            .expect("request half-close propagation timeout")
+            .expect("read request half-close"),
+        0,
+        "request FIN must half-close the target before carrier retirement",
+    );
+    let carrier_retirement = registration.begin_retirement();
+    tokio::time::timeout(Duration::from_secs(1), carrier_retirement.wait())
+        .await
+        .expect("carrier retirement must not wait for Product expiry or target closure");
+    assert!(
+        !binding.has_output_incarnation(key, output_incarnation),
+        "ordered PathDetached must be applied before carrier retirement completes",
+    );
+    assert!(
+        !relay.is_finished(),
+        "path detach must preserve the response-only Product stream",
+    );
+
+    relay.abort();
+    let _ = relay.await;
+    stream_retirement.retire().await;
+    drop(application);
+}
+
 fn record_server_delivery_evidence(binding: &ResponseStreamBinding, key: CarrierPathKey) {
     record_server_delivery_evidence_with_srtt(binding, key, 40_000);
 }
@@ -425,6 +934,107 @@ fn record_server_delivery_evidence_with_srtt(
             data_sample_bytes: 65_536,
         },
         ServerPathMetricsSource::LocalSender,
+    );
+}
+
+#[test]
+fn ambiguous_prefix_ack_cannot_withdraw_a_fresh_response_tail_beyond_the_horizon() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(613);
+    let quic = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(0),
+    };
+    let tcp = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (quic_commands, _quic_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(613),
+        quic.underlay,
+        quic.path_id,
+        quic_commands,
+        TrafficClass::Throughput,
+    );
+    let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            tcp.underlay,
+            tcp.path_id,
+            tcp_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    binding.mark_output_path_proven_for_test(quic);
+    binding.mark_output_path_proven_for_test(tcp);
+    record_server_delivery_evidence_with_srtt(&binding, quic, 1_000);
+    record_server_delivery_evidence_with_srtt(&binding, tcp, 1_000);
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: quic.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let quic_identity = binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == quic)
+        .map(|target| ServerReinjectionOutputIdentity {
+            key: quic,
+            incarnation: target.observation.incarnation,
+        })
+        .expect("attached QUIC response output");
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let prefix = send_stream
+        .send_data(Bytes::from_static(b"acked-prefix"))
+        .expect("send ACKed prefix");
+    let horizon = reliable_stream_frame_extent(&prefix)
+        .expect("prefix extent")
+        .1;
+    let tail = send_stream
+        .send_data(Bytes::from_static(b"silent-tail"))
+        .expect("send silent tail");
+    let tail_end = reliable_stream_frame_extent(&tail).expect("tail extent").1;
+    binding.record_original_flight(quic, &prefix);
+    binding.record_reinjected_flight(tcp, &prefix);
+    binding.record_original_flight(quic, &tail);
+    let ack_ranges = [OffsetRange::new(0, horizon).expect("prefix ACK range")];
+    let _ = send_stream.apply_ack(&ack_ranges);
+    let ack_release = binding.release_normalized_acked_ranges(&ack_ranges);
+    assert!(
+        ack_release.path_progress_outputs.is_empty(),
+        "delivery of an overlapping original and reinjection has no exact owner attribution",
+    );
+    let mut staleness = ReliableResponsePathStaleness::default();
+    let candidates = path_stream.data_ack_recovery_candidates(horizon, TrafficClass::Throughput);
+    assert!(
+        candidates.is_empty(),
+        "the fresh tail begins at the complete ACK horizon and is not an authoritative omission",
+    );
+    assert!(!mark_response_path_staleness(
+        &mut staleness,
+        &path_stream,
+        &candidates,
+        ack_release.path_progress_outputs.as_slice(),
+        TrafficClass::Throughput,
+    ));
+    assert_eq!(staleness.next_deadline(), None);
+    assert!(!binding.output_is_stale(quic_identity));
+    let later_horizon_candidates =
+        path_stream.data_ack_recovery_candidates(tail_end, TrafficClass::Throughput);
+    assert_eq!(later_horizon_candidates.len(), 1);
+    assert_eq!(
+        response_recovery_output_identity(later_horizon_candidates[0]),
+        quic_identity,
+        "the same retained tail becomes eligible only when a later complete horizon covers it",
     );
 }
 
@@ -624,34 +1234,6 @@ fn tail_timer_reinjection_allows_only_authoritative_or_failed_original_reinjecti
 }
 
 #[test]
-fn contiguous_ack_frontier_lag_is_tail_guard_not_reinjection_debt() {
-    let ranges = [OffsetRange {
-        start: 0,
-        end: 1024,
-    }];
-
-    assert!(
-        !stream_ack_ranges_expose_authoritative_gap(true, &ranges),
-        "a contiguous unacknowledged suffix is not an authoritative product reinjection gap"
-    );
-    assert_eq!(
-        reliable_relay_data_ack_outstanding_bytes(TrafficClass::Throughput, 1024, 8192,),
-        7168,
-        "a contiguous unacknowledged suffix is a tail guard for alternate original-transmission paths"
-    );
-    assert_eq!(
-        reliable_relay_data_ack_outstanding_bytes(TrafficClass::Throughput, 0, 8192,),
-        8192,
-        "before the first contiguous ACK, already-sent bulk bytes are still original-transmission path-tail debt for alternate original-transmission paths"
-    );
-    assert_eq!(
-        reliable_relay_data_ack_outstanding_bytes(TrafficClass::Latency, 1024, 8192,),
-        0,
-        "latency traffic must not be pinned by bulk original-transmission path-tail pressure"
-    );
-}
-
-#[test]
 fn incomplete_ack_chunks_after_a_snapshot_do_not_extend_its_negative_authority() {
     let limits = MuxLimits::default();
     let mut send_stream =
@@ -712,6 +1294,73 @@ fn incomplete_ack_chunks_after_a_snapshot_do_not_extend_its_negative_authority()
         0,
         "positive incomplete ACK chunks must not leave stale tail-guard debt",
     );
+}
+
+#[test]
+fn response_source_staging_uses_exact_retained_product_debt_in_every_lane() {
+    let limits = MuxLimits {
+        max_path_flight_bytes: 2 * 1024 * 1024,
+        max_repair_bytes: 8 * 1024 * 1024,
+        max_reorder_bytes: 8 * 1024 * 1024,
+        max_stream_window_bytes: 8 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let aggregate_product_window = 4 * 1024 * 1024;
+    let retained_product_debt = aggregate_product_window - 32 * 1024;
+    let queued_original_data = 16 * 1024;
+
+    for lane in [TrafficClass::Latency, TrafficClass::Throughput] {
+        assert_eq!(
+            reliable_relay_response_source_staging_headroom(
+                lane,
+                aggregate_product_window,
+                retained_product_debt,
+                queued_original_data,
+            ),
+            16 * 1024,
+            "retained exact Product O and queued OriginalData consume the same aggregate P before assignment in {lane:?}",
+        );
+        assert_eq!(
+            reliable_relay_response_source_staging_headroom(
+                lane,
+                aggregate_product_window,
+                0,
+                queued_original_data,
+            ),
+            aggregate_product_window - queued_original_data,
+            "MPP DataACK release must reopen source reads in {lane:?}",
+        );
+    }
+
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(StreamId(313), limits, u64::MAX);
+    send_stream
+        .send_data(Bytes::from(vec![0x44; 32 * 1024]))
+        .expect("retain exact Product bytes");
+    for lane in [TrafficClass::Latency, TrafficClass::Throughput] {
+        assert_eq!(
+            reliable_relay_current_data_ack_outstanding_bytes(lane, &send_stream, 0),
+            32 * 1024,
+        );
+    }
+    let ack = validate_stream_ack(
+        true,
+        vec![OffsetRange {
+            start: 0,
+            end: 32 * 1024,
+        }],
+        send_stream.next_offset(),
+    )
+    .expect("exact retained range ACK");
+    send_stream
+        .apply_validated_ack(&ack)
+        .expect("DataACK releases exact retained bytes");
+    for lane in [TrafficClass::Latency, TrafficClass::Throughput] {
+        assert_eq!(
+            reliable_relay_current_data_ack_outstanding_bytes(lane, &send_stream, 0),
+            0,
+        );
+    }
 }
 
 #[test]
@@ -813,6 +1462,7 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
     let outcome = enqueue_reliable_tail_reinjection_with_ack_horizon(
         &mut response_sender,
         &path_stream,
+        &[],
         stream_id,
         &send_stream,
         &ack_ranges,
@@ -865,10 +1515,7 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         binding.has_output_incarnation(original_outputs[0].0, original_outputs[0].1),
         "reinjection must preserve the exact original-output attribution",
     );
-    assert!(path_stream.has_recent_reinjection_overlap(
-        &reinjection_frame,
-        reliable_relay_tail_reinjection_delay(None),
-    ));
+    assert!(path_stream.has_recent_reinjection_overlap(&reinjection_frame));
 }
 
 #[test]
@@ -1696,7 +2343,10 @@ fn failed_original_tail_reinjection_is_immediate_after_original_path_detaches() 
         original_sent_at,
         None,
         None,
-        reliable_failed_original_tail_reinjection_ready(&path_stream, &send_stream),
+        reliable_failed_original_tail_reinjection_ready(
+            &path_stream.failed_original_recovery_state(),
+            &send_stream,
+        ),
     );
 
     assert_eq!(
@@ -2555,7 +3205,7 @@ fn failed_original_tail_reinjection_does_not_duplicate_queued_reinjection_range(
 }
 
 #[test]
-fn tail_reinjection_treats_live_inflight_reinjection_as_pending() {
+fn tail_reinjection_defers_live_inflight_reinjection_to_the_accepted_copy_wake() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(127);
     let original_key = CarrierPathKey {
@@ -2647,14 +3297,20 @@ fn tail_reinjection_treats_live_inflight_reinjection_as_pending() {
         "live in-flight ReinjectedData for the same range must not be stacked"
     );
     assert!(
-        outcome.pending,
-        "live in-flight ReinjectedData should keep the tail reinjection timer backed off"
+        !outcome.pending,
+        "the generic tail timer must not claim ownership of an accepted-copy wait"
+    );
+    assert!(
+        binding
+            .earliest_reinjection_suppression_deadline()
+            .is_some(),
+        "the immutable accepted-copy wake owns reevaluation of this live repair",
     );
     assert_eq!(response_sender.bytes(), 0);
 }
 
 #[test]
-fn persistent_tail_reinjection_waits_when_live_reinjection_copy_is_in_flight() {
+fn persistent_tail_reinjection_defers_a_live_copy_to_its_accepted_copy_wake() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(105);
     let original_key = CarrierPathKey {
@@ -2741,14 +3397,20 @@ fn persistent_tail_reinjection_waits_when_live_reinjection_copy_is_in_flight() {
         "persistent tail reinjection must not stack another copy while a live ReinjectedData flight already covers the frontier range"
     );
     assert!(
-        outcome.pending,
-        "live in-flight ReinjectedData should back off the tail reinjection timer"
+        !outcome.pending,
+        "the generic persistent-tail timer must not claim an accepted-copy wait"
+    );
+    assert!(
+        binding
+            .earliest_reinjection_suppression_deadline()
+            .is_some(),
+        "the immutable accepted-copy wake owns reevaluation of this live repair",
     );
     assert_eq!(response_sender.bytes(), 0);
 }
 
 #[test]
-fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
+fn stale_live_reinjection_flight_allows_terminal_tail_retry_on_a_distinct_output() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(106);
     let original_key = CarrierPathKey {
@@ -2758,6 +3420,10 @@ fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
     let reinjection_key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
+    };
+    let retry_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(2),
     };
     let (original_commands, _original_receivers) = reliable_path_command_channels(8);
     let binding = ResponseStreamBinding::new(
@@ -2773,6 +3439,16 @@ fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
             reinjection_key.underlay,
             reinjection_key.path_id,
             reinjection_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let (retry_commands, _retry_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            retry_key.underlay,
+            retry_key.path_id,
+            retry_commands,
             TrafficClass::Throughput,
         ),
         ResponseStreamAttachOutcome::Attached
@@ -2840,7 +3516,7 @@ fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
 
     assert_eq!(
         outcome.queued, 1,
-        "stale unacked ReinjectedData must not suppress correctness reinjection forever"
+        "expired native suppression may recover on a distinct exact output without minting same-target K"
     );
     assert!(
         !outcome.pending,
@@ -3720,7 +4396,7 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
 }
 
 #[test]
-fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
+fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(103);
     let original_key = CarrierPathKey {
@@ -3853,6 +4529,50 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
     );
 
     binding.age_original_flights_for_test(Duration::from_secs(1));
+    let frontier_frame = send_stream
+        .retransmission_frames_for_normalized_ack_gaps(
+            authoritative_ack.ranges(),
+            scored_frontier_bytes,
+        )
+        .into_iter()
+        .next()
+        .expect("frontier repair frame");
+    let mut blocked_response_sender = ServerResponseSenderService::new_with_performance(
+        SessionId(103),
+        stream_id,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 5,
+        },
+    );
+    blocked_response_sender.enqueue_critical_reinjection_frame_with_cause(
+        frontier_frame,
+        RelaySendCause::AckGapReinjection,
+    );
+    let blocked_bytes = blocked_response_sender.bytes();
+    let blocked = evaluate_server_data_ack_reinjection(
+        &mut blocked_response_sender,
+        &path_stream,
+        &send_stream,
+        &mut progress,
+        &authoritative_ack,
+        quantum as u64,
+        Some(modeled_path),
+        Some(slow_send_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+    assert!(blocked.frame_count >= 4);
+    assert_eq!(
+        blocked.queued, 0,
+        "a blocked frontier quantum must not enqueue later service-window repairs"
+    );
+    assert_eq!(
+        blocked_response_sender.bytes(),
+        blocked_bytes,
+        "later repair ranges must remain untouched until the frontier commits"
+    );
+
     let outcome = evaluate_server_data_ack_reinjection(
         &mut response_sender,
         &path_stream,
@@ -3876,7 +4596,7 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
         "persistent timer service must not collapse back to one liveness quantum"
     );
     assert!(outcome.persistent_ready);
-    assert!(progress.repeat_reinjection_deadline().is_some());
+    assert!(progress.next_reinjection_deadline().is_some());
     let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
     let dispatch = response_sender
         .dispatch_next_with_data_ack_outstanding(
@@ -3896,6 +4616,114 @@ fn persistent_ack_gap_timer_refills_a_measured_target_service_window() {
             ..
         })) if offset == quantum as u64 && payload.len() == scored_frontier_bytes
     ));
+}
+
+#[test]
+fn draining_response_owner_retains_one_distinct_ack_gap_recovery_target() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(104);
+    let original_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(0),
+    };
+    let reinjection_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (original_commands, _original_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(104),
+        original_key.underlay,
+        original_key.path_id,
+        original_commands.clone(),
+        TrafficClass::Throughput,
+    );
+    let (reinjection_commands, _reinjection_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            reinjection_key.underlay,
+            reinjection_key.path_id,
+            reinjection_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    record_server_delivery_evidence_with_srtt(&binding, reinjection_key, 100_000);
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: original_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let quantum = MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
+    let frame = send_stream
+        .prepare_data(Bytes::from(vec![0x52; quantum * 2]))
+        .expect("prepare response flight");
+    send_stream
+        .commit_prepared_data(&frame)
+        .expect("commit response flight");
+    binding.record_original_flight(original_key, &frame);
+    binding.age_original_flights_for_test(Duration::from_secs(1));
+
+    let ack_ranges = vec![OffsetRange {
+        start: quantum as u64,
+        end: (quantum * 2) as u64,
+    }];
+    let validated_ack = begin_reliable_stream_ack(&send_stream, true, ack_ranges)
+        .expect("validate later response range");
+    let _ = send_stream.apply_validated_ack(&validated_ack);
+    let mut authoritative_ack = AuthoritativeStreamAckSnapshot::default();
+    update_reinjection_authoritative_ack_snapshot(&mut authoritative_ack, &validated_ack);
+
+    original_commands.begin_path_drain();
+    let owner_snapshot = PathSnapshot::new(
+        original_key.path_id,
+        original_key.underlay,
+        100.0,
+        10_000_000.0,
+    );
+    let target_snapshot = PathSnapshot::new(
+        reinjection_key.path_id,
+        reinjection_key.underlay,
+        100.0,
+        100_000_000.0,
+    );
+    let mut response_sender = ServerResponseSenderService::new_with_performance(
+        SessionId(104),
+        stream_id,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 5,
+        },
+    );
+    let mut progress = ReliableAckGapReinjectionProgress::default();
+    let outcome = evaluate_server_data_ack_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &mut progress,
+        &authoritative_ack,
+        0,
+        Some(owner_snapshot),
+        Some(target_snapshot),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+
+    assert!(
+        outcome.has_multipath_alternative,
+        "the one healthy output is a distinct structural target after excluding the draining owner",
+    );
+    assert!(outcome.has_measured_target);
+    assert!(outcome.persistent_ready);
+    assert!(outcome.queued > 0);
 }
 
 #[test]

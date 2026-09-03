@@ -13,13 +13,15 @@ use super::writer::ServerTcpWriter;
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{CloseReason, Frame, PathId, PeerPathState, SessionId};
 use crate::runtime::error::RuntimeError;
+#[cfg(feature = "lab-diagnostics")]
+use crate::runtime::path::commands::reliable_path_command_writer_run_bytes;
 use crate::runtime::path::commands::{
     ReliablePathCarrierTerminalCause, ReliablePathCommand, ReliablePathCommandReceivers,
     ReliablePathCommandSender, recv_reliable_path_command, recv_reliable_path_command_during_drain,
     reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
-    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
-    reliable_path_frame_requires_capacity_command, reliable_path_receivers_closed,
-    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
+    reliable_path_command_writer_run_budget_items, reliable_path_frame_requires_capacity_command,
+    reliable_path_receivers_closed, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
@@ -71,6 +73,8 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathAdmission {
     pub(in crate::runtime::path::tcp) writer: ServerTcpWriter,
     pub(in crate::runtime::path::tcp) path_frames:
         mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    pub(in crate::runtime::path::tcp) native_terminal:
+        Option<tokio::sync::oneshot::Receiver<EncryptedFramedTransportError>>,
     pub(in crate::runtime::path::tcp) commands_tx: ReliablePathCommandSender,
     pub(in crate::runtime::path::tcp) commands_rx: ReliablePathCommandReceivers,
     pub(in crate::runtime::path::tcp) evidence: ServerTcpEvidenceState,
@@ -89,6 +93,7 @@ pub(in crate::runtime::path::tcp) struct ServerTcpPathSession {
     commands_rx: ReliablePathCommandReceivers,
     commands_tx: ReliablePathCommandSender,
     path_frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    native_terminal: Option<tokio::sync::oneshot::Receiver<EncryptedFramedTransportError>>,
     deferred_input: Option<Frame>,
     writer: ServerTcpWriter,
     peer_status: PeerStatusCarrier,
@@ -110,6 +115,7 @@ impl ServerTcpPathSession {
             commands_rx: admission.commands_rx,
             commands_tx: admission.commands_tx,
             path_frames: admission.path_frames,
+            native_terminal: admission.native_terminal,
             deferred_input: None,
             writer: admission.writer,
             peer_status: admission.peer_status,
@@ -132,10 +138,31 @@ impl ServerTcpPathSession {
         let carrier_terminal_signal = self.commands_tx.terminal_signal();
         let carrier_terminal = carrier_terminal_signal.wait();
         tokio::pin!(carrier_terminal);
+        let native_terminal = self.native_terminal.take();
+        let native_terminal = async move {
+            match native_terminal {
+                Some(receiver) => match receiver.await {
+                    Ok(error) => error,
+                    // Reader cancellation without an owned transport result is
+                    // not a new result class. The shared lifecycle signal owns
+                    // any external failure or planned retirement instead.
+                    Err(_) => std::future::pending::<EncryptedFramedTransportError>().await,
+                },
+                None => std::future::pending::<EncryptedFramedTransportError>().await,
+            }
+        };
+        tokio::pin!(native_terminal);
         let result = tokio::select! {
             biased;
             reason = &mut session_retirement => Err(RuntimeError::RemoteClosed(reason)),
             () = &mut retirement => Ok(()),
+            error = &mut native_terminal => {
+                if encrypted_framed_peer_closed(&error) {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::Encrypted(error))
+                }
+            }
             cause = &mut carrier_terminal => match cause {
                 ReliablePathCarrierTerminalCause::Failed => {
                     Err(RuntimeError::ReliablePathSessionClosed)
@@ -366,7 +393,7 @@ impl ServerTcpPathSession {
                 stream_id,
                 target,
                 demand,
-                ..
+                return_plan,
             } if self.state == ServerTcpCarrierState::Active => {
                 let reply = self
                     .streams
@@ -378,6 +405,7 @@ impl ServerTcpPathSession {
                         stream_id,
                         target,
                         demand,
+                        return_plan,
                     )
                     .await?;
                 let accepted = matches!(&reply, Some(Frame::StreamMaxData { .. }));
@@ -504,6 +532,7 @@ impl ServerTcpPathSession {
             }
             frame @ (Frame::StreamData { stream_id, .. }
             | Frame::StreamAck { stream_id, .. }
+            | Frame::StreamReturnPlanFinal { stream_id, .. }
             | Frame::StreamRequalifyAck { stream_id, .. }
             | Frame::StreamMaxData { stream_id, .. }
             | Frame::StreamFin { stream_id, .. }
@@ -702,10 +731,12 @@ impl ServerTcpPathSession {
         let byte_budget = reliable_path_command_writer_run_budget_bytes(self.context.mux_limits);
         let item_budget = reliable_path_command_writer_run_budget_items(self.context.mux_limits);
         let mut next_command = Some(first_command);
-        self.writer.clear_batch();
+        self.writer.begin_transaction()?;
+        #[cfg(feature = "lab-diagnostics")]
         let mut sent_bytes = 0usize;
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let sent_bytes = 0usize;
         let mut sent_items = 0usize;
-        let mut wrote_frame = false;
         let mut writer_pending_bytes = 0usize;
 
         loop {
@@ -730,6 +761,7 @@ impl ServerTcpPathSession {
                 break;
             };
             let pending_bytes = reliable_path_command_pending_bytes(&command);
+            #[cfg(feature = "lab-diagnostics")]
             let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
             if let ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command {
                 self.datagrams.remove(*flow_id);
@@ -745,16 +777,28 @@ impl ServerTcpPathSession {
                     ));
                 }
                 ReliablePathCommand::SendFrame(frame) => {
-                    let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
-                    self.writer.push_frame(frame);
-                    writer_pending_bytes = writer_pending_bytes.saturating_add(pending_bytes);
-                    wrote_frame = true;
-                    sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
-                    sent_items = sent_items.saturating_add(1);
-                    if is_stream_detach || sent_bytes >= byte_budget || sent_items >= item_budget {
-                        break;
+                    writer_pending_bytes = writer_pending_bytes.checked_add(pending_bytes).ok_or(
+                        RuntimeError::Protocol("server TCP writer transaction byte overflow"),
+                    )?;
+                    #[cfg(feature = "lab-diagnostics")]
+                    {
+                        sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+                        sent_items = sent_items.saturating_add(1);
                     }
-                    continue;
+                    self.writer.stage_transaction_frame(frame)?;
+                    if matches!(
+                        self.commit_transaction_respecting_deferred_input(
+                            &mut writer_pending_bytes,
+                        )
+                        .await?,
+                        ServerTcpSessionDisposition::Stop
+                    ) {
+                        return Ok(ServerTcpSessionDisposition::Stop);
+                    }
+                    // One ordinary frame is one irreversible transaction. Return
+                    // to the actor so priority and lifecycle lanes arbitrate the
+                    // next head after the exact commit boundary.
+                    break;
                 }
                 ReliablePathCommand::SendTcpCapacityProbe(probe) => {
                     drop(probe);
@@ -767,29 +811,35 @@ impl ServerTcpPathSession {
                 ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
                     // A TCP session is shared, so retire only this attachment
                     // after its reset has entered the ordered carrier writer.
+                    writer_pending_bytes = writer_pending_bytes.checked_add(pending_bytes).ok_or(
+                        RuntimeError::Protocol("server TCP writer transaction byte overflow"),
+                    )?;
+                    #[cfg(feature = "lab-diagnostics")]
+                    {
+                        sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+                        sent_items = sent_items.saturating_add(1);
+                    }
                     self.writer
-                        .push_frame(Frame::StreamReset { stream_id, reason });
-                    writer_pending_bytes = writer_pending_bytes.saturating_add(pending_bytes);
-                    wrote_frame = true;
-                    sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
-                    sent_items = sent_items.saturating_add(1);
+                        .stage_transaction_frame(Frame::StreamReset { stream_id, reason })?;
                     if matches!(
-                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
-                            .await?,
+                        self.commit_transaction_respecting_deferred_input(
+                            &mut writer_pending_bytes,
+                        )
+                        .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
                     self.streams
                         .detach(&self.context, &self.path_registration, stream_id)?;
-                    if self.deferred_input.is_some() {
-                        break;
-                    }
+                    break;
                 }
                 ReliablePathCommand::CloseStream(stream_id) => {
                     if matches!(
-                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
-                            .await?,
+                        self.commit_transaction_respecting_deferred_input(
+                            &mut writer_pending_bytes,
+                        )
+                        .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
@@ -810,8 +860,10 @@ impl ServerTcpPathSession {
                 | ReliablePathCommand::SendDatagramFrame { .. }
                 | ReliablePathCommand::CloseDatagramAttachment { .. } => {
                     if matches!(
-                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
-                            .await?,
+                        self.commit_transaction_respecting_deferred_input(
+                            &mut writer_pending_bytes,
+                        )
+                        .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
@@ -822,8 +874,10 @@ impl ServerTcpPathSession {
                 }
                 ReliablePathCommand::CancelTcpOpen { .. } => {
                     if matches!(
-                        self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
-                            .await?,
+                        self.commit_transaction_respecting_deferred_input(
+                            &mut writer_pending_bytes,
+                        )
+                        .await?,
                         ServerTcpSessionDisposition::Stop
                     ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
@@ -840,18 +894,18 @@ impl ServerTcpPathSession {
 
         if self.deferred_input.is_none() {
             if matches!(
-                self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
+                self.commit_transaction_respecting_deferred_input(&mut writer_pending_bytes)
                     .await?,
                 ServerTcpSessionDisposition::Stop
             ) {
                 return Ok(ServerTcpSessionDisposition::Stop);
             }
-        } else if wrote_frame {
+        } else {
             // The exact probe retained in `deferred_input` already owns the
-            // sole carrier-input slot, so write this bounded batch without
+            // sole carrier-input slot, so commit this transaction without
             // the receive interlock and leave that input untouched.
             if matches!(
-                self.write_batch_respecting_deferred_input(&mut writer_pending_bytes)
+                self.commit_transaction_respecting_deferred_input(&mut writer_pending_bytes)
                     .await?,
                 ServerTcpSessionDisposition::Stop
             ) {
@@ -875,37 +929,29 @@ impl ServerTcpPathSession {
                 sent_items >= item_budget,
             ),
         );
-        if wrote_frame && !self.writer.flush().await? {
-            return Ok(ServerTcpSessionDisposition::Stop);
-        }
         Ok(ServerTcpSessionDisposition::Continue)
     }
 
-    /// Flushes the current writer batch without polling the carrier input when
-    /// that exact input slot already retains a backpressured frame.
-    async fn write_batch_respecting_deferred_input(
+    /// Commits the current writer transaction without polling the carrier input
+    /// when that exact input slot already retains a backpressured frame.
+    async fn commit_transaction_respecting_deferred_input(
         &mut self,
         writer_pending_bytes: &mut usize,
     ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
         if self.deferred_input.is_none() {
-            return self.write_batch_interlocked(writer_pending_bytes).await;
+            return self
+                .commit_transaction_interlocked(writer_pending_bytes)
+                .await;
         }
-        let write_result = self.writer.write_batch(&mut self.evidence).await;
-        let pending_bytes = std::mem::take(writer_pending_bytes);
-        let wrote = match write_result {
-            Ok(wrote) => wrote,
-            Err(error) => {
-                self.commands_rx
-                    .release_pending_command_bytes(pending_bytes);
-                return Err(error);
-            }
-        };
-        if wrote && pending_bytes > 0 {
+        let wrote = self.writer.commit_transaction(&mut self.evidence).await?;
+        if wrote && *writer_pending_bytes > 0 {
             self.evidence
                 .observe_after_write(&self.context, &self.path_registration, self.path_id);
         }
-        self.commands_rx
-            .release_pending_command_bytes(pending_bytes);
+        if wrote {
+            self.commands_rx
+                .release_pending_command_bytes(std::mem::take(writer_pending_bytes));
+        }
         Ok(if wrote {
             ServerTcpSessionDisposition::Continue
         } else {
@@ -913,14 +959,14 @@ impl ServerTcpPathSession {
         })
     }
 
-    async fn write_batch_interlocked(
+    async fn commit_transaction_interlocked(
         &mut self,
         writer_pending_bytes: &mut usize,
     ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
         debug_assert!(self.deferred_input.is_none());
         let mut routed_frames = 0usize;
         let write_result = {
-            let write = self.writer.write_batch(&mut self.evidence);
+            let write = self.writer.commit_transaction(&mut self.evidence);
             tokio::pin!(write);
             loop {
                 tokio::select! {
@@ -938,6 +984,7 @@ impl ServerTcpPathSession {
                         let stream_id = match &frame {
                             Frame::StreamData { stream_id, .. }
                             | Frame::StreamAck { stream_id, .. }
+                            | Frame::StreamReturnPlanFinal { stream_id, .. }
                             | Frame::StreamRequalifyData { stream_id, .. }
                             | Frame::StreamRequalifyAck { stream_id, .. }
                             | Frame::StreamMaxData { stream_id, .. }
@@ -967,8 +1014,7 @@ impl ServerTcpPathSession {
             }
         };
         if write_result {
-            let pending_bytes = std::mem::take(writer_pending_bytes);
-            if pending_bytes > 0 {
+            if *writer_pending_bytes > 0 {
                 self.evidence.observe_after_write(
                     &self.context,
                     &self.path_registration,
@@ -976,8 +1022,10 @@ impl ServerTcpPathSession {
                 );
             }
             self.commands_rx
-                .release_pending_command_bytes(pending_bytes);
+                .release_pending_command_bytes(std::mem::take(writer_pending_bytes));
         }
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = routed_frames;
         #[cfg(feature = "lab-diagnostics")]
         if routed_frames > 0 || self.deferred_input.is_some() {
             lab_diagnostic(

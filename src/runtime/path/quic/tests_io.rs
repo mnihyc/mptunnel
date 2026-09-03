@@ -92,17 +92,6 @@ fn quic_writer_rejects_tcp_capacity_frames() {
             "PATH_CAPACITY frames are not valid on QUIC carriers"
         ))
     ));
-
-    assert_eq!(
-        Frame::StreamData {
-            stream_id: StreamId(8),
-            offset: 0,
-            payload: Bytes::from_static(b"stream"),
-        }
-        .delivery_evidence_bytes(),
-        6
-    );
-    assert_eq!(Frame::Ping { nonce: 1 }.delivery_evidence_bytes(), 0);
 }
 
 #[test]

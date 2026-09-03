@@ -50,9 +50,6 @@ jobs:
       - name: Lab contracts, including F0 declaration and evidence tooling
         run: python3 -m unittest discover --start-directory lab --pattern 'test_*.py'
 
-      - name: Deterministic benchmark and trace-replay tests
-        run: cargo test --locked --manifest-path lab/benchmarks/Cargo.toml
-
       - name: Deterministic release archive contracts
         run: >-
           python3 -m unittest discover

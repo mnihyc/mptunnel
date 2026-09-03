@@ -708,7 +708,7 @@ fn udp_edge_association_queue_is_bounded_by_resource_bytes() {
 }
 
 #[test]
-fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
+fn prospective_tcp_open_load_spreads_new_streams_and_releases_on_drop() {
     let first_path =
         "tcp://127.0.0.1:10021?initial-srtt-s=0.01&initial-rate-mbps=10&max-tcp-carriers=1"
             .parse::<PathSpec>()
@@ -724,7 +724,15 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(1), TrafficClass::Latency);
+    let load = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            TrafficClass::Latency,
+        )
+        .expect("prospective TCP open load");
     assert_eq!(
         context
             .ordered_tcp_path_indices(TrafficClass::Latency, 512)
@@ -733,7 +741,7 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
         Some(1)
     );
 
-    context.release_tcp_path_load(0, TrafficClass::Latency);
+    drop(load);
     assert_eq!(
         context
             .ordered_tcp_path_indices(TrafficClass::Latency, 512)
@@ -747,7 +755,7 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
 }
 
 #[test]
-fn active_interactive_tcp_flow_pushes_bulk_to_other_path() {
+fn prospective_interactive_tcp_open_pushes_bulk_to_other_path() {
     let low_latency_path =
         "tcp://127.0.0.1:10123?initial-srtt-s=0.02&initial-rate-mbps=100&max-tcp-carriers=1"
             .parse::<PathSpec>()
@@ -763,7 +771,15 @@ fn active_interactive_tcp_flow_pushes_bulk_to_other_path() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Latency);
+    let _interactive_open = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            TrafficClass::Latency,
+        )
+        .expect("prospective interactive TCP open");
     context.mark_tcp_path_delivery(
         1,
         PathDeliveryStats {
@@ -891,7 +907,15 @@ fn endpoint_only_tcp_interactive_opens_spread_active_load_without_probe_noise() 
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Latency);
+    let _interactive_open = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            TrafficClass::Latency,
+        )
+        .expect("prospective interactive TCP open");
     context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
 
     assert_eq!(
@@ -973,6 +997,10 @@ fn endpoint_only_mixed_reservation_prefers_proven_low_rtt_over_unproven_idle_pat
         ResourceLimits::default(),
     )
     .expect("context");
+    let first_path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    context.health().lock().expect("client path health").tcp[0].mutate_eligibility(|record| {
+        record.install_tcp_peer_usage(PathId(0), first_path_instance_id, 0, PathUsage::Available);
+    });
 
     let first = context
         .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
@@ -981,6 +1009,7 @@ fn endpoint_only_mixed_reservation_prefers_proven_low_rtt_over_unproven_idle_pat
     context.mark_relay_path_proof_observation(
         UnderlayProtocol::Tcp,
         0,
+        first_path_instance_id,
         PathProofObservation {
             proof_id: 1,
             elapsed: Duration::from_millis(40),
@@ -1009,13 +1038,15 @@ fn endpoint_only_tcp_bulk_load_spreads_replacement_without_realtime_work() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Latency);
-    context.change_relay_path_lane_load(
-        UnderlayProtocol::Tcp,
-        0,
-        TrafficClass::Latency,
-        TrafficClass::Throughput,
-    );
+    let _bulk_open = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("prospective bulk TCP open");
 
     let reserved = context
         .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
@@ -1042,14 +1073,24 @@ fn endpoint_only_tcp_bulk_load_keeps_new_interactive_streams_latency_first_with_
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Latency);
-    context.change_relay_path_lane_load(
-        UnderlayProtocol::Tcp,
-        0,
-        TrafficClass::Latency,
-        TrafficClass::Throughput,
-    );
-    context.mark_udp_path_open_success(0, Duration::from_millis(30));
+    let _bulk_open = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("prospective bulk TCP open");
+    let _realtime_open = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("prospective realtime QUIC open");
 
     let reserved = context
         .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
@@ -1073,14 +1114,24 @@ fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_late
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Latency);
-    context.change_relay_path_lane_load(
-        UnderlayProtocol::Tcp,
-        0,
-        TrafficClass::Latency,
-        TrafficClass::Throughput,
-    );
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Latency);
+    let _bulk_open = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("prospective bulk TCP open");
+    let _interactive_open = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            TrafficClass::Latency,
+        )
+        .expect("prospective interactive TCP open");
 
     let reserved = context
         .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
@@ -1131,12 +1182,14 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
         health.udp[0].mark_quic_path_metrics(
             path_instance_id,
             UdpPathMetrics {
+                controller_path_epoch: 1,
                 direction: PathMetricDirection::ClientToServer,
                 srtt: Duration::from_millis(42),
                 rttvar: Duration::from_millis(7),
                 rtt_observed: true,
                 delivery_rate_bps: 300_000_000.0,
                 pacing_rate_bps: 300_000_000.0,
+                controller_bandwidth_bps: None,
                 inflight_hi: 512 * 1024,
                 bytes_in_flight: 48 * 1024,
                 pending_bytes: 64 * 1024,
@@ -1174,12 +1227,14 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
         health.udp[0].mark_quic_path_metrics(
             path_instance_id,
             UdpPathMetrics {
+                controller_path_epoch: 1,
                 direction: PathMetricDirection::ClientToServer,
                 srtt: Duration::from_millis(42),
                 rttvar: Duration::from_millis(7),
                 rtt_observed: true,
                 delivery_rate_bps: 300_000_000.0,
                 pacing_rate_bps: 300_000_000.0,
+                controller_bandwidth_bps: None,
                 inflight_hi: 512 * 1024,
                 bytes_in_flight: 48 * 1024,
                 pending_bytes: 64 * 1024,
@@ -1210,7 +1265,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
 }
 
 #[test]
-fn active_udp_load_spreads_new_associations_and_releases_on_close() {
+fn prospective_udp_open_load_spreads_new_associations_and_releases_on_drop() {
     let first_path = "quic://127.0.0.1:10031?initial-srtt-s=0.01&initial-rate-mbps=10"
         .parse::<PathSpec>()
         .expect("first path");
@@ -1225,7 +1280,15 @@ fn active_udp_load_spreads_new_associations_and_releases_on_close() {
     .expect("context");
 
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
-    context.mark_udp_path_open_success(0, Duration::from_millis(1));
+    let load = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("prospective UDP open load");
     assert_eq!(
         udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS)
             .first()
@@ -1233,7 +1296,7 @@ fn active_udp_load_spreads_new_associations_and_releases_on_close() {
         Some(1)
     );
 
-    context.release_udp_path_load(0);
+    drop(load);
     assert!(udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS).contains(&0));
     let health = context.health().lock().expect("health lock");
     assert_eq!(health.udp[0].active_flows, 0);

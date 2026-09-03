@@ -5,11 +5,14 @@
 //! inputs and apply their outputs.
 
 pub(crate) mod ack_clock;
+pub(crate) mod acquisition_cursor;
 pub(crate) mod admission;
 pub(crate) mod capacity;
+pub(crate) mod carrier_rate_authority;
 pub(crate) mod datagram;
 pub(crate) mod multipath;
 pub(crate) mod path;
+pub(crate) mod product_qualification;
 pub(crate) mod requalification;
 pub(crate) mod request_capacity;
 pub(crate) mod request_evidence;

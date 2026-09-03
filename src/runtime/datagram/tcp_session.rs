@@ -38,7 +38,7 @@ impl TcpDatagramClientSession {
         context: &ClientPathContext,
         path_index: usize,
         open_deadline: tokio::time::Instant,
-        load_lease: RelayPathLoadLease,
+        mut load_lease: RelayPathLoadLease,
     ) -> Result<Self, RuntimeError> {
         context
             .tcp_paths
@@ -53,6 +53,9 @@ impl TcpDatagramClientSession {
             .ok_or(RuntimeError::NoSchedulableTcpPath)?
             .open_datagram_attachment(open_deadline, frame_queue)
             .await?;
+        if !load_lease.bind_to_instance(attachment.path_instance_id()) {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
         let path_snapshot = attachment.path_snapshot();
         Ok(Self {
             attachment,

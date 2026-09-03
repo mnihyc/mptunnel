@@ -20,13 +20,14 @@ use crate::mux::MuxLimits;
 use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+#[cfg(feature = "lab-diagnostics")]
+use crate::runtime::path::commands::reliable_path_command_writer_run_bytes;
 use crate::runtime::path::commands::{
     ClientTcpOpenedDatagramAttachment, ReliablePathCommand, ReliablePathCommandReceivers,
     TcpCapacityProbeCommand, reliable_path_command_pending_bytes,
     reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
-    reliable_path_writer_frame_queue, try_coalesce_reliable_path_writer_run,
-    try_recv_reliable_path_command,
+    reliable_path_frame_requires_capacity_command, reliable_path_writer_frame_queue,
+    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
@@ -61,11 +62,15 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
     let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
     let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
     let mut next_command = Some(first_command);
-    pending_frames.clear();
+    ensure_client_tcp_transaction_closed(pending_frames, 0)?;
+    #[cfg(feature = "lab-diagnostics")]
     let mut sent_bytes = 0usize;
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let sent_bytes = 0usize;
     let mut sent_items = 0usize;
-    let mut wrote_frame = false;
     let mut terminal_stream_id = None;
+    let mut writer_pending_bytes = 0usize;
+    let mut deferred_frame = None;
 
     loop {
         let Some(command) = next_command.take().or_else(|| {
@@ -89,6 +94,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
             break;
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        #[cfg(feature = "lab-diagnostics")]
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         match command {
             ReliablePathCommand::SendFrame(frame)
@@ -100,7 +106,6 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 ));
             }
             ReliablePathCommand::SendFrame(frame) => {
-                let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
                 #[cfg(feature = "lab-diagnostics")]
                 if let Frame::StreamAck {
                     stream_id,
@@ -122,15 +127,30 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                         ),
                     );
                 }
+                writer_pending_bytes = writer_pending_bytes.checked_add(pending_bytes).ok_or(
+                    RuntimeError::Protocol("client TCP writer transaction byte overflow"),
+                )?;
                 pending_frames.push(frame);
-                commands.release_pending_command_bytes(pending_bytes);
-                wrote_frame = true;
-                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
-                sent_items = sent_items.saturating_add(1);
-                if is_stream_detach || sent_bytes >= byte_budget || sent_items >= item_budget {
-                    break;
+                #[cfg(feature = "lab-diagnostics")]
+                {
+                    sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+                    sent_items = sent_items.saturating_add(1);
                 }
-                continue;
+                commit_client_tcp_command_frame_transaction(
+                    connection,
+                    pending_frames,
+                    streams,
+                    closed_streams,
+                    datagrams,
+                    runtime,
+                    commands,
+                    &mut writer_pending_bytes,
+                    &mut deferred_frame,
+                )
+                .await?;
+                // One ordinary frame is one irreversible transaction. Return
+                // to the actor so all lanes arbitrate the next command head.
+                break;
             }
             ReliablePathCommand::SendTcpCapacityProbe(probe) => {
                 let stream_id = probe.stream_id;
@@ -146,6 +166,19 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                     // canceled transactions rather than shared-path failures.
                     probe.request_lease().refund_if_unwritten();
                     commands.release_pending_command_bytes(pending_bytes);
+                    commit_client_tcp_command_frame_transaction(
+                        connection,
+                        pending_frames,
+                        streams,
+                        closed_streams,
+                        datagrams,
+                        runtime,
+                        commands,
+                        &mut writer_pending_bytes,
+                        &mut deferred_frame,
+                    )
+                    .await?;
+                    ensure_client_tcp_transaction_closed(pending_frames, writer_pending_bytes)?;
                     return Ok(());
                 }
                 if probe.path_id != runtime.path_id()
@@ -162,13 +195,16 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                         "request TCP capacity command does not match its writer",
                     ));
                 }
-                if let Err(error) = flush_client_tcp_frame_batch(
+                if let Err(error) = commit_client_tcp_command_frame_transaction(
                     connection,
                     pending_frames,
                     streams,
                     closed_streams,
                     datagrams,
                     runtime,
+                    commands,
+                    &mut writer_pending_bytes,
+                    &mut deferred_frame,
                 )
                 .await
                 {
@@ -178,6 +214,7 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 if Instant::now() >= probe.expires_at {
                     probe.request_lease().refund_if_unwritten();
                     commands.release_pending_command_bytes(pending_bytes);
+                    ensure_client_tcp_transaction_closed(pending_frames, writer_pending_bytes)?;
                     return Ok(());
                 }
                 let measurement_result = client_write_tcp_capacity_probe_interlocked(
@@ -243,12 +280,15 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                     )
                     .await?;
                 }
+                ensure_client_tcp_transaction_closed(pending_frames, writer_pending_bytes)?;
                 return Ok(());
             }
             ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
-                pending_frames.push(Frame::StreamReset { stream_id, reason });
-                commands.release_pending_command_bytes(pending_bytes);
-                wrote_frame = true;
+                let frame = Frame::StreamReset { stream_id, reason };
+                writer_pending_bytes = writer_pending_bytes.checked_add(pending_bytes).ok_or(
+                    RuntimeError::Protocol("client TCP writer transaction byte overflow"),
+                )?;
+                pending_frames.push(frame);
                 #[cfg(feature = "lab-diagnostics")]
                 {
                     sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
@@ -258,13 +298,16 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
                 break;
             }
             command => {
-                flush_client_tcp_frame_batch(
+                commit_client_tcp_command_frame_transaction(
                     connection,
                     pending_frames,
                     streams,
                     closed_streams,
                     datagrams,
                     runtime,
+                    commands,
+                    &mut writer_pending_bytes,
+                    &mut deferred_frame,
                 )
                 .await?;
                 handle_connected_client_tcp_command(
@@ -290,15 +333,19 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
         }
     }
 
-    flush_client_tcp_frame_batch(
+    commit_client_tcp_command_frame_transaction(
         connection,
         pending_frames,
         streams,
         closed_streams,
         datagrams,
         runtime,
+        commands,
+        &mut writer_pending_bytes,
+        &mut deferred_frame,
     )
     .await?;
+    ensure_client_tcp_transaction_closed(pending_frames, writer_pending_bytes)?;
     if let Some(stream_id) = terminal_stream_id {
         // TCP sessions are shared: terminal product state retires only this
         // stream after its reset is committed to the carrier writer.
@@ -321,31 +368,52 @@ pub(in crate::runtime::path::tcp) async fn handle_connected_client_tcp_command_r
             sent_items >= item_budget,
         ),
     );
-    if wrote_frame {
-        connection.carrier.writer.flush().await?;
-    }
     runtime.observe_sender_transport_state(connection, false);
     Ok(())
 }
 
-pub(in crate::runtime::path::tcp) async fn flush_client_tcp_frame_batch(
+/// Commits one client command transaction to the protected TCP writer before
+/// releasing the byte charge transferred from the command queues.
+///
+/// A failed write deliberately leaves the charge with `commands`; the
+/// receiver's terminal `Drop` reconciles every dequeued-but-unreleased byte.
+fn release_client_tcp_writer_transaction_charge(
+    commands: &ReliablePathCommandReceivers,
+    writer_pending_bytes: &mut usize,
+) {
+    commands.release_pending_command_bytes(std::mem::take(writer_pending_bytes));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_client_tcp_command_frame_transaction(
     connection: &mut ClientTcpPathConnection,
     frames: &mut Vec<Frame>,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
+    commands: &ReliablePathCommandReceivers,
+    writer_pending_bytes: &mut usize,
+    deferred_frame: &mut Option<Frame>,
 ) -> Result<(), RuntimeError> {
-    let deferred_frame = write_client_tcp_frame_batch_interlocked(
+    if frames.is_empty() {
+        return ensure_client_tcp_transaction_closed(frames, *writer_pending_bytes);
+    }
+    commit_client_tcp_frame_transaction_interlocked(
         connection,
         frames,
         streams,
         closed_streams,
         datagrams,
         runtime,
+        deferred_frame,
     )
     .await?;
-    if let Some(frame) = deferred_frame {
+    // Publish the exact post-commit native state before releasing private
+    // writer debt; that release can wake admission and scheduling waiters.
+    runtime.observe_sender_transport_state(connection, true);
+    release_client_tcp_writer_transaction_charge(commands, writer_pending_bytes);
+    if let Some(frame) = deferred_frame.take() {
         handle_client_tcp_path_frame(
             frame,
             connection,
@@ -359,8 +427,92 @@ pub(in crate::runtime::path::tcp) async fn flush_client_tcp_frame_batch(
     Ok(())
 }
 
+fn ensure_client_tcp_transaction_closed(
+    frames: &[Frame],
+    writer_pending_bytes: usize,
+) -> Result<(), RuntimeError> {
+    if frames.is_empty() && writer_pending_bytes == 0 {
+        Ok(())
+    } else {
+        Err(RuntimeError::Protocol(
+            "client TCP writer returned with an uncommitted transaction",
+        ))
+    }
+}
+
+/// Commits one ordinary head, or the explicitly ordered terminal drain, with
+/// one protected encode/write and one flush. Sent evidence and queue ownership
+/// remain unpublished until both operations succeed.
+#[allow(clippy::too_many_arguments)]
+async fn commit_client_tcp_frame_transaction_interlocked(
+    connection: &mut ClientTcpPathConnection,
+    frames: &mut Vec<Frame>,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    datagrams: &mut ClientTcpDatagramState,
+    runtime: &ClientTcpPathSessionRuntime,
+    deferred_frame: &mut Option<Frame>,
+) -> Result<(), RuntimeError> {
+    let mut routed_frames = 0usize;
+    if deferred_frame.is_some() {
+        connection.carrier.writer.write_frames(frames).await?;
+        connection.carrier.writer.flush().await?;
+    } else {
+        let commit = async {
+            connection.carrier.writer.write_frames(frames).await?;
+            connection.carrier.writer.flush().await
+        };
+        tokio::pin!(commit);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut commit => break result?,
+                incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() => {
+                    match incoming {
+                        Some(Ok(frame)) => match try_route_client_tcp_frame_during_write_for_session(
+                            frame,
+                            streams,
+                            closed_streams,
+                            datagrams,
+                            runtime,
+                            connection.path_instance_id,
+                        )? {
+                            ClientTcpWriteFrameRoute::Routed => {
+                                routed_frames = routed_frames.saturating_add(1);
+                            }
+                            ClientTcpWriteFrameRoute::Barrier(frame) => {
+                                *deferred_frame = Some(frame);
+                            }
+                        },
+                        Some(Err(err)) => return Err(RuntimeError::Encrypted(err)),
+                        None => return Err(RuntimeError::ReliablePathSessionClosed),
+                    }
+                }
+            }
+        }
+    }
+    // The successful write+flush is the transaction boundary.
+    publish_client_tcp_frame_transaction(connection, frames, runtime);
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = routed_frames;
+    #[cfg(feature = "lab-diagnostics")]
+    if routed_frames > 0 || deferred_frame.is_some() {
+        lab_diagnostic(
+            "client_tcp_write_feedback_interlock",
+            format_args!(
+                "path_index={} routed_frames={} deferred_frames={}",
+                runtime.path_index,
+                routed_frames,
+                usize::from(deferred_frame.is_some()),
+            ),
+        );
+    }
+    Ok(())
+}
+
 /// Writes one ordered frame batch while preserving an inbound barrier for the
-/// caller that owns the next lifecycle transition.
+/// caller that owns the next lifecycle transition. The batch is one commit:
+/// neither proof evidence nor frame ownership moves before the final flush.
 pub(in crate::runtime::path::tcp) async fn write_client_tcp_frame_batch_interlocked(
     connection: &mut ClientTcpPathConnection,
     frames: &mut Vec<Frame>,
@@ -369,49 +521,30 @@ pub(in crate::runtime::path::tcp) async fn write_client_tcp_frame_batch_interloc
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<Option<Frame>, RuntimeError> {
-    #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = runtime;
     if frames.is_empty() {
         return Ok(None);
     }
     let mut deferred_frame = None;
-    let mut routed_frames = 0usize;
-    {
-        let write = connection.carrier.writer.write_frames(frames);
-        tokio::pin!(write);
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut write => {
-                    result?;
-                    break;
-                }
-                incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() => {
-                    match incoming {
-                        Some(Ok(frame)) => {
-                            match try_route_client_tcp_frame_during_write_for_session(
-                                frame,
-                                streams,
-                                closed_streams,
-                                datagrams,
-                                runtime,
-                                connection.path_instance_id,
-                            )? {
-                                ClientTcpWriteFrameRoute::Routed => {
-                                    routed_frames = routed_frames.saturating_add(1);
-                                }
-                                ClientTcpWriteFrameRoute::Barrier(frame) => {
-                                    deferred_frame = Some(frame);
-                                }
-                            }
-                        }
-                        Some(Err(err)) => return Err(RuntimeError::Encrypted(err)),
-                        None => return Err(RuntimeError::ReliablePathSessionClosed),
-                    }
-                }
-            }
-        }
-    }
+    commit_client_tcp_frame_transaction_interlocked(
+        connection,
+        frames,
+        streams,
+        closed_streams,
+        datagrams,
+        runtime,
+        &mut deferred_frame,
+    )
+    .await?;
+    Ok(deferred_frame)
+}
+
+fn publish_client_tcp_frame_transaction(
+    connection: &mut ClientTcpPathConnection,
+    frames: &mut Vec<Frame>,
+    runtime: &ClientTcpPathSessionRuntime,
+) {
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = runtime;
     #[cfg(feature = "lab-diagnostics")]
     for frame in frames.iter() {
         if let Frame::StreamAck {
@@ -439,19 +572,6 @@ pub(in crate::runtime::path::tcp) async fn write_client_tcp_frame_batch_interloc
     }
     frames.clear();
     connection.record_outbound_activity();
-    #[cfg(feature = "lab-diagnostics")]
-    if routed_frames > 0 || deferred_frame.is_some() {
-        lab_diagnostic(
-            "client_tcp_write_feedback_interlock",
-            format_args!(
-                "path_index={} routed_frames={} deferred_frames={}",
-                runtime.path_index,
-                routed_frames,
-                usize::from(deferred_frame.is_some()),
-            ),
-        );
-    }
-    Ok(deferred_frame)
 }
 
 struct ClientTcpCapacityProbeInterlock<'a> {
@@ -746,6 +866,7 @@ async fn handle_connected_client_tcp_command(
             target,
             lane,
             initial_demand,
+            return_plan,
             advertised_recv_max_offset,
             open_deadlines,
             session_commands,
@@ -759,6 +880,7 @@ async fn handle_connected_client_tcp_command(
                 target,
                 lane,
                 initial_demand,
+                return_plan,
                 advertised_recv_max_offset,
                 open_deadline,
                 session_commands,

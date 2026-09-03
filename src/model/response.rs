@@ -33,6 +33,10 @@ pub(crate) struct ResponsePathObservation {
     pub(crate) stale_for_original_data: bool,
     #[cfg(test)]
     pub(crate) has_path_proof_evidence: bool,
+    /// Fresh exact Product delivery at the configured qualification floor.
+    /// Native carrier evidence cannot set this bit.
+    pub(crate) product_assignment_qualified: bool,
+    /// Fresh achieved-service evidence usable for completion ranking.
     pub(crate) has_bulk_rate_evidence: bool,
 }
 

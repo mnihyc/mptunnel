@@ -116,7 +116,9 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_path_frame(
                         underlay: crate::protocol::UnderlayProtocol::Tcp,
                         index: runtime.path_index,
                     },
-                    |record| record.mark_path_proof_success(observation),
+                    |record| {
+                        record.mark_path_proof_success(connection.path_instance_id, observation)
+                    },
                 );
             }
             Ok(())

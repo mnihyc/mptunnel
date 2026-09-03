@@ -134,7 +134,14 @@ fn canonical_initial_rate_forms_are_exact_and_mutually_exclusive() {
             .parse::<PathSpec>()
             .expect("canonical rate form");
         assert_eq!(path.metadata.initial_rate, expected, "{query}");
+        assert!(path.metadata.initial_rate_explicit, "{query}");
     }
+
+    let omitted = "tcp://example.com:443"
+        .parse::<PathSpec>()
+        .expect("rate omission");
+    assert_eq!(omitted.metadata.initial_rate, RateHint::Unknown);
+    assert!(!omitted.metadata.initial_rate_explicit);
 
     for invalid in [
         "initial-rate-bps=0",
@@ -152,6 +159,57 @@ fn canonical_initial_rate_forms_are_exact_and_mutually_exclusive() {
             "invalid rate must be rejected: {invalid}"
         );
     }
+}
+
+#[test]
+fn quic_initial_rate_rejects_inexact_native_startup_targets_only() {
+    const MAX_EXACT_RATE_BPS: u64 = 1 << 56;
+
+    let exact = format!("quic://example.com:443?initial-rate-bps={MAX_EXACT_RATE_BPS}")
+        .parse::<PathSpec>()
+        .expect("exact f64 pacing boundary");
+    assert_eq!(
+        exact.metadata.initial_rate,
+        RateHint::BitsPerSecond(MAX_EXACT_RATE_BPS),
+    );
+    let target = exact
+        .metadata
+        .quic_startup_target()
+        .expect("exact target validation")
+        .expect("finite target");
+    assert_eq!(target.pacing_bytes_per_second, 9_007_199_254_740_992);
+    assert_eq!(target.window_bytes, 2_999_397_351_828_751);
+
+    assert!(matches!(
+        format!(
+            "quic://example.com:443?initial-rate-bps={}",
+            MAX_EXACT_RATE_BPS + 1
+        )
+        .parse::<PathSpec>(),
+        Err(PathSpecParseError::QuicInitialRateTargetOutOfRange)
+    ));
+    assert!(matches!(
+        format!(
+            "quic://example.com:443?initial-rate-bps={MAX_EXACT_RATE_BPS}&initial-srtt-s=4294967.295"
+        )
+        .parse::<PathSpec>(),
+        Err(PathSpecParseError::QuicInitialRateTargetOutOfRange)
+    ));
+
+    "quic://example.com:443?initial-srtt-s=4294967.295&initial-rate=unlimited"
+        .parse::<PathSpec>()
+        .expect("unlimited does not manufacture a native startup target");
+
+    let tcp = format!(
+        "tcp://example.com:443?initial-rate-bps={}",
+        MAX_EXACT_RATE_BPS + 1
+    )
+    .parse::<PathSpec>()
+    .expect("TCP has no native BBR f64 target");
+    assert_eq!(
+        tcp.metadata.initial_rate,
+        RateHint::BitsPerSecond(MAX_EXACT_RATE_BPS + 1),
+    );
 }
 
 #[test]

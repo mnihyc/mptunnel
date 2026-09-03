@@ -1,13 +1,16 @@
 use super::*;
 use crate::model::capacity::{
     MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES,
-    adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_reinjection_bytes,
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
+    adaptive_reliable_relay_reinjection_bytes, data_level_service_window_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_bulk_product_windows,
+    reliable_product_feedback_window_bytes, reliable_product_recovery_window_bytes,
+    reliable_relay_buffer_len,
 };
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::timing::{reliable_data_retransmission_interval, transport_pto_from_snapshot};
 use crate::model::work::{
-    reliable_critical_tail_reinjection_limit_bytes, reliable_reinjection_service_limit_bytes,
+    ReliableReinjectionTargetWork, reliable_critical_tail_reinjection_limit_bytes,
+    reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::validate_stream_ack;
@@ -798,28 +801,81 @@ fn critical_reinjection_limit_uses_one_event_quantum() {
 }
 
 #[test]
-fn reinjection_service_uses_available_target_flight() {
+fn reinjection_service_fails_closed_without_exact_product_authority() {
+    let limits = MuxLimits::default();
+    let path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 40.0, 400_000_000.0);
+
+    assert_eq!(path.data_level_limit_bytes, 0);
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(path), 0, 0),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        0,
+        "an exact target without published Product authority cannot mint an emergency reserve",
+    );
+}
+
+#[test]
+fn native_window_does_not_rewrite_product_recovery_authority() {
     let limits = MuxLimits::default();
     let mut tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
+    tcp.product_progress_rate_bps = Some(400_000_000.0);
+    tcp.has_durable_product_progress = true;
     let base_limit = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
         adaptive_reliable_relay_reinjection_bytes(Some(tcp), TrafficClass::Throughput, limits),
     );
     let target_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
+        reliable_product_feedback_window_bytes(Some(tcp), TrafficClass::Throughput, limits);
+    tcp.data_level_limit_bytes = target_flight as u64;
     tcp.data_level_bytes_in_flight = target_flight as u64;
     tcp.queue_bytes = target_flight as u64;
     tcp.carrier_inflight_limit_bytes = PATH_OPEN_SCORE_BYTES as u64;
-    let congested_recovery_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
+    let retained_product_ceiling =
+        reliable_product_feedback_window_bytes(Some(tcp), TrafficClass::Throughput, limits);
 
     assert_eq!(
-        reliable_reinjection_service_limit_bytes(Some(tcp), 0, limits.max_repair_bytes, limits,),
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(tcp), 0, 0),
+            limits.max_repair_bytes,
+            limits,
+        ),
         reliable_critical_tail_reinjection_limit_bytes(base_limit, limits.max_repair_bytes, limits,),
         "a full target retains one product work quantum while native congestion gates emission",
     );
     assert_eq!(
-        congested_recovery_flight, target_flight,
-        "carrier queue and congestion credit gate emission below MPP; they do not shrink the retained-data recovery window a second time"
+        retained_product_ceiling, target_flight,
+        "a smaller native window gates the carrier writer; it cannot become a second Product controller",
+    );
+}
+
+#[test]
+fn quic_recovery_does_not_replace_product_authority_with_a_sampled_opportunity() {
+    let limits = MuxLimits::default();
+    let mut quic = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 100.0, 500_000_000.0);
+    quic.carrier_inflight_limit_bytes = 1024 * 1024;
+    let forward_ceiling =
+        reliable_product_feedback_window_bytes(Some(quic), TrafficClass::Throughput, limits);
+    quic.data_level_limit_bytes = forward_ceiling as u64;
+    let recovery_window =
+        reliable_product_recovery_window_bytes(Some(quic), TrafficClass::Throughput, limits);
+    let modeled_recovery =
+        data_level_service_window_bytes(quic, TrafficClass::Throughput, limits).ceil() as usize;
+
+    assert_eq!(recovery_window, forward_ceiling);
+    assert!(
+        recovery_window > modeled_recovery,
+        "a transient sampled rate must not shrink the exact Product recovery authority",
+    );
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(quic), 0, 0),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        forward_ceiling,
+        "an idle healthy QUIC target keeps the configured Product recovery window",
     );
 }
 
@@ -827,13 +883,13 @@ fn reinjection_service_uses_available_target_flight() {
 fn reinjection_service_is_transport_neutral_above_native_congestion() {
     let limits = MuxLimits::default();
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
-        let path = PathSnapshot::new(PathId(1), underlay, 40.0, 400_000_000.0);
+        let mut path = PathSnapshot::new(PathId(1), underlay, 40.0, 400_000_000.0);
         let target_flight =
-            adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, limits);
+            reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, limits);
+        path.data_level_limit_bytes = target_flight as u64;
         assert_eq!(
             reliable_reinjection_service_limit_bytes(
-                Some(path),
-                0,
+                ReliableReinjectionTargetWork::new(Some(path), 0, 0),
                 limits.max_repair_bytes,
                 limits,
             ),
@@ -848,43 +904,194 @@ fn reinjection_service_is_transport_neutral_above_native_congestion() {
 }
 
 #[test]
-fn reinjection_service_counts_queue_and_flight_as_committed_target_work() {
+fn reinjection_service_counts_only_exact_product_recovery_authority() {
     let limits = MuxLimits::default();
-    let path = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 40.0, 400_000_000.0);
-    let target_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, limits);
-    let base_limit = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
+    let mut path = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 40.0, 400_000_000.0);
+    path.data_level_limit_bytes =
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, limits) as u64;
+    let target_window =
+        reliable_product_recovery_window_bytes(Some(path), TrafficClass::Throughput, limits);
+    let emergency_reserve = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
         adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits),
     );
     let mut occupied = path;
-    occupied.data_level_bytes_in_flight = (target_flight / 2) as u64;
+    occupied.data_level_bytes_in_flight = (target_window / 2) as u64;
+    let remaining_ordinary = target_window / 2;
+    assert!(remaining_ordinary > emergency_reserve);
 
     assert_eq!(
         reliable_reinjection_service_limit_bytes(
-            Some(occupied),
-            target_flight / 2,
+            ReliableReinjectionTargetWork::new(
+                Some(occupied),
+                remaining_ordinary / 2,
+                remaining_ordinary / 2,
+            ),
             limits.max_repair_bytes,
             limits,
         ),
-        reliable_critical_tail_reinjection_limit_bytes(base_limit, limits.max_repair_bytes, limits,),
-        "current queued Product work and Product flight consume one shared service window",
+        0,
+        "exact queued and accepted ReinjectedData consume the remaining target repair authority",
     );
 
-    occupied.data_level_queue_bytes = target_flight.saturating_mul(2) as u64;
-    let available_after_flight = target_flight.saturating_sub(target_flight / 2);
+    occupied.queue_bytes = target_window.saturating_mul(2) as u64;
+    occupied.bytes_in_flight = target_window.saturating_mul(2) as u64;
+    occupied.data_level_queue_bytes = target_window.saturating_mul(2) as u64;
     assert_eq!(
         reliable_reinjection_service_limit_bytes(
-            Some(occupied),
-            0,
+            ReliableReinjectionTargetWork::new(Some(occupied), 0, 0),
             limits.max_repair_bytes,
             limits,
         ),
         reliable_critical_tail_reinjection_limit_bytes(
-            base_limit.max(available_after_flight),
+            remaining_ordinary,
             limits.max_repair_bytes,
             limits,
         ),
-        "an older published view of the shared queue cannot consume current service authority",
+        "sampled native queue/flight and aggregate Product staging are telemetry, not exact-target repair admission",
+    );
+}
+
+#[test]
+fn native_backlog_cannot_zero_exact_repair_at_500_and_10_mbps() {
+    let limits = MuxLimits::default();
+    let configured_window =
+        usize::try_from(reliable_bulk_product_windows(limits).per_output_product_limit_bytes)
+            .unwrap_or(usize::MAX);
+    for (rate_bps, carrier_window) in [(500_000_000.0, 6_250_000_u64), (10_000_000.0, 125_000_u64)]
+    {
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let mut path = PathSnapshot::new(PathId(1), underlay, 100.0, rate_bps);
+            path.carrier_delivery_rate_bps = Some(rate_bps);
+            path.carrier_inflight_limit_bytes = carrier_window;
+            path.data_level_limit_bytes = reliable_product_feedback_window_bytes(
+                Some(path),
+                TrafficClass::Throughput,
+                limits,
+            ) as u64;
+            let target_window = reliable_product_recovery_window_bytes(
+                Some(path),
+                TrafficClass::Throughput,
+                limits,
+            );
+            assert_eq!(
+                target_window, configured_window,
+                "sampled rate and native window cannot rewrite Product recovery authority",
+            );
+
+            let emergency_reserve = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
+                adaptive_reliable_relay_reinjection_bytes(
+                    Some(path),
+                    TrafficClass::Throughput,
+                    limits,
+                ),
+            );
+            path.queue_bytes = target_window.saturating_add(emergency_reserve) as u64;
+            path.bytes_in_flight = target_window.saturating_add(emergency_reserve) as u64;
+
+            assert_eq!(
+                reliable_reinjection_service_limit_bytes(
+                    ReliableReinjectionTargetWork::new(Some(path), 0, 0),
+                    limits.max_repair_bytes,
+                    limits,
+                ),
+                target_window,
+                "aggregate native queue+flight is not a Product ledger and cannot veto exact repair",
+            );
+        }
+    }
+}
+
+#[test]
+fn reinjection_consumes_published_product_authority_without_recomputing_older_c() {
+    let limits = MuxLimits::default();
+    let mut published = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 100.0, 500_000_000.0);
+    published.carrier_inflight_limit_bytes = 1024 * 1024;
+    published.product_progress_rate_bps = Some(500_000_000.0);
+    published.has_durable_product_progress = true;
+    published.data_level_limit_bytes = 9_440_536;
+
+    assert_eq!(
+        reliable_product_recovery_window_bytes(Some(published), TrafficClass::Throughput, limits,),
+        9_440_536,
+        "K consumes the timestamp-coherent published P; it cannot reapply an older 1 MiB C to a newer 500 Mbit/s R",
+    );
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(published), 0, 0),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        9_440_536,
+    );
+}
+
+#[test]
+fn reinjection_service_emergency_quantum_is_one_target_reserve_not_event_credit() {
+    let limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 100.0, 400_000_000.0);
+    path.data_level_limit_bytes =
+        reliable_product_feedback_window_bytes(Some(path), TrafficClass::Throughput, limits) as u64;
+    let target_window =
+        reliable_product_recovery_window_bytes(Some(path), TrafficClass::Throughput, limits);
+    let emergency_quantum = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
+        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits),
+    );
+    path.data_level_bytes_in_flight = target_window as u64;
+
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(path), 0, 0),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        emergency_quantum,
+        "a full target retains one bounded liveness reserve",
+    );
+
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(path), 0, emergency_quantum),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        0,
+        "accepted repair consumes the target reserve instead of renewing it on every recovery event",
+    );
+
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(path), 0, emergency_quantum / 2),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        emergency_quantum / 2,
+        "only the unoccupied portion of the target reserve remains available",
+    );
+
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(
+                Some(path),
+                emergency_quantum / 2,
+                emergency_quantum / 2,
+            ),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        0,
+        "path-unbound queued repair reserves the same emergency authority before dispatch",
+    );
+
+    path.queue_bytes = target_window.saturating_add(emergency_quantum) as u64;
+    path.bytes_in_flight = target_window.saturating_add(emergency_quantum) as u64;
+    assert_eq!(
+        reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(Some(path), 0, 0),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        emergency_quantum,
+        "native backlog cannot impersonate accepted ReinjectedData or consume the Product reserve",
     );
 }
 
@@ -1126,21 +1333,20 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
         true,
         now + reinjection_delay + Duration::from_millis(1),
     ));
-    progress.record_reinjection_queued_at(
-        now + reinjection_delay + Duration::from_millis(1),
-        reinjection_delay,
+    assert!(
+        progress.reinjection_ready_at(
+            true,
+            &grown,
+            true,
+            true,
+            now + reinjection_delay + Duration::from_millis(2),
+        ),
+        "sender-queue admission is not post-commit repeat authority"
     );
-    assert!(!progress.reinjection_ready_at(
-        true,
-        &grown,
-        true,
-        true,
-        now + reinjection_delay + Duration::from_millis(2),
-    ));
 }
 
 #[test]
-fn ack_gap_reinjection_progress_resets_repeat_suppression_when_frontier_advances() {
+fn ack_gap_reinjection_progress_accepts_an_advanced_frontier() {
     let mut progress = ReliableAckGapReinjectionProgress::default();
     let first = [
         OffsetRange {
@@ -1168,7 +1374,6 @@ fn ack_gap_reinjection_progress_resets_repeat_suppression_when_frontier_advances
 
     assert!(!progress.reinjection_ready_at(true, &first, true, false, now,));
     assert!(progress.reinjection_ready_at(true, &first, true, true, now + reinjection_delay,));
-    progress.record_reinjection_queued_at(now + reinjection_delay, reinjection_delay);
     assert!(progress.reinjection_ready_at(
         true,
         &advanced,
@@ -1284,7 +1489,7 @@ fn ack_gap_owner_clocks_are_monotonic_but_target_deadline_is_current() {
 }
 
 #[test]
-fn ack_gap_reinjection_requires_measured_loss_and_suppresses_repeat_attempts() {
+fn ack_gap_reinjection_requires_measured_loss_but_does_not_own_copy_lifetime() {
     let ranges = [
         OffsetRange {
             start: 0,
@@ -1296,31 +1501,75 @@ fn ack_gap_reinjection_requires_measured_loss_and_suppresses_repeat_attempts() {
         },
     ];
     let now = Instant::now();
-    let reinjection_delay = Duration::from_millis(300);
-
     let mut progress = ReliableAckGapReinjectionProgress::default();
     assert!(!progress.reinjection_ready_at(true, &ranges, true, false, now,));
     assert!(progress.reinjection_ready_at(true, &ranges, true, true, now,));
-    progress.record_reinjection_queued_at(now, reinjection_delay);
-    assert_eq!(
-        progress.repeat_reinjection_deadline(),
-        now.checked_add(reinjection_delay),
-        "repeat suppression is owned by the selected recovery copy deadline",
+    assert!(
+        progress.reinjection_ready_at(true, &ranges, true, true, now + Duration::from_millis(1),),
+        "queued overlap owns pre-commit suppression and the exact flight ledger owns post-commit suppression"
     );
-    assert!(!progress.reinjection_ready_at(
-        true,
-        &ranges,
-        true,
-        true,
-        now + Duration::from_millis(1),
+}
+
+#[test]
+fn accepted_copy_wake_consumes_due_predecessor_without_losing_successor() {
+    let now = Instant::now();
+    let first = now + Duration::from_millis(10);
+    let second = now + Duration::from_millis(30);
+    let mut wake = None;
+
+    assert!(!reconcile_accepted_copy_wake(&mut wake, Some(first), now,));
+    assert_eq!(wake, Some(first));
+    assert!(reconcile_accepted_copy_wake(
+        &mut wake,
+        Some(second),
+        now + Duration::from_millis(11),
     ));
-    progress.release_reinjection_attempt();
-    assert!(progress.reinjection_ready_at(
-        true,
-        &ranges,
-        true,
-        true,
-        now + Duration::from_millis(1),
+    assert_eq!(
+        wake,
+        Some(second),
+        "consuming D1 must leave a disjoint live D2 armed",
+    );
+    assert!(!reconcile_accepted_copy_wake(
+        &mut wake,
+        None,
+        now + Duration::from_millis(12),
+    ));
+    assert_eq!(wake, None, "exact ACK/detach cancels a future wake");
+}
+
+#[test]
+fn committed_copy_wake_survives_first_observation_after_expiry_and_keeps_batch_minimum() {
+    let now = Instant::now();
+    let expired = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+    let later = now + Duration::from_millis(20);
+    let mut wake = None;
+
+    retain_accepted_copy_wake(&mut wake, later);
+    retain_accepted_copy_wake(&mut wake, expired);
+    assert_eq!(
+        wake,
+        Some(expired),
+        "one bounded drain retains its minimum D"
+    );
+    assert!(
+        reconcile_accepted_copy_wake(&mut wake, None, now),
+        "a successful commit must remain a due one-shot even when the first ledger observation is already past D",
+    );
+    assert_eq!(wake, None, "the consumed one-shot does not busy-loop");
+}
+
+#[test]
+fn accepted_copy_due_boundary_precedes_topology_work() {
+    let now = Instant::now();
+    assert!(!accepted_copy_wake_is_due(None, now));
+    assert!(!accepted_copy_wake_is_due(
+        Some(now + Duration::from_millis(1)),
+        now,
+    ));
+    assert!(accepted_copy_wake_is_due(Some(now), now));
+    assert!(accepted_copy_wake_is_due(
+        Some(now.checked_sub(Duration::from_millis(1)).unwrap_or(now)),
+        now,
     ));
 }
 
@@ -1368,6 +1617,44 @@ fn request_path_staleness_requires_persistent_missing_data_ack_progress() {
             .as_slice(),
         &[path],
         "the restarted clock expires after one full persistence interval"
+    );
+}
+
+#[test]
+fn exact_progress_resets_deadline_once_using_the_current_persistence() {
+    let path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 6,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(26),
+        attachment_id: 26,
+    };
+    let now = Instant::now();
+    let initial =
+        ReliablePathStalenessObservation::with_persistence(path, true, Duration::from_millis(100));
+    let recovered =
+        ReliablePathStalenessObservation::with_persistence(path, true, Duration::from_millis(250));
+    let later_degraded =
+        ReliablePathStalenessObservation::with_persistence(path, true, Duration::from_secs(2));
+    let progress_at = now + Duration::from_millis(50);
+    let reset_deadline = progress_at + Duration::from_millis(250);
+    let mut progress = ReliableRequestPathStaleness::default();
+
+    assert!(progress.stale_paths_at(&[initial], &[], now).is_empty());
+    assert!(
+        progress
+            .stale_paths_at(&[recovered], &[path], progress_at)
+            .is_empty(),
+        "exact progress resets the owner clock using the persistence observed at that boundary",
+    );
+    assert_eq!(progress.next_deadline(), Some(reset_deadline));
+    assert_eq!(
+        progress
+            .stale_paths_at(&[later_degraded], &[], reset_deadline)
+            .as_slice(),
+        &[path],
+        "later metric growth cannot move the new absolute deadline after the exact-progress reset",
     );
 }
 

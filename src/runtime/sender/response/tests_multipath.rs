@@ -1,7 +1,8 @@
 use super::*;
+use crate::model::capacity::reliable_path_startup_sample_limit_bytes;
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, PathId, SessionId, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, OffsetRange, PathId, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::stream::response::ResponseStreamBinding;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
@@ -92,6 +93,47 @@ fn fixed_output_plan_uses_the_data_traffic_class_queue() {
 }
 
 #[test]
+fn fixed_output_product_window_blocks_at_exact_debt_and_data_ack_reopens() {
+    let (commands, _receivers) = reliable_path_command_channels(4);
+    let stream = stream_with_output(ReliablePathStreamOutput::fixed(
+        UnderlayProtocol::Tcp,
+        PathId(3),
+        commands,
+        MuxLimits::default(),
+    ));
+    let product_limit = stream
+        .output
+        .send_path_snapshot(TrafficClass::Throughput, 1024)
+        .expect("fixed output snapshot")
+        .data_level_limit_bytes;
+    assert!(product_limit > 0);
+    let flight = data_frame(
+        0,
+        usize::try_from(product_limit).expect("test Product limit"),
+    );
+    let ReliablePathStreamOutput::Fixed(fixed) = &stream.output else {
+        panic!("expected fixed output");
+    };
+    fixed.record_original_flight(&flight);
+
+    assert!(matches!(
+        plan_response_data_dispatch(&stream, TrafficClass::Throughput, product_limit, 1024),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+
+    stream
+        .output
+        .release_normalized_acked_ranges(&[crate::protocol::OffsetRange {
+            start: 0,
+            end: product_limit,
+        }]);
+    assert!(
+        plan_response_data_dispatch(&stream, TrafficClass::Throughput, product_limit, 1024).is_ok(),
+        "exact MPP Data ACK release restores Product assignment authority",
+    );
+}
+
+#[test]
 fn switchable_plan_uses_completion_time_not_attachment_order() {
     let (binding, initial, _initial_receivers) = switchable_binding(MuxLimits::default());
     let alternate = CarrierPathKey {
@@ -110,6 +152,25 @@ fn switchable_plan_uses_completion_time_not_attachment_order() {
     );
     binding.mark_output_path_proven_for_test(initial);
     binding.mark_output_path_proven_for_test(alternate);
+    let qualification_floor = reliable_path_startup_sample_limit_bytes(MuxLimits::default());
+    binding.record_original_flight(
+        initial,
+        &data_frame(
+            0,
+            usize::try_from(qualification_floor).expect("test qualification floor"),
+        ),
+    );
+    binding.record_original_flight(
+        alternate,
+        &data_frame(
+            qualification_floor,
+            usize::try_from(qualification_floor).expect("test qualification floor"),
+        ),
+    );
+    binding.release_normalized_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: qualification_floor * 2,
+    }]);
     binding.set_output_product_model_for_test(initial, 10_000_000.0, 100.0);
     binding.set_output_product_model_for_test(alternate, 500_000_000.0, 10.0);
     let stream = stream_with_output(ReliablePathStreamOutput::Switchable(binding));
@@ -187,7 +248,11 @@ fn replacement_gets_bounded_progress_without_inheriting_old_flight() {
     .expect("replacement receives bounded work while the old range remains debt");
     assert!(matches!(
         first,
-        ResponseDataDispatchTarget::Switchable { target, .. }
+        ResponseDataDispatchTarget::Switchable {
+            target,
+            position: BulkCandidatePosition::AdditionalPath,
+            ..
+        }
             if target.key == initial && target.incarnation != old_incarnation
     ));
 
@@ -205,7 +270,11 @@ fn replacement_gets_bounded_progress_without_inheriting_old_flight() {
     .expect("partial Data ACK does not create stop-and-wait failover");
     assert!(matches!(
         partial,
-        ResponseDataDispatchTarget::Switchable { target, .. }
+        ResponseDataDispatchTarget::Switchable {
+            target,
+            position: BulkCandidatePosition::AdditionalPath,
+            ..
+        }
             if target.key == initial && target.incarnation != old_incarnation
     ));
 

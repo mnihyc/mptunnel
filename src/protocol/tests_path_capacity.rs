@@ -38,3 +38,21 @@ fn capacity_receive_tracker_rejects_mismatched_finish() {
         Err(PathCapacityReceiveError::FinishMismatch)
     ));
 }
+
+#[test]
+fn capacity_receive_tracker_rejects_completed_or_regressed_token() {
+    let mut tracker = CapacityReceiveTracker::new(1024);
+    tracker.record_data(7, 400).expect("first data record");
+    assert_eq!(tracker.finish(7, 400).expect("first exact finish"), 400);
+
+    assert!(matches!(
+        tracker.record_data(7, 400),
+        Err(PathCapacityReceiveError::NonIncreasingToken)
+    ));
+    assert!(matches!(
+        tracker.record_data(6, 400),
+        Err(PathCapacityReceiveError::NonIncreasingToken)
+    ));
+    tracker.record_data(8, 400).expect("strictly newer token");
+    assert_eq!(tracker.finish(8, 400).expect("newer exact finish"), 400);
+}

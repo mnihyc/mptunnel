@@ -394,6 +394,12 @@ seconds, and validate the rebuilt file; do not mix it with an earlier schema.
 - `[flow].idle_timeout_s` defaults to 300 seconds; zero disables payload-idle
   expiry. TCP payload and accepted UDP datagrams refresh it, while transport
   control and keep-alive traffic do not.
+- Omitted `[flow].initial_rate_mbps` means that carrier startup capacity is
+  unknown. A positive whole-Mbit/s value supplies a global MPP path prior;
+  any path-URI `initial-rate-*` form wins, including `initial-rate=unknown`.
+  Finite QUIC targets remain the scheduling basis until exact post-
+  authentication native evidence from two packet-timed rounds qualifies;
+  omission does not enable that gate.
 - Omitted `[flow].optional_reinjection_budget_percent` is 10. It meters only
   optional reliable-payload reinjection, not native recovery, control, probes,
   or critical path-failure recovery.
@@ -560,8 +566,45 @@ cleanup halfway. Expiry closes only that logical flow and releases its
 admission, telemetry, and datagram-route ownership; it does not mark an MPP
 carrier or session failed. Direct and MPP egress use the same Product lifecycle.
 
-`[flow]` also supplies global MPP sender defaults. Omission uses 10 for both
-`optional_reinjection_budget_percent` and
+`[flow]` also supplies global MPP sender defaults. Optional
+`initial_rate_mbps` is a positive whole-Mbit/s startup prior inherited by every
+MPP TCP and QUIC path. Omission means unknown. Any path-URI `initial-rate-*`
+form overrides it; explicit `initial-rate=unknown` disables the global prior
+for that path. TCP uses the resolved value only for MPP startup scheduling and
+does not modify or replace the operating system's native TCP congestion
+controller. The rate is local configuration, never peer evidence or a
+guaranteed capacity claim, and live qualified evidence may replace it.
+
+For a finite resolved QUIC rate `R` bits/s and initial RTT `T` (the path's
+`initial-srtt-s`, or 333 ms when omitted), QUIC starts with native window target
+`max(IW10, ceil(R*T/8))` bytes and native pacing target `ceil(R/8)` bytes/s.
+This changes startup geometry only: it does not seed BBR `bw`, `max_bw`, or MPP
+operational-rate authority. `unknown` and `unlimited` retain exact Quinn BBR3
+startup defaults even when an initial RTT is present. Native observations and
+BBR state transitions govern the controller after construction. Overestimating
+the prior authorizes a larger first burst and may cause queueing or loss;
+native congestion control and recovery remain active.
+
+MPP does not let pre-authentication setup traffic immediately replace a finite
+QUIC prior. After the carrier-ready boundary, the first subsequently sent Data
+packet establishes a controller-local floor. BBR's exact completed sample must
+then be valid, positive, Data-space, at or beyond that floor, and
+non-application-limited in two distinct packet-timed source rounds. The first
+round alone cannot qualify because Quinn stamps packets with the preceding
+transmit poll's application-limited state. Invalid, app-limited, zero,
+pre-floor, and same-round samples are no-ops rather than resets. Once the
+second round qualifies, MPP permanently uses the controller's live rate for
+that activation; later idle or absence cannot restore the prior. Native BBR
+continues to own bandwidth sampling, window, pacing, loss, and recovery during
+the entire handoff. A fresh migrated controller obtains a fresh floor; a
+same-controller clone or retained rollback preserves its handoff state.
+
+Configuration rejects a resolved finite QUIC pair unless
+`ceil(R/8) <= 2^53` bytes/s and `ceil(R*T/8) <= u64::MAX` bytes. This prevents
+silent rounding in native BBR pacing state and saturation of the startup
+window. The QUIC-native exactness bound does not restrict a TCP-only prior.
+
+Omission uses 10 for both `optional_reinjection_budget_percent` and
 `quic_loss_compensation_percent`. The former meters only optional reliable MPP
 payload reinjection; native TCP/QUIC recovery, MPP control and probes, and
 critical path-failure recovery are outside that optional allowance. The latter
@@ -691,8 +734,10 @@ unknown, duplicate, empty, or inapplicable options fail configuration load.
 operator constraints that remain in force until configuration or management
 policy changes them. `initial-srtt-s`, `initial-rttvar-s`, and the
 `initial-rate-*` forms are startup measurement priors that live evidence may
-replace; the initial rate defaults to unknown. `source-address` selects a TCP or
-QUIC client source IP; `max-datagram-payload-bytes` is QUIC-client-only;
+replace. An omitted path rate inherits `[flow].initial_rate_mbps`, then defaults
+to unknown; explicit `initial-rate=unknown` suppresses inheritance.
+`source-address` selects a TCP or QUIC client source IP;
+`max-datagram-payload-bytes` is QUIC-client-only;
 `max-tcp-carriers` is TCP-client-only; and `port-rotation-interval-s` requires
 a ranged client endpoint. MPP listener paths use one fixed port. They may use
 the `initial-*` and scheduling boolean options; TCP listeners may also use

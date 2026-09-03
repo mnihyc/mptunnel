@@ -29,6 +29,7 @@ pub use native_egress::{
 };
 #[cfg(target_os = "linux")]
 pub use native_egress::{LinuxMarkedNativeSocketConfigurator, LinuxSocketMarker};
+pub(crate) use spec::QuicStartupTarget;
 pub use spec::{
     CARRIER_PATH_QUERY_KEYS, CarrierEndpoint, CarrierEndpointParseError, CarrierPortSet,
     DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS, DEFAULT_QUIC_LOSS_COMPENSATION_PERCENT,

@@ -18,7 +18,10 @@ use super::writer::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::path::{CarrierPathInstanceId, RelayPathKey, next_carrier_path_instance_id};
+use crate::model::path::{
+    CarrierPathInstanceId, RelayPathKey, carrier_path_instance_identity_is_available,
+    try_next_carrier_path_instance_id,
+};
 use crate::protocol::{CloseReason, Frame, PathMetricDirection, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -938,8 +941,6 @@ async fn drain_client_tcp_path(
         runtime,
     )
     .await?;
-    connection.carrier.writer.flush().await?;
-    connection.record_outbound_activity();
 
     if let Some(frame) = deferred_frame
         && match apply_client_tcp_drain_frame(
@@ -1129,13 +1130,15 @@ async fn handle_disconnected_client_tcp_command(
                     let _ = response.send(Ok(Some(readiness_rtt)));
                 }
                 Err(err) => {
-                    runtime
-                        .state
-                        .mark_tcp_path_establishment_failure_for_endpoint_generation(
-                            runtime.path_index,
-                            &runtime.endpoint_policy,
-                            endpoint_generation,
-                        );
+                    if client_tcp_establishment_error_has_health_authority(&err) {
+                        runtime
+                            .state
+                            .mark_tcp_path_establishment_failure_for_endpoint_generation(
+                                runtime.path_index,
+                                &runtime.endpoint_policy,
+                                endpoint_generation,
+                            );
+                    }
                     let _ = response.send(Err(err));
                 }
             }
@@ -1147,6 +1150,7 @@ async fn handle_disconnected_client_tcp_command(
             target,
             lane,
             initial_demand,
+            return_plan,
             advertised_recv_max_offset,
             open_deadlines,
             session_commands,
@@ -1201,6 +1205,7 @@ async fn handle_disconnected_client_tcp_command(
                         target,
                         lane,
                         initial_demand,
+                        return_plan,
                         advertised_recv_max_offset,
                         open_deadline,
                         session_commands,
@@ -1228,13 +1233,15 @@ async fn handle_disconnected_client_tcp_command(
                     }
                 }
                 Err(err) => {
-                    runtime
-                        .state
-                        .mark_tcp_path_establishment_failure_for_endpoint_generation(
-                            runtime.path_index,
-                            &runtime.endpoint_policy,
-                            endpoint_generation,
-                        );
+                    if client_tcp_establishment_error_has_health_authority(&err) {
+                        runtime
+                            .state
+                            .mark_tcp_path_establishment_failure_for_endpoint_generation(
+                                runtime.path_index,
+                                &runtime.endpoint_policy,
+                                endpoint_generation,
+                            );
+                    }
                     let _ = response.send(ClientTcpOpenResponse::RejectedWithoutOpen(err));
                 }
             }
@@ -1303,13 +1310,15 @@ async fn handle_disconnected_client_tcp_command(
                     }
                 }
                 Err(err) => {
-                    runtime
-                        .state
-                        .mark_tcp_path_establishment_failure_for_endpoint_generation(
-                            runtime.path_index,
-                            &runtime.endpoint_policy,
-                            endpoint_generation,
-                        );
+                    if client_tcp_establishment_error_has_health_authority(&err) {
+                        runtime
+                            .state
+                            .mark_tcp_path_establishment_failure_for_endpoint_generation(
+                                runtime.path_index,
+                                &runtime.endpoint_policy,
+                                endpoint_generation,
+                            );
+                    }
                     let _ = response.send(Err(err));
                 }
             }
@@ -1372,6 +1381,10 @@ fn retire_failed_client_tcp_connection(
     carrier_readiness.clear();
 }
 
+fn client_tcp_establishment_error_has_health_authority(error: &RuntimeError) -> bool {
+    !matches!(error, RuntimeError::ExactIdentityExhausted)
+}
+
 pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
     runtime: &ClientTcpPathSessionRuntime,
     open_deadline: tokio::time::Instant,
@@ -1380,6 +1393,9 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
     runtime.state.session_lifecycle().ensure_active()?;
     if !runtime.endpoint_policy.allows(endpoint_generation) {
         return Err(RuntimeError::NoSchedulableTcpPath);
+    }
+    if !carrier_path_instance_identity_is_available() {
+        return Err(RuntimeError::ExactIdentityExhausted);
     }
     let path_id = runtime.path_id();
     let mut startup_snapshot = path_startup_snapshot(runtime.path(), path_id);
@@ -1422,7 +1438,8 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
         Err(error) => return Err(error),
     };
     debug_assert_eq!(carrier.path_id, path_id);
-    let path_instance_id = next_carrier_path_instance_id();
+    let path_instance_id =
+        try_next_carrier_path_instance_id().ok_or(RuntimeError::ExactIdentityExhausted)?;
     startup_snapshot.peer_usage = Some(carrier.peer_usage);
     let peer_status = runtime.peer_status.register_path(
         runtime.session_id,
@@ -1586,6 +1603,16 @@ async fn wait_for_endpoint_policy_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_identity_exhaustion_has_no_tcp_path_health_authority() {
+        assert!(!client_tcp_establishment_error_has_health_authority(
+            &RuntimeError::ExactIdentityExhausted,
+        ));
+        assert!(client_tcp_establishment_error_has_health_authority(
+            &RuntimeError::PathOpenTimedOut,
+        ));
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 

@@ -15,6 +15,17 @@ pub const DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 pub const MIN_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 1_000;
 pub const DEFAULT_TCP_CARRIER_MAX: u16 = 3;
 pub const DEFAULT_QUIC_LOSS_COMPENSATION_PERCENT: u32 = 10;
+/// RFC 9002's initial RTT, used when a finite QUIC startup rate has no path RTT.
+const DEFAULT_QUIC_STARTUP_RTT_MS: u64 = 333;
+/// Largest integer that a native BBR `f64` pacing state represents exactly.
+const MAX_EXACT_QUIC_PACING_BYTES_PER_SECOND: u64 = 1 << 53;
+
+/// Exact finite startup geometry resolved from one QUIC path's local metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuicStartupTarget {
+    pub(crate) window_bytes: u64,
+    pub(crate) pacing_bytes_per_second: u64,
+}
 
 /// Complete public query-key vocabulary accepted by carrier path URIs.
 pub const CARRIER_PATH_QUERY_KEYS: &[&str] = &[
@@ -364,6 +375,11 @@ pub struct PathMetadata {
     pub initial_srtt_ms: Option<u32>,
     pub initial_jitter_ms: Option<u32>,
     pub initial_rate: RateHint,
+    /// Whether the carrier URI explicitly selected an `initial-rate-*` form.
+    ///
+    /// This provenance bit lets configuration inheritance distinguish an
+    /// omitted rate from the intentional `initial-rate=unknown` override.
+    pub initial_rate_explicit: bool,
     /// Expert-only local sender input. This is never peer protocol evidence.
     pub loss_compensation: Option<LossPolicyPercent>,
     /// Optional product datagram ceiling. QUIC owns transport PMTU discovery.
@@ -381,6 +397,7 @@ impl Default for PathMetadata {
             initial_srtt_ms: None,
             initial_jitter_ms: None,
             initial_rate: RateHint::Unknown,
+            initial_rate_explicit: false,
             loss_compensation: None,
             max_datagram_payload_bytes: None,
             tcp_carriers: None,
@@ -390,6 +407,13 @@ impl Default for PathMetadata {
 }
 
 impl PathSpec {
+    pub(crate) fn validate_quic_initial_rate_target(&self) -> Result<(), PathSpecParseError> {
+        if self.underlay != UnderlayProtocol::Udp {
+            return Ok(());
+        }
+        self.metadata.quic_startup_target().map(|_| ())
+    }
+
     pub fn tcp_carrier_range(&self) -> Option<TcpCarrierRange> {
         (self.underlay == UnderlayProtocol::Tcp)
             .then_some(self.metadata.tcp_carriers.unwrap_or_default())
@@ -405,6 +429,35 @@ impl PathSpec {
                     .unwrap_or(DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS),
             ))
         })
+    }
+}
+
+impl PathMetadata {
+    pub(crate) fn quic_startup_target(
+        &self,
+    ) -> Result<Option<QuicStartupTarget>, PathSpecParseError> {
+        let RateHint::BitsPerSecond(rate_bps) = self.initial_rate else {
+            return Ok(None);
+        };
+        if rate_bps == 0 {
+            return Ok(None);
+        }
+        let pacing_bytes_per_second = rate_bps.div_ceil(8);
+        let rtt_ms = u64::from(self.initial_srtt_ms.unwrap_or(
+            u32::try_from(DEFAULT_QUIC_STARTUP_RTT_MS).expect("default QUIC startup RTT fits u32"),
+        ))
+        .max(1);
+        let window_bytes = (u128::from(rate_bps) * u128::from(rtt_ms) + 7_999) / 8_000;
+        if pacing_bytes_per_second > MAX_EXACT_QUIC_PACING_BYTES_PER_SECOND
+            || window_bytes > u128::from(u64::MAX)
+        {
+            return Err(PathSpecParseError::QuicInitialRateTargetOutOfRange);
+        }
+        Ok(Some(QuicStartupTarget {
+            window_bytes: u64::try_from(window_bytes)
+                .expect("validated QUIC startup window fits u64"),
+            pacing_bytes_per_second,
+        }))
     }
 }
 
@@ -447,12 +500,14 @@ impl FromStr for PathSpec {
         if metadata.port_hop_interval_ms.is_some() && endpoint.ports().is_single() {
             return Err(PathSpecParseError::PortRotationIntervalRequiresRangedPath);
         }
-        Ok(Self {
+        let spec = Self {
             underlay,
             endpoint,
             binding,
             metadata,
-        })
+        };
+        spec.validate_quic_initial_rate_target()?;
+        Ok(spec)
     }
 }
 
@@ -500,12 +555,14 @@ fn parse_path_options(
             "initial-rate-bps" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
+                metadata.initial_rate_explicit = true;
                 metadata.initial_rate =
                     RateHint::BitsPerSecond(parse_nonzero_u64_param(key, value)?);
             }
             "initial-rate-kbps" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
+                metadata.initial_rate_explicit = true;
                 metadata.initial_rate = RateHint::BitsPerSecond(
                     parse_nonzero_u64_param(key, value)?
                         .checked_mul(1_000)
@@ -515,6 +572,7 @@ fn parse_path_options(
             "initial-rate-mbps" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
+                metadata.initial_rate_explicit = true;
                 metadata.initial_rate = RateHint::BitsPerSecond(
                     parse_nonzero_u64_param(key, value)?
                         .checked_mul(1_000_000)
@@ -524,6 +582,7 @@ fn parse_path_options(
             "initial-rate" => {
                 reject_duplicate(rate_set, key)?;
                 rate_set = true;
+                metadata.initial_rate_explicit = true;
                 metadata.initial_rate = match value
                     .ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?
                 {
@@ -839,6 +898,7 @@ pub enum PathSpecParseError {
     InvalidQueryParamValue(String, String),
     DuplicateQueryParam(String),
     QueryParamOverflow(String),
+    QuicInitialRateTargetOutOfRange,
     AllowDatagramsRequiresTcpPath,
     MaxDatagramPayloadRequiresQuicPath,
     LossCompensationRequiresQuicPath,
@@ -879,6 +939,9 @@ impl std::fmt::Display for PathSpecParseError {
             Self::QueryParamOverflow(key) => {
                 write!(f, "path query parameter {key:?} is too large")
             }
+            Self::QuicInitialRateTargetOutOfRange => f.write_str(
+                "finite QUIC initial rate and RTT exceed the exact native startup target range",
+            ),
             Self::AllowDatagramsRequiresTcpPath => {
                 write!(
                     f,

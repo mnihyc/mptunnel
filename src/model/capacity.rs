@@ -37,7 +37,6 @@ pub(crate) const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 pub(crate) const QUIC_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 pub(crate) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 pub(crate) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
-pub(crate) const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(crate) const CAPACITY_TIMING_SLACK_BYTES: u64 = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
 /// An attachment OPEN is acknowledged without granting another receive window.
 ///
@@ -88,12 +87,37 @@ pub(crate) fn product_delivery_samples_override_startup_prior(delivery_samples: 
     delivery_samples >= RELIABLE_INITIAL_WINDOW_PACKETS as u32
 }
 
-pub(crate) fn reliable_path_startup_sample_limit_bytes(mux_limits: MuxLimits) -> u64 {
-    let configured_envelope = (mux_limits.max_path_flight_bytes as u64)
+/// Configured bulk Product resource windows.
+///
+/// `W` bounds all unique source/repair/reorder exposure for one logical stream.
+/// `P` is the per-output Product window inside `W`; native TCP/QUIC admission
+/// remains owned by the carrier writer and congestion controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReliableBulkProductWindows {
+    /// Shared logical-stream resource window `W`.
+    pub(crate) stream_resource_limit_bytes: u64,
+    /// Per-output Product window `P`, released only by MPP Data ACK.
+    pub(crate) per_output_product_limit_bytes: u64,
+}
+
+pub(crate) fn reliable_bulk_product_windows(mux_limits: MuxLimits) -> ReliableBulkProductWindows {
+    let stream_resource_limit_bytes = mux_limits
+        .max_stream_window_bytes
         .min(mux_limits.max_repair_bytes as u64)
         .min(mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes)
         .max(1);
+    let per_output_product_limit_bytes = stream_resource_limit_bytes
+        .min(mux_limits.max_path_flight_bytes as u64)
+        .max(1);
+    ReliableBulkProductWindows {
+        stream_resource_limit_bytes,
+        per_output_product_limit_bytes,
+    }
+}
+
+pub(crate) fn reliable_path_startup_sample_limit_bytes(mux_limits: MuxLimits) -> u64 {
+    let configured_envelope =
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
     RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
         .saturating_div(2)
         .max(PATH_OPEN_SCORE_BYTES as u64)
@@ -106,11 +130,8 @@ pub(crate) fn reliable_path_startup_sample_limit_bytes(mux_limits: MuxLimits) ->
 /// evidence. The current frontier owner avoids cross-path reorder penalties,
 /// but still uses this floor inside its modeled carrier service window.
 pub(crate) fn reliable_unproven_path_startup_flight_limit_bytes(mux_limits: MuxLimits) -> u64 {
-    let configured_envelope = (mux_limits.max_path_flight_bytes as u64)
-        .min(mux_limits.max_repair_bytes as u64)
-        .min(mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes)
-        .max(1);
+    let configured_envelope =
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
     RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
         .max(PATH_OPEN_SCORE_BYTES as u64)
         .min(configured_envelope)
@@ -121,11 +142,7 @@ pub(crate) fn reliable_unproven_path_startup_flight_limit_bytes(mux_limits: MuxL
 /// Capacity measurement reuses this existing resource geometry and creates no
 /// additional byte budget.
 pub(crate) fn reliable_product_measurement_session_envelope_bytes(mux_limits: MuxLimits) -> u64 {
-    (mux_limits.max_path_flight_bytes as u64)
-        .min(mux_limits.max_repair_bytes as u64)
-        .min(mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes)
-        .max(1)
+    reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes
 }
 
 pub(crate) fn reliable_capacity_measurement_session_limit_bytes(mux_limits: MuxLimits) -> u64 {
@@ -144,46 +161,24 @@ pub(crate) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
         .max(1)
 }
 
-/// Initial product receive authority advertised independently of carrier cwnd.
+/// Initial Product receive authority `W`, independent of carrier and class.
 ///
-/// TCP and QUIC congestion controllers bound carrier flight below this window.
-/// Latency-sensitive QUIC keeps a smaller initial product-memory commitment.
+/// TCP and QUIC congestion controllers bound carrier flight below this window;
+/// traffic class controls arbitration and atomic service, not receive credit.
 pub(crate) fn reliable_stream_initial_advertised_window_bytes(
-    underlay: UnderlayProtocol,
-    lane: TrafficClass,
+    _underlay: UnderlayProtocol,
+    _lane: TrafficClass,
     mux_limits: MuxLimits,
 ) -> u64 {
-    reliable_stream_advertised_window_from_underlay(underlay, lane, mux_limits)
+    reliable_bulk_product_windows(mux_limits).stream_resource_limit_bytes
 }
 
 pub(crate) fn reliable_stream_advertised_window_bytes(
-    path: Option<PathSnapshot>,
-    lane: TrafficClass,
+    _path: Option<PathSnapshot>,
+    _lane: TrafficClass,
     mux_limits: MuxLimits,
 ) -> u64 {
-    let underlay = path
-        .map(|snapshot| snapshot.underlay)
-        .unwrap_or(UnderlayProtocol::Tcp);
-    reliable_stream_advertised_window_from_underlay(underlay, lane, mux_limits)
-}
-
-fn reliable_stream_advertised_window_from_underlay(
-    underlay: UnderlayProtocol,
-    lane: TrafficClass,
-    mux_limits: MuxLimits,
-) -> u64 {
-    let configured = mux_limits.max_stream_window_bytes.max(1);
-    if underlay != UnderlayProtocol::Udp || lane.is_bulk() {
-        return configured;
-    }
-
-    let relay_chunk = reliable_relay_buffer_len(mux_limits) as u64;
-    let min_window = RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES
-        .max(relay_chunk.saturating_mul(4))
-        .min(configured);
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
-        .max(min_window)
-        .min(configured)
+    reliable_bulk_product_windows(mux_limits).stream_resource_limit_bytes
 }
 
 pub(crate) fn reliable_stream_max_data_update_bytes(
@@ -278,58 +273,64 @@ pub(crate) fn adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         .max(1)
 }
 
-pub(crate) fn adaptive_reliable_relay_inflight_bytes(
+/// Bounded exploration window `E` for one unproven additional bulk output.
+///
+/// `carrier_inflight_limit_bytes` must already be scoped to a fresh observation
+/// of this exact carrier instance. A stale or unavailable native window is zero
+/// and therefore retains the portable startup allowance. Neither delivery-rate
+/// evidence nor Product debt can enlarge this window.
+pub(crate) fn reliable_bulk_unproven_exploration_limit_bytes(
+    path: PathSnapshot,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let product_limit = reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
+    let startup = reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
+    let native = (path.carrier_inflight_limit_bytes > 0).then(|| {
+        path.carrier_inflight_limit_bytes
+            .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits) as u64)
+    });
+    native.unwrap_or(0).max(startup).min(product_limit)
+}
+
+/// Total unique Product-outstanding window `P` released by MPP Data ACKs.
+///
+/// This is the configured per-output resource window, independent of traffic
+/// class, underlay, sampled native `C`, or achieved rate `R`. TCP/QUIC command
+/// reservation, writer backpressure, pacing, and congestion control own native
+/// admission below it. Traffic class still controls arbitration and atomic
+/// service quantum; it cannot install another Product feedback window.
+pub(crate) fn reliable_product_feedback_window_bytes(
+    _path: Option<PathSnapshot>,
+    _lane: TrafficClass,
+    mux_limits: MuxLimits,
+) -> usize {
+    usize::try_from(reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes)
+        .unwrap_or(usize::MAX)
+}
+
+/// Product recovery opportunity on one selected carrier.
+///
+/// Recovery consumes the same exact published Product envelope as forward
+/// OriginalData. Native TCP/QUIC rate, flight, and queue observations cannot
+/// enlarge it. The separate one-quantum emergency reserve is applied by the
+/// reinjection-work model after subtracting exact OriginalData debt.
+pub(crate) fn reliable_product_recovery_window_bytes(
     path: Option<PathSnapshot>,
     lane: TrafficClass,
     mux_limits: MuxLimits,
 ) -> usize {
-    let cap = mux_limits.max_path_flight_bytes.max(1);
-    let floor = reliable_lane_min_inflight_bytes(lane, mux_limits)
-        .min(cap)
-        .max(1);
     let Some(path) = path else {
-        return reliable_lane_startup_inflight_bytes(lane, mux_limits)
-            .min(cap)
-            .max(floor);
+        return reliable_product_feedback_window_bytes(None, lane, mux_limits);
     };
-
-    // This is a Data Sequence service window, not another congestion controller
-    // or a reservation of native send credit. It bounds unique ordered work
-    // accepted above the carrier; TCP/QUIC still enforce actual packet flight,
-    // recovery, pacing, and writer backpressure. An app-limited product sample
-    // must not clamp a larger native window that is available to drain work.
-    let modeled =
-        (data_level_service_window_bytes(path, lane, mux_limits).ceil() as usize).clamp(floor, cap);
-    if lane.is_bulk()
-        && path.underlay == UnderlayProtocol::Tcp
-        && path.carrier_inflight_limit_bytes == 0
-        && path.has_durable_product_progress
-    {
-        // Without native TCP send credit, a Data ACK rate is completion
-        // evidence but not a congestion window. After one bounded product
-        // proof, let the shared stream/reorder windows and socket backpressure
-        // govern service instead of feeding an app-limited rate back into a
-        // second per-path window.
-        return cap;
+    let forward_ceiling = usize::try_from(path.data_level_limit_bytes).unwrap_or(usize::MAX);
+    if forward_ceiling == 0 {
+        return 0;
     }
-    if !lane.is_bulk() || path.carrier_inflight_limit_bytes == 0 {
-        return modeled;
-    }
-    let carrier_limit = usize::try_from(path.carrier_inflight_limit_bytes).unwrap_or(usize::MAX);
-    let native_feed =
-        carrier_limit.saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
-    if path.underlay == UnderlayProtocol::Tcp {
-        // TCP's current congestion window owns unresolved per-path flight.
-        // Product completion evidence ranks the path but cannot enlarge that
-        // native window; one bounded feed quantum keeps the socket supplied.
-        // A smaller later window stops new placement but cannot revoke exact
-        // MPP flight that was already committed to this output.
-        let committed_flight = usize::try_from(path.data_level_bytes_in_flight)
-            .unwrap_or(usize::MAX)
-            .min(cap);
-        return native_feed.max(committed_flight).clamp(floor, cap);
-    }
-    modeled.max(native_feed).min(cap)
+    forward_ceiling.min(reliable_product_feedback_window_bytes(
+        Some(path),
+        lane,
+        mux_limits,
+    ))
 }
 
 /// One exact output considered for new OriginalData placement.
@@ -364,16 +365,32 @@ impl ReliableSourceCandidateSet {
     }
 }
 
-/// Projects connection-wide Product source admission before path assignment.
+fn published_product_feedback_window_bytes(
+    snapshot: PathSnapshot,
+    lane: TrafficClass,
+    mux_limits: MuxLimits,
+) -> usize {
+    let published = usize::try_from(snapshot.data_level_limit_bytes).unwrap_or(usize::MAX);
+    if !lane.is_bulk() {
+        return published;
+    }
+    let configured =
+        usize::try_from(reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes)
+            .unwrap_or(usize::MAX);
+    published.min(configured)
+}
+
+/// Projects one logical stream's Product source admission before path assignment.
 ///
 /// Selection and the bulk window consume the same exact, schedulable outputs.
 /// Non-stale regular outputs take precedence, then non-stale backup outputs;
-/// stale outputs are fallback-only. Bulk work sums the chosen set's native
-/// admission windows under the shared resource cap. Latency-sensitive work
-/// uses only the chosen output's window. Staging grants no DSN range or carrier
+/// stale outputs are fallback-only. Bulk work sums the chosen set's Product
+/// feedback windows under the shared resource cap. Latency-sensitive work
+/// uses only the chosen output's window, under the same stream/reorder/repair
+/// resource cap. Staging grants no DSN range or carrier
 /// reservation: every eventual output remains bounded by
-/// [`adaptive_reliable_relay_inflight_bytes`] and native writer backpressure at
-/// commit.
+/// the already-published exact Product envelope plus actual native
+/// writer/backpressure at commit.
 pub(crate) fn reliable_stream_source_admission<I>(
     outputs: I,
     lane: TrafficClass,
@@ -423,7 +440,7 @@ where
             &mut regular[stale_index]
         };
         let window_bytes = if calculate_window {
-            adaptive_reliable_relay_inflight_bytes(Some(output.snapshot), lane, mux_limits)
+            published_product_feedback_window_bytes(output.snapshot, lane, mux_limits)
         } else {
             0
         };
@@ -445,13 +462,18 @@ where
     let selected_path = candidates.selected.map(|(_, snapshot)| snapshot);
     let window_bytes = if !calculate_window {
         0
-    } else if lane.is_bulk() {
-        candidates
-            .aggregate_window_bytes
-            .min(mux_limits.max_path_flight_bytes.max(1))
-            .max(1)
     } else {
-        adaptive_reliable_relay_inflight_bytes(selected_path, lane, mux_limits)
+        let resource_ceiling =
+            usize::try_from(reliable_bulk_product_windows(mux_limits).stream_resource_limit_bytes)
+                .unwrap_or(usize::MAX);
+        let product_window = if lane.is_bulk() {
+            candidates.aggregate_window_bytes
+        } else {
+            selected_path.map_or(0, |snapshot| {
+                published_product_feedback_window_bytes(snapshot, lane, mux_limits)
+            })
+        };
+        product_window.min(resource_ceiling)
     };
     ReliableStreamSourceAdmission {
         selected_path,

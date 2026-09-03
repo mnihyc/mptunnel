@@ -5,6 +5,7 @@
 //! `stream::request::attachment`.
 
 use super::client::ClientRelayPathOpenSuppressions;
+use super::lifecycle::ClientReliableReturnPlan;
 use super::open::{
     ReliableRelayOpenSpec, no_schedulable_reliable_path_error, open_remote_stream_for_relay_path,
     relay_path_open_error_is_retryable,
@@ -27,6 +28,7 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) enum ReliableRelayAttachMode {
+    Startup,
     Any,
     BulkStriping,
     Recovery,
@@ -80,6 +82,7 @@ struct RelayPathAttachResult {
 async fn attach_relay_path_candidates(
     context: &ClientPathContext,
     remotes: &mut ReliableRelayRemoteSet,
+    startup: &mut ClientReliableReturnPlan,
     request: RelayPathAttachRequest<'_>,
 ) -> Result<RelayPathAttachResult, RuntimeError> {
     let stream_id = remotes.stream_id();
@@ -90,16 +93,38 @@ async fn attach_relay_path_candidates(
         if remotes.contains_path_key(key) {
             continue;
         }
+        let current_instance = context
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .path_record(key)
+            .and_then(|record| record.path_instance_id());
+        let startup_ordinal = startup.begin_candidate_for_open(key, current_instance);
+        let startup_expected_instance =
+            startup_ordinal.and_then(|ordinal| startup.bound_instance(ordinal));
+        let open_spec = startup_ordinal.map_or_else(
+            || request.spec.for_ordinary_attachment(),
+            |ordinal| request.spec.for_startup_ordinal(ordinal),
+        );
         match open_remote_stream_for_relay_path(
             context,
             stream_id,
-            request.spec,
+            &open_spec,
             request.output_lane,
             key,
         )
         .await
         {
             Ok(opened) => {
+                if startup_expected_instance
+                    .is_some_and(|expected| opened.path_instance_id() != expected)
+                {
+                    opened.retire_uncommitted();
+                    if let Some(ordinal) = startup_ordinal {
+                        startup.settle_failed(ordinal)?;
+                    }
+                    continue;
+                }
                 let attach_control_result = send_request_attach_control_frames(
                     opened.stream(),
                     request.send_stream,
@@ -107,31 +132,61 @@ async fn attach_relay_path_candidates(
                 );
                 match attach_control_result {
                     Ok(()) => {
-                        let attach_outcome = remotes.attach_candidate(opened);
+                        let attach_outcome = remotes.try_attach_candidate(opened)?;
                         match attach_outcome {
                             ReliableRelayAttachOutcome::Attached => {
+                                if let Some(ordinal) = startup_ordinal {
+                                    let instance = remotes.path_instance_for_key(key).ok_or(
+                                        RuntimeError::Protocol(
+                                            "attached startup carrier is absent from membership",
+                                        ),
+                                    )?;
+                                    startup.settle_accepted(ordinal, instance)?;
+                                }
                                 return Ok(RelayPathAttachResult { attached: 1 });
                             }
                             ReliableRelayAttachOutcome::RejectedDuplicate => {
+                                if let Some(ordinal) = startup_ordinal {
+                                    startup.settle_failed(ordinal)?;
+                                }
                                 continue;
                             }
                         }
                     }
                     Err(err) if reliable_path_error_is_migratable(&err) => {
+                        if let Some(ordinal) = startup_ordinal {
+                            startup.settle_failed(ordinal)?;
+                        }
                         last_retryable_error = Some(err);
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        if let Some(ordinal) = startup_ordinal {
+                            startup.settle_failed(ordinal)?;
+                        }
+                        return Err(err);
+                    }
                 }
             }
             Err(err @ RuntimeError::ReliablePathAttachmentRefused) => {
+                if let Some(ordinal) = startup_ordinal {
+                    startup.settle_failed(ordinal)?;
+                }
                 // The server refused this attachment, not the carrier. Keep
                 // global path health intact and consider the next candidate.
                 last_retryable_error = Some(err);
             }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
+                if let Some(ordinal) = startup_ordinal {
+                    startup.settle_failed(ordinal)?;
+                }
                 last_retryable_error = Some(err);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                if let Some(ordinal) = startup_ordinal {
+                    startup.settle_failed(ordinal)?;
+                }
+                return Err(err);
+            }
         }
     }
     if remotes.is_empty() {
@@ -147,6 +202,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
     spec: &ReliableRelayOpenSpec,
     lanes: ReliableRelayPathLanes,
     remotes: &mut ReliableRelayRemoteSet,
+    startup: &mut ClientReliableReturnPlan,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
@@ -154,7 +210,9 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
     inflight_path_claims: &HashSet<RelayPathKey>,
 ) -> Result<usize, RuntimeError> {
     let payload_bytes = match mode {
-        ReliableRelayAttachMode::Any | ReliableRelayAttachMode::Recovery => {
+        ReliableRelayAttachMode::Startup
+        | ReliableRelayAttachMode::Any
+        | ReliableRelayAttachMode::Recovery => {
             reliable_relay_attach_payload_bytes(send_stream, lanes.selection, context.mux_limits)
         }
         ReliableRelayAttachMode::BulkStriping => {
@@ -165,6 +223,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
         let result = attach_relay_path_candidates(
             context,
             remotes,
+            startup,
             RelayPathAttachRequest {
                 spec,
                 output_lane: lanes.output,
@@ -200,6 +259,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
         let result = attach_relay_path_candidates(
             context,
             remotes,
+            startup,
             RelayPathAttachRequest {
                 spec,
                 output_lane: lanes.output,
@@ -226,6 +286,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_suppressions(
     let result = attach_relay_path_candidates(
         context,
         remotes,
+        startup,
         RelayPathAttachRequest {
             spec,
             output_lane: lanes.output,

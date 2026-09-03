@@ -74,9 +74,9 @@ fn path_snapshot_preserves_rate_provenance() {
         measured_rate_bps: Some(100_000_000.0),
         product_delivery_rate_bps: Some(120_000_000.0),
         product_delivery_sample_bytes: 1024 * 1024,
-        delivery_samples: 1,
-        last_delivery_at: Some(now),
-        delivery_rate_expires_at: Some(now + Duration::from_secs(1)),
+        product_delivery_samples: 1,
+        product_last_delivery_at: Some(now),
+        product_delivery_rate_expires_at: Some(now + Duration::from_secs(1)),
         ..ClientPathObservation::default()
     };
     let provisional_snapshot = path_snapshot(&tcp, 0, product);
@@ -95,12 +95,18 @@ fn path_snapshot_preserves_rate_provenance() {
     );
 
     let mature_product = ClientPathObservation {
-        delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        product_delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         ..product
     };
     let product_snapshot = path_snapshot(&tcp, 0, mature_product);
-    assert_eq!(product_snapshot.delivery_rate_bps, 120_000_000.0);
-    assert_eq!(product_snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(product_snapshot.delivery_rate_bps, 400_000_000.0);
+    assert_eq!(product_snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(
+        product_snapshot.product_progress_rate_bps,
+        Some(120_000_000.0),
+        "the mature exact Product interval remains visible as a historical lower bound",
+    );
+    assert!(product_snapshot.has_durable_product_progress);
     assert_eq!(
         path_metrics_from_snapshot_at(
             product_snapshot,
@@ -109,7 +115,8 @@ fn path_snapshot_preserves_rate_provenance() {
             now,
         )
         .rate_valid_for_us,
-        1_000_000
+        0,
+        "a lower Product bound cannot lend its deadline to the selected configured baseline",
     );
 
     let carrier = ClientPathObservation {
@@ -139,6 +146,8 @@ fn path_snapshot_preserves_rate_provenance() {
 
     let generic = ClientPathObservation {
         measured_rate_bps: Some(90_000_000.0),
+        delivery_samples: 1,
+        delivery_sample_bytes: 32 * 1024,
         last_delivery_at: Some(now),
         delivery_rate_expires_at: Some(now + Duration::from_secs(3)),
         ..ClientPathObservation::default()
@@ -164,7 +173,7 @@ fn path_snapshot_preserves_rate_provenance() {
 }
 
 #[test]
-fn path_snapshot_preserves_app_limited_provenance_with_active_flight() {
+fn path_snapshot_uses_current_native_underfill_not_rate_epoch_provenance() {
     let udp = "quic://127.0.0.1:10000"
         .parse::<PathSpec>()
         .expect("UDP path");
@@ -173,7 +182,8 @@ fn path_snapshot_preserves_app_limited_provenance_with_active_flight() {
         0,
         ClientPathObservation {
             carrier_delivery_rate_bps: Some(3_000_000.0),
-            carrier_app_limited: true,
+            carrier_app_limited: false,
+            carrier_current_app_limited: Some(true),
             carrier_bytes_in_flight: 64 * 1024,
             relay_bytes_in_flight: 256 * 1024,
             ..ClientPathObservation::default()
@@ -182,7 +192,7 @@ fn path_snapshot_preserves_app_limited_provenance_with_active_flight() {
 
     assert!(
         snapshot.app_limited,
-        "active flight must not promote an app-limited delivery-rate lower bound to measured capacity"
+        "live local underfill must remain visible independently of the retained rate epoch"
     );
 }
 
@@ -202,7 +212,8 @@ fn native_carrier_evidence_is_post_attachment_fresh_and_ack_derived() {
         carrier_delivery_sample_bytes: 4 * 1024 * 1024,
         carrier_last_delivery_at: Some(now - Duration::from_millis(1)),
         carrier_bulk_proof_expires_at: Some(now + Duration::from_secs(2)),
-        carrier_app_limited: true,
+        carrier_app_limited: false,
+        carrier_current_app_limited: Some(true),
         carrier_ack_derived_data_seen: true,
         ..ClientPathObservation::default()
     };
@@ -316,6 +327,7 @@ fn tcp_native_peer_metrics_preserve_fresh_and_stale_rate_provenance_without_prod
         carrier_last_delivery_at: Some(now - Duration::from_micros(7)),
         carrier_bulk_proof_expires_at: Some(now + Duration::from_micros(1)),
         carrier_app_limited: false,
+        carrier_current_app_limited: Some(true),
         ..ClientPathObservation::default()
     };
     let snapshot = path_snapshot(&tcp, 0, observation);
@@ -330,6 +342,11 @@ fn tcp_native_peer_metrics_preserve_fresh_and_stale_rate_provenance_without_prod
     assert!(near_expiry.rate_observed);
     assert!(near_expiry.pacing_rate_observed);
     assert_eq!(near_expiry.pacing_rate_bps, 250_000_000);
+    assert!(snapshot.app_limited);
+    assert!(
+        !near_expiry.app_limited,
+        "peer metrics must carry the immutable non-app-limited rate-epoch provenance, not live local underfill"
+    );
     assert!(!near_expiry.has_ack_derived_data_sample);
     assert_eq!(near_expiry.data_sample_count, 0);
     assert_eq!(near_expiry.data_sample_bytes, 0);
@@ -387,6 +404,26 @@ fn explicit_capacity_proof_does_not_inherit_the_grown_native_sample_floor() {
 
     assert!(bulk_candidate_has_native_carrier_rate_evidence(&tcp, proof));
     assert_eq!(path_model_confidence(proof), 1.0);
+    let mut snapshot = path_snapshot(&tcp, 0, proof);
+    let mux_limits = crate::mux::MuxLimits::default();
+    snapshot.data_level_limit_bytes =
+        crate::model::capacity::reliable_bulk_product_windows(mux_limits)
+            .per_output_product_limit_bytes;
+    assert!(!snapshot.has_durable_product_progress);
+    assert_eq!(
+        crate::model::admission::bulk_original_data_assignment_authority(
+            snapshot,
+            MAX_RELIABLE_SERVICE_QUANTUM_BYTES,
+            mux_limits,
+            crate::model::admission::BulkCandidatePosition::AdditionalPath,
+            snapshot.has_durable_product_progress,
+        )
+        .assignment_limit_bytes,
+        crate::model::capacity::reliable_bulk_unproven_exploration_limit_bytes(
+            snapshot, mux_limits,
+        ),
+        "a native-only capacity proof cannot qualify Product P",
+    );
     assert!(
         !bulk_candidate_has_native_carrier_rate_evidence(
             &tcp,
@@ -414,13 +451,47 @@ fn product_delivery_evidence_does_not_chase_a_growing_tcp_cwnd() {
     let product = ClientPathObservation {
         product_delivery_rate_bps: Some(3_000_000.0),
         product_delivery_sample_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
-        delivery_samples: 1,
+        product_delivery_samples: 1,
         carrier_inflight_limit_bytes: 16 * 1024 * 1024,
         ..ClientPathObservation::default()
     };
 
     assert!(bulk_candidate_has_bulk_rate_evidence(&tcp, product));
     assert!(path_snapshot(&tcp, 0, product).has_durable_product_progress);
+}
+
+#[test]
+fn global_product_rate_requires_the_exact_service_quantum_boundary() {
+    let udp = "quic://127.0.0.1:10000?initial-rate-mbps=25"
+        .parse::<PathSpec>()
+        .expect("QUIC path");
+    let sample_floor = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
+    let raw_rate = 900_000_000.0;
+    let boundary_minus_one = ClientPathObservation {
+        product_delivery_rate_bps: Some(raw_rate),
+        product_delivery_sample_bytes: sample_floor - 1,
+        product_delivery_samples: 1,
+        ..ClientPathObservation::default()
+    };
+
+    let partial = path_snapshot(&udp, 0, boundary_minus_one);
+    assert_eq!(partial.delivery_rate_bps, 25_000_000.0);
+    assert_eq!(partial.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(partial.product_progress_rate_bps, None);
+    assert!(!partial.has_durable_product_progress);
+
+    let qualified = path_snapshot(
+        &udp,
+        0,
+        ClientPathObservation {
+            product_delivery_sample_bytes: sample_floor,
+            ..boundary_minus_one
+        },
+    );
+    assert_eq!(qualified.delivery_rate_bps, raw_rate);
+    assert_eq!(qualified.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(qualified.product_progress_rate_bps, Some(raw_rate));
+    assert!(qualified.has_durable_product_progress);
 }
 
 #[test]
@@ -437,9 +508,12 @@ fn stale_rate_evidence_cannot_win_scheduler_or_capacity_selection() {
     stale_record.measured_rate_bps = Some(1_000_000_000.0);
     stale_record.delivery_samples = 100;
     stale_record.product_delivery_rate_bps = Some(900_000_000.0);
+    stale_record.product_delivery_samples = 100;
     stale_record.product_delivery_sample_bytes = 8 * 1024 * 1024;
     stale_record.last_delivery_at = Some(stale_at);
     stale_record.delivery_rate_expires_at = Some(stale_at + Duration::from_secs(1));
+    stale_record.product_last_delivery_at = Some(stale_at);
+    stale_record.product_delivery_rate_expires_at = Some(stale_at + Duration::from_secs(1));
     stale_record.carrier_srtt_ms = Some(20.0);
     stale_record.carrier_rttvar_ms = Some(5.0);
     stale_record.carrier_delivery_rate_bps = Some(1_100_000_000.0);
@@ -455,9 +529,12 @@ fn stale_rate_evidence_cannot_win_scheduler_or_capacity_selection() {
     fresh_record.measured_rate_bps = Some(10_000_000.0);
     fresh_record.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
     fresh_record.product_delivery_rate_bps = Some(10_000_000.0);
+    fresh_record.product_delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
     fresh_record.product_delivery_sample_bytes = 1024 * 1024;
     fresh_record.last_delivery_at = Some(now - Duration::from_millis(1));
     fresh_record.delivery_rate_expires_at = Some(now + Duration::from_secs(1));
+    fresh_record.product_last_delivery_at = Some(now - Duration::from_millis(1));
+    fresh_record.product_delivery_rate_expires_at = Some(now + Duration::from_secs(1));
     let observations = [
         stale_record.observation_at(now),
         fresh_record.observation_at(now),

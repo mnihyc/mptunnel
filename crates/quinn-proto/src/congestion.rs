@@ -4,7 +4,8 @@ use crate::connection::RttEstimator;
 pub use crate::packet::SpaceId;
 use crate::{Duration, Instant};
 use std::any::Any;
-use std::sync::Arc;
+use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 mod bbr;
 mod bbr3;
@@ -15,6 +16,229 @@ pub use bbr::{Bbr, BbrConfig};
 pub use bbr3::{Bbr3, Bbr3Config};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
+
+/// Equality-only identity of one installed congestion-controller activation.
+///
+/// Values are transport-issued, nonzero, never reused within one activation
+/// fence, and never equal to `u64::MAX`, which is reserved for terminal
+/// exhaustion. The numeric value has no capacity, health, or ordering meaning
+/// outside the fence implementation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct ControllerActivation(u64);
+
+impl ControllerActivation {
+    /// Opaque checked serial for binding this identity into an external
+    /// authority stamp.
+    ///
+    /// The value is meaningful only for equality (and transport-issued
+    /// non-reuse) within its owning [`ControllerActivationFence`]. It is not a
+    /// rate, health score, or cross-fence order.
+    pub fn opaque_serial(self) -> u64 {
+        self.0
+    }
+}
+
+/// Current state protected by a [`ControllerActivationFence`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ControllerActivationState {
+    /// No controller has been installed through this fence yet.
+    Uninitialized,
+    /// The exact active controller carries this activation identity.
+    Live(ControllerActivation),
+    /// This fence is absorbing and cannot name a successor.
+    Terminal(ControllerActivationTerminal),
+}
+
+/// Why an activation fence became absorbing.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ControllerActivationTerminal {
+    /// The last live value was `u64::MAX - 1`; `u64::MAX` remains non-live.
+    Exhausted,
+    /// A replacement did not preserve the active controller's fence owner.
+    FenceMismatch,
+    /// An allocated transition returned without publishing its successor.
+    AbandonedTransition,
+    /// The owning QUIC connection is no longer live.
+    ConnectionClosed,
+}
+
+/// A poisoned controller-activation transition fence.
+///
+/// Poison is fail-closed because a panic may have interrupted an active-path
+/// pointer transition before its activation publication completed.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ControllerActivationFencePoisoned;
+
+/// Checked exhaustion of the controller-activation identity space.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ControllerActivationExhausted {
+    publish_terminal: bool,
+}
+
+impl ControllerActivationExhausted {
+    pub(crate) fn publish_terminal(self) -> bool {
+        self.publish_terminal
+    }
+}
+
+/// Failure to complete an exact active-controller transition.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ControllerActivationTransitionError {
+    Exhausted,
+    FencePoisoned,
+    FenceMismatch,
+}
+
+/// Shared serialization fence for active-controller pointer transitions and
+/// their activation publication.
+///
+/// Quinn holds this fence across install/reset/restore, local controller
+/// activation, and publication of the new current identity. Consumers must use
+/// [`Self::with_current`] for their final equality check and ownership transfer,
+/// so a transport switch cannot linearize between those operations.
+#[derive(Clone)]
+pub struct ControllerActivationFence(Arc<ControllerActivationFenceInner>);
+
+struct ControllerActivationFenceInner {
+    state: Mutex<ControllerActivationState>,
+}
+
+impl std::fmt::Debug for ControllerActivationFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControllerActivationFence")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ControllerActivationFence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControllerActivationFence {
+    /// Construct an uninitialized activation fence.
+    pub fn new() -> Self {
+        Self(Arc::new(ControllerActivationFenceInner {
+            state: Mutex::new(ControllerActivationState::Uninitialized),
+        }))
+    }
+
+    /// Inspect the exact current activation while excluding transport
+    /// transitions for the complete duration of `inspect`.
+    ///
+    /// Code in `inspect` must not re-enter the owning Quinn connection, whose
+    /// state lock is acquired before this fence on transport transitions.
+    pub fn with_current<T>(
+        &self,
+        inspect: impl FnOnce(ControllerActivationState) -> T,
+    ) -> Result<T, ControllerActivationFencePoisoned> {
+        let state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| ControllerActivationFencePoisoned)?;
+        Ok(inspect(*state))
+    }
+
+    pub(crate) fn begin_transition(
+        &self,
+    ) -> Result<ControllerActivationTransition<'_>, ControllerActivationFencePoisoned> {
+        let state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| ControllerActivationFencePoisoned)?;
+        Ok(ControllerActivationTransition {
+            state,
+            pending: None,
+        })
+    }
+
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn terminalize(
+        &self,
+        reason: ControllerActivationTerminal,
+        publish: impl FnOnce(),
+    ) -> Result<bool, ControllerActivationFencePoisoned> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| ControllerActivationFencePoisoned)?;
+        if matches!(*state, ControllerActivationState::Terminal(_)) {
+            return Ok(false);
+        }
+        *state = ControllerActivationState::Terminal(reason);
+        publish();
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_state(state: ControllerActivationState) -> Self {
+        Self(Arc::new(ControllerActivationFenceInner {
+            state: Mutex::new(state),
+        }))
+    }
+}
+
+pub(crate) struct ControllerActivationTransition<'a> {
+    state: MutexGuard<'a, ControllerActivationState>,
+    pending: Option<ControllerActivation>,
+}
+
+impl ControllerActivationTransition<'_> {
+    pub(crate) fn allocate(
+        &mut self,
+    ) -> Result<ControllerActivation, ControllerActivationExhausted> {
+        debug_assert!(self.pending.is_none(), "one activation per transition");
+        let current = match *self.state {
+            ControllerActivationState::Uninitialized => 0,
+            ControllerActivationState::Live(activation) => activation.0,
+            ControllerActivationState::Terminal(_) => {
+                return Err(ControllerActivationExhausted {
+                    publish_terminal: false,
+                });
+            }
+        };
+        let Some(next) = current.checked_add(1).filter(|next| *next < u64::MAX) else {
+            *self.state =
+                ControllerActivationState::Terminal(ControllerActivationTerminal::Exhausted);
+            return Err(ControllerActivationExhausted {
+                publish_terminal: true,
+            });
+        };
+        let activation = ControllerActivation(next);
+        self.pending = Some(activation);
+        Ok(activation)
+    }
+
+    pub(crate) fn publish(&mut self) {
+        let activation = self
+            .pending
+            .take()
+            .expect("an activation must be allocated before publication");
+        *self.state = ControllerActivationState::Live(activation);
+    }
+}
+
+impl Drop for ControllerActivationTransition<'_> {
+    fn drop(&mut self) {
+        if self.pending.take().is_some() {
+            // An allocated successor that was not published cannot leave the
+            // predecessor live: the pointer transaction may already have
+            // started. Fail closed instead of making the old identity appear
+            // current again.
+            *self.state = ControllerActivationState::Terminal(
+                ControllerActivationTerminal::AbandonedTransition,
+            );
+        }
+    }
+}
 
 /// Opaque identity of one congestion-controller recovery/undo transaction.
 ///
@@ -30,8 +254,64 @@ impl RecoveryTransactionId {
     }
 }
 
+/// Provenance of the most recently completed native delivery-rate sample.
+///
+/// The record is immutable once published. Its revision is local to one
+/// concrete controller lineage: state clones retain it, while a fresh path
+/// starts without a sample.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BandwidthSample {
+    /// Checked, nonzero revision advanced for every completed sample,
+    /// including samples whose delivery interval is invalid.
+    pub revision: NonZeroU64,
+    /// Whether the raw delivery-rate sample is finite and strictly positive
+    /// over a valid, nonzero interval.
+    pub valid: bool,
+    /// Packet-number space of the packet selected by the native sampler.
+    pub source_space: SpaceId,
+    /// Packet number selected by the native sampler.
+    pub source_packet_number: u64,
+    /// Packet-timed round recorded when the selected packet was sent.
+    pub source_round: u64,
+    /// Exact application-limited state recorded when the selected packet was
+    /// sent.
+    pub app_limited: bool,
+}
+
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
+    /// Optional shared fence for exact active-controller transitions.
+    ///
+    /// Controllers that opt in must return clones of one stable fence from all
+    /// path-state clones and fresh replacements belonging to the same
+    /// connection. Quinn does not call the activation hooks below when this is
+    /// `None`.
+    fn activation_fence(&self) -> Option<ControllerActivationFence> {
+        None
+    }
+
+    /// Bind this concrete controller object to a newly allocated activation.
+    ///
+    /// Quinn calls this while holding the controller's activation fence and
+    /// before publishing the fence's new current value.
+    #[allow(unused_variables)]
+    fn on_activated(&mut self, activation: ControllerActivation) {}
+
+    /// Publish a durable/coalescing wake after activation and pointer state are
+    /// coherent, but before releasing the activation fence.
+    fn on_activation_published(&self) {}
+
+    /// Publish a durable/coalescing wake for fail-closed terminal activation
+    /// state. Checked exhaustion invokes this while the fence remains held.
+    fn on_activation_terminal(&self) {}
+
+    /// The application protocol has authenticated and may begin using
+    /// congestion-controller evidence.
+    ///
+    /// Callers serialize this notification with packet callbacks. Controllers
+    /// without application-aware instrumentation may ignore it.
+    fn on_application_ready(&mut self) {}
+
     /// One or more packets were just sent
     #[allow(unused_variables)]
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}
@@ -83,15 +363,7 @@ pub trait Controller: Send + Sync {
         packet_state: Option<PacketDeliveryState>,
         rtt: &RttEstimator,
     ) {
-        self.on_ack(
-            now,
-            sent,
-            bytes,
-            packet_number,
-            space,
-            app_limited,
-            rtt,
-        );
+        self.on_ack(now, sent, bytes, packet_number, space, app_limited, rtt);
     }
 
     /// Packets are acked in batches, all with the same `now` argument. This indicates one of those batches has completed.
@@ -174,6 +446,15 @@ pub trait Controller: Send + Sync {
         }
     }
 
+    /// Provenance of the latest completed native delivery-rate sample.
+    ///
+    /// This is separate from [`ControllerMetrics`] because metrics are read on
+    /// every transmit poll, while sample provenance changes only at the end of
+    /// an ACK batch.
+    fn latest_bandwidth_sample(&self) -> Option<BandwidthSample> {
+        None
+    }
+
     /// Legacy compatibility hook for downstream controllers.
     ///
     /// Quinn's pacer consumes [`ControllerMetrics::pacing_rate`] exclusively.
@@ -238,3 +519,55 @@ pub trait ControllerFactory {
 }
 
 const BASE_DATAGRAM_SIZE: u64 = 1200;
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    #[test]
+    fn activation_is_checked_nonzero_and_reserves_max_for_terminal() {
+        let fence = ControllerActivationFence::with_test_state(ControllerActivationState::Live(
+            ControllerActivation(u64::MAX - 2),
+        ));
+        let last_live = {
+            let mut transition = fence.begin_transition().expect("transition fence");
+            let activation = transition.allocate().expect("last live activation");
+            assert_eq!(activation.0, u64::MAX - 1);
+            transition.publish();
+            activation
+        };
+        assert_eq!(
+            fence.with_current(|state| state).expect("current state"),
+            ControllerActivationState::Live(last_live)
+        );
+
+        let mut transition = fence.begin_transition().expect("terminal transition");
+        assert_eq!(
+            transition.allocate(),
+            Err(ControllerActivationExhausted {
+                publish_terminal: true,
+            })
+        );
+        drop(transition);
+        assert_eq!(
+            fence.with_current(|state| state).expect("terminal state"),
+            ControllerActivationState::Terminal(ControllerActivationTerminal::Exhausted)
+        );
+    }
+
+    #[test]
+    fn unpublished_allocation_fails_closed_instead_of_reviving_old_a() {
+        let fence = ControllerActivationFence::new();
+        {
+            let mut transition = fence.begin_transition().expect("transition fence");
+            let activation = transition.allocate().expect("first activation");
+            assert_ne!(activation.0, 0);
+            // Deliberately omit publication to model an interrupted nonpanic
+            // branch in future transition code.
+        }
+        assert_eq!(
+            fence.with_current(|state| state).expect("terminal state"),
+            ControllerActivationState::Terminal(ControllerActivationTerminal::AbandonedTransition,)
+        );
+    }
+}

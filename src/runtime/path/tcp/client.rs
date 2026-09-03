@@ -27,7 +27,9 @@ use self::session::{
 };
 pub(in crate::runtime) use self::state::ClientTcpPathSessionRuntime;
 use self::stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
-use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
+use crate::model::path::{
+    CarrierPathInstanceId, RelayPathKey, carrier_path_instance_identity_is_available,
+};
 use crate::performance::ResourceLimits;
 use crate::protocol::{
     CloseReason, Frame, IpPacketId, IpTunnelId, PathId, StreamDemandHint, StreamId, TargetAddr,
@@ -180,7 +182,9 @@ impl Drop for ClientTcpSuccessorClaim {
             member.successor_establishing = false;
         }
         drop(member);
-        self.carrier_groups.publish_change();
+        if carrier_path_instance_identity_is_available() {
+            self.carrier_groups.publish_change();
+        }
     }
 }
 
@@ -251,6 +255,7 @@ impl ClientTcpPathSessionHandle {
         target: TargetAddr,
         lane: TrafficClass,
         initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
@@ -259,6 +264,7 @@ impl ClientTcpPathSessionHandle {
             target,
             lane,
             initial_demand,
+            return_plan,
             open_deadlines,
             advertised_recv_max_offset,
         ))
@@ -271,6 +277,7 @@ impl ClientTcpPathSessionHandle {
         target: TargetAddr,
         lane: TrafficClass,
         initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
@@ -297,6 +304,7 @@ impl ClientTcpPathSessionHandle {
                     target: target.clone(),
                     lane,
                     initial_demand,
+                    return_plan,
                     advertised_recv_max_offset,
                     open_deadlines,
                     session_commands: commands.clone(),
@@ -784,7 +792,9 @@ impl ClientTcpPathSessionHandle {
     }
 
     pub(in crate::runtime) fn can_plan_replacement(&self) -> bool {
-        if self.runtime.state.session_lifecycle().reason().is_some() {
+        if self.runtime.state.session_lifecycle().reason().is_some()
+            || !carrier_path_instance_identity_is_available()
+        {
             return false;
         }
         let mut member = self.member.lock().expect("TCP carrier member lock");
@@ -798,7 +808,9 @@ impl ClientTcpPathSessionHandle {
     }
 
     pub(in crate::runtime) fn can_establish(&self) -> bool {
-        if self.runtime.state.session_lifecycle().reason().is_some() {
+        if self.runtime.state.session_lifecycle().reason().is_some()
+            || !carrier_path_instance_identity_is_available()
+        {
             return false;
         }
         let member = self.member.lock().expect("TCP carrier member lock");

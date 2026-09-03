@@ -10,12 +10,11 @@ use crate::model::admission::{
     BulkPathCandidate, bulk_scheduling_horizon_bytes, bulk_striping_admitted_candidates,
 };
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, ReliableOriginalDataOutput, ReliableStreamSourceAdmission,
-    relay_lane_startup_chunk_bytes, reliable_stream_source_admission,
+    PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes, reliable_bulk_product_windows,
 };
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
-use crate::runtime::path::health::ClientPathHealthRecord;
+use crate::runtime::path::health::{ClientPathHealthRecord, RelayPathLoadOwner};
 use crate::runtime::path::model::{
     ClientPathObservation, PacketPathCandidate, PacketPathSelectionInput, UdpPathCandidate,
     UdpPathRuntimeModel, apply_bulk_latency_isolation, bulk_candidate_has_bulk_rate_evidence,
@@ -41,6 +40,7 @@ use std::time::Instant;
 pub(in crate::runtime) struct ReliableRequestPathEvidence {
     pub(in crate::runtime) instance: RelayPathInstance,
     pub(in crate::runtime) shared_snapshot: Option<PathSnapshot>,
+    pub(in crate::runtime) startup_snapshot: Option<PathSnapshot>,
     pub(in crate::runtime) tcp: Option<ReliableRequestTcpPathEvidence>,
     pub(in crate::runtime) has_bulk_model_evidence: bool,
     pub(in crate::runtime) has_fresh_native_carrier_rate_evidence: bool,
@@ -262,14 +262,14 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn try_reserve_relay_path_load_if_unchanged(
         &self,
-        key: RelayPathKey,
+        instance: RelayPathInstance,
         lane: TrafficClass,
         expected_active_flows: u32,
         expected_active_latency_sensitive_flows: u32,
     ) -> Option<RelayPathLoadLease> {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
-        let current = health.path_record_mut(key)?;
+        let current = health.path_record_mut(instance.key)?;
         // Topology and carrier credit are revalidated by the sender. This
         // conditional claim fences only the shared load that influenced the
         // score; a still-attached Suspect path remains usable as before.
@@ -278,13 +278,15 @@ impl ClientPathContext {
         {
             return None;
         }
-        if !current.reserve_load(lane, now) {
+        let owner = RelayPathLoadOwner::ExactInstance(instance.path_instance_id);
+        if !current.reserve_load_for_owner(owner, lane, now) {
             return None;
         }
         drop(health);
         Some(RelayPathLoadLease::new(
             self.state.clone(),
-            key,
+            instance.key,
+            owner,
             lane,
             self.tcp_carrier_groups.clone(),
         ))
@@ -354,13 +356,17 @@ impl ClientPathContext {
             );
         }
         let selected = candidates.first()?.key;
-        let reserved = match selected.underlay {
-            UnderlayProtocol::Tcp => health.tcp.get_mut(selected.index)?.reserve_load(lane, now),
-            UnderlayProtocol::Udp => health.udp.get_mut(selected.index)?.reserve_load(lane, now),
+        let owner = match selected.underlay {
+            UnderlayProtocol::Tcp => health
+                .tcp
+                .get_mut(selected.index)?
+                .reserve_current_load(lane, now),
+            UnderlayProtocol::Udp => health
+                .udp
+                .get_mut(selected.index)?
+                .reserve_current_load(lane, now),
         };
-        if !reserved {
-            return None;
-        }
+        let owner = owner?;
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
             "reliable_stream_initial_path_selected",
@@ -376,6 +382,7 @@ impl ClientPathContext {
         Some(RelayPathLoadLease::new(
             self.state.clone(),
             selected,
+            owner,
             lane,
             self.tcp_carrier_groups.clone(),
         ))
@@ -619,7 +626,13 @@ impl ClientPathContext {
         .filter_map(|(index, eta_ms)| {
             let path = self.tcp_paths.get(index)?;
             let observation = tcp_observations.get(index).copied().unwrap_or_default();
-            let snapshot = path_snapshot(path, index, observation);
+            let mut snapshot = path_snapshot(path, index, observation);
+            // Global discovery has no exact stream/output debt yet. Publish the
+            // configured Product envelope only as its planning projection; the
+            // request-local snapshot and apply transaction later replace it
+            // with exact-instance authority and debt.
+            snapshot.data_level_limit_bytes =
+                reliable_bulk_product_windows(self.mux_limits).per_output_product_limit_bytes;
             path_can_be_auto_discovered(path, observation).then_some(bulk_path_candidate(
                 RelayPathKey {
                     underlay: UnderlayProtocol::Tcp,
@@ -642,7 +655,9 @@ impl ClientPathContext {
             .filter_map(|(index, eta_ms)| {
                 let path = self.udp_paths.get(index)?;
                 let observation = udp_observations.get(index).copied().unwrap_or_default();
-                let snapshot = path_snapshot(path, index, observation);
+                let mut snapshot = path_snapshot(path, index, observation);
+                snapshot.data_level_limit_bytes =
+                    reliable_bulk_product_windows(self.mux_limits).per_output_product_limit_bytes;
                 path_can_be_auto_discovered(path, observation).then_some(bulk_path_candidate(
                     RelayPathKey {
                         underlay: UnderlayProtocol::Udp,
@@ -673,10 +688,10 @@ impl ClientPathContext {
         let mut health = self.state.health().lock().expect("client path health lock");
         if include_bulk_admission {
             for record in health.tcp_records_mut() {
-                record.maintain(now);
+                record.mutate_eligibility(|record| record.maintain(now));
             }
             for record in &mut health.udp {
-                record.maintain(now);
+                record.mutate_eligibility(|record| record.maintain(now));
             }
         }
         // Full configured-path vectors are needed only for multipath admission.
@@ -726,6 +741,7 @@ impl ClientPathContext {
                     return ReliableRequestPathEvidence {
                         instance,
                         shared_snapshot: None,
+                        startup_snapshot: None,
                         tcp: None,
                         has_bulk_model_evidence: false,
                         has_fresh_native_carrier_rate_evidence: false,
@@ -746,6 +762,10 @@ impl ClientPathContext {
                 ReliableRequestPathEvidence {
                     instance,
                     shared_snapshot: Some(path_snapshot(path, key.index, observation)),
+                    startup_snapshot: Some(path_startup_snapshot(
+                        path,
+                        observation.wire_path_id.unwrap_or(PathId(key.index as u16)),
+                    )),
                     tcp: (key.underlay == UnderlayProtocol::Tcp).then(|| {
                         ReliableRequestTcpPathEvidence {
                             startup_snapshot: path_startup_snapshot(
@@ -851,64 +871,6 @@ impl ClientPathContext {
             .path_record(instance.key)?
             .observation_for_instance_at(instance.path_instance_id, Instant::now())?;
         Some(path_snapshot(path, instance.key.index, observation))
-    }
-
-    /// Projects exact attached carrier instances under one path-health lock.
-    ///
-    /// A newly authenticated instance can become available before its first
-    /// health publication. That is an unmeasured output, not an absent one:
-    /// use only the configured startup prior until exact-instance evidence is
-    /// published. Evidence from a replacement occupying the same path key is
-    /// never inherited by the older attachment.
-    pub(in crate::runtime) fn reliable_stream_source_admission(
-        &self,
-        instances: impl IntoIterator<Item = (RelayPathInstance, bool)>,
-        lane: TrafficClass,
-        payload_bytes: usize,
-    ) -> ReliableStreamSourceAdmission {
-        let now = Instant::now();
-        let health = self.state.health().lock().expect("client path health lock");
-        reliable_stream_source_admission(
-            instances.into_iter().filter_map(|(instance, stale)| {
-                let path = match instance.key.underlay {
-                    UnderlayProtocol::Tcp => self.tcp_path_spec(instance.key.index),
-                    UnderlayProtocol::Udp => self.udp_paths.get(instance.key.index),
-                }?;
-                let observation = health
-                    .path_record(instance.key)
-                    .and_then(|record| {
-                        record.observation_for_instance_at(instance.path_instance_id, now)
-                    })
-                    .unwrap_or_default();
-                Some(ReliableOriginalDataOutput {
-                    snapshot: path_snapshot(path, instance.key.index, observation),
-                    stale,
-                })
-            }),
-            lane,
-            payload_bytes,
-            self.mux_limits,
-        )
-    }
-
-    pub(in crate::runtime) fn tcp_native_drain_observed_for_instance(
-        &self,
-        instance: RelayPathInstance,
-    ) -> bool {
-        instance.key.underlay == UnderlayProtocol::Tcp
-            && self
-                .state
-                .health()
-                .lock()
-                .expect("client path health lock")
-                .tcp_record(instance.key.index)
-                .is_some_and(|record| {
-                    record.path_instance_id() == Some(instance.path_instance_id)
-                        && record
-                            .observation_for_instance_at(instance.path_instance_id, Instant::now())
-                            .is_some()
-                        && record.native_drain_observed
-                })
     }
 
     pub(in crate::runtime) fn reliable_path_rtt_is_observed(&self, key: RelayPathKey) -> bool {

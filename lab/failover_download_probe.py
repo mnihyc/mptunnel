@@ -2,6 +2,7 @@
 import argparse
 import ipaddress
 import json
+import os
 import socket
 import struct
 import sys
@@ -49,13 +50,25 @@ def read_exact(sock, size):
     return b"".join(chunks)
 
 
-def write_started_file(path, timestamp=None):
+def write_started_file(path, timestamp=None, monotonic=None):
     if not path:
         return
     if timestamp is None:
-        timestamp = time.time()
-    with open(path, "w", encoding="utf-8") as handle:
+        unix_ns = time.time_ns()
+        timestamp = unix_ns / 1_000_000_000
+    else:
+        unix_ns = int(timestamp * 1_000_000_000)
+    if monotonic is None:
+        monotonic_ns = time.monotonic_ns()
+    else:
+        monotonic_ns = int(monotonic * 1_000_000_000)
+    temporary_path = f"{path}.tmp-{os.getpid()}"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        # Preserve the first-line Unix timestamp consumed by existing cases.
         handle.write(f"{timestamp:.9f}\n")
+        handle.write(f"{monotonic_ns // 1_000_000}\n")
+        handle.write(f"{unix_ns // 1_000_000}\n")
+    os.replace(temporary_path, path)
 
 
 class SynchronizedStartAnchor:
@@ -71,7 +84,7 @@ class SynchronizedStartAnchor:
     def _release(self):
         self.monotonic = time.monotonic()
         self.wall_time = time.time()
-        write_started_file(self.started_file, self.wall_time)
+        write_started_file(self.started_file, self.wall_time, self.monotonic)
         self.released.set()
 
     def wait(self, deadline):

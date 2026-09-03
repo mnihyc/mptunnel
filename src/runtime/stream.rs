@@ -18,8 +18,8 @@ pub(in crate::runtime) use feedback::{
 #[cfg(test)]
 pub(in crate::runtime) use handle::FixedReliablePathOutput;
 pub(in crate::runtime) use handle::{
-    ReliablePathStream, ReliablePathStreamHandle, ReliablePathStreamOutput,
-    arm_carrier_capacity_notifies, reliable_work_lane_to_carrier_lane,
+    ReliablePathStream, ReliablePathStreamHandle, ReliablePathStreamOutput, RequalificationAttempt,
+    TargetCarrierCapacityWait, arm_carrier_capacity_notifies, reliable_work_lane_to_carrier_lane,
     wait_for_carrier_capacity_notifies,
 };
 #[cfg(test)]
@@ -31,7 +31,8 @@ pub(in crate::runtime) use registry::{
 #[cfg(test)]
 pub(in crate::runtime) use request::arm_client_relay_attachment_commits_for_test;
 pub(in crate::runtime) use request::{
-    OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
-    ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayOpenedStartup,
+    ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
 };
 pub(in crate::runtime) use send_buffer::SessionSendBuffer;

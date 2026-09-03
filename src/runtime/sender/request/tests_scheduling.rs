@@ -2,16 +2,20 @@ use super::{
     BulkRelayPathChoice, BulkRelayPathRequest, ObservedBulkPathCandidate,
     ObservedOrdinaryPathChoice, RequestRelayPathObservation, RequestRelaySchedulingObservation,
     RequestSchedulingState, choose_bulk_relay_path_for_extent_avoiding,
-    choose_observed_ordinary_data_path, observed_request_ack_clock_measurement_transaction,
-    relay_path_snapshot_for_bulk_choice,
+    choose_observed_ordinary_data_path, choose_request_ack_clock_measurement_with_rates,
+    observed_request_ack_clock_measurement_transaction, relay_path_snapshot_for_bulk_choice,
+    request_snapshot_has_fresh_completion_rate,
 };
 use crate::model::ack_clock::reliable_request_ack_clock_measurement_target_bytes;
 use crate::model::admission::{BulkPathCandidate, ReliableDataAckFrontierState};
-use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
+use crate::model::capacity::{
+    RELIABLE_INITIAL_WINDOW_PACKETS, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_bulk_product_windows,
+};
 use crate::model::path::{
     CarrierPathInstanceId, RelayPathInstance, RelayPathKey, RelayPathProofEpoch,
 };
-use crate::model::request_evidence::RequestPerFlowRateModel;
+use crate::model::request_evidence::RequestProductRateEpoch;
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::ReliableRequestTcpPathEvidence;
@@ -41,6 +45,8 @@ fn snapshot(instance: RelayPathInstance, srtt_ms: f64, rate_bps: f64) -> PathSna
         rate_bps,
     );
     snapshot.carrier_inflight_limit_bytes = 8 * 1024 * 1024;
+    snapshot.data_level_limit_bytes =
+        reliable_bulk_product_windows(MuxLimits::default()).per_output_product_limit_bytes;
     snapshot
 }
 
@@ -56,6 +62,7 @@ fn observed_path(
         can_enqueue_stream_lane: true,
         load_owned: true,
         shared_snapshot: Some(snapshot),
+        startup_snapshot: Some(snapshot),
         tcp: (instance.key.underlay == UnderlayProtocol::Tcp).then_some(
             ReliableRequestTcpPathEvidence {
                 startup_snapshot: snapshot,
@@ -111,6 +118,7 @@ fn scheduling_observation(
         paths,
         global_bulk_candidates,
         latency_pressure: false,
+        observed_at: Instant::now(),
     }
 }
 
@@ -137,8 +145,10 @@ struct RequestEvidence {
 impl RequestEvidence {
     fn prove_rate(mut self, instances: impl IntoIterator<Item = RelayPathInstance>) -> Self {
         for instance in instances {
+            self.path_states
+                .qualify_product_assignment_for_test(instance);
             let state = self.path_states.get_mut(instance);
-            state.mark_product_delivery_proven();
+            state.mark_product_path_use_proven();
             state.mark_capacity_admitted();
         }
         self
@@ -152,22 +162,28 @@ impl RequestEvidence {
             let state = self.path_states.get_mut(instance);
             state.mark_capacity_admitted();
             state.mark_ack_clock_proven();
-            state.set_per_flow_rate(RequestPerFlowRateModel {
-                rate_bps: 800_000_000.0,
-                delivery_samples: 10,
-            });
+            state.set_product_rate_epoch(RequestProductRateEpoch::for_test(800_000_000.0, 10));
         }
         self
     }
 
     fn prove_quic_product_delivery(mut self, instance: RelayPathInstance) -> Self {
+        self.path_states
+            .qualify_product_assignment_for_test(instance);
         let state = self.path_states.get_mut(instance);
-        state.mark_product_delivery_proven();
+        state.mark_product_path_use_proven();
         state.mark_capacity_admitted();
         self
     }
 
-    fn with_per_flow_rate(
+    fn prove_quic_product_progress_only(mut self, instance: RelayPathInstance) -> Self {
+        self.path_states
+            .get_mut(instance)
+            .mark_product_path_use_proven();
+        self
+    }
+
+    fn with_fresh_product_rate(
         mut self,
         instance: RelayPathInstance,
         rate_bps: f64,
@@ -176,10 +192,22 @@ impl RequestEvidence {
         let state = self.path_states.get_mut(instance);
         state.mark_capacity_admitted();
         state.mark_ack_clock_proven();
-        state.set_per_flow_rate(RequestPerFlowRateModel {
+        state.set_product_rate_epoch(RequestProductRateEpoch::for_test(
             rate_bps,
             delivery_samples,
-        });
+        ));
+        self
+    }
+
+    fn with_product_rate_epoch(
+        mut self,
+        instance: RelayPathInstance,
+        epoch: RequestProductRateEpoch,
+    ) -> Self {
+        let state = self.path_states.get_mut(instance);
+        state.mark_capacity_admitted();
+        state.mark_ack_clock_proven();
+        state.set_product_rate_epoch(epoch);
         self
     }
 
@@ -227,7 +255,53 @@ impl RequestEvidence {
         RequestSchedulingState {
             operation: self.operation,
             path_states: &self.path_states,
+            flights: None,
         }
+    }
+}
+
+#[test]
+fn product_assignment_qualification_is_durable_across_rate_expiry() {
+    for (underlay, id) in [(UnderlayProtocol::Tcp, 91), (UnderlayProtocol::Udp, 92)] {
+        let instance = instance(underlay, 0, id);
+        let mut evidence = RequestEvidence::default();
+        let authority_at = Instant::now();
+
+        assert!(
+            !evidence
+                .state()
+                .product_assignment_qualified(instance, authority_at),
+            "an attachment without exact Product volume remains unqualified"
+        );
+
+        evidence
+            .path_states
+            .qualify_product_assignment_for_test(instance);
+        assert!(
+            evidence
+                .state()
+                .product_assignment_qualified(instance, authority_at),
+            "exact Product-volume qualification does not require a native or numeric rate epoch"
+        );
+
+        evidence
+            .path_states
+            .get_mut(instance)
+            .set_product_rate_epoch(
+                RequestProductRateEpoch::new(
+                    800_000_000.0,
+                    10,
+                    authority_at - std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(1),
+                )
+                .expect("expired Product rate epoch"),
+            );
+        assert!(
+            evidence
+                .state()
+                .product_assignment_qualified(instance, authority_at),
+            "numeric rate expiry cannot revoke exact Product-volume qualification for the same active incarnation"
+        );
     }
 }
 
@@ -263,6 +337,24 @@ fn choose_bulk_at_frontier(
     })
 }
 
+fn choose_measurement_annotation(
+    observation: &RequestRelaySchedulingObservation,
+    flights: &RequestFlightLedger,
+    evidence: &RequestEvidence,
+) -> Option<BulkRelayPathChoice> {
+    let reference = flights.oldest_lower_flight_owner_before_offset(PAYLOAD_BYTES as u64)?;
+    choose_request_ack_clock_measurement_with_rates(
+        observation,
+        TrafficClass::Throughput,
+        PAYLOAD_BYTES as u64,
+        PAYLOAD_BYTES,
+        0,
+        Some(reference),
+        Some(flights),
+        Some(evidence.state()),
+    )
+}
+
 #[test]
 fn ordinary_data_chooses_lowest_eta_independent_of_attachment_order() {
     let slow = instance(UnderlayProtocol::Udp, 0, 10);
@@ -280,6 +372,7 @@ fn ordinary_data_chooses_lowest_eta_independent_of_attachment_order() {
                 PAYLOAD_BYTES,
                 0,
                 &[],
+                None,
             ),
             ObservedOrdinaryPathChoice::Selected(fast),
         );
@@ -287,6 +380,197 @@ fn ordinary_data_chooses_lowest_eta_independent_of_attachment_order() {
             choose_bulk(&observation, &no_flights, None),
             BulkRelayPathChoice::Selected(fast),
             "attachment order must not become scheduling authority",
+        );
+    }
+}
+
+#[test]
+fn request_acquisition_cannot_preempt_ordinary_first_owner_establishment() {
+    let ordinary_slow = instance(UnderlayProtocol::Udp, 0, 12);
+    let ordinary_fast = instance(UnderlayProtocol::Tcp, 0, 13);
+    let observation = scheduling_observation([
+        observed_path(ordinary_slow, 80.0, 20_000_000.0),
+        observed_path(ordinary_fast, 5.0, 800_000_000.0),
+    ]);
+    let no_flights = RequestFlightLedger::default();
+    let evidence = RequestEvidence::default()
+        .admit_ack_clock_candidate(ordinary_fast)
+        .admit_ack_clock_candidate(ordinary_slow);
+
+    assert_eq!(
+        choose_bulk(&observation, &no_flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(ordinary_fast),
+        "with O=0 the ordinary completion policy establishes the first exact owner; acquisition state cannot run before that commit",
+    );
+}
+
+#[test]
+fn ordinary_data_scores_unowned_path_with_joining_flow_projection() {
+    let owned = instance(UnderlayProtocol::Tcp, 0, 16);
+    let joining = instance(UnderlayProtocol::Tcp, 1, 17);
+    let mut owned_path = observed_path(owned, 20.0, 100_000_000.0);
+    owned_path
+        .shared_snapshot
+        .as_mut()
+        .expect("owned snapshot")
+        .active_flows = 1;
+    let mut joining_path = observed_path(joining, 10.0, 100_000_000.0);
+    joining_path.load_owned = false;
+    joining_path
+        .shared_snapshot
+        .as_mut()
+        .expect("joining snapshot")
+        .active_flows = 1;
+    let observation = scheduling_observation([owned_path, joining_path]);
+
+    assert_eq!(
+        choose_observed_ordinary_data_path(
+            &observation,
+            TrafficClass::Throughput,
+            1024 * 1024,
+            0,
+            &[],
+            None,
+        ),
+        ObservedOrdinaryPathChoice::Selected(owned),
+        "the unowned candidate must include the prospective joining flow in PathCapacity fair share",
+    );
+}
+
+#[test]
+fn repair_selection_ignores_native_unused_credit_acquisition() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let fast_underlay = match underlay {
+            UnderlayProtocol::Tcp => UnderlayProtocol::Udp,
+            UnderlayProtocol::Udp => UnderlayProtocol::Tcp,
+        };
+        let fast = instance(fast_underlay, 0, 70);
+        let underfed = instance(underlay, 1, 71);
+        let avoided_unrelated = instance(UnderlayProtocol::Tcp, 9, 72);
+        let fast_path = observed_path(fast, 10.0, 500_000_000.0);
+        let mut underfed_path = observed_path(underfed, 100.0, 1_000_000.0);
+        underfed_path
+            .shared_snapshot
+            .as_mut()
+            .expect("underfed snapshot")
+            .app_limited = true;
+        let observation = scheduling_observation([fast_path, underfed_path]);
+
+        assert_eq!(
+            choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
+                observation: &observation,
+                lane: TrafficClass::Throughput,
+                offset: PAYLOAD_BYTES as u64,
+                payload_bytes: PAYLOAD_BYTES,
+                cursor: 0,
+                avoid_instances: &[avoided_unrelated],
+                path_flights: None,
+                request_state: None,
+                frontier_state: ReliableDataAckFrontierState::Live,
+            }),
+            BulkRelayPathChoice::Selected(fast),
+            "repair/reinjection retains ordinary completion ordering for an underfed {underlay:?} carrier",
+        );
+    }
+}
+
+#[test]
+fn normal_request_bulk_can_feed_current_underfed_quic_credit() {
+    let owner = instance(UnderlayProtocol::Tcp, 0, 73);
+    let underfed = instance(UnderlayProtocol::Udp, 1, 74);
+    let mut owner_path = observed_path(owner, 100.0, 500_000_000.0);
+    let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("owner snapshot");
+    owner_snapshot.jitter_ms = 3.0;
+    owner_snapshot.bytes_in_flight = PAYLOAD_BYTES as u64;
+    owner_snapshot.data_level_bytes_in_flight = PAYLOAD_BYTES as u64;
+    let mut underfed_path = observed_path(underfed, 101.0, 500_000_000.0);
+    let underfed_snapshot = underfed_path
+        .shared_snapshot
+        .as_mut()
+        .expect("underfed snapshot");
+    underfed_snapshot.jitter_ms = 3.0;
+    underfed_snapshot.app_limited = true;
+    let observation = scheduling_observation([owner_path, underfed_path]);
+    let flights = original_flights(owner);
+    let evidence = RequestEvidence::default().prove_rate([owner, underfed]);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(underfed),
+        "normal bulk placement may feed an already-admitted QUIC controller before owner hysteresis",
+    );
+}
+
+#[test]
+fn tcp_delivery_sample_app_limited_flag_does_not_preempt_request_owner() {
+    let owner = instance(UnderlayProtocol::Udp, 0, 77);
+    let sampled_tcp = instance(UnderlayProtocol::Tcp, 1, 78);
+    let mut owner_path = observed_path(owner, 100.0, 500_000_000.0);
+    let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("owner snapshot");
+    owner_snapshot.jitter_ms = 3.0;
+    owner_snapshot.bytes_in_flight = PAYLOAD_BYTES as u64;
+    owner_snapshot.data_level_bytes_in_flight = PAYLOAD_BYTES as u64;
+    let mut sampled_path = observed_path(sampled_tcp, 101.0, 500_000_000.0);
+    let sampled_snapshot = sampled_path
+        .shared_snapshot
+        .as_mut()
+        .expect("sampled TCP snapshot");
+    sampled_snapshot.jitter_ms = 3.0;
+    sampled_snapshot.app_limited = true;
+    let observation = scheduling_observation([owner_path, sampled_path]);
+    let flights = original_flights(owner);
+    let evidence = RequestEvidence::default().prove_rate([owner, sampled_tcp]);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(owner),
+        "TCP_INFO delivery-sample classification cannot override lower-owner hysteresis",
+    );
+}
+
+#[test]
+fn materially_slower_underfed_request_credit_cannot_preempt_the_live_frontier() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let owner_underlay = match underlay {
+            UnderlayProtocol::Tcp => UnderlayProtocol::Udp,
+            UnderlayProtocol::Udp => UnderlayProtocol::Tcp,
+        };
+        let owner = instance(owner_underlay, 0, 75);
+        let underfed = instance(underlay, 1, 76);
+        let mut owner_path = observed_path(owner, 80.0, 555_000_000.0);
+        let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("owner snapshot");
+        owner_snapshot.jitter_ms = 20.0;
+        owner_snapshot.bytes_in_flight = PAYLOAD_BYTES as u64;
+        owner_snapshot.data_level_bytes_in_flight = PAYLOAD_BYTES as u64;
+
+        let mut underfed_path = observed_path(underfed, 100.0, 351_000.0);
+        underfed_path.has_bulk_model_evidence = false;
+        let underfed_snapshot = underfed_path
+            .shared_snapshot
+            .as_mut()
+            .expect("underfed snapshot");
+        underfed_snapshot.jitter_ms = 20.0;
+        underfed_snapshot.app_limited = true;
+        let owner_eta =
+            scheduler::score_path(*owner_snapshot, TrafficClass::Throughput, PAYLOAD_BYTES)
+                .expect("owner score")
+                .eta_ms;
+        let underfed_eta =
+            scheduler::score_path(*underfed_snapshot, TrafficClass::Throughput, PAYLOAD_BYTES)
+                .expect("underfed score")
+                .eta_ms;
+        assert!(
+            underfed_eta > owner_eta + owner_snapshot.jitter_ms,
+            "the fixture must reproduce a materially later underfed carrier: owner={owner_eta:.3} ms underfed={underfed_eta:.3} ms",
+        );
+
+        let observation = scheduling_observation([owner_path, underfed_path]);
+        let flights = original_flights(owner);
+        let evidence = RequestEvidence::default().prove_rate([owner, underfed]);
+        assert_eq!(
+            choose_bulk(&observation, &flights, Some(&evidence)),
+            BulkRelayPathChoice::Selected(owner),
+            "current native starvation is acquisition evidence, not authority to put a materially later {underlay:?} request range below the live frontier",
         );
     }
 }
@@ -311,6 +595,7 @@ fn ordinary_data_uses_available_path_before_faster_backup() {
             PAYLOAD_BYTES,
             0,
             &[],
+            None,
         ),
         ObservedOrdinaryPathChoice::Selected(available),
     );
@@ -336,6 +621,7 @@ fn ordinary_data_avoidance_ranks_only_within_available_paths() {
             PAYLOAD_BYTES,
             0,
             &[available],
+            None,
         ),
         ObservedOrdinaryPathChoice::Selected(available),
         "reuse avoidance cannot promote a peer Backup over a schedulable Available path",
@@ -357,6 +643,7 @@ fn ordinary_data_avoidance_ranks_only_within_available_paths() {
             PAYLOAD_BYTES,
             0,
             &[available],
+            None,
         ),
         ObservedOrdinaryPathChoice::Selected(available),
         "reuse avoidance cannot promote a locally configured Backup either",
@@ -390,6 +677,7 @@ fn ordinary_data_excludes_failed_and_draining_paths() {
             PAYLOAD_BYTES,
             0,
             &[],
+            None,
         ),
         ObservedOrdinaryPathChoice::Selected(available),
     );
@@ -422,7 +710,31 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
 }
 
 #[test]
-fn authoritative_gap_frontier_revokes_only_request_owner_native_bypass() {
+fn request_contiguous_owner_does_not_treat_sampled_native_shape_as_enqueue_credit() {
+    let owner = instance(UnderlayProtocol::Tcp, 0, 34);
+    let alternate = instance(UnderlayProtocol::Udp, 1, 35);
+    let mut owner_path = observed_path(owner, 10.0, 500_000_000.0);
+    let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("snapshot");
+    owner_snapshot.carrier_inflight_limit_bytes = PAYLOAD_BYTES as u64;
+    owner_snapshot.queue_bytes = 8 * 1024 * 1024;
+    owner_snapshot.bytes_in_flight = 8 * 1024 * 1024;
+    owner_snapshot.data_level_limit_bytes = PAYLOAD_BYTES as u64;
+    owner_snapshot.data_level_bytes_in_flight = 512 * 1024 - 1;
+    let mut alternate_path = observed_path(alternate, 8.0, 500_000_000.0);
+    alternate_path.can_enqueue_frame = false;
+    let observation = scheduling_observation([owner_path, alternate_path]);
+    let flights = original_flights(owner);
+    let evidence = RequestEvidence::default().prove_rate([owner, alternate]);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(owner),
+        "carrier-wide TCP queue samples do not consume the flow's Product window while exact Product debt still has headroom",
+    );
+}
+
+#[test]
+fn live_request_frontier_cannot_bypass_an_exhausted_product_window() {
     let owner = instance(UnderlayProtocol::Tcp, 0, 32);
     let alternate = instance(UnderlayProtocol::Udp, 1, 33);
     let mut owner_path = observed_path(owner, 10.0, 500_000_000.0);
@@ -436,8 +748,8 @@ fn authoritative_gap_frontier_revokes_only_request_owner_native_bypass() {
 
     assert_eq!(
         choose_bulk(&observation, &flights, Some(&evidence)),
-        BulkRelayPathChoice::Selected(owner),
-        "without receiver proof of a gap, the same owner remains native-work-conserving",
+        BulkRelayPathChoice::Blocked,
+        "a live contiguous owner cannot renew Product debt merely because TCP has native credit",
     );
     assert_eq!(
         choose_bulk_at_frontier(
@@ -447,12 +759,12 @@ fn authoritative_gap_frontier_revokes_only_request_owner_native_bypass() {
             ReliableDataAckFrontierState::AuthoritativeGap,
         ),
         BulkRelayPathChoice::Blocked,
-        "a receiver-proven gap must classify the overcommitted request owner through ordinary Product admission",
+        "an authoritative gap remains blocked by the same exhausted Product authority",
     );
 }
 
 #[test]
-fn tcp_product_rate_remains_fallback_without_fresh_native_capacity() {
+fn tcp_product_lower_bound_cannot_downshift_baseline_without_fresh_native_capacity() {
     let path_instance = instance(UnderlayProtocol::Tcp, 0, 35);
     let mut path = observed_path(path_instance, 180.0, 200_000_000.0);
     path.has_fresh_native_carrier_rate_evidence = false;
@@ -462,7 +774,8 @@ fn tcp_product_rate_remains_fallback_without_fresh_native_capacity() {
         .startup_snapshot
         .delivery_rate_bps = 1_000_000.0;
     let observation = scheduling_observation([path]);
-    let immature = RequestEvidence::default().with_per_flow_rate(path_instance, 3_000_000.0, 1);
+    let immature =
+        RequestEvidence::default().with_fresh_product_rate(path_instance, 3_000_000.0, 1);
 
     let retained = relay_path_snapshot_for_bulk_choice(
         &observation,
@@ -477,8 +790,35 @@ fn tcp_product_rate_remains_fallback_without_fresh_native_capacity() {
         retained.rate_scope,
         crate::scheduler::PathRateScope::PathCapacity
     );
+    assert_eq!(retained.product_progress_rate_bps, None);
+    assert!(!retained.has_durable_product_progress);
 
-    let mature = RequestEvidence::default().with_per_flow_rate(path_instance, 3_000_000.0, 10);
+    let boundary_minus_one = RequestEvidence::default().with_fresh_product_rate(
+        path_instance,
+        900_000_000.0,
+        RELIABLE_INITIAL_WINDOW_PACKETS as u32 - 1,
+    );
+    let retained_high_point = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(boundary_minus_one.state()),
+        true,
+    )
+    .expect("sub-floor high Product point retains typed capacity prior");
+    assert_eq!(retained_high_point.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(
+        retained_high_point.rate_scope,
+        crate::scheduler::PathRateScope::PathCapacity
+    );
+    assert_eq!(retained_high_point.product_progress_rate_bps, None);
+    assert!(!retained_high_point.has_durable_product_progress);
+
+    let mature = RequestEvidence::default().with_fresh_product_rate(
+        path_instance,
+        3_000_000.0,
+        RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+    );
     let measured = relay_path_snapshot_for_bulk_choice(
         &observation,
         path_instance,
@@ -487,11 +827,16 @@ fn tcp_product_rate_remains_fallback_without_fresh_native_capacity() {
         true,
     )
     .expect("mature per-flow snapshot");
-    assert_eq!(measured.delivery_rate_bps, 3_000_000.0);
+    assert_eq!(measured.delivery_rate_bps, 200_000_000.0);
     assert_eq!(
         measured.rate_scope,
-        crate::scheduler::PathRateScope::PerFlowGoodput,
-        "a mature Product ACK clock remains the fallback when native rate is unavailable",
+        crate::scheduler::PathRateScope::PathCapacity,
+        "a mature Product lower bound cannot downshift the configured path baseline when native rate is unavailable",
+    );
+    assert_eq!(measured.product_progress_rate_bps, Some(3_000_000.0));
+    assert!(
+        measured.has_durable_product_progress,
+        "the mature exact Data ACK clock qualifies Product service without claiming physical-carrier capacity"
     );
 }
 
@@ -504,12 +849,8 @@ fn fresh_native_tcp_capacity_outweighs_mature_product_fallback() {
         .as_mut()
         .expect("shared snapshot")
         .active_flows = 4;
-    let native_window = path
-        .shared_snapshot
-        .expect("shared snapshot")
-        .carrier_inflight_limit_bytes;
     let observation = scheduling_observation([path]);
-    let mature = RequestEvidence::default().with_per_flow_rate(path_instance, 3_000_000.0, 10);
+    let mature = RequestEvidence::default().with_fresh_product_rate(path_instance, 3_000_000.0, 10);
 
     let projected = relay_path_snapshot_for_bulk_choice(
         &observation,
@@ -528,8 +869,8 @@ fn fresh_native_tcp_capacity_outweighs_mature_product_fallback() {
     );
     assert_eq!(
         projected.data_level_limit_bytes,
-        native_window + reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64,
-        "rate provenance must not alter the native TCP Product service window",
+        reliable_bulk_product_windows(MuxLimits::default()).per_output_product_limit_bytes,
+        "native and Product rate provenance rank service but do not rewrite configured Product authority",
     );
 
     let projected_score = scheduler::score_path(projected, TrafficClass::Throughput, PAYLOAD_BYTES)
@@ -564,13 +905,14 @@ fn fresh_native_tcp_capacity_outweighs_mature_product_fallback() {
 }
 
 #[test]
-fn quic_request_snapshot_publishes_native_service_window() {
+fn quic_request_snapshot_publishes_configured_product_window() {
     let path_instance = instance(UnderlayProtocol::Udp, 0, 36);
     let mut path = observed_path(path_instance, 180.0, 2_000_000.0);
     let native_window = 2 * 1024 * 1024;
     let shared = path.shared_snapshot.as_mut().expect("shared snapshot");
     shared.carrier_inflight_limit_bytes = native_window;
     shared.app_limited = true;
+    shared.has_durable_product_progress = true;
     let observation = scheduling_observation([path]);
 
     let snapshot = relay_path_snapshot_for_bulk_choice(
@@ -584,13 +926,171 @@ fn quic_request_snapshot_publishes_native_service_window() {
 
     assert_eq!(
         snapshot.data_level_limit_bytes,
-        native_window + reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64,
+        reliable_bulk_product_windows(MuxLimits::default()).per_output_product_limit_bytes,
     );
     assert_eq!(snapshot.delivery_rate_bps, 2_000_000.0);
 }
 
 #[test]
-fn tcp_request_snapshot_publishes_native_service_window() {
+fn expired_request_product_rate_and_shared_sibling_rate_cannot_become_local_authority() {
+    let path_instance = instance(UnderlayProtocol::Udp, 0, 360);
+    let mut path = observed_path(path_instance, 100.0, 500_000_000.0);
+    let native_window = 1024 * 1024;
+    let shared = path.shared_snapshot.as_mut().expect("shared snapshot");
+    shared.carrier_inflight_limit_bytes = native_window;
+    shared.carrier_delivery_rate_bps = None;
+    shared.product_progress_rate_bps = Some(500_000_000.0);
+    shared.has_durable_product_progress = true;
+    shared.rate_scope = crate::scheduler::PathRateScope::PerFlowGoodput;
+    let mut startup = shared.to_owned();
+    startup.delivery_rate_bps = 5_000_000.0;
+    startup.pacing_rate_bps = 5_000_000.0;
+    startup.product_progress_rate_bps = None;
+    startup.has_durable_product_progress = false;
+    startup.rate_scope = crate::scheduler::PathRateScope::PathCapacity;
+    path.startup_snapshot = Some(startup);
+    let mut observation = scheduling_observation([path]);
+    let authority_at = Instant::now();
+    observation.observed_at = authority_at;
+    let expired = RequestProductRateEpoch::new(
+        500_000_000.0,
+        10,
+        authority_at - std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(1),
+    )
+    .expect("expired diagnostic epoch");
+    let evidence = RequestEvidence::default().with_product_rate_epoch(path_instance, expired);
+
+    let projected = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(evidence.state()),
+        true,
+    )
+    .expect("request-local authority snapshot");
+    assert!(!projected.has_durable_product_progress);
+    assert_eq!(projected.product_progress_rate_bps, None);
+    assert_eq!(projected.delivery_rate_bps, 5_000_000.0);
+    assert_eq!(
+        projected.rate_scope,
+        crate::scheduler::PathRateScope::PathCapacity
+    );
+    assert_eq!(
+        projected.data_level_limit_bytes,
+        reliable_bulk_product_windows(MuxLimits::default()).per_output_product_limit_bytes,
+        "configured Product authority is independent of expired local R and another stream's shared R",
+    );
+}
+
+#[test]
+fn immature_local_product_cannot_label_restored_startup_as_fresh_completion() {
+    let path_instance = instance(UnderlayProtocol::Tcp, 0, 362);
+    let mut path = observed_path(path_instance, 100.0, 900_000_000.0);
+    path.has_bulk_model_evidence = true;
+    path.has_fresh_native_carrier_rate_evidence = false;
+    let shared = path.shared_snapshot.as_mut().expect("shared snapshot");
+    shared.carrier_delivery_rate_bps = None;
+    shared.product_progress_rate_bps = Some(900_000_000.0);
+    shared.has_durable_product_progress = true;
+    shared.rate_scope = crate::scheduler::PathRateScope::PerFlowGoodput;
+    let mut startup = *shared;
+    startup.delivery_rate_bps = 25_000_000.0;
+    startup.pacing_rate_bps = 25_000_000.0;
+    startup.product_progress_rate_bps = None;
+    startup.has_durable_product_progress = false;
+    startup.rate_scope = crate::scheduler::PathRateScope::PathCapacity;
+    path.startup_snapshot = Some(startup);
+    path.tcp.as_mut().expect("TCP evidence").startup_snapshot = startup;
+    let observation = scheduling_observation([path]);
+    let local = RequestEvidence::default().with_fresh_product_rate(
+        path_instance,
+        800_000_000.0,
+        RELIABLE_INITIAL_WINDOW_PACKETS as u32 - 1,
+    );
+
+    let projected = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(local.state()),
+        true,
+    )
+    .expect("request-local authority snapshot");
+    let path = observation
+        .path_by_instance(path_instance)
+        .expect("exact path observation");
+    assert_eq!(projected.delivery_rate_bps, 25_000_000.0);
+    assert_eq!(
+        projected.rate_scope,
+        crate::scheduler::PathRateScope::PathCapacity
+    );
+    assert!(!request_snapshot_has_fresh_completion_rate(
+        path,
+        projected,
+        Some(local.state()),
+        observation.observed_at,
+    ));
+}
+
+#[test]
+fn request_product_limit_is_independent_of_native_window_and_rate_evidence() {
+    let path_instance = instance(UnderlayProtocol::Udp, 0, 361);
+    let product_at = Instant::now();
+    let mut path = observed_path(path_instance, 100.0, 500_000_000.0);
+    let shared = path.shared_snapshot.as_mut().expect("shared snapshot");
+    shared.carrier_inflight_limit_bytes = 1024 * 1024;
+    shared.carrier_delivery_rate_bps = None;
+    let mut observation = scheduling_observation([path]);
+    observation.observed_at = product_at;
+    let evidence = RequestEvidence::default().with_product_rate_epoch(
+        path_instance,
+        RequestProductRateEpoch::new(
+            500_000_000.0,
+            10,
+            product_at,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("fresh Product epoch"),
+    );
+
+    let newer_product = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(evidence.state()),
+        true,
+    )
+    .expect("request-local Product authority");
+    let product_limit =
+        reliable_bulk_product_windows(MuxLimits::default()).per_output_product_limit_bytes;
+    assert_eq!(
+        newer_product.data_level_limit_bytes, product_limit,
+        "native C cannot clamp configured Product authority",
+    );
+
+    path.shared_snapshot
+        .as_mut()
+        .expect("shared snapshot")
+        .carrier_delivery_rate_bps = Some(500_000_000.0);
+    let mut coherent_observation = scheduling_observation([path]);
+    coherent_observation.observed_at = product_at;
+    let coherent = relay_path_snapshot_for_bulk_choice(
+        &coherent_observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(evidence.state()),
+        true,
+    )
+    .expect("coherent request authority");
+    assert_eq!(
+        coherent.data_level_limit_bytes, product_limit,
+        "adding native R does not rewrite configured Product authority",
+    );
+}
+
+#[test]
+fn tcp_request_snapshot_publishes_configured_product_window() {
     let path_instance = instance(UnderlayProtocol::Tcp, 0, 39);
     let mut path = observed_path(path_instance, 180.0, 2_000_000.0);
     let native_window = 2 * 1024 * 1024;
@@ -610,8 +1110,8 @@ fn tcp_request_snapshot_publishes_native_service_window() {
 
     assert_eq!(
         snapshot.data_level_limit_bytes,
-        native_window + reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64,
-        "TCP request scheduling must feed the native window without replacing socket backpressure",
+        reliable_bulk_product_windows(MuxLimits::default()).per_output_product_limit_bytes,
+        "TCP Product authority is configured independently of native socket backpressure",
     );
     assert_eq!(snapshot.delivery_rate_bps, 2_000_000.0);
 }
@@ -667,6 +1167,91 @@ fn blocked_validated_quic_path_does_not_serialize_an_independent_quic_path() {
 }
 
 #[test]
+fn tcp_acquisition_awaiting_one_outputs_ack_does_not_serialize_an_independent_output() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 43);
+    let awaiting_ack = instance(UnderlayProtocol::Tcp, 0, 44);
+    let independent = instance(UnderlayProtocol::Tcp, 1, 45);
+    let reference_path = observed_path(reference, 100.0, 20_000_000.0);
+    let mut awaiting_path = observed_path(awaiting_ack, 80.0, 200_000_000.0);
+    awaiting_path.has_bulk_model_evidence = false;
+    let mut independent_path = observed_path(independent, 5.0, 800_000_000.0);
+    independent_path.has_bulk_model_evidence = false;
+    let observation = scheduling_observation([reference_path, awaiting_path, independent_path]);
+    let flights = original_flights(reference);
+    let target = reliable_request_ack_clock_measurement_target_bytes(MuxLimits::default());
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .own_ack_clock_candidate(awaiting_ack, target, target);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(independent),
+        "A's fully committed Product generation may await its exact Data ACK, but it cannot own a direction-global acquisition token that blocks B's independent E-bounded Product acquisition",
+    );
+}
+
+#[test]
+fn pending_tcp_acquisition_skips_a_blocked_candidate_without_fencing_an_independent_regular_output()
+{
+    let reference = instance(UnderlayProtocol::Udp, 0, 46);
+    let blocked = instance(UnderlayProtocol::Tcp, 0, 47);
+    let independent = instance(UnderlayProtocol::Tcp, 1, 48);
+    let reference_path = observed_path(reference, 100.0, 20_000_000.0);
+    let mut blocked_path = observed_path(blocked, 80.0, 200_000_000.0);
+    blocked_path.has_bulk_model_evidence = false;
+    blocked_path.can_enqueue_frame = false;
+    let mut independent_path = observed_path(independent, 5.0, 800_000_000.0);
+    independent_path.has_bulk_model_evidence = false;
+    let observation = scheduling_observation([reference_path, blocked_path, independent_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .pending_measurement(reference, blocked)
+        .admit_ack_clock_candidate(independent);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(independent),
+        "a transiently blocked advisory candidate is skipped for this acquisition round; its legacy Pending state cannot hold a direction-global fence over an independent regular output",
+    );
+}
+
+#[test]
+fn blocked_regular_membership_prevents_backup_product_acquisition() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 49);
+    let blocked_regular = instance(UnderlayProtocol::Tcp, 0, 50);
+    let backup = instance(UnderlayProtocol::Tcp, 1, 51);
+    let reference_path = observed_path(reference, 20.0, 500_000_000.0);
+    let mut blocked_regular_path = observed_path(blocked_regular, 10.0, 800_000_000.0);
+    blocked_regular_path.can_enqueue_frame = false;
+    let mut backup_path = observed_path(backup, 1.0, 1_000_000_000.0);
+    backup_path
+        .shared_snapshot
+        .as_mut()
+        .expect("backup shared snapshot")
+        .policy
+        .backup = true;
+    backup_path
+        .startup_snapshot
+        .as_mut()
+        .expect("backup startup snapshot")
+        .policy
+        .backup = true;
+    let observation = scheduling_observation([reference_path, blocked_regular_path, backup_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .admit_ack_clock_candidate(blocked_regular)
+        .admit_ack_clock_candidate(backup);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(reference),
+        "transient writer blockage does not remove a regular output from the selected acquisition tier, so an unqualified backup cannot acquire while regular membership exists",
+    );
+}
+
+#[test]
 fn measured_cross_tcp_quic_path_can_join_bulk_scheduling() {
     let quic_reference = instance(UnderlayProtocol::Udp, 0, 50);
     let tcp_candidate = instance(UnderlayProtocol::Tcp, 0, 51);
@@ -702,6 +1287,87 @@ fn exact_quic_data_ack_progress_joins_normal_bulk_scheduling() {
         choose_bulk(&observation, &flights, Some(&evidence)),
         BulkRelayPathChoice::Selected(candidate),
         "exact QUIC product delivery must enter normal completion-based scheduling",
+    );
+}
+
+#[test]
+fn sub_sample_quic_product_progress_retains_bounded_acquisition_after_proof_expiry() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 154);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 155);
+    let reference_path = observed_path(reference, 100.0, 20_000_000.0);
+    let mut candidate_path = observed_path(candidate, 5.0, 800_000_000.0);
+    candidate_path.has_bulk_model_evidence = false;
+    candidate_path.fresh_proof = None;
+    candidate_path
+        .shared_snapshot
+        .as_mut()
+        .expect("candidate snapshot")
+        .app_limited = true;
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .prove_quic_product_progress_only(candidate);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "exact unique Product progress keeps an unqualified QUIC path eligible for the existing native-credit acquisition window after attachment proof expires",
+    );
+}
+
+#[test]
+fn quic_product_progress_without_a_further_ack_stops_at_native_credit() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 156);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 157);
+    let reference_path = observed_path(reference, 100.0, 20_000_000.0);
+    let mut candidate_path = observed_path(candidate, 5.0, 800_000_000.0);
+    candidate_path.has_bulk_model_evidence = false;
+    candidate_path.fresh_proof = None;
+    let candidate_snapshot = candidate_path
+        .shared_snapshot
+        .as_mut()
+        .expect("candidate snapshot");
+    candidate_snapshot.app_limited = true;
+    candidate_snapshot.data_level_bytes_in_flight = candidate_snapshot
+        .carrier_inflight_limit_bytes
+        .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64);
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .prove_quic_product_progress_only(candidate);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(reference),
+        "one exact ACK is not unbounded rate authority: without another ACK, Product credit exhausts after the native window plus its one feed quantum",
+    );
+}
+
+#[test]
+fn slower_sub_sample_quic_progress_does_not_preempt_the_qualified_lead() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 158);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 159);
+    let reference_path = observed_path(reference, 20.0, 500_000_000.0);
+    let mut candidate_path = observed_path(candidate, 800.0, 351_000.0);
+    candidate_path.has_bulk_model_evidence = false;
+    candidate_path.fresh_proof = None;
+    candidate_path
+        .shared_snapshot
+        .as_mut()
+        .expect("candidate snapshot")
+        .app_limited = true;
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .prove_quic_product_progress_only(candidate);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(reference),
+        "bounded acquisition eligibility must not change qualified completion ordering",
     );
 }
 
@@ -857,11 +1523,11 @@ fn unavailable_quic_path_does_not_block_tcp_ack_clock_measurement() {
         .prove_rate([reference])
         .admit_ack_clock_candidate(tcp_candidate);
     assert!(matches!(
-        choose_bulk(&observation, &flights, Some(&evidence)),
-        BulkRelayPathChoice::SelectedAckClockMeasurement {
+        choose_measurement_annotation(&observation, &flights, &evidence),
+        Some(BulkRelayPathChoice::SelectedAckClockMeasurement {
             candidate,
             ..
-        } if candidate == tcp_candidate
+        }) if candidate == tcp_candidate
     ));
 }
 
@@ -878,25 +1544,24 @@ fn tcp_product_ack_clock_is_only_a_native_capacity_fallback() {
 
     let without_native_capacity = scheduling_observation([reference_path, candidate_path]);
     assert!(matches!(
-        choose_bulk(&without_native_capacity, &flights, Some(&evidence)),
-        BulkRelayPathChoice::SelectedAckClockMeasurement {
+        choose_measurement_annotation(&without_native_capacity, &flights, &evidence),
+        Some(BulkRelayPathChoice::SelectedAckClockMeasurement {
             candidate: selected,
             ..
-        } if selected == candidate
+        }) if selected == candidate
     ));
 
     let mut native_candidate_path = candidate_path;
     native_candidate_path.has_fresh_native_carrier_rate_evidence = true;
     let with_native_capacity = scheduling_observation([reference_path, native_candidate_path]);
-    assert_eq!(
-        choose_bulk(&with_native_capacity, &flights, Some(&evidence)),
-        BulkRelayPathChoice::Selected(candidate),
-        "native TCP delivery evidence must suppress redundant product calibration",
+    assert!(
+        choose_measurement_annotation(&with_native_capacity, &flights, &evidence).is_none(),
+        "native TCP delivery evidence must suppress redundant Product calibration annotation",
     );
 }
 
 #[test]
-fn slow_tcp_ack_clock_acquisition_cannot_preempt_a_qualified_quic_frontier() {
+fn unmeasured_tcp_startup_prior_cannot_trigger_ecf_suppression() {
     let reference = instance(UnderlayProtocol::Udp, 0, 164);
     let candidate = instance(UnderlayProtocol::Tcp, 0, 165);
     let reference_path = observed_path(reference, 20.0, 500_000_000.0);
@@ -907,15 +1572,20 @@ fn slow_tcp_ack_clock_acquisition_cannot_preempt_a_qualified_quic_frontier() {
 
     let entry = RequestEvidence::default()
         .prove_rate([reference])
+        .with_fresh_product_rate(
+            reference,
+            500_000_000.0,
+            RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        )
         .admit_ack_clock_candidate(candidate);
-    let entry_choice = choose_bulk(&observation, &flights, Some(&entry));
+    let entry_choice = choose_measurement_annotation(&observation, &flights, &entry);
     let entry_preempts = matches!(
         entry_choice,
-        BulkRelayPathChoice::SelectedAckClockMeasurement {
+        Some(BulkRelayPathChoice::SelectedAckClockMeasurement {
             candidate: selected,
             target_bytes,
             ..
-        } if selected == candidate && target_bytes == target
+        }) if selected == candidate && target_bytes == target
     );
 
     // Prove that this is a cumulative transaction rather than a one-quantum
@@ -924,25 +1594,25 @@ fn slow_tcp_ack_clock_acquisition_cannot_preempt_a_qualified_quic_frontier() {
     let nearly_spent = target.saturating_sub(PAYLOAD_BYTES as u64);
     let continuing = RequestEvidence::default()
         .prove_rate([reference])
+        .with_fresh_product_rate(
+            reference,
+            500_000_000.0,
+            RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        )
         .own_ack_clock_candidate(candidate, target, nearly_spent);
     let continuation_preempts = matches!(
-        choose_bulk(&observation, &flights, Some(&continuing)),
-        BulkRelayPathChoice::SelectedAckClockMeasurement {
+        choose_measurement_annotation(&observation, &flights, &continuing),
+        Some(BulkRelayPathChoice::SelectedAckClockMeasurement {
             candidate: selected,
             target_bytes,
             ..
-        } if selected == candidate && target_bytes == target
+        }) if selected == candidate && target_bytes == target
     );
 
-    let candidate_completion_ms = 800.0 / 2.0 + (target as f64 * 8.0 / 351_000.0) * 1_000.0;
-    let qualified_completion_ms = 20.0 / 2.0 + (target as f64 * 8.0 / 500_000_000.0) * 1_000.0;
-
-    assert_eq!(
-        entry_choice,
-        BulkRelayPathChoice::Selected(reference),
-        "the {target}-byte unique-DSN ACK-clock transaction must not preempt its qualified QUIC frontier: projected TCP completion {candidate_completion_ms:.3} ms versus qualified control {qualified_completion_ms:.3} ms",
+    assert!(
+        entry_preempts,
+        "an unmeasured TCP startup prior is not achieved completion evidence and cannot invoke ECF suppression",
     );
-    assert!(!entry_preempts);
     assert!(
         continuation_preempts,
         "once admitted, the exact ACK-clock owner must remain stable through its final quantum",
@@ -963,12 +1633,12 @@ fn begun_tcp_ack_clock_transaction_keeps_its_exact_owner_across_later_rate_chang
         .own_ack_clock_candidate(candidate, target, PAYLOAD_BYTES as u64);
 
     assert!(matches!(
-        choose_bulk(&observation, &flights, Some(&begun)),
-        BulkRelayPathChoice::SelectedAckClockMeasurement {
+        choose_measurement_annotation(&observation, &flights, &begun),
+        Some(BulkRelayPathChoice::SelectedAckClockMeasurement {
             candidate: selected,
             target_bytes,
             ..
-        } if selected == candidate && target_bytes == target
+        }) if selected == candidate && target_bytes == target
     ));
 }
 
@@ -986,11 +1656,11 @@ fn tcp_ack_clock_acquisition_remains_fallback_when_reference_cannot_enqueue() {
         .admit_ack_clock_candidate(candidate);
 
     assert!(matches!(
-        choose_bulk(&observation, &flights, Some(&evidence)),
-        BulkRelayPathChoice::SelectedAckClockMeasurement {
+        choose_measurement_annotation(&observation, &flights, &evidence),
+        Some(BulkRelayPathChoice::SelectedAckClockMeasurement {
             candidate: selected,
             ..
-        } if selected == candidate
+        }) if selected == candidate
     ));
 }
 
@@ -1010,17 +1680,17 @@ fn equal_or_faster_tcp_capacity_can_start_ack_clock_acquisition() {
             .admit_ack_clock_candidate(candidate);
 
         assert!(matches!(
-            choose_bulk(&observation, &flights, Some(&evidence)),
-            BulkRelayPathChoice::SelectedAckClockMeasurement {
+            choose_measurement_annotation(&observation, &flights, &evidence),
+            Some(BulkRelayPathChoice::SelectedAckClockMeasurement {
                 candidate: selected,
                 ..
-            } if selected == candidate
+            }) if selected == candidate
         ));
     }
 }
 
 #[test]
-fn ack_clock_transaction_fences_exact_reference_and_candidate_instances() {
+fn pending_ack_clock_metadata_has_no_acquisition_or_placement_authority() {
     let reference = instance(UnderlayProtocol::Udp, 0, 70);
     let candidate = instance(UnderlayProtocol::Tcp, 0, 71);
     let stale_reference = RelayPathInstance {
@@ -1043,14 +1713,11 @@ fn ack_clock_transaction_fences_exact_reference_and_candidate_instances() {
             reference.key,
             Some(exact.state()),
         ),
-        Some(candidate),
+        None,
     );
     assert_eq!(
         choose_bulk(&observation, &flights, Some(&exact)),
-        BulkRelayPathChoice::SelectedAckClockMeasurementFence {
-            reference,
-            candidate,
-        },
+        BulkRelayPathChoice::Selected(reference),
     );
 
     let stale = RequestEvidence::default()

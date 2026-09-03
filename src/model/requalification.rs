@@ -90,6 +90,25 @@ impl<Candidate: Copy + Eq> StreamPathRequalification<Candidate> {
         self.state(candidate).stale_for_original_data()
     }
 
+    /// Resolves an exact non-reused probe to the forward attachment that owns
+    /// its pending transaction. The attachment returning the ACK is not an
+    /// input to this lookup.
+    pub(crate) fn pending_probe_candidate(
+        &self,
+        probe: StreamRequalificationProbe,
+    ) -> Option<Candidate> {
+        self.entries.iter().find_map(|(candidate, state)| {
+            matches!(
+                state,
+                StreamPathQualification::Requalifying {
+                    probe: expected,
+                    ..
+                } if *expected == probe
+            )
+            .then_some(*candidate)
+        })
+    }
+
     pub(crate) fn mark_stale(&mut self, candidate: Candidate, now: Instant) -> bool {
         let state = self.state_mut(candidate);
         if state.stale_for_original_data() {

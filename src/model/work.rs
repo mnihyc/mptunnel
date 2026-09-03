@@ -4,8 +4,8 @@
 //! describe what product work may do to ordered ownership and sender queues.
 
 use crate::model::capacity::{
-    adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_reinjection_bytes,
-    reliable_bulk_carrier_feed_quantum_bytes,
+    adaptive_reliable_relay_reinjection_bytes, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_product_recovery_window_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::protocol::OffsetRange;
@@ -43,6 +43,36 @@ pub(crate) struct RangeRecoveryState {
     pub(crate) retry_deadline: Option<Instant>,
 }
 
+/// Committed work that consumes one selected target's Product recovery
+/// authority.
+///
+/// `path.data_level_bytes_in_flight` contains exact OriginalData only.
+/// `accepted_reinjection_bytes` contains every exact un-DataACKed repair copy
+/// accepted by this target incarnation: a retry deadline or native backlog
+/// release does not remove it. Queued repair contains target-bound work plus
+/// current-stream target-unbound work, but never raw Data/control or repair
+/// already bound to another exact target.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReliableReinjectionTargetWork {
+    path: Option<PathSnapshot>,
+    queued_reinjection_bytes: usize,
+    accepted_reinjection_bytes: usize,
+}
+
+impl ReliableReinjectionTargetWork {
+    pub(crate) fn new(
+        path: Option<PathSnapshot>,
+        queued_reinjection_bytes: usize,
+        accepted_reinjection_bytes: usize,
+    ) -> Self {
+        Self {
+            path,
+            queued_reinjection_bytes,
+            accepted_reinjection_bytes,
+        }
+    }
+}
+
 /// Caps one product reinjection event by current debt and configured resource
 /// ceilings; carrier command admission remains the final emission authority.
 pub(crate) fn reliable_critical_tail_reinjection_limit_bytes(
@@ -71,35 +101,53 @@ pub(crate) fn reliable_critical_tail_reinjection_limit_bytes(
 /// target's available Product service window. The target's TCP or QUIC sender
 /// remains the final pacing, congestion, and enqueue authority.
 pub(crate) fn reliable_reinjection_service_limit_bytes(
-    path: Option<PathSnapshot>,
-    queued_product_bytes: usize,
+    target: ReliableReinjectionTargetWork,
     reinjection_debt_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    // Keep one Product work quantum available even when the target already
-    // owns a full modeled flight; its TCP/QUIC sender still gates emission.
-    let event_limit =
-        adaptive_reliable_relay_reinjection_bytes(path, TrafficClass::Throughput, mux_limits)
-            .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
-    let target_flight =
-        adaptive_reliable_relay_inflight_bytes(path, TrafficClass::Throughput, mux_limits);
-    let existing_target_debt = path.map_or(queued_product_bytes, |snapshot| {
-        // Native and Product accounting overlap once work enters the carrier,
-        // but queue and flight are disjoint within either domain. Use the same
-        // committed-work geometry as completion-time scheduling. The explicit
-        // queue value is authoritative for the current sender turn; the path
-        // snapshot contains an asynchronously published view of that same
-        // shared Product queue and must not retain a stale high watermark.
-        let native_work = snapshot
-            .queue_bytes
-            .saturating_add(snapshot.bytes_in_flight);
-        let product_work = snapshot
-            .data_level_bytes_in_flight
-            .saturating_add(u64::try_from(queued_product_bytes).unwrap_or(u64::MAX));
-        native_work.max(product_work).min(usize::MAX as u64) as usize
+    // `Some` identifies an exact selected target, so zero published Product
+    // authority is a complete negative observation. A portable `None` target
+    // may still use the bounded fallback below; an exact target must not turn
+    // missing/expired P into a renewable emergency reserve.
+    if target
+        .path
+        .is_some_and(|snapshot| snapshot.data_level_limit_bytes == 0)
+    {
+        return 0;
+    }
+    // Keep one Product work quantum available when ordinary target headroom is
+    // full, but treat it as one outstanding reserve. Reevaluation cannot mint
+    // another reserve while queued or accepted ReinjectedData still owns it.
+    let emergency_reserve = adaptive_reliable_relay_reinjection_bytes(
+        target.path,
+        TrafficClass::Throughput,
+        mux_limits,
+    )
+    .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
+    let target_window =
+        reliable_product_recovery_window_bytes(target.path, TrafficClass::Throughput, mux_limits);
+    // Product recovery authority is exact to one stream direction and target
+    // incarnation. Raw Product staging and sampled native queue/flight are
+    // neither assigned to this target nor native admission authority. The
+    // bounded writer reservation below this model owns native admission.
+    let original_data = target.path.map_or(0, |snapshot| {
+        usize::try_from(snapshot.data_level_bytes_in_flight).unwrap_or(usize::MAX)
     });
-    let event_limit = event_limit.max(target_flight.saturating_sub(existing_target_debt));
-    reliable_critical_tail_reinjection_limit_bytes(event_limit, reinjection_debt_bytes, mux_limits)
+    let repair_cap = target_window
+        .saturating_sub(original_data)
+        .max(emergency_reserve);
+    let outstanding_reinjection = target
+        .accepted_reinjection_bytes
+        .saturating_add(target.queued_reinjection_bytes);
+    let service_limit = repair_cap.saturating_sub(outstanding_reinjection);
+    if service_limit == 0 {
+        return 0;
+    }
+    reliable_critical_tail_reinjection_limit_bytes(
+        service_limit,
+        reinjection_debt_bytes,
+        mux_limits,
+    )
 }
 
 pub(crate) fn reliable_critical_tail_reinjection_is_over_budget(

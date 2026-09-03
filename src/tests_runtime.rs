@@ -1552,6 +1552,7 @@ async fn pre_model_red_tcp_session_close_interrupts_a_backpressured_ordered_writ
             TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
             TrafficClass::Throughput,
             StreamDemandHint::Throughput,
+            Default::default(),
             crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
                 tokio::time::Instant::now() + Duration::from_secs(5),
             ),
@@ -1658,6 +1659,7 @@ async fn pre_model_red_tcp_queued_open_observes_sticky_session_terminal() {
             TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
             TrafficClass::Throughput,
             StreamDemandHint::Throughput,
+            Default::default(),
             crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
                 tokio::time::Instant::now() + Duration::from_secs(5),
             ),
@@ -1714,6 +1716,7 @@ async fn pre_model_red_tcp_queued_open_observes_sticky_session_terminal() {
                 TargetAddr::Ip("127.0.0.1:81".parse().expect("target")),
                 TrafficClass::Latency,
                 StreamDemandHint::Latency,
+                Default::default(),
                 crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
                     tokio::time::Instant::now() + Duration::from_secs(5),
                 ),
@@ -1799,6 +1802,7 @@ async fn pre_model_red_tcp_sibling_session_close_interrupts_a_backpressured_acto
             TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
             TrafficClass::Throughput,
             StreamDemandHint::Throughput,
+            Default::default(),
             crate::runtime::path::commands::ClientTcpOpenDeadlines::fixed(
                 tokio::time::Instant::now() + Duration::from_secs(5),
             ),
@@ -2461,14 +2465,14 @@ fn client_snapshot_separates_product_progress_from_native_carrier_evidence() {
     let mut observation = ClientPathObservation {
         measured_rate_bps: Some(100_000_000.0),
         product_delivery_rate_bps: Some(100_000_000.0),
-        delivery_samples: 1,
+        product_delivery_samples: 1,
         product_delivery_sample_bytes: sample_floor - 1,
         carrier_inflight_limit_bytes: sample_floor,
         ..ClientPathObservation::default()
     };
 
     let point_rate = path_snapshot(&path, 0, observation);
-    assert!(point_rate.product_progress_rate_bps.is_some());
+    assert_eq!(point_rate.product_progress_rate_bps, None);
     assert!(!point_rate.has_durable_product_progress);
     assert!(!bulk_candidate_has_bulk_rate_evidence(&path, observation));
 
@@ -3167,6 +3171,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
             stream_id,
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: old_path_registration.clone(),
                 commands: old_commands,
@@ -3209,6 +3214,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
                 stream_id,
                 target: target.clone(),
                 initial_demand: StreamDemandHint::Throughput,
+                return_plan: Default::default(),
                 attachment: ServerStreamPathAttachment {
                     path_registration: new_path_registration.clone(),
                     commands: new_commands,
@@ -3379,19 +3385,28 @@ async fn server_response_sender_dispatches_reinjection_before_data() {
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
+    let original = send_stream
+        .send_data(Bytes::from_static(b"reinjection"))
+        .expect("establish retained response Product debt");
+    let ReliablePathStreamOutput::Fixed(fixed) = &path_stream.output else {
+        unreachable!("test fixture is a fixed response output");
+    };
+    fixed
+        .try_enqueue_original_data_frame(&original, TrafficClass::Throughput)
+        .expect("commit the earlier OriginalData to the fixed output");
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ref payload,
+            ..
+        })) if payload == &Bytes::from_static(b"reinjection")
+    ));
     let mut sender = ServerResponseSenderService::new(SessionId(8), stream_id);
     sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
     assert!(
         sender
-            .enqueue_reinjection_frame_with_priority(
-                Frame::StreamData {
-                    stream_id,
-                    offset: 64,
-                    payload: Bytes::from_static(b"reinjection"),
-                },
-                MuxLimits::default(),
-                true,
-            )
+            .enqueue_reinjection_frame_with_priority(original, MuxLimits::default(), true,)
             .is_some()
     );
 
@@ -3404,11 +3419,11 @@ async fn server_response_sender_dispatches_reinjection_before_data() {
         )
         .expect("dispatch reinjection");
     assert_eq!(reinjection_dispatch.lane, ReliableWorkClass::Reinjection);
-    assert_eq!(send_stream.next_offset(), 0);
+    assert_eq!(send_stream.next_offset(), b"reinjection".len() as u64);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
-            offset: 64,
+            offset: 0,
             payload,
             ..
         })) if payload == Bytes::from_static(b"reinjection")
@@ -3423,14 +3438,18 @@ async fn server_response_sender_dispatches_reinjection_before_data() {
         )
         .expect("dispatch ordinary data");
     assert_eq!(data_dispatch.lane, ReliableWorkClass::Data);
-    assert_eq!(send_stream.next_offset(), b"ordinary".len() as u64);
+    assert_eq!(
+        send_stream.next_offset(),
+        (b"reinjection".len() + b"ordinary".len()) as u64
+    );
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
-            offset: 0,
+            offset,
             payload,
             ..
-        })) if payload == Bytes::from_static(b"ordinary")
+        })) if offset == b"reinjection".len() as u64
+            && payload == Bytes::from_static(b"ordinary")
     ));
 }
 
@@ -4484,6 +4503,7 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
             stream_id: StreamId(7),
             target: target.clone(),
             initial_demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -4530,6 +4550,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
             stream_id,
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands: first_commands,
@@ -4550,6 +4571,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
             stream_id,
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands: duplicate_commands,
@@ -4598,6 +4620,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
             stream_id: StreamId(8),
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -4677,6 +4700,7 @@ fn server_reliable_registry_opens_an_unknown_stream_on_any_live_path() {
             stream_id: StreamId(99),
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -4709,6 +4733,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
             stream_id,
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands,
@@ -4732,6 +4757,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
             stream_id,
             target: target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: replacement_path_registration.clone(),
                 commands,

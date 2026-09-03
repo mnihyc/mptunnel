@@ -37,6 +37,7 @@ pub enum RuntimeError {
     NoSchedulableTcpPath,
     NoSchedulableUdpPath,
     PathIdOverflow,
+    ExactIdentityExhausted,
     PathOpenTimedOut,
     PathHeartbeatTimeout,
     DatagramResponseTimedOut,
@@ -213,6 +214,9 @@ impl std::fmt::Display for RuntimeError {
                 )
             }
             Self::PathIdOverflow => write!(f, "configured paths exceed protocol path ID space"),
+            Self::ExactIdentityExhausted => {
+                write!(f, "exact runtime identity space is permanently exhausted")
+            }
             Self::PathOpenTimedOut => write!(f, "path stream open timed out"),
             Self::PathHeartbeatTimeout => write!(f, "TCP path heartbeat timed out"),
             Self::DatagramResponseTimedOut => write!(f, "datagram response timed out"),
@@ -288,6 +292,7 @@ impl std::error::Error for RuntimeError {
             | Self::NoSchedulableTcpPath
             | Self::NoSchedulableUdpPath
             | Self::PathIdOverflow
+            | Self::ExactIdentityExhausted
             | Self::PathOpenTimedOut
             | Self::PathHeartbeatTimeout
             | Self::DatagramResponseTimedOut

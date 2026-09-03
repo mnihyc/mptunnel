@@ -1,4 +1,4 @@
-use std::{cmp, net::SocketAddr};
+use std::{cmp, mem, net::SocketAddr};
 
 use tracing::trace;
 
@@ -174,12 +174,7 @@ impl PathData {
         Self {
             remote,
             rtt: prev.rtt,
-            pacing: Pacer::new(
-                smoothed_rtt,
-                congestion.window(),
-                prev.current_mtu(),
-                now,
-            ),
+            pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
             sending_ecn: true,
             congestion,
             challenge: None,
@@ -198,6 +193,106 @@ impl PathData {
         }
     }
 
+    /// Publish this already-installed initial controller as the active path.
+    /// The connection is not externally visible until this transaction has
+    /// completed.
+    pub(super) fn activate_initial(
+        &mut self,
+    ) -> Result<(), congestion::ControllerActivationTransitionError> {
+        let Some(fence) = self.congestion.activation_fence() else {
+            return Ok(());
+        };
+        let mut transition = match fence.begin_transition() {
+            Ok(transition) => transition,
+            Err(_) => {
+                self.congestion.on_activation_terminal();
+                return Err(congestion::ControllerActivationTransitionError::FencePoisoned);
+            }
+        };
+        let activation = match transition.allocate() {
+            Ok(activation) => activation,
+            Err(exhausted) => {
+                if exhausted.publish_terminal() {
+                    self.congestion.on_activation_terminal();
+                }
+                return Err(congestion::ControllerActivationTransitionError::Exhausted);
+            }
+        };
+        self.congestion.on_activated(activation);
+        transition.publish();
+        self.congestion.on_activation_published();
+        Ok(())
+    }
+
+    /// Install `replacement` as the exact active path under its shared
+    /// activation fence and return the previously active path.
+    pub(super) fn replace_with_activated(
+        &mut self,
+        mut replacement: Self,
+    ) -> Result<Self, congestion::ControllerActivationTransitionError> {
+        let Some(fence) = self.require_shared_activation_fence(replacement.congestion.as_ref())?
+        else {
+            return Ok(mem::replace(self, replacement));
+        };
+        let mut transition = match fence.begin_transition() {
+            Ok(transition) => transition,
+            Err(_) => {
+                replacement.congestion.on_activation_terminal();
+                return Err(congestion::ControllerActivationTransitionError::FencePoisoned);
+            }
+        };
+        let activation = match transition.allocate() {
+            Ok(activation) => activation,
+            Err(exhausted) => {
+                if exhausted.publish_terminal() {
+                    replacement.congestion.on_activation_terminal();
+                }
+                return Err(congestion::ControllerActivationTransitionError::Exhausted);
+            }
+        };
+        replacement.congestion.on_activated(activation);
+        let previous = mem::replace(self, replacement);
+        transition.publish();
+        self.congestion.on_activation_published();
+        Ok(previous)
+    }
+
+    fn require_shared_activation_fence(
+        &self,
+        replacement: &dyn congestion::Controller,
+    ) -> Result<
+        Option<congestion::ControllerActivationFence>,
+        congestion::ControllerActivationTransitionError,
+    > {
+        let current = self.congestion.activation_fence();
+        let next = replacement.activation_fence();
+        match (&current, &next) {
+            (None, None) => Ok(None),
+            (Some(current), Some(next)) if current.same_owner(next) => Ok(Some(next.clone())),
+            _ => {
+                if let Some(fence) = current.as_ref() {
+                    let _ = fence.terminalize(
+                        congestion::ControllerActivationTerminal::FenceMismatch,
+                        || self.congestion.on_activation_terminal(),
+                    );
+                }
+                if let Some(fence) = next.as_ref() {
+                    let _ = fence.terminalize(
+                        congestion::ControllerActivationTerminal::FenceMismatch,
+                        || replacement.on_activation_terminal(),
+                    );
+                }
+                Err(congestion::ControllerActivationTransitionError::FenceMismatch)
+            }
+        }
+    }
+
+    pub(super) fn terminalize_activation(&self, reason: congestion::ControllerActivationTerminal) {
+        if let Some(fence) = self.congestion.activation_fence() {
+            let _ = fence.terminalize(reason, || self.congestion.on_activation_terminal());
+        }
+    }
+
     /// Resets RTT, congestion control and MTU states.
     ///
     /// This is useful when it is known the underlying path has changed.
@@ -206,10 +301,9 @@ impl PathData {
         now: Instant,
         config: &TransportConfig,
         controller_epoch: u64,
-    ) {
-        self.rtt = RttEstimator::new(config.initial_rtt);
+    ) -> Result<(), congestion::ControllerActivationTransitionError> {
         let current_mtu = config.get_initial_mtu();
-        self.congestion = self
+        let mut replacement = self
             .congestion
             .fresh_path_box(now, current_mtu)
             .unwrap_or_else(|| {
@@ -218,6 +312,41 @@ impl PathData {
                     .clone()
                     .build(now, current_mtu)
             });
+        let Some(fence) = self.require_shared_activation_fence(replacement.as_ref())? else {
+            self.install_reset_state(replacement, config, controller_epoch);
+            return Ok(());
+        };
+        let mut transition = match fence.begin_transition() {
+            Ok(transition) => transition,
+            Err(_) => {
+                replacement.on_activation_terminal();
+                return Err(congestion::ControllerActivationTransitionError::FencePoisoned);
+            }
+        };
+        let activation = match transition.allocate() {
+            Ok(activation) => activation,
+            Err(exhausted) => {
+                if exhausted.publish_terminal() {
+                    replacement.on_activation_terminal();
+                }
+                return Err(congestion::ControllerActivationTransitionError::Exhausted);
+            }
+        };
+        replacement.on_activated(activation);
+        self.install_reset_state(replacement, config, controller_epoch);
+        transition.publish();
+        self.congestion.on_activation_published();
+        Ok(())
+    }
+
+    fn install_reset_state(
+        &mut self,
+        congestion: Box<dyn congestion::Controller>,
+        config: &TransportConfig,
+        controller_epoch: u64,
+    ) {
+        self.rtt = RttEstimator::new(config.initial_rtt);
+        self.congestion = congestion;
         self.controller_epoch = controller_epoch;
         self.first_packet_after_rtt_sample = None;
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
@@ -400,6 +529,11 @@ impl RttEstimator {
         self.min
     }
 
+    /// Current RTT-variation estimate used by QUIC recovery.
+    pub(crate) fn variance(&self) -> Duration {
+        self.var
+    }
+
     // PTO computed as described in RFC9002#6.2.1
     pub(crate) fn pto_base(&self) -> Duration {
         self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
@@ -497,7 +631,10 @@ struct PathResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::congestion::{Controller, ControllerFactory};
+    use crate::congestion::{
+        Controller, ControllerActivationFence, ControllerActivationState,
+        ControllerActivationTerminal, ControllerActivationTransitionError, ControllerFactory,
+    };
     use std::any::Any;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -556,6 +693,59 @@ mod tests {
         supports_fresh_path: bool,
     }
 
+    #[derive(Clone)]
+    struct FencedController {
+        fence: ControllerActivationFence,
+    }
+
+    impl Controller for FencedController {
+        fn activation_fence(&self) -> Option<ControllerActivationFence> {
+            Some(self.fence.clone())
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            _now: Instant,
+            _sent: Instant,
+            _is_persistent_congestion: bool,
+            _is_ecn: bool,
+            _lost_bytes: u64,
+            _largest_lost: u64,
+            _space: crate::packet::SpaceId,
+        ) {
+        }
+
+        fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+        fn window(&self) -> u64 {
+            12_000
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(self.clone())
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    struct FencedControllerFactory {
+        fence: ControllerActivationFence,
+    }
+
+    impl ControllerFactory for FencedControllerFactory {
+        fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
+            Box::new(FencedController {
+                fence: self.fence.clone(),
+            })
+        }
+    }
+
     impl ControllerFactory for EpochControllerFactory {
         fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
             Box::new(EpochController {
@@ -584,6 +774,49 @@ mod tests {
             now,
             config,
         )
+    }
+
+    #[test]
+    fn replacement_with_a_different_activation_fence_fails_closed() {
+        let now = Instant::now();
+        let current_fence = ControllerActivationFence::new();
+        let replacement_fence = ControllerActivationFence::new();
+        let mut current_config = TransportConfig::default();
+        current_config.congestion_controller_factory(Arc::new(FencedControllerFactory {
+            fence: current_fence.clone(),
+        }));
+        let mut replacement_config = TransportConfig::default();
+        replacement_config.congestion_controller_factory(Arc::new(FencedControllerFactory {
+            fence: replacement_fence.clone(),
+        }));
+        let mut current = path(&current_config, 0, now);
+        current.activate_initial().expect("initial activation");
+        let mut replacement = path(&replacement_config, 1, now);
+        replacement
+            .activate_initial()
+            .expect("replacement's independent activation");
+        let original_remote = current.remote;
+
+        assert!(matches!(
+            current.replace_with_activated(replacement),
+            Err(ControllerActivationTransitionError::FenceMismatch)
+        ));
+        assert_eq!(
+            current.remote, original_remote,
+            "active pointer did not switch"
+        );
+        assert_eq!(
+            current_fence
+                .with_current(|state| state)
+                .expect("current terminal fence"),
+            ControllerActivationState::Terminal(ControllerActivationTerminal::FenceMismatch)
+        );
+        assert_eq!(
+            replacement_fence
+                .with_current(|state| state)
+                .expect("replacement terminal fence"),
+            ControllerActivationState::Terminal(ControllerActivationTerminal::FenceMismatch)
+        );
     }
 
     #[test]
@@ -622,7 +855,7 @@ mod tests {
         assert_eq!(migrated.controller_epoch(), 2);
         assert_eq!(factory.builds.load(Ordering::Relaxed), 1);
 
-        migrated.reset(now, &config, 3);
+        migrated.reset(now, &config, 3).expect("controller reset");
         assert_eq!(controller(&migrated).lineage, controller(&initial).lineage);
         assert_eq!(controller(&migrated).epoch, controller(&initial).epoch + 2);
         assert_eq!(migrated.controller_epoch(), 3);

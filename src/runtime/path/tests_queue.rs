@@ -36,8 +36,10 @@ fn ordered_writer_flow_load_tracks_lane_changes_and_lifetime() {
     let (commands, _receivers) = reliable_path_command_channels(1);
     assert_eq!(commands.active_flow_counts(), (0, 0));
 
-    let throughput = commands.register_flow(TrafficClass::Throughput);
-    let latency = commands.register_flow(TrafficClass::Latency);
+    let throughput = commands.register_inactive_flow(TrafficClass::Throughput);
+    throughput.activate();
+    let latency = commands.register_inactive_flow(TrafficClass::Latency);
+    latency.activate();
     assert_eq!(commands.active_flow_counts(), (2, 1));
 
     throughput.set_lane(TrafficClass::Latency);
@@ -50,6 +52,80 @@ fn ordered_writer_flow_load_tracks_lane_changes_and_lifetime() {
 
     drop(throughput);
     assert_eq!(commands.active_flow_counts(), (0, 0));
+}
+
+#[test]
+fn inactive_writer_flow_retains_lane_and_counts_only_while_demanding_service() {
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    let registration = commands.register_inactive_flow(TrafficClass::Throughput);
+    assert!(!registration.is_active());
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+
+    registration.set_lane(TrafficClass::Latency);
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+    registration.activate();
+    registration.activate();
+    assert!(registration.is_active());
+    assert_eq!(commands.active_flow_counts(), (1, 1));
+
+    registration.set_lane(TrafficClass::Throughput);
+    assert_eq!(commands.active_flow_counts(), (1, 0));
+    registration.deactivate();
+    registration.deactivate();
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+
+    registration.set_lane(TrafficClass::Latency);
+    registration.activate();
+    assert_eq!(commands.active_flow_counts(), (1, 1));
+    drop(registration);
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+}
+
+#[test]
+fn writer_flow_lane_and_demand_transitions_are_concurrency_exact() {
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    for _ in 0..64 {
+        let registration = commands.register_inactive_flow(TrafficClass::Throughput);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let activate = registration.clone();
+            let activate_start = start.clone();
+            scope.spawn(move || {
+                activate_start.wait();
+                activate.activate();
+            });
+            let change_lane = registration.clone();
+            scope.spawn(move || {
+                start.wait();
+                change_lane.set_lane(TrafficClass::Latency);
+            });
+        });
+        assert_eq!(
+            commands.active_flow_counts(),
+            (1, 1),
+            "activation and lane publication linearize to one exact latency flow"
+        );
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let deactivate = registration.clone();
+            let deactivate_start = start.clone();
+            scope.spawn(move || {
+                deactivate_start.wait();
+                deactivate.deactivate();
+            });
+            let change_lane = registration.clone();
+            scope.spawn(move || {
+                start.wait();
+                change_lane.set_lane(TrafficClass::Throughput);
+            });
+        });
+        assert_eq!(
+            commands.active_flow_counts(),
+            (0, 0),
+            "deactivation releases the lane that owns the packed count without underflow"
+        );
+    }
 }
 
 #[tokio::test]
@@ -125,6 +201,84 @@ async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
 }
 
 #[tokio::test]
+async fn path_drain_retains_exact_requalification_ack_recovery_control() {
+    let (commands, mut receivers) = reliable_path_command_channels(2);
+    commands.begin_path_drain();
+
+    let ack = Frame::StreamRequalifyAck {
+        stream_id: StreamId(3),
+        probe_id: 7,
+        offset: 4096,
+        payload_bytes: 1024,
+    };
+    commands
+        .try_enqueue_admitted_frame(ack.clone(), TrafficClass::Control)
+        .expect(
+            "carrier drain rejects new Product placement but retains recovery and ordered-control processing",
+        );
+
+    receivers.close_for_path_drain();
+    assert!(matches!(
+        recv_reliable_path_command_during_drain(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(frame)) if frame == ack
+    ));
+}
+
+#[test]
+fn failed_path_terminal_rejects_new_unbounded_retirement_handoffs() {
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    commands.terminate_failed_path();
+
+    assert!(matches!(
+        commands.retire_accepted_stream(StreamId(31)),
+        Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
+    ));
+    assert!(matches!(
+        commands.reset_accepted_stream(StreamId(32), ResetReason::Refused),
+        Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
+    ));
+    assert!(matches!(
+        commands.retire_datagram_attachment(33),
+        Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
+    ));
+    assert!(matches!(
+        commands.retire_server_datagram_flow(DatagramFlowId(34)),
+        Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut receivers).is_none(),
+        "a terminal carrier cannot report ownership transfer to an unserviceable retirement lane",
+    );
+}
+
+#[tokio::test]
+async fn planned_drain_retains_unbounded_retirement_handoff() {
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let stream_id = StreamId(35);
+    commands.begin_path_drain();
+    commands
+        .retire_accepted_stream(stream_id)
+        .expect("planned drain retains queue-independent settlement handoff");
+
+    receivers.close_for_path_drain();
+    assert!(matches!(
+        recv_reliable_path_command_during_drain(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach {
+            stream_id: detached,
+        })) if detached == stream_id
+    ));
+    assert!(matches!(
+        recv_reliable_path_command_during_drain(&mut receivers).await,
+        Some(ReliablePathCommand::CloseStream(closed)) if closed == stream_id
+    ));
+    assert!(
+        recv_reliable_path_command_during_drain(&mut receivers)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn failed_path_termination_fences_admission_and_signals_terminal() {
     let (commands, receivers) = reliable_path_command_channels(1);
     let signal = receivers.path_drain_signal();
@@ -148,6 +302,35 @@ async fn failed_path_termination_fences_admission_and_signals_terminal() {
         commands.try_reserve_admitted_frame(stream_data_frame(1, 1024), TrafficClass::Throughput),
         Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
     ));
+}
+
+#[tokio::test]
+async fn terminal_failure_releases_a_full_non_product_control_waiter() {
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    commands
+        .send_control(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
+        .await
+        .expect("fill bounded control queue");
+
+    let mut waiting =
+        Box::pin(commands.send_control(ReliablePathCommand::SendFrame(Frame::Pong { nonce: 2 })));
+    tokio::select! {
+        biased;
+        result = waiting.as_mut() => panic!("full control queue accepted waiter early: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+
+    commands.terminate_failed_path();
+    tokio::select! {
+        biased;
+        result = waiting.as_mut() => assert!(
+            result.is_err(),
+            "known-terminal control admission unexpectedly succeeded",
+        ),
+        () = std::future::ready(()) => {
+            panic!("known-terminal control waiter remained parked on queue capacity")
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -201,6 +384,7 @@ fn control_and_ack_frames_never_use_throughput_lane() {
                     port: 443,
                 },
                 demand: StreamDemandHint::throughput(),
+                return_plan: Default::default(),
             },
             TrafficClass::Control,
         ),
@@ -575,4 +759,121 @@ fn reinjection_headroom_is_bounded() {
         commands.try_enqueue_reinjection_frame(second, TrafficClass::Throughput),
         Err(crate::runtime::RuntimeError::SenderServiceBlocked)
     ));
+}
+
+#[tokio::test]
+async fn frame_reservation_owns_byte_charge_from_reserve_through_writer_release() {
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let quantum = 64 * 1024;
+
+    let cancelled = commands
+        .try_reserve_admitted_frame(stream_data_frame(50, quantum), TrafficClass::Throughput)
+        .expect("reserve one exact carrier command");
+    assert_eq!(
+        commands.pending_bytes(),
+        quantum as u64,
+        "reservation must precharge the carrier before Product publishes ownership"
+    );
+    let mut capacity_released = Box::pin(commands.capacity_notify().notified_owned());
+    capacity_released.as_mut().enable();
+    drop(cancelled);
+    tokio::time::timeout(std::time::Duration::from_millis(200), capacity_released)
+        .await
+        .expect("dropping a precharged reservation wakes blocked admission");
+    assert_eq!(
+        commands.pending_bytes(),
+        0,
+        "dropping an unpublished reservation must return its charge"
+    );
+
+    let committed = commands
+        .try_reserve_admitted_frame(stream_data_frame(51, quantum), TrafficClass::Throughput)
+        .expect("reserve replacement carrier command");
+    committed.commit();
+    assert_eq!(
+        commands.pending_bytes(),
+        quantum as u64,
+        "commit transfers, rather than duplicates or releases, byte ownership"
+    );
+
+    let command =
+        try_recv_reliable_path_command(&mut receivers).expect("committed OriginalData command");
+    assert_eq!(
+        commands.pending_bytes(),
+        quantum as u64,
+        "dequeue retains the charge until the carrier writer releases it"
+    );
+    assert_eq!(commands.writer_pending_bytes(), quantum as u64);
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
+}
+
+#[test]
+fn cloned_senders_pipeline_original_data_in_the_shared_bounded_queue() {
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let first = commands.clone();
+    let second = commands.clone();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let attempted = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let quantum = 64 * 1024;
+
+    let (first_admitted, second_admitted) = std::thread::scope(|scope| {
+        let first_start = start.clone();
+        let first_attempted = attempted.clone();
+        let first_thread = scope.spawn(move || {
+            first_start.wait();
+            let reservation = first.try_reserve_admitted_frame(
+                stream_data_frame(60, quantum),
+                TrafficClass::Throughput,
+            );
+            first_attempted.wait();
+            match reservation {
+                Ok(reservation) => {
+                    reservation.commit();
+                    true
+                }
+                Err(crate::runtime::RuntimeError::SenderServiceBlocked) => false,
+                Err(error) => panic!("unexpected first reservation error: {error}"),
+            }
+        });
+
+        let second_start = start.clone();
+        let second_attempted = attempted.clone();
+        let second_thread = scope.spawn(move || {
+            second_start.wait();
+            let reservation = second.try_reserve_admitted_frame(
+                stream_data_frame(61, quantum),
+                TrafficClass::Throughput,
+            );
+            second_attempted.wait();
+            match reservation {
+                Ok(reservation) => {
+                    reservation.commit();
+                    true
+                }
+                Err(crate::runtime::RuntimeError::SenderServiceBlocked) => false,
+                Err(error) => panic!("unexpected second reservation error: {error}"),
+            }
+        });
+
+        (
+            first_thread.join().expect("first reservation thread"),
+            second_thread.join().expect("second reservation thread"),
+        )
+    });
+
+    assert_eq!(
+        usize::from(first_admitted) + usize::from(second_admitted),
+        2,
+        "the shared bounded queue, not a one-quantum stop-and-wait lease, serializes Product actors"
+    );
+    assert_eq!(commands.pending_bytes(), (2 * quantum) as u64);
+    for _ in 0..2 {
+        let command = try_recv_reliable_path_command(&mut receivers)
+            .expect("both admitted OriginalData commands remain bounded and ordered");
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    }
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+    assert_eq!(commands.pending_bytes(), 0);
 }

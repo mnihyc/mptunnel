@@ -214,6 +214,80 @@ async fn candidate_membership_drops_open_load_until_product_claim_commits() {
 }
 
 #[tokio::test]
+async fn one_hundred_idle_initial_attachments_publish_zero_active_demand() {
+    let context = context(&["tcp://127.0.0.1:11102"]);
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let mut retained = Vec::new();
+    for stream in 0..100_u64 {
+        let lease = context
+            .reserve_relay_path_load(key, TrafficClass::Throughput)
+            .expect("prospective initial-open load");
+        let (opened, receivers, frames) =
+            opened_stream(StreamId(1_000 + stream), UnderlayProtocol::Tcp, 0);
+        let remotes = ReliableRelayRemoteSet::new(opened.with_load_lease(lease), 4);
+        assert!(!remotes.paths[0].has_load_reservation());
+        assert_eq!(
+            context.health().lock().expect("path health").tcp[0].active_flows,
+            0,
+            "idle attachment membership must not divide shared path capacity"
+        );
+        retained.push((remotes, receivers, frames));
+    }
+    assert_eq!(retained.len(), 100);
+}
+
+#[tokio::test]
+async fn stale_ack_instance_cannot_depublish_replacement_load() {
+    let context = context(&["tcp://127.0.0.1:11103"]);
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let (first, _receivers, _frames) = opened_stream(StreamId(2_000), UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let predecessor = remotes.paths[0].instance();
+    let predecessor_lease = context
+        .reserve_relay_path_load(key, TrafficClass::Throughput)
+        .expect("predecessor OriginalData load");
+    remotes.commit_path_instance_load_claim(predecessor, predecessor_lease);
+    drop(
+        remotes
+            .remove_path_instance(predecessor)
+            .expect("remove predecessor attachment"),
+    );
+
+    let (replacement, _receivers, _frames) =
+        opened_stream(StreamId(2_000), UnderlayProtocol::Tcp, 0);
+    assert_eq!(
+        remotes.attach(replacement),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    let successor = remotes.paths[0].instance();
+    assert_eq!(successor.key, predecessor.key);
+    assert_ne!(successor, predecessor);
+    let successor_lease = context
+        .reserve_relay_path_load(key, TrafficClass::Throughput)
+        .expect("successor OriginalData load");
+    remotes.commit_path_instance_load_claim(successor, successor_lease);
+
+    assert!(!remotes.depublish_path_instance_load(predecessor));
+    assert!(remotes.paths[0].has_load_reservation());
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        1,
+        "an old exact-instance ACK cannot release its successor's demand",
+    );
+    assert!(remotes.depublish_path_instance_load(successor));
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        0,
+    );
+}
+
+#[tokio::test]
 async fn membership_generation_fences_replaced_path_incarnations() {
     let stream_id = StreamId(941);
     let (first, _receivers, _frames) = opened_stream(stream_id, UnderlayProtocol::Udp, 0);

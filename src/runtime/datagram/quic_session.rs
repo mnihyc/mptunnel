@@ -154,6 +154,8 @@ impl UdpDatagramClientSession {
             peer_status_snapshot: PeerStatusSnapshotSource::new(|| Some(Vec::new())),
             authenticated_carriers: crate::runtime::path::AuthenticatedCarrierInventory::default(),
             ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub::default(),
+            reconciliation: crate::runtime::path::quic::client::ClientUdpCarrierReconciliation::new(
+            ),
         });
         Self::open_from_udp_session(path_session, path_index, mux_limits, open_deadline).await
     }

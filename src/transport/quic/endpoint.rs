@@ -1,5 +1,7 @@
 //! QUIC endpoint, connection, authentication, and transport configuration.
 
+#[cfg(test)]
+use super::congestion::checked_positive_bytes_per_second_to_bits_per_second;
 use super::native_datagram::NativeDatagramHub;
 use super::presentation::H3Presentation;
 use super::socket::{
@@ -9,7 +11,8 @@ use super::socket::{
 use super::socket::{bind_client_udp_socket, bind_server_udp_socket};
 use super::stream::{DatagramFlowRegistry, IpTunnelRegistry};
 use super::{
-    CongestionMetrics, InstrumentedBbrConfig, InstrumentedController, QuicCandidateSelector,
+    CongestionMetrics, InstrumentedBbrConfig, InstrumentedController,
+    NativeControllerAuthoritySnapshot, NativeControllerShapeSnapshot, QuicCandidateSelector,
     QuicCandidateVerifier, QuicCarrierError, QuicCarrierTelemetry, RecvStream, SendStream,
 };
 use crate::mux::MuxLimits;
@@ -17,6 +20,7 @@ use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
 use crate::transport::{CarrierSocket, PathMetadata};
 use quinn::{ClientConfig, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt};
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
@@ -227,6 +231,43 @@ impl Endpoint {
 }
 
 impl Connection {
+    /// Mark the authenticated MPP carrier ready to offer application traffic.
+    pub(crate) fn mark_application_ready(&self) {
+        self.connection.mark_application_ready();
+    }
+
+    /// Capture the exact active controller together with the `PathData` that
+    /// owns it under Quinn's single connection-state acquisition.
+    fn active_native_controller_snapshot(
+        &self,
+    ) -> (NativeControllerShapeSnapshot, Box<InstrumentedController>) {
+        let path = self.connection.active_path_snapshot();
+        let smoothed_rtt = path.smoothed_rtt;
+        let rtt_variance = path.rtt_variance;
+        let bytes_in_flight = path.bytes_in_flight;
+        let current_mtu = path.current_mtu;
+        let app_limited = path.app_limited;
+        let instrumented = path
+            .congestion
+            .into_any()
+            .downcast::<InstrumentedController>()
+            .expect("QUIC carrier must use the instrumented congestion controller");
+        debug_assert!(
+            Arc::ptr_eq(&instrumented.telemetry, &self.telemetry),
+            "fresh QUIC paths must preserve the carrier telemetry owner"
+        );
+        let shape = instrumented
+            .native_shape_snapshot(
+                smoothed_rtt,
+                rtt_variance,
+                bytes_in_flight,
+                current_mtu,
+                app_limited,
+            )
+            .expect("the active QUIC controller must carry a transport activation");
+        (shape, instrumented)
+    }
+
     async fn from_quinn(
         connection: quinn::Connection,
         role: EndpointRole,
@@ -379,9 +420,17 @@ impl Connection {
         self.connection.rtt()
     }
 
-    pub fn congestion_metrics(&self) -> CongestionMetrics {
+    /// Non-consuming identity read for registration and exact observer
+    /// fencing. Unlike `congestion_metrics`, this does not advance the ACK
+    /// telemetry cursor.
+    pub(crate) fn native_path_epoch(&self) -> u64 {
+        self.telemetry.current_path_epoch()
+    }
+
+    /// Coherent `(A, I, kind, B_op)` snapshot from one clone of the exact
+    /// active Quinn controller. This does not consume diagnostic ACK cursors.
+    pub(crate) fn native_controller_authority_snapshot(&self) -> NativeControllerAuthoritySnapshot {
         let controller = self.connection.congestion_state();
-        let metrics = controller.metrics();
         let instrumented = controller
             .into_any()
             .downcast::<InstrumentedController>()
@@ -390,16 +439,46 @@ impl Connection {
             Arc::ptr_eq(&instrumented.telemetry, &self.telemetry),
             "fresh QUIC paths must preserve the carrier telemetry owner"
         );
+        instrumented
+            .native_authority_snapshot()
+            .expect("the active QUIC controller must carry a transport activation")
+    }
+
+    /// Non-consuming native scheduling shape from one exact active-PathData
+    /// read. Shared path-lineage ACK/loss diagnostics are intentionally not
+    /// part of this activation-stamped value.
+    pub(crate) fn native_controller_shape_snapshot(&self) -> NativeControllerShapeSnapshot {
+        self.active_native_controller_snapshot().0
+    }
+
+    /// Shared transport switch fence used by native-authority final precommit.
+    pub(crate) fn native_controller_activation_fence(
+        &self,
+    ) -> quinn::congestion::ControllerActivationFence {
+        self.telemetry.controller_activation_fence()
+    }
+
+    /// Durable/coalescing wake for active-controller transitions.
+    pub(crate) fn native_controller_authority_notify(&self) -> Arc<Notify> {
+        self.telemetry.native_authority_notify()
+    }
+
+    pub fn congestion_metrics(&self) -> CongestionMetrics {
+        let (shape, instrumented) = self.active_native_controller_snapshot();
         let snapshot = instrumented.snapshot();
+        debug_assert_eq!(
+            shape.controller().opaque_serial(),
+            snapshot.path_epoch,
+            "activation-local shape and lineage diagnostics must name the same controller I"
+        );
         CongestionMetrics {
-            path_epoch: snapshot.path_epoch,
+            path_epoch: shape.controller().opaque_serial(),
             delivery_clock_epoch: snapshot.delivery_clock_epoch,
-            congestion_window: metrics.congestion_window,
-            bytes_in_flight: snapshot.bytes_in_flight,
+            congestion_window: shape.congestion_window(),
+            bytes_in_flight: Some(shape.bytes_in_flight()),
             pending_bytes: self.write_backlog.load(Ordering::Relaxed),
-            pacing_rate_bps: metrics
-                .pacing_rate
-                .map(|bytes_per_second| bytes_per_second.saturating_mul(8)),
+            bandwidth_estimate_bps: shape.operational_rate_bps().map(NonZeroU64::get),
+            pacing_rate_bps: shape.pacing_rate_bps().map(NonZeroU64::get),
             loss_ppm: snapshot.loss_ppm,
             lost_bytes: snapshot.lost_bytes,
             ecn_ppm: None,
@@ -407,28 +486,16 @@ impl Connection {
             non_app_limited_acked_bytes: snapshot.non_app_limited_acked_bytes,
             timed_non_app_limited_acked_bytes: snapshot.timed_non_app_limited_acked_bytes,
             non_app_limited_ack_elapsed: snapshot.non_app_limited_ack_elapsed,
-            timed_non_app_limited_delivery_evidence_acked_bytes: snapshot
-                .timed_non_app_limited_delivery_evidence_acked_bytes,
-            timed_non_app_limited_delivery_evidence_sample_count: snapshot
-                .timed_non_app_limited_delivery_evidence_sample_count,
-            timed_non_app_limited_delivery_evidence_elapsed: snapshot
-                .timed_non_app_limited_delivery_evidence_elapsed,
-            delivery_evidence_written_bytes: self.telemetry.delivery_evidence_written_bytes(),
-            delivery_evidence_cancelled_bytes: self.telemetry.delivery_evidence_cancelled_bytes(),
-            delivery_evidence_pending_ack_bytes: self
-                .telemetry
-                .delivery_evidence_pending_ack_bytes(),
-            delivery_evidence_newly_acked_bytes: snapshot.delivery_evidence_newly_acked_bytes,
             delivery_sample_count: snapshot.delivery_sample_count,
             non_app_limited_delivery_sample_count: snapshot.non_app_limited_delivery_sample_count,
             timed_non_app_limited_delivery_sample_count: snapshot
                 .timed_non_app_limited_delivery_sample_count,
-            app_limited: snapshot.app_limited,
+            app_limited: shape.app_limited(),
         }
     }
 
-    pub fn delivery_activity_notify(&self) -> Arc<Notify> {
-        self.telemetry.delivery_activity_notify()
+    pub fn write_activity_notify(&self) -> Arc<Notify> {
+        self.telemetry.write_activity_notify()
     }
 
     #[cfg(test)]

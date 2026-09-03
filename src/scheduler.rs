@@ -8,8 +8,9 @@ mod traffic;
 
 pub use policy::{PathRateScope, PathScore, PathSnapshot, PathState, choose_path, score_path};
 pub(crate) use policy::{
-    QUIC_INITIAL_WINDOW_PACKETS, path_bdp_bytes, path_is_backup, path_is_schedulable, path_pto_ms,
-    path_within_adaptive_lead_hysteresis, payload_tx_ms,
+    QUIC_INITIAL_WINDOW_PACKETS, path_bdp_bytes, path_has_material_completion_advantage,
+    path_is_backup, path_is_schedulable, path_pto_ms, path_within_adaptive_lead_hysteresis,
+    payload_tx_ms,
 };
 pub use traffic::TrafficClass;
 pub(crate) use traffic::{

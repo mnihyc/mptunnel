@@ -6,6 +6,7 @@ pub(crate) enum PathCapacityReceiveError {
     ReceiptOverflow,
     SessionEnvelopeExceeded,
     InterleavedToken,
+    NonIncreasingToken,
     FinishWithoutData,
     FinishMismatch,
 }
@@ -17,6 +18,7 @@ impl PathCapacityReceiveError {
             Self::ReceiptOverflow => "path capacity receipt overflow",
             Self::SessionEnvelopeExceeded => "path capacity data exceeds the session envelope",
             Self::InterleavedToken => "interleaved path capacity measurement tokens",
+            Self::NonIncreasingToken => "path capacity measurement token did not increase",
             Self::FinishWithoutData => "path capacity finish has no data epoch",
             Self::FinishMismatch => "path capacity finish does not match received data",
         }
@@ -28,6 +30,7 @@ impl PathCapacityReceiveError {
 #[derive(Debug)]
 pub(crate) struct CapacityReceiveTracker {
     active: Option<(u64, u64)>,
+    token_high_water: u64,
     limit_bytes: u64,
 }
 
@@ -35,6 +38,7 @@ impl CapacityReceiveTracker {
     pub(crate) fn new(limit_bytes: u64) -> Self {
         Self {
             active: None,
+            token_high_water: 0,
             limit_bytes: limit_bytes.max(1),
         }
     }
@@ -58,7 +62,13 @@ impl CapacityReceiveTracker {
                 }
                 self.active = Some((token, received_bytes));
             }
-            None if payload_bytes <= self.limit_bytes => self.active = Some((token, payload_bytes)),
+            None if token <= self.token_high_water => {
+                return Err(PathCapacityReceiveError::NonIncreasingToken);
+            }
+            None if payload_bytes <= self.limit_bytes => {
+                self.token_high_water = token;
+                self.active = Some((token, payload_bytes));
+            }
             None => {
                 return Err(PathCapacityReceiveError::SessionEnvelopeExceeded);
             }

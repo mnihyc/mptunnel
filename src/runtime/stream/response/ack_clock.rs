@@ -220,6 +220,10 @@ pub(super) fn apply_response_ack_clock_release_samples(
                 let carrier_app_limited = entry
                     .local_path_metrics
                     .is_some_and(|metrics| metrics.metrics.app_limited);
+                // This is deliberately the raw fresh Product point history:
+                // consecutive ACK batches smooth the diagnostic estimate even
+                // before either completion floor is met. Snapshot projection
+                // separately qualifies epoch and lifetime bytes before ECF.
                 let previous_fresh_epoch = entry
                     .product_rate_epoch
                     .filter(|epoch| epoch.fresh_rate_at(now).is_some());

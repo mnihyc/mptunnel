@@ -82,7 +82,7 @@ impl TcpCapacityFixture {
         &self,
         controller: &mut RequestTcpCapacityController,
         request: &RequestStreamState,
-        reference: Option<(RelayPathInstance, RequestPerFlowRateModel)>,
+        reference: Option<(RelayPathInstance, RequestProductRateEpoch)>,
     ) {
         controller.try_start(
             self.stream_id,
@@ -95,22 +95,19 @@ impl TcpCapacityFixture {
     }
 }
 
-fn mature_reference_model() -> RequestPerFlowRateModel {
-    RequestPerFlowRateModel {
-        rate_bps: 200_000_000.0,
-        delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-    }
+fn mature_reference_model() -> RequestProductRateEpoch {
+    RequestProductRateEpoch::for_test(200_000_000.0, RELIABLE_INITIAL_WINDOW_PACKETS as u32)
 }
 
 fn request_with_reference(
     reference: RelayPathInstance,
-    model: RequestPerFlowRateModel,
+    model: RequestProductRateEpoch,
 ) -> RequestStreamState {
     let mut request = RequestStreamState::default();
     request
         .path_states
         .get_mut(reference)
-        .set_per_flow_rate(model);
+        .set_product_rate_epoch(model);
     request
 }
 
@@ -127,9 +124,10 @@ async fn tcp_measurement_requires_fresh_candidate_proof_and_mature_reference() {
     assert!(try_recv_reliable_path_command(&mut fixture.candidate_rx).is_none());
 
     fixture.mark_candidate_proven();
-    let immature = RequestPerFlowRateModel {
+    let immature = RequestProductRateEpoch {
         rate_bps: mature.rate_bps,
         delivery_samples: 1,
+        ..mature
     };
     fixture.start(
         &mut controller,

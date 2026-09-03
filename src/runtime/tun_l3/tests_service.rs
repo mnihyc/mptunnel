@@ -1,4 +1,3 @@
-use super::service::server_packet_delivery_rate;
 use super::*;
 use crate::config::{MppPerformanceConfig, ResourceLimits, ServerSecurityConfig, SharedSecret};
 use crate::outbound::OutboundConfig;
@@ -35,7 +34,8 @@ impl ServerIpTunnelCarrier for TestCarrier {
         tunnel_id: IpTunnelId,
         packet_id: IpPacketId,
         payload: Bytes,
-        _budget: &IpPacketQueueBudget,
+        _budget_permit: Option<IpPacketQueuePermit>,
+        _native_retention_limit_bytes: Option<u64>,
     ) -> Result<IpTunnelPacketSendOutcome, crate::runtime::error::RuntimeError> {
         self.events
             .send(TestCarrierEvent::Packet {
@@ -63,7 +63,8 @@ impl ServerIpTunnelCarrier for RetiredTestCarrier {
         _tunnel_id: IpTunnelId,
         _packet_id: IpPacketId,
         _payload: Bytes,
-        _budget: &IpPacketQueueBudget,
+        _budget_permit: Option<IpPacketQueuePermit>,
+        _native_retention_limit_bytes: Option<u64>,
     ) -> Result<IpTunnelPacketSendOutcome, crate::runtime::error::RuntimeError> {
         Ok(IpTunnelPacketSendOutcome::Retired)
     }
@@ -162,6 +163,77 @@ fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Bytes {
     }
     packet[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
     Bytes::from(packet)
+}
+
+#[test]
+fn udp_requires_native_authority_while_tcp_keeps_legacy_carrier_support() {
+    let (context, security) = server_context();
+    let (port, device) = ServerIpTunnelService::build(
+        plan(&security),
+        context.reliable_streams.clone(),
+        4,
+        16 * 1_500,
+        context.session_retention_timeout,
+    );
+    let session_id = SessionId(90);
+    let udp_path = context.reliable_streams.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let session_references_before = session_reference_count(&context, session_id);
+    let (udp_events, mut udp_commands) = tokio::sync::mpsc::unbounded_channel();
+
+    assert!(matches!(
+        port.open(ServerIpTunnelOpenRequest {
+            tunnel_id: IpTunnelId(90),
+            path: &udp_path,
+            carrier: Arc::new(TestCarrier { events: udp_events }),
+        }),
+        Err(crate::runtime::RuntimeError::Protocol(
+            "server UDP IP tunnel carrier missing native rate authority"
+        ))
+    ));
+    assert_eq!(
+        session_reference_count(&context, session_id),
+        session_references_before,
+        "rejected UDP carrier must not acquire logical-tunnel ownership",
+    );
+    assert!(
+        !device
+            .try_send_to_peer(ipv4_packet([10, 88, 0, 1], [10, 88, 0, 2]))
+            .expect("rejected UDP carrier leaves no route")
+    );
+    assert!(
+        udp_commands.try_recv().is_err(),
+        "rejected UDP open must not emit a carrier event",
+    );
+
+    let tcp_path = context.reliable_streams.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(1),
+        ServerLocalPathProperties::default(),
+    );
+    let (tcp_events, mut tcp_commands) = tokio::sync::mpsc::unbounded_channel();
+    let _tcp_attachment = port
+        .open(ServerIpTunnelOpenRequest {
+            tunnel_id: IpTunnelId(90),
+            path: &tcp_path,
+            carrier: Arc::new(TestCarrier { events: tcp_events }),
+        })
+        .expect("TCP carrier retains the existing non-Native contract");
+    let reply = ipv4_packet([10, 88, 0, 1], [10, 88, 0, 2]);
+    assert!(
+        device
+            .try_send_to_peer(reply.clone())
+            .expect("dispatch over legacy TCP carrier")
+    );
+    assert!(matches!(
+        tcp_commands.try_recv(),
+        Ok(TestCarrierEvent::Packet { payload, .. }) if payload == reply
+    ));
 }
 
 #[tokio::test]
@@ -955,35 +1027,4 @@ fn retired_inflight_opener_cannot_displace_same_principal_successor() {
             ..
         }) if payload == reply
     ));
-}
-
-#[test]
-fn server_packet_ranking_requires_delivered_capacity_evidence() {
-    let path: crate::transport::PathSpec =
-        "quic://127.0.0.1:9000?initial-srtt-s=0.02&initial-rate-mbps=100"
-            .parse()
-            .expect("path");
-    let local = ServerLocalPath::new(0, path);
-    let startup = local.startup_metrics(PathId(0));
-    let mut live = crate::protocol::PathMetrics {
-        delivery_rate_bps: 700_000_000,
-        pacing_rate_bps: 900_000_000,
-        has_ack_derived_data_sample: false,
-        ..startup
-    };
-    assert_eq!(
-        server_packet_delivery_rate(Some(live), Some(startup)),
-        startup.delivery_rate_bps as f64
-    );
-
-    live.has_ack_derived_data_sample = true;
-    live.data_sample_count = 1;
-    live.data_sample_bytes = 64 * 1024;
-    live.rate_observed = true;
-    live.rate_valid_for_us = 1_000_000;
-    live.pacing_rate_observed = true;
-    assert_eq!(
-        server_packet_delivery_rate(Some(live), Some(startup)),
-        700_000_000.0
-    );
 }

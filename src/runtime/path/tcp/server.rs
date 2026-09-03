@@ -15,7 +15,7 @@ use self::evidence::ServerTcpEvidenceState;
 use self::session::{ServerTcpPathAdmission, ServerTcpPathSession};
 use self::writer::ServerTcpWriter;
 use super::admission::authenticate_prelude;
-use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader_with_observers};
+use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader_with_terminal_result};
 use super::metrics::TcpMetricPublisher;
 use crate::protocol::{Frame, PeerPathState, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
@@ -43,15 +43,25 @@ fn tcp_carrier_peer(stream: &TcpStream) -> Result<ServerCarrierPeer, std::io::Er
 /// it may emit a successful PATH_CLOSE.
 fn observe_authenticated_server_tcp_frame(
     frame: &Frame,
+    session_id: crate::protocol::SessionId,
     path_id: crate::protocol::PathId,
     commands: &crate::runtime::path::commands::ReliablePathCommandSender,
     path_state: &ServerCarrierPathStateHandle,
+    context: &ServerPathContext,
 ) {
-    if !matches!(frame, Frame::PathDrain { path_id: drain_path_id } if *drain_path_id == path_id) {
-        return;
+    match frame {
+        Frame::PathDrain {
+            path_id: drain_path_id,
+        } if *drain_path_id == path_id => {
+            commands.begin_path_drain();
+            path_state.set_state(PeerPathState::Draining);
+        }
+        // Session retirement is session-wide negative authority. Publish it at
+        // the authenticated decode boundary so a following native EOF cannot
+        // preempt the retained close reason behind a full actor queue.
+        Frame::SessionClose { reason } => context.retire_session(session_id, *reason),
+        _ => {}
     }
-    commands.begin_path_drain();
-    path_state.set_state(PeerPathState::Draining);
 }
 
 #[cfg(test)]
@@ -161,20 +171,19 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     };
     let path_registration = context
         .reliable_streams
-        .register_carrier_path_with_observed_peer(
+        .register_carrier_path_with_observed_peer_and_authority(
             session_id,
             UnderlayProtocol::Tcp,
             path_id,
             local_properties,
+            peer_usage,
+            0,
             path_join.principal_permit,
             peer,
             context.configured_path_name(local_path.config_ordinal()),
         )?;
     let local_usage = local_path.advertised_usage();
     let ready = fence_server_carrier_readiness(path_registration.session_retirement(), async {
-        context
-            .reliable_streams
-            .record_peer_path_usage(&path_registration, 0, peer_usage);
         context.reliable_streams.record_local_path_metrics(
             &path_registration,
             local_metrics,
@@ -209,16 +218,19 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
     let observed_commands = commands_tx.clone();
     let observed_path_state = path_registration.state_handle();
+    let observed_context = context.clone();
     let terminal_commands = commands_tx.clone();
-    let path_frames = spawn_encrypted_tcp_reader_with_observers(
+    let (path_frames, native_terminal) = spawn_encrypted_tcp_reader_with_terminal_result(
         reader,
         reliable_path_writer_frame_queue(context.mux_limits),
         move |frame| {
             observe_authenticated_server_tcp_frame(
                 frame,
+                session_id,
                 path_id,
                 &observed_commands,
                 &observed_path_state,
+                &observed_context,
             );
         },
         move |_| terminal_commands.terminate_failed_path(),
@@ -233,6 +245,7 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         path_registration,
         writer: ServerTcpWriter::new(writer),
         path_frames,
+        native_terminal: Some(native_terminal),
         commands_tx,
         commands_rx,
         evidence,

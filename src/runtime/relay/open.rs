@@ -7,7 +7,7 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
+    MIN_RELIABLE_PIPE_PACKETS, PATH_OPEN_SCORE_BYTES, RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
     reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::path::RelayPathKey;
@@ -15,20 +15,26 @@ use crate::model::timing::{
     path_open_pto, path_open_serialized_exchanges, path_open_timeout, transport_pto_from_snapshot,
 };
 use crate::protocol::{
-    Frame, PathMetrics, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    Frame, PathMetrics, PathUsage, StreamAttachmentPhase, StreamDemandHint, StreamId,
+    StreamReturnPlan, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
 use crate::runtime::path::quic::client::{ClientUdpErrorDisposition, client_udp_error_disposition};
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
-use crate::runtime::stream::{OpenedRemoteStream, ReliablePathStream};
+use crate::runtime::stream::{
+    OpenedRemoteStream, ReliablePathStream, ReliableRelayReturnCandidate, ReliableRelayReturnPlan,
+};
 use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliableRelayOpenSpec {
     pub(in crate::runtime) target: TargetAddr,
     pub(in crate::runtime) initial_demand: StreamDemandHint,
+    return_plan: StreamReturnPlan,
+    startup_plan: Option<Arc<ReliableRelayReturnPlan>>,
 }
 
 impl ReliableRelayOpenSpec {
@@ -36,8 +42,142 @@ impl ReliableRelayOpenSpec {
         Self {
             target,
             initial_demand: stream_demand_hint_for_traffic_class(initial_lane),
+            return_plan: StreamReturnPlan {
+                trigger_bytes: 0,
+                candidate_total: 1,
+                candidate_tier: PathUsage::Available,
+                phase: StreamAttachmentPhase::Startup,
+                candidate_ordinal: 0,
+            },
+            startup_plan: None,
         }
     }
+
+    fn for_initial_plan(
+        target: TargetAddr,
+        initial_lane: TrafficClass,
+        startup_plan: Arc<ReliableRelayReturnPlan>,
+    ) -> Self {
+        let return_plan = startup_plan.wire(StreamAttachmentPhase::Ordinary, 0);
+        Self {
+            target,
+            initial_demand: stream_demand_hint_for_traffic_class(initial_lane),
+            return_plan,
+            startup_plan: Some(startup_plan),
+        }
+    }
+
+    pub(in crate::runtime) fn with_startup_plan(
+        mut self,
+        startup_plan: Arc<ReliableRelayReturnPlan>,
+    ) -> Self {
+        self.return_plan = startup_plan.wire(StreamAttachmentPhase::Ordinary, 0);
+        self.startup_plan = Some(startup_plan);
+        self
+    }
+
+    pub(in crate::runtime) fn for_startup_ordinal(&self, ordinal: u8) -> Self {
+        let mut spec = self.clone();
+        let plan = spec
+            .startup_plan
+            .as_ref()
+            .expect("startup attachment requires a frozen return plan");
+        debug_assert!(plan.candidate(ordinal).is_some());
+        spec.return_plan = plan.wire(StreamAttachmentPhase::Startup, ordinal);
+        spec
+    }
+
+    pub(in crate::runtime) fn for_ordinary_attachment(&self) -> Self {
+        let mut spec = self.clone();
+        if let Some(plan) = &spec.startup_plan {
+            spec.return_plan = plan.wire(StreamAttachmentPhase::Ordinary, 0);
+        }
+        spec
+    }
+
+    pub(in crate::runtime) fn return_plan(&self) -> StreamReturnPlan {
+        self.return_plan
+    }
+}
+
+fn freeze_reliable_relay_return_plan(
+    context: &ClientPathContext,
+    lane: TrafficClass,
+) -> Result<Arc<ReliableRelayReturnPlan>, RuntimeError> {
+    let configured = context
+        .tcp_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            (
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index,
+                },
+                path,
+            )
+        })
+        .chain(context.udp_paths.iter().enumerate().map(|(index, path)| {
+            (
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                },
+                path,
+            )
+        }))
+        .filter(|(_, path)| {
+            !path.metadata.policy.probe_only
+                && (lane != TrafficClass::Throughput || path.metadata.policy.bulk_allowed)
+        })
+        .collect::<Vec<_>>();
+    // Operator-disabled slots are not members of this stream's immutable
+    // plan. Health state and the presence of an exact instance are evidence,
+    // not membership: a configured connecting slot remains pending (`None`).
+    let configured = {
+        let health = context.health().lock().expect("client path health lock");
+        let now = Instant::now();
+        configured
+            .into_iter()
+            .filter_map(|(key, path)| {
+                let record = health.path_record(key);
+                if record.is_some_and(|record| record.observation_at(now).manual_disabled) {
+                    return None;
+                }
+                Some((
+                    key,
+                    path,
+                    record.and_then(|record| record.path_instance_id()),
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let candidate_tier = if configured
+        .iter()
+        .any(|(_, path, _)| !path.metadata.policy.backup)
+    {
+        PathUsage::Available
+    } else {
+        PathUsage::Backup
+    };
+    let ranked_slots = configured
+        .into_iter()
+        .filter(|(_, path, _)| path.metadata.policy.backup == (candidate_tier == PathUsage::Backup))
+        .map(|(key, _, path_instance_id)| (key, path_instance_id))
+        .collect::<Vec<_>>();
+    if ranked_slots.is_empty() {
+        return Err(no_schedulable_reliable_path_error(context));
+    }
+    let trigger_bytes = if ranked_slots.len() == 1 {
+        0
+    } else {
+        (PATH_OPEN_SCORE_BYTES as u64).saturating_mul(MIN_RELIABLE_PIPE_PACKETS as u64)
+    };
+    Ok(Arc::new(ReliableRelayReturnPlan::new(
+        trigger_bytes,
+        candidate_tier,
+        ranked_slots,
+    )?))
 }
 
 /// A selected initial carrier whose scheduler load remains owned across I/O.
@@ -76,14 +216,45 @@ pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
     }))
 }
 
+fn reserve_reliable_initial_plan_attempt(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    lane: TrafficClass,
+    candidate: ReliableRelayReturnCandidate,
+) -> Option<ReliableInitialOpenAttempt> {
+    let candidate_is_current = || {
+        candidate.path_instance_id.is_none_or(|frozen| {
+            context
+                .health()
+                .lock()
+                .expect("client path health lock")
+                .path_record(candidate.key)
+                .and_then(|record| record.path_instance_id())
+                == Some(frozen)
+        })
+    };
+    if !candidate_is_current() {
+        return None;
+    }
+    let load_lease = context.reserve_relay_path_load(candidate.key, lane)?;
+    if !candidate_is_current() {
+        drop(load_lease);
+        return None;
+    }
+    Some(ReliableInitialOpenAttempt {
+        key: candidate.key,
+        stream_id,
+        load_lease,
+    })
+}
+
 async fn open_reliable_initial_attempt(
     context: &ClientPathContext,
     attempt: ReliableInitialOpenAttempt,
-    target: TargetAddr,
+    spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     has_unattempted_alternative: bool,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    let spec = ReliableRelayOpenSpec::new(target, lane);
     let ReliableInitialOpenAttempt {
         key,
         stream_id,
@@ -98,7 +269,7 @@ async fn open_reliable_initial_attempt(
             match open_remote_stream_on_preselected_tcp_path(
                 context,
                 stream_id,
-                &spec,
+                spec,
                 lane,
                 key.index,
                 open_deadlines,
@@ -137,7 +308,7 @@ async fn open_reliable_initial_attempt(
                 open_remote_stream_on_preselected_udp_path(
                     context,
                     stream_id,
-                    &spec,
+                    spec,
                     lane,
                     key.index,
                     open_deadline,
@@ -223,24 +394,32 @@ async fn open_remote_stream_active(
     lane: TrafficClass,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let stream_id = context.allocate_reliable_stream_id()?;
-    let mut attempted = Vec::new();
+    let startup_plan = freeze_reliable_relay_return_plan(context, lane)?;
+    let base_spec = ReliableRelayOpenSpec::for_initial_plan(target, lane, startup_plan.clone());
+    let mut failed_ordinals = Vec::new();
     let mut last_retryable_error = None;
-    while let Some(attempt) = reserve_reliable_initial_open_attempt(
-        context,
-        stream_id,
-        lane,
-        PATH_OPEN_SCORE_BYTES,
-        &mut attempted,
-    )? {
-        let key = attempt.key;
-        let has_unattempted_alternative = context
-            .ordered_reliable_path_keys(lane, PATH_OPEN_SCORE_BYTES)
-            .into_iter()
-            .any(|candidate| !attempted.contains(&candidate));
+    let ranked_keys = context.ordered_reliable_path_keys(lane, PATH_OPEN_SCORE_BYTES);
+    let mut opening_candidates = startup_plan.candidates().to_vec();
+    opening_candidates.sort_by_key(|candidate| {
+        ranked_keys
+            .iter()
+            .position(|key| *key == candidate.key)
+            .unwrap_or(ranked_keys.len() + usize::from(candidate.ordinal))
+    });
+    for (position, candidate) in opening_candidates.iter().copied().enumerate() {
+        let Some(attempt) =
+            reserve_reliable_initial_plan_attempt(context, stream_id, lane, candidate)
+        else {
+            failed_ordinals.push(candidate.ordinal);
+            continue;
+        };
+        let key = candidate.key;
+        let has_unattempted_alternative = position + 1 < opening_candidates.len();
+        let attempt_spec = base_spec.for_startup_ordinal(candidate.ordinal);
         let open = open_reliable_initial_attempt(
             context,
             attempt,
-            target.clone(),
+            &attempt_spec,
             lane,
             has_unattempted_alternative,
         )
@@ -258,7 +437,21 @@ async fn open_remote_stream_active(
             Err(err) => Err(err),
         };
         match open {
-            Ok(opened) => return Ok(opened),
+            Ok(opened)
+                if candidate
+                    .path_instance_id
+                    .is_none_or(|frozen| opened.path_instance_id() == frozen) =>
+            {
+                return Ok(opened.with_startup(startup_plan, candidate.ordinal, failed_ordinals));
+            }
+            Ok(opened) => {
+                // The frozen physical owner disappeared while its open was in
+                // flight. A same-slot successor is ordinary later topology;
+                // it cannot inherit this candidate's startup ordinal.
+                opened.close().await;
+                failed_ordinals.push(candidate.ordinal);
+                last_retryable_error = Some(RuntimeError::ReliablePathRetired);
+            }
             Err(
                 err @ (RuntimeError::ReliablePathAttachmentRefused
                 | RuntimeError::ReliablePathRetired),
@@ -267,9 +460,11 @@ async fn open_remote_stream_active(
                 // Preserve the logical ID and try another carrier without
                 // turning target-establishment delay into path failure.
                 last_retryable_error = Some(err);
+                failed_ordinals.push(candidate.ordinal);
             }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
                 last_retryable_error = Some(err);
+                failed_ordinals.push(candidate.ordinal);
             }
             Err(err) => return Err(err),
         }
@@ -409,6 +604,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
             spec.target.clone(),
             lane,
             spec.initial_demand,
+            spec.return_plan(),
             open_deadlines,
             advertised_recv_max_offset,
         )
@@ -548,6 +744,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
             spec.target.clone(),
             lane,
             spec.initial_demand,
+            spec.return_plan(),
             open_deadline,
             advertised_recv_max_offset,
         )

@@ -7,8 +7,9 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
-    BulkAdmissionCheck, BulkCandidatePosition, ReliableDataAckFrontierState,
+    BulkAdmissionCheck, BulkAdmissionEvidence, BulkCandidatePosition, ReliableDataAckFrontierState,
     bulk_candidate_admission_suppression_with_completion_backlog,
+    bulk_contiguous_frontier_can_accept_enqueue, original_data_assignment_has_product_headroom,
 };
 use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
 use crate::model::path::carrier_path_key_order;
@@ -30,6 +31,7 @@ use crate::scheduler::{self, TrafficClass};
 pub(super) struct ResponseDataPathSelection {
     pub(super) target: ResponseSenderPathTarget,
     pub(super) payload_bytes: usize,
+    pub(super) position: BulkCandidatePosition,
 }
 
 #[cfg(test)]
@@ -193,7 +195,7 @@ pub(super) fn select_response_data_path_with_payload(
                 let owns_lower_frontier =
                     lower_owner == Some((key, target.observation.incarnation));
                 let position = if owns_lower_frontier
-                    && frontier_state.owner_uses_native_admission()
+                    && frontier_state.owner_has_live_contiguous_frontier()
                 {
                     BulkCandidatePosition::ContiguousFrontier
                 } else if lower_owner.is_none() && key == lead_key {
@@ -207,52 +209,68 @@ pub(super) fn select_response_data_path_with_payload(
                     (lead_snapshot, lead_eta_ms)
                 };
                 // Every unproven additional path may own only one bounded
-                // startup flight until exact Data ACKs prove progress. The
-                // contiguous owner instead remains governed by shared Product
-                // credit and its native carrier.
-                let has_data_level_credit = (owns_lower_frontier
-                    && frontier_state.owner_uses_native_admission())
+                // startup flight until exact Data ACKs prove progress. A live
+                // contiguous owner may enter admission directly, but still
+                // requires Product and (for QUIC) native window headroom.
+                let may_attempt_product_admission = (owns_lower_frontier
+                    && frontier_state.owner_has_live_contiguous_frontier())
                     || snapshot.has_durable_product_progress
                     || target
                         .observation
                         .original_data_in_flight_bytes
                         .saturating_add(target_payload_bytes as u64)
                         <= reliable_unproven_path_startup_flight_limit_bytes(mux_limits);
-                // ECF and product service windows govern bulk placement. A
-                // sole enqueueable output may bypass that second controller
-                // only while it owns the contiguous frontier. If an absent
+                // ECF and Product service windows govern bulk placement. A
+                // sole enqueueable contiguous output may use a work-conserving
+                // gate that still checks Product/native authority. If an absent
                 // output still owns lower bytes, this candidate remains an
                 // additional path and must not extend that receive hole
                 // without bound. Once latency work is ready, deferring it
                 // cannot move it ahead of bytes already handed to an ordered
                 // carrier; publish it into the carrier's priority queue at the
                 // earliest opportunity.
-                let suppression = if lane.is_latency_sensitive()
-                    || (single_live_path
-                        && position != BulkCandidatePosition::AdditionalPath
-                        && snapshot.active_latency_sensitive_flows == 0)
-                {
+                let admission_check = BulkAdmissionCheck {
+                    best_snapshot,
+                    best_eta_ms,
+                    candidate_snapshot: snapshot,
+                    candidate_eta_ms: eta_ms,
+                    payload_bytes: target_payload_bytes,
+                    mux_limits,
+                    position,
+                    stream_ordering_debt_bytes: external_flight,
+                };
+                let uses_contiguous_work_conserving_gate = single_live_path
+                    && position != BulkCandidatePosition::AdditionalPath
+                    && snapshot.active_latency_sensitive_flows == 0;
+                let suppression = if !original_data_assignment_has_product_headroom(snapshot) {
+                    Some("product_window")
+                } else if lane.is_latency_sensitive() {
                     None
+                } else if uses_contiguous_work_conserving_gate {
+                    (!bulk_contiguous_frontier_can_accept_enqueue(
+                        snapshot,
+                        target_payload_bytes,
+                        mux_limits,
+                    ))
+                    .then_some("carrier_enqueue_limit")
                 } else {
-                    has_data_level_credit
-                    .then(|| {
-                        bulk_candidate_admission_suppression_with_completion_backlog(
-                            BulkAdmissionCheck {
-                                best_snapshot,
-                                best_eta_ms,
-                                candidate_snapshot: snapshot,
-                                candidate_eta_ms: eta_ms,
-                                payload_bytes: target_payload_bytes,
-                                mux_limits,
-                                position,
-                                stream_ordering_debt_bytes: external_flight,
-                            },
-                            lead_completion_backlog_bytes,
-                            target.observation.has_bulk_rate_evidence,
-                        )
-                    })
+                    may_attempt_product_admission
+                        .then(|| {
+                            bulk_candidate_admission_suppression_with_completion_backlog(
+                                admission_check,
+                                lead_completion_backlog_bytes,
+                                BulkAdmissionEvidence {
+                                    product_assignment_qualified: target
+                                        .observation
+                                        .product_assignment_qualified,
+                                    fresh_completion_rate: target
+                                        .observation
+                                        .has_bulk_rate_evidence,
+                                },
+                            )
+                        })
                     .flatten()
-                    .or((!has_data_level_credit).then_some("startup_flight_limit"))
+                    .or((!may_attempt_product_admission).then_some("startup_flight_limit"))
                 };
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -297,6 +315,7 @@ pub(super) fn select_response_data_path_with_payload(
                     eta_ms,
                     external_flight,
                     target_payload_bytes,
+                    position,
                 ))
             })
             .collect::<Vec<_>>();
@@ -329,9 +348,11 @@ pub(super) fn select_response_data_path_with_payload(
                 )
             })
             .unwrap_or(best);
+
         Some(ResponseDataPathSelection {
             target: selected.0.clone(),
             payload_bytes: selected.4,
+            position: selected.5,
         })
     };
 
@@ -358,6 +379,15 @@ pub(super) fn response_completion_snapshot(
     // includes commands already drained into a TCP socket, which TCP_INFO
     // cannot report in bytes portably. Repair copies remain carrier work; only
     // unique data contributes to the data-level completion view.
+    let exact_native_queue_floor = if target.observation.native_drain_observed {
+        target.observation.native_queue_bytes
+    } else {
+        0
+    };
+    snapshot.queue_bytes = snapshot
+        .queue_bytes
+        .max(exact_native_queue_floor)
+        .saturating_add(target.observation.writer_pending_bytes);
     snapshot.data_level_queue_bytes = 0;
     snapshot.data_level_bytes_in_flight = target.observation.original_data_in_flight_bytes;
     snapshot
@@ -390,10 +420,11 @@ pub(super) fn select_response_frame_path(
         reinjection_cause.is_some_and(RelaySendCause::is_persistent_ack_gap_reinjection);
     let exact_reinjection_target =
         reinjection_cause.and_then(RelaySendCause::persistent_server_target);
-    let can_enqueue = |target: &&ResponseSenderPathTarget, require_idle: bool| {
+    let can_enqueue = |target: &&ResponseSenderPathTarget, require_product_drain: bool| {
         if reinjection_cause.is_some() {
             return target.can_enqueue_reinjection_frame(frame)
-                && (!require_idle || ordered_carrier_reinjection_ready(target));
+                && (!require_product_drain
+                    || target.observation.original_data_in_flight_bytes == 0);
         }
         match emit_mode {
             CarrierEmitMode::Classified => target.can_enqueue_frame(frame, lane),
@@ -403,13 +434,13 @@ pub(super) fn select_response_frame_path(
     let select = |allow_backup: bool,
                   avoid_existing: bool,
                   require_delivery_progress: bool,
-                  require_idle: bool| {
+                  require_product_drain: bool| {
         let candidates = targets
             .iter()
             .filter(|target| {
                 reinjection_cause.is_none() || !target.observation.stale_for_original_data
             })
-            .filter(|target| can_enqueue(target, require_idle))
+            .filter(|target| can_enqueue(target, require_product_drain))
             .filter(|target| {
                 allow_backup || !scheduler::path_is_backup(target.observation.snapshot)
             })
@@ -460,21 +491,22 @@ pub(super) fn select_response_frame_path(
         if requires_measured_reinjection_target {
             // The recovery decision already proved that this measured path can
             // finish before the original carrier. Its bounded repair queue,
-            // rather than complete carrier idleness, is the admission limit.
+            // rather than sampled carrier idleness, is the admission limit.
             return select(allow_backup, avoid_existing, true, false);
         }
         if path_failure_reinjection {
-            // Prefer a drained measured survivor. Confirmed failure may use a
-            // busy carrier as a final liveness fallback.
+            // Prefer a measured survivor with no unresolved OriginalData for
+            // this stream. Confirmed failure may use a Product-busy carrier as
+            // a final liveness fallback.
             return select(allow_backup, avoid_existing, true, true)
                 .or_else(|| select(allow_backup, avoid_existing, false, true))
                 .or_else(|| select(allow_backup, avoid_existing, true, false))
                 .or_else(|| select(allow_backup, avoid_existing, false, false));
         }
         if matches!(reinjection_cause, Some(RelaySendCause::TailReinjection)) {
-            // The bounded live-tail probe prefers a drained carrier. Shared
-            // carrier work may delay it, but cannot veto recovery when every
-            // distinct healthy output is busy with unrelated streams.
+            // The bounded live-tail probe prefers an output with no unresolved
+            // OriginalData for this stream. Native work remains completion
+            // evidence and cannot veto recovery on a queue-admissible target.
             return select(allow_backup, avoid_existing, false, true)
                 .or_else(|| select(allow_backup, avoid_existing, false, false));
         }
@@ -509,23 +541,6 @@ pub(super) fn select_response_frame_path(
                 .then(|| select_for_cause(true, false))
                 .flatten()
         })
-}
-
-/// Idle preference for ordinary speculative repair. Authoritative recovery
-/// causes may separately fall back to a busy carrier with bounded queue space.
-fn ordered_carrier_reinjection_ready(target: &ResponseSenderPathTarget) -> bool {
-    let observation = &target.observation;
-    if observation.writer_pending_bytes != 0 {
-        return false;
-    }
-    match observation.key.underlay {
-        crate::protocol::UnderlayProtocol::Tcp if observation.native_drain_observed => {
-            observation.snapshot.bytes_in_flight == 0 && observation.native_queue_bytes == 0
-        }
-        crate::protocol::UnderlayProtocol::Tcp | crate::protocol::UnderlayProtocol::Udp => {
-            observation.original_data_in_flight_bytes == 0 && observation.native_queue_bytes == 0
-        }
-    }
 }
 
 fn response_external_ordering_debt_bytes(

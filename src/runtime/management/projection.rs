@@ -881,9 +881,11 @@ fn client_path_status(
         freshness_horizon_ms: rate.freshness_horizon_ms,
         metric_age_scope: rate.observed_at.map(|_| "delivery"),
         native_delivery_observed: Some(rate_diagnostics.carrier_delivery_samples > 0),
-        product_delivery_observed: Some(rate_diagnostics.delivery_samples > 0),
+        product_delivery_observed: Some(rate_diagnostics.product_delivery_samples > 0),
         ack_derived_data_observed: Some(
-            rate_diagnostics.delivery_samples > 0 || rate_diagnostics.carrier_ack_derived_data_seen,
+            rate_diagnostics.delivery_samples > 0
+                || rate_diagnostics.product_delivery_samples > 0
+                || rate_diagnostics.carrier_ack_derived_data_seen,
         ),
     }
 }
@@ -1288,18 +1290,18 @@ fn client_rate_projection(
         });
     let product = diagnostics
         .product_delivery_rate_bps
-        .filter(|_| diagnostics.delivery_samples > 0)
+        .filter(|_| diagnostics.product_delivery_samples > 0)
         .map(|delivery_rate_bps| ClientRateProjection {
             delivery_rate_bps,
             source: "product_goodput",
             scope: "per_flow_goodput",
-            observed_at: diagnostics.last_delivery_at,
-            expires_at: diagnostics.delivery_rate_expires_at,
+            observed_at: diagnostics.product_last_delivery_at,
+            expires_at: diagnostics.product_delivery_rate_expires_at,
             freshness_horizon_ms: client_rate_freshness_horizon_ms(
-                diagnostics.last_delivery_at,
-                diagnostics.delivery_rate_expires_at,
+                diagnostics.product_last_delivery_at,
+                diagnostics.product_delivery_rate_expires_at,
             ),
-            samples: Some(diagnostics.delivery_samples),
+            samples: Some(diagnostics.product_delivery_samples),
             sample_bytes: Some(diagnostics.product_delivery_sample_bytes),
             app_limited: None,
         });
@@ -1320,8 +1322,8 @@ fn client_rate_projection(
                 diagnostics.delivery_rate_expires_at,
             ),
             samples: (diagnostics.delivery_samples > 0).then_some(diagnostics.delivery_samples),
-            sample_bytes: (diagnostics.product_delivery_sample_bytes > 0)
-                .then_some(diagnostics.product_delivery_sample_bytes),
+            sample_bytes: (diagnostics.delivery_sample_bytes > 0)
+                .then_some(diagnostics.delivery_sample_bytes),
             app_limited: None,
         });
     let product_side = product.or(mpp);
@@ -1576,6 +1578,8 @@ mod tests {
             usage: Some(PathUsage::Available),
             metrics: Some(metrics),
             carrier_delivery_rate_sample: None,
+            eligibility_epoch: Some(1),
+            native_scheduling_shape: None,
             source: Some("local_sender"),
         }
     }

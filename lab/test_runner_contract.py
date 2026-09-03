@@ -1,3 +1,5 @@
+import os
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -26,6 +28,125 @@ RANDOM_INTERNET = (
 
 
 class RunnerContractTests(unittest.TestCase):
+    @staticmethod
+    def _shell_function(name):
+        marker = f"{name}() {{"
+        return marker + SCRIPT.split(marker, 1)[1].split("\n}", 1)[0] + "\n}"
+
+    def _run_initial_rate_contract(self, command, **overrides):
+        environment = os.environ.copy()
+        for name in (
+            "MPTUNNEL_LAB_INITIAL_RATE_MBPS",
+            "MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS",
+            "MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS",
+            "MPTUNNEL_LAB_USE_PATH_HINTS",
+        ):
+            environment.pop(name, None)
+        environment.update(overrides)
+        source = "\n".join(
+            (
+                self._shell_function("flow_config_toml"),
+                self._shell_function("validate_initial_rate_lab_contract"),
+                command,
+            )
+        )
+        return subprocess.run(
+            ["bash", "-c", source],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+    def test_initial_rate_flow_arms_are_direction_local(self):
+        arms = (
+            ({}, "", ""),
+            (
+                {"MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS": "80"},
+                "[flow]\ninitial_rate_mbps = 80\n",
+                "",
+            ),
+            (
+                {"MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS": "120"},
+                "",
+                "[flow]\ninitial_rate_mbps = 120\n",
+            ),
+            (
+                {
+                    "MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS": "80",
+                    "MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS": "120",
+                },
+                "[flow]\ninitial_rate_mbps = 80\n",
+                "[flow]\ninitial_rate_mbps = 120\n",
+            ),
+        )
+        for environment, expected_client, expected_server in arms:
+            with self.subTest(environment=environment):
+                validation = self._run_initial_rate_contract(
+                    "validate_initial_rate_lab_contract", **environment
+                )
+                self.assertEqual(validation.returncode, 0, validation.stderr)
+                client = self._run_initial_rate_contract(
+                    "flow_config_toml client", **environment
+                )
+                server = self._run_initial_rate_contract(
+                    "flow_config_toml server", **environment
+                )
+                self.assertEqual(client.returncode, 0, client.stderr)
+                self.assertEqual(server.returncode, 0, server.stderr)
+                self.assertEqual(client.stdout, expected_client)
+                self.assertEqual(server.stdout, expected_server)
+
+        server_config = SCRIPT.split("server_config_toml() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        socks_config = SCRIPT.split("socks_client_config_toml() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        tun_config = SCRIPT.split("tun_client_config_toml() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn("flow_config_toml server", server_config)
+        self.assertIn("flow_config_toml client", socks_config)
+        self.assertIn("flow_config_toml client", tun_config)
+
+    def test_ambiguous_initial_rate_inputs_fail_before_lab_startup(self):
+        legacy = self._run_initial_rate_contract(
+            "validate_initial_rate_lab_contract",
+            MPTUNNEL_LAB_INITIAL_RATE_MBPS="100",
+        )
+        self.assertEqual(legacy.returncode, 2)
+        self.assertIn("ambiguous and no longer accepted", legacy.stderr)
+
+        for environment in (
+            {"MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS": "80"},
+            {"MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS": "120"},
+            {
+                "MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS": "80",
+                "MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS": "120",
+            },
+        ):
+            with self.subTest(environment=environment):
+                conflict = self._run_initial_rate_contract(
+                    "validate_initial_rate_lab_contract",
+                    MPTUNNEL_LAB_USE_PATH_HINTS="1",
+                    **environment,
+                )
+                self.assertEqual(conflict.returncode, 2)
+                self.assertIn("path hints supply client per-path", conflict.stderr)
+
+        path_hints_only = self._run_initial_rate_contract(
+            "validate_initial_rate_lab_contract",
+            MPTUNNEL_LAB_USE_PATH_HINTS="1",
+        )
+        self.assertEqual(path_hints_only.returncode, 0, path_hints_only.stderr)
+
+        startup = SCRIPT.split("validate_client_runtime_case_filter\n", 1)[1]
+        self.assertLess(
+            startup.index("validate_initial_rate_lab_contract"),
+            startup.index("docker compose version"),
+        )
+
     def test_only_optional_baselines_can_emit_skipped_rows(self):
         optional_protocols = (
             '"vmess"',

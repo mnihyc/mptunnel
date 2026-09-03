@@ -124,7 +124,29 @@ retention_timeout_s = 300
 # rearms before retirement; cancellation completes exact owner cleanup. Expiry
 # closes that logical flow and releases its admission/telemetry state without
 # declaring a carrier or session failure. Set zero to disable retirement.
-idle_timeout_s = 300
+# idle_timeout_s = 300
+# Optional sender-local startup-rate prior, as a positive whole number of
+# decimal Mbit/s, for every MPP TCP and QUIC path. Omission means unknown.
+# Scaling to bits/second must fit in u64. Any `initial-rate-*` form in a path
+# URI overrides this value; `initial-rate=unknown` explicitly suppresses it for
+# that path. On TCP this remains an MPP scheduling prior and does not alter the
+# operating system's native TCP congestion controller. On QUIC a finite rate
+# R and initial RTT T (the path `initial-srtt-s`, otherwise 0.333 s) set the
+# initial native window target to max(IW10, ceil(R*T/8)) bytes and the initial
+# pacing target to ceil(R/8) bytes/s. They do not seed BBR bandwidth evidence.
+# MPP retains the finite prior until the exact post-authentication BBR sample
+# is valid, Data-space, non-application-limited, and observed in two distinct
+# packet-timed source rounds. Pre-ready, invalid, app-limited, pre-floor, and
+# same-round records are no-ops; after qualification the native basis cannot
+# revert to the prior. BBR window, pacing, loss, and recovery remain active
+# throughout. Omitted/unknown/unlimited rates bypass this qualification gate.
+# A resolved finite QUIC pair is rejected unless ceil(R/8) <= 2^53 and
+# ceil(R*T/8) <= u64::MAX; there is no silent floating-point rounding or window
+# saturation. This QUIC-native bound does not restrict a TCP-only finite prior.
+# `unknown` and `unlimited` keep exact Quinn BBR3 startup defaults. A high prior
+# permits a larger initial burst and can create queueing or loss; native
+# congestion control and recovery remain authoritative.
+# initial_rate_mbps = 100
 # Default optional reliable MPP payload-reinjection budget for every local
 # sender. Each MPP inbound/outbound performance table may override it. The
 # budget is applied independently in each sending direction: 10 permits
@@ -563,7 +585,11 @@ paths = [
 #   millisecond-granular startup evidence;
 # - exactly one initial-rate-bps|initial-rate-kbps|initial-rate-mbps=<nonzero-u64>,
 #   or initial-rate=unknown|unlimited; scaled values must fit in u64 bits/second;
-#   omission means unknown.
+#   omission inherits `[flow].initial_rate_mbps`, or means unknown when that
+#   global prior is also omitted. Explicit `initial-rate=unknown` suppresses
+#   the global prior for this path. Resolved finite QUIC rate/RTT pairs must
+#   also fit the exact native startup target and post-authentication handoff
+#   contract documented under `[flow]`.
 #
 # Transport and carrier-group controls:
 # - loss-compensation-percent=0..99.9999: sender-local QUIC policy that corrects

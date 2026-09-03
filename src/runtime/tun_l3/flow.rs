@@ -97,6 +97,25 @@ where
         Some(binding.carrier)
     }
 
+    /// Observe an affinity candidate without refreshing its activity clock.
+    /// Planning is advisory; only an accepted packet publication calls
+    /// `bind`, so a rejected/stale plan cannot keep a flow artificially live.
+    pub(super) fn planned_current(
+        &mut self,
+        flow: &IpPacketFlowKey,
+        now: Instant,
+        eligible: impl FnOnce(C) -> bool,
+    ) -> Option<C> {
+        self.expire(now);
+        let binding = self.bindings.get(flow)?;
+        if !eligible(binding.carrier)
+            || now.saturating_duration_since(binding.last_packet_at) >= binding.flowlet_timeout
+        {
+            return None;
+        }
+        Some(binding.carrier)
+    }
+
     pub(super) fn active_load_for(&self, carrier: C, excluding: &IpPacketFlowKey) -> u32 {
         self.load
             .get(&carrier)

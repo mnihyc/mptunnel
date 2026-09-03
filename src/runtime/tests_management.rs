@@ -281,6 +281,12 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
             health
                 .tcp
                 .iter()
+                .all(|record| record.eligibility_epoch() == Some(1))
+        );
+        assert!(
+            health
+                .tcp
+                .iter()
                 .all(|record| record.state == SchedulerPathState::Failed)
         );
     }
@@ -290,6 +296,12 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
 
     let health = context.health().lock().expect("health");
     assert!(health.tcp.iter().all(|record| !record.manual_disabled));
+    assert!(
+        health
+            .tcp
+            .iter()
+            .all(|record| record.eligibility_epoch() == Some(2))
+    );
     assert!(
         health
             .tcp
@@ -307,9 +319,7 @@ fn node_path_control_can_select_client_by_outbound_name() {
         vec![ClientPathConfig {
             name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443?max-tcp-carriers=1"
-                .parse()
-                .expect("path"),
+            spec: "quic://127.0.0.1:443".parse().expect("path"),
             security,
         }],
         ResourceLimits::default(),
@@ -334,10 +344,14 @@ fn node_path_control_can_select_client_by_outbound_name() {
     target
         .control_path_json(br#"{"outbound":"edge-mpp","path":"path-1","state":"disabled"}"#)
         .expect("control path");
+    target
+        .control_path_json(br#"{"outbound":"edge-mpp","path":"path-1","state":"disabled"}"#)
+        .expect("idempotent control path");
 
     let health = context.health().lock().expect("health");
-    assert!(health.tcp[0].manual_disabled);
-    assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
+    assert!(health.udp[0].manual_disabled);
+    assert_eq!(health.udp[0].state, SchedulerPathState::Failed);
+    assert_eq!(health.udp[0].eligibility_epoch(), Some(1));
 }
 
 #[test]
@@ -666,10 +680,10 @@ fn client_status_does_not_mix_native_pacing_with_newer_product_delivery_epoch() 
         record.carrier_app_limited = false;
         record.measured_rate_bps = Some(80_000_000.0);
         record.product_delivery_rate_bps = Some(80_000_000.0);
-        record.delivery_samples = 1;
+        record.product_delivery_samples = 1;
         record.product_delivery_sample_bytes = 64 * 1024;
-        record.last_delivery_at = Some(product_at);
-        record.delivery_rate_expires_at = Some(product_at + Duration::from_secs(1));
+        record.product_last_delivery_at = Some(product_at);
+        record.product_delivery_rate_expires_at = Some(product_at + Duration::from_secs(1));
     }
     let target = ManagementTarget {
         clients: vec![context],

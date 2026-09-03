@@ -1,6 +1,8 @@
 use super::*;
 use crate::model::admission::ReliableDataAckFrontierState;
-use crate::model::capacity::reliable_unproven_path_startup_flight_limit_bytes;
+use crate::model::capacity::{
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_unproven_path_startup_flight_limit_bytes,
+};
 use crate::model::path::CarrierPathKey;
 use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
@@ -155,6 +157,27 @@ fn latency_response_does_not_wait_for_a_bulk_service_window() {
 }
 
 #[test]
+fn latency_response_still_requires_exact_product_headroom() {
+    let mut target = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 1024 * 1024, true);
+    target.observation.snapshot.data_level_limit_bytes = 24 * 1024;
+    target.observation.snapshot.data_level_bytes_in_flight = 24 * 1024;
+    target.observation.original_data_in_flight_bytes = 24 * 1024;
+
+    assert!(
+        select_response_data_path(
+            &[target],
+            TrafficClass::Latency,
+            64,
+            MuxLimits::default(),
+            &[],
+            0,
+        )
+        .is_none(),
+        "latency bypasses ECF and hysteresis, not exact Product O < P authority",
+    );
+}
+
+#[test]
 fn completion_time_selects_the_earliest_available_path() {
     let first = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
     let later = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -217,7 +240,7 @@ fn sole_tcp_path_is_not_double_limited_by_product_flight() {
 }
 
 #[test]
-fn sole_tcp_path_bounds_bulk_when_its_writer_has_a_latency_flow() {
+fn sole_tcp_path_with_a_latency_flow_defers_native_arbitration_to_its_writer() {
     let mux_limits = MuxLimits::default();
     let product_flight = 2 * 1024 * 1024_u64;
     let mut target = response_target(
@@ -231,7 +254,7 @@ fn sole_tcp_path_bounds_bulk_when_its_writer_has_a_latency_flow() {
     target.observation.snapshot.active_flows = 2;
     target.observation.snapshot.active_latency_sensitive_flows = 1;
 
-    assert!(
+    assert_eq!(
         select_response_data_path(
             &[target],
             TrafficClass::Throughput,
@@ -240,8 +263,12 @@ fn sole_tcp_path_bounds_bulk_when_its_writer_has_a_latency_flow() {
             &[],
             product_flight as usize,
         )
-        .is_none(),
-        "a sole ordered TCP writer cannot reprioritize latency data behind prior bulk"
+        .map(|selected| selected.observation.key),
+        Some(CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        }),
+        "sampled flow mix ranks completion but cannot replace the exact bounded writer reservation as native admission authority",
     );
 }
 
@@ -272,6 +299,158 @@ fn sole_quic_path_is_not_double_limited_by_product_flight() {
         .map(|selected| selected.observation.key),
         Some(target.observation.key),
         "one live carrier remains work-conserving under Quinn's native controller",
+    );
+}
+
+#[test]
+fn sole_tcp_path_does_not_treat_sampled_native_shape_as_enqueue_credit() {
+    let mux_limits = MuxLimits::default();
+    let native_cwnd = 112 * 1024_u64;
+    let product_flight = 10 * 1024 * 1024_u64;
+    let mut target = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        100.0,
+        native_cwnd,
+        native_cwnd,
+        true,
+    );
+    target.observation.snapshot.has_durable_product_progress = false;
+    target.observation.original_data_in_flight_bytes = product_flight;
+    target.observation.snapshot.data_level_bytes_in_flight = product_flight;
+    target.observation.snapshot.data_level_limit_bytes = product_flight + 64 * 1024;
+    target.observation.snapshot.queue_bytes = product_flight - native_cwnd;
+
+    assert_eq!(
+        select_response_data_path(
+            &[target.clone()],
+            TrafficClass::Throughput,
+            64 * 1024,
+            mux_limits,
+            &[],
+            product_flight as usize,
+        )
+        .map(|selected| selected.observation.key),
+        Some(target.observation.key),
+        "exact queue readiness and the bounded writer head, not periodic cwnd/queue samples, own feed",
+    );
+}
+
+#[test]
+fn sole_tcp_path_without_native_telemetry_still_uses_the_bounded_writer_head() {
+    let mux_limits = MuxLimits::default();
+    let product_flight = 32 * 1024 * 1024_u64;
+    let mut target = response_target(0, UnderlayProtocol::Tcp, 100.0, product_flight, 0, true);
+    target.observation.snapshot.data_level_limit_bytes = product_flight + 64 * 1024;
+
+    assert_eq!(
+        select_response_data_path(
+            &[target.clone()],
+            TrafficClass::Throughput,
+            64 * 1024,
+            mux_limits,
+            &[],
+            product_flight as usize,
+        )
+        .map(|selected| selected.observation.key),
+        Some(target.observation.key),
+        "optional TCP telemetry cannot turn unknown native state into a closed Product gate",
+    );
+}
+
+#[test]
+fn sole_quic_path_defers_native_enqueue_authority_to_exact_writer_reservation() {
+    let mux_limits = MuxLimits::default();
+    let native_cwnd = 112 * 1024_u64;
+    let product_flight = 10 * 1024 * 1024_u64;
+    let mut target = response_target(
+        0,
+        UnderlayProtocol::Udp,
+        100.0,
+        native_cwnd,
+        native_cwnd,
+        true,
+    );
+    target.observation.snapshot.has_durable_product_progress = false;
+    target.observation.original_data_in_flight_bytes = product_flight;
+    target.observation.snapshot.data_level_bytes_in_flight = product_flight;
+    target.observation.snapshot.queue_bytes = product_flight - native_cwnd;
+
+    assert_eq!(
+        select_response_data_path(
+            &[target.clone()],
+            TrafficClass::Throughput,
+            64 * 1024,
+            mux_limits,
+            &[],
+            product_flight as usize,
+        )
+        .map(|selected| selected.observation.key),
+        Some(target.observation.key),
+        "sampled native queue/cwnd are completion diagnostics; the exact bounded QUIC writer reservation owns native enqueue authority",
+    );
+}
+
+#[test]
+fn repair_debt_cannot_reopen_additional_path_original_credit() {
+    let mux_limits = MuxLimits::default();
+    let payload_bytes = 64 * 1024;
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        100.0,
+        payload_bytes as u64,
+        4 * 1024 * 1024,
+        true,
+    );
+    owner.observation.snapshot.data_level_limit_bytes = 4 * 1024 * 1024;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: payload_bytes as u64,
+    }];
+
+    let native_window = 1024 * 1024_u64;
+    let repair_flight = 64 * 1024_u64;
+    let forward_ceiling = native_window
+        + u64::try_from(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+            .expect("test feed quantum fits u64");
+    let mut alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, native_window, false);
+    alternate.observation.snapshot.data_level_limit_bytes = forward_ceiling;
+    alternate.observation.original_data_in_flight_bytes = 8 * 1024 * 1024;
+    alternate.observation.snapshot.data_level_bytes_in_flight =
+        alternate.observation.original_data_in_flight_bytes + repair_flight;
+
+    assert_eq!(
+        select_response_data_path(
+            &[owner.clone(), alternate.clone()],
+            TrafficClass::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower,
+            payload_bytes,
+        )
+        .map(|selected| selected.observation.key),
+        Some(owner.observation.key),
+        "retained OriginalData and repair debt cannot renew an additional path's forward credit",
+    );
+
+    alternate.observation.original_data_in_flight_bytes =
+        forward_ceiling.saturating_sub(payload_bytes as u64);
+    alternate.observation.snapshot.data_level_bytes_in_flight =
+        alternate.observation.original_data_in_flight_bytes + repair_flight;
+    assert_eq!(
+        select_response_data_path(
+            &[owner, alternate.clone()],
+            TrafficClass::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower,
+            payload_bytes,
+        )
+        .map(|selected| selected.observation.key),
+        Some(alternate.observation.key),
+        "Data ACK progress below the live forward ceiling reopens the faster additional path",
     );
 }
 
@@ -312,7 +491,7 @@ fn sole_survivor_cannot_extend_a_nonlive_cross_path_frontier_without_bound() {
 }
 
 #[test]
-fn clear_frontier_owner_remains_native_work_conserving_with_two_live_paths() {
+fn clear_frontier_owner_remains_work_conserving_below_product_window() {
     let mux_limits = MuxLimits::default();
     let product_flight = 2 * 1024 * 1024_u64;
     let mut owner = response_target(
@@ -323,7 +502,7 @@ fn clear_frontier_owner_remains_native_work_conserving_with_two_live_paths() {
         512 * 1024,
         true,
     );
-    owner.observation.snapshot.data_level_limit_bytes = 1024 * 1024;
+    owner.observation.snapshot.data_level_limit_bytes = product_flight + 64 * 1024;
     owner.observation.snapshot.bytes_in_flight = 0;
     let mut alternate = response_target(1, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, false);
     block_data_queue(&mut alternate);
@@ -344,12 +523,12 @@ fn clear_frontier_owner_remains_native_work_conserving_with_two_live_paths() {
         )
         .map(|selected| selected.observation.key),
         Some(owner.observation.key),
-        "the exact frontier owner is governed by shared credit and its native carrier",
+        "the exact frontier owner remains work-conserving while Product credit remains",
     );
 }
 
 #[test]
-fn authoritative_gap_frontier_revokes_only_the_owner_native_bypass() {
+fn live_response_frontier_cannot_bypass_an_exhausted_product_window() {
     let mux_limits = MuxLimits::default();
     let product_flight = 48 * 1024 * 1024_u64;
     let mut owner = response_target(
@@ -370,7 +549,7 @@ fn authoritative_gap_frontier_revokes_only_the_owner_native_bypass() {
         bytes: product_flight,
     }];
 
-    assert_eq!(
+    assert!(
         select_response_data_path(
             &[owner.clone(), alternate.clone()],
             TrafficClass::Throughput,
@@ -379,9 +558,8 @@ fn authoritative_gap_frontier_revokes_only_the_owner_native_bypass() {
             &lower,
             product_flight as usize,
         )
-        .map(|selected| selected.observation.key),
-        Some(owner.observation.key),
-        "without receiver proof of a gap, the same owner remains native-work-conserving",
+        .is_none(),
+        "a live contiguous owner cannot renew Product debt merely because TCP has native credit",
     );
     assert!(
         select_response_data_path_at_frontier(
@@ -394,7 +572,7 @@ fn authoritative_gap_frontier_revokes_only_the_owner_native_bypass() {
             ReliableDataAckFrontierState::AuthoritativeGap,
         )
         .is_none(),
-        "a receiver-proven gap must classify the overcommitted owner through ordinary Product admission",
+        "an authoritative gap remains blocked by the same exhausted Product authority",
     );
 }
 
@@ -487,6 +665,74 @@ fn additional_unproven_path_owns_at_most_one_startup_flight() {
     )
     .expect("durable Data ACK progress unlocks additional-path placement");
     assert_eq!(selected.observation.key, candidate.observation.key);
+}
+
+#[test]
+fn recovered_quic_native_opportunity_receives_unique_product_before_product_rate_refresh() {
+    let mux_limits = MuxLimits::default();
+    let payload_bytes = 64 * 1024;
+    let lead_flight = 8 * 1024 * 1024_u64;
+    let mut lead = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        100.0,
+        lead_flight,
+        2 * 1024 * 1024,
+        true,
+    );
+    lead.observation.snapshot.delivery_rate_bps = 16_000_000.0;
+    lead.observation.snapshot.pacing_rate_bps = 16_000_000.0;
+    lead.observation.snapshot.carrier_delivery_rate_bps = Some(16_000_000.0);
+    lead.observation.snapshot.product_progress_rate_bps = Some(16_000_000.0);
+
+    let mut recovered = response_target(1, UnderlayProtocol::Udp, 100.0, 0, 6_250_000, false);
+    // This is the reported recovery state: native QUIC has already exposed a
+    // high delivery/pacing opportunity, while the path-local Product rate has
+    // expired because no fresh unique range has yet completed on this output.
+    recovered.observation.snapshot.delivery_rate_bps = 392_000_000.0;
+    recovered.observation.snapshot.pacing_rate_bps = 471_000_000.0;
+    recovered.observation.snapshot.carrier_delivery_rate_bps = Some(392_000_000.0);
+    recovered.observation.snapshot.product_progress_rate_bps = None;
+    recovered.observation.snapshot.has_durable_product_progress = false;
+    recovered.observation.has_bulk_rate_evidence = true;
+
+    let lower = [CarrierPathFlightDebt {
+        key: lead.observation.key,
+        output_incarnation: lead.observation.incarnation,
+        bytes: lead_flight,
+    }];
+
+    assert_eq!(
+        select_response_data_path(
+            &[lead.clone(), recovered.clone()],
+            TrafficClass::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower,
+            lead_flight as usize,
+        )
+        .map(|selected| selected.observation.key),
+        Some(recovered.observation.key),
+        "fresh native completion evidence must admit real Product that refreshes the stale Product rate; stale Product evidence cannot create a circular no-work gate",
+    );
+
+    recovered.observation.snapshot.delivery_rate_bps = 351_000.0;
+    recovered.observation.snapshot.pacing_rate_bps = 351_000.0;
+    recovered.observation.snapshot.carrier_delivery_rate_bps = None;
+    recovered.observation.has_bulk_rate_evidence = false;
+    assert_eq!(
+        select_response_data_path(
+            &[lead, recovered.clone()],
+            TrafficClass::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower,
+            lead_flight as usize,
+        )
+        .map(|selected| selected.observation.key),
+        Some(recovered.observation.key),
+        "even after the native rate sample expires, one bounded Product quantum completes before the lead's lower backlog and refreshes the recovered path without forced exploration",
+    );
 }
 
 #[test]
@@ -726,7 +972,7 @@ fn unqualified_fallback_rate_remains_completion_ranked_against_live_frontier() {
         owner_flight,
         true,
     );
-    owner.observation.snapshot.data_level_limit_bytes = owner_flight;
+    owner.observation.snapshot.data_level_limit_bytes = owner_flight + 64 * 1024;
 
     let mut cold = response_target(1, UnderlayProtocol::Tcp, 333.0, 0, 16 * 1024 * 1024, false);
     cold.observation.snapshot.delivery_rate_bps = 351_000.0;
@@ -964,18 +1210,16 @@ fn ack_gap_reinjection_uses_distinct_repair_headroom_when_fresh_data_is_full() {
     );
 
     backup.observation.writer_pending_bytes = 1;
-    assert!(
-        select_response_frame_path(
-            &[available.clone(), backup.clone()],
-            TrafficClass::Throughput,
-            &frame,
-            CarrierEmitMode::StreamOrdered,
-            &[(available.observation.key, available.observation.incarnation)],
-            Some(RelaySendCause::AckGapReinjection),
-        )
-        .is_none(),
-        "ordinary speculative repair still waits for shared carrier drain",
-    );
+    let selected = select_response_frame_path(
+        &[available.clone(), backup.clone()],
+        TrafficClass::Throughput,
+        &frame,
+        CarrierEmitMode::StreamOrdered,
+        &[(available.observation.key, available.observation.incarnation)],
+        Some(RelaySendCause::AckGapReinjection),
+    )
+    .expect("sampled writer backlog does not revoke exact repair authority");
+    assert_eq!(selected.observation.key, backup.observation.key);
     let selected = select_response_frame_path(
         &[available.clone(), backup.clone()],
         TrafficClass::Throughput,
@@ -1105,7 +1349,7 @@ fn ack_gap_reinjection_can_use_a_replacement_of_the_original_path_key() {
 }
 
 #[test]
-fn ordinary_reinjection_uses_a_drained_alternate_carrier() {
+fn ordinary_reinjection_ranks_native_backlog_without_turning_it_into_authority() {
     let original = response_target(0, UnderlayProtocol::Udp, 20.0, 0, 16 * 1024 * 1024, true);
     let mut busy_tcp = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
     busy_tcp.observation.snapshot.queue_bytes = 8 * 1024 * 1024;
@@ -1130,11 +1374,13 @@ fn ordinary_reinjection_uses_a_drained_alternate_carrier() {
 
     assert_eq!(
         (selected.observation.key, selected.observation.incarnation),
-        (idle_tcp.observation.key, idle_tcp.observation.incarnation)
+        (idle_tcp.observation.key, idle_tcp.observation.incarnation),
+        "large native backlog remains completion-time evidence",
     );
 
     let mut fast_busy_tcp = busy_tcp.clone();
     fast_busy_tcp.observation.snapshot.queue_bytes = 64 * 1024;
+    fast_busy_tcp.observation.native_queue_bytes = 64 * 1024;
     let slow_idle_tcp =
         response_target(3, UnderlayProtocol::Tcp, 800.0, 0, 16 * 1024 * 1024, false);
     let selected = select_response_frame_path(
@@ -1147,22 +1393,20 @@ fn ordinary_reinjection_uses_a_drained_alternate_carrier() {
     )
     .expect("drained TCP repair carrier");
     assert_eq!(
-        selected.observation.key, slow_idle_tcp.observation.key,
-        "ordinary repair waits for a drained alternate even when a busy path has a lower ETA",
+        selected.observation.key, fast_busy_tcp.observation.key,
+        "the lower completion-time target wins without a sampled-idleness veto",
     );
 
-    assert!(
-        select_response_frame_path(
-            std::slice::from_ref(&fast_busy_tcp),
-            TrafficClass::Throughput,
-            &frame,
-            CarrierEmitMode::StreamOrdered,
-            &avoid_original,
-            Some(RelaySendCause::AckGapReinjection),
-        )
-        .is_none(),
-        "ordinary ACK-gap repair must not append duplicate work to a busy carrier",
-    );
+    let selected = select_response_frame_path(
+        std::slice::from_ref(&fast_busy_tcp),
+        TrafficClass::Throughput,
+        &frame,
+        CarrierEmitMode::StreamOrdered,
+        &avoid_original,
+        Some(RelaySendCause::AckGapReinjection),
+    )
+    .expect("native backlog alone cannot veto the sole exact repair target");
+    assert_eq!(selected.observation.key, fast_busy_tcp.observation.key);
 
     let selected = select_response_frame_path(
         std::slice::from_ref(&fast_busy_tcp),
@@ -1195,7 +1439,7 @@ fn ordinary_reinjection_uses_a_drained_alternate_carrier() {
 }
 
 #[test]
-fn ordinary_tcp_reinjection_waits_for_native_sender_drain() {
+fn ordinary_tcp_reinjection_does_not_require_sampled_native_sender_idleness() {
     let original = response_target(0, UnderlayProtocol::Udp, 20.0, 0, 16 * 1024 * 1024, true);
     let busy_tcp = response_target(
         1,
@@ -1211,20 +1455,11 @@ fn ordinary_tcp_reinjection_waits_for_native_sender_drain() {
     };
 
     let mut busy_tcp = busy_tcp;
+    busy_tcp.observation.original_data_in_flight_bytes = 0;
+    busy_tcp.observation.snapshot.data_level_bytes_in_flight = 0;
     busy_tcp.observation.native_drain_observed = true;
-    assert!(
-        select_response_frame_path(
-            std::slice::from_ref(&busy_tcp),
-            TrafficClass::Throughput,
-            &frame,
-            CarrierEmitMode::StreamOrdered,
-            &[(original.observation.key, original.observation.incarnation)],
-            Some(RelaySendCause::AckGapReinjection),
-        )
-        .is_none(),
-        "ordinary repair cannot get ahead while the alternate TCP sender still has flight",
-    );
-    busy_tcp.observation.snapshot.bytes_in_flight = 0;
+    busy_tcp.observation.native_queue_bytes = 1;
+    busy_tcp.observation.writer_pending_bytes = 1;
     assert!(
         select_response_frame_path(
             &[busy_tcp],
@@ -1235,6 +1470,7 @@ fn ordinary_tcp_reinjection_waits_for_native_sender_drain() {
             Some(RelaySendCause::AckGapReinjection),
         )
         .is_some(),
+        "sampled native flight, native queue, and writer backlog are ranking evidence, not repair authority",
     );
 }
 
@@ -1280,7 +1516,7 @@ fn portable_tcp_reinjection_waits_for_exact_product_flight() {
 }
 
 #[test]
-fn quic_reinjection_waits_for_same_stream_flight_and_writer_backlog() {
+fn quic_reinjection_retains_product_authority_without_sampled_native_idleness_gate() {
     let mut quic = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     quic.observation.original_data_in_flight_bytes = 64 * 1024;
     quic.observation.snapshot.data_level_bytes_in_flight = 64 * 1024;
@@ -1303,14 +1539,20 @@ fn quic_reinjection_waits_for_same_stream_flight_and_writer_backlog() {
     quic.observation.original_data_in_flight_bytes = 0;
     quic.observation.snapshot.data_level_bytes_in_flight = 0;
     quic.observation.native_queue_bytes = 1;
-    assert!(select(&quic).is_none());
+    assert!(
+        select(&quic).is_some(),
+        "sampled native queue occupancy cannot veto exact repair authority",
+    );
     quic.observation.native_queue_bytes = 0;
     quic.observation.writer_pending_bytes = 1;
-    assert!(select(&quic).is_none());
+    assert!(
+        select(&quic).is_some(),
+        "sampled writer backlog cannot veto exact repair authority",
+    );
     quic.observation.writer_pending_bytes = 0;
     assert!(
         select(&quic).is_some(),
-        "QUIC repair becomes useful after same-stream flight and private writer backlog drain",
+        "QUIC repair remains eligible after sampled writer backlog changes",
     );
 }
 
@@ -1423,6 +1665,143 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
         selected.observation.key, owner.observation.key,
         "the exact lower-flight owner must not flap on a sub-jitter completion difference",
     );
+}
+
+#[test]
+fn response_owner_hysteresis_does_not_activate_unused_quic_credit() {
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Tcp,
+        100.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    owner.observation.snapshot.jitter_ms = 3.0;
+    let mut underfed = response_target(1, UnderlayProtocol::Udp, 103.0, 0, 16 * 1024 * 1024, false);
+    underfed.observation.snapshot.jitter_ms = 3.0;
+    underfed.observation.snapshot.app_limited = true;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+
+    let owner_eta = scheduler::score_path(
+        owner.observation.snapshot,
+        TrafficClass::Throughput,
+        64 * 1024,
+    )
+    .expect("owner score")
+    .eta_ms;
+    let underfed_eta = scheduler::score_path(
+        underfed.observation.snapshot,
+        TrafficClass::Throughput,
+        64 * 1024,
+    )
+    .expect("underfed score")
+    .eta_ms;
+    assert!(
+        underfed_eta > owner_eta
+            && underfed_eta <= owner_eta + owner.observation.snapshot.jitter_ms,
+        "the fixture must keep acquisition inside measured completion uncertainty",
+    );
+    assert_eq!(
+        select(&[owner.clone(), underfed.clone()], &lower, 64 * 1024),
+        Some(owner.observation.key),
+        "response placement must not activate a path merely because its QUIC controller is app-limited",
+    );
+    assert_eq!(
+        select_response_data_path(
+            &[owner.clone(), underfed.clone()],
+            TrafficClass::Latency,
+            64 * 1024,
+            MuxLimits::default(),
+            &lower,
+            64 * 1024,
+        )
+        .map(|target| target.observation.key),
+        Some(owner.observation.key),
+        "QUIC-window acquisition must not change latency placement",
+    );
+}
+
+#[test]
+fn tcp_delivery_sample_app_limited_flag_does_not_preempt_response_owner() {
+    let mut owner = response_target(
+        0,
+        UnderlayProtocol::Udp,
+        100.0,
+        64 * 1024,
+        16 * 1024 * 1024,
+        true,
+    );
+    owner.observation.snapshot.jitter_ms = 3.0;
+    let mut sampled_tcp =
+        response_target(1, UnderlayProtocol::Tcp, 103.0, 0, 16 * 1024 * 1024, false);
+    sampled_tcp.observation.snapshot.jitter_ms = 3.0;
+    sampled_tcp.observation.snapshot.app_limited = true;
+    let lower = [CarrierPathFlightDebt {
+        key: owner.observation.key,
+        output_incarnation: owner.observation.incarnation,
+        bytes: 64 * 1024,
+    }];
+
+    assert_eq!(
+        select(&[owner.clone(), sampled_tcp], &lower, 64 * 1024),
+        Some(owner.observation.key),
+        "TCP_INFO delivery-sample classification cannot override lower-owner hysteresis",
+    );
+}
+
+#[test]
+fn materially_slower_underfed_native_credit_cannot_preempt_the_live_frontier() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let owner_underlay = match underlay {
+            UnderlayProtocol::Tcp => UnderlayProtocol::Udp,
+            UnderlayProtocol::Udp => UnderlayProtocol::Tcp,
+        };
+        let mut owner = response_target(0, owner_underlay, 80.0, 64 * 1024, 16 * 1024 * 1024, true);
+        owner.observation.snapshot.jitter_ms = 20.0;
+        owner.observation.snapshot.delivery_rate_bps = 555_000_000.0;
+        owner.observation.snapshot.pacing_rate_bps = 555_000_000.0;
+
+        let mut underfed = response_target(1, underlay, 100.0, 0, 16 * 1024 * 1024, false);
+        underfed.observation.snapshot.jitter_ms = 20.0;
+        underfed.observation.snapshot.delivery_rate_bps = 351_000.0;
+        underfed.observation.snapshot.pacing_rate_bps = 351_000.0;
+        underfed.observation.snapshot.app_limited = true;
+        underfed.observation.has_bulk_rate_evidence = false;
+        let lower = [CarrierPathFlightDebt {
+            key: owner.observation.key,
+            output_incarnation: owner.observation.incarnation,
+            bytes: 4 * 1024 * 1024,
+        }];
+
+        let owner_eta = scheduler::score_path(
+            owner.observation.snapshot,
+            TrafficClass::Throughput,
+            64 * 1024,
+        )
+        .expect("owner score")
+        .eta_ms;
+        let underfed_eta = scheduler::score_path(
+            underfed.observation.snapshot,
+            TrafficClass::Throughput,
+            64 * 1024,
+        )
+        .expect("underfed score")
+        .eta_ms;
+        assert!(
+            underfed_eta > owner_eta + owner.observation.snapshot.jitter_ms,
+            "the fixture must reproduce a materially later underfed carrier: owner={owner_eta:.3} ms underfed={underfed_eta:.3} ms",
+        );
+        assert_eq!(
+            select(&[owner.clone(), underfed], &lower, 4 * 1024 * 1024),
+            Some(owner.observation.key),
+            "current native starvation is acquisition evidence, not authority to put a materially later {underlay:?} range below the live frontier",
+        );
+    }
 }
 
 #[test]

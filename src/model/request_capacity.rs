@@ -8,7 +8,7 @@ use super::capacity::{
     product_delivery_samples_override_startup_prior,
     reliable_capacity_measurement_session_limit_bytes, reliable_path_startup_sample_limit_bytes,
 };
-use super::request_evidence::RequestPerFlowRateModel;
+use super::request_evidence::RequestProductRateEpoch;
 use super::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
@@ -43,7 +43,7 @@ pub(crate) fn request_capacity_stable_candidate_share_bytes(
 
 pub(crate) fn request_tcp_capacity_measurement_geometry(
     candidate: PathSnapshot,
-    reference_model: RequestPerFlowRateModel,
+    reference_model: RequestProductRateEpoch,
     mux_limits: MuxLimits,
     train_envelope_bytes: u64,
 ) -> Option<RequestTcpCapacityMeasurementGeometry> {

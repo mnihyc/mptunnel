@@ -207,6 +207,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
 ) -> Result<(), RuntimeError> {
     let groups = context.tcp_carrier_groups.clone();
     let mut changes = groups.subscribe();
+    let mut udp_changes = context.udp_carrier_reconciliation.subscribe();
     let now = tokio::time::Instant::now();
     let mut retry = vec![ClientTcpMemberRetry::new(now); context.tcp_sessions.len()];
     let mut measurements = tokio::task::JoinSet::new();
@@ -225,9 +226,16 @@ pub(in crate::runtime) async fn run_path_probe_service(
     ticker.tick().await;
 
     groups.reconcile(&context, interval, &mut retry).await;
+    reconcile_udp_carrier_owners(&context).await;
 
     loop {
-        let maintenance_at = groups.next_maintenance_at(&context, &retry);
+        let maintenance_at = match (
+            groups.next_maintenance_at(&context, &retry),
+            next_udp_carrier_reconciliation_at(&context),
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
         let maintenance_timer = async {
             match maintenance_at {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -242,10 +250,15 @@ pub(in crate::runtime) async fn run_path_probe_service(
                     .reconcile(&context, interval, &mut retry)
                     .await;
             }
+            changed = udp_changes.changed() => {
+                changed.expect("QUIC owner reconciliation sender lives with path context");
+                reconcile_udp_carrier_owners(&context).await;
+            }
             _ = &mut maintenance_timer => {
                 groups
                     .reconcile(&context, interval, &mut retry)
                     .await;
+                reconcile_udp_carrier_owners(&context).await;
             }
             _ = ticker.tick() => {
                 if measurements.is_empty() {
@@ -268,6 +281,44 @@ pub(in crate::runtime) async fn run_path_probe_service(
                     );
                 }
             }
+        }
+    }
+}
+
+fn next_udp_carrier_reconciliation_at(context: &ClientPathContext) -> Option<tokio::time::Instant> {
+    context
+        .udp_sessions
+        .iter()
+        .filter_map(|session| session.reconciliation_deadline())
+        .min()
+}
+
+/// Reconciles configured QUIC physical owners only. Optional measurement is
+/// intentionally absent: active Product flows, probe eligibility, and the
+/// periodic measurement ticker cannot suppress a missing owner.
+async fn reconcile_udp_carrier_owners(context: &ClientPathContext) {
+    if context.ensure_session_active().is_err() {
+        return;
+    }
+    let now = tokio::time::Instant::now();
+    let mut attempts = tokio::task::JoinSet::new();
+    for session in context.udp_sessions.iter() {
+        if session
+            .reconciliation_deadline()
+            .is_some_and(|not_before| not_before <= now)
+        {
+            let session = session.clone();
+            attempts.spawn(async move { session.reconcile_connection_owner().await });
+        }
+    }
+    while let Some(attempt) = attempts.join_next().await {
+        if let Err(error) = attempt {
+            crate::observability::process_event!(
+                Warn,
+                "quic",
+                "owner_reconciliation_task_failed",
+                "QUIC carrier-owner reconciliation task failed: {error}"
+            );
         }
     }
 }

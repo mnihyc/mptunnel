@@ -12,15 +12,15 @@ use crate::config::{
 };
 use crate::outbound::OutboundConfig;
 use crate::protocol::{
-    Frame, PathId, PathUsage, PeerPathState, ResetReason, SessionId, StreamDemandHint, StreamId,
-    TargetAddr, UnderlayProtocol,
+    CloseReason, Frame, PathId, PathUsage, PeerPathState, ResetReason, SessionId, StreamDemandHint,
+    StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     ClientTcpOpenAttemptId, ReliablePathCarrierTerminalCause, ReliablePathCommand,
     recv_reliable_path_command, reliable_path_command_channels,
-    reliable_path_command_pending_bytes,
+    reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, PathProofObservation, ServerDatagramOpenError,
@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 struct PolicyDenyDatagramBackend;
 
@@ -377,6 +377,7 @@ async fn server_tcp_test_session_with_mode(
             path_registration,
             writer: ServerTcpWriter::new(server_writer),
             path_frames,
+            native_terminal: None,
             commands_tx,
             commands_rx,
             evidence,
@@ -404,6 +405,7 @@ async fn server_tcp_l3_mode_rejects_l4_forwarding_opens() {
             stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
             demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
         })
         .await
         .expect("reject L4 stream open in L3 mode");
@@ -450,6 +452,7 @@ async fn server_tcp_route_denials_are_flow_local_and_drop_is_silent() {
             stream_id: sibling_stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
             demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
         })
         .await
         .expect("open allowed sibling stream");
@@ -483,6 +486,7 @@ async fn server_tcp_route_denials_are_flow_local_and_drop_is_silent() {
             stream_id: rejected_stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
             demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
         })
         .await
         .expect("reject one logical stream");
@@ -499,6 +503,7 @@ async fn server_tcp_route_denials_are_flow_local_and_drop_is_silent() {
             stream_id: dropped_stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
             demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
         })
         .await
         .expect("silently drop one logical stream");
@@ -887,6 +892,7 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
                     stream_id,
                     target.clone(),
                     StreamDemandHint::throughput(),
+                    Default::default(),
                 )
                 .await
                 .expect("open shared TCP response stream")
@@ -1088,6 +1094,89 @@ async fn server_tcp_deferred_probe_drain_releases_dequeued_command_accounting() 
 }
 
 #[tokio::test]
+async fn server_tcp_one_head_transaction_returns_to_priority_arbitration() {
+    let (mut session, mut client, commands, _path_frames, _relay) =
+        server_tcp_test_session(SessionId(306), PathId(0)).await;
+    let bulk = Frame::StreamData {
+        stream_id: StreamId(306),
+        offset: 0,
+        payload: Bytes::from_static(b"ordinary protected head"),
+    };
+    let control = Frame::Ping { nonce: 306 };
+    let later_bulk = Frame::StreamData {
+        stream_id: StreamId(307),
+        offset: 0,
+        payload: Bytes::from_static(b"later bulk frame"),
+    };
+    commands
+        .try_enqueue_admitted_frame(bulk.clone(), TrafficClass::Throughput)
+        .expect("queue bulk frame");
+    let bulk_command = recv_reliable_path_command(&mut session.commands_rx)
+        .await
+        .expect("dequeue bulk head");
+    commands
+        .try_enqueue_admitted_frame(control.clone(), TrafficClass::Control)
+        .expect("publish control after bulk dequeue");
+    commands
+        .try_enqueue_admitted_frame(later_bulk.clone(), TrafficClass::Throughput)
+        .expect("queue later bulk frame");
+
+    assert!(matches!(
+        session
+            .drain_commands(bulk_command)
+            .await
+            .expect("commit first writer transaction"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(client.read_frame().await.expect("read bulk head"), bulk);
+
+    let control_command = try_recv_reliable_path_command(&mut session.commands_rx)
+        .expect("control remains queued after the first transaction");
+    assert!(matches!(
+        &control_command,
+        ReliablePathCommand::SendFrame(frame) if frame == &control
+    ));
+    assert!(matches!(
+        session
+            .drain_commands(control_command)
+            .await
+            .expect("commit control transaction"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(
+        client.read_frame().await.expect("read control transaction"),
+        control
+    );
+
+    let later_bulk_command = try_recv_reliable_path_command(&mut session.commands_rx)
+        .expect("later bulk remains queued after the control transaction");
+    assert!(matches!(
+        &later_bulk_command,
+        ReliablePathCommand::SendFrame(frame) if frame == &later_bulk
+    ));
+    assert!(matches!(
+        session
+            .drain_commands(later_bulk_command)
+            .await
+            .expect("commit later bulk transaction"),
+        ServerTcpSessionDisposition::Continue
+    ));
+    assert_eq!(
+        client
+            .read_frame()
+            .await
+            .expect("read later bulk transaction"),
+        later_bulk
+    );
+    assert_eq!(commands.pending_bytes(), 0);
+    assert_eq!(commands.writer_pending_bytes(), 0);
+    assert!(
+        try_recv_reliable_path_command(&mut session.commands_rx).is_none(),
+        "each ordinary frame must require its own actor transaction"
+    );
+}
+
+#[tokio::test]
 async fn server_tcp_zero_debt_batch_wakes_retained_control_publication() {
     let stream_id = StreamId(305);
     let (mut session, mut client, _commands, _path_frames, _relay) =
@@ -1197,6 +1286,7 @@ async fn server_tcp_attachment_refusal_is_stream_local_during_ordered_detach() {
                 stream_id,
                 target.clone(),
                 StreamDemandHint::throughput(),
+                Default::default(),
             )
             .await
             .expect("open TCP response stream")
@@ -1218,6 +1308,7 @@ async fn server_tcp_attachment_refusal_is_stream_local_during_ordered_detach() {
                 stream_id,
                 target,
                 StreamDemandHint::throughput(),
+                Default::default(),
             )
             .await
             .expect("retry TCP attachment while detach is pending"),
@@ -1269,6 +1360,106 @@ async fn server_tcp_native_terminal_signal_cancels_and_retires_the_exact_registr
     drop(retained_registration);
 }
 
+#[tokio::test]
+async fn server_tcp_native_peer_close_keeps_clean_result_and_retires_exact_registry_instance() {
+    let session_id = SessionId(403);
+    let path_id = PathId(0);
+    let (mut session, _client_framed, commands, _path_frames, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    let context = session.context.clone();
+    let (native_terminal_tx, native_terminal_rx) = oneshot::channel();
+    session.native_terminal = Some(native_terminal_rx);
+
+    let actor = tokio::spawn(session.run());
+    commands.terminate_failed_path();
+    native_terminal_tx
+        .send(EncryptedFramedTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed",
+        )))
+        .expect("publish exact native close");
+
+    actor
+        .await
+        .expect("server TCP actor join")
+        .expect("ordinary authenticated peer close remains a clean handler result");
+    assert!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .is_empty(),
+        "native peer close must still retire the exact carrier row"
+    );
+}
+
+#[tokio::test]
+async fn server_tcp_native_protocol_error_keeps_exact_encrypted_result() {
+    let session_id = SessionId(404);
+    let path_id = PathId(0);
+    let (mut session, _client_framed, commands, _path_frames, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    let context = session.context.clone();
+    let (native_terminal_tx, native_terminal_rx) = oneshot::channel();
+    session.native_terminal = Some(native_terminal_rx);
+
+    let actor = tokio::spawn(session.run());
+    commands.terminate_failed_path();
+    native_terminal_tx
+        .send(EncryptedFramedTransportError::InvalidNoiseRecordLength(7))
+        .expect("publish exact native error");
+
+    assert!(matches!(
+        actor.await.expect("server TCP actor join"),
+        Err(RuntimeError::Encrypted(
+            EncryptedFramedTransportError::InvalidNoiseRecordLength(7)
+        ))
+    ));
+    assert!(
+        context
+            .reliable_streams
+            .management_snapshot()
+            .paths
+            .is_empty(),
+        "native protocol failure must retire the exact carrier row"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_session_close_precedes_following_native_eof() {
+    let session_id = SessionId(405);
+    let path_id = PathId(0);
+    let (mut session, _client_framed, commands, _path_frames, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    let context = session.context.clone();
+    let path_state = session.path_registration.state_handle();
+    let (native_terminal_tx, native_terminal_rx) = oneshot::channel();
+    session.native_terminal = Some(native_terminal_rx);
+
+    observe_authenticated_server_tcp_frame(
+        &Frame::SessionClose {
+            reason: CloseReason::Normal,
+        },
+        session_id,
+        path_id,
+        &commands,
+        &path_state,
+        &context,
+    );
+    commands.terminate_failed_path();
+    native_terminal_tx
+        .send(EncryptedFramedTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed after SESSION_CLOSE",
+        )))
+        .expect("publish following native close");
+
+    assert!(matches!(
+        session.run().await,
+        Err(RuntimeError::RemoteClosed(CloseReason::Normal))
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
     let session_id = SessionId(402);
@@ -1286,9 +1477,11 @@ async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
         &Frame::PathDrain {
             path_id: PathId(path_id.0 + 1),
         },
+        session_id,
         path_id,
         &commands,
         &path_state,
+        &context,
     );
     assert_eq!(drain.drain_started_at(), None);
     assert_eq!(
@@ -1300,9 +1493,11 @@ async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
     let requested_at = tokio::time::Instant::now();
     observe_authenticated_server_tcp_frame(
         &Frame::PathDrain { path_id },
+        session_id,
         path_id,
         &commands,
         &path_state,
+        &context,
     );
     assert_eq!(drain.drain_started_at(), Some(requested_at));
     assert_eq!(
@@ -1316,9 +1511,11 @@ async fn authenticated_path_drain_deadline_is_not_deferred_by_actor_delivery() {
     tokio::time::advance(Duration::from_secs(5)).await;
     observe_authenticated_server_tcp_frame(
         &Frame::PathDrain { path_id },
+        session_id,
         path_id,
         &commands,
         &path_state,
+        &context,
     );
     assert_eq!(
         drain.drain_started_at(),

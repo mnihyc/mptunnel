@@ -25,6 +25,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_pending_bytes,
 };
 use crate::runtime::path::proof::PathProofTracker;
+use crate::runtime::path::quic::client::ClientUdpCarrierReconciliation;
 use crate::runtime::path::quic::client::ClientUdpPathSessionRuntime;
 use crate::runtime::path::quic::client_stream::run_client_udp_stream;
 use crate::runtime::path::quic::io::{
@@ -261,6 +262,7 @@ impl ServerUdpTerminalWriterFixture {
                 stream_id,
                 target: target.clone(),
                 initial_demand: StreamDemandHint::Throughput,
+                return_plan: Default::default(),
                 attachment: ServerStreamPathAttachment {
                     path_registration: path_registration.clone(),
                     commands: commands_tx.clone(),
@@ -328,6 +330,7 @@ impl ServerUdpTerminalWriterFixture {
             peer_status_snapshot: PeerStatusSnapshotSource::new(|| Some(Vec::new())),
             authenticated_carriers: crate::runtime::path::AuthenticatedCarrierInventory::default(),
             ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub::default(),
+            reconciliation: ClientUdpCarrierReconciliation::new(),
         };
         let client_carrier = CarrierSocket::system(CarrierSocketRequest {
             path: &client_path,
@@ -568,7 +571,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             fixture._path_registration.path_instance_id()
         );
         assert!(!binding.output_is_stale(identity), "starts Qualified");
-        let connection_owner = fixture._server_connection.delivery_activity_notify();
+        let connection_owner = fixture._server_connection.write_activity_notify();
 
         let (alternate, alternate_rx) = reliable_path_command_channels(8);
         let _ = binding.attach(
@@ -582,7 +585,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
             .send_data(Bytes::from_static(b"qualified-before-stale"))
             .expect("prepare old original data");
         binding.record_original_flight(initial.key, &old);
-        assert!(binding.mark_output_stale(identity));
+        assert!(binding.mark_output_stale(identity, TrafficClass::Throughput));
         assert!(binding.output_is_stale(identity), "becomes Stale");
         drop(alternate_rx);
         assert_eq!(
@@ -592,7 +595,8 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
                     TrafficClass::Throughput,
                     64,
                 )
-                .expect("queue response probe"),
+                .expect("queue response probe")
+                .published_payload_bytes(),
             Some(22),
         );
         assert!(
@@ -718,7 +722,7 @@ async fn server_quic_live_attachment_requalifies_without_replacement() {
         assert_eq!(final_state.incarnation, initial.incarnation);
         assert!(Arc::ptr_eq(
             &connection_owner,
-            &fixture._server_connection.delivery_activity_notify()
+            &fixture._server_connection.write_activity_notify()
         ));
         assert!(!fixture._server_connection.is_closed());
         actor.abort();
@@ -750,6 +754,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
             stream_id,
             target,
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -1253,6 +1258,7 @@ async fn server_quic_duplicate_refusal_preserves_live_attachment() {
             stream_id,
             target: fixture.target.clone(),
             demand: crate::protocol::StreamDemandHint::throughput(),
+            return_plan: Default::default(),
         },
         fixture.context.codec_limits,
     )
@@ -1277,6 +1283,8 @@ async fn server_quic_duplicate_refusal_preserves_live_attachment() {
             stream_id,
             target: fixture.target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
+            native_rate_authority: None,
         },
     )
     .await
@@ -1322,6 +1330,7 @@ async fn server_quic_route_denials_are_stream_local_and_drop_has_no_response() {
             stream_id: rejected_stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
             demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
         },
         fixture.context.codec_limits,
     )
@@ -1365,6 +1374,7 @@ async fn server_quic_route_denials_are_stream_local_and_drop_has_no_response() {
             stream_id: dropped_stream_id,
             target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
             demand: StreamDemandHint::Latency,
+            return_plan: Default::default(),
         },
         fixture.context.codec_limits,
     )
@@ -2148,6 +2158,7 @@ async fn server_quic_attachment_refusal_is_stream_local_during_ordered_detach() 
             stream_id,
             target: fixture.target.clone(),
             demand: crate::protocol::StreamDemandHint::throughput(),
+            return_plan: Default::default(),
         },
         fixture.context.codec_limits,
     )
@@ -2172,6 +2183,8 @@ async fn server_quic_attachment_refusal_is_stream_local_during_ordered_detach() 
             stream_id,
             target: fixture.target.clone(),
             initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
+            native_rate_authority: None,
         },
     )
     .await

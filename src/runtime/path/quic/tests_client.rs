@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{
-    ClientSecurityConfig, MppPerformanceConfig, ResourceLimits, ServerSecurityConfig, SharedSecret,
+    ClientPathConfig, ClientSecurityConfig, MppPerformanceConfig, ResourceLimits,
+    ServerSecurityConfig, SharedSecret,
 };
 use crate::outbound::OutboundConfig;
 use crate::protocol::{CloseReason, Frame, StreamDemandHint, TargetAddr};
@@ -9,8 +10,74 @@ use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::health::{ClientPathHealth, ClientPathHealthRecord};
 use crate::runtime::path::quic::server::accept_server_udp_path_handshake_for_test;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
-use crate::transport::{CarrierEndpoint, PathBinding, PathMetadata};
+use crate::transport::{
+    CarrierEndpoint, CarrierNetworkProvider, CarrierResolutionFuture, CarrierResolutionRequest,
+    CarrierSocket, CarrierSocketRequest, PathBinding, PathMetadata, SystemCarrierNetworkProvider,
+};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+#[test]
+fn client_native_health_publication_rejects_stale_activation_before_mutation() {
+    let instance = next_carrier_path_instance_id();
+    let scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        instance,
+        PathMetricDirection::ClientToServer,
+    );
+    let authority = crate::runtime::path::authority::NativeCarrierRateAuthorityHandle::from_observation_for_test(
+        scope,
+        25_000_000,
+        1,
+        7,
+        None,
+    )
+    .expect("A1 central authority");
+    let stale_shape = authority
+        .refresh_scheduling_shape_for_test(
+            scope,
+            1,
+            7,
+            None,
+            Duration::from_millis(80),
+            Duration::from_millis(10),
+            128 * 1024,
+            32 * 1024,
+            1_400,
+            Some(30_000_000),
+            false,
+        )
+        .expect("A1 shape");
+    authority
+        .advance_transport_activation_for_test(2)
+        .expect("install same-lineage A2");
+
+    let mutations = AtomicUsize::new(0);
+    let error = commit_client_native_health_projection(authority.as_ref(), stale_shape, || {
+        mutations.fetch_add(1, AtomicOrdering::SeqCst)
+    })
+    .expect_err("A1 publication must not mutate health after A2 is live");
+    assert!(error.is_retryable_publication(), "{error:?}");
+    assert_eq!(mutations.load(AtomicOrdering::SeqCst), 0);
+}
+
+#[test]
+fn exhausted_identity_suppresses_quic_candidate_rearm_and_maintenance_deadline() {
+    let reconciliation = ClientUdpCarrierReconciliation::new();
+    let owner = ClientUdpPathOwner::new(reconciliation.clone(), Duration::from_secs(1));
+    let vacancy_before = owner.vacancy_not_before();
+    let generation_before = reconciliation.generation();
+    let mut claim = ClientUdpCandidateClaim::new(owner.clone());
+
+    claim.finish_uncommitted(false);
+
+    assert_eq!(owner.vacancy_not_before(), vacancy_before);
+    assert_eq!(reconciliation.generation(), generation_before);
+    assert!(
+        owner
+            .reconciliation_deadline_with_identity_availability(false)
+            .is_none()
+    );
+}
 
 #[test]
 fn session_close_is_terminal_for_quic_open() {
@@ -64,6 +131,10 @@ struct AcceptedTestCarrier {
 
 impl ClientOpenRaceFixture {
     async fn new() -> Self {
+        Self::new_with_provider(Arc::new(SystemCarrierNetworkProvider)).await
+    }
+
+    async fn new_with_provider(provider: Arc<dyn CarrierNetworkProvider>) -> Self {
         let shared_secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret");
         let security = ServerSecurityConfig::for_test(shared_secret.clone());
@@ -101,10 +172,17 @@ impl ClientOpenRaceFixture {
             binding: PathBinding::default(),
             metadata: PathMetadata::default(),
         };
-        let context = ClientPathContext::new(
-            vec![client_path],
-            client_security,
+        let context = ClientPathContext::new_with_carrier_network(
+            vec![ClientPathConfig {
+                name: "path-1".to_string(),
+                spec: client_path,
+                security: client_security,
+                tls: crate::transport::encrypted::test_client_tls_config(),
+            }],
             ResourceLimits::default(),
+            None,
+            0,
+            provider,
         )
         .expect("client QUIC context");
         let session = context.udp_sessions[0].clone();
@@ -154,6 +232,58 @@ impl ClientOpenRaceFixture {
     }
 }
 
+struct BlockingResolutionProvider {
+    block_call: usize,
+    calls: AtomicUsize,
+    started: mpsc::UnboundedSender<usize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl BlockingResolutionProvider {
+    fn new(
+        block_call: usize,
+    ) -> (
+        Arc<Self>,
+        mpsc::UnboundedReceiver<usize>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let (started, started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        (
+            Arc::new(Self {
+                block_call,
+                calls: AtomicUsize::new(0),
+                started,
+                release: release.clone(),
+            }),
+            started_rx,
+            release,
+        )
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(AtomicOrdering::Acquire)
+    }
+}
+
+impl CarrierNetworkProvider for BlockingResolutionProvider {
+    fn resolve<'a>(&'a self, request: CarrierResolutionRequest<'a>) -> CarrierResolutionFuture<'a> {
+        Box::pin(async move {
+            request.validate()?;
+            let call = self.calls.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+            if call == self.block_call {
+                let _ = self.started.send(call);
+                self.release.notified().await;
+            }
+            SystemCarrierNetworkProvider.resolve(request).await
+        })
+    }
+
+    fn create_socket(&self, request: CarrierSocketRequest<'_>) -> std::io::Result<CarrierSocket> {
+        CarrierSocket::system(request)
+    }
+}
+
 #[tokio::test]
 async fn server_quic_observed_ingress_captures_the_real_authenticated_carrier_peer() {
     let fixture = ClientOpenRaceFixture::new().await;
@@ -175,6 +305,7 @@ async fn server_quic_observed_ingress_captures_the_real_authenticated_carrier_pe
     );
     let client_bind = fixture
         .session
+        .owner
         .connection
         .lock()
         .await
@@ -213,11 +344,306 @@ async fn current_client_carrier(
     session: &ClientUdpPathSessionHandle,
 ) -> Option<ClientUdpCarrierInstance> {
     session
+        .owner
         .connection
         .lock()
         .await
         .as_ref()
         .map(|connection| connection.carrier.clone())
+}
+
+async fn wait_for_client_owner_absence(session: &ClientUdpPathSessionHandle) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if current_client_carrier(session).await.is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client QUIC owner retirement timeout");
+}
+
+#[tokio::test]
+async fn spontaneous_native_close_atomically_retires_exact_owner_and_wakes_once() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted = fixture.establish_current().await;
+    let current = current_client_carrier(&fixture.session)
+        .await
+        .expect("published client QUIC owner");
+    let reconciliation = fixture.session.runtime.reconciliation.clone();
+    let before_generation = reconciliation.generation();
+    let mut changes = reconciliation.subscribe();
+    assert_eq!(
+        fixture.context.authenticated_carriers.snapshot().live_count,
+        1
+    );
+    assert_eq!(
+        fixture
+            .context
+            .peer_status
+            .carrier_count(fixture.context.session_id),
+        1
+    );
+
+    current.connection.close();
+    tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("native close reconciliation wake timeout")
+        .expect("QUIC reconciliation source remains alive");
+    wait_for_client_owner_absence(&fixture.session).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.context.authenticated_carriers.snapshot().live_count == 0
+                && fixture
+                    .context
+                    .peer_status
+                    .carrier_count(fixture.context.session_id)
+                    == 0
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exact QUIC registrations were not released");
+
+    assert_eq!(
+        reconciliation.generation(),
+        before_generation.wrapping_add(1),
+        "one exact owner retirement emits one coalescing reconciliation wake",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), changes.changed())
+            .await
+            .is_err(),
+        "duplicate close observers emitted a second replacement wake",
+    );
+    let health = fixture.context.health().lock().expect("QUIC path health");
+    let record = &health.udp[0];
+    assert_eq!(record.path_instance_id(), Some(current.path_instance_id));
+    assert!(!record.accepts_product_commit(current.path_instance_id));
+    drop(health);
+    drop(accepted);
+}
+
+#[tokio::test]
+async fn active_product_flow_cannot_suppress_missing_quic_owner_reconciliation() {
+    let fixture = ClientOpenRaceFixture::new().await;
+    let accepted = fixture.establish_current().await;
+    let current = current_client_carrier(&fixture.session)
+        .await
+        .expect("published client QUIC owner");
+    fixture
+        .context
+        .health()
+        .lock()
+        .expect("QUIC path health")
+        .udp[0]
+        .active_flows = 1;
+    assert_eq!(
+        fixture.context.udp_path_probe_expected_instance(0),
+        None,
+        "active Product work suppresses optional measurement",
+    );
+
+    let service_context = fixture.context.clone();
+    let service = tokio::spawn(async move {
+        crate::runtime::node::run_path_probe_service(
+            service_context,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    let successor_accept = fixture.spawn_server_accept();
+    let mut changes = fixture.session.runtime.reconciliation.subscribe();
+    let closed_at = tokio::time::Instant::now();
+    current.connection.close();
+    drop(accepted);
+    tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("native-close reconciliation wake timeout")
+        .expect("QUIC reconciliation source remains alive");
+
+    let successor = tokio::time::timeout(Duration::from_secs(5), successor_accept)
+        .await
+        .expect("successor QUIC accept timeout")
+        .expect("successor QUIC accept join")
+        .expect("successor QUIC authentication");
+    assert!(
+        closed_at.elapsed() < Duration::from_secs(5),
+        "event-driven owner reconciliation must not wait for the 10 s measurement ticker",
+    );
+    let replacement = current_client_carrier(&fixture.session)
+        .await
+        .expect("replacement QUIC owner");
+    assert_ne!(replacement.path_instance_id, current.path_instance_id);
+    assert_eq!(
+        fixture.context.authenticated_carriers.snapshot().live_count,
+        1
+    );
+    drop(successor);
+    service.abort();
+    assert!(
+        service
+            .await
+            .expect_err("probe service cancellation")
+            .is_cancelled()
+    );
+}
+
+#[tokio::test]
+async fn cancelled_quic_candidate_leaves_a_bounded_reconcilable_vacancy() {
+    let (provider, mut started, _release) = BlockingResolutionProvider::new(2);
+    let fixture = ClientOpenRaceFixture::new_with_provider(provider.clone()).await;
+    let accepted = fixture.establish_current().await;
+    let predecessor = current_client_carrier(&fixture.session)
+        .await
+        .expect("predecessor QUIC owner");
+    {
+        let mut health = fixture.context.health().lock().expect("QUIC path health");
+        let record = &mut health.udp[0];
+        assert_eq!(
+            record.path_instance_id(),
+            Some(predecessor.path_instance_id)
+        );
+        record.carrier_srtt_ms = Some(20.0);
+        record.carrier_rttvar_ms = Some(10.0);
+    }
+    predecessor.connection.close();
+    drop(accepted);
+    wait_for_client_owner_absence(&fixture.session).await;
+    let retry_interval = fixture.session.owner.reconciliation_attempt_timeout();
+    assert_eq!(retry_interval, Duration::from_millis(765));
+    assert!(
+        retry_interval < Duration::from_secs(10),
+        "owner-derived retry must not inherit the optional measurement period",
+    );
+
+    let mut changes = fixture.session.runtime.reconciliation.subscribe();
+    let generation = fixture.session.runtime.reconciliation.generation();
+    let session = fixture.session.clone();
+    let candidate = tokio::spawn(async move { session.reconcile_connection_owner().await });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .expect("candidate resolution start timeout")
+            .expect("candidate resolution start channel"),
+        2,
+    );
+    let cancelled_after = tokio::time::Instant::now();
+    candidate.abort();
+    assert!(
+        candidate
+            .await
+            .expect_err("candidate cancellation")
+            .is_cancelled()
+    );
+    let cancellation_observed_at = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("cancelled candidate vacancy wake timeout")
+        .expect("QUIC reconciliation source remains alive");
+    assert_eq!(
+        fixture.session.runtime.reconciliation.generation(),
+        generation.wrapping_add(1),
+        "candidate cancellation leaves exactly one dirty-vacancy wake",
+    );
+    let retry_at = fixture
+        .session
+        .reconciliation_deadline()
+        .expect("cancelled candidate retains owner vacancy");
+    assert!(retry_at > tokio::time::Instant::now());
+    assert!(
+        retry_at >= cancelled_after + retry_interval
+            && retry_at <= cancellation_observed_at + retry_interval,
+        "candidate Drop derives its deadline from the exact 765 ms owner clock",
+    );
+
+    tokio::time::sleep_until(retry_at).await;
+    let successor_accept = fixture.spawn_server_accept();
+    fixture
+        .session
+        .reconcile_connection_owner()
+        .await
+        .expect("bounded retry publishes successor");
+    let successor = tokio::time::timeout(Duration::from_secs(5), successor_accept)
+        .await
+        .expect("successor QUIC accept timeout")
+        .expect("successor QUIC accept join")
+        .expect("successor QUIC authentication");
+    let replacement = current_client_carrier(&fixture.session)
+        .await
+        .expect("replacement QUIC owner");
+    assert_ne!(replacement.path_instance_id, predecessor.path_instance_id);
+    assert_eq!(provider.calls(), 3);
+    drop(successor);
+}
+
+#[tokio::test]
+async fn concurrent_quic_reconciliation_starts_one_candidate_and_publishes_fresh_owner() {
+    let (provider, mut started, release) = BlockingResolutionProvider::new(2);
+    let fixture = ClientOpenRaceFixture::new_with_provider(provider.clone()).await;
+    let accepted = fixture.establish_current().await;
+    let predecessor = current_client_carrier(&fixture.session)
+        .await
+        .expect("predecessor QUIC owner");
+    predecessor.connection.close();
+    drop(accepted);
+    wait_for_client_owner_absence(&fixture.session).await;
+
+    let successor_accept = fixture.spawn_server_accept();
+    let left_session = fixture.session.clone();
+    let left = tokio::spawn(async move { left_session.reconcile_connection_owner().await });
+    let right_session = fixture.session.clone();
+    let right = tokio::spawn(async move { right_session.reconcile_connection_owner().await });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .expect("replacement resolution start timeout")
+            .expect("replacement resolution start channel"),
+        2,
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        provider.calls(),
+        2,
+        "owner mutex admits only one candidate for the vacancy generation",
+    );
+    release.notify_one();
+    let successor = tokio::time::timeout(Duration::from_secs(5), successor_accept)
+        .await
+        .expect("successor QUIC accept timeout")
+        .expect("successor QUIC accept join")
+        .expect("successor QUIC authentication");
+    left.await
+        .expect("left reconciliation join")
+        .expect("left reconciliation result");
+    right
+        .await
+        .expect("right reconciliation join")
+        .expect("right reconciliation result");
+    assert_eq!(provider.calls(), 2);
+
+    let replacement = current_client_carrier(&fixture.session)
+        .await
+        .expect("replacement QUIC owner");
+    assert_ne!(replacement.path_instance_id, predecessor.path_instance_id);
+    let health = fixture.context.health().lock().expect("QUIC path health");
+    assert_eq!(
+        health.udp[0].path_instance_id(),
+        Some(replacement.path_instance_id)
+    );
+    assert!(health.udp[0].accepts_product_commit(replacement.path_instance_id));
+    assert_eq!(
+        fixture.context.authenticated_carriers.snapshot().live_count,
+        1
+    );
+    drop(health);
+    drop(successor);
 }
 
 async fn read_test_stream_open(
@@ -320,6 +746,7 @@ fn spawn_test_open(
                 TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
                 TrafficClass::Latency,
                 StreamDemandHint::Latency,
+                Default::default(),
                 tokio::time::Instant::now() + Duration::from_secs(10),
                 65_536,
             )
@@ -518,6 +945,19 @@ async fn stale_carrier_lifetime_open_failure_keeps_the_replacement_connection() 
         fixture.server_context.codec_limits,
     ));
     let replacement_lifetime = replacement_carrier.connection.clone();
+    let replacement_generation = fixture.session.runtime.reconciliation.generation();
+    assert!(
+        !fixture
+            .session
+            .retire_failed_connection_instance(first_carrier.path_instance_id)
+            .await,
+        "stale N cleanup must not match owner N+1",
+    );
+    assert_eq!(
+        fixture.session.runtime.reconciliation.generation(),
+        replacement_generation,
+        "stale N cleanup must not emit a replacement wake for N+1",
+    );
 
     resume_failure.notify_one();
     tokio::select! {
@@ -1084,6 +1524,7 @@ async fn relay_request_stream_abandonment_preserves_live_quic_owner_and_health()
             code: h3::error::Code::from(0_u64),
         },
     ));
+    let reconciliation_generation = fixture.session.runtime.reconciliation.generation();
 
     let suppressed = crate::runtime::relay::control::resolve_client_relay_path_error_for_test(
         &mut sender,
@@ -1108,5 +1549,10 @@ async fn relay_request_stream_abandonment_preserves_live_quic_owner_and_health()
     assert_eq!(record.path_instance_id(), Some(attachment.path_instance_id));
     assert!(record.accepts_product_commit(attachment.path_instance_id));
     assert_eq!(record.consecutive_failures, 0);
+    assert_eq!(
+        fixture.session.runtime.reconciliation.generation(),
+        reconciliation_generation,
+        "operation-local H3 reset/cancel must not wake physical replacement",
+    );
     drop(accepted_carrier);
 }

@@ -53,6 +53,23 @@ fn sender_queue_read_budget_respects_stream_flow_control_credit() {
 }
 
 #[test]
+fn sender_queue_preserves_multipath_product_window_above_one_path_cap() {
+    let limits = MuxLimits {
+        max_stream_window_bytes: 8 * 1024 * 1024,
+        max_repair_bytes: 8 * 1024 * 1024,
+        max_reorder_bytes: 8 * 1024 * 1024,
+        max_path_flight_bytes: 2 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let summed_product_window = 4 * 1024 * 1024;
+    assert_eq!(
+        reliable_relay_sender_queue_limit(limits, summed_product_window),
+        summed_product_window,
+        "a per-path cap cannot collapse an exact two-output source window",
+    );
+}
+
+#[test]
 fn sender_queue_dispatches_original_data_before_ordinary_reinjection() {
     let stream_id = StreamId(77);
     let mut queue = ReliableRelaySenderQueue::default();
@@ -99,6 +116,181 @@ fn sender_queue_dispatches_critical_reinjection_before_original_data() {
         "critical ReinjectedData closes an active product hole and must preempt later OriginalData"
     );
     assert_eq!(work.payload_bytes, b"reinjection".len());
+}
+
+#[test]
+fn request_target_queue_view_keeps_bound_and_unbound_repair_authority_separate() {
+    let instance = |index, id| RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(id),
+        attachment_id: id,
+    };
+    let first = instance(1, 11);
+    let second = instance(2, 12);
+    let third = instance(3, 13);
+    let owner = instance(0, 10);
+    let identity = |instance| ClientReinjectionOutputIdentity { instance };
+    let stream_id = StreamId(79);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from(vec![0x60; 100]));
+
+    let repairs = [
+        (10, RelaySendCause::AckGapReinjection),
+        (
+            20,
+            RelaySendCause::ClientPathFailureReinjection(identity(first)),
+        ),
+        (
+            30,
+            RelaySendCause::PersistentClientAckGapReinjection(PersistentClientAckGapBatch {
+                target: identity(second),
+                expires_at: Instant::now() + Duration::from_secs(1),
+            }),
+        ),
+        (
+            40,
+            RelaySendCause::CompletionTailReinjection(identity(first)),
+        ),
+        (
+            50,
+            RelaySendCause::ClientStalePathReinjection {
+                owner,
+                target: identity(second),
+            },
+        ),
+    ];
+    let mut offset = 100u64;
+    for (payload_bytes, cause) in repairs {
+        queue.push_critical_reinjection_with_cause(
+            Frame::StreamData {
+                stream_id,
+                offset,
+                payload: Bytes::from(vec![0x61; payload_bytes]),
+            },
+            cause,
+        );
+        offset += payload_bytes as u64;
+    }
+
+    assert_eq!(queue.bytes(), 250);
+    assert_eq!(queue.reinjection_bytes(), 150);
+    assert_eq!(
+        queue.request_target_queued_reinjection_bytes(first, false),
+        70,
+        "unbound repair and first-bound repair consume the first target only",
+    );
+    assert_eq!(
+        queue.request_target_queued_reinjection_bytes(second, false),
+        90,
+        "unbound repair and second-bound repair consume the second target only",
+    );
+    assert_eq!(
+        queue.request_target_queued_reinjection_bytes(third, false),
+        10,
+        "repair without a selected target remains conservatively charged to every candidate",
+    );
+    assert_eq!(
+        queue.request_target_queued_reinjection_bytes(first, true),
+        60,
+        "apply-time revalidation excludes only its own front unbound intent",
+    );
+    assert_eq!(
+        queue.request_target_queued_reinjection_bytes(second, true),
+        80,
+    );
+    assert_eq!(
+        queue.request_target_queued_reinjection_bytes(third, true),
+        0,
+    );
+}
+
+#[test]
+fn response_target_queue_view_keeps_bound_and_unbound_repair_authority_separate() {
+    let identity = |path_id, incarnation| ServerReinjectionOutputIdentity {
+        key: CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(path_id),
+        },
+        incarnation,
+    };
+    let first = identity(1, 11);
+    let second = identity(2, 12);
+    let third = identity(3, 13);
+    let stale_owner = identity(0, 10);
+    let stream_id = StreamId(80);
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from(vec![0x60; 100]));
+    queue.push_final_control(Frame::StreamFin {
+        stream_id,
+        final_offset: 100,
+    });
+
+    let repairs = [
+        (10, RelaySendCause::AckGapReinjection),
+        (
+            20,
+            RelaySendCause::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
+                target: first,
+                expires_at: Instant::now() + Duration::from_secs(1),
+            }),
+        ),
+        (
+            30,
+            RelaySendCause::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
+                target: second,
+                expires_at: Instant::now() + Duration::from_secs(1),
+            }),
+        ),
+        (
+            40,
+            RelaySendCause::StaleResponsePathReinjection(stale_owner),
+        ),
+    ];
+    let mut offset = 100u64;
+    for (payload_bytes, cause) in repairs {
+        queue.push_critical_reinjection_with_cause(
+            Frame::StreamData {
+                stream_id,
+                offset,
+                payload: Bytes::from(vec![0x61; payload_bytes]),
+            },
+            cause,
+        );
+        offset += payload_bytes as u64;
+    }
+
+    assert_eq!(queue.reinjection_bytes(), 100);
+    assert_eq!(
+        queue.response_target_queued_reinjection_bytes(first, false),
+        70,
+        "unbound repair and first-bound repair consume only the first target",
+    );
+    assert_eq!(
+        queue.response_target_queued_reinjection_bytes(second, false),
+        80,
+        "unbound repair and second-bound repair consume only the second target",
+    );
+    assert_eq!(
+        queue.response_target_queued_reinjection_bytes(third, false),
+        50,
+        "Data/control and repair bound elsewhere cannot consume a third target",
+    );
+    assert_eq!(
+        queue.response_target_queued_reinjection_bytes(first, true),
+        60,
+        "apply-time revalidation excludes only its own front unbound repair",
+    );
+    assert_eq!(
+        queue.response_target_queued_reinjection_bytes(second, true),
+        70,
+    );
+    assert_eq!(
+        queue.response_target_queued_reinjection_bytes(third, true),
+        40,
+    );
 }
 
 #[test]

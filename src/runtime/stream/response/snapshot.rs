@@ -6,31 +6,64 @@
 
 use super::ResponseStreamBinding;
 use super::attachment::{
-    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
+    ResponseAcquisitionOutputId, ResponseDispatchTarget, ResponseSenderPathTarget,
+    ResponseStreamOutputEntry, ResponseStreamOutputs,
 };
+use super::delivery::response_latest_original_hole;
 use super::evidence::{
-    server_output_has_bulk_rate_evidence_at, server_output_has_durable_product_ack_progress,
+    ServerPathMetricsEntry, server_output_has_bulk_rate_evidence_at,
     server_output_local_path_metrics, server_output_peer_path_metrics,
+    server_output_product_assignment_qualified,
     server_output_product_rate_epoch_has_bulk_evidence_at, server_path_metrics_estimate_rate_bps,
     server_path_metrics_has_bulk_rate_evidence_at,
-    server_path_metrics_has_qualified_delivery_history,
+    server_path_metrics_has_qualified_delivery_history, server_path_metrics_native_window_sample,
     server_path_metrics_rate_evidence_is_fresh_at, server_path_metrics_snapshot_is_fresh_at,
+};
+use crate::model::acquisition_cursor::{
+    AcquisitionCandidate, AcquisitionQualificationIdentity, AcquisitionSnapshot, AcquisitionTier,
+};
+use crate::model::admission::{
+    BulkCandidatePosition, ReliableDataAckFrontierState, bulk_original_data_assignment_authority,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, ReliableOriginalDataOutput,
-    ReliableStreamSourceAdmission, adaptive_reliable_relay_inflight_bytes,
+    ReliableStreamSourceAdmission, reliable_bulk_product_windows,
+    reliable_product_feedback_window_bytes, reliable_relay_buffer_len,
     reliable_stream_source_admission, reliable_stream_source_path,
 };
+use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
+use crate::model::response::{CarrierPathFlightDebt, response_oldest_lower_flight_owner};
+use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
-use crate::protocol::{SessionId, UnderlayProtocol};
+use crate::protocol::{OffsetRange, SessionId};
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+/// One coherent response acquisition observation and its exact apply targets.
+pub(in crate::runtime) struct ResponseAcquisitionObservation {
+    pub(in crate::runtime) snapshot: AcquisitionSnapshot<ResponseAcquisitionOutputId>,
+    pub(in crate::runtime) expected_model_generation: u64,
+    targets: Vec<(ResponseAcquisitionOutputId, ResponseDispatchTarget)>,
+}
+
+impl ResponseAcquisitionObservation {
+    pub(in crate::runtime) fn target(
+        &self,
+        id: ResponseAcquisitionOutputId,
+    ) -> Option<ResponseDispatchTarget> {
+        self.targets
+            .iter()
+            .find_map(|(candidate, target)| (*candidate == id).then_some(*target))
+    }
+}
 use tokio::sync::Notify;
 
 impl ResponseStreamBinding {
@@ -115,50 +148,214 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream request feedback ingress lock");
 
-        let targets = outputs
-            .entries
-            .iter()
-            .filter(|entry| !entry.commands.is_closed())
-            .map(|entry| {
-                let now = Instant::now();
-                let snapshot = server_bulk_output_snapshot_at(
-                    entry,
-                    outputs.data_level_queue_bytes,
-                    lane,
-                    self.mux_limits,
-                    now,
-                );
-                ResponseSenderPathTarget {
-                    observation: ResponsePathObservation {
-                        key: entry.key,
-                        path_instance_id: entry.path_instance_id,
-                        incarnation: entry.incarnation,
-                        snapshot,
-                        native_queue_bytes: server_output_native_queue_bytes(entry),
-                        native_drain_observed: server_output_local_path_metrics(entry)
-                            .is_some_and(|metrics| metrics.native_drain_observed),
-                        writer_pending_bytes: entry.commands.writer_pending_bytes(),
-                        original_data_in_flight_bytes: entry.original_data_in_flight_bytes,
-                        is_request_feedback: request_feedback_ingress.is_some_and(|ingress| {
-                            ingress.key == entry.key
-                                && ingress.path_instance_id == entry.path_instance_id
-                        }),
-                        stale_for_original_data: entry.qualification.stale_for_original_data(),
-                        #[cfg(test)]
-                        has_path_proof_evidence: entry.path_proof.is_some(),
-                        has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(
-                            entry,
-                            self.mux_limits,
-                            now,
-                        ),
-                    },
-                    product_admission_active: entry.commands.product_admission_active(),
-                    command_queue: entry.commands.queue_snapshot(),
-                }
-            })
-            .collect();
+        let targets =
+            outputs
+                .entries
+                .iter()
+                .filter(|entry| !entry.commands.is_closed())
+                .map(|entry| {
+                    let now = Instant::now();
+                    let snapshot = server_bulk_output_snapshot_at(
+                        entry,
+                        outputs.data_level_queue_bytes,
+                        lane,
+                        self.mux_limits,
+                        now,
+                    );
+                    ResponseSenderPathTarget {
+                        native_authority_stamp: entry
+                            .native_scheduling_shape
+                            .map(|shape| shape.stamp()),
+                        observation: ResponsePathObservation {
+                            key: entry.key,
+                            path_instance_id: entry.path_instance_id,
+                            incarnation: entry.incarnation,
+                            snapshot,
+                            native_queue_bytes: server_output_native_queue_bytes(entry),
+                            native_drain_observed: server_output_local_path_metrics(entry)
+                                .is_some_and(|metrics| metrics.native_drain_observed),
+                            writer_pending_bytes: entry.commands.writer_pending_bytes(),
+                            original_data_in_flight_bytes: entry.original_data_in_flight_bytes,
+                            is_request_feedback: request_feedback_ingress.is_some_and(|ingress| {
+                                ingress.key == entry.key
+                                    && ingress.path_instance_id == entry.path_instance_id
+                            }),
+                            stale_for_original_data: entry.qualification.stale_for_original_data(),
+                            #[cfg(test)]
+                            has_path_proof_evidence: entry.path_proof.is_some(),
+                            product_assignment_qualified:
+                                server_output_product_assignment_qualified(entry, self.mux_limits),
+                            has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(
+                                entry,
+                                self.mux_limits,
+                                now,
+                            ),
+                        },
+                        product_admission_active: entry.commands.product_admission_active(),
+                        command_queue: entry.commands.queue_snapshot(),
+                    }
+                })
+                .collect();
         drop(outputs);
         targets
+    }
+
+    /// Captures one complete response-direction acquisition quantum while the
+    /// output membership and exact flight ledger are observed in their global
+    /// `outputs -> flights` order.
+    pub(in crate::runtime) fn response_acquisition_observation(
+        &self,
+        lane: TrafficClass,
+        pending_range: OffsetRange,
+        data_ack_outstanding_bytes: usize,
+        frontier_state: ReliableDataAckFrontierState,
+    ) -> Option<ResponseAcquisitionObservation> {
+        let quantum_bytes = pending_range.len();
+        let payload_bytes = usize::try_from(quantum_bytes).ok()?;
+        if quantum_bytes == 0 {
+            return None;
+        }
+
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        let now = Instant::now();
+        let mut lower_flights = BTreeMap::<u64, CarrierPathFlightDebt>::new();
+        for (flight_offset, path_flights) in flights.range(..pending_range.start) {
+            if let Some(original) = path_flights
+                .iter()
+                .rev()
+                .find(|flight| flight.kind == CarrierWorkKind::OriginalData)
+            {
+                lower_flights.insert(
+                    *flight_offset,
+                    CarrierPathFlightDebt {
+                        key: original.key,
+                        output_incarnation: original.output_incarnation,
+                        bytes: original.bytes as u64,
+                    },
+                );
+            }
+        }
+        drop(flights);
+        let ack_ordering = self
+            .ack_ordering
+            .lock()
+            .expect("server response ACK ordering lock");
+        for (hole_offset, holes) in ack_ordering.acked_holes.range(..pending_range.start) {
+            if let Some(latest) = response_latest_original_hole(holes) {
+                lower_flights.insert(
+                    *hole_offset,
+                    CarrierPathFlightDebt {
+                        key: latest.key,
+                        output_incarnation: latest.output_incarnation,
+                        bytes: latest.bytes,
+                    },
+                );
+            }
+        }
+        drop(ack_ordering);
+        let lower_flights = lower_flights.into_values().collect::<Vec<_>>();
+        let lower_owner = response_oldest_lower_flight_owner(&lower_flights);
+        let ordinary_owner_established =
+            outputs.original_data_in_flight_bytes > 0 && lower_owner.is_some();
+
+        let product_windows = reliable_bulk_product_windows(self.mux_limits);
+        let connection_limit = u64::try_from(self.mux_limits.max_reorder_bytes)
+            .unwrap_or(u64::MAX)
+            .min(self.mux_limits.max_stream_window_bytes);
+        let shared_quantum_legal = quantum_bytes
+            <= u64::try_from(reliable_relay_buffer_len(self.mux_limits)).unwrap_or(u64::MAX)
+            && outputs
+                .original_data_in_flight_bytes
+                .checked_add(quantum_bytes)
+                .is_some_and(|next| next <= product_windows.stream_resource_limit_bytes)
+            && u64::try_from(data_ack_outstanding_bytes)
+                .ok()
+                .and_then(|outstanding| outstanding.checked_add(quantum_bytes))
+                .is_some_and(|next| next <= connection_limit);
+
+        let mut candidates = Vec::with_capacity(outputs.entries.len());
+        let mut targets = Vec::with_capacity(outputs.entries.len());
+        for entry in &outputs.entries {
+            let id = ResponseAcquisitionOutputId::from(entry);
+            let path = server_bulk_output_snapshot_at(
+                entry,
+                outputs.data_level_queue_bytes,
+                lane,
+                self.mux_limits,
+                now,
+            );
+            let locally_eligible = entry.commands.product_admission_active()
+                && crate::scheduler::path_is_schedulable(path, lane);
+            let stale = entry.qualification.stale_for_original_data();
+            let qualified = entry.product_qualification.qualified();
+            let authority = bulk_original_data_assignment_authority(
+                path,
+                payload_bytes,
+                self.mux_limits,
+                BulkCandidatePosition::AdditionalPath,
+                qualified,
+            );
+            let legal_whole_quantum = shared_quantum_legal
+                && locally_eligible
+                && !stale
+                && entry.commands.can_enqueue_lane_now(lane)
+                && authority.has_headroom(entry.original_data_in_flight_bytes);
+            let owns_live_contiguous_frontier = lower_owner == Some((entry.key, entry.incarnation))
+                && frontier_state.owner_has_live_contiguous_frontier();
+            let additional = !owns_live_contiguous_frontier;
+            candidates.push(AcquisitionCandidate {
+                exact_id: id,
+                qualification_identity: AcquisitionQualificationIdentity::capture(
+                    &entry.product_qualification,
+                ),
+                tier: if crate::scheduler::path_is_backup(path) {
+                    AcquisitionTier::Backup
+                } else {
+                    AcquisitionTier::Regular
+                },
+                locally_eligible,
+                stale,
+                additional,
+                qualified,
+                generation_deficit_bytes: entry.product_qualification.deficit_bytes(),
+                legal_whole_quantum,
+            });
+            targets.push((
+                id,
+                ResponseDispatchTarget {
+                    key: entry.key,
+                    path_instance_id: entry.path_instance_id,
+                    incarnation: entry.incarnation,
+                    has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(
+                        entry,
+                        self.mux_limits,
+                        now,
+                    ),
+                    native_authority_stamp: entry
+                        .native_scheduling_shape
+                        .map(|shape| shape.stamp()),
+                },
+            ));
+        }
+        let expected_model_generation = self.response_model_generation.load(Ordering::Acquire);
+        drop(outputs);
+        Some(ResponseAcquisitionObservation {
+            snapshot: AcquisitionSnapshot {
+                pending_range,
+                quantum_bytes,
+                ordinary_owner_established,
+                candidates,
+            },
+            expected_model_generation,
+            targets,
+        })
     }
 
     pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {
@@ -171,9 +368,18 @@ impl ResponseStreamBinding {
 }
 
 fn server_output_native_queue_bytes(entry: &ResponseStreamOutputEntry) -> u64 {
+    if entry.key.underlay == crate::protocol::UnderlayProtocol::Udp
+        && entry.commands.native_rate_authority().is_some()
+    {
+        return 0;
+    }
     server_output_local_path_metrics(entry)
         .filter(|metrics| metrics.metrics.queue_observed)
         .map_or(0, |metrics| metrics.metrics.queue_bytes)
+}
+
+fn server_native_shape_is_fresh_at(metrics: ServerPathMetricsEntry, now: Instant) -> bool {
+    server_path_metrics_native_window_sample(metrics).is_some_and(|sample| sample.fresh_at(now))
 }
 
 impl ResponseStreamOutputs {
@@ -279,13 +485,48 @@ pub(super) fn server_bulk_output_snapshot(
     )
 }
 
-fn server_bulk_output_snapshot_at(
+/// Structural Product eligibility shared by response placement, stale-owner
+/// withdrawal, and recovery. Queue fullness is deliberately excluded: it is a
+/// transient capacity condition, whereas drain, health, and lane policy decide
+/// whether an output can be the surviving payload owner at all.
+pub(super) fn server_output_payload_schedulable(
+    entry: &ResponseStreamOutputEntry,
+    data_level_queue_bytes: u64,
+    lane: TrafficClass,
+    mux_limits: MuxLimits,
+) -> bool {
+    entry.commands.product_admission_active()
+        && crate::scheduler::path_is_schedulable(
+            server_bulk_output_snapshot_at(
+                entry,
+                data_level_queue_bytes,
+                lane,
+                mux_limits,
+                Instant::now(),
+            ),
+            lane,
+        )
+}
+
+pub(super) fn server_bulk_output_snapshot_at(
     entry: &ResponseStreamOutputEntry,
     data_level_queue_bytes: u64,
     lane: TrafficClass,
     mux_limits: MuxLimits,
     now: Instant,
 ) -> PathSnapshot {
+    if entry.key.underlay == crate::protocol::UnderlayProtocol::Udp
+        && entry.commands.native_rate_authority().is_some()
+    {
+        return server_native_bulk_output_snapshot_at(
+            entry,
+            data_level_queue_bytes,
+            lane,
+            mux_limits,
+            entry.native_scheduling_shape,
+        );
+    }
+
     let local_metrics = server_output_local_path_metrics(entry);
     let peer_hint = (entry.delivery_samples == 0)
         .then(|| server_output_peer_path_metrics(entry))
@@ -323,15 +564,26 @@ fn server_bulk_output_snapshot_at(
         })
         .clamp(0.0, 1.0);
 
-    let product_rate = entry
+    // The ACK-clock epoch retains its raw point estimate for diagnostics and
+    // subsequent batch smoothing. Completion ranking requires both the
+    // current epoch's byte floor and the output's lifetime Product-ACK floor;
+    // freshness alone cannot turn a partial point into ECF authority.
+    let raw_product_point_rate = entry
         .product_rate_epoch
         .and_then(|epoch| epoch.fresh_rate_at(now));
+    let qualified_product_completion_rate =
+        server_output_product_rate_epoch_has_bulk_evidence_at(entry, mux_limits, now)
+            .then_some(raw_product_point_rate)
+            .flatten();
     // Startup configuration is a prior, not measured carrier capacity. Only
     // ACK-derived evidence may turn local metrics into a scheduling rate.
     let native_rate = local_metrics
         .filter(|metrics| server_path_metrics_has_bulk_rate_evidence_at(*metrics, now))
         .map(server_path_metrics_estimate_rate_bps);
-    let native_startup_rate = local_metrics
+    // A partial native ACK epoch may expose current send intent before it has
+    // covered the frozen delivery window. Preserve that value as pacing shape,
+    // but never project it into achieved completion service below.
+    let native_startup_pacing_rate = local_metrics
         .filter(|metrics| !server_path_metrics_has_bulk_rate_evidence_at(*metrics, now))
         .filter(|metrics| {
             !server_path_metrics_has_qualified_delivery_history(*metrics)
@@ -375,46 +627,22 @@ fn server_bulk_output_snapshot_at(
             })
         })
         .map(|rate| rate.max(1) as f64)
-        .or(native_startup_rate);
+        .or(native_startup_pacing_rate);
     let peer_rate = peer_hint
         .filter(|metrics| server_path_metrics_snapshot_is_fresh_at(*metrics, now))
         .filter(|metrics| !metrics.metrics.app_limited)
         .map(server_path_metrics_estimate_rate_bps);
-    let fresh_tcp_product_rate = (entry.key.underlay == UnderlayProtocol::Tcp
-        && server_output_product_rate_epoch_has_bulk_evidence_at(entry, mux_limits, now))
-    .then_some(product_rate)
-    .flatten();
-    let (rate_bps, rate_scope) = match entry.key.underlay {
-        UnderlayProtocol::Tcp if native_rate.is_some() => (
-            native_rate
-                .expect("guarded native rate")
-                .max(fresh_tcp_product_rate.unwrap_or(0.0)),
-            PathRateScope::PathCapacity,
-        ),
-        _ if native_rate.is_some() => (
-            native_rate.expect("guarded native rate"),
-            PathRateScope::PathCapacity,
-        ),
-        UnderlayProtocol::Tcp if product_rate.is_some() => (
-            product_rate.expect("guarded product rate"),
-            PathRateScope::PerFlowGoodput,
-        ),
-        // During transport Startup, pacing ranks paths with available native
-        // congestion credit but never grants completion-time authority. A
-        // window-covering ACK sample replaces it with delivery rate above.
-        _ if native_startup_rate.is_some() => (
-            native_startup_rate.expect("guarded native startup rate"),
-            PathRateScope::PathCapacity,
-        ),
-        _ if peer_rate.is_some() => (
-            peer_rate.expect("guarded peer rate"),
-            PathRateScope::PathCapacity,
-        ),
-        _ if product_rate.is_some() => (
-            product_rate.expect("guarded product rate"),
-            PathRateScope::PerFlowGoodput,
-        ),
-        _ => (default_path_rate_bps(), PathRateScope::PathCapacity),
+    // Product completion is a historical lower bound. It may raise the
+    // compatible configured/native projection, but a low Product point cannot
+    // prove that baseline slower.
+    let baseline_rate = native_rate
+        .or(peer_rate)
+        .unwrap_or_else(default_path_rate_bps);
+    let (rate_bps, rate_scope) = match qualified_product_completion_rate
+        .filter(|product_rate| *product_rate > baseline_rate)
+    {
+        Some(product_rate) => (product_rate, PathRateScope::PerFlowGoodput),
+        None => (baseline_rate, PathRateScope::PathCapacity),
     };
 
     let mut snapshot = PathSnapshot::new(
@@ -427,23 +655,34 @@ fn server_bulk_output_snapshot_at(
     snapshot.carrier_delivery_rate_bps = native_rate;
     snapshot.policy = entry.local_policy;
     snapshot.peer_usage = entry.peer_usage;
-    let (active_flows, active_latency_sensitive_flows) = entry.commands.active_flow_counts();
+    let (mut active_flows, mut active_latency_sensitive_flows) =
+        entry.commands.active_flow_counts();
+    // Queue counters describe existing backlogged owners. Ranking this output
+    // is a prospective service request, so include this flow exactly once even
+    // before its first OriginalData flight is committed.
+    if entry.original_data_in_flight_bytes == 0 {
+        active_flows = active_flows.saturating_add(1);
+        active_latency_sensitive_flows =
+            active_latency_sensitive_flows.saturating_add(u32::from(lane.is_latency_sensitive()));
+    }
     snapshot.active_flows = active_flows;
     snapshot.active_latency_sensitive_flows = active_latency_sensitive_flows;
-    snapshot.product_progress_rate_bps = product_rate;
-    snapshot.has_durable_product_progress =
-        server_output_has_durable_product_ack_progress(entry, mux_limits);
+    // `product_progress_rate_bps` is consumed by completion and reorder math,
+    // so it carries qualified completion service only, never the raw point.
+    snapshot.product_progress_rate_bps = qualified_product_completion_rate;
+    // Tagged Product qualification is an incarnation-local historical fact.
+    // Numeric completion service may expire independently without returning
+    // this output to the unproven startup-flight tier.
+    snapshot.has_durable_product_progress = entry.product_qualification.qualified();
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
     if let Some(metrics) = local_metrics {
         if let Some(pacing_rate_bps) = native_pacing_rate {
             snapshot.pacing_rate_bps = pacing_rate_bps.max(1.0).max(snapshot.delivery_rate_bps);
         }
-        if native_rate.is_some() || native_startup_rate.is_some() {
-            snapshot.app_limited = metrics
-                .carrier_delivery_rate_sample
-                .map_or(metrics.metrics.app_limited, |_| false);
-        }
+        // Current carrier state and retained delivery provenance are separate:
+        // keeping a qualified rate epoch must not relabel an idle sender busy.
+        snapshot.app_limited = metrics.metrics.app_limited;
         if metrics.metrics.queue_observed {
             snapshot.queue_bytes = metrics.metrics.queue_bytes;
         }
@@ -455,7 +694,8 @@ fn server_bulk_output_snapshot_at(
         // The carrier window is an independent TCP capability: a platform can
         // expose cwnd/send credit even when it cannot report exact current
         // flight. Do not erase that useful bound with the flight presence bit.
-        if metrics.metrics.inflight_limit_bytes > 0 {
+        if metrics.metrics.inflight_limit_bytes > 0 && server_native_shape_is_fresh_at(metrics, now)
+        {
             snapshot.carrier_inflight_limit_bytes = metrics.metrics.inflight_limit_bytes;
         }
     }
@@ -463,9 +703,88 @@ fn server_bulk_output_snapshot_at(
         .queue_bytes
         .saturating_add(entry.commands.pending_bytes());
     snapshot.data_level_queue_bytes = data_level_queue_bytes;
-    snapshot.data_level_bytes_in_flight = entry.bytes_in_flight;
+    snapshot.data_level_bytes_in_flight = entry.original_data_in_flight_bytes;
     snapshot.confidence = server_output_confidence_at(entry, now);
-    snapshot.data_level_limit_bytes = u64::try_from(adaptive_reliable_relay_inflight_bytes(
+    // This scalar is `P`: total unique Product exposure released only by MPP
+    // DataACK. Native TCP/QUIC admission remains writer/backpressure-owned.
+    snapshot.data_level_limit_bytes = u64::try_from(reliable_product_feedback_window_bytes(
+        Some(snapshot),
+        lane,
+        mux_limits,
+    ))
+    .unwrap_or(u64::MAX);
+    snapshot
+}
+
+/// Exclusive server NativeMode projection.
+///
+/// The central C0/Bop value and activation-local Quinn shape are one stamped
+/// bundle. Peer hints, lineage ACK/loss, and Product rates are deliberately
+/// absent. A missing or structurally mismatched bundle is unschedulable for
+/// this observation; the final commit independently revalidates the stamp.
+pub(super) fn server_native_bulk_output_snapshot_at(
+    entry: &ResponseStreamOutputEntry,
+    data_level_queue_bytes: u64,
+    lane: TrafficClass,
+    mux_limits: MuxLimits,
+    shape: Option<NativeCarrierSchedulingShapeSnapshot>,
+) -> PathSnapshot {
+    let shape = shape.filter(|shape| {
+        let scope = shape.stamp().scope();
+        scope.carrier_instance_id() == entry.path_instance_id
+            && scope.direction() == crate::protocol::PathMetricDirection::ServerToClient
+            && shape.rate_bps() > 0
+    });
+    let srtt_ms = shape
+        .filter(|shape| !shape.srtt().is_zero())
+        .map_or_else(default_path_srtt_ms, |shape| {
+            shape.srtt().as_secs_f64() * 1_000.0
+        });
+    let rate_bps = shape.map_or_else(default_path_rate_bps, |shape| shape.rate_bps() as f64);
+    let mut snapshot = PathSnapshot::new(
+        entry.key.path_id,
+        entry.key.underlay,
+        srtt_ms,
+        rate_bps.max(1.0),
+    );
+    snapshot.policy = entry.local_policy;
+    snapshot.peer_usage = entry.peer_usage;
+    if shape.is_none() {
+        snapshot.state = crate::scheduler::PathState::Failed;
+    }
+    let (mut active_flows, mut active_latency_sensitive_flows) =
+        entry.commands.active_flow_counts();
+    if entry.original_data_in_flight_bytes == 0 {
+        active_flows = active_flows.saturating_add(1);
+        active_latency_sensitive_flows =
+            active_latency_sensitive_flows.saturating_add(u32::from(lane.is_latency_sensitive()));
+    }
+    snapshot.active_flows = active_flows;
+    snapshot.active_latency_sensitive_flows = active_latency_sensitive_flows;
+    snapshot.queue_bytes = entry.commands.pending_bytes();
+    snapshot.data_level_queue_bytes = data_level_queue_bytes;
+    snapshot.data_level_bytes_in_flight = entry.original_data_in_flight_bytes;
+    if let Some(shape) = shape {
+        snapshot.carrier_delivery_rate_bps = Some(shape.rate_bps() as f64);
+        snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
+        snapshot.pacing_rate_bps = shape
+            .pacing_rate_bps()
+            .map_or(shape.rate_bps() as f64, |rate| rate as f64)
+            .max(1.0);
+        snapshot.bytes_in_flight = shape.bytes_in_flight();
+        snapshot.carrier_inflight_limit_bytes = shape
+            .congestion_window()
+            .max(u64::from(shape.current_mtu()));
+        snapshot.app_limited = shape.app_limited();
+        snapshot.confidence = if shape.basis() == CarrierRateAuthorityBasis::NativeOperational {
+            1.0
+        } else {
+            1.0 / confidence_sample_denominator()
+        };
+    } else {
+        snapshot.confidence = 0.0;
+    }
+    snapshot.data_level_limit_bytes = u64::try_from(reliable_product_feedback_window_bytes(
         Some(snapshot),
         lane,
         mux_limits,

@@ -885,12 +885,14 @@ const KEY_PHASE_BIT: u8 = 0x04;
 pub enum SpaceId {
     /// Unprotected packets, used to bootstrap the handshake
     Initial = 0,
+    /// Protected packets used while completing the handshake.
     Handshake = 1,
     /// Application data space, used for 0-RTT and post-handshake/1-RTT packets
     Data = 2,
 }
 
 impl SpaceId {
+    /// Iterates over packet number spaces in wire progression order.
     pub fn iter() -> impl Iterator<Item = Self> {
         [Self::Initial, Self::Handshake, Self::Data].iter().cloned()
     }

@@ -11,9 +11,12 @@ use super::quic::metrics::UdpPathMetrics;
 use super::tcp::capacity::RequestTcpCapacityRecord;
 use super::tcp::metrics::TcpNativeObservation;
 use crate::model::capacity::{PathRateSample, RELIABLE_INITIAL_RTT, TcpCapacityProofCandidate};
+use crate::model::carrier_rate_authority::{CarrierRateAuthorityBasis, CarrierRateAuthorityStamp};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::timing::transport_rate_sample_freshness_horizon;
-use crate::protocol::{PathId, PathUsage, UnderlayProtocol};
+use crate::protocol::{PathId, PathMetricDirection, PathUsage, UnderlayProtocol};
+use crate::runtime::path::CarrierNativeWindowSample;
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::scheduler::{PathState as SchedulerPathState, TrafficClass};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -25,6 +28,17 @@ pub(in crate::runtime) struct ClientPathHealth {
     pub(in crate::runtime) udp: Vec<ClientPathHealthRecord>,
 }
 
+/// Physical ownership of one scheduler-load reservation.
+///
+/// A cold open has no carrier incarnation yet, so its anti-stampede claim stays
+/// prospective until that open either rolls back or binds to its authenticated
+/// carrier. All other load belongs to one exact physical incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelayPathLoadOwner {
+    ProspectiveOpen,
+    ExactInstance(CarrierPathInstanceId),
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) state: SchedulerPathState,
@@ -34,21 +48,46 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) peer_usage: Option<PathUsage>,
     path_instance_id: Option<CarrierPathInstanceId>,
     peer_usage_sequence: Option<u64>,
+    /// Native controller lifetime within `path_instance_id`. QUIC publishes
+    /// Quinn's exact controller path epoch; TCP keeps zero for the complete
+    /// physical-socket lifetime. Ordinary metric refreshes never alter it.
+    native_capacity_epoch: u64,
+    /// Exact central Native authority stamp of the current QUIC shape.
+    native_authority_stamp: Option<CarrierRateAuthorityStamp>,
+    /// Typed provenance of the central Native value. This is scheduling
+    /// authority in its own right and must never be relabeled as ACK proof.
+    native_authority_basis: Option<CarrierRateAuthorityBasis>,
+    /// Non-expiring central C0/Bop projection for the live QUIC activation.
+    native_authority_rate_bps: Option<f64>,
+    /// Pacing belongs to the matching activation-local shape, not rate
+    /// authority. It is retained only while `native_authority_stamp` is live.
+    native_authority_pacing_rate_bps: Option<f64>,
+    native_authority_inflight_limit_bytes: Option<u64>,
+    /// Exact structural-eligibility lifetime over
+    /// `ClientPathEligibilityFingerprint`.
+    eligibility_epoch: Option<u64>,
     pub(in crate::runtime) consecutive_failures: u32,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
     pub(in crate::runtime) measured_loss_rate: Option<f64>,
+    /// Generic path-delivery evidence (for example UDP datagram feedback).
     pub(in crate::runtime) delivery_samples: u32,
-    // Reliable product rate is separate from generic/datagram path goodput.
+    pub(in crate::runtime) delivery_sample_bytes: u64,
+    // Reliable Product delivery owns an independent evidence epoch.
     pub(in crate::runtime) product_delivery_rate_bps: Option<f64>,
+    pub(in crate::runtime) product_delivery_samples: u32,
     pub(in crate::runtime) product_delivery_sample_bytes: u64,
     pub(in crate::runtime) datagram_feedback_samples: u32,
     pub(in crate::runtime) last_delivery_at: Option<Instant>,
     pub(in crate::runtime) delivery_rate_expires_at: Option<Instant>,
+    pub(in crate::runtime) product_last_delivery_at: Option<Instant>,
+    pub(in crate::runtime) product_delivery_rate_expires_at: Option<Instant>,
     pub(in crate::runtime) failed_until: Option<Instant>,
     pub(in crate::runtime) active_flows: u32,
     pub(in crate::runtime) active_latency_sensitive_flows: u32,
+    prospective_active_flows: u32,
+    prospective_active_latency_sensitive_flows: u32,
     pub(in crate::runtime) relay_bytes_in_flight: u64,
     pub(in crate::runtime) relay_queue_bytes: u64,
     pub(in crate::runtime) carrier_srtt_ms: Option<f64>,
@@ -62,13 +101,21 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) carrier_queue_bytes: u64,
     pub(in crate::runtime) carrier_queue_bytes_observed: bool,
     pub(in crate::runtime) carrier_inflight_limit_bytes: u64,
+    /// Placement authority for the retained diagnostic native window.
+    /// Its deadline is frozen with the observation that supplied `C`.
+    pub(in crate::runtime) carrier_native_window_sample: Option<CarrierNativeWindowSample>,
     pub(in crate::runtime) native_drain_observed: bool,
     pub(in crate::runtime) carrier_delivery_samples: u32,
     pub(in crate::runtime) carrier_delivery_sample_bytes: u64,
     pub(in crate::runtime) carrier_delivery_window_covered: bool,
     pub(in crate::runtime) carrier_last_delivery_at: Option<Instant>,
     pub(in crate::runtime) carrier_bulk_proof_expires_at: Option<Instant>,
+    /// Application-limited provenance of the retained delivery-rate epoch.
+    /// This is immutable with that epoch and is not live controller state.
     pub(in crate::runtime) carrier_app_limited: bool,
+    /// Current exact local native-controller state. `None` means the carrier
+    /// has not exposed this capability in its current physical lifetime.
+    pub(in crate::runtime) carrier_current_app_limited: Option<bool>,
     pub(in crate::runtime) carrier_ack_derived_data_seen: bool,
     pub(in crate::runtime::path) tcp_capacity: RequestTcpCapacityRecord,
     pub(in crate::runtime) path_proof_success: bool,
@@ -87,10 +134,14 @@ pub(in crate::runtime) struct ClientPathRateDiagnostics {
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
     pub(in crate::runtime) product_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) delivery_samples: u32,
+    pub(in crate::runtime) delivery_sample_bytes: u64,
+    pub(in crate::runtime) product_delivery_samples: u32,
     pub(in crate::runtime) product_delivery_sample_bytes: u64,
     pub(in crate::runtime) datagram_feedback_samples: u32,
     pub(in crate::runtime) last_delivery_at: Option<Instant>,
     pub(in crate::runtime) delivery_rate_expires_at: Option<Instant>,
+    pub(in crate::runtime) product_last_delivery_at: Option<Instant>,
+    pub(in crate::runtime) product_delivery_rate_expires_at: Option<Instant>,
     pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_pacing_rate_bps: Option<f64>,
     pub(in crate::runtime) carrier_delivery_samples: u32,
@@ -106,7 +157,6 @@ pub(in crate::runtime) struct ClientPathRateDiagnostics {
 /// ordinary Product service. Rate, RTT, loss, proof, load, queue, and flight
 /// evidence are intentionally excluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
 pub(in crate::runtime) struct ClientPathEligibilityFingerprint {
     state: SchedulerPathState,
     manual_disabled: bool,
@@ -152,20 +202,33 @@ impl Default for ClientPathHealthRecord {
             peer_usage: None,
             path_instance_id: None,
             peer_usage_sequence: None,
+            native_capacity_epoch: 0,
+            native_authority_stamp: None,
+            native_authority_basis: None,
+            native_authority_rate_bps: None,
+            native_authority_pacing_rate_bps: None,
+            native_authority_inflight_limit_bytes: None,
+            eligibility_epoch: Some(0),
             consecutive_failures: 0,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
             measured_rate_bps: None,
             measured_loss_rate: None,
             delivery_samples: 0,
+            delivery_sample_bytes: 0,
             product_delivery_rate_bps: None,
+            product_delivery_samples: 0,
             product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
             delivery_rate_expires_at: None,
+            product_last_delivery_at: None,
+            product_delivery_rate_expires_at: None,
             failed_until: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
+            prospective_active_flows: 0,
+            prospective_active_latency_sensitive_flows: 0,
             relay_bytes_in_flight: 0,
             relay_queue_bytes: 0,
             carrier_srtt_ms: None,
@@ -179,6 +242,7 @@ impl Default for ClientPathHealthRecord {
             carrier_queue_bytes: 0,
             carrier_queue_bytes_observed: false,
             carrier_inflight_limit_bytes: 0,
+            carrier_native_window_sample: None,
             native_drain_observed: false,
             carrier_delivery_samples: 0,
             carrier_delivery_sample_bytes: 0,
@@ -186,6 +250,7 @@ impl Default for ClientPathHealthRecord {
             carrier_last_delivery_at: None,
             carrier_bulk_proof_expires_at: None,
             carrier_app_limited: true,
+            carrier_current_app_limited: None,
             carrier_ack_derived_data_seen: false,
             tcp_capacity: RequestTcpCapacityRecord::default(),
             path_proof_success: false,
@@ -280,12 +345,20 @@ impl ClientPathHealthRecord {
             measured_rate_bps: self.measured_rate_bps,
             product_delivery_rate_bps: self.product_delivery_rate_bps,
             delivery_samples: self.delivery_samples,
+            delivery_sample_bytes: self.delivery_sample_bytes,
+            product_delivery_samples: self.product_delivery_samples,
             product_delivery_sample_bytes: self.product_delivery_sample_bytes,
             datagram_feedback_samples: self.datagram_feedback_samples,
             last_delivery_at: self.last_delivery_at,
             delivery_rate_expires_at: self.delivery_rate_expires_at,
-            carrier_delivery_rate_bps: self.carrier_delivery_rate_bps,
-            carrier_pacing_rate_bps: self.carrier_pacing_rate_bps,
+            product_last_delivery_at: self.product_last_delivery_at,
+            product_delivery_rate_expires_at: self.product_delivery_rate_expires_at,
+            carrier_delivery_rate_bps: self
+                .native_authority_rate_bps
+                .or(self.carrier_delivery_rate_bps),
+            carrier_pacing_rate_bps: self
+                .native_authority_pacing_rate_bps
+                .or(self.carrier_pacing_rate_bps),
             carrier_delivery_samples: self.carrier_delivery_samples,
             carrier_delivery_sample_bytes: self.carrier_delivery_sample_bytes,
             carrier_delivery_window_covered: self.carrier_delivery_window_covered,
@@ -305,7 +378,16 @@ impl ClientPathHealthRecord {
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn eligibility_fingerprint(&self) -> ClientPathEligibilityFingerprint {
+    pub(in crate::runtime) fn native_capacity_epoch(&self) -> u64 {
+        self.native_capacity_epoch
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn eligibility_epoch(&self) -> Option<u64> {
+        self.eligibility_epoch
+    }
+
+    fn current_eligibility_fingerprint(&self) -> ClientPathEligibilityFingerprint {
         ClientPathEligibilityFingerprint {
             state: self.state,
             manual_disabled: self.manual_disabled,
@@ -313,6 +395,32 @@ impl ClientPathHealthRecord {
             data_plane_failure_instance_id: self.data_plane_failure_instance_id,
             peer_usage: self.peer_usage,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn eligibility_fingerprint(&self) -> ClientPathEligibilityFingerprint {
+        self.current_eligibility_fingerprint()
+    }
+
+    /// Applies one lock-owned eligibility transaction. The epoch advances
+    /// exactly once if and only if the complete structural fingerprint differs
+    /// at commit. Metric, proof, and transient-load mutations are therefore
+    /// invisible to structural owners by construction.
+    pub(in crate::runtime) fn mutate_eligibility<R>(
+        &mut self,
+        mutation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let before = self.current_eligibility_fingerprint();
+        let result = mutation(self);
+        if self.current_eligibility_fingerprint() != before {
+            // Exhaustion is permanent and non-fatal. `None` makes the path
+            // ineligible for learned marginal authority because later
+            // structural transitions can no longer be named exactly.
+            self.eligibility_epoch = self
+                .eligibility_epoch
+                .and_then(|epoch| epoch.checked_add(1));
+        }
+        result
     }
 
     pub(in crate::runtime) fn install_peer_usage(
@@ -328,6 +436,17 @@ impl ClientPathHealthRecord {
         self.peer_usage_sequence = Some(sequence);
         self.peer_usage = Some(usage);
         self.mark_liveness_success();
+    }
+
+    pub(in crate::runtime) fn install_udp_peer_usage(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        native_capacity_epoch: u64,
+        sequence: u64,
+        usage: PathUsage,
+    ) {
+        self.install_peer_usage(path_instance_id, sequence, usage);
+        self.native_capacity_epoch = native_capacity_epoch;
     }
 
     pub(in crate::runtime) fn install_tcp_peer_usage(
@@ -500,6 +619,12 @@ impl ClientPathHealthRecord {
             .is_some_and(|(sample_at, expires_at)| sample_at <= now && now < expires_at)
     }
 
+    fn product_delivery_rate_evidence_is_fresh_at(&self, now: Instant) -> bool {
+        self.product_last_delivery_at
+            .zip(self.product_delivery_rate_expires_at)
+            .is_some_and(|(sample_at, expires_at)| sample_at <= now && now < expires_at)
+    }
+
     fn carrier_rate_evidence_is_fresh_at(&self, now: Instant) -> bool {
         self.carrier_bulk_proof_expires_at
             .zip(self.carrier_last_delivery_at)
@@ -509,11 +634,18 @@ impl ClientPathHealthRecord {
     fn clear_delivery_rate_evidence(&mut self) {
         self.measured_rate_bps = None;
         self.delivery_samples = 0;
-        self.product_delivery_rate_bps = None;
-        self.product_delivery_sample_bytes = 0;
+        self.delivery_sample_bytes = 0;
         self.datagram_feedback_samples = 0;
         self.last_delivery_at = None;
         self.delivery_rate_expires_at = None;
+    }
+
+    fn clear_product_delivery_rate_evidence(&mut self) {
+        self.product_delivery_rate_bps = None;
+        self.product_delivery_samples = 0;
+        self.product_delivery_sample_bytes = 0;
+        self.product_last_delivery_at = None;
+        self.product_delivery_rate_expires_at = None;
     }
 
     fn clear_native_delivery_rate_evidence(&mut self) {
@@ -562,6 +694,11 @@ impl ClientPathHealthRecord {
         }
         if let Some(inflight_limit_bytes) = observation.inflight_limit_bytes() {
             self.carrier_inflight_limit_bytes = inflight_limit_bytes;
+            self.carrier_native_window_sample = CarrierNativeWindowSample::new(
+                inflight_limit_bytes,
+                now,
+                self.rate_sample_freshness_horizon(),
+            );
         }
         if let Some(queue_bytes) = observation.queue_bytes() {
             self.carrier_queue_bytes = queue_bytes;
@@ -569,6 +706,9 @@ impl ClientPathHealthRecord {
         self.carrier_loss_rate = observation
             .loss_ppm()
             .map(|loss_ppm| f64::from(loss_ppm) / 1_000_000.0);
+        if let Some(app_limited) = observation.app_limited() {
+            self.carrier_current_app_limited = Some(app_limited);
+        }
         if observation.app_limited() == Some(false)
             && let Some(newly_acked_bytes) =
                 observation.newly_acked_bytes().filter(|bytes| *bytes > 0)
@@ -632,9 +772,16 @@ impl ClientPathHealthRecord {
         let proof_sample_bytes = tcp_proof.map(|proof| proof.rate_sample_bytes);
         let proof_accepted_at = tcp_proof.map(|proof| proof.accepted_at);
         let proof_expires_at = tcp_proof.map(|proof| proof.expires_at);
+        // This legacy proof bit is ACK/receipt-backed TCP authority. Native
+        // QUIC C0/Bop has its own typed provenance below and must not fabricate
+        // ACK samples, ACK freshness, or delivery-window qualification.
         let explicit_carrier_capacity_proof = proof_rate_bps.is_some();
         let delivery_rate_fresh = self.delivery_rate_evidence_is_fresh_at(now);
+        let product_delivery_rate_fresh = self.product_delivery_rate_evidence_is_fresh_at(now);
         let carrier_rate_fresh = self.carrier_rate_evidence_is_fresh_at(now);
+        let native_window = self
+            .carrier_native_window_sample
+            .filter(|sample| sample.fresh_at(now));
         let fresh_carrier_rate = carrier_rate_fresh
             .then_some(self.carrier_delivery_rate_bps)
             .flatten();
@@ -667,10 +814,20 @@ impl ClientPathHealthRecord {
             } else {
                 0
             },
-            product_delivery_rate_bps: delivery_rate_fresh
+            delivery_sample_bytes: if delivery_rate_fresh {
+                self.delivery_sample_bytes
+            } else {
+                0
+            },
+            product_delivery_rate_bps: product_delivery_rate_fresh
                 .then_some(self.product_delivery_rate_bps)
                 .flatten(),
-            product_delivery_sample_bytes: if delivery_rate_fresh {
+            product_delivery_samples: if product_delivery_rate_fresh {
+                self.product_delivery_samples
+            } else {
+                0
+            },
+            product_delivery_sample_bytes: if product_delivery_rate_fresh {
                 self.product_delivery_sample_bytes
             } else {
                 0
@@ -686,6 +843,12 @@ impl ClientPathHealthRecord {
             delivery_rate_expires_at: delivery_rate_fresh
                 .then_some(self.delivery_rate_expires_at)
                 .flatten(),
+            product_last_delivery_at: product_delivery_rate_fresh
+                .then_some(self.product_last_delivery_at)
+                .flatten(),
+            product_delivery_rate_expires_at: product_delivery_rate_fresh
+                .then_some(self.product_delivery_rate_expires_at)
+                .flatten(),
             active_flows: self.active_flows,
             active_latency_sensitive_flows: self.active_latency_sensitive_flows,
             relay_bytes_in_flight: self.relay_bytes_in_flight,
@@ -694,13 +857,19 @@ impl ClientPathHealthRecord {
             carrier_rttvar_ms: self.carrier_rttvar_ms,
             carrier_loss_rate: self.carrier_loss_rate,
             carrier_ecn_rate: self.carrier_ecn_rate,
-            carrier_delivery_rate_bps: proof_rate_bps.or(fresh_carrier_rate),
-            carrier_pacing_rate_bps: fresh_carrier_pacing,
+            carrier_delivery_rate_bps: proof_rate_bps
+                .or(self.native_authority_rate_bps)
+                .or(fresh_carrier_rate),
+            carrier_pacing_rate_bps: self
+                .native_authority_pacing_rate_bps
+                .or(fresh_carrier_pacing),
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
             carrier_bytes_in_flight_observed: self.carrier_bytes_in_flight_observed,
             carrier_queue_bytes: self.carrier_queue_bytes,
             carrier_queue_bytes_observed: self.carrier_queue_bytes_observed,
-            carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
+            carrier_inflight_limit_bytes: self
+                .native_authority_inflight_limit_bytes
+                .unwrap_or_else(|| native_window.map_or(0, |sample| sample.inflight_limit_bytes)),
             carrier_delivery_samples: if explicit_carrier_capacity_proof {
                 fresh_carrier_samples.max(1)
             } else {
@@ -725,9 +894,11 @@ impl ClientPathHealthRecord {
             }),
             carrier_app_limited: !explicit_carrier_capacity_proof
                 && (!carrier_rate_fresh || self.carrier_app_limited),
+            carrier_current_app_limited: self.carrier_current_app_limited,
             carrier_ack_derived_data_seen: explicit_carrier_capacity_proof
                 || (carrier_rate_fresh && self.carrier_ack_derived_data_seen),
             explicit_carrier_capacity_proof,
+            native_carrier_authority_basis: self.native_authority_basis,
             path_proof_success: self.path_proof_success,
         }
     }
@@ -776,10 +947,13 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn mark_path_proof_success(
         &mut self,
+        path_instance_id: CarrierPathInstanceId,
         observation: PathProofObservation,
-    ) {
-        if self.manual_disabled || observation.sent_at < self.path_proof_valid_after {
-            return;
+    ) -> bool {
+        if !self.accepts_liveness_sample(path_instance_id)
+            || observation.sent_at < self.path_proof_valid_after
+        {
+            return false;
         }
         self.mark_success(observation.elapsed);
         self.path_proof_success = true;
@@ -801,6 +975,7 @@ impl ClientPathHealthRecord {
                 self.successful_path_proofs.remove(&proof_id);
             }
         }
+        true
     }
 
     pub(in crate::runtime) fn invalidate_path_proofs(&mut self) {
@@ -815,22 +990,28 @@ impl ClientPathHealthRecord {
         if self.manual_disabled {
             return;
         }
-        self.state = SchedulerPathState::Active;
+        // Retirement is a one-way owner transition. Same-instance native
+        // telemetry and Product ACKs may remain useful diagnostics while the
+        // carrier drains, but they cannot reopen Product admission. A genuine
+        // successor first publishes a different physical instance, which
+        // clears the retired state before reporting liveness.
+        if self.state != SchedulerPathState::Draining {
+            self.state = SchedulerPathState::Active;
+        }
         self.consecutive_failures = 0;
         self.failed_until = None;
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn mark_open_success(&mut self, _elapsed: Duration, lane: TrafficClass) {
+    pub(in crate::runtime) fn mark_open_success(
+        &mut self,
+        _elapsed: Duration,
+        _lane: TrafficClass,
+    ) {
         if self.manual_disabled {
             return;
         }
         self.mark_liveness_success();
-        self.active_flows = self.active_flows.saturating_add(1);
-        if lane.is_latency_sensitive() {
-            self.active_latency_sensitive_flows =
-                self.active_latency_sensitive_flows.saturating_add(1);
-        }
     }
 
     #[cfg(test)]
@@ -847,7 +1028,34 @@ impl ClientPathHealthRecord {
         true
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn reserve_load(&mut self, lane: TrafficClass, now: Instant) -> bool {
+        let owner = self.path_instance_id.map_or(
+            RelayPathLoadOwner::ProspectiveOpen,
+            RelayPathLoadOwner::ExactInstance,
+        );
+        self.reserve_load_for_owner(owner, lane, now)
+    }
+
+    pub(super) fn reserve_current_load(
+        &mut self,
+        lane: TrafficClass,
+        now: Instant,
+    ) -> Option<RelayPathLoadOwner> {
+        let owner = self.path_instance_id.map_or(
+            RelayPathLoadOwner::ProspectiveOpen,
+            RelayPathLoadOwner::ExactInstance,
+        );
+        self.reserve_load_for_owner(owner, lane, now)
+            .then_some(owner)
+    }
+
+    pub(super) fn reserve_load_for_owner(
+        &mut self,
+        owner: RelayPathLoadOwner,
+        lane: TrafficClass,
+        now: Instant,
+    ) -> bool {
         // Selection may precede an asynchronous open. Revalidate at the
         // reservation commit point so a concurrent disable or failure cannot
         // publish load onto a path that is no longer schedulable.
@@ -860,10 +1068,27 @@ impl ClientPathHealthRecord {
         {
             return false;
         }
+        match owner {
+            RelayPathLoadOwner::ProspectiveOpen if self.path_instance_id.is_some() => return false,
+            RelayPathLoadOwner::ExactInstance(path_instance_id)
+                if !self.accepts_product_commit(path_instance_id) =>
+            {
+                return false;
+            }
+            RelayPathLoadOwner::ProspectiveOpen | RelayPathLoadOwner::ExactInstance(_) => {}
+        }
         self.active_flows = self.active_flows.saturating_add(1);
         if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
+        }
+        if owner == RelayPathLoadOwner::ProspectiveOpen {
+            self.prospective_active_flows = self.prospective_active_flows.saturating_add(1);
+            if lane.is_latency_sensitive() {
+                self.prospective_active_latency_sensitive_flows = self
+                    .prospective_active_latency_sensitive_flows
+                    .saturating_add(1);
+            }
         }
         true
     }
@@ -884,33 +1109,141 @@ impl ClientPathHealthRecord {
         true
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn release_load(&mut self, lane: TrafficClass) {
-        self.active_flows = self.active_flows.saturating_sub(1);
-        if lane.is_latency_sensitive() {
-            self.active_latency_sensitive_flows =
-                self.active_latency_sensitive_flows.saturating_sub(1);
-        }
+        let owner = self.path_instance_id.map_or(
+            RelayPathLoadOwner::ProspectiveOpen,
+            RelayPathLoadOwner::ExactInstance,
+        );
+        let _ = self.release_load_for_owner(owner, lane);
     }
 
-    pub(in crate::runtime) fn change_lane_load(&mut self, from: TrafficClass, to: TrafficClass) {
+    pub(super) fn release_load_for_owner(
+        &mut self,
+        owner: RelayPathLoadOwner,
+        lane: TrafficClass,
+    ) -> bool {
+        match owner {
+            RelayPathLoadOwner::ProspectiveOpen => {
+                if self.prospective_active_flows == 0 {
+                    return false;
+                }
+                self.prospective_active_flows -= 1;
+                if lane.is_latency_sensitive() {
+                    self.prospective_active_latency_sensitive_flows = self
+                        .prospective_active_latency_sensitive_flows
+                        .checked_sub(1)
+                        .expect("prospective latency load must balance its lease");
+                }
+            }
+            RelayPathLoadOwner::ExactInstance(path_instance_id) => {
+                if self.path_instance_id != Some(path_instance_id) {
+                    return false;
+                }
+            }
+        }
+        self.active_flows = self
+            .active_flows
+            .checked_sub(1)
+            .expect("active path load must balance its lease");
+        if lane.is_latency_sensitive() {
+            self.active_latency_sensitive_flows = self
+                .active_latency_sensitive_flows
+                .checked_sub(1)
+                .expect("active latency load must balance its lease");
+        }
+        true
+    }
+
+    pub(super) fn change_lane_load_for_owner(
+        &mut self,
+        owner: RelayPathLoadOwner,
+        from: TrafficClass,
+        to: TrafficClass,
+    ) -> bool {
+        if from == to {
+            return true;
+        }
+        match owner {
+            RelayPathLoadOwner::ProspectiveOpen if self.prospective_active_flows == 0 => {
+                return false;
+            }
+            RelayPathLoadOwner::ExactInstance(path_instance_id)
+                if self.path_instance_id != Some(path_instance_id) =>
+            {
+                return false;
+            }
+            RelayPathLoadOwner::ProspectiveOpen | RelayPathLoadOwner::ExactInstance(_) => {}
+        }
         if from.is_latency_sensitive() && !to.is_latency_sensitive() {
-            self.active_latency_sensitive_flows =
-                self.active_latency_sensitive_flows.saturating_sub(1);
+            self.active_latency_sensitive_flows = self
+                .active_latency_sensitive_flows
+                .checked_sub(1)
+                .expect("reclassified latency load must exist");
+            if owner == RelayPathLoadOwner::ProspectiveOpen {
+                self.prospective_active_latency_sensitive_flows = self
+                    .prospective_active_latency_sensitive_flows
+                    .checked_sub(1)
+                    .expect("reclassified prospective latency load must exist");
+            }
         } else if !from.is_latency_sensitive() && to.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
+            if owner == RelayPathLoadOwner::ProspectiveOpen {
+                self.prospective_active_latency_sensitive_flows = self
+                    .prospective_active_latency_sensitive_flows
+                    .saturating_add(1);
+            }
+        }
+        true
+    }
+
+    pub(super) fn bind_load_to_instance(
+        &mut self,
+        owner: RelayPathLoadOwner,
+        path_instance_id: CarrierPathInstanceId,
+        lane: TrafficClass,
+    ) -> bool {
+        if !self.accepts_product_commit(path_instance_id) {
+            return false;
+        }
+        match owner {
+            RelayPathLoadOwner::ExactInstance(current) if current == path_instance_id => true,
+            RelayPathLoadOwner::ProspectiveOpen => {
+                self.prospective_active_flows = self
+                    .prospective_active_flows
+                    .checked_sub(1)
+                    .expect("bound prospective load must exist");
+                if lane.is_latency_sensitive() {
+                    self.prospective_active_latency_sensitive_flows = self
+                        .prospective_active_latency_sensitive_flows
+                        .checked_sub(1)
+                        .expect("bound prospective latency load must exist");
+                }
+                true
+            }
+            RelayPathLoadOwner::ExactInstance(_) => false,
         }
     }
 
     fn prepare_delivery_rate_sample(&mut self, now: Instant) {
         if self.last_delivery_at.is_some() && !self.delivery_rate_evidence_is_fresh_at(now) {
-            // Product and generic samples share one delivery epoch. Reset every
-            // provenance counter together so a small post-idle sample cannot
-            // revive an old rate, byte floor, or confidence count.
+            // A fresh generic epoch must earn its own rate and confidence.
             self.clear_delivery_rate_evidence();
         }
     }
 
+    fn prepare_product_delivery_rate_sample(&mut self, now: Instant) {
+        if self.product_last_delivery_at.is_some()
+            && !self.product_delivery_rate_evidence_is_fresh_at(now)
+        {
+            // A fresh Product epoch must independently earn its own byte floor
+            // and confidence; unrelated generic feedback cannot revive it.
+            self.clear_product_delivery_rate_evidence();
+        }
+    }
+
+    #[cfg(test)]
     fn mark_delivery_at(&mut self, sample: PathRateSample, now: Instant) {
         self.mark_delivery_at_with_expiry(sample, now, None);
     }
@@ -923,6 +1256,7 @@ impl ClientPathHealthRecord {
     ) {
         self.mark_liveness_success();
         self.delivery_samples = self.delivery_samples.saturating_add(1);
+        self.delivery_sample_bytes = self.delivery_sample_bytes.saturating_add(sample.bytes());
         self.last_delivery_at = Some(now);
         self.delivery_rate_expires_at =
             explicit_expires_at.or_else(|| now.checked_add(self.rate_sample_freshness_horizon()));
@@ -948,16 +1282,33 @@ impl ClientPathHealthRecord {
             return;
         }
         let now = Instant::now();
-        self.prepare_delivery_rate_sample(now);
+        self.mark_product_delivery_at(sample, now, false);
+    }
+
+    fn mark_product_delivery_at(
+        &mut self,
+        sample: PathRateSample,
+        now: Instant,
+        replace_rate: bool,
+    ) {
+        self.prepare_product_delivery_rate_sample(now);
         let sample_bps = sample.rate_bps();
-        self.product_delivery_rate_bps = Some(match self.product_delivery_rate_bps {
-            Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
-            None => sample_bps,
+        self.product_delivery_rate_bps = Some(if replace_rate {
+            sample_bps
+        } else {
+            match self.product_delivery_rate_bps {
+                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                None => sample_bps,
+            }
         });
         self.product_delivery_sample_bytes = self
             .product_delivery_sample_bytes
             .saturating_add(sample.bytes());
-        self.mark_delivery_at(sample, now);
+        self.mark_liveness_success();
+        self.product_delivery_samples = self.product_delivery_samples.saturating_add(1);
+        self.product_last_delivery_at = Some(now);
+        self.product_delivery_rate_expires_at =
+            now.checked_add(self.rate_sample_freshness_horizon());
     }
 
     pub(in crate::runtime) fn mark_product_delivery_for_instance(
@@ -978,16 +1329,7 @@ impl ClientPathHealthRecord {
             return;
         }
         let now = Instant::now();
-        self.prepare_delivery_rate_sample(now);
-        self.product_delivery_sample_bytes = self
-            .product_delivery_sample_bytes
-            .saturating_add(sample.bytes());
-        self.product_delivery_rate_bps = Some(sample.rate_bps());
-        self.mark_liveness_success();
-        self.delivery_samples = self.delivery_samples.saturating_add(1);
-        self.last_delivery_at = Some(now);
-        self.delivery_rate_expires_at = now.checked_add(self.rate_sample_freshness_horizon());
-        self.measured_rate_bps = Some(sample.rate_bps());
+        self.mark_product_delivery_at(sample, now, true);
     }
 
     pub(in crate::runtime) fn mark_product_delivery_replacing_rate_for_instance(
@@ -1051,6 +1393,23 @@ impl ClientPathHealthRecord {
         if !self.accepts_liveness_sample(path_instance_id) {
             return;
         }
+        if metrics.controller_path_epoch < self.native_capacity_epoch {
+            // The connection's controller epoch is monotonic. A late poll from
+            // an older epoch has no authority to relabel either capacity or
+            // diagnostics after a reset/migration has already been observed.
+            return;
+        }
+        if metrics.controller_path_epoch > self.native_capacity_epoch {
+            // A controller path epoch is a native network-path lifetime, not
+            // an ordinary sample generation. No diagnostic from the previous
+            // lifetime may be retained when the first new-epoch poll exposes
+            // only a subset of native capabilities.
+            self.clear_native_carrier_state();
+        }
+        // This is Quinn's exact native network-path lifetime. Capturing it at
+        // physical publication prevents cold-start aliasing; later polls may
+        // only preserve it or publish a genuine controller reset/migration.
+        self.native_capacity_epoch = metrics.controller_path_epoch;
         self.mark_liveness_success();
         if metrics.rtt_observed {
             self.carrier_srtt_ms = Some(metrics.srtt.as_secs_f64() * 1000.0);
@@ -1071,16 +1430,15 @@ impl ClientPathHealthRecord {
             metrics.bulk_proof_expires_at,
         ) {
             (None, _) => {
-                // Quinn starts a new transport-evidence epoch on path change.
-                // Old-path diagnostics must not be relabelled as the new path.
-                self.clear_native_delivery_rate_evidence();
+                // Before this native path covers a complete delivery window it
+                // exposes shape only. A new controller epoch was cleared above;
+                // ordinary same-epoch polls cannot manufacture rate authority.
             }
             (Some(observed_at), Some(expires_at)) => {
                 if self.carrier_last_delivery_at != Some(observed_at) {
-                    // Only a new qualified ACK epoch replaces this bundle.
-                    // Shape polls may change current Quinn pacing while
-                    // retaining the old sample timestamp and deadline; those
-                    // values must not be relabelled as same-epoch evidence.
+                    // This bundle is connection-wide native carrier evidence.
+                    // It deliberately says nothing about which H3 stream or
+                    // Product frame contributed the acknowledged packets.
                     self.carrier_delivery_rate_bps = (metrics.delivery_sample_count > 0)
                         .then_some(metrics.delivery_rate_bps.max(1.0));
                     self.carrier_pacing_rate_bps = (metrics.delivery_sample_count > 0)
@@ -1088,17 +1446,23 @@ impl ClientPathHealthRecord {
                     self.carrier_delivery_samples =
                         u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX);
                     self.carrier_delivery_sample_bytes = metrics.delivery_sample_bytes;
+                    self.carrier_delivery_window_covered = metrics.delivery_sample_bytes > 0;
                     self.carrier_last_delivery_at = Some(observed_at);
                     self.carrier_bulk_proof_expires_at = Some(expires_at);
+                    // The estimator publishes only completed non-application-
+                    // limited native delivery epochs. Current controller
+                    // underfill is retained independently below.
+                    self.carrier_app_limited = false;
                 }
             }
             (Some(_), None) => {
-                // Expiry revokes authority, not diagnostic provenance. The
-                // retained deadline prevents this raw rate from falling back
-                // into startup or current scheduling state.
+                // Expiry revokes authority in `observation_at`; retain the
+                // immutable diagnostic epoch until a native path reset.
             }
         }
         if metrics.ack_derived_data_seen {
+            // Historical name: this is native ACK-derived carrier evidence,
+            // never MPP Product delivery or completion.
             self.carrier_ack_derived_data_seen = true;
         }
         self.carrier_bytes_in_flight = metrics.bytes_in_flight as u64;
@@ -1108,7 +1472,72 @@ impl ClientPathHealthRecord {
             .saturating_sub(metrics.bytes_in_flight) as u64;
         self.carrier_queue_bytes_observed = true;
         self.carrier_inflight_limit_bytes = metrics.inflight_hi as u64;
-        self.carrier_app_limited = metrics.app_limited;
+        let native_window_observed_at = Instant::now();
+        self.carrier_native_window_sample = CarrierNativeWindowSample::new(
+            self.carrier_inflight_limit_bytes,
+            native_window_observed_at,
+            self.rate_sample_freshness_horizon(),
+        );
+        self.carrier_current_app_limited = Some(metrics.app_limited);
+    }
+
+    /// Apply the production NativeMode projection for one exact QUIC sender.
+    ///
+    /// The central C0/Bop rate does not expire and is never replaced by the
+    /// wrapper ACK estimator. Activation-local RTT/window/flight/pacing comes
+    /// from the matching stamped Quinn shape. Shared lineage ACK/loss fields
+    /// remain diagnostics and cannot mint rate or Product authority here.
+    pub(in crate::runtime) fn mark_quic_native_authority_metrics(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        metrics: UdpPathMetrics,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) {
+        if !self.accepts_liveness_sample(path_instance_id) {
+            return;
+        }
+        let scope = shape.stamp().scope();
+        if scope.carrier_instance_id() != path_instance_id
+            || scope.direction() != PathMetricDirection::ClientToServer
+        {
+            return;
+        }
+
+        self.native_authority_stamp = Some(shape.stamp());
+        self.native_authority_basis = Some(shape.basis());
+        self.native_authority_rate_bps = Some(shape.rate_bps().max(1) as f64);
+        self.native_authority_pacing_rate_bps =
+            shape.pacing_rate_bps().map(|rate| rate.max(1) as f64);
+        self.native_authority_inflight_limit_bytes = Some(
+            shape
+                .congestion_window()
+                .max(u64::from(shape.current_mtu())),
+        );
+        self.native_capacity_epoch = metrics.controller_path_epoch;
+        self.mark_liveness_success();
+
+        if !shape.srtt().is_zero() {
+            self.carrier_srtt_ms = Some(shape.srtt().as_secs_f64() * 1000.0);
+            self.carrier_rttvar_ms = Some(shape.rttvar().as_secs_f64() * 1000.0);
+        }
+        if let Some(loss_ppm) = metrics.loss_ppm {
+            self.carrier_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
+        }
+        if let Some(ecn_ppm) = metrics.ecn_ppm {
+            self.carrier_ecn_rate = Some(f64::from(ecn_ppm) / 1_000_000.0);
+        }
+        self.carrier_bytes_in_flight = shape.bytes_in_flight();
+        self.carrier_bytes_in_flight_observed = true;
+        // Command pending bytes are sampled outside Quinn's activation-local
+        // shape. Do not combine them with stamped flight into one scheduling
+        // queue. The command queue remains an exact admission authority at
+        // enqueue; this shared snapshot reports the mixed value unavailable.
+        self.carrier_queue_bytes = 0;
+        self.carrier_queue_bytes_observed = false;
+        self.carrier_inflight_limit_bytes = shape
+            .congestion_window()
+            .max(u64::from(shape.current_mtu()));
+        self.carrier_current_app_limited = Some(shape.app_limited());
     }
 
     fn accepts_native_carrier_observation(&self, path_instance_id: CarrierPathInstanceId) -> bool {
@@ -1156,8 +1585,7 @@ impl ClientPathHealthRecord {
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
         // Product and native carrier evidence belongs to the failed association.
-        self.product_delivery_rate_bps = None;
-        self.product_delivery_sample_bytes = 0;
+        self.clear_product_delivery_rate_evidence();
         self.clear_native_carrier_state();
         self.tcp_capacity.reset_after_data_plane_failure();
         self.invalidate_path_proofs();
@@ -1172,6 +1600,11 @@ impl ClientPathHealthRecord {
     }
 
     fn clear_native_carrier_state(&mut self) {
+        self.native_authority_stamp = None;
+        self.native_authority_basis = None;
+        self.native_authority_rate_bps = None;
+        self.native_authority_pacing_rate_bps = None;
+        self.native_authority_inflight_limit_bytes = None;
         self.carrier_srtt_ms = None;
         self.carrier_rttvar_ms = None;
         self.carrier_loss_rate = None;
@@ -1181,8 +1614,10 @@ impl ClientPathHealthRecord {
         self.carrier_queue_bytes = 0;
         self.carrier_queue_bytes_observed = false;
         self.carrier_inflight_limit_bytes = 0;
+        self.carrier_native_window_sample = None;
         self.native_drain_observed = false;
         self.clear_native_delivery_rate_evidence();
+        self.carrier_current_app_limited = None;
     }
 
     fn clear_physical_carrier_state(&mut self) {
@@ -1191,18 +1626,19 @@ impl ClientPathHealthRecord {
         self.peer_usage = None;
         self.path_instance_id = None;
         self.peer_usage_sequence = None;
+        self.native_capacity_epoch = 0;
         self.consecutive_failures = 0;
         self.measured_srtt_ms = None;
         self.measured_jitter_ms = None;
-        self.measured_rate_bps = None;
         self.measured_loss_rate = None;
-        self.delivery_samples = 0;
-        self.product_delivery_rate_bps = None;
-        self.product_delivery_sample_bytes = 0;
-        self.datagram_feedback_samples = 0;
-        self.last_delivery_at = None;
-        self.delivery_rate_expires_at = None;
+        self.clear_delivery_rate_evidence();
+        self.clear_product_delivery_rate_evidence();
         self.failed_until = None;
+        // Configured slots do not own Product load. Preserve only cold opens
+        // that have not authenticated a carrier yet; predecessor-incarnation
+        // demand must never be projected onto its successor.
+        self.active_flows = self.prospective_active_flows;
+        self.active_latency_sensitive_flows = self.prospective_active_latency_sensitive_flows;
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
         self.clear_native_carrier_state();

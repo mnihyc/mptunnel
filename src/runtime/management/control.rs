@@ -196,26 +196,28 @@ fn set_client_path_state(
         .get_mut(index)
         .expect("configured UDP path must have one health record");
     let now = Instant::now();
-    record.invalidate_path_proofs();
-    match state {
-        PathControlState::Enabled | PathControlState::Suspect => {
-            record.manual_disabled = false;
-            record.state = SchedulerPathState::Suspect;
-            record.failed_until = None;
+    record.mutate_eligibility(|record| {
+        record.invalidate_path_proofs();
+        match state {
+            PathControlState::Enabled | PathControlState::Suspect => {
+                record.manual_disabled = false;
+                record.state = SchedulerPathState::Suspect;
+                record.failed_until = None;
+            }
+            PathControlState::Failed => {
+                record.manual_disabled = false;
+                record.state = SchedulerPathState::Failed;
+                record.failed_until = Some(now + path_record_failure_cooldown(record));
+            }
+            PathControlState::Disabled => {
+                record.manual_disabled = true;
+                record.state = SchedulerPathState::Failed;
+                record.failed_until = None;
+                record.relay_bytes_in_flight = 0;
+                record.relay_queue_bytes = 0;
+            }
         }
-        PathControlState::Failed => {
-            record.manual_disabled = false;
-            record.state = SchedulerPathState::Failed;
-            record.failed_until = Some(now + path_record_failure_cooldown(record));
-        }
-        PathControlState::Disabled => {
-            record.manual_disabled = true;
-            record.state = SchedulerPathState::Failed;
-            record.failed_until = None;
-            record.relay_bytes_in_flight = 0;
-            record.relay_queue_bytes = 0;
-        }
-    }
+    });
     Ok(())
 }
 

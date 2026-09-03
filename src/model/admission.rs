@@ -3,12 +3,12 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, RELIABLE_PIPE_WINDOW_BDPS, data_level_service_window_bytes,
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_unproven_path_startup_flight_limit_bytes,
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, RELIABLE_PIPE_WINDOW_BDPS, reliable_bulk_product_windows,
+    reliable_bulk_unproven_exploration_limit_bytes,
 };
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
-use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup};
+use crate::scheduler::{PathSnapshot, path_is_backup};
 use smallvec::SmallVec;
 
 // Decisions in this module never mutate a path or enqueue carrier work.
@@ -94,12 +94,81 @@ pub(crate) enum BulkCandidatePosition {
     AdditionalPath,
 }
 
+/// Independent provenance carried into one bulk admission decision.
+///
+/// Product qualification controls only `P` versus `E`. A fresh achieved-rate
+/// sample controls only completion comparison. Neither authority is inferred
+/// from the snapshot's generic confidence scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BulkAdmissionEvidence {
+    pub(crate) product_assignment_qualified: bool,
+    pub(crate) fresh_completion_rate: bool,
+}
+
+/// Exact bulk OriginalData authority for one current output observation.
+///
+/// `P` is the configured Product envelope as published by the exact output.
+/// `E` is the bounded acquisition envelope for an unqualified additional
+/// output. `A` is the effective assignment envelope after position and
+/// evidence are applied. Traffic-class arbitration and native writer state may
+/// protect latency, but sampled carrier rate never rewrites Product authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BulkOriginalDataAssignmentAuthority {
+    pub(crate) product_limit_bytes: u64,
+    pub(crate) exploration_limit_bytes: u64,
+    pub(crate) assignment_limit_bytes: u64,
+    /// Exact pending OriginalData quantum covered by this authority snapshot.
+    pub(crate) assignment_payload_bytes: u64,
+}
+
+impl BulkOriginalDataAssignmentAuthority {
+    pub(crate) fn has_headroom(self, assigned_product_bytes: u64) -> bool {
+        self.assignment_limit_bytes > 0
+            && assigned_product_bytes
+                .checked_add(self.assignment_payload_bytes)
+                .is_some_and(|committed| committed <= self.assignment_limit_bytes)
+    }
+}
+
+pub(crate) fn bulk_original_data_assignment_authority(
+    candidate: PathSnapshot,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    position: BulkCandidatePosition,
+    product_assignment_qualified: bool,
+) -> BulkOriginalDataAssignmentAuthority {
+    let configured_product_limit =
+        reliable_bulk_product_windows(mux_limits).per_output_product_limit_bytes;
+    // Zero is an exact negative publication at assignment/apply time. A global
+    // planning projection is installed separately by discovery above.
+    let product_limit_bytes = candidate
+        .data_level_limit_bytes
+        .min(configured_product_limit);
+    let exploration_limit_bytes =
+        reliable_bulk_unproven_exploration_limit_bytes(candidate, mux_limits)
+            .min(product_limit_bytes);
+    let base_limit =
+        if position == BulkCandidatePosition::AdditionalPath && !product_assignment_qualified {
+            exploration_limit_bytes
+        } else {
+            product_limit_bytes
+        };
+    let assignment_limit_bytes = base_limit;
+    BulkOriginalDataAssignmentAuthority {
+        product_limit_bytes,
+        exploration_limit_bytes,
+        assignment_limit_bytes,
+        assignment_payload_bytes: payload_bytes as u64,
+    }
+}
+
 /// Receiver knowledge that determines whether the exact lowest-range owner
-/// may use native-only fresh-data admission.
+/// still owns a live contiguous frontier.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReliableDataAckFrontierState {
     /// No complete sparse Data ACK proves that the lowest outstanding range is
-    /// missing. The owner remains work-conserving under native send credit.
+    /// missing. The owner remains work-conserving while both Product and
+    /// native admission authorities have headroom.
     #[default]
     Live,
     /// A complete retained Data ACK omits the lowest outstanding range. Exact
@@ -117,7 +186,7 @@ impl ReliableDataAckFrontierState {
         }
     }
 
-    pub(crate) fn owner_uses_native_admission(self) -> bool {
+    pub(crate) fn owner_has_live_contiguous_frontier(self) -> bool {
         self == Self::Live
     }
 }
@@ -164,8 +233,10 @@ pub(crate) fn bulk_striping_admitted_paths(
         };
         // Global discovery has no stream backlog. Defer ECF to the directional
         // sender, which owns the exact lower-offset tail for every carrier.
-        let suppression =
-            bulk_candidate_resource_suppression(check, candidate.has_bulk_rate_evidence);
+        // Global discovery has no exact flow-local Product evidence. It may
+        // rank a measured carrier, but cannot promote an additional output
+        // from acquisition `E` to Product assignment `P`.
+        let suppression = bulk_candidate_resource_suppression(check, false);
         if suppression.is_none() {
             selected.push(candidate);
         } else {
@@ -202,10 +273,7 @@ pub(crate) fn bulk_striping_admitted_paths(
                         payload_bytes,
                         mux_limits,
                         position,
-                        bulk_path_has_completion_evidence(
-                            candidate.snapshot,
-                            candidate.has_bulk_rate_evidence,
-                        ),
+                        false,
                     ),
                     bulk_scheduler_inflight_debt_bytes(candidate.snapshot, position),
                     candidate.snapshot.queue_bytes,
@@ -253,25 +321,6 @@ pub(crate) fn bulk_scheduling_window_bytes(payload_bytes: usize, mux_limits: Mux
         .clamp(horizon as f64, envelope as f64) as usize
 }
 
-/// Bounds bytes read from the source before they receive a data sequence.
-///
-/// Unassigned bytes are connection work regardless of the eventual TCP/QUIC
-/// path. Exact Data-ACK outstanding bytes and queued source bytes therefore
-/// consume one shared reorder/receive-window envelope.
-pub(crate) fn reliable_relay_source_staging_headroom(
-    lane: TrafficClass,
-    data_ack_outstanding_bytes: usize,
-    queued_data_bytes: usize,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    if !lane.is_bulk() {
-        return usize::MAX;
-    }
-    let envelope = bulk_reorder_window_bytes(payload_bytes, mux_limits);
-    envelope.saturating_sub(data_ack_outstanding_bytes.saturating_add(queued_data_bytes))
-}
-
 #[cfg(test)]
 pub(crate) fn bulk_candidate_admission_suppression(
     best_snapshot: PathSnapshot,
@@ -297,17 +346,24 @@ pub(crate) fn bulk_candidate_admission_suppression(
 pub(crate) fn bulk_candidate_admission_suppression_with_ordering_debt(
     check: BulkAdmissionCheck,
 ) -> Option<&'static str> {
-    bulk_candidate_admission_suppression_with_completion_backlog(check, 0, true)
+    bulk_candidate_admission_suppression_with_completion_backlog(
+        check,
+        0,
+        BulkAdmissionEvidence {
+            product_assignment_qualified: true,
+            fresh_completion_rate: true,
+        },
+    )
 }
 
 pub(crate) fn bulk_candidate_admission_suppression_with_completion_backlog(
     check: BulkAdmissionCheck,
     completion_backlog_bytes: u64,
-    has_bulk_rate_evidence: bool,
+    evidence: BulkAdmissionEvidence,
 ) -> Option<&'static str> {
-    let has_qualified_bulk_rate =
-        bulk_path_has_completion_evidence(check.candidate_snapshot, has_bulk_rate_evidence);
-    if let Some(reason) = bulk_candidate_resource_suppression(check, has_qualified_bulk_rate) {
+    if let Some(reason) =
+        bulk_candidate_resource_suppression(check, evidence.product_assignment_qualified)
+    {
         return Some(reason);
     }
     // Ordering debt bounds receive-hole resources; it does not prove that the
@@ -316,18 +372,35 @@ pub(crate) fn bulk_candidate_admission_suppression_with_completion_backlog(
     if let Some(reason) = bulk_additional_path_completion_suppression(
         check,
         completion_backlog_bytes,
-        has_qualified_bulk_rate,
+        evidence.fresh_completion_rate,
     ) {
         return Some(reason);
     }
     None
 }
 
+fn bulk_candidate_within_stream_reorder_envelope(
+    candidate: PathSnapshot,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    position: BulkCandidatePosition,
+    stream_ordering_debt_bytes: u64,
+) -> bool {
+    let candidate_product_debt = bulk_product_reorder_debt_bytes(candidate);
+    bulk_quantum_granular_limit_allows(
+        candidate_product_debt.saturating_add(stream_ordering_debt_bytes),
+        payload_bytes,
+        bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits),
+        position,
+    )
+}
+
 fn bulk_candidate_resource_suppression(
     check: BulkAdmissionCheck,
-    has_qualified_bulk_rate: bool,
+    product_assignment_qualified: bool,
 ) -> Option<&'static str> {
-    if !bulk_candidate_within_inflight_limit(check, has_qualified_bulk_rate) {
+    if !bulk_candidate_within_original_data_assignment_windows(check, product_assignment_qualified)
+    {
         return Some("inflight_limit");
     }
     if !bulk_candidate_within_reorder_budget(
@@ -336,7 +409,7 @@ fn bulk_candidate_resource_suppression(
         check.mux_limits,
         check.position,
         check.stream_ordering_debt_bytes,
-        has_qualified_bulk_rate,
+        product_assignment_qualified,
     ) {
         return Some("reorder_budget");
     }
@@ -361,12 +434,12 @@ fn bulk_candidate_resource_suppression(
 fn bulk_additional_path_completion_suppression(
     check: BulkAdmissionCheck,
     completion_backlog_bytes: u64,
-    has_qualified_bulk_rate: bool,
+    fresh_completion_rate: bool,
 ) -> Option<&'static str> {
     if check.position != BulkCandidatePosition::AdditionalPath {
         return None;
     }
-    if !has_qualified_bulk_rate {
+    if !fresh_completion_rate {
         return None;
     }
     // For a full bulk backlog, compare the candidate with the leading path
@@ -391,23 +464,6 @@ fn bulk_additional_path_completion_suppression(
         return Some("ecf_no_completion_gain");
     }
     None
-}
-
-fn bulk_path_has_completion_evidence(
-    candidate: PathSnapshot,
-    has_bulk_rate_evidence: bool,
-) -> bool {
-    // The evidence owner already retains a fresh qualified delivery sample
-    // across later app-limited polls. Current idleness cannot revoke that
-    // completion authority; after the sample expires, bounded native-credit
-    // acquisition below supplies fresh evidence.
-    has_bulk_rate_evidence && candidate.confidence >= 1.0
-}
-
-fn bulk_path_acquiring_native_capacity(candidate: PathSnapshot) -> bool {
-    candidate.app_limited
-        && candidate.carrier_inflight_limit_bytes > 0
-        && !bulk_path_has_latency_pressure(candidate)
 }
 
 fn bulk_completion_horizon_applies(check: BulkAdmissionCheck) -> bool {
@@ -453,91 +509,44 @@ pub(crate) fn bulk_completion_horizon_ms_with_ordering_debt(
     best_eta_ms.max(0.0) + best_payload_tx_ms + absorption_ms
 }
 
-fn bulk_candidate_within_inflight_limit(
+fn bulk_candidate_within_original_data_assignment_windows(
     check: BulkAdmissionCheck,
-    has_qualified_bulk_rate: bool,
+    product_assignment_qualified: bool,
 ) -> bool {
-    let candidate = check.candidate_snapshot;
-    let payload_bytes = check.payload_bytes;
-    let mux_limits = check.mux_limits;
-    let position = check.position;
-    // The exact contiguous-frontier owner follows carrier enqueue capacity,
-    // not its overlapping Product flight. Latency pressure retains the
-    // bounded Product horizon.
-    if position == BulkCandidatePosition::ContiguousFrontier
-        && !bulk_path_has_latency_pressure(candidate)
-    {
-        return bulk_contiguous_frontier_can_accept_enqueue(candidate, payload_bytes, mux_limits);
-    }
-    if bulk_path_has_latency_pressure(candidate) {
-        let inflight_limit = bulk_product_inflight_limit_bytes(
-            candidate,
-            payload_bytes,
-            mux_limits,
-            position,
-            has_qualified_bulk_rate,
-        );
-        let committed = bulk_scheduler_inflight_debt_bytes(candidate, position);
-        return committed.saturating_add(payload_bytes as u64) <= inflight_limit
-            || committed < inflight_limit;
-    }
-
-    // Native TCP or QUIC credit governs packet emission. This independent
-    // product-service window bounds how much ordered Data Sequence work MPP
-    // may assign before product ACKs prove that the carrier drained it.
-    let inflight_limit = bulk_product_inflight_limit_bytes(
-        candidate,
-        payload_bytes,
-        mux_limits,
-        position,
-        has_qualified_bulk_rate,
+    let authority = bulk_original_data_assignment_authority(
+        check.candidate_snapshot,
+        check.payload_bytes,
+        check.mux_limits,
+        check.position,
+        product_assignment_qualified,
     );
-    let committed = bulk_scheduler_inflight_debt_bytes(candidate, position);
-    bulk_quantum_granular_limit_allows(committed, payload_bytes, inflight_limit, position)
+    authority.has_headroom(bulk_scheduler_inflight_debt_bytes(
+        check.candidate_snapshot,
+        check.position,
+    ))
+}
+
+/// Whether one exact output retains Product authority for another OriginalData
+/// assignment. The assignment may overshoot by the already-sized command
+/// quantum; the next decision observes the incremented debt and stops.
+///
+/// Native packet flight is intentionally absent. This is Product authority
+/// only.
+pub(crate) fn original_data_assignment_has_product_headroom(candidate: PathSnapshot) -> bool {
+    candidate.data_level_limit_bytes > 0
+        && candidate.data_level_bytes_in_flight < candidate.data_level_limit_bytes
 }
 
 /// Whether the exact contiguous-frontier carrier can accept another original
 /// data quantum without installing a second congestion controller.
 ///
-/// A native congestion window makes carrier queue plus native flight the
-/// enqueue authority. The existing Product service window is the portable
-/// fallback when the underlay cannot expose native send credit.
+/// Every underlay independently requires unique Product debt below `P`.
 pub(crate) fn bulk_contiguous_frontier_can_accept_enqueue(
     candidate: PathSnapshot,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
+    _payload_bytes: usize,
+    _mux_limits: MuxLimits,
 ) -> bool {
-    let payload_bytes_u64 = payload_bytes as u64;
-    let configured_ceiling = (mux_limits.max_path_flight_bytes as u64)
-        .max(payload_bytes_u64)
-        .max(1);
-    let (committed, limit) = if candidate.carrier_inflight_limit_bytes > 0 {
-        let committed = candidate
-            .queue_bytes
-            .saturating_add(candidate.bytes_in_flight);
-        let limit = candidate
-            .carrier_inflight_limit_bytes
-            .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits) as u64)
-            .min(configured_ceiling)
-            .max(payload_bytes_u64);
-        (committed, limit)
-    } else {
-        let committed = bulk_assigned_product_debt_bytes(candidate);
-        let portable_limit = if candidate.data_level_limit_bytes > 0 {
-            candidate.data_level_limit_bytes.max(payload_bytes_u64)
-        } else {
-            data_level_service_window_bytes(candidate, TrafficClass::Throughput, mux_limits)
-                .ceil()
-                .max(payload_bytes_u64 as f64) as u64
-        };
-        (committed, portable_limit.min(configured_ceiling))
-    };
-    bulk_quantum_granular_limit_allows(
-        committed,
-        payload_bytes,
-        limit,
-        BulkCandidatePosition::ContiguousFrontier,
-    )
+    original_data_assignment_has_product_headroom(candidate)
 }
 
 fn bulk_quantum_granular_limit_allows(
@@ -561,52 +570,16 @@ fn bulk_product_inflight_limit_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
     position: BulkCandidatePosition,
-    has_qualified_bulk_rate: bool,
+    product_assignment_qualified: bool,
 ) -> u64 {
-    let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
-    let payload_floor = payload_bytes as u64;
-    let bdp = if bulk_path_has_latency_pressure(candidate) {
-        bulk_latency_pressure_bdp_bytes(candidate)
-    } else {
-        bulk_path_bdp_bytes(candidate)
-    };
-    let bdp_limit = bulk_pipe_window_bytes(bdp).max(payload_floor);
-    let modeled_limit = if candidate.data_level_limit_bytes > 0 {
-        // The runtime capacity model has already bounded this product-layer
-        // service window by measured delivery and native carrier flight. Do
-        // not collapse its feed headroom back to the cold delivery-rate BDP.
-        candidate.data_level_limit_bytes.max(payload_floor)
-    } else {
-        bdp_limit
-    };
-    let modeled_limit = if !has_qualified_bulk_rate
-        && position == BulkCandidatePosition::AdditionalPath
-        && bulk_path_acquiring_native_capacity(candidate)
-    {
-        // Positive Data ACK attribution proves liveness, not current capacity.
-        // While the rate sample is unqualified, reacquire service only through
-        // observed native congestion credit. A retained Product service window
-        // may describe an older network condition and must not enlarge that
-        // acquisition flight. A portable carrier with no native-window
-        // observation keeps the bounded Product fallback computed above.
-        bulk_unproven_path_flight_limit_bytes(candidate, mux_limits)
-    } else if !has_qualified_bulk_rate {
-        modeled_limit.max(bulk_unproven_path_flight_limit_bytes(candidate, mux_limits))
-    } else {
-        modeled_limit
-    }
-    .min(configured_ceiling.max(payload_floor));
-    if bulk_path_has_latency_pressure(candidate) {
-        let latency_limit = if has_qualified_bulk_rate {
-            bulk_latency_pressure_bdp_bytes(candidate)
-        } else {
-            reliable_unproven_path_startup_flight_limit_bytes(mux_limits)
-        }
-        .max(payload_floor)
-        .min(configured_ceiling.max(payload_floor));
-        return modeled_limit.min(latency_limit);
-    }
-    modeled_limit
+    bulk_original_data_assignment_authority(
+        candidate,
+        payload_bytes,
+        mux_limits,
+        position,
+        product_assignment_qualified,
+    )
+    .assignment_limit_bytes
 }
 
 fn bulk_candidate_within_reorder_budget(
@@ -615,7 +588,7 @@ fn bulk_candidate_within_reorder_budget(
     mux_limits: MuxLimits,
     position: BulkCandidatePosition,
     stream_ordering_debt_bytes: u64,
-    has_qualified_bulk_rate: bool,
+    product_assignment_qualified: bool,
 ) -> bool {
     if position == BulkCandidatePosition::AdditionalPath {
         // Native carrier congestion windows bound each path below MPP. The
@@ -624,20 +597,20 @@ fn bulk_candidate_within_reorder_budget(
         // The connection-wide envelope still bounds the complete receive hole.
         let candidate_product_debt = bulk_product_reorder_debt_bytes(candidate);
         let measured_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
-        let acquisition_budget =
-            if !has_qualified_bulk_rate && bulk_path_acquiring_native_capacity(candidate) {
-                // QUIC/TCP congestion credit bounds acquisition below MPP. An old
-                // Product service window is not current native send authority.
-                // Without a native-window observation, the portable Product model
-                // remains the only transport-neutral bound.
-                bulk_unproven_path_flight_limit_bytes(candidate, mux_limits)
-            } else if !has_qualified_bulk_rate {
-                candidate
-                    .data_level_limit_bytes
-                    .max(bulk_unproven_path_flight_limit_bytes(candidate, mux_limits))
-            } else {
-                candidate.data_level_limit_bytes
-            };
+        let authority = bulk_original_data_assignment_authority(
+            candidate,
+            payload_bytes,
+            mux_limits,
+            position,
+            product_assignment_qualified,
+        );
+        let acquisition_budget = if !product_assignment_qualified {
+            // App-limited state is not qualification. Every unqualified
+            // additional output remains at `E`.
+            authority.exploration_limit_bytes
+        } else {
+            authority.product_limit_bytes
+        };
         let path_budget = measured_budget
             .max(acquisition_budget)
             .min(mux_limits.max_path_flight_bytes as u64)
@@ -648,11 +621,12 @@ fn bulk_candidate_within_reorder_budget(
             path_budget,
             position,
         );
-        let within_stream_envelope = bulk_quantum_granular_limit_allows(
-            candidate_product_debt.saturating_add(stream_ordering_debt_bytes),
+        let within_stream_envelope = bulk_candidate_within_stream_reorder_envelope(
+            candidate,
             payload_bytes,
-            bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits),
+            mux_limits,
             position,
+            stream_ordering_debt_bytes,
         );
         return within_path_budget && within_stream_envelope;
     }
@@ -669,15 +643,6 @@ fn bulk_candidate_within_reorder_budget(
         admission_budget,
         position,
     )
-}
-
-fn bulk_unproven_path_flight_limit_bytes(candidate: PathSnapshot, mux_limits: MuxLimits) -> u64 {
-    candidate
-        .carrier_inflight_limit_bytes
-        .max(reliable_unproven_path_startup_flight_limit_bytes(
-            mux_limits,
-        ))
-        .min(mux_limits.max_path_flight_bytes as u64)
 }
 
 fn bulk_reorder_absorption_ms(
@@ -700,52 +665,24 @@ fn bulk_reorder_absorption_ms(
 
 fn bulk_scheduler_inflight_debt_bytes(
     candidate: PathSnapshot,
-    position: BulkCandidatePosition,
+    _position: BulkCandidatePosition,
 ) -> u64 {
-    if position != BulkCandidatePosition::AdditionalPath {
-        return bulk_assigned_product_debt_bytes(candidate);
-    }
-    bulk_product_reorder_debt_bytes(candidate)
+    bulk_assigned_product_debt_bytes(candidate)
 }
 
 fn bulk_assigned_product_debt_bytes(candidate: PathSnapshot) -> u64 {
-    // Product flight owns accepted OriginalData from carrier enqueue through
-    // STREAM_ACK, so the carrier queue is an overlapping pressure view rather
-    // than additional product debt.
-    candidate
-        .data_level_bytes_in_flight
-        .max(candidate.queue_bytes)
-}
-
-fn bulk_leading_path_has_latency_pressure(
-    candidate: PathSnapshot,
-    position: BulkCandidatePosition,
-) -> bool {
-    position != BulkCandidatePosition::AdditionalPath && bulk_path_has_latency_pressure(candidate)
-}
-
-fn bulk_path_has_latency_pressure(candidate: PathSnapshot) -> bool {
-    bulk_latency_pressure_flows(candidate) > 0
-}
-
-fn bulk_latency_pressure_bdp_bytes(candidate: PathSnapshot) -> u64 {
-    let rate = candidate
-        .carrier_delivery_rate_bps
-        .filter(|rate| rate.is_finite() && *rate > 0.0)
-        .unwrap_or_else(|| bulk_effective_rate_bps(candidate));
-    bulk_rate_bdp_bytes(rate, candidate.srtt_ms)
-}
-
-fn bulk_latency_pressure_flows(candidate: PathSnapshot) -> u32 {
-    candidate.active_latency_sensitive_flows
+    // This is exact per-flow unique data awaiting a Product Data ACK. The
+    // carrier queue is shared native state (and can contain other flows); it
+    // remains geometry/diagnostics while actual writer reservation owns native
+    // admission.
+    candidate.data_level_bytes_in_flight
 }
 
 fn bulk_product_reorder_debt_bytes(candidate: PathSnapshot) -> u64 {
-    if candidate.data_level_bytes_in_flight > 0 {
-        candidate.data_level_bytes_in_flight
-    } else {
-        candidate.bytes_in_flight
-    }
+    // Reorder debt is unique assigned Product data awaiting a Data ACK.
+    // Native packet flight is a separate, renewable transport view and must
+    // never stand in for Product debt when the exact Product value is zero.
+    candidate.data_level_bytes_in_flight
 }
 
 fn bulk_total_reorder_debt_bytes(
@@ -802,22 +739,10 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
         BulkCandidatePosition::FirstPath | BulkCandidatePosition::ContiguousFrontier
             if stream_ordering_debt_bytes == 0 =>
         {
-            if bulk_leading_path_has_latency_pressure(candidate, position) {
-                bulk_scheduling_horizon_bytes(payload_bytes, mux_limits) as u64
-            } else {
-                bulk_reorder_window_bytes(payload_bytes, mux_limits) as u64
-            }
+            bulk_reorder_window_bytes(payload_bytes, mux_limits) as u64
         }
         BulkCandidatePosition::FirstPath | BulkCandidatePosition::ContiguousFrontier => {
-            let reorder_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
-            if stream_ordering_debt_bytes > 0
-                && bulk_leading_path_has_latency_pressure(candidate, position)
-            {
-                let service_horizon =
-                    bulk_scheduling_horizon_bytes(payload_bytes, mux_limits) as u64;
-                return reorder_budget.min(service_horizon.max(payload_bytes as u64));
-            }
-            reorder_budget
+            bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
         }
         BulkCandidatePosition::AdditionalPath => {
             bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits)
@@ -855,6 +780,7 @@ fn bulk_path_bdp_bytes(candidate: PathSnapshot) -> u64 {
     bulk_rate_bdp_bytes(rate, candidate.srtt_ms)
 }
 
+#[cfg(test)]
 pub(crate) fn bulk_candidate_pipe_bytes(candidate: PathSnapshot) -> u64 {
     bulk_pipe_window_bytes(bulk_path_bdp_bytes(candidate))
 }

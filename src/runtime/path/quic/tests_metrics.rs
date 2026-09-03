@@ -3,12 +3,14 @@ use super::*;
 
 fn quic_metrics_for_polling() -> UdpPathMetrics {
     UdpPathMetrics {
+        controller_path_epoch: 1,
         direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(180),
         rttvar: Duration::from_millis(45),
         rtt_observed: true,
         delivery_rate_bps: 500_000_000.0,
         pacing_rate_bps: 500_000_000.0,
+        controller_bandwidth_bps: None,
         inflight_hi: 4 * 1024 * 1024,
         bytes_in_flight: 0,
         pending_bytes: 0,
@@ -55,46 +57,113 @@ fn active_app_limited_quic_path_polls_on_ack_clock() {
 }
 
 #[test]
-fn quic_product_data_accepted_by_quinn_counts_as_queue_until_ack() {
+fn live_controller_capacity_is_typed_separately_from_product_proof() {
     let mut tracker = UdpPathMetricTracker::default();
-    let congestion = quic_congestion(4 * 1024 * 1024, Some(500_000_000));
+    let mut congestion = quic_congestion(4 * 1024 * 1024, Some(625_000_000));
+    congestion.path_epoch = 9;
+    congestion.bandwidth_estimate_bps = Some(500_000_000);
+    let mut stats = quinn::ConnectionStats::default();
+    stats.path.rtt = Duration::from_millis(100);
+    stats.path.cwnd = 4 * 1024 * 1024;
+    stats.path.current_mtu = 1400;
+
+    let metrics = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
+    assert_eq!(metrics.controller_path_epoch, 9);
+    assert_eq!(metrics.controller_bandwidth_bps, Some(500_000_000));
+    assert_eq!(metrics.delivery_sample_count, 0);
+    assert_eq!(metrics.bulk_proof_expires_at, None);
+    assert!(quic_path_metrics_should_publish_local_sender(metrics, true));
+    assert!(
+        !quic_path_metrics_should_publish_local_sender(metrics, false),
+        "unchanged idle controller state must not walk all bound response streams",
+    );
+}
+
+#[test]
+fn controller_publication_cursor_tracks_path_epoch_and_operational_bandwidth() {
+    let mut cursor = QuicControllerPublicationCursor::default();
+    let mut metrics = quic_metrics_for_polling();
+    assert!(
+        cursor.changed(metrics),
+        "the first state clears any old task state"
+    );
+    assert!(!cursor.changed(metrics));
+
+    metrics.app_limited = !metrics.app_limited;
+    assert!(
+        !cursor.changed(metrics),
+        "current app-limited state is not response-side live-capacity authority",
+    );
+
+    metrics.controller_bandwidth_bps = Some(500_000_000);
+    assert!(
+        cursor.changed(metrics),
+        "a changed controller-owned operational rate must reach bound response streams"
+    );
+    assert!(!cursor.changed(metrics));
+    metrics.controller_bandwidth_bps = Some(10_000_000);
+    assert!(cursor.changed(metrics), "a native downshift must publish");
+    metrics.controller_bandwidth_bps = Some(500_000_000);
+    assert!(cursor.changed(metrics), "a native recovery must publish");
+    metrics.controller_path_epoch = 2;
+    assert!(
+        cursor.changed(metrics),
+        "same rate on a new path is new authority"
+    );
+    metrics.controller_bandwidth_bps = None;
+    assert!(
+        cursor.changed(metrics),
+        "loss of operational-rate availability must clear the prior published value"
+    );
+
+    metrics.controller_bandwidth_bps = Some(0);
+    assert!(
+        !cursor.changed(metrics),
+        "zero is normalized to unavailable"
+    );
+}
+
+#[test]
+fn connection_wide_native_queue_is_reported_without_product_attribution() {
+    let mut tracker = UdpPathMetricTracker::default();
+    let mut congestion = quic_congestion(4 * 1024 * 1024, Some(500_000_000));
+    congestion.pending_bytes = 8 * 1024 * 1024;
     let mut stats = quinn::ConnectionStats::default();
     stats.path.rtt = Duration::from_millis(50);
     stats.path.cwnd = 4 * 1024 * 1024;
     stats.path.current_mtu = 1400;
     let _ = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
 
-    let queued = tracker.observe(
-        stats,
-        with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
-        PathMetricDirection::ServerToClient,
-    );
+    let queued = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
     assert_eq!(queued.bytes_in_flight, 0);
     assert_eq!(queued.pending_bytes, 8 * 1024 * 1024);
-    let product_metrics = path_metrics_from_quic_path(PathId(7), queued, None);
-    assert_eq!(product_metrics.queue_bytes, 8 * 1024 * 1024);
+    let native_metrics = path_metrics_from_quic_path(PathId(7), queued, None);
+    assert_eq!(native_metrics.queue_bytes, 8 * 1024 * 1024);
 
-    let partially_acked = tracker.observe(
+    // An arbitrary connection ACK cannot subtract from an alleged Product
+    // scalar. Only Quinn's own native pending snapshot changes this queue.
+    let acked = tracker.observe(
         stats,
-        with_acked_bytes(
-            with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
-            2 * 1024 * 1024,
-            1,
-        ),
+        with_acked_bytes(congestion, 2 * 1024 * 1024, 1),
         PathMetricDirection::ServerToClient,
     );
+    assert_eq!(acked.pending_bytes, 8 * 1024 * 1024);
+    congestion.pending_bytes = 6 * 1024 * 1024;
+    let partially_acked = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
     assert_eq!(partially_acked.pending_bytes, 6 * 1024 * 1024);
 }
 
 #[test]
 fn quic_loss_unknown_is_not_reported_as_observed_zero() {
     let metrics = UdpPathMetrics {
+        controller_path_epoch: 1,
         direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(20),
         rttvar: Duration::from_millis(2),
         rtt_observed: true,
         delivery_rate_bps: 500_000_000.0,
         pacing_rate_bps: 500_000_000.0,
+        controller_bandwidth_bps: None,
         inflight_hi: 4 * 1024 * 1024,
         bytes_in_flight: 128 * 1024,
         pending_bytes: 256 * 1024,
@@ -125,14 +194,16 @@ fn quic_loss_unknown_is_not_reported_as_observed_zero() {
 }
 
 #[test]
-fn quic_server_metrics_publish_ack_data_seen_even_when_app_limited() {
+fn quic_server_metrics_publish_native_ack_qualification_even_when_currently_app_limited() {
     let metrics = UdpPathMetrics {
+        controller_path_epoch: 1,
         direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(50),
         rttvar: Duration::from_millis(5),
         rtt_observed: true,
         delivery_rate_bps: 500_000_000.0,
         pacing_rate_bps: 500_000_000.0,
+        controller_bandwidth_bps: None,
         inflight_hi: 4 * 1024 * 1024,
         bytes_in_flight: 0,
         pending_bytes: 0,
@@ -152,11 +223,13 @@ fn quic_server_metrics_publish_ack_data_seen_even_when_app_limited() {
         ack_poll: QuicAckPollDiagnostics::default(),
     };
 
-    assert!(quic_path_metrics_should_publish_local_sender(metrics));
-    let product_metrics = path_metrics_from_quic_path(PathId(7), metrics, None);
-    assert!(product_metrics.has_ack_derived_data_sample);
-    assert_eq!(product_metrics.data_sample_count, 0);
-    assert!(product_metrics.app_limited);
+    assert!(quic_path_metrics_should_publish_local_sender(
+        metrics, false
+    ));
+    let native_metrics = path_metrics_from_quic_path(PathId(7), metrics, None);
+    assert!(native_metrics.has_ack_derived_data_sample);
+    assert_eq!(native_metrics.data_sample_count, 0);
+    assert!(native_metrics.app_limited);
 }
 
 #[test]
@@ -200,7 +273,10 @@ fn server_quic_sidecar_freezes_expiry_and_survives_expired_rtt_refreshes_until_e
         projected.confidence_ppm,
         ratio_to_ppm((4.0 / QUIC_INITIAL_WINDOW_PACKETS as f64).clamp(0.0, 1.0))
     );
-    assert!(!projected.app_limited);
+    assert!(
+        projected.app_limited,
+        "a retained qualified rate epoch must not overwrite current Quinn application-limited state",
+    );
     assert!(projected.has_ack_derived_data_sample);
 
     let stale = path_metrics_from_quic_path(

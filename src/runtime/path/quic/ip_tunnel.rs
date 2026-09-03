@@ -13,13 +13,13 @@ use crate::protocol::{CloseReason, Frame, IpPacketId, IpTunnelId, UnderlayProtoc
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerPathContext};
 use crate::runtime::tun_l3::{
-    IpPacketQueueBudget, IpPacketQueuePermit, IpTunnelPacketSendOutcome, ServerIpTunnelCarrier,
+    IpPacketQueuePermit, IpTunnelPacketSendOutcome, ServerIpTunnelCarrier,
     ServerIpTunnelOpenRequest,
 };
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub(in crate::runtime) struct ClientUdpIpTunnelAttachment {
@@ -57,6 +57,7 @@ impl ClientUdpIpTunnelAttachment {
                 packet_id,
                 payload,
                 _budget: budget,
+                _native_pending: None,
             })
             .map_err(|_| RuntimeError::ReliablePathRetired)
     }
@@ -286,6 +287,48 @@ struct QueuedUdpIpPacket {
     packet_id: IpPacketId,
     payload: Bytes,
     _budget: IpPacketQueuePermit,
+    _native_pending: Option<ServerUdpPendingPacket>,
+}
+
+#[derive(Debug)]
+struct ServerUdpPendingPacket {
+    pending_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for ServerUdpPendingPacket {
+    fn drop(&mut self) {
+        self.pending_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+fn try_reserve_server_udp_pending(
+    pending_bytes: &Arc<AtomicUsize>,
+    bytes: usize,
+    limit_bytes: u64,
+) -> Option<ServerUdpPendingPacket> {
+    let limit_bytes = usize::try_from(limit_bytes).unwrap_or(usize::MAX);
+    let mut current = pending_bytes.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(bytes)?;
+        if next > limit_bytes {
+            return None;
+        }
+        match pending_bytes.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(ServerUdpPendingPacket {
+                    pending_bytes: pending_bytes.clone(),
+                    bytes,
+                });
+            }
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 async fn run_udp_ip_packet_sender(
@@ -315,6 +358,8 @@ struct ServerUdpIpTunnelCarrier {
     packets: mpsc::UnboundedSender<QueuedUdpIpPacket>,
     close: mpsc::UnboundedSender<ServerUdpIpTunnelClose>,
     ready: AtomicBool,
+    pending_bytes: Arc<AtomicUsize>,
+    native_rate_authority: Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
 }
 
 impl ServerIpTunnelCarrier for ServerUdpIpTunnelCarrier {
@@ -323,27 +368,42 @@ impl ServerIpTunnelCarrier for ServerUdpIpTunnelCarrier {
         tunnel_id: IpTunnelId,
         packet_id: IpPacketId,
         payload: Bytes,
-        budget: &IpPacketQueueBudget,
+        budget_permit: Option<IpPacketQueuePermit>,
+        native_retention_limit_bytes: Option<u64>,
     ) -> Result<IpTunnelPacketSendOutcome, RuntimeError> {
         if !self.ready.load(Ordering::Acquire) {
             return Ok(IpTunnelPacketSendOutcome::Full);
         }
-        let permit = match budget.try_reserve(payload.len()) {
-            Ok(permit) => permit,
-            Err(RuntimeError::SenderServiceBlocked) => {
-                return Ok(IpTunnelPacketSendOutcome::Full);
+        let Some(permit) = budget_permit else {
+            return Ok(IpTunnelPacketSendOutcome::Full);
+        };
+        let native_pending = match native_retention_limit_bytes {
+            Some(limit) => {
+                let Some(pending) =
+                    try_reserve_server_udp_pending(&self.pending_bytes, payload.len(), limit)
+                else {
+                    return Ok(IpTunnelPacketSendOutcome::Full);
+                };
+                Some(pending)
             }
-            Err(error) => return Err(error),
+            None => None,
         };
         match self.packets.send(QueuedUdpIpPacket {
             tunnel_id,
             packet_id,
             payload,
             _budget: permit,
+            _native_pending: native_pending,
         }) {
             Ok(()) => Ok(IpTunnelPacketSendOutcome::Accepted),
             Err(_) => Ok(IpTunnelPacketSendOutcome::Retired),
         }
+    }
+
+    fn native_rate_authority(
+        &self,
+    ) -> Option<Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>> {
+        Some(self.native_rate_authority.clone())
     }
 
     fn close(&self, tunnel_id: IpTunnelId, reason: CloseReason) {
@@ -359,6 +419,7 @@ pub(super) async fn handle_server_udp_ip_tunnel(
     context: ServerPathContext,
     path_registration: ServerCarrierPathRegistration,
     tunnel_id: IpTunnelId,
+    native_rate_authority: Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>,
 ) -> Result<(), RuntimeError> {
     send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
     let Some(service) = context.ip_tunnels.as_ref() else {
@@ -381,6 +442,8 @@ pub(super) async fn handle_server_udp_ip_tunnel(
         packets,
         close,
         ready: AtomicBool::new(false),
+        pending_bytes: Arc::new(AtomicUsize::new(0)),
+        native_rate_authority,
     });
     let accepted = match service.open(ServerIpTunnelOpenRequest {
         tunnel_id,

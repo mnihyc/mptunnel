@@ -12,19 +12,14 @@ use crate::model::ack_clock::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::admission::bulk_completion_horizon_ms_with_ordering_debt;
 use crate::model::admission::{
-    BulkAdmissionCheck, BulkCandidatePosition, BulkPathCandidate, ReliableDataAckFrontierState,
-    bulk_candidate_admission_suppression_with_completion_backlog,
-    bulk_candidate_admission_suppression_with_ordering_debt, bulk_candidate_pipe_bytes,
-    bulk_reorder_window_bytes, bulk_scheduling_horizon_bytes, bulk_scheduling_window_bytes,
-    bulk_striping_admitted_candidates,
+    BulkAdmissionCheck, BulkAdmissionEvidence, BulkCandidatePosition, BulkPathCandidate,
+    ReliableDataAckFrontierState, bulk_candidate_admission_suppression_with_completion_backlog,
+    bulk_candidate_admission_suppression_with_ordering_debt, bulk_scheduling_horizon_bytes,
+    bulk_striping_admitted_candidates, original_data_assignment_has_product_headroom,
 };
-use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_inflight_bytes, data_level_service_window_bytes,
-    product_delivery_samples_override_startup_prior,
-};
+use crate::model::capacity::reliable_product_feedback_window_bytes;
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
-#[cfg(feature = "lab-diagnostics")]
-use crate::model::request_evidence::RequestPerFlowRateModel;
+use crate::model::request_evidence::RequestProductRateEpoch;
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
@@ -38,6 +33,7 @@ use crate::scheduler::{
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BulkRelayPathChoice {
@@ -46,10 +42,6 @@ pub(super) enum BulkRelayPathChoice {
         candidate: RelayPathInstance,
         target_bytes: u64,
         proof: RelayPathProofEpoch,
-    },
-    SelectedAckClockMeasurementFence {
-        reference: RelayPathInstance,
-        candidate: RelayPathInstance,
     },
     Blocked,
     NotApplicable,
@@ -75,6 +67,7 @@ pub(super) struct RequestRelayPathObservation {
     pub(super) can_enqueue_stream_lane: bool,
     pub(super) load_owned: bool,
     pub(super) shared_snapshot: Option<PathSnapshot>,
+    pub(super) startup_snapshot: Option<PathSnapshot>,
     pub(super) tcp: Option<ReliableRequestTcpPathEvidence>,
     pub(super) has_bulk_model_evidence: bool,
     pub(super) has_fresh_native_carrier_rate_evidence: bool,
@@ -101,6 +94,7 @@ pub(super) fn choose_observed_ordinary_data_path(
     payload_bytes: usize,
     cursor: usize,
     avoid_instances: &[RelayPathInstance],
+    request_state: Option<RequestSchedulingState<'_>>,
 ) -> ObservedOrdinaryPathChoice {
     let allowed = |path: &&RequestRelayPathObservation| path.can_enqueue_stream_lane;
     let choose = |allow_backup: bool, prefer_avoiding: bool| {
@@ -111,9 +105,29 @@ pub(super) fn choose_observed_ordinary_data_path(
             .filter(|(_, path)| !prefer_avoiding || !avoid_instances.contains(&path.instance))
             .filter(|(_, path)| allowed(path))
             .filter_map(|(position, path)| {
-                let snapshot = path.shared_snapshot?;
+                let mut snapshot = request_original_data_authority_snapshot(
+                    observation,
+                    path.instance,
+                    None,
+                    lane,
+                    request_state,
+                    path.load_owned,
+                )?;
+                if !original_data_assignment_has_product_headroom(snapshot) {
+                    return None;
+                }
                 if !allow_backup && scheduler::path_is_backup(snapshot) {
                     return None;
+                }
+                if !path.load_owned {
+                    // Score the same demand that the ensuing OriginalData
+                    // transaction will reserve. Idle attachment membership is
+                    // not active demand, but a joining stream must include
+                    // itself in shared-capacity and latency-load projection.
+                    if lane.is_latency_sensitive() {
+                        snapshot.active_latency_sensitive_flows =
+                            snapshot.active_latency_sensitive_flows.saturating_add(1);
+                    }
                 }
                 let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
                 Some((
@@ -143,10 +157,18 @@ pub(super) fn choose_observed_ordinary_data_path(
             .filter(&allowed)
             .filter(|path| !prefer_avoiding || !avoid_instances.contains(&path.instance))
             .find(|path| {
-                allow_backup
-                    || path
-                        .shared_snapshot
-                        .is_none_or(|snapshot| !scheduler::path_is_backup(snapshot))
+                let Some(snapshot) = request_original_data_authority_snapshot(
+                    observation,
+                    path.instance,
+                    None,
+                    lane,
+                    request_state,
+                    path.load_owned,
+                ) else {
+                    return false;
+                };
+                original_data_assignment_has_product_headroom(snapshot)
+                    && (allow_backup || !scheduler::path_is_backup(snapshot))
             })
     };
     let capacity_fallback = capacity_fallback(false, true)
@@ -183,6 +205,7 @@ pub(super) struct RequestRelaySchedulingObservation {
     pub(super) paths: SmallVec<[RequestRelayPathObservation; 4]>,
     pub(super) global_bulk_candidates: SmallVec<[ObservedBulkPathCandidate; 4]>,
     pub(super) latency_pressure: bool,
+    pub(super) observed_at: Instant,
 }
 
 impl RequestRelaySchedulingObservation {
@@ -224,6 +247,7 @@ impl RequestRelaySchedulingObservation {
 pub(super) struct RequestSchedulingState<'a> {
     pub(super) operation: Option<RequestAckClockOperation>,
     pub(super) path_states: &'a RequestPathStates,
+    pub(super) flights: Option<&'a RequestFlightLedger>,
 }
 
 impl<'a> RequestSchedulingState<'a> {
@@ -233,6 +257,30 @@ impl<'a> RequestSchedulingState<'a> {
 
     fn path_state(self, instance: RelayPathInstance) -> Option<&'a RequestPathState> {
         self.path_states.get(instance)
+    }
+
+    fn product_rate_epoch(
+        self,
+        instance: RelayPathInstance,
+        authority_at: Instant,
+    ) -> Option<RequestProductRateEpoch> {
+        self.path_state(instance)
+            .and_then(RequestPathState::product_rate_epoch)
+            .filter(|epoch| epoch.fresh_rate_at(authority_at).is_some())
+    }
+
+    fn original_data_in_flight_bytes(self, instance: RelayPathInstance) -> Option<u64> {
+        self.flights
+            .map(|flights| flights.original_data_in_flight_bytes(instance))
+    }
+
+    pub(super) fn product_assignment_qualified(
+        self,
+        instance: RelayPathInstance,
+        _authority_at: Instant,
+    ) -> bool {
+        self.path_state(instance)
+            .is_some_and(RequestPathState::product_assignment_qualified)
     }
 
     #[cfg(feature = "lab-diagnostics")]
@@ -250,7 +298,7 @@ fn observed_request_ack_clock_measurement_transaction(
     request_state: Option<RequestSchedulingState<'_>>,
 ) -> Option<RelayPathInstance> {
     let request_state = request_state?;
-    let reference_path = paths.iter().find(|path| path.key() == reference_key)?;
+    let _reference_path = paths.iter().find(|path| path.key() == reference_key)?;
     let (candidate, owner_target_spent) = match request_state.operation? {
         RequestAckClockOperation::Owner {
             candidate,
@@ -263,19 +311,23 @@ fn observed_request_ack_clock_measurement_transaction(
                 .is_some_and(|spent| spent >= target_bytes),
         ),
         RequestAckClockOperation::Pending {
-            reference: operation_reference,
-            candidate,
-        } => (
-            (operation_reference == reference_path.instance()).then_some(candidate)?,
-            false,
-        ),
+            reference: _,
+            candidate: _,
+        } => return None,
     };
     let candidate_path = paths.iter().find(|path| {
         path.instance() == candidate && path.key().underlay == UnderlayProtocol::Tcp
     })?;
+    // A sealed Owner has no unsent cohort work. Retain its exact-instance
+    // state for ACK attribution and lifecycle cleanup, but do not let an
+    // arbitrarily delayed ACK fence unrelated outputs that still pass their
+    // independent Product and writer authorities.
+    if owner_target_spent {
+        return None;
+    }
     // Fresh carrier evidence authorizes entry and target emission. Once the
-    // fixed target is fully committed, only exact product ACK or a real path
-    // lifecycle change may retire its AwaitingAck transaction.
+    // fixed target is fully committed, only exact Product ACK or a real path
+    // lifecycle change may retire its passive AwaitingAck transaction.
     let candidate_state = request_state.path_state(candidate)?;
     // An offset-free TCP receipt supplies only the causal boundary for one
     // bounded product stage. It is never equivalent to product ACK proof.
@@ -342,13 +394,16 @@ fn request_path_has_exact_flow_local_delivery_evidence(
     let Some(state) = request_state.and_then(|request| request.path_state(instance)) else {
         return false;
     };
-    if !state.capacity_admitted() {
-        return false;
-    }
-
     match instance.key.underlay {
-        UnderlayProtocol::Tcp => state.per_flow_rate().is_some() && state.ack_clock_proven(),
-        UnderlayProtocol::Udp => state.product_delivery_proven(),
+        UnderlayProtocol::Tcp => {
+            state.capacity_admitted()
+                && state.product_rate_epoch().is_some()
+                && state.ack_clock_proven()
+        }
+        // One exact unique Data ACK proves path use, but not a rate. It only
+        // opens the existing native-flight/reorder-bounded acquisition path;
+        // the rate-qualified admission flag remains false until a full sample.
+        UnderlayProtocol::Udp => state.product_path_use_proven(),
     }
 }
 
@@ -375,9 +430,16 @@ fn request_quic_native_window_utilization(snapshot: PathSnapshot) -> Option<(u64
 }
 
 fn compare_request_quic_native_window_utilization(
+    left_eta_ms: f64,
     left: PathSnapshot,
+    right_eta_ms: f64,
     right: PathSnapshot,
 ) -> Ordering {
+    if scheduler::path_has_material_completion_advantage(left_eta_ms, left, right_eta_ms, right)
+        || scheduler::path_has_material_completion_advantage(right_eta_ms, right, left_eta_ms, left)
+    {
+        return Ordering::Equal;
+    }
     match (
         request_quic_native_window_utilization(left),
         request_quic_native_window_utilization(right),
@@ -407,31 +469,6 @@ fn request_scoring_class(lane: TrafficClass) -> &'static str {
     } else {
         "bulk_horizon"
     }
-}
-
-fn request_ack_clock_measurement_reference_reservoir_has_credit(
-    flights: &RequestFlightLedger,
-    offset: u64,
-    candidate: RelayPathInstance,
-    request_state: RequestSchedulingState<'_>,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> bool {
-    let measurement_prefix = match request_state.operation {
-        Some(RequestAckClockOperation::Owner {
-            candidate: owner,
-            target_bytes,
-        }) if owner == candidate => target_bytes,
-        _ => reliable_request_ack_clock_measurement_target_bytes(mux_limits),
-    };
-    let product_envelope = bulk_reorder_window_bytes(payload_bytes, mux_limits);
-    let reservoir = bulk_scheduling_window_bytes(payload_bytes, mux_limits)
-        .saturating_add(usize::try_from(measurement_prefix).unwrap_or(usize::MAX))
-        .min(product_envelope);
-    let data_ack_outstanding =
-        usize::try_from(flights.original_transmission_bytes_before_offset(offset))
-            .unwrap_or(usize::MAX);
-    data_ack_outstanding.saturating_add(payload_bytes) <= reservoir
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -477,12 +514,21 @@ fn request_ack_clock_measurement_start_suppression(
             stream_ordering_debt_bytes: ordering_debt,
         },
         completion_backlog,
-        candidate_path.has_bulk_model_evidence,
+        BulkAdmissionEvidence {
+            product_assignment_qualified: request_state
+                .product_assignment_qualified(candidate_path.instance(), observation.observed_at),
+            fresh_completion_rate: request_snapshot_has_fresh_completion_rate(
+                candidate_path,
+                candidate_snapshot,
+                Some(request_state),
+                observation.observed_at,
+            ),
+        },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn choose_request_ack_clock_measurement_with_rates(
+pub(super) fn choose_request_ack_clock_measurement_with_rates(
     observation: &RequestRelaySchedulingObservation,
     lane: TrafficClass,
     offset: u64,
@@ -503,7 +549,7 @@ fn choose_request_ack_clock_measurement_with_rates(
     let reference_proven = request_state.is_none_or(|request| {
         request
             .path_state(reference_instance)
-            .is_some_and(RequestPathState::product_delivery_proven)
+            .is_some_and(RequestPathState::product_path_use_proven)
     });
     let latency_pressure = observation.latency_pressure;
     let reference_bulk_evidence = reference_path.has_bulk_model_evidence;
@@ -581,6 +627,13 @@ fn choose_request_ack_clock_measurement_with_rates(
     let hard_ceiling = reliable_ack_clock_measurement_ceiling_bytes(observation.mux_limits);
     let product_envelope =
         request_startup_product_envelope_bytes(payload_bytes, observation.mux_limits);
+    let selected_tier_has_regular = paths.iter().any(|path| {
+        path.shared_snapshot.is_some_and(|snapshot| {
+            snapshot.peer_usage.is_some()
+                && scheduler::path_is_schedulable(snapshot, lane)
+                && !scheduler::path_is_backup(snapshot)
+        })
+    });
     let mut allowed_owner_keys = vec![reference_key];
     for path in paths.iter().filter(|path| {
         request_state
@@ -726,6 +779,9 @@ fn choose_request_ack_clock_measurement_with_rates(
                 Some(request_state),
                 path.load_owned,
             )?;
+            if selected_tier_has_regular && scheduler::path_is_backup(snapshot) {
+                return None;
+            }
             if snapshot.active_latency_sensitive_flows > 0
                 || snapshot.session_active_latency_sensitive_flows > 0
                 || !path.has_bulk_model_evidence
@@ -848,7 +904,7 @@ struct RequestFlowLocalBulkCandidate {
     diagnostics: BulkRelayCandidateDiagnostics,
     instance: RelayPathInstance,
     initial_gate: &'static str,
-    local_model: Option<RequestPerFlowRateModel>,
+    local_model: Option<RequestProductRateEpoch>,
 }
 
 #[cfg(feature = "lab-diagnostics")]
@@ -975,7 +1031,7 @@ fn log_request_flow_local_admission_shadow(
     outcome: &'static str,
     global_admitted_keys: &[RelayPathKey],
     retained_admitted_keys: &[RelayPathKey],
-    local_model: Option<RequestPerFlowRateModel>,
+    local_model: Option<RequestProductRateEpoch>,
 ) {
     if !lab_diagnostic_event_enabled("request_flow_local_admission_shadow") {
         return;
@@ -1131,6 +1187,13 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         return BulkRelayPathChoice::NotApplicable;
     }
     let normal_bulk_send = avoid_instances.is_empty();
+    let quic_unused_credit_order = |left_eta_ms, left, right_eta_ms, right| {
+        if normal_bulk_send {
+            compare_request_quic_native_window_utilization(left_eta_ms, left, right_eta_ms, right)
+        } else {
+            Ordering::Equal
+        }
+    };
     let sole_path_authoritative_gap_owner = paths.len() == 1
         && frontier_state == ReliableDataAckFrontierState::AuthoritativeGap
         && path_flights
@@ -1211,6 +1274,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             payload_bytes,
             cursor,
             avoid_instances,
+            request_state,
         ) {
             ObservedOrdinaryPathChoice::Selected(instance) => {
                 BulkRelayPathChoice::Selected(instance)
@@ -1247,83 +1311,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     } else {
         None
     };
-    let measurement_transaction_candidate = normal_bulk_send
-        .then(|| {
-            reference_key.and_then(|reference_key| {
-                observed_request_ack_clock_measurement_transaction(
-                    paths,
-                    reference_key,
-                    request_state,
-                )
-            })
-        })
-        .flatten();
-    let mut measurement_reference_fence = None;
-    if let Some(candidate) = measurement_transaction_candidate {
-        let reference_key =
-            reference_key.expect("a live measurement transaction has an attached reference path");
-        let mut allowed_lower_owners = vec![reference_key];
-        if request_state.is_some_and(|request| {
-            matches!(
-                request.operation,
-                Some(RequestAckClockOperation::Owner { .. })
-            )
-        }) && !allowed_lower_owners.contains(&candidate.key)
-        {
-            allowed_lower_owners.push(candidate.key);
-        }
-        let foreign_optional_owner = path_flights.is_some_and(|flights| {
-            flights.has_foreign_original_transmission_before_offset(offset, &allowed_lower_owners)
-        });
-        if !foreign_optional_owner
-            && let Some(choice) = choose_request_ack_clock_measurement_with_rates(
-                observation,
-                lane,
-                offset,
-                payload_bytes,
-                cursor,
-                Some(reference_key),
-                path_flights,
-                request_state,
-            )
-        {
-            return choice;
-        }
-        // A begun TCP measurement transaction preempts ordinary scheduling.
-        // Its reference path still passes completion and reorder gates below.
-        measurement_reference_fence = Some(candidate);
-    }
-    if measurement_transaction_candidate.is_none()
-        && normal_bulk_send
-        && reference_key.is_some()
-        && let Some(choice) = choose_request_ack_clock_measurement_with_rates(
-            observation,
-            lane,
-            offset,
-            payload_bytes,
-            cursor,
-            reference_key,
-            path_flights,
-            request_state,
-        )
-    {
-        if let BulkRelayPathChoice::SelectedAckClockMeasurement { candidate, .. } = choice
-            && let Some(reference_key) = reference_key
-            && path_flights.is_some_and(|flights| {
-                flights.has_foreign_original_transmission_before_offset(offset, &[reference_key])
-            })
-        {
-            // The candidate passed every existing entry gate; defer only its
-            // ownership commit until prior optional work leaves the frontier.
-            measurement_reference_fence = Some(candidate);
-        } else {
-            return choice;
-        }
-    }
     if normal_bulk_send && lead.is_none() {
-        if measurement_reference_fence.is_some() {
-            return BulkRelayPathChoice::Blocked;
-        }
         if lower_flight_owner.is_none()
             && let Some(reference_key) = reference_key
             && let Some((position, _)) = paths
@@ -1350,9 +1338,6 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     let mut best_flow_local_shadow: Option<RequestFlowLocalBulkCandidate> = None;
     for (position, path) in paths.iter().enumerate() {
         let key = path.key();
-        if measurement_reference_fence.is_some() && Some(key) != reference_key {
-            continue;
-        }
         #[cfg(feature = "lab-diagnostics")]
         let mut flow_local_shadow_gate = None;
         #[cfg(feature = "lab-diagnostics")]
@@ -1372,6 +1357,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                         .is_some_and(RequestPathState::ack_clock_proven)
                 });
             if (is_uncapacity_admitted || lacks_tcp_capacity_proof)
+                && !request_path_has_exact_flow_local_delivery_evidence(path, request_state)
                 && !path.has_bulk_model_evidence
                 && !validated_path
             {
@@ -1549,9 +1535,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     "no_path_snapshot",
                     &global_admitted_bulk_keys,
                     &admitted_bulk_keys,
-                    request_state
-                        .and_then(|request| request.path_state(path.instance()))
-                        .and_then(RequestPathState::per_flow_rate),
+                    request_state.and_then(|request| {
+                        request.product_rate_epoch(path.instance(), observation.observed_at)
+                    }),
                 );
             }
             continue;
@@ -1607,9 +1593,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     "no_path_score",
                     &global_admitted_bulk_keys,
                     &admitted_bulk_keys,
-                    request_state
-                        .and_then(|request| request.path_state(path.instance()))
-                        .and_then(RequestPathState::per_flow_rate),
+                    request_state.and_then(|request| {
+                        request.product_rate_epoch(path.instance(), observation.observed_at)
+                    }),
                 );
             }
             continue;
@@ -1621,15 +1607,16 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
                 .unwrap_or(0);
             let owns_lower_frontier = lower_flight_owner == Some(key);
-            let position = if owns_lower_frontier && frontier_state.owner_uses_native_admission() {
-                BulkCandidatePosition::ContiguousFrontier
-            } else if Some(key) == lead_key && cross_path_ordering_debt == 0 {
-                BulkCandidatePosition::FirstPath
-            } else if lower_flight_owner.is_some() || lead_key.is_some() {
-                BulkCandidatePosition::AdditionalPath
-            } else {
-                BulkCandidatePosition::FirstPath
-            };
+            let position =
+                if owns_lower_frontier && frontier_state.owner_has_live_contiguous_frontier() {
+                    BulkCandidatePosition::ContiguousFrontier
+                } else if Some(key) == lead_key && cross_path_ordering_debt == 0 {
+                    BulkCandidatePosition::FirstPath
+                } else if lower_flight_owner.is_some() || lead_key.is_some() {
+                    BulkCandidatePosition::AdditionalPath
+                } else {
+                    BulkCandidatePosition::FirstPath
+                };
             let admission_ordering_debt = cross_path_ordering_debt;
             let (best_snapshot, best_eta_ms) = if owns_lower_frontier {
                 (snapshot, score.eta_ms)
@@ -1662,40 +1649,33 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     snapshot: Some(snapshot),
                 });
             }
+            let admission_check = BulkAdmissionCheck {
+                best_snapshot,
+                best_eta_ms,
+                candidate_snapshot: snapshot,
+                candidate_eta_ms: score.eta_ms,
+                payload_bytes,
+                mux_limits,
+                position,
+                stream_ordering_debt_bytes: admission_ordering_debt,
+            };
             let ordering_suppression = bulk_candidate_admission_suppression_with_completion_backlog(
-                BulkAdmissionCheck {
-                    best_snapshot,
-                    best_eta_ms,
-                    candidate_snapshot: snapshot,
-                    candidate_eta_ms: score.eta_ms,
-                    payload_bytes,
-                    mux_limits,
-                    position,
-                    stream_ordering_debt_bytes: admission_ordering_debt,
-                },
+                admission_check,
                 completion_backlog_bytes,
-                path.has_bulk_model_evidence,
+                BulkAdmissionEvidence {
+                    product_assignment_qualified: request_state.is_some_and(|request| {
+                        request
+                            .product_assignment_qualified(path.instance(), observation.observed_at)
+                    }),
+                    fresh_completion_rate: request_snapshot_has_fresh_completion_rate(
+                        path,
+                        snapshot,
+                        request_state,
+                        observation.observed_at,
+                    ),
+                },
             );
-            let measurement_reference_reservoir =
-                measurement_reference_fence.is_some_and(|candidate| {
-                    Some(key) == reference_key
-                        && request_state.is_some_and(|request_state| {
-                            path_flights.is_some_and(|flights| {
-                                request_ack_clock_measurement_reference_reservoir_has_credit(
-                                    flights,
-                                    offset,
-                                    candidate,
-                                    request_state,
-                                    payload_bytes,
-                                    mux_limits,
-                                )
-                            })
-                        })
-                });
-            if let Some(reason) = ordering_suppression
-                && !(measurement_reference_reservoir
-                    && matches!(reason, "ecf_no_completion_gain" | "completion_horizon"))
-            {
+            if let Some(reason) = ordering_suppression {
                 #[cfg(feature = "lab-diagnostics")]
                 if let Some(diagnostics) = candidate_diagnostics {
                     if flow_local_shadow_gate.is_none() {
@@ -1709,9 +1689,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                             reason,
                             &global_admitted_bulk_keys,
                             &admitted_bulk_keys,
-                            request_state
-                                .and_then(|request| request.path_state(path.instance()))
-                                .and_then(RequestPathState::per_flow_rate),
+                            request_state.and_then(|request| {
+                                request.product_rate_epoch(path.instance(), observation.observed_at)
+                            }),
                         );
                     }
                 }
@@ -1751,9 +1731,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 "admissible",
                 &global_admitted_bulk_keys,
                 &admitted_bulk_keys,
-                request_state
-                    .and_then(|request| request.path_state(path.instance()))
-                    .and_then(RequestPathState::per_flow_rate),
+                request_state.and_then(|request| {
+                    request.product_rate_epoch(path.instance(), observation.observed_at)
+                }),
             );
             let candidate = RequestFlowLocalBulkCandidate {
                 eta_ms: score.eta_ms,
@@ -1762,9 +1742,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 diagnostics,
                 instance: path.instance(),
                 initial_gate,
-                local_model: request_state
-                    .and_then(|request| request.path_state(path.instance()))
-                    .and_then(RequestPathState::per_flow_rate),
+                local_model: request_state.and_then(|request| {
+                    request.product_rate_epoch(path.instance(), observation.observed_at)
+                }),
             };
             let replaces_shadow = best_flow_local_shadow.as_ref().is_none_or(|best| {
                 score.eta_ms < best.eta_ms
@@ -1804,7 +1784,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             }
             Some((_, best_eta, best_distance, best_snapshot)) => {
                 let native_window_order =
-                    compare_request_quic_native_window_utilization(snapshot, best_snapshot);
+                    quic_unused_credit_order(score.eta_ms, snapshot, best_eta, best_snapshot);
                 if native_window_order == Ordering::Less
                     || (native_window_order == Ordering::Equal
                         && (score.eta_ms < best_eta
@@ -1872,9 +1852,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         );
     }
     if let Some((best_position, best_eta_ms, _, best_snapshot)) = best {
-        let position = old_lead_candidate
+        let (position, _, _) = old_lead_candidate
             .filter(|(_, old_eta_ms, old_snapshot)| {
-                compare_request_quic_native_window_utilization(best_snapshot, *old_snapshot)
+                quic_unused_credit_order(best_eta_ms, best_snapshot, *old_eta_ms, *old_snapshot)
                     != Ordering::Less
                     && relay_path_within_adaptive_lead_hysteresis(
                         *old_eta_ms,
@@ -1884,18 +1864,10 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                         payload_bytes,
                     )
             })
-            .map(|(position, _, _)| position)
-            .unwrap_or(best_position);
+            .unwrap_or((best_position, best_eta_ms, best_snapshot));
         #[cfg(feature = "lab-diagnostics")]
         if let Some(diagnostics) = best_diagnostics {
             log_bulk_relay_candidate_decision(diagnostics, true, "selected");
-        }
-        if let Some(candidate) = measurement_reference_fence {
-            debug_assert_eq!(Some(paths[position].key()), reference_key);
-            return BulkRelayPathChoice::SelectedAckClockMeasurementFence {
-                reference: paths[position].instance(),
-                candidate,
-            };
         }
         return BulkRelayPathChoice::Selected(paths[position].instance());
     }
@@ -2051,45 +2023,79 @@ fn relay_path_snapshot_for_bulk_choice(
     request_state: Option<RequestSchedulingState<'_>>,
     current_flow_owns_path: bool,
 ) -> Option<PathSnapshot> {
+    request_original_data_authority_snapshot(
+        observation,
+        instance,
+        reference_key,
+        TrafficClass::Throughput,
+        request_state,
+        current_flow_owns_path,
+    )
+}
+
+/// Builds the request stream's exact Product-authority view for one output.
+/// Shared native carrier evidence remains valid; shared per-flow Product rate
+/// and aggregate relay flight are replaced by this stream's immutable epoch
+/// and exact OriginalData ledger.
+pub(super) fn request_original_data_authority_snapshot(
+    observation: &RequestRelaySchedulingObservation,
+    instance: RelayPathInstance,
+    reference_key: Option<RelayPathKey>,
+    lane: TrafficClass,
+    request_state: Option<RequestSchedulingState<'_>>,
+    current_flow_owns_path: bool,
+) -> Option<PathSnapshot> {
     let path = observation
         .paths
         .iter()
         .find(|path| path.instance == instance)?;
     let mut snapshot = path.shared_snapshot?;
+    if let Some(exact_product_debt) =
+        request_state.and_then(|request| request.original_data_in_flight_bytes(instance))
+    {
+        snapshot.data_level_bytes_in_flight = exact_product_debt;
+    }
+    snapshot.product_progress_rate_bps = None;
+    snapshot.has_durable_product_progress = false;
+    let local_model = request_state
+        .and_then(|request| request.product_rate_epoch(instance, observation.observed_at));
+    let qualified_local_product_rate =
+        local_model.and_then(|model| model.qualified_completion_rate_at(observation.observed_at));
+    if let Some(rate_bps) = qualified_local_product_rate {
+        snapshot.product_progress_rate_bps = Some(rate_bps.max(1.0));
+        snapshot.has_durable_product_progress = true;
+    }
+    if snapshot.rate_scope == PathRateScope::PerFlowGoodput {
+        // A shared per-flow scalar belongs to the sibling logical stream that
+        // produced it. Restore typed native/configured capacity provenance
+        // before comparing this stream's Product lower bound with it.
+        let startup = path.startup_snapshot?;
+        snapshot.delivery_rate_bps = snapshot
+            .carrier_delivery_rate_bps
+            .unwrap_or(startup.delivery_rate_bps)
+            .max(1.0);
+        snapshot.pacing_rate_bps = snapshot.delivery_rate_bps;
+        snapshot.rate_scope = PathRateScope::PathCapacity;
+        if snapshot.carrier_delivery_rate_bps.is_none() {
+            snapshot.confidence = startup.confidence;
+        }
+    }
     if instance.key.underlay == UnderlayProtocol::Tcp {
         let tcp = path.tcp?;
         let startup = tcp.startup_snapshot;
         let durable_shared_capacity_rate_bps = (path.has_bulk_model_evidence
             && snapshot.rate_scope == PathRateScope::PathCapacity)
             .then_some(snapshot.delivery_rate_bps);
-        let local_model = request_state
-            .and_then(|request| request.path_state(instance))
-            .and_then(RequestPathState::per_flow_rate);
         let has_fresh_native_capacity = path.has_fresh_native_carrier_rate_evidence
             && snapshot.rate_scope == PathRateScope::PathCapacity;
-        if local_model.is_none() && snapshot.rate_scope == PathRateScope::PerFlowGoodput {
-            // Shared TCP product samples belong to whichever logical flow
-            // produced them. Until this flow has exact local evidence, fall
-            // back to the carrier-capacity prior so active-flow sharing remains
-            // visible instead of borrowing another flow's undivided goodput.
-            snapshot.delivery_rate_bps = startup.delivery_rate_bps;
-            snapshot.pacing_rate_bps = startup.pacing_rate_bps;
-            snapshot.rate_scope = PathRateScope::PathCapacity;
-            snapshot.product_progress_rate_bps = None;
-            snapshot.has_durable_product_progress = false;
-            snapshot.carrier_inflight_limit_bytes = startup.carrier_inflight_limit_bytes;
-            snapshot.confidence = startup.confidence;
-        }
-        if let Some(model) = local_model
-            && !has_fresh_native_capacity
+        if !has_fresh_native_capacity
+            && qualified_local_product_rate.is_none()
+            && local_model.is_some()
         {
-            // A product ACK clock measures this logical flow's delivered share.
-            // It is the fallback when fresh qualified native carrier capacity is
-            // unavailable; otherwise placement-limited Product completion must
-            // not replace the native rate or its shared active-flow accounting.
-            let mature = product_delivery_samples_override_startup_prior(model.delivery_samples);
-            // This preserves the existing rate-prior gate exactly. Other path
-            // metadata is intentionally not collapsed into this observation.
+            // A partial exact epoch is retained for EWMA history, but cannot
+            // outrank typed capacity priors in either direction. Endpoint-only
+            // exploration may borrow a qualified reference completion rate or
+            // a path-capacity prior, never a sibling/raw per-flow scalar.
             let rate_hint_unknown = tcp.rate_hint_unknown;
             let reference_exploration_rate_bps = (Some(instance.key) != reference_key
                 && rate_hint_unknown)
@@ -2097,11 +2103,20 @@ fn relay_path_snapshot_for_bulk_choice(
                     reference_key.and_then(|active| {
                         request_state
                             .and_then(|request| {
-                                request.path_states.iter().find_map(|(instance, state)| {
+                                request.path_states.iter().find_map(|(instance, _)| {
                                     (instance.key == active)
-                                        .then(|| state.per_flow_rate())
+                                        .then(|| {
+                                            request.product_rate_epoch(
+                                                instance,
+                                                observation.observed_at,
+                                            )
+                                        })
                                         .flatten()
-                                        .map(|model| model.rate_bps)
+                                        .and_then(|model| {
+                                            model.qualified_completion_rate_at(
+                                                observation.observed_at,
+                                            )
+                                        })
                                 })
                             })
                             .or_else(|| {
@@ -2113,83 +2128,76 @@ fn relay_path_snapshot_for_bulk_choice(
                                 observation
                                     .path_by_key(active)
                                     .and_then(|path| path.shared_snapshot)
+                                    .filter(|snapshot| {
+                                        snapshot.rate_scope == PathRateScope::PathCapacity
+                                    })
                                     .map(|snapshot| snapshot.delivery_rate_bps)
                             })
                     })
                 })
                 .flatten()
                 .unwrap_or(0.0);
-            // A durable same-carrier capacity observation has stronger
-            // provenance than an immature per-flow Data ACK estimate.
             let provisional_rate_bps = startup
                 .delivery_rate_bps
                 .max(durable_shared_capacity_rate_bps.unwrap_or(0.0))
                 .max(reference_exploration_rate_bps);
-            let retain_capacity_prior = !mature && provisional_rate_bps > model.rate_bps;
-            snapshot.delivery_rate_bps = if retain_capacity_prior {
-                provisional_rate_bps
-            } else {
-                model.rate_bps
-            }
-            .max(1.0);
+            snapshot.delivery_rate_bps = provisional_rate_bps.max(1.0);
             snapshot.pacing_rate_bps = snapshot.delivery_rate_bps;
-            snapshot.rate_scope = if retain_capacity_prior {
-                PathRateScope::PathCapacity
-            } else {
-                PathRateScope::PerFlowGoodput
-            };
-            if Some(instance.key) != reference_key && retain_capacity_prior {
-                // Endpoint-only paths have no configured capacity hint. Once
-                // exact ownership is proven, borrow only the current reference
-                // rate as bounded exploration credit so the candidate TCP can
-                // leave slow start. The candidate's own tenth exact sample
-                // replaces this prior; kernel cwnd and the product envelope
-                // remain hard limits throughout.
-                let provisional_pipe = bulk_candidate_pipe_bytes(snapshot).min(
-                    reliable_ack_clock_measurement_ceiling_bytes(observation.mux_limits),
-                );
-                snapshot.data_level_limit_bytes = snapshot
-                    .data_level_limit_bytes
-                    .max(provisional_pipe)
-                    .max(PATH_OPEN_SCORE_BYTES as u64);
-            } else if Some(instance.key) != reference_key && mature {
-                // A configured capacity prior may keep an underfed candidate in the
-                // ranking set. Only a mature continuous per-flow ACK model may
-                // shrink its initial pipe; one bounded proof sample is expected
-                // to be app-limited while the TCP carrier is still ramping.
-                let mut observed = snapshot;
-                observed.delivery_rate_bps = model.rate_bps.max(1.0);
-                observed.pacing_rate_bps = observed.delivery_rate_bps;
-                observed.rate_scope = PathRateScope::PerFlowGoodput;
-                let observed_pipe_bytes = data_level_service_window_bytes(
-                    observed,
-                    TrafficClass::Throughput,
-                    observation.mux_limits,
-                )
-                .ceil()
-                .max(PATH_OPEN_SCORE_BYTES as f64) as u64;
-                snapshot.data_level_limit_bytes = if snapshot.data_level_limit_bytes > 0 {
-                    snapshot.data_level_limit_bytes.min(observed_pipe_bytes)
-                } else {
-                    observed_pipe_bytes
-                }
-                .max(PATH_OPEN_SCORE_BYTES as u64);
-            }
+            snapshot.rate_scope = PathRateScope::PathCapacity;
         }
     }
     if Some(instance.key) != reference_key && !current_flow_owns_path {
         snapshot.active_flows = snapshot.active_flows.saturating_add(1);
     }
-    // Native TCP/QUIC credit supplies carrier feed geometry in both
-    // directions. The shared Data Sequence and reorder windows remain the
-    // connection-level admission authority above this path-local window.
-    snapshot.data_level_limit_bytes = u64::try_from(adaptive_reliable_relay_inflight_bytes(
+    if let Some(rate_bps) = qualified_local_product_rate {
+        // Product ACK timing is a per-flow achieved-service lower bound. It may
+        // raise a compatible native/configured per-flow baseline, but it must
+        // never replace that baseline with a lower completion estimate.
+        let active_bulk_flows = snapshot
+            .active_flows
+            .saturating_sub(snapshot.active_latency_sensitive_flows)
+            .max(1) as f64;
+        let compatible_baseline_bps = match snapshot.rate_scope {
+            PathRateScope::PathCapacity => snapshot.delivery_rate_bps / active_bulk_flows,
+            PathRateScope::PerFlowGoodput => snapshot.delivery_rate_bps,
+        };
+        if rate_bps > compatible_baseline_bps {
+            snapshot.delivery_rate_bps = rate_bps.max(1.0);
+            snapshot.pacing_rate_bps = snapshot.delivery_rate_bps;
+            snapshot.rate_scope = PathRateScope::PerFlowGoodput;
+        }
+    }
+    // Product authority is the configured exact-output resource envelope.
+    // Native C/R evidence remains available for ranking and acquisition, but
+    // cannot rewrite this scalar.
+    snapshot.data_level_limit_bytes = u64::try_from(reliable_product_feedback_window_bytes(
         Some(snapshot),
-        TrafficClass::Throughput,
+        lane,
         observation.mux_limits,
     ))
     .unwrap_or(u64::MAX);
     Some(snapshot)
+}
+
+fn request_snapshot_has_fresh_completion_rate(
+    path: &RequestRelayPathObservation,
+    snapshot: PathSnapshot,
+    request_state: Option<RequestSchedulingState<'_>>,
+    authority_at: Instant,
+) -> bool {
+    match snapshot.rate_scope {
+        PathRateScope::PathCapacity => {
+            path.has_fresh_native_carrier_rate_evidence
+                && snapshot.carrier_delivery_rate_bps.is_some()
+        }
+        PathRateScope::PerFlowGoodput => {
+            snapshot.product_progress_rate_bps.is_some()
+                && request_state
+                    .and_then(|request| request.product_rate_epoch(path.instance(), authority_at))
+                    .and_then(|epoch| epoch.qualified_completion_rate_at(authority_at))
+                    .is_some()
+        }
+    }
 }
 
 #[cfg(test)]

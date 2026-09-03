@@ -627,6 +627,34 @@ async fn protected_wire_counter_excludes_handshake_and_advances_on_frame_write()
 }
 
 #[tokio::test]
+async fn split_writer_single_head_transaction_is_profile_neutral() {
+    for (profile, (client, server)) in [
+        ("TLS", connected_pair(64 * 1024).await),
+        ("Noise", transport_secret_pair(64 * 1024).await),
+    ] {
+        let frame = Frame::StreamData {
+            stream_id: StreamId(19),
+            offset: 7,
+            payload: Bytes::from_static(b"one protected serialization head"),
+        };
+        let (_client_reader, mut client_writer) = client.split().expect("split client carrier");
+        let (mut server_reader, _server_writer) = server.split().expect("split server carrier");
+
+        let (commit, received) = tokio::join!(
+            async {
+                client_writer
+                    .write_frames(std::slice::from_ref(&frame))
+                    .await?;
+                client_writer.flush().await
+            },
+            server_reader.read_frame(),
+        );
+        commit.expect("flush one protected head");
+        assert_eq!(received.expect("read committed head"), frame, "{profile}");
+    }
+}
+
+#[tokio::test]
 async fn abrupt_protected_truncation_is_not_reported_as_a_protocol_frame() {
     for (profile, (mut client, server)) in [
         ("TLS", connected_pair(64 * 1024).await),

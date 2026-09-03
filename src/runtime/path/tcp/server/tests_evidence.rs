@@ -107,6 +107,74 @@ fn partial_rate_without_transport_shape_does_not_refresh_the_registry() {
 }
 
 #[test]
+fn rtt_only_refresh_cannot_resurrect_expired_native_window_authority() {
+    let path_id = PathId(2);
+    let direction = PathMetricDirection::ServerToClient;
+    let full = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 10_000,
+            rttvar_us: Some(1_250),
+        }),
+        flight: Some(TcpNativeFlight {
+            bytes_in_flight: Some(0),
+            inflight_limit_bytes: 512 * 1024,
+            inflight_hi_bytes: Some(512 * 1024),
+        }),
+        ..TcpNativeSnapshot::default()
+    };
+    let full_observation = TcpSenderMetricTracker::new(full).observe(path_id, direction, full);
+    let mut state = ServerTcpEvidenceState::new(None, None, MuxLimits::default());
+    let first_observed_at = Instant::now();
+    state.observe_native_window_sample_at(full_observation, first_observed_at);
+    let first = state
+        .native_window_sample
+        .expect("genuine native flight publishes C");
+    assert_eq!(first.inflight_limit_bytes, 512 * 1024);
+    assert!(first.fresh_at(first_observed_at));
+
+    let rtt_only = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 1_000_000,
+            rttvar_us: Some(500_000),
+        }),
+        ..TcpNativeSnapshot::default()
+    };
+    let rtt_only_observation =
+        TcpSenderMetricTracker::new(rtt_only).observe(path_id, direction, rtt_only);
+    let expired_at = first.expires_at;
+    state.observe_native_window_sample_at(rtt_only_observation, expired_at);
+    assert_eq!(
+        state.native_window_sample,
+        Some(first),
+        "an RTT-only poll preserves the original C epoch instead of dating the retained scalar again",
+    );
+    assert!(!first.fresh_at(expired_at));
+
+    let refreshed = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 20_000,
+            rttvar_us: Some(2_000),
+        }),
+        flight: Some(TcpNativeFlight {
+            bytes_in_flight: Some(0),
+            inflight_limit_bytes: 1024 * 1024,
+            inflight_hi_bytes: Some(1024 * 1024),
+        }),
+        ..TcpNativeSnapshot::default()
+    };
+    let refreshed_observation =
+        TcpSenderMetricTracker::new(refreshed).observe(path_id, direction, refreshed);
+    let refreshed_at = expired_at + Duration::from_millis(1);
+    state.observe_native_window_sample_at(refreshed_observation, refreshed_at);
+    let second = state
+        .native_window_sample
+        .expect("genuine replacement flight refreshes C");
+    assert_eq!(second.inflight_limit_bytes, 1024 * 1024);
+    assert_eq!(second.observed_at, refreshed_at);
+    assert!(second.fresh_at(refreshed_at));
+}
+
+#[test]
 fn server_retains_qualified_native_delivery_across_later_app_limited_polls() {
     let baseline = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {

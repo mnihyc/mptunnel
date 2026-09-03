@@ -13,11 +13,13 @@ level = "info" # all levels are good
 
 [flow]
 # TCP streams and UDP associations idle on application payload; 0 disables.
-idle_timeout_s = 300
+# idle_timeout_s = 300
+# Optional startup-rate prior; path URI wins, QUIC qualifies native handoff.
+# initial_rate_mbps = 100
 # Optional reliable MPP payload reinjection; control/probes/native recovery are outside it.
-optional_reinjection_budget_percent = 10
+# optional_reinjection_budget_percent = 10
 # Sender-side QUIC loss correction with a bounded 3-round burst envelope; path URI wins.
-quic_loss_compensation_percent = 10
+# quic_loss_compensation_percent = 10
 
 [admission]
 max_live_flows = 4096
@@ -79,6 +81,8 @@ protocol = "mpp"
 # TCP and QUIC/UDP remain separate carriers under one logical MPP session.
 # QUIC loss compensation inherits performance/[flow]. A path URI overrides it:
 # append `?loss-compensation-percent=10` (or `=0` for draft BBR3 behavior).
+# Per-path startup override: append `?initial-rate-mbps=100`; use
+# `?initial-rate=unknown` to suppress the `[flow]` prior on that path.
 paths = [
   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
   { name = "path-2", endpoint = "quic://server.example.com:7443" },

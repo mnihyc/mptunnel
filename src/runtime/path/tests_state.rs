@@ -47,6 +47,26 @@ fn udp_path_load_test_context() -> ClientPathContext {
     .expect("UDP load test context")
 }
 
+#[test]
+fn udp_owner_publication_captures_the_cold_native_epoch_atomically() {
+    let context = udp_path_load_test_context();
+    let instance = next_carrier_path_instance_id();
+    assert!(context.state.publish_udp_peer_path_usage_committed(
+        0,
+        instance,
+        41,
+        0,
+        PathUsage::Available,
+        || true,
+        || {},
+    ));
+
+    let health = context.health().lock().expect("UDP publication health");
+    assert_eq!(health.udp[0].path_instance_id(), Some(instance));
+    assert_eq!(health.udp[0].native_capacity_epoch(), 41);
+    assert_eq!(health.udp[0].eligibility_epoch(), Some(1));
+}
+
 #[tokio::test]
 async fn path_model_publication_before_wait_arm_is_not_lost() {
     let context = udp_path_load_test_context();
@@ -312,17 +332,15 @@ fn multiple_default_tcp_endpoints_publish_their_bounded_pool_target() {
 #[test]
 fn stale_shared_load_snapshot_has_only_one_claim_winner() {
     let context = tcp_path_test_context(1);
-    let key = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
+    let instance = tcp_path_instance(0, 1);
+    context.install_relay_path_instance_for_test(instance);
 
     let first = context
-        .try_reserve_relay_path_load_if_unchanged(key, TrafficClass::Throughput, 0, 0)
+        .try_reserve_relay_path_load_if_unchanged(instance, TrafficClass::Throughput, 0, 0)
         .expect("first exact snapshot claim");
     assert!(
         context
-            .try_reserve_relay_path_load_if_unchanged(key, TrafficClass::Throughput, 0, 0)
+            .try_reserve_relay_path_load_if_unchanged(instance, TrafficClass::Throughput, 0, 0,)
             .is_none(),
         "a stale contender must rescore instead of sharing one idle candidate"
     );
@@ -362,7 +380,48 @@ fn relay_path_load_lease_rolls_back_scheduler_demand_on_drop() {
 }
 
 #[test]
-fn udp_logical_load_lease_survives_physical_replacement_and_balances_on_drop() {
+fn prospective_open_load_survives_first_publication_then_binds_exactly() {
+    let context = udp_path_load_test_context();
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let mut lease = context
+        .reserve_relay_path_load(key, TrafficClass::RealtimeDatagram)
+        .expect("cold prospective open load");
+    let opened = next_carrier_path_instance_id();
+    context.install_relay_path_instance_for_test(RelayPathInstance {
+        key,
+        path_instance_id: opened,
+        attachment_id: 0,
+    });
+    assert_eq!(
+        context.health().lock().expect("opened health").udp[0].active_flows,
+        1,
+        "carrier publication must retain the in-flight open anti-stampede claim",
+    );
+    assert!(lease.bind_to_instance(opened));
+
+    let replacement = next_carrier_path_instance_id();
+    context.install_relay_path_instance_for_test(RelayPathInstance {
+        key,
+        path_instance_id: replacement,
+        attachment_id: 0,
+    });
+    assert_eq!(
+        context.health().lock().expect("replacement health").udp[0].active_flows,
+        0,
+        "once bound, load belongs only to the authenticated physical instance",
+    );
+    drop(lease);
+    assert_eq!(
+        context.health().lock().expect("stale drop health").udp[0].active_flows,
+        0,
+    );
+}
+
+#[test]
+fn udp_physical_replacement_clears_predecessor_load_without_releasing_successor() {
     let context = udp_path_load_test_context();
     let key = RelayPathKey {
         underlay: UnderlayProtocol::Udp,
@@ -374,7 +433,7 @@ fn udp_logical_load_lease_survives_physical_replacement_and_balances_on_drop() {
         path_instance_id: predecessor,
         attachment_id: 0,
     });
-    let lease = context
+    let predecessor_lease = context
         .reserve_relay_path_load(key, TrafficClass::RealtimeDatagram)
         .expect("UDP association load lease");
     assert_eq!(
@@ -392,15 +451,24 @@ fn udp_logical_load_lease_survives_physical_replacement_and_balances_on_drop() {
         let health = context.health().lock().expect("UDP successor health");
         assert_eq!(health.udp[0].path_instance_id(), Some(successor));
         assert_eq!(
-            health.udp[0].active_flows, 1,
-            "physical N to N+1 publication cannot duplicate or release logical association load",
+            health.udp[0].active_flows, 0,
+            "physical N load cannot transfer to physical N+1",
         );
     }
-    drop(lease);
+    let successor_lease = context
+        .reserve_relay_path_load(key, TrafficClass::RealtimeDatagram)
+        .expect("UDP successor association load lease");
+    drop(predecessor_lease);
+    assert_eq!(
+        context.health().lock().expect("UDP released health").udp[0].active_flows,
+        1,
+        "predecessor drop cannot release successor association load",
+    );
+    drop(successor_lease);
     assert_eq!(
         context.health().lock().expect("UDP released health").udp[0].active_flows,
         0,
-        "success, failure, and cancellation all balance through the same RAII drop",
+        "the exact successor lease balances its own association load",
     );
 }
 
@@ -414,12 +482,6 @@ fn relay_path_load_lease_releases_the_reclassified_lane() {
     let mut lease = context
         .reserve_relay_path_load(key, TrafficClass::Throughput)
         .expect("path load lease");
-    context.change_relay_path_lane_load(
-        UnderlayProtocol::Tcp,
-        0,
-        TrafficClass::Throughput,
-        TrafficClass::Latency,
-    );
     lease.set_recorded_lane(TrafficClass::Latency);
 
     drop(lease);
@@ -459,9 +521,12 @@ fn tcp_replacement_publication_is_exact_instance_atomic_during_product_work() {
         predecessor.measured_rate_bps = Some(900_000_000.0);
         predecessor.delivery_samples = 7;
         predecessor.product_delivery_rate_bps = Some(850_000_000.0);
+        predecessor.product_delivery_samples = 7;
         predecessor.product_delivery_sample_bytes = 512 * 1024;
         predecessor.last_delivery_at = Some(now);
         predecessor.delivery_rate_expires_at = Some(now + Duration::from_secs(1));
+        predecessor.product_last_delivery_at = Some(now);
+        predecessor.product_delivery_rate_expires_at = Some(now + Duration::from_secs(1));
         predecessor.carrier_srtt_ms = Some(18.0);
         predecessor.carrier_rttvar_ms = Some(3.0);
         predecessor.carrier_delivery_rate_bps = Some(920_000_000.0);

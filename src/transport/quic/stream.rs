@@ -90,42 +90,20 @@ impl SendStream {
 
 pub(super) struct QuicWriteTransaction {
     write_backlog: Arc<AtomicU64>,
-    telemetry: Arc<QuicCarrierTelemetry>,
     packet_len: u64,
-    delivery_evidence_bytes: u64,
-    rollback_delivery_evidence: bool,
 }
 
 impl QuicWriteTransaction {
-    pub(super) fn new(
-        write_backlog: Arc<AtomicU64>,
-        telemetry: Arc<QuicCarrierTelemetry>,
-        packet_len: u64,
-        delivery_evidence_bytes: u64,
-    ) -> Self {
-        telemetry.record_delivery_evidence_written(delivery_evidence_bytes);
+    pub(super) fn new(write_backlog: Arc<AtomicU64>, packet_len: u64) -> Self {
         Self {
             write_backlog,
-            telemetry,
             packet_len,
-            delivery_evidence_bytes,
-            rollback_delivery_evidence: true,
         }
     }
-
-    pub(super) fn complete(mut self) {
-        self.rollback_delivery_evidence = false;
-    }
-
-    pub(super) fn fail_stream(self) {}
 }
 
 impl Drop for QuicWriteTransaction {
     fn drop(&mut self) {
-        if self.rollback_delivery_evidence {
-            self.telemetry
-                .record_delivery_evidence_cancelled(self.delivery_evidence_bytes);
-        }
         let _ = self
             .write_backlog
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -629,9 +607,6 @@ async fn write_reliable_frame_bytes(
     frames: &[Frame],
     limits: CodecLimits,
 ) -> Result<(), QuicCarrierError> {
-    let delivery_evidence_bytes = frames.iter().fold(0_u64, |total, frame| {
-        total.saturating_add(frame.delivery_evidence_bytes())
-    });
     #[cfg(feature = "lab-diagnostics")]
     let encode_started = std::time::Instant::now();
     let mut packet = Vec::new();
@@ -651,21 +626,12 @@ async fn write_reliable_frame_bytes(
     );
     #[cfg(feature = "lab-diagnostics")]
     let write_started = std::time::Instant::now();
-    send.write_backlog.fetch_add(packet_len, Ordering::Relaxed);
-    // Reserve Product delivery evidence before handing DATA to H3. Native ACK
-    // callbacks may run before the write future resumes; the transaction rolls
-    // the reservation back if the request stream is cancelled or rejected.
-    let transaction = QuicWriteTransaction::new(
-        send.write_backlog.clone(),
-        send.telemetry.clone(),
-        packet_len,
-        delivery_evidence_bytes,
-    );
-    if let Err(err) = send.stream.send_data(Bytes::from(packet)).await {
-        transaction.fail_stream();
-        return Err(err);
+    let pending_before = send.write_backlog.fetch_add(packet_len, Ordering::Relaxed);
+    if pending_before == 0 {
+        send.telemetry.record_write_activity();
     }
-    transaction.complete();
+    let _transaction = QuicWriteTransaction::new(send.write_backlog.clone(), packet_len);
+    send.stream.send_data(Bytes::from(packet)).await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.write_frames_wait",

@@ -2594,12 +2594,12 @@ fn flow_performance_is_inherited_and_each_mpp_node_can_override_it() {
     let inherited = |document: &str| {
         document
             .replacen(
-                "optional_reinjection_budget_percent = 10",
+                "# optional_reinjection_budget_percent = 10",
                 "optional_reinjection_budget_percent = 17",
                 1,
             )
             .replacen(
-                "quic_loss_compensation_percent = 10",
+                "# quic_loss_compensation_percent = 10",
                 "quic_loss_compensation_percent = 12.3456",
                 1,
             )
@@ -2748,6 +2748,144 @@ fn quic_loss_compensation_file_percent_rejects_invalid_values_and_removed_name()
         load_config_toml_str(&removed),
         Err(ConfigFileError::Toml(_))
     ));
+}
+
+#[test]
+fn flow_initial_rate_inherits_to_mpp_paths_and_uri_presence_wins() {
+    let paths = concat!(
+        "paths = [",
+        "{ name = \"inherited-tcp\", endpoint = \"tcp://127.0.0.1:4401\" }, ",
+        "{ name = \"inherited-quic\", endpoint = \"quic://127.0.0.1:4402\" }, ",
+        "{ name = \"bps\", endpoint = \"tcp://127.0.0.1:4403?initial-rate-bps=7\" }, ",
+        "{ name = \"kbps\", endpoint = \"tcp://127.0.0.1:4404?initial-rate-kbps=7\" }, ",
+        "{ name = \"mbps\", endpoint = \"quic://127.0.0.1:4405?initial-rate-mbps=7\" }, ",
+        "{ name = \"unknown\", endpoint = \"quic://127.0.0.1:4406?initial-rate=unknown\" }, ",
+        "{ name = \"unlimited\", endpoint = \"tcp://127.0.0.1:4407?initial-rate=unlimited\" }",
+        "]",
+    );
+    let document = format!(
+        "[flow]\ninitial_rate_mbps = 250\n{}",
+        mpp_outbound_security_document("").replace(
+            "paths = [{ name = \"path-1\", endpoint = \"quic://127.0.0.1:443\" }]",
+            paths,
+        )
+    );
+    let config = load_config_toml_str(&document).expect("global initial-rate inheritance");
+    let CommandConfig::Node(node) = config.command;
+    let paths = &mpp_outbounds(&node)[0].paths;
+    let expected = [
+        crate::transport::RateHint::BitsPerSecond(250_000_000),
+        crate::transport::RateHint::BitsPerSecond(250_000_000),
+        crate::transport::RateHint::BitsPerSecond(7),
+        crate::transport::RateHint::BitsPerSecond(7_000),
+        crate::transport::RateHint::BitsPerSecond(7_000_000),
+        crate::transport::RateHint::Unknown,
+        crate::transport::RateHint::Unlimited,
+    ];
+    assert_eq!(paths.len(), expected.len());
+    for (index, (path, expected)) in paths.iter().zip(expected).enumerate() {
+        assert_eq!(path.spec.metadata.initial_rate, expected, "path {index}");
+        assert_eq!(
+            path.spec.metadata.initial_rate_explicit,
+            index >= 2,
+            "path {index} URI provenance",
+        );
+    }
+
+    let inbound = format!(
+        "[flow]\ninitial_rate_mbps = 321\n{}",
+        mpp_inbound_security_document("").replace(
+            "paths = [{ name = \"path-1\", endpoint = \"tcp://127.0.0.1:443\" }]",
+            concat!(
+                "paths = [",
+                "{ name = \"tcp\", endpoint = \"tcp://127.0.0.1:443\" }, ",
+                "{ name = \"quic\", endpoint = \"quic://127.0.0.1:444\" }",
+                "]",
+            ),
+        )
+    );
+    let config = load_config_toml_str(&inbound).expect("inbound initial-rate inheritance");
+    let CommandConfig::Node(node) = config.command;
+    for path in &node.servers[0].paths {
+        assert_eq!(
+            path.spec.metadata.initial_rate,
+            crate::transport::RateHint::BitsPerSecond(321_000_000),
+        );
+        assert!(!path.spec.metadata.initial_rate_explicit);
+    }
+}
+
+#[test]
+fn flow_initial_rate_requires_positive_exact_u64_bits_per_second() {
+    let maximum = format!(
+        "[flow]\ninitial_rate_mbps = 18446744073709\n{}",
+        mpp_outbound_security_document("").replace("quic://127.0.0.1:443", "tcp://127.0.0.1:443")
+    );
+    let config = load_config_toml_str(&maximum).expect("largest fitting whole Mbit/s rate");
+    let CommandConfig::Node(node) = config.command;
+    assert_eq!(
+        mpp_outbounds(&node)[0].paths[0].spec.metadata.initial_rate,
+        crate::transport::RateHint::BitsPerSecond(18_446_744_073_709_000_000),
+    );
+
+    for value in ["0", "-1", "1.5", "\"100\"", "18446744073710"] {
+        let document = format!(
+            "[flow]\ninitial_rate_mbps = {value}\n{}",
+            mpp_outbound_security_document("")
+        );
+        assert!(
+            matches!(
+                load_config_toml_str(&document),
+                Err(ConfigFileError::Toml(_))
+            ),
+            "invalid global initial rate must fail: {value}",
+        );
+    }
+}
+
+#[test]
+fn flow_initial_rate_rejects_only_inexact_resolved_quic_targets() {
+    let too_fast = format!(
+        "[flow]\ninitial_rate_mbps = 100000000000\n{}",
+        mpp_outbound_security_document("")
+    );
+    assert!(matches!(
+        load_config_toml_str(&too_fast),
+        Err(ConfigFileError::PathSpec(
+            PathSpecParseError::QuicInitialRateTargetOutOfRange
+        ))
+    ));
+
+    let too_wide = format!(
+        "[flow]\ninitial_rate_mbps = 72000000000\n{}",
+        mpp_outbound_security_document("").replace(
+            "quic://127.0.0.1:443",
+            "quic://127.0.0.1:443?initial-srtt-s=4294967.295",
+        )
+    );
+    assert!(matches!(
+        load_config_toml_str(&too_wide),
+        Err(ConfigFileError::PathSpec(
+            PathSpecParseError::QuicInitialRateTargetOutOfRange
+        ))
+    ));
+
+    let tcp_only = too_fast.replace("quic://127.0.0.1:443", "tcp://127.0.0.1:443");
+    let config = load_config_toml_str(&tcp_only).expect("TCP has no native BBR f64 target");
+    let CommandConfig::Node(node) = config.command;
+    assert_eq!(
+        mpp_outbounds(&node)[0].paths[0].spec.metadata.initial_rate,
+        crate::transport::RateHint::BitsPerSecond(100_000_000_000_000_000),
+    );
+
+    for override_query in ["initial-rate=unknown", "initial-rate-mbps=100"] {
+        let overridden = too_fast.replace(
+            "quic://127.0.0.1:443",
+            &format!("quic://127.0.0.1:443?{override_query}"),
+        );
+        load_config_toml_str(&overridden)
+            .unwrap_or_else(|error| panic!("{override_query} must override global: {error}"));
+    }
 }
 
 #[test]

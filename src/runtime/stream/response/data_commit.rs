@@ -6,11 +6,16 @@
 
 use super::ResponseStreamBinding;
 use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputEntry};
+use super::evidence::server_output_product_assignment_qualified;
+use super::snapshot::{server_bulk_output_snapshot_at, server_native_bulk_output_snapshot_at};
+use crate::model::admission::{BulkCandidatePosition, bulk_original_data_assignment_authority};
+use crate::model::capacity::reliable_bulk_product_windows;
 use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::runtime::RuntimeError;
 use crate::scheduler::TrafficClass;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 impl ResponseStreamBinding {
     pub(in crate::runtime) fn try_enqueue_data_frame_for_dispatch_target(
@@ -19,17 +24,32 @@ impl ResponseStreamBinding {
         frame: &Frame,
         lane: TrafficClass,
         expected_model_generation: u64,
+        position: BulkCandidatePosition,
     ) -> Result<(), RuntimeError> {
-        if !self.response_stream_open.load(Ordering::Acquire)
-            || reliable_stream_frame_extent(frame).is_none()
-        {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
+        self.try_enqueue_data_frame_for_dispatch_target_with_apply_clock(
+            target,
+            frame,
+            lane,
+            expected_model_generation,
+            position,
+            Instant::now,
+            || {},
+        )
+    }
 
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
+    fn try_enqueue_data_frame_for_dispatch_target_with_apply_clock(
+        &self,
+        target: &ResponseDispatchTarget,
+        frame: &Frame,
+        lane: TrafficClass,
+        expected_model_generation: u64,
+        position: BulkCandidatePosition,
+        apply_now: impl FnOnce() -> Instant,
+        after_reserve: impl FnOnce(),
+    ) -> Result<(), RuntimeError> {
+        let Some((_, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
+            return Err(RuntimeError::SenderServiceBlocked);
+        };
         if !self.response_stream_open.load(Ordering::Acquire) {
             return Err(RuntimeError::SenderServiceBlocked);
         }
@@ -39,23 +59,107 @@ impl ResponseStreamBinding {
                 && entry.path_instance_id == target.path_instance_id
                 && entry.incarnation == target.incarnation
         };
-        let Some(target_index) = outputs.entries.iter().position(target_matches) else {
-            return Err(RuntimeError::SenderServiceBlocked);
+        let target_commands = {
+            let outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            if !self.response_stream_open.load(Ordering::Acquire) {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            outputs
+                .entries
+                .iter()
+                .find(|entry| target_matches(entry))
+                .map(|entry| entry.commands.clone())
+                .ok_or(RuntimeError::SenderServiceBlocked)?
         };
-
-        if self.response_model_generation.load(Ordering::Acquire) != expected_model_generation {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-
-        let target_commands = outputs.entries[target_index].commands.clone();
-        // Reservation is the only fallible mutation. Exact range ownership is
-        // visible before the carrier can dequeue the committed command.
-        // STREAM_DATA carries an explicit offset, so independent streams may
-        // retain their traffic-class priority without changing byte ordering.
+        // The writer's real bounded queue is the native admission and
+        // linearization resource. Dropping this reservation on any exact-model
+        // failure below refunds its permit and pending-byte accounting.
         let command = target_commands.try_reserve_admitted_frame(frame.clone(), lane)?;
-        self.record_validated_original_flight_with_outputs(&mut outputs, target_index, frame);
-        command.commit();
-        Ok(())
+        after_reserve();
+        let native_authority = target_commands.native_rate_authority().cloned();
+        let expected_native_stamp = target.native_authority_stamp;
+        let commit = || {
+            let mut outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            if !self.response_stream_open.load(Ordering::Acquire)
+                || self.response_model_generation.load(Ordering::Acquire)
+                    != expected_model_generation
+            {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            let Some(target_index) = outputs.entries.iter().position(target_matches) else {
+                return Err(RuntimeError::SenderServiceBlocked);
+            };
+            let entry = &outputs.entries[target_index];
+            let native_shape = match expected_native_stamp {
+                Some(stamp) => entry
+                    .native_scheduling_shape
+                    .filter(|shape| shape.stamp() == stamp),
+                None => None,
+            };
+            if expected_native_stamp.is_some() && native_shape.is_none() {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            // Planning is advisory. After real writer reservation, recompute
+            // the exact output at one instant. Native mode uses only the
+            // already-stamped sidecar while its fence is held.
+            let now = apply_now();
+            let assignment = if expected_native_stamp.is_some() {
+                server_native_bulk_output_snapshot_at(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                    native_shape,
+                )
+            } else {
+                server_bulk_output_snapshot_at(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                    now,
+                )
+            };
+            let product_assignment_qualified =
+                server_output_product_assignment_qualified(entry, self.mux_limits);
+            let assignment_authority = bulk_original_data_assignment_authority(
+                assignment,
+                payload_bytes,
+                self.mux_limits,
+                position,
+                product_assignment_qualified,
+            );
+            let product_windows = reliable_bulk_product_windows(self.mux_limits);
+            if outputs
+                .original_data_in_flight_bytes
+                .checked_add(payload_bytes as u64)
+                .is_none_or(|committed| committed > product_windows.stream_resource_limit_bytes)
+                || !assignment_authority
+                    .has_headroom(outputs.entries[target_index].original_data_in_flight_bytes)
+            {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+
+            // Exact range ownership is visible before the carrier can dequeue
+            // the committed command. Lock order for Native is fence ->
+            // coordinator -> outputs -> flights.
+            self.record_validated_original_flight_with_outputs(&mut outputs, target_index, frame)?;
+            command.commit();
+            Ok(())
+        };
+        match (native_authority, expected_native_stamp) {
+            (Some(authority), Some(stamp)) => authority
+                .commit_if_current(stamp, commit)
+                .map_err(|_| RuntimeError::SenderServiceBlocked)?,
+            (None, None) => commit(),
+            _ => Err(RuntimeError::SenderServiceBlocked),
+        }
     }
 }
 

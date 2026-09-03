@@ -122,6 +122,7 @@ pub(super) fn mark_client_path_proof_fresh_for_test(
     context.mark_relay_path_proof_observation(
         instance.key.underlay,
         instance.key.index,
+        instance.path_instance_id,
         PathProofObservation {
             proof_id,
             elapsed,

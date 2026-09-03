@@ -2,13 +2,14 @@ use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IpPacketId, IpTunnelId,
     OffsetRange, PATH_METRICS_MAX_RATE_VALID_FOR_US, PathId, PathMetricDirection, PathMetrics,
     PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode, ResetReason, SessionId,
-    StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    StreamAttachmentPhase, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr,
+    UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 9;
+const VERSION: u8 = 10;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 116;
@@ -135,6 +136,9 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
             16usize.saturating_add(addresses.len().saturating_mul(17))
         }
         Frame::OpenStream { .. } => 128,
+        Frame::StreamReturnPlanFinal {
+            retained_ordinals, ..
+        } => 9usize.saturating_add(retained_ordinals.len()),
         _ => 64,
     }
 }
@@ -347,11 +351,29 @@ fn encode_payload(
             stream_id,
             target,
             demand,
+            return_plan,
         } => {
             put_u64(out, stream_id.0);
             encode_target(out, target, limits)?;
             encode_stream_demand_hint(out, *demand);
+            put_u64(out, return_plan.trigger_bytes);
+            put_u8(out, return_plan.candidate_total);
+            put_u8(out, path_usage_to_u8(return_plan.candidate_tier));
+            put_u8(out, stream_attachment_phase_to_u8(return_plan.phase));
+            put_u8(out, return_plan.candidate_ordinal);
             Ok(FrameKind::OpenStream)
+        }
+        Frame::StreamReturnPlanFinal {
+            stream_id,
+            retained_ordinals,
+        } => {
+            validate_path_count(retained_ordinals.len(), limits)?;
+            let retained_count =
+                u8::try_from(retained_ordinals.len()).map_err(|_| CodecError::LengthOverflow)?;
+            put_u64(out, stream_id.0);
+            put_u8(out, retained_count);
+            out.extend_from_slice(retained_ordinals);
+            Ok(FrameKind::StreamReturnPlanFinal)
         }
         Frame::StreamData {
             stream_id,
@@ -653,7 +675,24 @@ fn decode_payload(
             stream_id: StreamId(reader.get_u64()?),
             target: decode_target(reader, limits)?,
             demand: decode_stream_demand_hint(reader)?,
+            return_plan: StreamReturnPlan {
+                trigger_bytes: reader.get_u64()?,
+                candidate_total: reader.get_u8()?,
+                candidate_tier: path_usage_from_u8(reader.get_u8()?)?,
+                phase: stream_attachment_phase_from_u8(reader.get_u8()?)?,
+                candidate_ordinal: reader.get_u8()?,
+            },
         }),
+        FrameKind::StreamReturnPlanFinal => {
+            let stream_id = StreamId(reader.get_u64()?);
+            let retained_count = usize::from(reader.get_u8()?);
+            validate_path_count(retained_count, limits)?;
+            let retained_ordinals = reader.get_exact(retained_count)?.to_vec();
+            Ok(Frame::StreamReturnPlanFinal {
+                stream_id,
+                retained_ordinals,
+            })
+        }
         FrameKind::StreamData => {
             let stream_id = StreamId(reader.get_u64()?);
             let offset = reader.get_u64()?;
@@ -1346,6 +1385,7 @@ enum FrameKind {
     IpTunnelClose = 41,
     StreamRequalifyData = 42,
     StreamRequalifyAck = 43,
+    StreamReturnPlanFinal = 49,
 }
 
 impl FrameKind {
@@ -1386,6 +1426,7 @@ impl FrameKind {
             41 => Ok(Self::IpTunnelClose),
             42 => Ok(Self::StreamRequalifyData),
             43 => Ok(Self::StreamRequalifyAck),
+            49 => Ok(Self::StreamReturnPlanFinal),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1440,6 +1481,21 @@ fn path_usage_from_u8(value: u8) -> Result<PathUsage, CodecError> {
     match value {
         0 => Ok(PathUsage::Available),
         1 => Ok(PathUsage::Backup),
+        _ => Err(CodecError::InvalidEnum),
+    }
+}
+
+fn stream_attachment_phase_to_u8(value: StreamAttachmentPhase) -> u8 {
+    match value {
+        StreamAttachmentPhase::Startup => 0,
+        StreamAttachmentPhase::Ordinary => 1,
+    }
+}
+
+fn stream_attachment_phase_from_u8(value: u8) -> Result<StreamAttachmentPhase, CodecError> {
+    match value {
+        0 => Ok(StreamAttachmentPhase::Startup),
+        1 => Ok(StreamAttachmentPhase::Ordinary),
         _ => Err(CodecError::InvalidEnum),
     }
 }

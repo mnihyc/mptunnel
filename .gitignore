@@ -1,6 +1,7 @@
 /target
 /lab/benchmarks/target
 /crates/quinn-proto/target
+/crates/quinn/target
 /.tmp
 __pycache__/
 *.py[cod]

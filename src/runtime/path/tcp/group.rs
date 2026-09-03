@@ -711,7 +711,7 @@ impl ClientPathContext {
             let record = health
                 .tcp_record_mut(index)
                 .expect("TCP pool member must have one health record");
-            match state {
+            record.mutate_eligibility(|record| match state {
                 ClientTcpEndpointControlState::Enabled | ClientTcpEndpointControlState::Suspect => {
                     record.invalidate_path_proofs();
                     let retiring = record.has_physical_carrier()
@@ -740,7 +740,7 @@ impl ClientPathContext {
                     record.relay_bytes_in_flight = 0;
                     record.relay_queue_bytes = 0;
                 }
-            }
+            });
         }
         drop(health);
         drop(_policy_commitment);

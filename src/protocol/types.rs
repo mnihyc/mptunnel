@@ -99,7 +99,34 @@ pub enum PathUsage {
     Backup,
 }
 
-/// Largest remaining delivery-rate authority representable by protocol v9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAttachmentPhase {
+    Startup,
+    Ordinary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamReturnPlan {
+    pub trigger_bytes: u64,
+    pub candidate_total: u8,
+    pub candidate_tier: PathUsage,
+    pub phase: StreamAttachmentPhase,
+    pub candidate_ordinal: u8,
+}
+
+impl Default for StreamReturnPlan {
+    fn default() -> Self {
+        Self {
+            trigger_bytes: 0,
+            candidate_total: 1,
+            candidate_tier: PathUsage::Available,
+            phase: StreamAttachmentPhase::Startup,
+            candidate_ordinal: 0,
+        }
+    }
+}
+
+/// Largest remaining delivery-rate authority representable by protocol v10.
 ///
 /// This is the three-PTO horizon at the maximum wire RTT and RTT variance:
 /// `(u32::MAX + 4 * u32::MAX + 25_000us) * 3`. A receiver rejects larger
@@ -264,6 +291,11 @@ pub enum Frame {
         stream_id: StreamId,
         target: TargetAddr,
         demand: StreamDemandHint,
+        return_plan: StreamReturnPlan,
+    },
+    StreamReturnPlanFinal {
+        stream_id: StreamId,
+        retained_ordinals: Vec<u8>,
     },
     StreamData {
         stream_id: StreamId,
@@ -283,7 +315,8 @@ pub enum Frame {
         offset: u64,
         payload: Bytes,
     },
-    /// Exact receipt for `STREAM_REQUALIFY_DATA` on the carrying attachment.
+    /// Exact receipt for `STREAM_REQUALIFY_DATA`. It may return on any
+    /// authenticated attachment of the same logical session.
     StreamRequalifyAck {
         stream_id: StreamId,
         probe_id: u64,
@@ -374,15 +407,6 @@ impl Frame {
         )
     }
 
-    pub fn delivery_evidence_bytes(&self) -> u64 {
-        match self {
-            Self::StreamData { payload, .. } | Self::DatagramData { payload, .. } => {
-                payload.len() as u64
-            }
-            _ => 0,
-        }
-    }
-
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::SessionHello { .. } => "SESSION_HELLO",
@@ -399,6 +423,7 @@ impl Frame {
             Self::PathCapacityFinish { .. } => "PATH_CAPACITY_FINISH",
             Self::PathCapacityReceipt { .. } => "PATH_CAPACITY_RECEIPT",
             Self::OpenStream { .. } => "OPEN_STREAM",
+            Self::StreamReturnPlanFinal { .. } => "STREAM_RETURN_PLAN_FINAL",
             Self::StreamData { .. } => "STREAM_DATA",
             Self::StreamAck { .. } => "STREAM_ACK",
             Self::StreamRequalifyData { .. } => "STREAM_REQUALIFY_DATA",

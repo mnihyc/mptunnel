@@ -19,20 +19,19 @@ use crate::runtime::stream::response::ResponseStreamBinding;
 
 pub(super) type ResponseOutputIdentity = (CarrierPathKey, u64);
 
-/// Native recovery owns the exact original carrier instance. Data-ACK and tail
-/// repair may reuse the best eligible alternate after the live-copy interval;
-/// confirmed path-failure recovery avoids every output already carrying it.
+/// One exact output incarnation may carry at most one unresolved copy of the
+/// same Product range.
+///
+/// Native suppression deadlines only make a different exact incarnation
+/// eligible for recovery. They do not authorize another copy behind the same
+/// obstruction; the accepted copy retains that target's K until DataACK or
+/// target terminal/detach.
 pub(super) fn response_reinjection_avoid_outputs(
     binding: &ResponseStreamBinding,
     frame: &Frame,
     cause: RelaySendCause,
 ) -> Vec<ResponseOutputIdentity> {
-    if cause.is_ack_gap_reinjection()
-        || cause == RelaySendCause::TailReinjection
-        || matches!(cause, RelaySendCause::StaleResponsePathReinjection(_))
-    {
-        binding.original_flight_outputs_overlapping_frame(frame)
-    } else if cause.is_reinjection() {
+    if cause.is_reinjection() {
         binding.flight_outputs_overlapping_frame(frame)
     } else {
         Vec::new()

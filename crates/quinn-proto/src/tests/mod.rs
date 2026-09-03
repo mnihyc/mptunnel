@@ -4,8 +4,8 @@ use std::{
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
 };
 
@@ -22,20 +22,23 @@ use rustls::crypto::aws_lc_rs::default_provider;
 #[cfg(feature = "rustls-ring")]
 use rustls::crypto::ring::default_provider;
 use rustls::{
-    AlertDescription, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     server::WebPkiClientVerifier,
+    AlertDescription, RootCertStore,
 };
 use tracing::info;
 
 use super::*;
 use crate::{
-    Duration, Instant,
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
-    congestion::{Controller, ControllerFactory, ControllerMetrics, SpaceId},
+    congestion::{
+        Controller, ControllerActivation, ControllerActivationFence, ControllerFactory,
+        ControllerMetrics, SpaceId,
+    },
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     transport_parameters::TransportParameters,
+    Duration, Instant,
 };
 mod util;
 use util::*;
@@ -1254,6 +1257,157 @@ fn server_hs_retransmit() {
     );
 }
 
+#[derive(Debug)]
+struct ActivationTraceOwner {
+    fence: ControllerActivationFence,
+    next_controller_identity: AtomicU64,
+    published: AtomicU64,
+    mutate_next_send_rate: AtomicU64,
+}
+
+impl Default for ActivationTraceOwner {
+    fn default() -> Self {
+        Self {
+            fence: ControllerActivationFence::new(),
+            next_controller_identity: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            mutate_next_send_rate: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ActivationTraceOwner {
+    fn allocate_controller_identity(&self) -> u64 {
+        self.next_controller_identity
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+}
+
+#[derive(Debug)]
+struct ActivationTraceController {
+    owner: Arc<ActivationTraceOwner>,
+    controller_identity: u64,
+    activation: Option<ControllerActivation>,
+    operational_rate: u64,
+}
+
+impl ActivationTraceController {
+    fn new(owner: Arc<ActivationTraceOwner>) -> Self {
+        let controller_identity = owner.allocate_controller_identity();
+        Self {
+            owner,
+            controller_identity,
+            activation: None,
+            operational_rate: 100,
+        }
+    }
+}
+
+impl Controller for ActivationTraceController {
+    fn activation_fence(&self) -> Option<ControllerActivationFence> {
+        Some(self.owner.fence.clone())
+    }
+
+    fn on_activated(&mut self, activation: ControllerActivation) {
+        self.activation = Some(activation);
+    }
+
+    fn on_activation_published(&self) {
+        self.owner.published.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_sent(&mut self, _now: Instant, _bytes: u64, _last_packet_number: u64) {
+        let rate = self.owner.mutate_next_send_rate.swap(0, Ordering::Relaxed);
+        if rate != 0 {
+            self.operational_rate = rate;
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: SpaceId,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        u64::MAX / 2
+    }
+
+    fn metrics(&self) -> ControllerMetrics {
+        ControllerMetrics {
+            congestion_window: self.window(),
+            bandwidth_estimate: Some(self.operational_rate),
+            ..ControllerMetrics::default()
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(Self {
+            owner: self.owner.clone(),
+            controller_identity: self.controller_identity,
+            activation: self.activation,
+            operational_rate: self.operational_rate,
+        })
+    }
+
+    fn fresh_path_box(&self, _now: Instant, _current_mtu: u16) -> Option<Box<dyn Controller>> {
+        Some(Box::new(Self::new(self.owner.clone())))
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct ActivationTraceFactory(Arc<ActivationTraceOwner>);
+
+impl ControllerFactory for ActivationTraceFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(ActivationTraceController::new(self.0.clone()))
+    }
+}
+
+fn activation_traced_server_config(owner: Arc<ActivationTraceOwner>) -> ServerConfig {
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(ActivationTraceFactory(owner)));
+    let mut config = server_config();
+    config.transport = Arc::new(transport);
+    config
+}
+
+fn active_activation_trace(connection: &Connection) -> ActivationTraceController {
+    let expected_rtt = connection.rtt();
+    let expected_flight = connection.bytes_in_flight();
+    let snapshot = connection.active_path_snapshot();
+    assert_eq!(
+        snapshot.smoothed_rtt, expected_rtt,
+        "one active-path read returns the current PathData RTT"
+    );
+    assert_eq!(
+        snapshot.bytes_in_flight, expected_flight,
+        "one active-path read returns the current PathData flight"
+    );
+    *snapshot
+        .congestion
+        .into_any()
+        .downcast::<ActivationTraceController>()
+        .expect("activation trace controller")
+}
+
 #[test]
 fn migration() {
     let _guard = subscribe();
@@ -1293,6 +1447,168 @@ fn migration() {
         client_stats_after_migrate.frame_tx.immediate_ack
             - client_stats_after_connect.frame_tx.immediate_ack,
         1
+    );
+}
+
+#[test]
+fn failed_migration_reactivates_the_previous_controller_epoch() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let initial = pair.server_conn_mut(server_ch).active_controller_epoch();
+
+    // A different IP is a fresh network path, rather than an IPv4 NAT
+    // rebinding. Deliver only the initiating packet; all validation traffic is
+    // dropped below so the deterministic PathValidation timer must roll back.
+    pair.client.addr = SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, 1).into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.drive_server();
+    pair.client.inbound.clear();
+
+    let tentative = pair.server_conn_mut(server_ch).active_controller_epoch();
+    assert_ne!(
+        tentative, initial,
+        "a different IP creates a fresh controller"
+    );
+
+    for _ in 0..32 {
+        let Some(next) = pair.server.next_wakeup() else {
+            break;
+        };
+        pair.time = next;
+        pair.server.drive_outgoing(pair.time);
+        pair.server.outbound.clear();
+        if pair.server_conn_mut(server_ch).active_controller_epoch() == initial {
+            break;
+        }
+    }
+
+    assert_eq!(
+        pair.server_conn_mut(server_ch).active_controller_epoch(),
+        initial,
+        "failed path validation restores the parked controller identity"
+    );
+}
+
+#[test]
+fn same_identity_clone_and_rollback_receive_distinct_activations() {
+    let _guard = subscribe();
+    let owner = Arc::new(ActivationTraceOwner::default());
+    let mut pair = Pair::new(
+        Arc::new(EndpointConfig::default()),
+        activation_traced_server_config(owner.clone()),
+    );
+    // Start on IPv4 so changing only the port selects PathData::from_previous.
+    pair.client.addr = SocketAddr::new(
+        Ipv4Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let initial = active_activation_trace(pair.server_conn_mut(server_ch));
+    let initial_a = initial.activation.expect("initial activation");
+    assert_eq!(initial.operational_rate, 100);
+    let publishes_before_inspection = owner.published.load(Ordering::Relaxed);
+    let inspected = active_activation_trace(pair.server_conn_mut(server_ch));
+    assert_eq!(inspected.activation, Some(initial_a));
+    assert_eq!(inspected.controller_identity, initial.controller_identity);
+    assert_eq!(inspected.operational_rate, initial.operational_rate);
+    assert_eq!(
+        owner.published.load(Ordering::Relaxed),
+        publishes_before_inspection,
+        "inspection clone must not activate or publish"
+    );
+
+    pair.client
+        .addr
+        .set_port(CLIENT_PORTS.lock().unwrap().next().unwrap());
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    owner.mutate_next_send_rate.store(200, Ordering::Relaxed);
+    pair.drive_server();
+    pair.client.inbound.clear();
+
+    let candidate = active_activation_trace(pair.server_conn_mut(server_ch));
+    let candidate_a = candidate.activation.expect("candidate activation");
+    assert_ne!(candidate_a, initial_a);
+    assert_eq!(
+        candidate.controller_identity, initial.controller_identity,
+        "same-IP from_previous clone preserves controller lineage I"
+    );
+    assert_eq!(
+        candidate.operational_rate, 200,
+        "the active clone can diverge without mutating the parked original"
+    );
+
+    for _ in 0..32 {
+        let Some(next) = pair.server.next_wakeup() else {
+            break;
+        };
+        pair.time = next;
+        pair.server.drive_outgoing(pair.time);
+        pair.server.outbound.clear();
+        let restored = active_activation_trace(pair.server_conn_mut(server_ch));
+        if restored.activation != Some(candidate_a) {
+            break;
+        }
+    }
+
+    let restored = active_activation_trace(pair.server_conn_mut(server_ch));
+    let restored_a = restored.activation.expect("restored activation");
+    assert_ne!(restored_a, initial_a);
+    assert_ne!(restored_a, candidate_a);
+    assert_eq!(restored.controller_identity, initial.controller_identity);
+    assert_eq!(
+        restored.operational_rate, 100,
+        "the atomic active-path snapshot follows the parked original after rollback instead of fusing the candidate's B_op into restored PathData"
+    );
+}
+
+#[test]
+fn explicit_path_reset_installs_one_fresh_controller_activation() {
+    let _guard = subscribe();
+    let owner = Arc::new(ActivationTraceOwner::default());
+    let mut pair = Pair::new(
+        Arc::new(EndpointConfig::default()),
+        activation_traced_server_config(owner.clone()),
+    );
+    let (_client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    let initial = active_activation_trace(pair.server_conn_mut(server_ch));
+    let initial_a = initial.activation.expect("initial activation");
+    let publishes_before_reset = owner.published.load(Ordering::Relaxed);
+
+    let now = pair.time;
+    pair.server_conn_mut(server_ch).path_changed(now);
+
+    let reset = active_activation_trace(pair.server_conn_mut(server_ch));
+    assert_ne!(reset.activation, Some(initial_a));
+    assert_ne!(
+        reset.controller_identity, initial.controller_identity,
+        "an explicit network-path reset creates a fresh controller lineage"
+    );
+    assert_eq!(
+        owner.published.load(Ordering::Relaxed),
+        publishes_before_reset + 1,
+        "one reset must publish exactly one successor activation"
+    );
+
+    let publishes_before_inspection = owner.published.load(Ordering::Relaxed);
+    let inspected = active_activation_trace(pair.server_conn_mut(server_ch));
+    assert_eq!(inspected.activation, reset.activation);
+    assert_eq!(inspected.controller_identity, reset.controller_identity);
+    assert_eq!(
+        owner.published.load(Ordering::Relaxed),
+        publishes_before_inspection,
+        "inspection after reset must not advance activation"
     );
 }
 
@@ -1550,10 +1866,9 @@ fn bounded_keep_alive_renewal_spans_the_configured_window() {
     );
     for sample in [1, u64::MAX / 4, u64::MAX / 2, 3 * (u64::MAX / 4)] {
         assert!(
-            (minimum..=maximum)
-                .contains(&crate::connection::bounded_renewal_delay(
-                    minimum, maximum, sample
-                ))
+            (minimum..=maximum).contains(&crate::connection::bounded_renewal_delay(
+                minimum, maximum, sample
+            ))
         );
     }
 }
@@ -1659,8 +1974,8 @@ fn cid_rotation() {
     let mut stop = pair.time;
     let end = pair.time + 5 * CID_TIMEOUT;
 
-    use crate::LOC_CID_COUNT;
     use crate::cid_queue::CidQueue;
+    use crate::LOC_CID_COUNT;
     let mut active_cid_num = CidQueue::LEN as u64 + 1;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
     let mut left_bound = 0;
@@ -1707,8 +2022,8 @@ fn cid_retirement() {
     assert!(!pair.server_conn_mut(server_ch).is_closed());
     assert_matches!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
 
-    use crate::LOC_CID_COUNT;
     use crate::cid_queue::CidQueue;
+    use crate::LOC_CID_COUNT;
     let mut active_cid_num = CidQueue::LEN as u64;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
 
@@ -3561,6 +3876,7 @@ fn preferred_address() {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ControllerTraceEvent {
+    ApplicationReady,
     Ack {
         space: SpaceId,
         packet_number: u64,
@@ -3579,6 +3895,13 @@ struct ControllerTrace {
 }
 
 impl Controller for ControllerTrace {
+    fn on_application_ready(&mut self) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ControllerTraceEvent::ApplicationReady);
+    }
+
     fn on_ack(
         &mut self,
         _now: Instant,
@@ -3589,14 +3912,11 @@ impl Controller for ControllerTrace {
         _app_limited: bool,
         _rtt: &RttEstimator,
     ) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(ControllerTraceEvent::Ack {
-                space,
-                packet_number,
-                bytes,
-            });
+        self.events.lock().unwrap().push(ControllerTraceEvent::Ack {
+            space,
+            packet_number,
+            bytes,
+        });
     }
 
     fn on_end_acks(
@@ -3608,13 +3928,10 @@ impl Controller for ControllerTrace {
         space: SpaceId,
     ) {
         if let Some(largest_packet_number) = largest_packet_num_acked {
-            self.events
-                .lock()
-                .unwrap()
-                .push(ControllerTraceEvent::End {
-                    space,
-                    largest_packet_number,
-                });
+            self.events.lock().unwrap().push(ControllerTraceEvent::End {
+                space,
+                largest_packet_number,
+            });
         }
     }
 
@@ -3674,6 +3991,26 @@ fn traced_client_config(events: Arc<Mutex<Vec<ControllerTraceEvent>>>) -> Client
     let mut config = client_config();
     config.transport = Arc::new(transport);
     config
+}
+
+#[test]
+fn application_ready_notifies_the_active_controller_without_changing_app_limited_state() {
+    let _guard = subscribe();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(traced_client_config(events.clone()));
+    events.lock().unwrap().clear();
+
+    let connection = pair.client_conn_mut(client_ch);
+    let app_limited_before = connection.active_path_snapshot().app_limited;
+    connection.mark_application_ready();
+    let app_limited_after = connection.active_path_snapshot().app_limited;
+
+    assert_eq!(app_limited_after, app_limited_before);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [ControllerTraceEvent::ApplicationReady]
+    );
 }
 
 #[test]

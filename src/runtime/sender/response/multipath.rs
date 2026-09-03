@@ -5,11 +5,12 @@
 //! flight generation before publishing the carrier command.
 
 use super::scheduling::select_response_data_path_with_payload;
-use crate::model::admission::ReliableDataAckFrontierState;
+use crate::model::acquisition_cursor::AcquisitionSnapshot;
+use crate::model::admission::{BulkCandidatePosition, ReliableDataAckFrontierState};
 use crate::model::path::CarrierPathKey;
 use crate::model::work::ReliableWorkClass;
 use crate::runtime::RuntimeError;
-use crate::runtime::stream::response::ResponseDispatchTarget;
+use crate::runtime::stream::response::{ResponseAcquisitionOutputId, ResponseDispatchTarget};
 use crate::runtime::stream::{
     ReliablePathStream, ReliablePathStreamOutput, reliable_work_lane_to_carrier_lane,
 };
@@ -22,6 +23,7 @@ pub(super) enum ResponseDataDispatchTarget {
     Switchable {
         target: ResponseDispatchTarget,
         expected_model_generation: u64,
+        position: BulkCandidatePosition,
     },
 }
 
@@ -68,10 +70,32 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
     data_ack_outstanding_bytes: usize,
     frontier_state: ReliableDataAckFrontierState,
 ) -> Result<(usize, ResponseDataDispatchTarget), RuntimeError> {
+    plan_response_data_payload_with_acquisition_guard(
+        stream,
+        relay_lane,
+        next_offset,
+        payload_bytes,
+        data_ack_outstanding_bytes,
+        frontier_state,
+        None,
+    )
+}
+
+pub(super) fn plan_response_data_payload_with_acquisition_guard(
+    stream: &ReliablePathStream,
+    relay_lane: TrafficClass,
+    next_offset: u64,
+    payload_bytes: usize,
+    data_ack_outstanding_bytes: usize,
+    frontier_state: ReliableDataAckFrontierState,
+    acquisition: Option<&AcquisitionSnapshot<ResponseAcquisitionOutputId>>,
+) -> Result<(usize, ResponseDataDispatchTarget), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
             let lane = reliable_work_lane_to_carrier_lane(ReliableWorkClass::Data, relay_lane);
-            if !fixed.commands().can_enqueue_lane_now(lane) {
+            if !fixed.commands().can_enqueue_lane_now(lane)
+                || !fixed.can_assign_original_data(relay_lane)
+            {
                 return Err(RuntimeError::SenderServiceBlocked);
             }
             Ok((
@@ -85,7 +109,14 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
             // snapshot assembled across two generations.
             let expected_model_generation = binding.response_model_generation();
             let lower_flights = binding.lower_flights_before_offset(next_offset);
-            let targets = binding.sender_path_targets(relay_lane, payload_bytes);
+            let mut targets = binding.sender_path_targets(relay_lane, payload_bytes);
+            if let Some(acquisition) = acquisition {
+                targets.retain(|target| {
+                    acquisition.ordinary_target_preserves_acquisition(
+                        &ResponseAcquisitionOutputId::from(target),
+                    )
+                });
+            }
             let selection = select_response_data_path_with_payload(
                 &targets,
                 relay_lane,
@@ -101,6 +132,7 @@ pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
                 ResponseDataDispatchTarget::Switchable {
                     target: selection.target.into(),
                     expected_model_generation,
+                    position: selection.position,
                 },
             ))
         }

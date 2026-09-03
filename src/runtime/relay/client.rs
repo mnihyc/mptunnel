@@ -15,8 +15,9 @@ use super::lifecycle::RelayAdditionalPathOpenTask;
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::timing::{reliable_data_ack_gap_timing, reliable_data_retransmission_interval};
-use crate::model::work::reliable_reinjection_service_limit_bytes;
+use crate::model::timing::reliable_data_ack_gap_timing;
+use crate::model::work::{ReliableReinjectionTargetWork, reliable_reinjection_service_limit_bytes};
+use crate::mux::MuxLimits;
 use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
 use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
@@ -327,13 +328,41 @@ pub(super) fn apply_client_stream_data_state(
         payload_len,
     )?;
     #[cfg(feature = "lab-diagnostics")]
+    let frontier_before = recv_stream.next_offset();
+    #[cfg(feature = "lab-diagnostics")]
+    let reorder_before = recv_stream.reorder_bytes();
+    #[cfg(feature = "lab-diagnostics")]
     let mux_started = Instant::now();
     let outcome = recv_stream
         .receive_data(offset, payload)
         .map_err(RuntimeError::Stream)?;
     #[cfg(feature = "lab-diagnostics")]
     {
+        let frontier_after = recv_stream.next_offset();
         let reorder_bytes = recv_stream.reorder_bytes();
+        if reorder_before > 0 && frontier_after > frontier_before {
+            let released_bytes = outcome
+                .delivered
+                .iter()
+                .map(bytes::Bytes::len)
+                .sum::<usize>();
+            lab_diagnostic(
+                "receive_hole_release",
+                format_args!(
+                    "stream_id={} source_underlay={:?} source_path_index={} frame_start={} frame_end={} frontier_before={} frontier_after={} reorder_before={} reorder_after={} released_bytes={}",
+                    stream_id.0,
+                    path_key.underlay,
+                    path_key.index,
+                    offset,
+                    offset.saturating_add(payload_len as u64),
+                    frontier_before,
+                    frontier_after,
+                    reorder_before,
+                    reorder_bytes,
+                    released_bytes,
+                ),
+            );
+        }
         if reorder_bytes > 0 {
             let ack_summary = recv_stream.ack_range_summary();
             let hole_state = (
@@ -393,15 +422,15 @@ pub(super) struct ClientStreamAckContext<'a> {
     pub(super) sender: &'a mut RequestSenderService,
     pub(super) sender_queue: &'a mut ReliableRelaySenderQueue,
     pub(super) context: &'a ClientPathContext,
-    pub(super) remotes: &'a ReliableRelayRemoteSet,
+    pub(super) remotes: &'a mut ReliableRelayRemoteSet,
     pub(super) send_stream: &'a mut ReliableSendStream,
     pub(super) path_snapshot: Option<PathSnapshot>,
     pub(super) relay_lane: TrafficClass,
 }
 
-/// Runs exact-attachment stale-path decisions on both Data ACK events and
-/// relay timer ticks. A path that stops every ACK must still become stale;
-/// TCP and QUIC continue to own recovery of their already-emitted flights.
+/// Runs exact-attachment stale-path decisions for OriginalData omitted below a
+/// complete authoritative Data ACK horizon. TCP and QUIC continue to own
+/// recovery of their already-emitted flights.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_request_path_staleness(
     state: &mut ClientRelayState,
@@ -409,6 +438,7 @@ pub(super) fn update_request_path_staleness(
     context: &ClientPathContext,
     remotes: &ReliableRelayRemoteSet,
     data_ack_progress_paths: &[RelayPathInstance],
+    lane: TrafficClass,
     stream_id: StreamId,
 ) -> bool {
     let authoritative_horizon = state.progress.last_send_ack.horizon().unwrap_or(0);
@@ -419,7 +449,7 @@ pub(super) fn update_request_path_staleness(
         .map(|candidate| {
             ReliablePathStalenessObservation::new(
                 candidate,
-                sender.request_path_has_reinjection_path(remotes, candidate),
+                sender.request_path_has_reinjection_path(context, remotes, candidate, lane),
                 Some(candidate.key.underlay),
                 context.reliable_path_snapshot_for_instance(candidate),
             )
@@ -431,7 +461,7 @@ pub(super) fn update_request_path_staleness(
         .stale_paths(&observations, data_ack_progress_paths);
     let mut marked_stale = false;
     for stale_path in stale_paths {
-        if !sender.mark_request_path_stale(remotes, stale_path) {
+        if !sender.mark_request_path_stale(context, remotes, stale_path, lane) {
             continue;
         }
         marked_stale = true;
@@ -460,6 +490,23 @@ pub(super) struct ClientDataAckReinjectionOutcome {
     pub(super) persistent_ready: bool,
     pub(super) has_multipath_alternative: bool,
     pub(super) has_measured_target: bool,
+    pub(super) target_service_exhausted: bool,
+}
+
+fn request_target_reinjection_service_limit(
+    target: RelayPathInstance,
+    snapshot: PathSnapshot,
+    sender_queue: &ReliableRelaySenderQueue,
+    accepted_reinjection_bytes: usize,
+    reinjection_debt_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let queued = sender_queue.request_target_queued_reinjection_bytes(target, false);
+    reliable_reinjection_service_limit_bytes(
+        ReliableReinjectionTargetWork::new(Some(snapshot), queued, accepted_reinjection_bytes),
+        reinjection_debt_bytes,
+        mux_limits,
+    )
 }
 
 /// Evaluates retained authoritative Data ACK evidence against the exact
@@ -477,7 +524,8 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     relay_lane: TrafficClass,
     stream_id: StreamId,
 ) -> ClientDataAckReinjectionOutcome {
-    let has_multipath_reinjection_alternative = remotes.path_keys().len() > 1;
+    let has_multipath_reinjection_alternative =
+        sender.has_multipath_reinjection_alternative(context, remotes, relay_lane);
     let authoritative_ack_complete = state.progress.last_send_ack.complete();
     let authoritative_ack_ranges = state.progress.last_send_ack.ranges();
     if !stream_ack_ranges_expose_authoritative_gap(
@@ -507,6 +555,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         context,
         remotes,
         send_stream,
+        sender_queue,
         authoritative_ack_ranges,
         base_reinjection_limit,
         relay_lane,
@@ -539,12 +588,6 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     );
     let measured_reinjection_ready =
         candidate_gap_deadline.is_some_and(|deadline| observed_at >= deadline);
-    let reinjection_retry_after = reinjection_target.map_or_else(
-        || reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing),
-        |(_, snapshot)| {
-            reliable_data_retransmission_interval(Some(snapshot.underlay), Some(snapshot))
-        },
-    );
     let ack_gap_reinjection_ready = state.progress.ack_gap_reinjection.reinjection_ready(
         authoritative_ack_complete,
         authoritative_ack_ranges,
@@ -556,10 +599,16 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     // Persistent authoritative evidence may fill one measured target service
     // window despite optional duplicate-budget exhaustion. Missing, failed, or
     // declared-stale owners retain their separate exact-range recovery.
-    let reinjection_limit = if persistent_ack_gap_reinjection_ready {
-        reliable_reinjection_service_limit_bytes(
-            reinjection_target.map(|(_, snapshot)| snapshot),
-            sender_queue.bytes(),
+    let reinjection_limit = if reinjection.target_service_exhausted {
+        0
+    } else if persistent_ack_gap_reinjection_ready {
+        let (target, snapshot) =
+            reinjection_target.expect("persistent reinjection requires a measured path");
+        request_target_reinjection_service_limit(
+            target.instance(),
+            snapshot,
+            sender_queue,
+            reinjection.reinjection_target_flight_bytes,
             send_stream.reinjection_bytes(),
             context.mux_limits,
         )
@@ -585,9 +634,17 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     let frame_count = reinjection_frames.len();
     let persistent_ack_gap_reinjection =
         persistent_ack_gap_reinjection_ready && !reinjection_frames.is_empty();
-    let mut queued_persistent_ack_gap_reinjection = false;
-    for frame in reinjection_frames {
-        let queued = if sender_queue.has_queued_reinjection_overlap(&frame) {
+    let mut accepted_copy_deadline = None::<Instant>;
+    for (frame_index, frame) in reinjection_frames.into_iter().enumerate() {
+        let live_copy_deadline = sender.reinjection_suppression_deadline_for_frame(&frame, remotes);
+        accepted_copy_deadline = match (accepted_copy_deadline, live_copy_deadline) {
+            (Some(current), Some(deadline)) => Some(current.min(deadline)),
+            (None, deadline) => deadline,
+            (current, None) => current,
+        };
+        let queued = if live_copy_deadline.is_some()
+            || sender_queue.has_queued_reinjection_overlap(&frame)
+        {
             false
         } else if persistent_ack_gap_reinjection {
             sender.enqueue_critical_reinjection_frame(
@@ -614,15 +671,10 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             ),
         );
         if queued {
-            queued_persistent_ack_gap_reinjection |= persistent_ack_gap_reinjection_ready;
             state.progress.sender_retry_at = None;
+        } else if frame_index == 0 {
+            break;
         }
-    }
-    if queued_persistent_ack_gap_reinjection {
-        state
-            .progress
-            .ack_gap_reinjection
-            .record_reinjection_queued(reinjection_retry_after);
     }
     let timer_active = stream_ack_ranges_expose_authoritative_gap(
         authoritative_ack_complete,
@@ -637,17 +689,23 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         .progress
         .ack_gap_reinjection
         .next_reinjection_deadline();
-    state.progress.data_ack_reinjection_at = timer_active
+    let candidate_wake = timer_active
         .then_some(next_deadline)
         .flatten()
         .filter(|deadline| *deadline > observed_at)
         .map(tokio::time::Instant::from_std);
+    let accepted_copy_wake = accepted_copy_deadline.map(tokio::time::Instant::from_std);
+    state.progress.data_ack_reinjection_at =
+        candidate_wake.into_iter().chain(accepted_copy_wake).min();
 
     ClientDataAckReinjectionOutcome {
         frame_count,
         persistent_ready: persistent_ack_gap_reinjection_ready,
         has_multipath_alternative: has_multipath_reinjection_alternative,
         has_measured_target: has_measured_reinjection_target,
+        target_service_exhausted: ack_gap_reinjection_ready
+            && reinjection.target_service_exhausted
+            && send_stream.reinjection_bytes() > 0,
     }
 }
 
@@ -688,6 +746,9 @@ pub(super) fn apply_client_stream_ack(
     let previous_reinjection_bytes = send_stream.reinjection_bytes();
     let ack_outcome =
         sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?;
+    for instance in ack_outcome.idle_original_data_instances.iter().copied() {
+        remotes.depublish_path_instance_load(instance);
+    }
     update_reinjection_authoritative_ack_snapshot(
         &mut state.progress.last_send_ack,
         &validated_ack,
@@ -702,6 +763,7 @@ pub(super) fn apply_client_stream_ack(
         context,
         remotes,
         &data_ack_progress_paths,
+        relay_lane,
         stream_id,
     );
     let reinjection = evaluate_client_data_ack_reinjection(

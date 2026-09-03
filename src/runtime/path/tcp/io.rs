@@ -14,7 +14,7 @@ use crate::transport::encrypted::{
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub(in crate::runtime) type EncryptedTcpReader = EncryptedFramedReader<TcpStream>;
 pub(in crate::runtime) type EncryptedTcpWriter = EncryptedFramedWriter<TcpStream>;
@@ -23,33 +23,12 @@ pub(in crate::runtime) type EncryptedTcpWriter = EncryptedFramedWriter<TcpStream
 /// actor delivery. Session-wide terminal publication uses this boundary so a
 /// blocked ordered writer cannot defer a peer SESSION_CLOSE behind its write.
 pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_observer<Observe>(
-    reader: EncryptedTcpReader,
-    queue_size: usize,
-    mut observe: Observe,
-) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>
-where
-    Observe: FnMut(&Frame) + Send + 'static,
-{
-    spawn_encrypted_tcp_reader_with_observers(
-        reader,
-        queue_size,
-        move |frame| observe(frame),
-        |_| {},
-    )
-}
-
-/// Adds an out-of-band native-terminal observer to the authenticated reader.
-/// The terminal callback runs immediately after a read/decode error and before
-/// delivery of that error through a bounded actor queue can block.
-pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_observers<Observe, ObserveTerminal>(
     mut reader: EncryptedTcpReader,
     queue_size: usize,
     mut observe: Observe,
-    mut observe_terminal: ObserveTerminal,
 ) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>
 where
     Observe: FnMut(&Frame) + Send + 'static,
-    ObserveTerminal: FnMut(&EncryptedFramedTransportError) + Send + 'static,
 {
     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
     tokio::spawn(async move {
@@ -60,8 +39,6 @@ where
             };
             if let Ok(frame) = frame.as_ref() {
                 observe(frame);
-            } else if let Err(error) = frame.as_ref() {
-                observe_terminal(error);
             }
             let done = frame.is_err();
             #[cfg(feature = "lab-diagnostics")]
@@ -81,6 +58,61 @@ where
         }
     });
     frames_rx
+}
+
+/// Separates successful ordered frames from the server's owned native result.
+///
+/// The terminal callback freezes Product admission before the exact transport
+/// error is moved through an unbounded one-shot result plane. A full ordered
+/// frame queue therefore cannot defer carrier retirement or erase the prior
+/// peer-close versus encrypted-error classification.
+pub(in crate::runtime) fn spawn_encrypted_tcp_reader_with_terminal_result<
+    Observe,
+    ObserveTerminal,
+>(
+    mut reader: EncryptedTcpReader,
+    queue_size: usize,
+    mut observe: Observe,
+    mut observe_terminal: ObserveTerminal,
+) -> (
+    mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    oneshot::Receiver<EncryptedFramedTransportError>,
+)
+where
+    Observe: FnMut(&Frame) + Send + 'static,
+    ObserveTerminal: FnMut(&EncryptedFramedTransportError) + Send + 'static,
+{
+    let (frames_tx, frames_rx) = mpsc::channel(queue_size);
+    let (terminal_tx, terminal_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            let frame = tokio::select! {
+                _ = frames_tx.closed() => break,
+                frame = reader.read_frame() => frame,
+            };
+            match frame {
+                Ok(frame) => {
+                    observe(&frame);
+                    #[cfg(feature = "lab-diagnostics")]
+                    let bytes = reliable_path_frame_pacing_bytes(&frame);
+                    #[cfg(feature = "lab-diagnostics")]
+                    let started = Instant::now();
+                    let send_result = frames_tx.send(Ok(frame)).await;
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_perf_record("runtime.tcp_reader.queue_send", started.elapsed(), bytes);
+                    if send_result.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    observe_terminal(&error);
+                    let _ = terminal_tx.send(error);
+                    break;
+                }
+            }
+        }
+    });
+    (frames_rx, terminal_rx)
 }
 
 pub(in crate::runtime) fn encrypted_framed_peer_closed(
@@ -129,15 +161,15 @@ mod tests {
         let mut client = client.expect("client protected carrier");
         let server = server.expect("server protected carrier");
         let (server_reader, _server_writer) = server.split().expect("split protected carrier");
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        let mut terminal_tx = Some(terminal_tx);
-        let mut frames = spawn_encrypted_tcp_reader_with_observers(
+        let (observed_terminal_tx, observed_terminal_rx) = oneshot::channel();
+        let mut observed_terminal_tx = Some(observed_terminal_tx);
+        let (mut frames, native_terminal) = spawn_encrypted_tcp_reader_with_terminal_result(
             server_reader,
             1,
             |_| {},
             move |_| {
-                if let Some(terminal_tx) = terminal_tx.take() {
-                    let _ = terminal_tx.send(());
+                if let Some(observed_terminal_tx) = observed_terminal_tx.take() {
+                    let _ = observed_terminal_tx.send(());
                 }
             },
         );
@@ -149,10 +181,18 @@ mod tests {
         client.flush().await.expect("flush frame before terminal");
         drop(client);
 
-        tokio::time::timeout(Duration::from_secs(5), terminal_rx)
+        tokio::time::timeout(Duration::from_secs(5), observed_terminal_rx)
             .await
             .expect("native terminal observer timeout")
             .expect("native terminal observer dropped");
+        let native_error = tokio::time::timeout(Duration::from_secs(5), native_terminal)
+            .await
+            .expect("native terminal result timeout")
+            .expect("native terminal result dropped");
+        assert!(
+            encrypted_framed_peer_closed(&native_error),
+            "ordinary authenticated peer EOF must retain its exact close classification"
+        );
         assert!(matches!(
             frames
                 .try_recv()

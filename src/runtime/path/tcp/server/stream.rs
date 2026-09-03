@@ -10,7 +10,9 @@ use crate::model::capacity::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
-use crate::protocol::{Frame, PathId, SessionId, StreamDemandHint, StreamId, TargetAddr};
+use crate::protocol::{
+    Frame, PathId, SessionId, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
@@ -45,6 +47,7 @@ impl ServerTcpStreamState {
         stream_id: StreamId,
         target: TargetAddr,
         demand: StreamDemandHint,
+        return_plan: StreamReturnPlan,
     ) -> Result<Option<Frame>, RuntimeError> {
         let response = match context
             .reliable_streams
@@ -53,6 +56,7 @@ impl ServerTcpStreamState {
                 stream_id,
                 target,
                 initial_demand: demand,
+                return_plan,
                 attachment: ServerStreamPathAttachment {
                     path_registration: path_registration.clone(),
                     commands: commands.clone(),

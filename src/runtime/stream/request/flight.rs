@@ -3,6 +3,7 @@
 //! Original and reinjected ranges remain keyed by exact attachment instance so
 //! Data ACK attribution cannot cross a reconnect boundary.
 
+use super::state::RequestProductQualificationReceipt;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::work::{
     CarrierWorkKind, RangeRecoveryState, ambiguous_flight_intervals, flight_interval_bytes,
@@ -13,17 +14,21 @@ use crate::protocol::frame::{
 };
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use smallvec::SmallVec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RequestPathRelease {
     pub(in crate::runtime) instance: RelayPathInstance,
+    pub(in crate::runtime) range: OffsetRange,
     pub(in crate::runtime) bytes: usize,
+    pub(in crate::runtime) kind: CarrierWorkKind,
     pub(in crate::runtime) sent_at: Instant,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) elapsed: Duration,
     pub(in crate::runtime) path_proving: bool,
+    /// Exact qualification authority clipped to this released interval.
+    pub(in crate::runtime) qualification: Option<RequestProductQualificationReceipt>,
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +36,15 @@ pub(in crate::runtime) struct RequestFlightLedger {
     // OriginalData identifies the ordered path; ReinjectedData remains a duplicate.
     // Exact attachment instances fence ACK evidence across path replacement.
     flights: BTreeMap<u64, Vec<RequestFlight>>,
+    /// Exact un-DataACKed OriginalData bytes across this logical stream.
+    ///
+    /// The serialized request sender is the only mutation owner. Keeping this
+    /// aggregate beside the range ledger makes the shared Product-window apply
+    /// check O(1) instead of rescanning every outstanding range per quantum.
+    original_data_in_flight_bytes: u64,
+    /// Exact un-DataACKed OriginalData bytes by physical attachment instance.
+    /// Reconnect successors must start at zero even when they reuse a path key.
+    original_data_in_flight_bytes_by_instance: HashMap<RelayPathInstance, u64>,
 }
 
 impl RequestFlightLedger {
@@ -61,7 +75,7 @@ impl RequestFlightLedger {
         instance: RelayPathInstance,
         frame: &Frame,
     ) -> usize {
-        self.record_original_frame_instance_with_evidence(instance, frame, true)
+        self.record_original_frame_instance_with_evidence(instance, frame, true, None)
     }
 
     pub(in crate::runtime) fn record_original_frame_instance_with_evidence(
@@ -69,21 +83,47 @@ impl RequestFlightLedger {
         instance: RelayPathInstance,
         frame: &Frame,
         evidence_eligible: bool,
+        qualification: Option<RequestProductQualificationReceipt>,
     ) -> usize {
         self.record_product_frame(
             instance,
             frame,
             CarrierWorkKind::OriginalData,
             evidence_eligible,
+            qualification,
+            None,
         )
+        .0
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn record_reinjection_frame_instance(
         &mut self,
         instance: RelayPathInstance,
         frame: &Frame,
     ) -> usize {
-        self.record_product_frame(instance, frame, CarrierWorkKind::ReinjectedData, false)
+        self.record_reinjection_frame_instance_with_suppression_interval(
+            instance,
+            frame,
+            Duration::from_secs(1),
+        )
+        .0
+    }
+
+    pub(in crate::runtime) fn record_reinjection_frame_instance_with_suppression_interval(
+        &mut self,
+        instance: RelayPathInstance,
+        frame: &Frame,
+        suppression_interval: Duration,
+    ) -> (usize, Option<Instant>) {
+        self.record_product_frame(
+            instance,
+            frame,
+            CarrierWorkKind::ReinjectedData,
+            false,
+            None,
+            Some(suppression_interval),
+        )
     }
 
     fn record_product_frame(
@@ -92,19 +132,37 @@ impl RequestFlightLedger {
         frame: &Frame,
         kind: CarrierWorkKind,
         evidence_eligible: bool,
-    ) -> usize {
+        qualification: Option<RequestProductQualificationReceipt>,
+        reinjection_suppression_interval: Option<Duration>,
+    ) -> (usize, Option<Instant>) {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
-            return 0;
+            return (0, None);
         };
+        let sent_at = Instant::now();
+        let reinjection_suppression_deadline = reinjection_suppression_interval
+            .and_then(|interval| sent_at.checked_add(interval))
+            .or(reinjection_suppression_interval.map(|_| sent_at));
         self.flights.entry(offset).or_default().push(RequestFlight {
             instance,
             end,
             bytes,
-            sent_at: Instant::now(),
+            sent_at,
             kind,
             evidence_eligible,
+            qualification,
+            reinjection_suppression_deadline,
         });
-        bytes
+        if kind.is_original_transmission() {
+            self.original_data_in_flight_bytes = self
+                .original_data_in_flight_bytes
+                .saturating_add(bytes as u64);
+            let instance_bytes = self
+                .original_data_in_flight_bytes_by_instance
+                .entry(instance)
+                .or_default();
+            *instance_bytes = instance_bytes.saturating_add(bytes as u64);
+        }
+        (bytes, reinjection_suppression_deadline)
     }
 
     /// Revokes every assignment from the pre-stale Product authority epoch.
@@ -145,15 +203,44 @@ impl RequestFlightLedger {
                 if bytes == 0 {
                     continue;
                 }
+                if flight.kind.is_original_transmission() {
+                    self.original_data_in_flight_bytes = self
+                        .original_data_in_flight_bytes
+                        .checked_sub(bytes as u64)
+                        .expect("request shared OriginalData debt covers released flight");
+                    let instance_bytes = self
+                        .original_data_in_flight_bytes_by_instance
+                        .get_mut(&flight.instance)
+                        .expect("request exact-instance OriginalData debt covers released flight");
+                    *instance_bytes = instance_bytes
+                        .checked_sub(bytes as u64)
+                        .expect("request exact-instance OriginalData debt covers released bytes");
+                    let remove_instance = *instance_bytes == 0;
+                    if remove_instance {
+                        self.original_data_in_flight_bytes_by_instance
+                            .remove(&flight.instance);
+                    }
+                }
                 let path_proving = flight.evidence_eligible
                     && flight.kind.is_original_transmission()
                     && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end);
                 released.push(RequestPathRelease {
                     instance: flight.instance,
+                    range: OffsetRange {
+                        start: acked_start,
+                        end: acked_end,
+                    },
                     bytes,
+                    kind: flight.kind,
                     sent_at: flight.sent_at,
                     elapsed: now.saturating_duration_since(flight.sent_at),
                     path_proving,
+                    qualification: flight.qualification.and_then(|qualification| {
+                        qualification.intersect(OffsetRange {
+                            start: acked_start,
+                            end: acked_end,
+                        })
+                    }),
                 });
             }
             for (retained_start, retained_end) in split.retained {
@@ -167,6 +254,12 @@ impl RequestFlightLedger {
                     .push(RequestFlight {
                         end: retained_end,
                         bytes,
+                        qualification: flight.qualification.and_then(|qualification| {
+                            qualification.intersect(OffsetRange {
+                                start: retained_start,
+                                end: retained_end,
+                            })
+                        }),
                         ..flight
                     });
             }
@@ -176,14 +269,27 @@ impl RequestFlightLedger {
 
     pub(in crate::runtime) fn drain_all(&mut self) -> Vec<RequestPathRelease> {
         let mut released = Vec::new();
-        for flights in std::mem::take(&mut self.flights).into_values() {
+        self.original_data_in_flight_bytes = 0;
+        self.original_data_in_flight_bytes_by_instance.clear();
+        for (start, flights) in std::mem::take(&mut self.flights) {
             for flight in flights {
                 released.push(RequestPathRelease {
                     instance: flight.instance,
+                    range: OffsetRange {
+                        start,
+                        end: flight.end,
+                    },
                     bytes: flight.bytes,
+                    kind: flight.kind,
                     sent_at: flight.sent_at,
                     elapsed: Instant::now().saturating_duration_since(flight.sent_at),
                     path_proving: false,
+                    qualification: flight.qualification.and_then(|qualification| {
+                        qualification.intersect(OffsetRange {
+                            start,
+                            end: flight.end,
+                        })
+                    }),
                 });
             }
         }
@@ -208,6 +314,34 @@ impl RequestFlightLedger {
         instances
     }
 
+    /// Exact OriginalData qualification authorities overlapping one accepted
+    /// duplicate. The caller consumes them before publishing ReinjectedData,
+    /// so a later ACK cannot attribute the duplicated bytes uniquely.
+    pub(in crate::runtime) fn overlapping_original_qualification_receipts(
+        &self,
+        range: OffsetRange,
+    ) -> Vec<RequestProductQualificationReceipt> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+        self.flights
+            .range(..range.end)
+            .flat_map(|(start, flights)| {
+                flights.iter().filter_map(move |flight| {
+                    (flight.kind.is_original_transmission() && flight.end > range.start)
+                        .then_some(flight.qualification)
+                        .flatten()
+                        .and_then(|qualification| {
+                            qualification.intersect(OffsetRange {
+                                start: (*start).max(range.start),
+                                end: flight.end.min(range.end),
+                            })
+                        })
+                })
+            })
+            .collect()
+    }
+
     /// Exact unique Data Sequence bytes still owned by one attachment. This is
     /// the portable ordered-stream backlog when native per-socket state is not
     /// available; reinjection copies never contribute to it.
@@ -215,34 +349,75 @@ impl RequestFlightLedger {
         &self,
         instance: RelayPathInstance,
     ) -> u64 {
+        self.original_data_in_flight_bytes_by_instance
+            .get(&instance)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Exact shared OriginalData debt for the logical stream.
+    pub(in crate::runtime) fn total_original_data_in_flight_bytes(&self) -> u64 {
+        self.original_data_in_flight_bytes
+    }
+
+    /// Every exact un-DataACKed ReinjectedData byte accepted on one attachment
+    /// instance. A suppression deadline may authorize another exact target;
+    /// it cannot renew the same reliable carrier's recovery authority.
+    pub(in crate::runtime) fn reinjected_data_in_flight_bytes(
+        &self,
+        instance: RelayPathInstance,
+    ) -> usize {
         self.flights
             .values()
             .flat_map(|flights| flights.iter())
-            .filter(|flight| flight.instance == instance && flight.kind.is_original_transmission())
-            .fold(0_u64, |bytes, flight| {
-                bytes.saturating_add(flight.bytes as u64)
+            .filter(|flight| {
+                flight.instance == instance && flight.kind == CarrierWorkKind::ReinjectedData
             })
+            .fold(0usize, |bytes, flight| bytes.saturating_add(flight.bytes))
     }
 
-    pub(in crate::runtime) fn has_recent_reinjection_on_instance(
+    /// Earliest immutable accepted-copy expiry overlapping one exact range on
+    /// any attachment still owned by this actor.
+    pub(in crate::runtime) fn reinjection_suppression_deadline_for_frame(
         &self,
         frame: &Frame,
-        instance: RelayPathInstance,
-        retry_after: Duration,
-    ) -> bool {
-        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
-            return false;
-        };
+        actor_attached_paths: &[RelayPathInstance],
+    ) -> Option<Instant> {
+        let (start, end, _) = reliable_stream_frame_extent(frame)?;
         let now = Instant::now();
-        self.flights.range(..end).any(|(offset, flights)| {
-            *offset < end
-                && flights.iter().any(|flight| {
-                    flight.end > start
-                        && flight.instance == instance
-                        && flight.kind == CarrierWorkKind::ReinjectedData
-                        && now.saturating_duration_since(flight.sent_at) < retry_after
-                })
-        })
+        self.flights
+            .range(..end)
+            .flat_map(|(offset, flights)| {
+                flights
+                    .iter()
+                    .filter(move |flight| *offset < end && flight.end > start)
+            })
+            .filter(|flight| {
+                flight.kind == CarrierWorkKind::ReinjectedData
+                    && actor_attached_paths.contains(&flight.instance)
+            })
+            .filter_map(|flight| flight.reinjection_suppression_deadline)
+            .filter(|deadline| *deadline > now)
+            .min()
+    }
+
+    /// Earliest immutable expiry of an accepted ReinjectedData copy still
+    /// owned by this actor's exact attachment set.
+    pub(in crate::runtime) fn earliest_reinjection_suppression_deadline(
+        &self,
+        actor_attached_paths: &[RelayPathInstance],
+    ) -> Option<Instant> {
+        let now = Instant::now();
+        self.flights
+            .values()
+            .flat_map(|flights| flights.iter())
+            .filter(|flight| {
+                flight.kind == CarrierWorkKind::ReinjectedData
+                    && actor_attached_paths.contains(&flight.instance)
+            })
+            .filter_map(|flight| flight.reinjection_suppression_deadline)
+            .filter(|deadline| *deadline > now)
+            .min()
     }
 
     #[cfg(test)]
@@ -256,6 +431,9 @@ impl RequestFlightLedger {
                     .sent_at
                     .checked_sub(elapsed)
                     .unwrap_or(flight.sent_at);
+                flight.reinjection_suppression_deadline = flight
+                    .reinjection_suppression_deadline
+                    .and_then(|deadline| deadline.checked_sub(elapsed));
             }
         }
     }
@@ -427,7 +605,6 @@ impl RequestFlightLedger {
         frame: &Frame,
         live_instances: &[RelayPathInstance],
         first_reinjection_after: Duration,
-        repeat_reinjection_after: Duration,
     ) -> Vec<RelayPathKey> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
@@ -464,7 +641,9 @@ impl RequestFlightLedger {
                         && flight.kind == CarrierWorkKind::ReinjectedData
                         && live_instances.contains(&flight.instance)
                         && !owner_keys.contains(&flight.instance.key)
-                        && now.saturating_duration_since(flight.sent_at) < repeat_reinjection_after
+                        && flight
+                            .reinjection_suppression_deadline
+                            .is_some_and(|deadline| deadline > now)
                 })
         });
         if recent_distinct_reinjection {
@@ -494,18 +673,19 @@ impl RequestFlightLedger {
         normalize_offset_ranges(ranges)
     }
 
-    /// Exact attachment owners with unacknowledged OriginalData below an
-    /// authoritative Data ACK horizon. The caller filters current liveness.
+    /// Exact current-epoch attachment owners with retained unacknowledged
+    /// OriginalData below a complete authoritative Data ACK horizon. The
+    /// caller filters current attachment liveness.
     pub(in crate::runtime) fn unacked_original_paths_before(
         &self,
-        horizon: u64,
+        authoritative_horizon: u64,
     ) -> SmallVec<[RelayPathInstance; 4]> {
         let mut paths = SmallVec::new();
-        for (_, flights) in self.flights.range(..horizon) {
+        for (_, flights) in self.flights.range(..authoritative_horizon) {
             let Some(original) = latest_original_transmission(flights) else {
                 continue;
             };
-            if !paths.contains(&original.instance) {
+            if original.evidence_eligible && !paths.contains(&original.instance) {
                 paths.push(original.instance);
             }
         }
@@ -517,8 +697,7 @@ impl RequestFlightLedger {
     pub(in crate::runtime) fn range_recovery_state(
         &self,
         original_path: RelayPathInstance,
-        usable_alternate_paths: &[RelayPathInstance],
-        retry_after: Duration,
+        actor_attached_paths: &[RelayPathInstance],
     ) -> RangeRecoveryState {
         let now = Instant::now();
         let mut original_ranges = Vec::new();
@@ -535,11 +714,11 @@ impl RequestFlightLedger {
             for flight in flights {
                 if flight.kind != CarrierWorkKind::ReinjectedData
                     || flight.instance == original_path
-                    || !usable_alternate_paths.contains(&flight.instance)
+                    || !actor_attached_paths.contains(&flight.instance)
                 {
                     continue;
                 }
-                let Some(deadline) = flight.sent_at.checked_add(retry_after) else {
+                let Some(deadline) = flight.reinjection_suppression_deadline else {
                     continue;
                 };
                 if deadline > now {
@@ -675,8 +854,19 @@ impl RequestFlightLedger {
         &self,
         offset: u64,
     ) -> Option<RelayPathKey> {
+        self.oldest_lower_flight_owner_instance_before_offset(offset)
+            .map(|instance| instance.key)
+    }
+
+    /// Exact attachment owning the oldest OriginalData range below `offset`.
+    /// A reconnect may reuse a configured key, so apply-time authority must not
+    /// collapse this identity to `RelayPathKey`.
+    pub(in crate::runtime) fn oldest_lower_flight_owner_instance_before_offset(
+        &self,
+        offset: u64,
+    ) -> Option<RelayPathInstance> {
         self.flights.range(..offset).find_map(|(_, flights)| {
-            latest_original_transmission(flights).map(|flight| flight.instance.key)
+            latest_original_transmission(flights).map(|flight| flight.instance)
         })
     }
 }
@@ -696,6 +886,9 @@ struct RequestFlight {
     sent_at: Instant,
     kind: CarrierWorkKind,
     evidence_eligible: bool,
+    qualification: Option<RequestProductQualificationReceipt>,
+    /// Frozen from the selected carrier's exact snapshot at command commit.
+    reinjection_suppression_deadline: Option<Instant>,
 }
 
 #[cfg(test)]

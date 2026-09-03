@@ -120,6 +120,21 @@ pub(crate) fn path_within_adaptive_lead_hysteresis(
         && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
 }
 
+/// Whether one candidate has a completion lead beyond measured timing
+/// uncertainty. Both ETAs already include carrier/Product flight, queue, and
+/// the next scheduling quantum, so raw queue bytes must not be counted again.
+pub(crate) fn path_has_material_completion_advantage(
+    candidate_eta_ms: f64,
+    candidate_snapshot: PathSnapshot,
+    available_eta_ms: f64,
+    available_snapshot: PathSnapshot,
+) -> bool {
+    let jitter_hysteresis_ms = candidate_snapshot
+        .jitter_ms
+        .max(available_snapshot.jitter_ms);
+    candidate_eta_ms + jitter_hysteresis_ms < available_eta_ms
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PathScore {
     pub path_id: PathId,

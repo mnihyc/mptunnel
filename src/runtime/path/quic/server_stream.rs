@@ -9,7 +9,9 @@ use super::server_writer::{
     drain_one_server_udp_command_while_input_deferred, drain_server_udp_reliable_commands,
 };
 use crate::model::capacity::RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET;
-use crate::protocol::{Frame, PathId, SessionId, StreamDemandHint, StreamId, TargetAddr};
+use crate::protocol::{
+    Frame, PathId, SessionId, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommandReceivers, ReliablePathCommandSender, recv_reliable_path_command,
@@ -154,6 +156,9 @@ pub(super) struct ServerUdpReliableStreamContext {
     pub(super) stream_id: StreamId,
     pub(super) target: TargetAddr,
     pub(super) initial_demand: StreamDemandHint,
+    pub(super) return_plan: StreamReturnPlan,
+    pub(super) native_rate_authority:
+        Option<std::sync::Arc<crate::runtime::path::authority::NativeCarrierRateAuthorityHandle>>,
 }
 
 struct ServerUdpReliableOutputDetachGuard {
@@ -210,12 +215,18 @@ pub(super) async fn handle_server_udp_reliable_stream(
         stream_id,
         target,
         initial_demand,
+        return_plan,
+        native_rate_authority,
     } = stream_context;
     let duplicate_open_target = target.clone();
     let (commands_tx, commands_rx) = reliable_path_command_channels(udp_path_command_queue(
         context.mux_limits,
         context.codec_limits,
     ));
+    let commands_tx = match native_rate_authority {
+        Some(authority) => commands_tx.with_native_rate_authority(authority),
+        None => commands_tx,
+    };
     let mut path_proofs = PathProofTracker::from_limits(context.mux_limits);
     let accept_existing = match context
         .reliable_streams
@@ -224,6 +235,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
             stream_id,
             target: target.clone(),
             initial_demand,
+            return_plan,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands: commands_tx.clone(),
@@ -385,6 +397,10 @@ async fn run_server_udp_reliable_stream_loop(
                         stream_id: received_stream_id,
                         ..
                     }
+                    | Frame::StreamReturnPlanFinal {
+                        stream_id: received_stream_id,
+                        ..
+                    }
                     | Frame::StreamMaxData {
                         stream_id: received_stream_id,
                         ..
@@ -421,6 +437,7 @@ async fn run_server_udp_reliable_stream_loop(
                 Ok(Some(Ok(
                     Frame::StreamData { .. }
                     | Frame::StreamAck { .. }
+                    | Frame::StreamReturnPlanFinal { .. }
                     | Frame::StreamRequalifyData { .. }
                     | Frame::StreamRequalifyAck { .. }
                     | Frame::StreamMaxData { .. }
@@ -557,6 +574,7 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
+                        | Frame::StreamReturnPlanFinal { stream_id: received_stream_id, .. }
                         | Frame::StreamRequalifyAck { stream_id: received_stream_id, .. }
                         | Frame::StreamMaxData { stream_id: received_stream_id, .. }
                         | Frame::StreamFin { stream_id: received_stream_id, .. }
@@ -588,7 +606,7 @@ async fn run_server_udp_reliable_stream_loop(
                         stream_id: open_stream_id,
                         target: open_target,
                         demand: open_demand,
-                        ..
+                        return_plan: open_return_plan,
                     })) if open_stream_id == stream_id && open_target == target =>
                     {
                         match context
@@ -598,6 +616,7 @@ async fn run_server_udp_reliable_stream_loop(
                                 stream_id,
                                 target: target.clone(),
                                 initial_demand: open_demand,
+                                return_plan: open_return_plan,
                                 attachment: ServerStreamPathAttachment {
                                     path_registration: path_registration.clone(),
                                     commands: commands_tx.clone(),

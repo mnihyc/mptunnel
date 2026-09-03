@@ -6,15 +6,18 @@ use super::ack_clock::ResponseAckClockRateEvidence;
 use super::evidence::{ServerPathMetricsEntry, install_path_metrics_entry};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::carrier_rate_authority::CarrierRateAuthorityStamp;
 #[cfg(test)]
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
+use crate::model::product_qualification::ProductQualificationLedger;
 use crate::model::requalification::StreamPathQualification;
 use crate::model::response::ResponsePathObservation;
 #[cfg(test)]
 use crate::protocol::PathId;
 use crate::protocol::{Frame, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::commands::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandSender, ReliablePathLoadRegistration,
 };
@@ -49,6 +52,8 @@ pub(in crate::runtime) enum ResponsePathDetachOutcome {
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::runtime) struct ResponseOutputAttachmentState {
     pub(in crate::runtime::stream) metrics: Option<ServerPathMetricsEntry>,
+    pub(in crate::runtime::stream) native_scheduling_shape:
+        Option<NativeCarrierSchedulingShapeSnapshot>,
     pub(in crate::runtime::stream) peer_usage: Option<(u64, PathUsage)>,
     pub(in crate::runtime::stream) path_proof: Option<PathProofObservation>,
 }
@@ -108,6 +113,12 @@ fn apply_attachment_state(
     let mut changed = state
         .metrics
         .is_some_and(|metrics| install_path_metrics_entry(entry, metrics));
+    if let Some(shape) = state.native_scheduling_shape
+        && entry.native_scheduling_shape != Some(shape)
+    {
+        entry.native_scheduling_shape = Some(shape);
+        changed = true;
+    }
     if let Some((sequence, usage)) = state.peer_usage
         && entry
             .peer_usage_sequence
@@ -133,14 +144,14 @@ fn apply_attachment_state(
 ///
 /// It owns carrier command access and sender-evidence fields for this stream on
 /// this path. Product reinjection and ordering identity stay in `ResponseStreamBinding`.
-#[cfg_attr(test, derive(Clone))]
 pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
     pub(super) path_instance_id: CarrierPathInstanceId,
     pub(super) local_policy: PathPolicy,
     pub(super) incarnation: u64,
     pub(super) commands: ReliablePathCommandSender,
-    /// Keeps this stream visible to the exact ordered writer queue it can use.
+    /// Publishes demand to the exact ordered writer only while this output owns
+    /// unacknowledged unique OriginalData. Its lane survives inactive periods.
     pub(super) load_registration: ReliablePathLoadRegistration,
     /// Unacknowledged unique OriginalData assigned to this response output.
     /// Reinjection copies remain in `bytes_in_flight` but never enter this counter.
@@ -148,6 +159,9 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// Data-ACK recovery may withdraw an output from new OriginalData placement
     /// without closing it or interfering with native carrier recovery.
     pub(super) qualification: StreamPathQualification,
+    /// Durable exact-volume Product qualification for this attachment
+    /// incarnation. Numeric rate evidence has an independent lifetime.
+    pub(super) product_qualification: ProductQualificationLedger,
     pub(super) bytes_in_flight: u64,
     /// Exact OriginalData ACK goodput. It is per-flow evidence, not carrier
     /// capacity, and its immutable deadline owns all placement authority.
@@ -168,6 +182,9 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) ack_publication: StreamAckPublicationCursor,
     pub(super) local_path_metrics: Option<ServerPathMetricsEntry>,
     pub(super) peer_path_metrics: Option<ServerPathMetricsEntry>,
+    /// Complete endpoint-local NativeMode decision/shape for this exact QUIC
+    /// output. It is separate from peer/ACK/Product evidence.
+    pub(super) native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
     /// Latest directional preference advertised by the peer for this exact
     /// carrier instance. It is independent of local path health.
     pub(super) peer_usage: Option<PathUsage>,
@@ -177,10 +194,16 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
 }
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
+    /// Next exact output incarnation, or permanent exhaustion after MAX.
+    pub(super) next_output_incarnation: Option<u64>,
     /// Outputs withdrawn from scheduling but still owned by the stream actor.
     /// Their flights remain live until the ordered detach event is applied.
     pub(super) detaching: Vec<ResponseStreamOutputEntry>,
     pub(super) entries: Vec<ResponseStreamOutputEntry>,
+    /// Unique OriginalData retained by this response stream awaiting MPP
+    /// DataACK. This survives output detach and excludes repair copies and
+    /// native carrier work.
+    pub(super) original_data_in_flight_bytes: u64,
     /// Offset-free sender-service staging belongs to the response stream, not
     /// to any carrier output.
     pub(super) data_level_queue_bytes: u64,
@@ -199,7 +222,7 @@ fn publish_pending_max_data(
     let desired = outputs.desired_max_data_offset;
     let mut publication = StreamMaxDataPublication::default();
     for entry in &mut outputs.entries {
-        if entry.commands.control_frame_queue_is_closed()
+        if entry.commands.control_frame_admission_is_closed()
             || entry.published_max_data_offset >= desired
         {
             continue;
@@ -220,7 +243,8 @@ fn publish_pending_max_data(
         }
     }
     publication.pending = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_queue_is_closed() && entry.published_max_data_offset < desired
+        !entry.commands.control_frame_admission_is_closed()
+            && entry.published_max_data_offset < desired
     });
     publication
 }
@@ -233,7 +257,7 @@ fn publish_ack_update(
 ) -> StreamAckPublication {
     let mut publication = StreamAckPublication::default();
     for entry in &mut outputs.entries {
-        if entry.commands.control_frame_queue_is_closed() {
+        if entry.commands.control_frame_admission_is_closed() {
             continue;
         }
         let commands = &entry.commands;
@@ -251,11 +275,11 @@ fn publish_ack_update(
         publication.published |= attachment.published;
     }
     publication.published = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_queue_is_closed()
+        !entry.commands.control_frame_admission_is_closed()
             && !entry.ack_publication.is_pending(generation)
     });
     publication.pending = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_queue_is_closed()
+        !entry.commands.control_frame_admission_is_closed()
             && entry.ack_publication.is_pending(generation)
     });
     publication
@@ -268,7 +292,7 @@ fn retry_pending_ack(
 ) -> StreamAckPublication {
     let mut publication = StreamAckPublication::default();
     for entry in &mut outputs.entries {
-        if entry.commands.control_frame_queue_is_closed()
+        if entry.commands.control_frame_admission_is_closed()
             || !entry.ack_publication.is_pending(generation)
         {
             continue;
@@ -286,11 +310,11 @@ fn retry_pending_ack(
         publication.published |= attachment.published;
     }
     publication.published = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_queue_is_closed()
+        !entry.commands.control_frame_admission_is_closed()
             && !entry.ack_publication.is_pending(generation)
     });
     publication.pending = outputs.entries.iter().any(|entry| {
-        !entry.commands.control_frame_queue_is_closed()
+        !entry.commands.control_frame_admission_is_closed()
             && entry.ack_publication.is_pending(generation)
     });
     publication
@@ -315,8 +339,14 @@ impl ResponseStreamBinding {
             .any(|entry| entry.commands.product_admission_active())
     }
 
-    fn allocate_output_incarnation(&self) -> u64 {
-        self.next_output_incarnation.fetch_add(1, Ordering::AcqRel)
+    fn allocate_output_incarnation(
+        outputs: &mut ResponseStreamOutputs,
+    ) -> Result<u64, RuntimeError> {
+        let incarnation = outputs
+            .next_output_incarnation
+            .ok_or(RuntimeError::ExactIdentityExhausted)?;
+        outputs.next_output_incarnation = incarnation.checked_add(1);
+        Ok(incarnation)
     }
 
     pub(in crate::runtime) fn output_membership_generation(&self) -> u64 {
@@ -366,7 +396,7 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .filter(|entry| {
-                !entry.commands.control_frame_queue_is_closed()
+                !entry.commands.control_frame_admission_is_closed()
                     && entry.ack_publication.is_pending(generation)
             })
             .map(|entry| entry.commands.capacity_notify())
@@ -405,7 +435,7 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         outputs.entries.iter().any(|entry| {
-            !entry.commands.control_frame_queue_is_closed()
+            !entry.commands.control_frame_admission_is_closed()
                 && entry.published_max_data_offset < outputs.desired_max_data_offset
         })
     }
@@ -421,7 +451,7 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .filter(|entry| {
-                !entry.commands.control_frame_queue_is_closed()
+                !entry.commands.control_frame_admission_is_closed()
                     && entry.published_max_data_offset < outputs.desired_max_data_offset
             })
             .map(|entry| entry.commands.capacity_notify())
@@ -459,10 +489,27 @@ impl ResponseStreamBinding {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::stream) fn attach_output(
         &self,
         attachment: ResponseOutputAttachment,
     ) -> ResponseStreamAttachOutcome {
+        self.try_attach_output(attachment)
+            .expect("test response attachment identity space")
+    }
+
+    pub(in crate::runtime::stream) fn try_attach_output(
+        &self,
+        attachment: ResponseOutputAttachment,
+    ) -> Result<ResponseStreamAttachOutcome, RuntimeError> {
+        self.try_attach_output_with_return_plan(attachment, None)
+    }
+
+    pub(super) fn try_attach_output_with_return_plan(
+        &self,
+        attachment: ResponseOutputAttachment,
+        return_plan: Option<crate::protocol::StreamReturnPlan>,
+    ) -> Result<ResponseStreamAttachOutcome, RuntimeError> {
         let ResponseOutputAttachment {
             key,
             path_instance_id,
@@ -472,6 +519,15 @@ impl ResponseStreamBinding {
         } = attachment;
         #[cfg(feature = "lab-diagnostics")]
         let CarrierPathKey { underlay, path_id } = key;
+        // Enrollment/finalization and output publication share this lock order:
+        // startup -> lane -> outputs. A sender can therefore observe neither a
+        // published-but-unbound STARTUP output nor a binding without its exact
+        // live output.
+        let mut startup = return_plan.map(|_| {
+            self.response_startup
+                .lock()
+                .expect("server response startup lock")
+        });
         // A new carrier inherits the sender-local live response lane. The
         // peer's immutable OPEN_STREAM hint cannot mutate this direction.
         let current_lane = self.lane.lock().expect("server reliable stream lane lock");
@@ -483,7 +539,7 @@ impl ResponseStreamBinding {
         // Close snapshots outputs under this lock after publishing the closed
         // flag. An attach either enters that snapshot or observes closure.
         if !self.response_stream_open.load(Ordering::Acquire) {
-            return ResponseStreamAttachOutcome::RejectedClosedStream;
+            return Ok(ResponseStreamAttachOutcome::RejectedClosedStream);
         }
         if outputs
             .detaching
@@ -494,7 +550,7 @@ impl ResponseStreamBinding {
             // Refusing reattachment until the actor consumes that boundary
             // prevents authenticated reconnect churn from accumulating
             // detaching entries and one waiter task per retry.
-            return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
+            return Ok(ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput);
         }
         let mut replaced_closed = false;
         let mut replaced_incarnation = None;
@@ -517,6 +573,16 @@ impl ResponseStreamBinding {
                     ),
                 );
                 if same_channel {
+                    let exact = ResponseAcquisitionOutputId::from(&*entry);
+                    let startup_commit = match (&startup, return_plan) {
+                        (Some(startup), Some(plan)) => {
+                            Some(startup.prepare_attachment(plan, exact)?)
+                        }
+                        _ => None,
+                    };
+                    if let (Some(startup), Some(commit)) = (&mut startup, startup_commit) {
+                        startup.commit_attachment(commit);
+                    }
                     let evidence_changed = apply_attachment_state(entry, attachment_state);
                     if evidence_changed {
                         self.response_model_generation
@@ -527,23 +593,48 @@ impl ResponseStreamBinding {
                     if evidence_changed {
                         self.notify_update();
                     }
-                    return ResponseStreamAttachOutcome::Attached;
+                    return Ok(ResponseStreamAttachOutcome::Attached);
                 }
-                return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
+                return Ok(ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput);
             }
         }
+        // Validate enrollment against the exact prospective incarnation before
+        // mutating either output membership or the non-reusable incarnation
+        // counter. The state lock makes the returned commit infallible.
+        let prospective_incarnation = outputs
+            .next_output_incarnation
+            .ok_or(RuntimeError::ExactIdentityExhausted)?;
+        let prospective_output = ResponseAcquisitionOutputId {
+            key,
+            path_instance_id,
+            incarnation: prospective_incarnation,
+        };
+        let startup_commit = match (&startup, return_plan) {
+            (Some(startup), Some(plan)) => {
+                Some(startup.prepare_attachment(plan, prospective_output)?)
+            }
+            _ => None,
+        };
+        // Exact identity allocation is the final fallible step and precedes
+        // removal or mutation of a closed predecessor.
+        let allocated_incarnation = Self::allocate_output_incarnation(&mut outputs)?;
+        debug_assert_eq!(allocated_incarnation, prospective_incarnation);
         let mut entry = if let Some(position) = existing_position {
             let mut entry = outputs.entries.remove(position);
             if entry.commands.is_closed() {
                 replaced_incarnation = Some(entry.incarnation);
                 entry.path_instance_id = path_instance_id;
                 entry.local_policy = local_policy;
-                entry.incarnation = self.allocate_output_incarnation();
+                entry.incarnation = allocated_incarnation;
                 entry.load_registration.deactivate();
                 entry.commands = commands;
-                entry.load_registration = entry.commands.register_flow(lane);
+                entry.load_registration = entry.commands.register_inactive_flow(lane);
                 entry.original_data_in_flight_bytes = 0;
                 entry.qualification = StreamPathQualification::Qualified;
+                // Incarnation is part of the exact owner identity. A closed
+                // replacement therefore starts a new ledger rather than
+                // reusing or reactivating predecessor authority.
+                entry.product_qualification = ProductQualificationLedger::default();
                 entry.bytes_in_flight = 0;
                 entry.product_rate_epoch = None;
                 entry.tcp_product_rate_evidence = None;
@@ -554,6 +645,7 @@ impl ResponseStreamBinding {
                 entry.ack_publication = StreamAckPublicationCursor::default();
                 entry.local_path_metrics = None;
                 entry.peer_path_metrics = None;
+                entry.native_scheduling_shape = None;
                 entry.peer_usage = None;
                 entry.peer_usage_sequence = None;
                 entry.path_proof = None;
@@ -581,16 +673,17 @@ impl ResponseStreamBinding {
             }
             entry
         } else {
-            let load_registration = commands.register_flow(lane);
+            let load_registration = commands.register_inactive_flow(lane);
             ResponseStreamOutputEntry {
                 key,
                 path_instance_id,
                 local_policy,
-                incarnation: self.allocate_output_incarnation(),
+                incarnation: allocated_incarnation,
                 commands,
                 load_registration,
                 original_data_in_flight_bytes: 0,
                 qualification: StreamPathQualification::Qualified,
+                product_qualification: ProductQualificationLedger::default(),
                 bytes_in_flight: 0,
                 product_rate_epoch: None,
                 tcp_product_rate_evidence: None,
@@ -601,6 +694,7 @@ impl ResponseStreamBinding {
                 ack_publication: StreamAckPublicationCursor::default(),
                 local_path_metrics: None,
                 peer_path_metrics: None,
+                native_scheduling_shape: None,
                 peer_usage: None,
                 peer_usage_sequence: None,
                 path_proof: None,
@@ -608,6 +702,9 @@ impl ResponseStreamBinding {
         };
         let _ = apply_attachment_state(&mut entry, attachment_state);
         outputs.entries.push(entry);
+        if let (Some(startup), Some(commit)) = (&mut startup, startup_commit) {
+            startup.commit_attachment(commit);
+        }
         for output in outputs.entries.iter().chain(&outputs.detaching) {
             output.load_registration.set_lane(lane);
         }
@@ -622,9 +719,9 @@ impl ResponseStreamBinding {
         drop(current_lane);
         self.notify_update();
         if replaced_closed {
-            ResponseStreamAttachOutcome::ReplacedClosedOutput
+            Ok(ResponseStreamAttachOutcome::ReplacedClosedOutput)
         } else {
-            ResponseStreamAttachOutcome::Attached
+            Ok(ResponseStreamAttachOutcome::Attached)
         }
     }
 
@@ -686,6 +783,8 @@ impl ResponseStreamBinding {
             .position(|entry| entry.key == key && entry.path_instance_id == path_instance_id)?;
         let entry = outputs.entries.remove(position);
         entry.load_registration.deactivate();
+        let mut entry = entry;
+        entry.product_qualification.revoke();
         let output_incarnation = entry.incarnation;
         outputs.detaching.push(entry);
         self.clear_request_feedback_ingress_if(key, path_instance_id);
@@ -728,6 +827,16 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         let live_outputs_before = outputs.entries.len();
+        for entry in &mut outputs.entries {
+            if entry.key == key && matches(entry) {
+                entry.product_qualification.revoke();
+            }
+        }
+        for entry in &mut outputs.detaching {
+            if entry.key == key && matches(entry) {
+                entry.product_qualification.revoke();
+            }
+        }
         let mut removed = Vec::new();
         let mut retain = |entry: &ResponseStreamOutputEntry| {
             let remove = entry.key == key && matches(entry);
@@ -867,6 +976,17 @@ impl ResponseStreamBinding {
         true
     }
 
+    #[cfg(test)]
+    pub(in crate::runtime) fn update_peer_path_usage_for_test(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) -> bool {
+        self.update_peer_path_usage_for_instance(key, path_instance_id, sequence, usage)
+    }
+
     pub(in crate::runtime::stream) fn mark_path_proof_success_for_instance(
         &self,
         key: CarrierPathKey,
@@ -982,7 +1102,7 @@ impl ResponseStreamBinding {
         }
     }
 
-    fn clear_request_feedback_ingress_if(
+    pub(super) fn clear_request_feedback_ingress_if(
         &self,
         key: CarrierPathKey,
         path_instance_id: CarrierPathInstanceId,
@@ -1003,6 +1123,7 @@ impl ResponseStreamBinding {
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) observation: ResponsePathObservation,
+    pub(in crate::runtime) native_authority_stamp: Option<CarrierRateAuthorityStamp>,
     pub(in crate::runtime) product_admission_active: bool,
     pub(in crate::runtime) command_queue: ReliablePathCommandQueueSnapshot,
 }
@@ -1040,12 +1161,45 @@ impl ResponseSenderPathTarget {
 
 /// ID-only apply target retained after ranking. The binding resolves the exact
 /// live command port under its output lock before committing any mutation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct ResponseDispatchTarget {
     pub(in crate::runtime) key: CarrierPathKey,
     pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) incarnation: u64,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
+    pub(in crate::runtime) native_authority_stamp: Option<CarrierRateAuthorityStamp>,
+}
+
+/// Exact response-output identity used only by direction-local acquisition.
+///
+/// Logical path keys can be reused after a carrier reconnect, and attachment
+/// incarnations can be replaced on one carrier. All three components are
+/// therefore part of cursor authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ResponseAcquisitionOutputId {
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) incarnation: u64,
+}
+
+impl From<&ResponseStreamOutputEntry> for ResponseAcquisitionOutputId {
+    fn from(entry: &ResponseStreamOutputEntry) -> Self {
+        Self {
+            key: entry.key,
+            path_instance_id: entry.path_instance_id,
+            incarnation: entry.incarnation,
+        }
+    }
+}
+
+impl From<&ResponseSenderPathTarget> for ResponseAcquisitionOutputId {
+    fn from(target: &ResponseSenderPathTarget) -> Self {
+        Self {
+            key: target.observation.key,
+            path_instance_id: target.observation.path_instance_id,
+            incarnation: target.observation.incarnation,
+        }
+    }
 }
 
 impl From<ResponseSenderPathTarget> for ResponseDispatchTarget {
@@ -1055,6 +1209,7 @@ impl From<ResponseSenderPathTarget> for ResponseDispatchTarget {
             path_instance_id: target.observation.path_instance_id,
             incarnation: target.observation.incarnation,
             has_bulk_rate_evidence: target.observation.has_bulk_rate_evidence,
+            native_authority_stamp: target.native_authority_stamp,
         }
     }
 }
@@ -1066,6 +1221,7 @@ impl From<&ResponseSenderPathTarget> for ResponseDispatchTarget {
             path_instance_id: target.observation.path_instance_id,
             incarnation: target.observation.incarnation,
             has_bulk_rate_evidence: target.observation.has_bulk_rate_evidence,
+            native_authority_stamp: target.native_authority_stamp,
         }
     }
 }

@@ -15,7 +15,8 @@ use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 #[cfg(test)]
 use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
-use crate::runtime::path::CarrierDeliveryRateSample;
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
+use crate::runtime::path::{CarrierDeliveryRateSample, CarrierNativeWindowSample};
 use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::time::Duration;
@@ -32,10 +33,19 @@ pub(in crate::runtime) struct ServerPathMetricsEntry {
     pub(in crate::runtime::stream) metrics: PathMetrics,
     pub(in crate::runtime::stream) source: ServerPathMetricsSource,
     pub(in crate::runtime::stream) native_drain_observed: bool,
+    /// Immutable native-window authority from the exact local carrier sample.
+    /// `metrics.inflight_limit_bytes` may outlive it as diagnostics only.
+    pub(in crate::runtime::stream) carrier_native_window_sample: Option<CarrierNativeWindowSample>,
     pub(in crate::runtime::stream) carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     // The wire budget is remaining authority at receipt. Residence is measured
     // from this instant and never recomputed from mutable RTT.
     pub(in crate::runtime::stream) recorded_at: Instant,
+}
+
+pub(super) fn server_path_metrics_native_window_sample(
+    path_metrics: ServerPathMetricsEntry,
+) -> Option<CarrierNativeWindowSample> {
+    path_metrics.carrier_native_window_sample
 }
 
 pub(super) fn server_output_local_path_metrics(
@@ -81,7 +91,6 @@ pub(super) fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) 
 }
 
 #[cfg(test)]
-#[cfg(test)]
 pub(super) fn server_path_metrics_has_bulk_rate_evidence(
     path_metrics: ServerPathMetricsEntry,
 ) -> bool {
@@ -93,7 +102,7 @@ pub(super) fn server_path_metrics_has_bulk_rate_evidence_at(
     now: Instant,
 ) -> bool {
     if path_metrics.carrier_delivery_rate_sample.is_some() {
-        // The local TCP sidecar owns the qualified ACK epoch. Refreshed merged
+        // The local native-carrier sidecar owns the qualified ACK epoch. Refreshed merged
         // PathMetrics may retain old ACK counters, but cannot extend it.
         return server_carrier_delivery_rate_sample_has_bulk_evidence_at(path_metrics, now);
     }
@@ -168,11 +177,18 @@ pub(super) fn server_output_has_durable_product_ack_progress(
     mux_limits: crate::mux::MuxLimits,
 ) -> bool {
     let sample_floor = reliable_path_startup_sample_limit_bytes(mux_limits);
-    let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
-    entry
-        .original_data_acked_bytes
-        .saturating_add(accounting_slack)
-        >= sample_floor
+    entry.original_data_acked_bytes >= sample_floor
+}
+
+/// Exact Product-volume authority for additional-output assignment.
+///
+/// This is an incarnation-local historical fact. Numeric rate publication and
+/// its freshness lifetime are separate completion-ranking authorities.
+pub(super) fn server_output_product_assignment_qualified(
+    entry: &ResponseStreamOutputEntry,
+    _mux_limits: crate::mux::MuxLimits,
+) -> bool {
+    entry.product_qualification.qualified()
 }
 
 #[cfg(test)]
@@ -201,6 +217,16 @@ pub(super) fn server_output_has_bulk_rate_evidence_at(
     mux_limits: crate::mux::MuxLimits,
     now: Instant,
 ) -> bool {
+    if entry.key.underlay == UnderlayProtocol::Udp
+        && entry.commands.native_rate_authority().is_some()
+    {
+        return entry.native_scheduling_shape.is_some_and(|shape| {
+            let scope = shape.stamp().scope();
+            scope.carrier_instance_id() == entry.path_instance_id
+                && scope.direction() == PathMetricDirection::ServerToClient
+                && shape.rate_bps() > 0
+        });
+    }
     let has_local_carrier_sample = server_output_local_path_metrics(entry)
         .is_some_and(|metrics| server_path_metrics_has_bulk_rate_evidence_at(metrics, now));
     match entry.key.underlay {
@@ -256,6 +282,34 @@ impl ResponseStreamBinding {
             .fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Installs fresh historical completion evidence while deliberately
+    /// leaving the current Product qualification generation incomplete.
+    /// This models a reactivated attachment whose prior service is known but
+    /// whose new exact generation still requires acquisition authority.
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_output_historical_product_model_for_test(
+        &self,
+        key: CarrierPathKey,
+        rate_bps: f64,
+        srtt_ms: f64,
+    ) {
+        self.set_output_product_model_for_test(key, rate_bps, srtt_ms);
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let entry = outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .expect("test modeled output");
+        entry.original_data_acked_bytes = entry
+            .original_data_acked_bytes
+            .max(reliable_path_startup_sample_limit_bytes(self.mux_limits));
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) fn update_path_metrics_for_instance(
         &self,
@@ -276,6 +330,51 @@ impl ResponseStreamBinding {
         self.install_path_metrics_entry_matching(key, Some(path_instance_id), path_metrics, true);
     }
 
+    pub(in crate::runtime) fn install_native_scheduling_shape_for_instance(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> bool {
+        let scope = shape.stamp().scope();
+        if key.underlay != UnderlayProtocol::Udp
+            || scope.carrier_instance_id() != path_instance_id
+            || scope.direction() != PathMetricDirection::ServerToClient
+        {
+            return false;
+        }
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let Some(entry) = outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
+        else {
+            return false;
+        };
+        if let Some(previous) = entry.native_scheduling_shape {
+            let previous_stamp = previous.stamp();
+            let replacement_stamp = shape.stamp();
+            if replacement_stamp.revision() < previous_stamp.revision()
+                || (replacement_stamp.revision() == previous_stamp.revision()
+                    && replacement_stamp != previous_stamp)
+            {
+                return false;
+            }
+        }
+        if entry.native_scheduling_shape == Some(shape) {
+            return false;
+        }
+        entry.native_scheduling_shape = Some(shape);
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+        drop(outputs);
+        self.notify_update();
+        true
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) fn update_path_metrics(
         &self,
@@ -294,6 +393,10 @@ impl ResponseStreamBinding {
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
     ) {
+        let recorded_at = Instant::now();
+        let carrier_native_window_sample = (source == ServerPathMetricsSource::LocalSender)
+            .then(|| CarrierNativeWindowSample::from_path_metrics_at(metrics, recorded_at))
+            .flatten();
         let (_, changed) = self.install_path_metrics_entry_matching(
             key,
             path_instance_id,
@@ -301,8 +404,9 @@ impl ResponseStreamBinding {
                 metrics,
                 source,
                 native_drain_observed: false,
+                carrier_native_window_sample,
                 carrier_delivery_rate_sample: None,
-                recorded_at: Instant::now(),
+                recorded_at,
             },
             true,
         );
@@ -368,16 +472,38 @@ pub(super) fn install_path_metrics_entry(
     path_metrics: ServerPathMetricsEntry,
 ) -> bool {
     let source = path_metrics.source;
+    let native_quic_diagnostics_only = entry.key.underlay == UnderlayProtocol::Udp
+        && entry.commands.native_rate_authority().is_some();
     let current = match source {
         ServerPathMetricsSource::LocalSender => &mut entry.local_path_metrics,
         ServerPathMetricsSource::PeerHint => &mut entry.peer_path_metrics,
     };
-    let scheduling_changed = current.is_none_or(|previous| {
-        previous.source != source
-            || previous.native_drain_observed != path_metrics.native_drain_observed
-            || previous.carrier_delivery_rate_sample != path_metrics.carrier_delivery_rate_sample
-            || !server_path_metrics_scheduling_equivalent(previous.metrics, path_metrics.metrics)
-    });
+    if native_quic_diagnostics_only {
+        // Lineage-scoped ACK/loss/peer telemetry remains inspectable, but it
+        // cannot wake or modify the NativeMode scheduling model.
+        *current = Some(path_metrics);
+        return false;
+    }
+    let native_window_authority_changed = source == ServerPathMetricsSource::LocalSender
+        && current.is_none_or(|previous| {
+            let previous = server_path_metrics_native_window_sample(previous);
+            let replacement = server_path_metrics_native_window_sample(path_metrics);
+            previous.map(|sample| sample.inflight_limit_bytes)
+                != replacement.map(|sample| sample.inflight_limit_bytes)
+                || (previous.is_none_or(|sample| !sample.fresh_at(path_metrics.recorded_at))
+                    && replacement.is_some_and(|sample| sample.fresh_at(path_metrics.recorded_at)))
+        });
+    let scheduling_changed = native_window_authority_changed
+        || current.is_none_or(|previous| {
+            previous.source != source
+                || previous.native_drain_observed != path_metrics.native_drain_observed
+                || previous.carrier_delivery_rate_sample
+                    != path_metrics.carrier_delivery_rate_sample
+                || !server_path_metrics_scheduling_equivalent(
+                    previous.metrics,
+                    path_metrics.metrics,
+                )
+        });
     *current = Some(path_metrics);
     scheduling_changed
 }

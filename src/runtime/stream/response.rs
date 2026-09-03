@@ -12,19 +12,25 @@ mod evidence;
 mod requalification;
 mod session;
 mod snapshot;
+mod startup;
 
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
+use crate::model::product_qualification::ProductQualificationLedger;
 use crate::model::requalification::StreamPathQualification;
 use crate::mux::MuxLimits;
-use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
+use crate::protocol::{
+    PathId, PathUsage, ResetReason, SessionId, StreamAttachmentPhase, StreamId, StreamReturnPlan,
+    UnderlayProtocol,
+};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::TrafficClass;
 #[cfg(test)]
 pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
-    ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
-    ResponsePathDetachOutcome, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
+    ResponseAcquisitionOutputId, ResponseDispatchTarget, ResponseOutputAttachment,
+    ResponseOutputAttachmentState, ResponsePathDetachOutcome, ResponseSenderPathTarget,
+    ResponseStreamAttachOutcome,
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use delivery::ResponseAckOrderingState;
@@ -36,6 +42,8 @@ pub(in crate::runtime) use delivery::{ResponseDataAckRecoveryCandidate, Response
 pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
+pub(in crate::runtime) use snapshot::ResponseAcquisitionObservation;
+pub(in crate::runtime) use startup::ResponseStartupFinalOutcome;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,7 +77,6 @@ pub(in crate::runtime) struct ResponseStreamBinding {
     lane: Mutex<TrafficClass>,
     mux_limits: MuxLimits,
     session_registration: ServerSessionRegistration,
-    next_output_incarnation: AtomicU64,
     /// Changes only when the set of live response attachments changes.
     output_membership_generation: AtomicU64,
     // Publishes coherent path evidence, exact flights, ACK ordering, and queues.
@@ -77,10 +84,20 @@ pub(in crate::runtime) struct ResponseStreamBinding {
     // Close publishes before carrier commands so no later scheduler commit can
     // assign new connection data after stream retirement begins.
     response_stream_open: AtomicBool,
+    // The requester's frozen return-topology transaction is independent of
+    // carrier evidence and Product ownership. Before exact finalization it
+    // contributes only a non-refilling unique-offset ceiling.
+    response_startup: Mutex<startup::ResponseStartupPlanState>,
     outputs: Mutex<ResponseStreamOutputs>,
     // Return-path affinity is observed ingress, not request or response
     // ownership. Exact carrier identity prevents reuse across reconnects.
     request_feedback_ingress: Mutex<Option<RequestFeedbackIngress>>,
+    // A request-direction requalification receipt belongs to the logical
+    // response stream, not to the carrier that delivered the probe. Keeping
+    // one exact receipt here lets the stream actor retry every authenticated
+    // return attachment without inheriting that ingress writer's head-of-line
+    // delay.
+    request_requalification_ack: Mutex<requalification::RequestRequalificationAckPublication>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
     version: watch::Sender<u64>,
@@ -173,20 +190,63 @@ impl ResponseStreamBinding {
         path_instance_id: CarrierPathInstanceId,
         local_policy: PathPolicy,
     ) -> Result<Arc<Self>, RuntimeError> {
+        Self::new_with_limits_tracker_path_instance_and_return_plan(
+            session_id,
+            underlay,
+            path_id,
+            commands,
+            lane,
+            mux_limits,
+            session_tracker,
+            path_instance_id,
+            local_policy,
+            StreamReturnPlan {
+                trigger_bytes: 0,
+                candidate_total: 1,
+                candidate_tier: PathUsage::Available,
+                phase: StreamAttachmentPhase::Startup,
+                candidate_ordinal: 0,
+            },
+        )
+    }
+
+    /// Constructs the initially accepted response attachment and its frozen
+    /// return plan before either can be published to the registry or sender.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime::stream) fn new_with_limits_tracker_path_instance_and_return_plan(
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        commands: ReliablePathCommandSender,
+        lane: TrafficClass,
+        mux_limits: MuxLimits,
+        session_tracker: Arc<ServerSessionTracker>,
+        path_instance_id: CarrierPathInstanceId,
+        local_policy: PathPolicy,
+        return_plan: StreamReturnPlan,
+    ) -> Result<Arc<Self>, RuntimeError> {
         let (version, _) = watch::channel(0);
         let key = CarrierPathKey { underlay, path_id };
         let session_registration = ServerSessionRegistration::try_new(session_tracker, session_id)?;
-        let load_registration = commands.register_flow(lane);
+        let load_registration = commands.register_inactive_flow(lane);
+        let opening_output = ResponseAcquisitionOutputId {
+            key,
+            path_instance_id,
+            incarnation: 1,
+        };
+        let response_startup =
+            startup::ResponseStartupPlanState::from_initial_open(return_plan, opening_output)?;
         Ok(Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
             mux_limits,
             session_registration,
-            next_output_incarnation: AtomicU64::new(2),
             output_membership_generation: AtomicU64::new(1),
             response_model_generation: AtomicU64::new(0),
             response_stream_open: AtomicBool::new(true),
+            response_startup: Mutex::new(response_startup),
             outputs: Mutex::new(ResponseStreamOutputs {
+                next_output_incarnation: Some(2),
                 detaching: Vec::new(),
                 entries: vec![ResponseStreamOutputEntry {
                     key,
@@ -197,6 +257,7 @@ impl ResponseStreamBinding {
                     load_registration,
                     original_data_in_flight_bytes: 0,
                     qualification: StreamPathQualification::Qualified,
+                    product_qualification: ProductQualificationLedger::default(),
                     bytes_in_flight: 0,
                     product_rate_epoch: None,
                     tcp_product_rate_evidence: None,
@@ -209,10 +270,12 @@ impl ResponseStreamBinding {
                     ack_publication: Default::default(),
                     local_path_metrics: None,
                     peer_path_metrics: None,
+                    native_scheduling_shape: None,
                     peer_usage: None,
                     peer_usage_sequence: None,
                     path_proof: None,
                 }],
+                original_data_in_flight_bytes: 0,
                 data_level_queue_bytes: 0,
                 desired_max_data_offset: 0,
                 next_requalification_probe_id: Some(1),
@@ -222,6 +285,7 @@ impl ResponseStreamBinding {
                 key,
                 path_instance_id,
             })),
+            request_requalification_ack: Mutex::new(Default::default()),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
             version,
@@ -237,7 +301,20 @@ impl ResponseStreamBinding {
         attachment: ResponseOutputAttachment,
     ) -> Result<ResponseStreamAttachOutcome, RuntimeError> {
         self.session_registration
-            .commit_if_active(|| self.attach_output(attachment))
+            .commit_if_active(|| self.try_attach_output(attachment))?
+    }
+
+    /// Atomically publishes one exact output and applies its phase-tagged
+    /// return-plan enrollment under the same output lock. The caller must use
+    /// this boundary for every version-10 OPEN on an existing stream.
+    pub(in crate::runtime::stream) fn attach_output_with_return_plan_if_session_active(
+        &self,
+        attachment: ResponseOutputAttachment,
+        return_plan: StreamReturnPlan,
+    ) -> Result<ResponseStreamAttachOutcome, RuntimeError> {
+        self.session_registration.commit_if_active(|| {
+            self.try_attach_output_with_return_plan(attachment, Some(return_plan))
+        })?
     }
 
     pub(in crate::runtime) fn subscribe_updates(&self) -> watch::Receiver<u64> {
@@ -246,13 +323,18 @@ impl ResponseStreamBinding {
 
     fn begin_close(&self) -> Vec<ReliablePathCommandSender> {
         {
-            let outputs = self
+            let mut outputs = self
                 .outputs
                 .lock()
                 .expect("server reliable stream binding lock");
             self.response_stream_open.store(false, Ordering::Release);
-            for entry in outputs.entries.iter().chain(&outputs.detaching) {
+            for entry in &mut outputs.entries {
                 entry.load_registration.deactivate();
+                entry.product_qualification.revoke();
+            }
+            for entry in &mut outputs.detaching {
+                entry.load_registration.deactivate();
+                entry.product_qualification.revoke();
             }
             outputs
                 .entries
@@ -267,15 +349,20 @@ impl ResponseStreamBinding {
     /// between closing attachment admission and transferring every reset to
     /// the carrier retirement lanes.
     fn begin_terminal_handoff(&self) -> Vec<ReliablePathCommandSender> {
-        let outputs = self
+        let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
         if !self.response_stream_open.swap(false, Ordering::AcqRel) {
             return Vec::new();
         }
-        for entry in outputs.entries.iter().chain(&outputs.detaching) {
+        for entry in &mut outputs.entries {
             entry.load_registration.deactivate();
+            entry.product_qualification.revoke();
+        }
+        for entry in &mut outputs.detaching {
+            entry.load_registration.deactivate();
+            entry.product_qualification.revoke();
         }
         outputs
             .entries

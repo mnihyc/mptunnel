@@ -1,4 +1,5 @@
 use super::attachment::ResponseStreamAttachOutcome;
+use super::test_support::{qualify_product_assignment, stream_data_frame};
 use super::{ResponseStreamBinding, ServerSessionTracker};
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
@@ -41,6 +42,17 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
         first_commands,
         TrafficClass::Throughput,
     );
+    {
+        let mut outputs = binding.outputs.lock().expect("response outputs lock");
+        qualify_product_assignment(&mut outputs.entries[0], MuxLimits::default());
+    }
+    binding.record_original_flight(
+        crate::model::path::CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        },
+        &stream_data_frame(4096),
+    );
     let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
     assert_eq!(
         binding.attach(
@@ -54,6 +66,20 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
     binding
         .reset_and_close_stream_ordered(stream_id, ResetReason::Refused, TrafficClass::Throughput)
         .await;
+
+    {
+        let outputs = binding.outputs.lock().expect("response outputs lock");
+        assert!(
+            outputs
+                .entries
+                .iter()
+                .all(|entry| !entry.product_qualification.qualified())
+        );
+        assert_eq!(
+            outputs.original_data_in_flight_bytes, 4096,
+            "terminal qualification reset cannot delete unresolved Product ownership"
+        );
+    }
 
     for receivers in [&mut first_receivers, &mut second_receivers] {
         let terminal = recv_reliable_path_command(receivers)

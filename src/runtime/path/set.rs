@@ -9,7 +9,9 @@ use super::health::{ClientPathHealth, ClientPathHealthRecord};
 use super::model::{
     ClientPathObservation, path_metrics_from_snapshot, path_snapshot, path_snapshot_with_id,
 };
-use super::quic::client::{ClientUdpPathSessionHandle, ClientUdpPathSessionRuntime};
+use super::quic::client::{
+    ClientUdpCarrierReconciliation, ClientUdpPathSessionHandle, ClientUdpPathSessionRuntime,
+};
 use super::state::ClientPathState;
 use super::tcp::client::{
     ClientTcpPathSessionHandle, ClientTcpPathSessionRuntime, tcp_session_command_queue,
@@ -79,6 +81,7 @@ pub struct ClientPathContext {
     pub(in crate::runtime) tcp_tls: Arc<Vec<TcpClientTlsConfig>>,
     pub(in crate::runtime) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(in crate::runtime) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
+    pub(in crate::runtime) udp_carrier_reconciliation: Arc<ClientUdpCarrierReconciliation>,
     pub(super) state: Arc<ClientPathState>,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) telemetry: RuntimeTelemetry,
@@ -494,6 +497,7 @@ impl ClientPathContext {
         let peer_status = PeerStatusBroker::new(allow_peer_diagnostics);
         let authenticated_carriers = AuthenticatedCarrierInventory::default();
         let ip_tunnels = crate::runtime::tun_l3::ClientIpTunnelHub::default();
+        let udp_carrier_reconciliation = ClientUdpCarrierReconciliation::new();
         let peer_status_snapshot = PeerStatusSnapshotSource::new({
             let tcp_paths = tcp_paths.clone();
             let udp_paths = udp_paths.clone();
@@ -567,6 +571,7 @@ impl ClientPathContext {
                     peer_status_snapshot: peer_status_snapshot.clone(),
                     authenticated_carriers: authenticated_carriers.clone(),
                     ip_tunnels: ip_tunnels.clone(),
+                    reconciliation: udp_carrier_reconciliation.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -587,6 +592,7 @@ impl ClientPathContext {
             tcp_tls,
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
+            udp_carrier_reconciliation,
             state,
             session_id,
             telemetry,

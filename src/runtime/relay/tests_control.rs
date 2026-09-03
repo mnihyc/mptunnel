@@ -5,7 +5,8 @@ use crate::mux::MuxLimits;
 use crate::protocol::{CloseReason, OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
-    reliable_path_command_channels, try_recv_reliable_path_priority_command,
+    reliable_path_command_channels, try_recv_reliable_path_command,
+    try_recv_reliable_path_priority_command,
 };
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
@@ -103,6 +104,150 @@ async fn prearmed_ack_gap_capacity_wait_retains_release_before_select_poll() {
     tokio::time::timeout(Duration::from_millis(50), wait)
         .await
         .expect("pre-armed capacity release must remain ready before the select poll");
+}
+
+#[tokio::test]
+async fn actor_recovery_pass_prunes_lost_target_before_reselecting_survivor() {
+    let stream_id = StreamId(919);
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:10919?initial-srtt-s=0.08&initial-rate-mbps=100",
+            "tcp://127.0.0.1:10920?initial-srtt-s=0.005&initial-rate-mbps=1000",
+            "tcp://127.0.0.1:10921?initial-srtt-s=0.04&initial-rate-mbps=200",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let (owner_frames, owner_frames_rx) = mpsc::channel(1);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        test_opened_remote_stream(stream_id, 0, owner_commands, owner_frames_rx),
+        8,
+    );
+    let owner = remotes.paths[0].instance();
+
+    let (lost_commands, mut lost_receivers) = reliable_path_command_channels(8);
+    let (lost_frames, lost_frames_rx) = mpsc::channel(1);
+    remotes.attach_candidate(test_opened_remote_stream(
+        stream_id,
+        1,
+        lost_commands,
+        lost_frames_rx,
+    ));
+    let lost = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("initial fast recovery target")
+        .instance();
+
+    let (survivor_commands, mut survivor_receivers) = reliable_path_command_channels(8);
+    let (survivor_frames, survivor_frames_rx) = mpsc::channel(1);
+    remotes.attach_candidate(test_opened_remote_stream(
+        stream_id,
+        2,
+        survivor_commands,
+        survivor_frames_rx,
+    ));
+    let survivor = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("surviving recovery target")
+        .instance();
+
+    for receivers in [
+        &mut owner_receivers,
+        &mut lost_receivers,
+        &mut survivor_receivers,
+    ] {
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+    }
+    for instance in [owner, lost, survivor] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+
+    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let original = send_stream
+        .send_data(Bytes::from(vec![0x5a; 4096]))
+        .expect("retained request range");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &original);
+    assert!(sender.mark_request_path_stale(&context, &remotes, owner, TrafficClass::Throughput,));
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    assert!(
+        sender
+            .drive_request_path_recovery(
+                &mut sender_queue,
+                &context,
+                &remotes,
+                &send_stream,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+
+    drop(
+        remotes
+            .remove_path_instance(lost)
+            .expect("retire exact queued target"),
+    );
+    let mut request_recovery_dirty = false;
+    assert_eq!(
+        prune_unavailable_request_recovery_before_drive(
+            &sender,
+            &mut sender_queue,
+            &remotes,
+            &mut request_recovery_dirty,
+        ),
+        4096,
+    );
+    assert!(request_recovery_dirty);
+
+    let recovery = sender.drive_request_path_recovery(
+        &mut sender_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        TrafficClass::Throughput,
+    );
+    assert!(
+        recovery.queued,
+        "the same actor recovery pass must bind the uncovered range to the survivor",
+    );
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut sender_queue,
+            4096,
+            ReliableDataAckFrontierState::Live,
+        )
+        .await
+        .expect("survivor recovery dispatch");
+    assert!(matches!(dispatch, ClientQueuedDispatch::Reinjection { .. }));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut survivor_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        })) if payload.len() == 4096
+    ));
+    assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
+
+    // Keep the mock attachment inputs alive until after the recovery assertion.
+    drop((owner_frames, lost_frames, survivor_frames));
 }
 
 #[tokio::test]
@@ -414,7 +559,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
         },
         0,
     );
-    let remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 8);
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let sent = send_stream
         .send_data(Bytes::from_static(b"abcdefgh"))
@@ -436,7 +581,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             sender: &mut sender,
             sender_queue: &mut sender_queue,
             context: &context,
-            remotes: &remotes,
+            remotes: &mut remotes,
             send_stream: &mut send_stream,
             path_snapshot: None,
             relay_lane: TrafficClass::Throughput,
@@ -469,7 +614,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
             sender: &mut sender,
             sender_queue: &mut sender_queue,
             context: &context,
-            remotes: &remotes,
+            remotes: &mut remotes,
             send_stream: &mut send_stream,
             path_snapshot: None,
             relay_lane: TrafficClass::Throughput,
@@ -827,6 +972,65 @@ async fn client_completion_retains_ack_until_every_live_attachment_accepts_it() 
 }
 
 #[tokio::test]
+async fn client_completion_retains_zero_publication_requalification_ack() {
+    let stream_id = StreamId(616);
+    let limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands.clone(),
+                limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    while try_recv_reliable_path_priority_command(&mut receivers).is_some() {}
+    commands
+        .try_enqueue_admitted_frame(Frame::Ping { nonce: 616 }, TrafficClass::Control)
+        .expect("fill the only exact reverse-control queue");
+
+    let target = remotes.paths[0].instance();
+    assert!(
+        !remotes
+            .publish_requalification_ack(
+                target,
+                Frame::StreamRequalifyAck {
+                    stream_id,
+                    probe_id: 1,
+                    offset: 4096,
+                    payload_bytes: 512,
+                },
+            )
+            .expect("retain a zero-publication exact receipt")
+    );
+    assert!(remotes.has_pending_requalification_ack());
+
+    let mut state = ClientRelayState::new();
+    state.record_local_eof();
+    state.record_local_fin_sent();
+    state.record_terminal_fin_replayed();
+    state.record_remote_finished();
+    let send_stream = ReliableSendStream::new(stream_id, limits);
+    let recv_stream = ReliableRecvStream::new(stream_id, limits);
+    let sender_queue = ReliableRelaySenderQueue::default();
+    assert!(
+        !client_relay_finished(&state, &send_stream, &recv_stream, &sender_queue, &remotes,),
+        "stream completion must not discard its retained exact requalification receipt",
+    );
+}
+
+#[tokio::test]
 async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
     let stream_id = StreamId(614);
     let (mut application, relay, frames_tx, mut command_receivers) =
@@ -892,15 +1096,16 @@ fn request_outstanding_limit_uses_stream_resources_then_exact_ack_headroom() {
         ..MuxLimits::default()
     };
     let payload_bytes = 64 * 1024;
-    let limit = reliable_relay_request_outstanding_limit_bytes(
-        TrafficClass::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
     let accounting_limit = mux_limits
         .max_repair_bytes
         .min(mux_limits.max_reorder_bytes)
         .min(mux_limits.max_stream_window_bytes as usize);
+    let limit = reliable_relay_request_outstanding_limit_bytes(
+        TrafficClass::Throughput,
+        payload_bytes,
+        accounting_limit,
+        mux_limits,
+    );
     assert_eq!(limit, accounting_limit);
 
     let mut send_stream = ReliableSendStream::new(StreamId(90), mux_limits);
@@ -950,12 +1155,59 @@ fn request_outstanding_limit_uses_stream_resources_then_exact_ack_headroom() {
 }
 
 #[test]
+fn request_source_staging_exhausts_sum_product_window_and_data_ack_reopens_it() {
+    let mux_limits = MuxLimits {
+        max_stream_window_bytes: 4 * 1024 * 1024,
+        max_repair_bytes: 4 * 1024 * 1024,
+        max_reorder_bytes: 4 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let product_window = 2 * 1024 * 1024;
+    let limit = reliable_relay_request_outstanding_limit_bytes(
+        TrafficClass::Throughput,
+        64 * 1024,
+        product_window,
+        mux_limits,
+    );
+    assert_eq!(limit, product_window);
+
+    let mut send_stream = ReliableSendStream::new(StreamId(91), mux_limits);
+    send_stream
+        .send_data(Bytes::from(vec![0x51; 512 * 1024]))
+        .expect("first retained Product frame");
+    send_stream
+        .send_data(Bytes::from(vec![0x52; 512 * 1024]))
+        .expect("second retained Product frame");
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    sender_queue.push_data(Bytes::from(vec![0x53; 1024 * 1024]));
+    assert_eq!(
+        reliable_relay_request_outstanding_headroom_bytes(&send_stream, &sender_queue, limit,),
+        0,
+        "retained plus queued unique bytes consume the complete sum(P_i) source envelope",
+    );
+
+    let ack = send_stream
+        .apply_ack(&[OffsetRange {
+            start: 0,
+            end: 1024 * 1024,
+        }])
+        .expect("exact Data ACK");
+    assert_eq!(ack.released_bytes, 1024 * 1024);
+    assert_eq!(
+        reliable_relay_request_outstanding_headroom_bytes(&send_stream, &sender_queue, limit,),
+        1024 * 1024,
+        "Data ACK release reopens source staging without borrowing another stream's window",
+    );
+}
+
+#[test]
 fn latency_request_outstanding_limit_keeps_the_staging_reservoir() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = 64 * 1024;
     let limit = reliable_relay_request_outstanding_limit_bytes(
         TrafficClass::Latency,
         payload_bytes,
+        reliable_relay_buffer_len(mux_limits),
         mux_limits,
     );
 
@@ -967,7 +1219,12 @@ fn latency_request_outstanding_limit_keeps_the_staging_reservoir() {
 async fn bulk_request_staging_uses_resource_ceiling_and_bounded_ready_work() {
     let limits = MuxLimits::default();
     assert_eq!(
-        reliable_relay_request_outstanding_limit_bytes(TrafficClass::Throughput, 64 * 1024, limits,),
+        reliable_relay_request_outstanding_limit_bytes(
+            TrafficClass::Throughput,
+            64 * 1024,
+            usize::MAX,
+            limits,
+        ),
         limits
             .max_repair_bytes
             .min(limits.max_reorder_bytes)

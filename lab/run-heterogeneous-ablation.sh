@@ -844,6 +844,46 @@ resource_config_toml() {
   fi
 }
 
+flow_config_toml() {
+  local role="$1"
+  local env_name initial_rate_mbps
+  case "$role" in
+    client)
+      env_name="MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS"
+      ;;
+    server)
+      env_name="MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS"
+      ;;
+    *)
+      echo "flow_config_toml role must be client or server" >&2
+      return 2
+      ;;
+  esac
+  initial_rate_mbps="${!env_name:-}"
+  if [[ -z "$initial_rate_mbps" ]]; then
+    return 0
+  fi
+  if [[ ! "$initial_rate_mbps" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$env_name must be a positive integer" >&2
+    return 2
+  fi
+  printf '[flow]\ninitial_rate_mbps = %s\n' "$initial_rate_mbps"
+}
+
+validate_initial_rate_lab_contract() {
+  if [[ -n "${MPTUNNEL_LAB_INITIAL_RATE_MBPS:-}" ]]; then
+    echo "MPTUNNEL_LAB_INITIAL_RATE_MBPS is ambiguous and no longer accepted; set MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS and/or MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS explicitly" >&2
+    return 2
+  fi
+  flow_config_toml client >/dev/null || return
+  flow_config_toml server >/dev/null || return
+  if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]] \
+    && [[ -n "${MPTUNNEL_LAB_CLIENT_INITIAL_RATE_MBPS:-}${MPTUNNEL_LAB_SERVER_INITIAL_RATE_MBPS:-}" ]]; then
+    echo "MPTUNNEL_LAB_USE_PATH_HINTS=1 cannot be combined with direction-local initial-rate inputs because path hints supply client per-path initial-rate-mbps" >&2
+    return 2
+  fi
+}
+
 probe_config_toml() {
   if [[ -n "${PATH_PROBE_INTERVAL_S:-}" ]]; then
     if [[ ! "${PATH_PROBE_INTERVAL_S}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
@@ -957,7 +997,7 @@ shared_transport_secret_toml() {
 
 server_config_toml() {
   local log_level_json credential_path_json certificate_path_json private_key_path_json
-  local paths resources management transport_security
+  local paths resources flow management transport_security
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$server_credential_path")"
   certificate_path_json="$(toml_string "$server_tls_certificate_path")"
@@ -990,6 +1030,7 @@ server_config_toml() {
     "quic://172.31.59.20:${server_port}" \
     "quic://172.31.60.20:${server_port}")"
   resources="$(resource_config_toml)"
+  flow="$(flow_config_toml server)"
   management="$(management_config_toml "$server_management_token_path")"
   if [[ -n "$resources" ]]; then
     resources="${resources}"$'\n\n'
@@ -997,11 +1038,14 @@ server_config_toml() {
   if [[ -n "$management" ]]; then
     management="${management}"$'\n'
   fi
+  if [[ -n "$flow" ]]; then
+    flow="${flow}"$'\n'
+  fi
   cat <<EOF
 [logging]
 level = ${log_level_json}
 
-${resources}${management}[[credentials]]
+${resources}${flow}${management}[[credentials]]
 credential_id = "lab"
 principal_id = "lab"
 secret = { from = "file", path = ${credential_path_json} }
@@ -1037,7 +1081,7 @@ EOF
 socks_client_config_toml() {
   local path_args="$1"
   local log_level_json credential_path_json certificate_path_json
-  local listen paths resources probe management transport_security
+  local listen paths resources flow probe management transport_security
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$client_credential_path")"
   certificate_path_json="$(toml_string "$client_tls_certificate_path")"
@@ -1045,6 +1089,7 @@ socks_client_config_toml() {
   listen="$(toml_array_from_args "127.0.0.1:${proxy_port}")"
   paths="$(path_args_to_named_path_array "$path_args")"
   resources="$(resource_config_toml)"
+  flow="$(flow_config_toml client)"
   probe="$(probe_config_toml)"
   management="$(management_config_toml "$client_management_token_path")"
   if [[ -n "$resources" ]]; then
@@ -1056,11 +1101,14 @@ socks_client_config_toml() {
   if [[ -n "$management" ]]; then
     management="${management}"$'\n'
   fi
+  if [[ -n "$flow" ]]; then
+    flow="${flow}"$'\n'
+  fi
   cat <<EOF
 [logging]
 level = ${log_level_json}
 
-${resources}${management}[[credentials]]
+${resources}${flow}${management}[[credentials]]
 credential_id = "lab"
 principal_id = "lab"
 secret = { from = "file", path = ${credential_path_json} }
@@ -1108,13 +1156,14 @@ EOF
 tun_client_config_toml() {
   local path_args="$1"
   local log_level_json credential_path_json certificate_path_json
-  local paths resources probe management transport_security
+  local paths resources flow probe management transport_security
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$client_credential_path")"
   certificate_path_json="$(toml_string "$client_tls_certificate_path")"
   transport_security="$(shared_transport_secret_toml "$client_transport_secret_path")"
   paths="$(path_args_to_named_path_array "$path_args")"
   resources="$(resource_config_toml)"
+  flow="$(flow_config_toml client)"
   probe="$(probe_config_toml)"
   management="$(management_config_toml "$client_management_token_path")"
   if [[ -n "$resources" ]]; then
@@ -1126,11 +1175,14 @@ tun_client_config_toml() {
   if [[ -n "$management" ]]; then
     management="${management}"$'\n'
   fi
+  if [[ -n "$flow" ]]; then
+    flow="${flow}"$'\n'
+  fi
   cat <<EOF
 [logging]
 level = ${log_level_json}
 
-${resources}${management}[[credentials]]
+${resources}${flow}${management}[[credentials]]
 credential_id = "lab"
 principal_id = "lab"
 secret = { from = "file", path = ${credential_path_json} }
@@ -2738,12 +2790,20 @@ start_bulk_interactive_loss_scheduler() {
   local pid_file="$8"
   local result_prefix="$9"
   local log_file="${10}"
+  local profile="${11:-balanced}"
+  local rates_csv="${12:-}"
   local losses_csv
   losses_csv="$(IFS=,; printf '%s' "${bulk_interactive_loss_percent[*]}")"
   compose exec -T \
+    -e MPTUNNEL_LAB_LOWLAT_RATE="$bulk_interactive_rate" \
+    -e MPTUNNEL_LAB_LOWLAT_DELAY="$bulk_interactive_delay" \
+    -e MPTUNNEL_LAB_LOWLAT_JITTER="$bulk_interactive_jitter" \
     -e MPTUNNEL_LAB_BALANCED_RATE="$bulk_interactive_rate" \
     -e MPTUNNEL_LAB_BALANCED_DELAY="$bulk_interactive_delay" \
     -e MPTUNNEL_LAB_BALANCED_JITTER="$bulk_interactive_jitter" \
+    -e MPTUNNEL_LAB_FAT_RATE="$bulk_interactive_rate" \
+    -e MPTUNNEL_LAB_FAT_DELAY="$bulk_interactive_delay" \
+    -e MPTUNNEL_LAB_FAT_JITTER="$bulk_interactive_jitter" \
     -e MPTUNNEL_LAB_SCHEDULE_ROLE="$role" \
     -e MPTUNNEL_LAB_SCHEDULE_SERVICE="$service" \
     -e MPTUNNEL_LAB_SCHEDULE_STARTED_FILE="$probe_started_file" \
@@ -2758,6 +2818,8 @@ start_bulk_interactive_loss_scheduler() {
     -e MPTUNNEL_LAB_SCHEDULE_LATENESS_MS="$bulk_interactive_transition_complete_lateness_ms" \
     -e MPTUNNEL_LAB_SCHEDULE_COMMAND_TIMEOUT_S="$bulk_interactive_transition_command_timeout_seconds" \
     -e MPTUNNEL_LAB_SCHEDULE_LOSSES="$losses_csv" \
+    -e MPTUNNEL_LAB_SCHEDULE_PROFILE="$profile" \
+    -e MPTUNNEL_LAB_SCHEDULE_RATES="$rates_csv" \
     "$service" bash -lc \
     "exec /workspace/lab/configure-netem.sh bulk-interactive-loss-schedule" \
     >"$log_file" 2>&1 &
@@ -3169,6 +3231,474 @@ fi; printf '%s\n' \"\$probe_exit\" > '${probe_status_container_file}.tmp'; mv '$
   cleanup_active_bulk_interactive_probe
 }
 
+quic_qos_recovery_metadata() {
+  local probe_started_file="$1"
+  local management_file="$2"
+  local management_artifact="$3"
+  shift 3
+  python3 - "$probe_started_file" "$management_file" "$management_artifact" "$@" <<'PY'
+import base64
+import binascii
+import json
+from pathlib import Path
+import re
+import sys
+
+
+losses = [3, 8, 5, 6, 10, 3, 5, 8]
+epoch_ms = 5_000
+duration_ms = len(losses) * epoch_ms
+lateness_ms = 250
+stable_rates = ["500mbit"] * len(losses)
+quic_rates = ["500mbit", "500mbit", "500mbit", "500mbit", "10mbit", "500mbit", "500mbit", "500mbit"]
+started_path = Path(sys.argv[1])
+management_path = Path(sys.argv[2])
+management_artifact = sys.argv[3]
+spec_fields = sys.argv[4:]
+errors = []
+schedules = {}
+completion_by_epoch = [[] for _ in losses]
+
+try:
+    started_lines = started_path.read_text(encoding="utf-8").splitlines()
+    if len(started_lines) != 3:
+        raise ValueError("probe start marker does not have three clock fields")
+    probe_started_monotonic_ms = int(started_lines[1])
+except (OSError, ValueError) as exc:
+    probe_started_monotonic_ms = None
+    errors.append(f"invalid probe start marker: {exc}")
+
+if len(spec_fields) % 5:
+    errors.append("schedule specification is malformed")
+for offset in range(0, len(spec_fields) - 4, 5):
+    label, profile, service, status_name, result_prefix = spec_fields[offset:offset + 5]
+    expected_subnet = "172.31.10" if profile == "lowlat" else "172.31.20"
+    expected_host = "10" if service == "client" else "20"
+    expected_address = f"{expected_subnet}.{expected_host}/24"
+    expected_rates = stable_rates if profile == "lowlat" else quic_rates
+    schedule = {"profile": profile, "service": service, "events": []}
+    schedules[label] = schedule
+    try:
+        status = json.loads(Path(status_name).read_text(encoding="utf-8"))
+        schedule["status"] = status
+        completed = status.get("completed_offset_ms")
+        if (
+            status.get("exit_code") != 0
+            or type(completed) is not int
+            or not duration_ms <= completed <= duration_ms + lateness_ms
+        ):
+            errors.append(f"{label} schedule did not complete on time")
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"{label} status is unavailable: {exc}")
+    for index, (loss, expected_rate) in enumerate(zip(losses, expected_rates)):
+        event_path = Path(f"{result_prefix}-epoch-{index}.json")
+        try:
+            event = json.loads(event_path.read_text(encoding="utf-8"))
+            schedule["events"].append(event)
+            planned = index * epoch_ms
+            if (
+                event.get("role") != label
+                or event.get("service") != service
+                or any(
+                    event.get(field) != 0
+                    for field in (
+                        "command_exit_code",
+                        "apply_exit_code",
+                        "readback_exit_code",
+                    )
+                )
+                or type(event.get("start_offset_ms")) is not int
+                or type(event.get("end_offset_ms")) is not int
+                or not planned <= event["start_offset_ms"] <= event["end_offset_ms"] <= planned + lateness_ms
+            ):
+                raise ValueError("transition timing or exit status is invalid")
+            completion_by_epoch[index].append(event["end_offset_ms"])
+            decoded = base64.b64decode(
+                event.get("readback_base64", ""), validate=True
+            ).decode("utf-8")
+            lines = decoded.splitlines()
+            if (
+                len(lines) != 3
+                or re.fullmatch(r"interface=[^\s=]+", lines[0]) is None
+                or lines[1] != f"address={expected_address}"
+            ):
+                raise ValueError("qdisc interface readback is invalid")
+            qdisc = lines[2]
+            rate_number = expected_rate.removesuffix("mbit")
+            if (
+                re.search(r"^qdisc\s+netem\s+\S+.*\broot\b", qdisc) is None
+                or re.search(rf"\brate\s+{rate_number}(?:[.]0+)?Mbit\b", qdisc, re.I) is None
+                or re.search(r"\bdelay\s+50(?:[.]0+)?ms\s+20(?:[.]0+)?ms\b", qdisc, re.I) is None
+                or re.search(rf"\bloss(?:\s+random)?\s+{loss}(?:[.]0+)?%(?:\s|$)", qdisc, re.I) is None
+            ):
+                raise ValueError("qdisc values do not match the declared epoch")
+        except (OSError, ValueError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as exc:
+            errors.append(f"{label} epoch {index} is invalid: {exc}")
+
+for index, completions in enumerate(completion_by_epoch):
+    if len(completions) != 4 or max(completions) - min(completions) > lateness_ms:
+        errors.append(f"epoch {index} endpoint/profile skew is invalid")
+
+management_available = management_path.is_file() and management_path.stat().st_size > 0
+if not management_available:
+    errors.append("management snapshots are unavailable")
+
+metadata = {
+    "schema_version": 1,
+    "condition": {
+        "tcp": {"subnet": "172.31.10.0/24", "rate": "500mbit"},
+        "quic": {
+            "subnet": "172.31.20.0/24",
+            "rate_by_epoch": quic_rates,
+        },
+        "delay_each_direction": "50ms",
+        "jitter_each_direction": "20ms",
+        "loss_percent": losses,
+        "mean_loss_percent": 6.0,
+        "epoch_seconds": 5,
+        "impairment_epoch": 4,
+        "restore_epoch": 5,
+        "request_contract": "one-fixed-request-no-replacement",
+    },
+    "probe_started_monotonic_ms": probe_started_monotonic_ms,
+    "management_snapshot_artifact": management_artifact,
+    "management_evidence_available": management_available,
+    "schedules": schedules,
+    "trace_complete": not errors,
+    "errors": errors,
+}
+print(json.dumps(metadata, separators=(",", ":"), sort_keys=True))
+PY
+}
+
+run_quic_qos_recovery_split_case() {
+  local case_name="mptunnel_tcp_quic_qos_recovery_split"
+  local out_file="/tmp/${case_name}.out"
+  local err_file="/tmp/${case_name}.err"
+  local probe_pid_file="/tmp/${case_name}.pid"
+  local base_relative=".tmp/lab/${case_name}-${timestamp}-$$"
+  local probe_started_relative="${base_relative}.started"
+  local probe_finished_relative="${base_relative}.finished"
+  local probe_status_relative="${base_relative}.status"
+  local cancel_relative="${base_relative}.cancel"
+  local probe_started_file="${repo_root}/${probe_started_relative}"
+  local probe_finished_file="${repo_root}/${probe_finished_relative}"
+  local probe_status_file="${repo_root}/${probe_status_relative}"
+  local cancel_file="${repo_root}/${cancel_relative}"
+  local probe_started_container="/workspace/${probe_started_relative}"
+  local probe_finished_container="/workspace/${probe_finished_relative}"
+  local probe_status_container="/workspace/${probe_status_relative}"
+  local cancel_container="/workspace/${cancel_relative}"
+  local stable_rates_csv quic_rates_csv
+  local telemetry_pid output probe_stderr exit_code metadata augmented_output
+  local management_file management_artifact
+  local scheduler_ready_deadline all_ready schedule_pid index epoch
+  local -a labels=(client-tcp client-quic server-tcp server-quic)
+  local -a services=(client client server server)
+  local -a profiles=(lowlat fat lowlat fat)
+  local -a rates=()
+  local -a ready_files=() status_files=() pid_container_files=() result_prefixes=()
+  local -a metadata_args=()
+
+  if (( object_mib < 4096 )); then
+    echo "${case_name} requires MPTUNNEL_LAB_OBJECT_MIB=4096 so its fixed request spans every epoch" >&2
+    return 2
+  fi
+  stable_rates_csv="500mbit,500mbit,500mbit,500mbit,500mbit,500mbit,500mbit,500mbit"
+  quic_rates_csv="500mbit,500mbit,500mbit,500mbit,10mbit,500mbit,500mbit,500mbit"
+  rates=("$stable_rates_csv" "$quic_rates_csv" "$stable_rates_csv" "$quic_rates_csv")
+
+  MPTUNNEL_LAB_LOWLAT_RATE="$bulk_interactive_rate" \
+  MPTUNNEL_LAB_LOWLAT_DELAY="$bulk_interactive_delay" \
+  MPTUNNEL_LAB_LOWLAT_JITTER="$bulk_interactive_jitter" \
+  MPTUNNEL_LAB_LOWLAT_LOSS="$bulk_interactive_initial_loss" \
+  MPTUNNEL_LAB_FAT_RATE="$bulk_interactive_rate" \
+  MPTUNNEL_LAB_FAT_DELAY="$bulk_interactive_delay" \
+  MPTUNNEL_LAB_FAT_JITTER="$bulk_interactive_jitter" \
+  MPTUNNEL_LAB_FAT_LOSS="$bulk_interactive_initial_loss" \
+    start_client "$case_name" "$tcp_endpoint_lowlat $udp_endpoint_fat"
+
+  mkdir -p "$(dirname "$probe_started_file")"
+  management_file="$(management_snapshot_file_for_case "$case_name")"
+  management_artifact="$(basename "$management_file")"
+  rm -f "$probe_started_file" "$probe_finished_file" "$probe_status_file" "$cancel_file"
+  exec_in client "rm -f '${out_file}' '${err_file}' '${probe_pid_file}'"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  active_telemetry_case="$case_name"
+  active_telemetry_pid="$telemetry_pid"
+  active_bulk_interactive_probe_pid_file="$probe_pid_file"
+  active_bulk_interactive_cancel_file="$cancel_file"
+  active_bulk_interactive_host_files=(
+    "$probe_started_file" "$probe_finished_file" "$probe_status_file" "$cancel_file"
+  )
+  active_bulk_interactive_schedule_pids=()
+  active_bulk_interactive_schedule_services=()
+  active_bulk_interactive_schedule_pid_files=()
+
+  for index in "${!labels[@]}"; do
+    local schedule_relative="${base_relative}-${labels[$index]}"
+    local ready_file="${repo_root}/${schedule_relative}.ready"
+    local status_file="${repo_root}/${schedule_relative}.status"
+    local pid_container="/workspace/${schedule_relative}.pid"
+    local result_prefix="${repo_root}/${schedule_relative}"
+    local result_container_prefix="/workspace/${schedule_relative}"
+    ready_files+=("$ready_file")
+    status_files+=("$status_file")
+    pid_container_files+=("$pid_container")
+    result_prefixes+=("$result_prefix")
+    active_bulk_interactive_host_files+=(
+      "$ready_file" "$status_file" "${repo_root}/${schedule_relative}.pid"
+      "${repo_root}/${schedule_relative}.log"
+    )
+    for epoch in "${!bulk_interactive_loss_percent[@]}"; do
+      active_bulk_interactive_host_files+=("${result_prefix}-epoch-${epoch}.json")
+    done
+  done
+  rm -f "${active_bulk_interactive_host_files[@]}"
+
+  for index in "${!labels[@]}"; do
+    local schedule_relative="${base_relative}-${labels[$index]}"
+    local pid_container="${pid_container_files[$index]}"
+    local result_container_prefix="/workspace/${schedule_relative}"
+    start_bulk_interactive_loss_scheduler \
+      "${labels[$index]}" "${services[$index]}" \
+      "$probe_started_container" "$probe_finished_container" "$cancel_container" \
+      "/workspace/${schedule_relative}.ready" \
+      "/workspace/${schedule_relative}.status" "$pid_container" \
+      "$result_container_prefix" "${repo_root}/${schedule_relative}.log" \
+      "${profiles[$index]}" "${rates[$index]}"
+    active_bulk_interactive_schedule_pids+=("$bulk_interactive_scheduler_wrapper_pid")
+    active_bulk_interactive_schedule_services+=("${services[$index]}")
+    active_bulk_interactive_schedule_pid_files+=("$pid_container")
+  done
+
+  scheduler_ready_deadline=$((SECONDS + 10))
+  while (( SECONDS < scheduler_ready_deadline )); do
+    all_ready=1
+    for index in "${!ready_files[@]}"; do
+      if [[ ! -f "${ready_files[$index]}" ]]; then
+        all_ready=0
+        break
+      fi
+    done
+    [[ "$all_ready" == "1" ]] && break
+    sleep 0.01
+  done
+  if [[ "${all_ready:-0}" != "1" ]]; then
+    : > "$cancel_file"
+    cleanup_active_bulk_interactive_probe
+    stop_case_telemetry "$case_name" "$telemetry_pid"
+    active_telemetry_case=""
+    active_telemetry_pid=""
+    apply_netem "$default_netem_mode"
+    append_download_probe_result \
+      "$case_name" 78 "" "split-path endpoint scheduler readiness failed" 1 \
+      "tcp+quic-qos-recovery"
+    return 0
+  fi
+
+  exec_in client "(if timeout $((bulk_interactive_probe_timeout_seconds + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --protocol 'tcp+quic-qos-recovery' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '$((4 * bulk_interactive_epoch_seconds))' --timeout '${bulk_interactive_probe_timeout_seconds}' --load-duration '${bulk_interactive_duration_seconds}' --parallel-downloads 1 --request-lifecycle fixed --interval-seconds 0.2 --started-file '${probe_started_container}' >'${out_file}' 2>'${err_file}'; then probe_exit=0; else probe_exit=\$?; fi; python3 -c 'import time; print(time.monotonic_ns() // 1000000)' > '${probe_finished_container}.tmp'; mv '${probe_finished_container}.tmp' '${probe_finished_container}'; printf '%s\n' \"\$probe_exit\" > '${probe_status_container}.tmp'; mv '${probe_status_container}.tmp' '${probe_status_container}') </dev/null >/dev/null 2>&1 & echo \$! > '${probe_pid_file}'"
+
+  for schedule_pid in "${active_bulk_interactive_schedule_pids[@]}"; do
+    wait "$schedule_pid" >/dev/null 2>&1 || true
+  done
+  active_bulk_interactive_schedule_pids=()
+  active_bulk_interactive_schedule_services=()
+  active_bulk_interactive_schedule_pid_files=()
+  wait_for_case_probe \
+    "$probe_status_file" "$probe_pid_file" "$bulk_interactive_probe_timeout_seconds"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  active_telemetry_case=""
+  active_telemetry_pid=""
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  exit_code="$(cat "$probe_status_file" 2>/dev/null || echo 124)"
+
+  for index in "${!labels[@]}"; do
+    metadata_args+=(
+      "${labels[$index]}" "${profiles[$index]}" "${services[$index]}"
+      "${status_files[$index]}" "${result_prefixes[$index]}"
+    )
+  done
+  metadata="$(quic_qos_recovery_metadata \
+    "$probe_started_file" "$management_file" "$management_artifact" \
+    "${metadata_args[@]}")"
+  augmented_output="$(ROW="$output" METADATA="$metadata" python3 - <<'PY'
+import json
+import os
+
+try:
+    row = json.loads(os.environ.get("ROW", ""))
+except json.JSONDecodeError:
+    row = {"status": "fail", "raw_output": os.environ.get("ROW", "")}
+metadata = json.loads(os.environ["METADATA"])
+row["quic_qos_recovery"] = metadata
+same_request = (
+    row.get("request_lifecycle") == "fixed"
+    and row.get("request_attempts_started") == 1
+    and row.get("replacement_requests") == 0
+    and row.get("early_terminations") == 0
+)
+row["same_request_contract_ok"] = same_request
+if not metadata.get("trace_complete") or not same_request:
+    row.setdefault("probe_status_before_qos_recovery_validation", row.get("status"))
+    row["status"] = "fail"
+    row["failure_reason"] = "split-path QoS recovery evidence is incomplete"
+print(json.dumps(row, separators=(",", ":"), sort_keys=True))
+PY
+)"
+  apply_netem "$default_netem_mode"
+  append_download_probe_result \
+    "$case_name" "$exit_code" "$augmented_output" "$probe_stderr" 1 \
+    "tcp+quic-qos-recovery"
+  cleanup_active_bulk_interactive_probe
+}
+
+run_quic_blackhole_retirement_split_case() {
+  local case_name="mptunnel_tcp_quic_blackhole_retirement_split"
+  local warmup_seconds=10
+  local blackhole_seconds=35
+  local restore_observation_seconds=25
+  # Keep the one request alive across the two bounded qdisc transactions and
+  # the complete 10 + 35 + 25 second observation windows.
+  local probe_duration_seconds=$((warmup_seconds + blackhole_seconds + restore_observation_seconds + 5))
+  local probe_timeout_seconds=$((probe_duration_seconds + 10))
+  local out_file="/tmp/${case_name}.out"
+  local err_file="/tmp/${case_name}.err"
+  local probe_pid_file="/tmp/${case_name}.pid"
+  local base_relative=".tmp/lab/${case_name}-${timestamp}-$$"
+  local probe_started_relative="${base_relative}.started"
+  local probe_finished_relative="${base_relative}.finished"
+  local probe_status_relative="${base_relative}.status"
+  local probe_started_file="${repo_root}/${probe_started_relative}"
+  local probe_finished_file="${repo_root}/${probe_finished_relative}"
+  local probe_status_file="${repo_root}/${probe_status_relative}"
+  local probe_started_container="/workspace/${probe_started_relative}"
+  local probe_finished_container="/workspace/${probe_finished_relative}"
+  local probe_status_container="/workspace/${probe_status_relative}"
+  local trace_file="${result_dir}/transitions-${case_name}.jsonl"
+  local management_file management_artifact
+  local telemetry_pid output probe_stderr exit_code gate_deadline
+  local probe_started_monotonic_ms probe_finished_monotonic_ms
+  local transition_started_ns transition_finished_ns
+
+  if (( object_mib < 16384 )); then
+    echo "${case_name} requires MPTUNNEL_LAB_OBJECT_MIB of at least 16384 so one request spans the complete lifecycle" >&2
+    return 2
+  fi
+  if ! management_snapshots_enabled; then
+    echo "${case_name} requires MPTUNNEL_LAB_MANAGEMENT_SNAPSHOTS=1 for timestamped path and progress evidence" >&2
+    return 2
+  fi
+
+  MPTUNNEL_LAB_LOWLAT_RATE="500mbit" \
+  MPTUNNEL_LAB_LOWLAT_DELAY="50ms" \
+  MPTUNNEL_LAB_LOWLAT_JITTER="20ms" \
+  MPTUNNEL_LAB_LOWLAT_LOSS="6%" \
+  MPTUNNEL_LAB_FAT_RATE="500mbit" \
+  MPTUNNEL_LAB_FAT_DELAY="50ms" \
+  MPTUNNEL_LAB_FAT_JITTER="20ms" \
+  MPTUNNEL_LAB_FAT_LOSS="6%" \
+    start_client "$case_name" "$tcp_endpoint_lowlat $udp_endpoint_fat"
+
+  mkdir -p "$(dirname "$probe_started_file")"
+  management_file="$(management_snapshot_file_for_case "$case_name")"
+  management_artifact="$(basename "$management_file")"
+  rm -f "$probe_started_file" "$probe_finished_file" "$probe_status_file" "$trace_file"
+  exec_in client "rm -f '${out_file}' '${err_file}' '${probe_pid_file}'"
+  printf '{"event":"evidence","management_snapshot_artifact":"%s","management_progress_clock":"sample_started_monotonic_ns","probe_interval_seconds":0.2}\n' \
+    "$management_artifact" >> "$trace_file"
+
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  active_telemetry_case="$case_name"
+  active_telemetry_pid="$telemetry_pid"
+  active_bulk_interactive_probe_pid_file="$probe_pid_file"
+  active_bulk_interactive_host_files=(
+    "$probe_started_file" "$probe_finished_file" "$probe_status_file"
+  )
+
+  exec_in client "(if timeout $((probe_timeout_seconds + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --protocol 'tcp+quic-blackhole-retirement' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${warmup_seconds}' --timeout '${probe_timeout_seconds}' --load-duration '${probe_duration_seconds}' --parallel-downloads 1 --request-lifecycle fixed --interval-seconds 0.2 --started-file '${probe_started_container}' >'${out_file}' 2>'${err_file}'; then probe_exit=0; else probe_exit=\$?; fi; python3 -c 'import time; print(time.monotonic_ns() // 1000000)' > '${probe_finished_container}.tmp'; mv '${probe_finished_container}.tmp' '${probe_finished_container}'; printf '%s\n' \"\$probe_exit\" > '${probe_status_container}.tmp'; mv '${probe_status_container}.tmp' '${probe_status_container}') </dev/null >/dev/null 2>&1 & echo \$! > '${probe_pid_file}'"
+
+  gate_deadline=$((SECONDS + 10))
+  while [[ ! -f "$probe_started_file" && ! -f "$probe_status_file" ]] \
+    && (( SECONDS < gate_deadline )); do
+    sleep 0.01
+  done
+  if [[ -f "$probe_started_file" ]]; then
+    probe_started_monotonic_ms="$(sed -n '2p' "$probe_started_file")"
+    printf '{"event":"probe_started","monotonic_ms":%s}\n' \
+      "$probe_started_monotonic_ms" >> "$trace_file"
+
+    sleep "$warmup_seconds"
+    transition_started_ns="$(monotonic_time_ns)"
+    printf '{"event":"quic_blackhole_started","monotonic_ns":%s}\n' \
+      "$transition_started_ns" >> "$trace_file"
+    MPTUNNEL_LAB_BLACKHOLE_LOSS="100%" exec_netem client blackhole-fat
+    transition_finished_ns="$(monotonic_time_ns)"
+    printf '{"event":"quic_blackhole_client_applied","monotonic_ns":%s}\n' \
+      "$transition_finished_ns" >> "$trace_file"
+    MPTUNNEL_LAB_BLACKHOLE_LOSS="100%" exec_netem server blackhole-fat
+    transition_finished_ns="$(monotonic_time_ns)"
+    printf '{"event":"quic_blackhole_fully_applied","monotonic_ns":%s}\n' \
+      "$transition_finished_ns" >> "$trace_file"
+    capture_qdisc_snapshot "$case_name" blackhole
+
+    sleep "$blackhole_seconds"
+    transition_started_ns="$(monotonic_time_ns)"
+    printf '{"event":"quic_restore_started","monotonic_ns":%s}\n' \
+      "$transition_started_ns" >> "$trace_file"
+    MPTUNNEL_LAB_FAT_RATE="500mbit" \
+    MPTUNNEL_LAB_FAT_DELAY="50ms" \
+    MPTUNNEL_LAB_FAT_JITTER="20ms" \
+    MPTUNNEL_LAB_FAT_LOSS="6%" \
+      exec_netem client apply-fat
+    transition_finished_ns="$(monotonic_time_ns)"
+    printf '{"event":"quic_restore_client_applied","monotonic_ns":%s}\n' \
+      "$transition_finished_ns" >> "$trace_file"
+    MPTUNNEL_LAB_FAT_RATE="500mbit" \
+    MPTUNNEL_LAB_FAT_DELAY="50ms" \
+    MPTUNNEL_LAB_FAT_JITTER="20ms" \
+    MPTUNNEL_LAB_FAT_LOSS="6%" \
+      exec_netem server apply-fat
+    transition_finished_ns="$(monotonic_time_ns)"
+    printf '{"event":"quic_restore_fully_applied","monotonic_ns":%s}\n' \
+      "$transition_finished_ns" >> "$trace_file"
+    capture_qdisc_snapshot "$case_name" restored
+
+    sleep "$restore_observation_seconds"
+    wait_for_case_probe "$probe_status_file" "$probe_pid_file" "$probe_timeout_seconds"
+  else
+    printf '{"event":"probe_start_failed","monotonic_ns":%s}\n' \
+      "$(monotonic_time_ns)" >> "$trace_file"
+    wait_for_case_probe "$probe_status_file" "$probe_pid_file" 1
+  fi
+
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  active_telemetry_case=""
+  active_telemetry_pid=""
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  exit_code="$(cat "$probe_status_file" 2>/dev/null || echo 124)"
+  if [[ ! "$exit_code" =~ ^[0-9]+$ ]]; then
+    exit_code=124
+  fi
+  probe_finished_monotonic_ms="$(sed -n '1p' "$probe_finished_file" 2>/dev/null || true)"
+  if [[ "$probe_finished_monotonic_ms" =~ ^[0-9]+$ ]]; then
+    printf '{"event":"probe_finished","monotonic_ms":%s,"exit_code":%s}\n' \
+      "$probe_finished_monotonic_ms" "$exit_code" >> "$trace_file"
+  else
+    printf '{"event":"probe_finish_unavailable","observed_monotonic_ns":%s,"exit_code":%s}\n' \
+      "$(monotonic_time_ns)" "$exit_code" >> "$trace_file"
+  fi
+  apply_netem "$default_netem_mode"
+  append_download_probe_result \
+    "$case_name" "$exit_code" "$output" "$probe_stderr" 1 \
+    "tcp+quic-blackhole-retirement"
+  cleanup_active_bulk_interactive_probe
+}
+
 run_raw_tcp_bulk_interactive_case() {
   local case_name="baseline_raw_tcp_bulk_interactive_balanced"
   local probe_status=0
@@ -3178,7 +3708,11 @@ run_raw_tcp_bulk_interactive_case() {
   stop_server
   for service in client server; do
     pid_file="/tmp/mptunnel-${service}.pid"
-    exec_in "$service" "deadline=\$((SECONDS + 5)); while pgrep -f '[m]ptunnel.*--config' >/dev/null && (( SECONDS < deadline )); do sleep 0.05; done; test ! -e '${pid_file}'; ! pgrep -f '[m]ptunnel.*--config' >/dev/null"
+    # Keep the PID-file check out of the pgrep command line. Otherwise the
+    # regex can start at `mptunnel-*.pid` in this shell's own argv and finish
+    # at the pattern's literal `--config`, making the guard self-match.
+    exec_in "$service" "test ! -e '${pid_file}'"
+    exec_in "$service" "deadline=\$((SECONDS + 5)); while pgrep -f '[m]ptunnel.*--config' >/dev/null && (( SECONDS < deadline )); do sleep 0.05; done; ! pgrep -f '[m]ptunnel.*--config' >/dev/null"
   done
   if run_bulk_interactive_probe_case \
     "$case_name" "" 0 "" direct target raw-tcp; then
@@ -4613,6 +5147,7 @@ run_upload_latency_spike_case() {
 }
 
 validate_client_runtime_case_filter
+validate_initial_rate_lab_contract
 mkdir -p "$result_dir"
 : > "$result_file"
 : > "$result_dir/config-sha256.txt"
@@ -4982,6 +5517,14 @@ if should_run_case "mptunnel_tcp_quic_bulk_interactive_balanced"; then
     "tcp_quic_bulk_interactive_balanced" "$tcp_balanced $udp_balanced"
   run_bulk_interactive_probe_case \
     "mptunnel_tcp_quic_bulk_interactive_balanced" "$proxy_port"
+fi
+
+if should_run_case "mptunnel_tcp_quic_qos_recovery_split"; then
+  run_quic_qos_recovery_split_case
+fi
+
+if should_run_case "mptunnel_tcp_quic_blackhole_retirement_split"; then
+  run_quic_blackhole_retirement_split_case
 fi
 
 if should_run_case "mptunnel_tcp_single_cross_continent_high_bandwidth"; then

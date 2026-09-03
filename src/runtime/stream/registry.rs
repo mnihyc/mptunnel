@@ -4,8 +4,9 @@ use super::handle::{
 };
 use super::response::{
     ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
-    ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsEntry,
-    ServerPathMetricsSource, ServerSessionRegistration, ServerSessionTracker,
+    ResponseStartupFinalOutcome, ResponseStreamAttachOutcome, ResponseStreamBinding,
+    ServerPathMetricsEntry, ServerPathMetricsSource, ServerSessionRegistration,
+    ServerSessionTracker,
 };
 use super::send_buffer::SessionSendBuffer;
 #[cfg(feature = "lab-diagnostics")]
@@ -24,6 +25,7 @@ use crate::protocol::{
 use crate::runtime::RuntimeError;
 #[cfg(test)]
 use crate::runtime::path::ServerCarrierPathRegistration;
+use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 #[cfg(test)]
 use crate::runtime::path::commands::ReliablePathCommand;
 use crate::runtime::path::commands::{
@@ -31,11 +33,11 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::proof::PathProofObservation;
 use crate::runtime::path::{
-    CarrierDeliveryRateSample, ServerCarrierPathIdentity, ServerCarrierPathRetirement,
-    ServerCarrierPathStatusSnapshot, ServerMppIngress, ServerNewStreamPolicy, ServerPathValidation,
-    ServerRealtimeFlowLease, ServerSessionManagementSnapshot, ServerStreamFrameRoute,
-    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPort, ServerStreamPortBackend,
+    CarrierDeliveryRateSample, CarrierNativeWindowSample, ServerCarrierPathApplyAuthority,
+    ServerCarrierPathIdentity, ServerCarrierPathRetirement, ServerCarrierPathStatusSnapshot,
+    ServerMppIngress, ServerNewStreamPolicy, ServerPathValidation, ServerRealtimeFlowLease,
+    ServerSessionManagementSnapshot, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
+    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPort, ServerStreamPortBackend,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
 use crate::scheduler::{TrafficClass, traffic_class_from_stream_demand_hint};
@@ -63,9 +65,6 @@ pub(in crate::runtime) struct ServerReliableStreamRegistry {
             (SessionId, UnderlayProtocol, PathId, CarrierPathInstanceId),
             ServerPathMetricsEntry,
         >,
-    >,
-    path_usage: Mutex<
-        HashMap<(SessionId, UnderlayProtocol, PathId, CarrierPathInstanceId), ServerPathUsageEntry>,
     >,
     registered_path_instances: Mutex<ServerCarrierPathRegistry>,
     closed_streams: Mutex<RecentIdCache<(SessionId, StreamId)>>,
@@ -104,9 +103,94 @@ struct ServerPathUsageEntry {
 struct ServerRegisteredPath {
     local: crate::runtime::path::ServerLocalPathProperties,
     state: PeerPathState,
+    peer_usage: Option<ServerPathUsageEntry>,
+    /// Exact local congestion-controller/network-path lifetime. TCP uses zero
+    /// because physical socket replacement already changes `path_instance_id`;
+    /// QUIC publishes Quinn's path epoch independently of optional rate data.
+    native_capacity_epoch: u64,
+    /// Single registry-owned structural/Native apply fence shared with packet
+    /// attachments. It contains no ACK/Product-derived rate.
+    apply_authority: ServerCarrierPathApplyAuthority,
     path_proof: Option<PathProofObservation>,
     retirement_started: bool,
     retirement_completion: watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerCarrierPathStatusBasis {
+    identity: ServerCarrierPathIdentity,
+    local: crate::runtime::path::ServerLocalPathProperties,
+    state: PeerPathState,
+    usage: Option<PathUsage>,
+    eligibility_epoch: Option<u64>,
+    native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
+}
+
+impl ServerCarrierPathStatusBasis {
+    /// Capture structural state and its apply epoch under the registry owner.
+    /// Callers must hold `registered_path_instances` while invoking this.
+    fn capture(identity: ServerCarrierPathIdentity, path: &ServerRegisteredPath) -> Self {
+        let apply = path.apply_authority.snapshot();
+        Self {
+            identity,
+            local: path.local,
+            state: path.state,
+            usage: path.peer_usage.map(|entry| entry.usage),
+            eligibility_epoch: apply.eligibility_epoch,
+            native_scheduling_shape: apply.native_scheduling_shape,
+        }
+    }
+}
+
+impl ServerRegisteredPath {
+    fn advance_eligibility_epoch(&mut self) {
+        self.apply_authority.advance_eligibility_epoch();
+    }
+
+    fn set_state(&mut self, state: PeerPathState) -> bool {
+        if self.state == state {
+            return false;
+        }
+        self.advance_eligibility_epoch();
+        self.state = state;
+        true
+    }
+
+    fn update_peer_usage(&mut self, sequence: u64, usage: PathUsage) -> bool {
+        if self
+            .peer_usage
+            .is_some_and(|current| sequence <= current.sequence)
+        {
+            return false;
+        }
+        let eligibility_changed = self.peer_usage.map(|current| current.usage) != Some(usage);
+        if eligibility_changed {
+            self.advance_eligibility_epoch();
+        }
+        self.peer_usage = Some(ServerPathUsageEntry { sequence, usage });
+        true
+    }
+
+    fn begin_retirement(&mut self) -> bool {
+        if self.retirement_started {
+            return false;
+        }
+        self.advance_eligibility_epoch();
+        self.retirement_started = true;
+        self.state = PeerPathState::Draining;
+        true
+    }
+
+    /// Accepts one observation from the exact local QUIC controller lifetime.
+    /// A late publication from an older path epoch cannot restore obsolete
+    /// native capacity or overwrite the current path's diagnostics.
+    fn observe_native_capacity_epoch(&mut self, epoch: u64) -> bool {
+        if epoch < self.native_capacity_epoch {
+            return false;
+        }
+        self.native_capacity_epoch = epoch;
+        true
+    }
 }
 
 type ServerLogicalPathKey = (SessionId, UnderlayProtocol, PathId);
@@ -162,6 +246,20 @@ struct ExistingOrderedPathDetach {
     key: CarrierPathKey,
     path_instance_id: CarrierPathInstanceId,
     output_incarnation: u64,
+}
+
+enum OrderedPathDetachCompletion {
+    Pending(PendingOrderedPathDetach),
+    Existing(ExistingOrderedPathDetach),
+}
+
+impl OrderedPathDetachCompletion {
+    async fn wait(self) {
+        match self {
+            Self::Pending(detach) => detach.send().await,
+            Self::Existing(detach) => detach.wait().await,
+        }
+    }
 }
 
 impl ExistingOrderedPathDetach {
@@ -712,7 +810,6 @@ impl ServerReliableStreamRegistry {
             accepted,
             streams: Mutex::new(HashMap::new()),
             path_metrics: Mutex::new(HashMap::new()),
-            path_usage: Mutex::new(HashMap::new()),
             registered_path_instances: Mutex::new(ServerCarrierPathRegistry::default()),
             closed_streams: Mutex::new(RecentIdCache::new(reliable_closed_stream_cache_capacity(
                 max_streams,
@@ -752,58 +849,30 @@ impl ServerReliableStreamRegistry {
         #[cfg(test)]
         let active_streams = self.streams.lock().expect("server stream lock").len();
         let now = Instant::now();
-        let registered = self
-            .registered_path_instances
-            .lock()
-            .expect("server active path instance lock")
-            .instances
-            .iter()
-            .map(|(identity, path)| (*identity, path.clone()))
-            .collect::<Vec<_>>();
-        let path_metrics = self.path_metrics.lock().expect("server path metrics lock");
-        let path_usage = self.path_usage.lock().expect("server path usage lock");
-        let mut paths = registered
-            .into_iter()
-            .map(
-                |((session_id, underlay, path_id, path_instance_id), registered)| {
-                    let identity = (session_id, underlay, path_id, path_instance_id);
-                    let (metrics, source, carrier_delivery_rate_sample) =
-                        path_metrics.get(&identity).map_or_else(
-                            || {
-                                (
-                                    registered.local.initial_metrics,
-                                    registered.local.initial_metrics.map(|_| "startup"),
-                                    None,
-                                )
+        let registered = {
+            let registered = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            registered
+                .instances
+                .iter()
+                .map(
+                    |(&(session_id, underlay, path_id, path_instance_id), path)| {
+                        ServerCarrierPathStatusBasis::capture(
+                            ServerCarrierPathIdentity {
+                                session_id,
+                                underlay,
+                                path_id,
+                                path_instance_id,
                             },
-                            |entry| {
-                                let residence = now.saturating_duration_since(entry.recorded_at);
-                                (
-                                    Some(path_metrics_after_residence(entry.metrics, residence)),
-                                    Some(match entry.source {
-                                        ServerPathMetricsSource::PeerHint => "peer_hint",
-                                        ServerPathMetricsSource::LocalSender => "local_sender",
-                                    }),
-                                    entry.carrier_delivery_rate_sample,
-                                )
-                            },
-                        );
-                    ServerCarrierPathStatusSnapshot {
-                        session_id,
-                        underlay,
-                        path_id,
-                        path_instance_id,
-                        configured_index: registered.local.config_ordinal,
-                        policy: registered.local.policy,
-                        state: registered.state,
-                        usage: path_usage.get(&identity).map(|entry| entry.usage),
-                        metrics,
-                        carrier_delivery_rate_sample,
-                        source,
-                    }
-                },
-            )
-            .collect::<Vec<_>>();
+                            path,
+                        )
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        let mut paths = self.project_carrier_path_statuses(registered, now);
         paths.sort_unstable_by_key(|path| {
             (
                 path.session_id,
@@ -831,6 +900,67 @@ impl ServerReliableStreamRegistry {
         }
     }
 
+    /// Project only the exact carrier instances requested by a packet owner.
+    /// Unlike `management_snapshot`, this is O(requested paths), does not scan
+    /// unrelated sessions, and still captures structural fields with their
+    /// apply epoch in one registry transaction.
+    pub(in crate::runtime) fn carrier_path_statuses(
+        &self,
+        identities: &[ServerCarrierPathIdentity],
+    ) -> Vec<Option<ServerCarrierPathStatusSnapshot>> {
+        let now = Instant::now();
+        let registered = {
+            let registered = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            identities
+                .iter()
+                .map(|identity| {
+                    registered
+                        .instances
+                        .get(&server_physical_path_key(*identity))
+                        .map(|path| ServerCarrierPathStatusBasis::capture(*identity, path))
+                })
+                .collect::<Vec<_>>()
+        };
+        let path_metrics = self.path_metrics.lock().expect("server path metrics lock");
+        registered
+            .into_iter()
+            .map(|basis| {
+                basis.map(|basis| {
+                    project_carrier_path_status(
+                        basis,
+                        path_metrics
+                            .get(&server_physical_path_key(basis.identity))
+                            .copied(),
+                        now,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn project_carrier_path_statuses(
+        &self,
+        registered: Vec<ServerCarrierPathStatusBasis>,
+        now: Instant,
+    ) -> Vec<ServerCarrierPathStatusSnapshot> {
+        let path_metrics = self.path_metrics.lock().expect("server path metrics lock");
+        registered
+            .into_iter()
+            .map(|basis| {
+                project_carrier_path_status(
+                    basis,
+                    path_metrics
+                        .get(&server_physical_path_key(basis.identity))
+                        .copied(),
+                    now,
+                )
+            })
+            .collect()
+    }
+
     pub(in crate::runtime) fn peer_status_snapshot(
         &self,
         session_id: SessionId,
@@ -846,6 +976,12 @@ impl ServerReliableStreamRegistry {
             registered.instances.iter()
         {
             if *entry_session != session_id {
+                continue;
+            }
+            let logical_key = (*entry_session, *underlay, *path_id);
+            if registered.logical_instances.get(&logical_key) != Some(path_instance_id) {
+                // Peer status describes the current logical carrier, never a
+                // non-current exact physical lifecycle record.
                 continue;
             }
             let instance_key = (*entry_session, *underlay, *path_id, *path_instance_id);
@@ -978,7 +1114,11 @@ impl ServerReliableStreamRegistry {
         &self,
         identity: ServerCarrierPathIdentity,
         local: crate::runtime::path::ServerLocalPathProperties,
+        initial_peer_usage: Option<PathUsage>,
+        native_capacity_epoch: u64,
+        apply_authority: ServerCarrierPathApplyAuthority,
         principal_permit: PrincipalPermit,
+        retirement_completion: watch::Sender<bool>,
     ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
         let ServerCarrierPathIdentity {
             session_id,
@@ -1040,7 +1180,6 @@ impl ServerReliableStreamRegistry {
             return Err(RuntimeError::RemoteClosed(reason));
         }
 
-        let (retirement_completion, _) = watch::channel(false);
         paths
             .logical_instances
             .insert(logical_key, path_instance_id);
@@ -1054,6 +1193,10 @@ impl ServerReliableStreamRegistry {
                 ServerRegisteredPath {
                     local,
                     state: PeerPathState::Active,
+                    peer_usage: initial_peer_usage
+                        .map(|usage| ServerPathUsageEntry { sequence: 0, usage }),
+                    native_capacity_epoch,
+                    apply_authority,
                     path_proof: None,
                     retirement_started: false,
                     retirement_completion,
@@ -1087,8 +1230,23 @@ impl ServerReliableStreamRegistry {
             .instances
             .get_mut(&key)
         {
-            path.state = state;
+            path.set_state(state);
         }
+    }
+
+    fn carrier_path_accepts_attachment(&self, identity: ServerCarrierPathIdentity) -> bool {
+        let paths = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        paths
+            .logical_instances
+            .get(&server_logical_path_key(identity))
+            == Some(&identity.path_instance_id)
+            && paths
+                .instances
+                .get(&server_physical_path_key(identity))
+                .is_some_and(|path| !path.retirement_started)
     }
 
     fn retire_carrier_path(
@@ -1102,33 +1260,18 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         } = identity;
         let (retirement, retirement_started) = {
-            let logical_key = server_logical_path_key(identity);
             let physical_key = server_physical_path_key(identity);
             let mut paths = self
                 .registered_path_instances
                 .lock()
                 .expect("server active path instance lock");
-            if paths.logical_instances.get(&logical_key) != Some(&path_instance_id) {
+            let Some(path) = paths.instances.get_mut(&physical_key) else {
                 return ServerCarrierPathRetirement::complete();
-            } else {
-                let (retirement, retirement_started) = {
-                    let Some(path) = paths.instances.get_mut(&physical_key) else {
-                        return ServerCarrierPathRetirement::complete();
-                    };
-                    let retirement = ServerCarrierPathRetirement::pending(
-                        path.retirement_completion.subscribe(),
-                    );
-                    let retirement_started = if path.retirement_started {
-                        false
-                    } else {
-                        path.retirement_started = true;
-                        path.state = PeerPathState::Draining;
-                        true
-                    };
-                    (retirement, retirement_started)
-                };
-                (retirement, retirement_started)
-            }
+            };
+            let retirement =
+                ServerCarrierPathRetirement::pending(path.retirement_completion.subscribe());
+            let retirement_started = path.begin_retirement();
+            (retirement, retirement_started)
         };
         if !retirement_started {
             return retirement;
@@ -1187,20 +1330,54 @@ impl ServerReliableStreamRegistry {
                 }
             }
         }
+        let retired_path = {
+            let logical_key = server_logical_path_key(identity);
+            let physical_key = server_physical_path_key(identity);
+            let mut paths = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            if paths.logical_instances.get(&logical_key) == Some(&path_instance_id) {
+                // `begin_path_detach` already removed every extant attachment
+                // from scheduling. Release logical admission at that same
+                // lifecycle boundary; exact physical cleanup may finish later
+                // without withholding a same-key successor.
+                paths.logical_instances.remove(&logical_key);
+                decrement_session_path_count(&mut paths.session_path_counts, session_id);
+            }
+            paths.instances.remove(&physical_key)
+        };
+        let Some(retired_path) = retired_path else {
+            return retirement;
+        };
+        self.path_metrics
+            .lock()
+            .expect("server path metrics lock")
+            .remove(&(session_id, underlay, path_id, path_instance_id));
+        // The carrier's session reference ends with its physical ownership.
+        // Each surviving Product binding independently retains the session
+        // while its exact ordered detach remains actor-owned below.
+        self.session_tracker.detach_session(session_id);
         if pending.is_empty() && existing.is_empty() {
-            self.finish_carrier_path_retirement(identity);
+            retired_path.retirement_completion.send_replace(true);
             return retirement;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let registry = self.clone();
             runtime.spawn(async move {
-                for detach in pending {
-                    detach.send().await;
-                }
-                for detach in existing {
-                    detach.wait().await;
-                }
-                registry.finish_carrier_path_retirement(identity);
+                // Each stream owns an independent bounded actor queue. Publish
+                // every detach concurrently so a full dormant stream cannot
+                // withhold the lifecycle boundary from runnable siblings;
+                // aggregate retirement still joins every actor-applied detach.
+                let completions = pending
+                    .into_iter()
+                    .map(OrderedPathDetachCompletion::Pending)
+                    .chain(
+                        existing
+                            .into_iter()
+                            .map(OrderedPathDetachCompletion::Existing),
+                    );
+                futures::future::join_all(completions.map(OrderedPathDetachCompletion::wait)).await;
+                retired_path.retirement_completion.send_replace(true);
             });
         } else {
             for detach in pending {
@@ -1209,49 +1386,9 @@ impl ServerReliableStreamRegistry {
             for detach in existing {
                 detach.finish_without_runtime();
             }
-            self.finish_carrier_path_retirement(identity);
+            retired_path.retirement_completion.send_replace(true);
         }
         retirement
-    }
-
-    fn finish_carrier_path_retirement(&self, identity: ServerCarrierPathIdentity) {
-        let ServerCarrierPathIdentity {
-            session_id,
-            underlay,
-            path_id,
-            path_instance_id,
-        } = identity;
-        let removed = {
-            let logical_key = server_logical_path_key(identity);
-            let physical_key = server_physical_path_key(identity);
-            let mut paths = self
-                .registered_path_instances
-                .lock()
-                .expect("server active path instance lock");
-            if paths.logical_instances.get(&logical_key) != Some(&path_instance_id) {
-                None
-            } else {
-                let removed = paths.instances.remove(&physical_key);
-                if removed.is_some() {
-                    paths.logical_instances.remove(&logical_key);
-                    decrement_session_path_count(&mut paths.session_path_counts, session_id);
-                }
-                removed
-            }
-        };
-        let Some(removed) = removed else {
-            return;
-        };
-        self.path_metrics
-            .lock()
-            .expect("server path metrics lock")
-            .remove(&(session_id, underlay, path_id, path_instance_id));
-        self.path_usage
-            .lock()
-            .expect("server path usage lock")
-            .remove(&(session_id, underlay, path_id, path_instance_id));
-        self.session_tracker.detach_session(session_id);
-        removed.retirement_completion.send_replace(true);
     }
 
     #[cfg(test)]
@@ -1273,6 +1410,7 @@ impl ServerReliableStreamRegistry {
             stream_id,
             target,
             initial_demand,
+            return_plan,
             attachment,
             mux_limits,
         } = request;
@@ -1291,6 +1429,18 @@ impl ServerReliableStreamRegistry {
             .streams
             .lock()
             .expect("server reliable stream registry lock");
+        if !self.carrier_path_accepts_attachment(ServerCarrierPathIdentity {
+            session_id,
+            underlay,
+            path_id,
+            path_instance_id,
+        }) {
+            // Retirement marks the exact physical owner before taking the
+            // stream-membership lock. An opener that linearized first is
+            // included in its detach scan; a later opener cannot resurrect the
+            // predecessor after scheduler withdrawal.
+            return Ok(ServerReliableStreamOpen::Rejected);
+        }
         // Resolve stored evidence after taking the stream membership lock. An
         // update published while this opener waited must either be inherited
         // here or observe the newly published binding afterward.
@@ -1304,6 +1454,8 @@ impl ServerReliableStreamRegistry {
         let initial_usage = self.stored_path_usage(session_id, underlay, path_id, path_instance_id);
         let initial_path_proof =
             self.initial_path_proof(session_id, underlay, path_id, path_instance_id);
+        let initial_native_scheduling_shape =
+            self.initial_native_scheduling_shape(session_id, underlay, path_id, path_instance_id);
         if let Some(entry) = streams.get_mut(&(session_id, stream_id)) {
             if entry.target != target || entry.initial_demand != initial_demand {
                 #[cfg(feature = "lab-diagnostics")]
@@ -1316,28 +1468,29 @@ impl ServerReliableStreamRegistry {
                 );
                 return Ok(ServerReliableStreamOpen::Rejected);
             }
-            let attach_outcome =
-                match entry
-                    .binding
-                    .attach_output_if_session_active(ResponseOutputAttachment {
+            let attach_outcome = match entry
+                .binding
+                .attach_output_with_return_plan_if_session_active(
+                    ResponseOutputAttachment {
                         key: CarrierPathKey { underlay, path_id },
                         path_instance_id,
                         local_policy,
                         commands,
                         state: ResponseOutputAttachmentState {
                             metrics: initial_metrics,
+                            native_scheduling_shape: initial_native_scheduling_shape,
                             peer_usage: initial_usage.map(|usage| (usage.sequence, usage.usage)),
                             path_proof: initial_path_proof,
                         },
-                    }) {
-                    Ok(outcome) => outcome,
-                    Err(
-                        RuntimeError::RemoteClosed(_) | RuntimeError::ReliablePathSessionClosed,
-                    ) => {
-                        return Ok(ServerReliableStreamOpen::Rejected);
-                    }
-                    Err(error) => return Err(error),
-                };
+                    },
+                    return_plan,
+                ) {
+                Ok(outcome) => outcome,
+                Err(RuntimeError::RemoteClosed(_) | RuntimeError::ReliablePathSessionClosed) => {
+                    return Ok(ServerReliableStreamOpen::Rejected);
+                }
+                Err(error) => return Err(error),
+            };
             let response_lane = entry.binding.lane();
             if matches!(
                 attach_outcome,
@@ -1426,7 +1579,7 @@ impl ServerReliableStreamRegistry {
         ));
         let opening_path_validation = path_registration.path_validation();
         let opening_commands = commands.clone();
-        let binding = ResponseStreamBinding::new_with_limits_tracker_and_path_instance(
+        let binding = ResponseStreamBinding::new_with_limits_tracker_path_instance_and_return_plan(
             session_id,
             underlay,
             path_id,
@@ -1436,6 +1589,7 @@ impl ServerReliableStreamRegistry {
             self.session_tracker.clone(),
             path_instance_id,
             local_policy,
+            return_plan,
         )?;
         let session_send_buffer = binding.session_send_buffer();
         if let Some(metrics) = initial_metrics {
@@ -1443,6 +1597,13 @@ impl ServerReliableStreamRegistry {
                 CarrierPathKey { underlay, path_id },
                 path_instance_id,
                 metrics,
+            );
+        }
+        if let Some(shape) = initial_native_scheduling_shape {
+            binding.install_native_scheduling_shape_for_instance(
+                CarrierPathKey { underlay, path_id },
+                path_instance_id,
+                shape,
             );
         }
         if let Some(usage) = initial_usage {
@@ -1521,6 +1682,8 @@ impl ServerReliableStreamRegistry {
             ServerPathMetricsSource::PeerHint,
             false,
             None,
+            None,
+            None,
         );
     }
 
@@ -1531,10 +1694,14 @@ impl ServerReliableStreamRegistry {
         metrics: PathMetrics,
         native_drain_observed: bool,
     ) {
+        let native_window_sample =
+            CarrierNativeWindowSample::from_path_metrics_at(metrics, Instant::now());
         self.record_local_path_metrics_with_delivery_rate_sample(
             identity,
             metrics,
             native_drain_observed,
+            None,
+            native_window_sample,
             None,
         );
     }
@@ -1544,6 +1711,8 @@ impl ServerReliableStreamRegistry {
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         native_drain_observed: bool,
+        native_capacity_epoch: Option<u64>,
+        native_window_sample: Option<CarrierNativeWindowSample>,
         delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) {
         self.record_path_metrics_with_source(
@@ -1551,6 +1720,8 @@ impl ServerReliableStreamRegistry {
             metrics,
             ServerPathMetricsSource::LocalSender,
             native_drain_observed,
+            native_capacity_epoch,
+            native_window_sample,
             delivery_rate_sample,
         );
     }
@@ -1616,29 +1787,13 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         } = identity;
         let instance_key = (session_id, underlay, path_id, path_instance_id);
-        let registered_path_instances = self
+        let changed = self
             .registered_path_instances
             .lock()
-            .expect("server active path instance lock");
-        if !registered_path_instances
+            .expect("server active path instance lock")
             .instances
-            .contains_key(&instance_key)
-        {
-            return;
-        }
-        let changed = {
-            let mut path_usage = self.path_usage.lock().expect("server path usage lock");
-            if path_usage
-                .get(&instance_key)
-                .is_some_and(|current| sequence <= current.sequence)
-            {
-                false
-            } else {
-                path_usage.insert(instance_key, ServerPathUsageEntry { sequence, usage });
-                true
-            }
-        };
-        drop(registered_path_instances);
+            .get_mut(&instance_key)
+            .is_some_and(|path| path.update_peer_usage(sequence, usage));
         if !changed {
             return;
         }
@@ -1667,11 +1822,12 @@ impl ServerReliableStreamRegistry {
         path_id: PathId,
         path_instance_id: CarrierPathInstanceId,
     ) -> Option<ServerPathUsageEntry> {
-        self.path_usage
+        self.registered_path_instances
             .lock()
-            .expect("server path usage lock")
+            .expect("server active path instance lock")
+            .instances
             .get(&(session_id, underlay, path_id, path_instance_id))
-            .copied()
+            .and_then(|path| path.peer_usage)
     }
 
     fn initial_path_proof(
@@ -1689,12 +1845,104 @@ impl ServerReliableStreamRegistry {
             .and_then(|path| path.path_proof)
     }
 
+    fn initial_native_scheduling_shape(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Option<NativeCarrierSchedulingShapeSnapshot> {
+        self.registered_path_instances
+            .lock()
+            .expect("server active path instance lock")
+            .instances
+            .get(&(session_id, underlay, path_id, path_instance_id))
+            .and_then(|path| path.apply_authority.snapshot().native_scheduling_shape)
+    }
+
+    fn stage_native_scheduling_shape(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> bool {
+        let ServerCarrierPathIdentity {
+            session_id,
+            underlay,
+            path_id,
+            path_instance_id,
+        } = identity;
+        let scope = shape.stamp().scope();
+        if underlay != UnderlayProtocol::Udp
+            || scope.carrier_instance_id() != path_instance_id
+            || scope.direction() != crate::protocol::PathMetricDirection::ServerToClient
+        {
+            return false;
+        }
+        let instance_key = (session_id, underlay, path_id, path_instance_id);
+        let changed = {
+            let mut registered = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            let Some(path) = registered.instances.get_mut(&instance_key) else {
+                return false;
+            };
+            path.apply_authority.stage_native_scheduling_shape(shape)
+        };
+        changed
+    }
+
+    fn fanout_native_scheduling_shape(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) {
+        let ServerCarrierPathIdentity {
+            session_id,
+            underlay,
+            path_id,
+            path_instance_id,
+        } = identity;
+        let instance_key = (session_id, underlay, path_id, path_instance_id);
+        let remains_current = self
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock")
+            .instances
+            .get(&instance_key)
+            .is_some_and(|path| {
+                path.apply_authority.snapshot().native_scheduling_shape == Some(shape)
+            });
+        if !remains_current {
+            return;
+        }
+        let bindings = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            streams
+                .iter()
+                .filter_map(|((entry_session_id, _), entry)| {
+                    (*entry_session_id == session_id).then_some(entry.binding.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let key = CarrierPathKey { underlay, path_id };
+        for binding in bindings {
+            binding.install_native_scheduling_shape_for_instance(key, path_instance_id, shape);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record_path_metrics_with_source(
         &self,
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
         native_drain_observed: bool,
+        native_capacity_epoch: Option<u64>,
+        native_window_sample: Option<CarrierNativeWindowSample>,
         delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) {
         let ServerCarrierPathIdentity {
@@ -1704,23 +1952,29 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         } = identity;
         let instance_key = (session_id, underlay, path_id, path_instance_id);
-        let registered_path_instances = self
+        let mut registered_path_instances = self
             .registered_path_instances
             .lock()
             .expect("server active path instance lock");
-        if !registered_path_instances
-            .instances
-            .contains_key(&instance_key)
+        let Some(registered_path) = registered_path_instances.instances.get_mut(&instance_key)
+        else {
+            return;
+        };
+        let metrics = PathMetrics { path_id, ..metrics };
+        if source == ServerPathMetricsSource::LocalSender
+            && underlay == UnderlayProtocol::Udp
+            && let Some(native_capacity_epoch) = native_capacity_epoch
+            && !registered_path.observe_native_capacity_epoch(native_capacity_epoch)
         {
             return;
         }
-        let metrics = PathMetrics { path_id, ..metrics };
         let mut path_metrics = self.path_metrics.lock().expect("server path metrics lock");
         let previous = path_metrics.get(&instance_key).copied();
         let entry = ServerPathMetricsEntry {
             metrics,
             source,
             native_drain_observed,
+            carrier_native_window_sample: native_window_sample,
             carrier_delivery_rate_sample: delivery_rate_sample,
             recorded_at: Instant::now(),
         };
@@ -1781,12 +2035,20 @@ impl ServerReliableStreamRegistry {
         initial_metrics: Option<PathMetrics>,
     ) -> Option<ServerPathMetricsEntry> {
         let stored = self.stored_path_metrics(session_id, underlay, path_id, path_instance_id);
-        let initial = initial_metrics.map(|metrics| ServerPathMetricsEntry {
-            metrics: PathMetrics { path_id, ..metrics },
-            source: ServerPathMetricsSource::LocalSender,
-            native_drain_observed: false,
-            carrier_delivery_rate_sample: None,
-            recorded_at: Instant::now(),
+        let initial = initial_metrics.map(|metrics| {
+            let recorded_at = Instant::now();
+            let metrics = PathMetrics { path_id, ..metrics };
+            ServerPathMetricsEntry {
+                metrics,
+                source: ServerPathMetricsSource::LocalSender,
+                native_drain_observed: false,
+                carrier_native_window_sample: CarrierNativeWindowSample::from_path_metrics_at(
+                    metrics,
+                    recorded_at,
+                ),
+                carrier_delivery_rate_sample: None,
+                recorded_at,
+            }
         });
         match stored {
             Some(metrics) if metrics.source == ServerPathMetricsSource::LocalSender => {
@@ -1934,6 +2196,28 @@ impl ServerReliableStreamRegistry {
         }
     }
 
+    fn apply_response_startup_final(
+        target: &ServerStreamFrameRouteTarget,
+        retained_ordinals: &[u8],
+    ) -> Result<(), RuntimeError> {
+        let outcome = target
+            .binding
+            .finalize_response_startup_plan(retained_ordinals)?;
+        let ResponseStartupFinalOutcome::Finalized { withdrawn_outputs } = outcome else {
+            return Ok(());
+        };
+        for output in withdrawn_outputs {
+            queue_ordered_path_detach(
+                target.events.clone(),
+                target.binding.clone(),
+                output.key,
+                output.path_instance_id,
+                output.incarnation,
+            );
+        }
+        Ok(())
+    }
+
     async fn route_frame_from_path(
         &self,
         identity: ServerCarrierPathIdentity,
@@ -1958,6 +2242,12 @@ impl ServerReliableStreamRegistry {
             path_id: identity.path_id,
         };
         match &frame {
+            Frame::StreamReturnPlanFinal {
+                retained_ordinals, ..
+            } => {
+                Self::apply_response_startup_final(&target, retained_ordinals)?;
+                return Ok(());
+            }
             Frame::StreamRequalifyData {
                 probe_id,
                 offset,
@@ -2024,6 +2314,12 @@ impl ServerReliableStreamRegistry {
             path_id: identity.path_id,
         };
         match &frame {
+            Frame::StreamReturnPlanFinal {
+                retained_ordinals, ..
+            } => {
+                Self::apply_response_startup_final(&target, retained_ordinals)?;
+                return Ok(ServerStreamFrameRoute::Routed);
+            }
             Frame::StreamRequalifyData {
                 probe_id,
                 offset,
@@ -2101,10 +2397,21 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         &self,
         identity: ServerCarrierPathIdentity,
         local: crate::runtime::path::ServerLocalPathProperties,
+        initial_peer_usage: Option<PathUsage>,
+        native_capacity_epoch: u64,
+        apply_authority: ServerCarrierPathApplyAuthority,
         principal_permit: PrincipalPermit,
+        retirement_completion: watch::Sender<bool>,
     ) -> Result<crate::runtime::path::ServerSessionRetirement, RuntimeError> {
-        self.registry
-            .activate_carrier_path(identity, local, principal_permit)
+        self.registry.activate_carrier_path(
+            identity,
+            local,
+            initial_peer_usage,
+            native_capacity_epoch,
+            apply_authority,
+            principal_permit,
+            retirement_completion,
+        )
     }
 
     fn retire_carrier_path(
@@ -2235,6 +2542,8 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         native_drain_observed: bool,
+        native_capacity_epoch: Option<u64>,
+        native_window_sample: Option<CarrierNativeWindowSample>,
         delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) {
         self.registry
@@ -2242,8 +2551,27 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
                 identity,
                 metrics,
                 native_drain_observed,
+                native_capacity_epoch,
+                native_window_sample,
                 delivery_rate_sample,
             );
+    }
+
+    fn stage_native_scheduling_shape(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> bool {
+        self.registry.stage_native_scheduling_shape(identity, shape)
+    }
+
+    fn fanout_native_scheduling_shape(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) {
+        self.registry
+            .fanout_native_scheduling_shape(identity, shape);
     }
 
     fn record_path_proof_success(
@@ -2257,6 +2585,13 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
 
     fn peer_status_snapshot(&self, session_id: SessionId) -> Vec<PeerPathStatus> {
         self.registry.peer_status_snapshot(session_id)
+    }
+
+    fn carrier_path_statuses(
+        &self,
+        identities: &[ServerCarrierPathIdentity],
+    ) -> Vec<Option<ServerCarrierPathStatusSnapshot>> {
+        self.registry.carrier_path_statuses(identities)
     }
 
     fn management_snapshot(&self) -> ServerStreamManagementSnapshot {
@@ -2278,6 +2613,54 @@ fn path_metrics_after_residence(mut metrics: PathMetrics, residence: Duration) -
         .saturating_add(u32::try_from(residence_us).unwrap_or(u32::MAX));
     metrics.rate_valid_for_us = metrics.rate_valid_for_us.saturating_sub(residence_us);
     metrics
+}
+
+fn project_carrier_path_status(
+    basis: ServerCarrierPathStatusBasis,
+    metrics_entry: Option<ServerPathMetricsEntry>,
+    now: Instant,
+) -> ServerCarrierPathStatusSnapshot {
+    let ServerCarrierPathIdentity {
+        session_id,
+        underlay,
+        path_id,
+        path_instance_id,
+    } = basis.identity;
+    let (metrics, source, carrier_delivery_rate_sample) = metrics_entry.map_or_else(
+        || {
+            (
+                basis.local.initial_metrics,
+                basis.local.initial_metrics.map(|_| "startup"),
+                None,
+            )
+        },
+        |entry| {
+            let residence = now.saturating_duration_since(entry.recorded_at);
+            (
+                Some(path_metrics_after_residence(entry.metrics, residence)),
+                Some(match entry.source {
+                    ServerPathMetricsSource::PeerHint => "peer_hint",
+                    ServerPathMetricsSource::LocalSender => "local_sender",
+                }),
+                entry.carrier_delivery_rate_sample,
+            )
+        },
+    );
+    ServerCarrierPathStatusSnapshot {
+        session_id,
+        underlay,
+        path_id,
+        path_instance_id,
+        configured_index: basis.local.config_ordinal,
+        policy: basis.local.policy,
+        state: basis.state,
+        usage: basis.usage,
+        metrics,
+        carrier_delivery_rate_sample,
+        eligibility_epoch: basis.eligibility_epoch,
+        native_scheduling_shape: basis.native_scheduling_shape,
+        source,
+    }
 }
 
 #[cfg(test)]

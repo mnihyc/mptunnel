@@ -5,7 +5,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerPathContext};
 use crate::runtime::tun_l3::{
-    AcceptedServerIpTunnel, IpPacketQueueBudget, IpTunnelPacketSendOutcome, ServerIpTunnelCarrier,
+    AcceptedServerIpTunnel, IpTunnelPacketSendOutcome, ServerIpTunnelCarrier,
     ServerIpTunnelOpenRequest,
 };
 use crate::scheduler::TrafficClass;
@@ -39,7 +39,8 @@ impl ServerIpTunnelCarrier for ServerTcpIpTunnelCarrier {
         tunnel_id: IpTunnelId,
         packet_id: IpPacketId,
         payload: Bytes,
-        _budget: &IpPacketQueueBudget,
+        _budget_permit: Option<crate::runtime::tun_l3::IpPacketQueuePermit>,
+        _native_retention_limit_bytes: Option<u64>,
     ) -> Result<IpTunnelPacketSendOutcome, RuntimeError> {
         match self.path.try_enqueue_admitted_frame(
             Frame::IpPacket {

@@ -66,6 +66,32 @@ fn stream_frames_round_trip() {
             port: 443,
         },
         demand: StreamDemandHint::Throughput,
+        return_plan: StreamReturnPlan {
+            trigger_bytes: 58_400,
+            candidate_total: 4,
+            candidate_tier: PathUsage::Available,
+            phase: StreamAttachmentPhase::Startup,
+            candidate_ordinal: 0,
+        },
+    });
+    round_trip(Frame::OpenStream {
+        stream_id: StreamId(8),
+        target: TargetAddr::Domain {
+            host: "example.net".to_string(),
+            port: 443,
+        },
+        demand: StreamDemandHint::Latency,
+        return_plan: StreamReturnPlan {
+            trigger_bytes: u64::MAX,
+            candidate_total: u8::MAX,
+            candidate_tier: PathUsage::Backup,
+            phase: StreamAttachmentPhase::Ordinary,
+            candidate_ordinal: u8::MAX,
+        },
+    });
+    round_trip(Frame::StreamReturnPlanFinal {
+        stream_id: StreamId(7),
+        retained_ordinals: vec![0, 2, 3],
     });
     round_trip(Frame::StreamData {
         stream_id: StreamId(7),
@@ -102,24 +128,147 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v9_has_no_attachment_role_field() {
+fn open_stream_v10_canonically_carries_return_plan() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
         demand: StreamDemandHint::Throughput,
+        return_plan: StreamReturnPlan {
+            trigger_bytes: 58_400,
+            candidate_total: 4,
+            candidate_tier: PathUsage::Available,
+            phase: StreamAttachmentPhase::Startup,
+            candidate_ordinal: 2,
+        },
     };
 
     let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 9, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
-            187, 2,
+            b'M', b'P', b'T', b'F', 10, 7, 0, 0, 0, 28, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            187, 2, 0, 0, 0, 0, 0, 0, 228, 32, 4, 0, 0, 2,
         ]
     );
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
         frame
+    );
+}
+
+#[test]
+fn stream_return_plan_final_v10_has_canonical_kind_and_count() {
+    let frame = Frame::StreamReturnPlanFinal {
+        stream_id: StreamId(0x0102_0304_0506_0708),
+        retained_ordinals: vec![0, 2, 7],
+    };
+    let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
+    assert_eq!(
+        encoded,
+        vec![
+            b'M', b'P', b'T', b'F', 10, 49, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 3, 0, 2, 7,
+        ]
+    );
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
+        frame
+    );
+}
+
+#[test]
+fn stream_return_plan_enums_reject_noncanonical_wire_values() {
+    let frame = Frame::OpenStream {
+        stream_id: StreamId(7),
+        target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
+        demand: StreamDemandHint::Throughput,
+        return_plan: StreamReturnPlan {
+            trigger_bytes: 58_400,
+            candidate_total: 2,
+            candidate_tier: PathUsage::Available,
+            phase: StreamAttachmentPhase::Startup,
+            candidate_ordinal: 0,
+        },
+    };
+    let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
+
+    let mut bad_tier = encoded.clone();
+    let tier_offset = bad_tier.len() - 3;
+    bad_tier[tier_offset] = 2;
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(bad_tier), CodecLimits::default()),
+        Err(CodecError::InvalidEnum)
+    );
+
+    let mut bad_phase = encoded;
+    let phase_offset = bad_phase.len() - 2;
+    bad_phase[phase_offset] = 2;
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(bad_phase), CodecLimits::default()),
+        Err(CodecError::InvalidEnum)
+    );
+}
+
+#[test]
+fn stream_return_plan_final_obeys_path_limit_and_exact_length() {
+    let limits = CodecLimits {
+        max_paths: 2,
+        ..CodecLimits::default()
+    };
+    let oversized = Frame::StreamReturnPlanFinal {
+        stream_id: StreamId(7),
+        retained_ordinals: vec![0, 1, 2],
+    };
+    assert_eq!(
+        encode_frame(&oversized, limits),
+        Err(CodecError::TooManyPaths {
+            actual: 3,
+            limit: 2,
+        })
+    );
+
+    let mut encoded = encode_frame(
+        &Frame::StreamReturnPlanFinal {
+            stream_id: StreamId(7),
+            retained_ordinals: vec![0, 1, 2],
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode");
+    encoded[4] = 10;
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), limits),
+        Err(CodecError::TooManyPaths {
+            actual: 3,
+            limit: 2,
+        })
+    );
+
+    let mut truncated = encode_frame(
+        &Frame::StreamReturnPlanFinal {
+            stream_id: StreamId(7),
+            retained_ordinals: vec![0, 1],
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode");
+    truncated.pop();
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(truncated), CodecLimits::default()),
+        Err(CodecError::UnexpectedEof)
+    );
+
+    let mut extra = encode_frame(
+        &Frame::StreamReturnPlanFinal {
+            stream_id: StreamId(7),
+            retained_ordinals: vec![0, 1],
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode");
+    extra[FRAME_HEADER_LEN + 8] = 1;
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(extra), CodecLimits::default()),
+        Err(CodecError::TrailingBytes)
     );
 }
 
@@ -155,19 +304,19 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_v8_frames_after_v9_wire_cut() {
+fn decoder_rejects_v9_frames_after_v10_wire_cut() {
     let mut encoded =
         encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
-    encoded[4] = 8;
+    encoded[4] = 9;
 
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
-        Err(CodecError::UnsupportedVersion(8))
+        Err(CodecError::UnsupportedVersion(9))
     );
 }
 
 #[test]
-fn path_metrics_v9_presence_bits_distinguish_absence_from_observed_zero() {
+fn path_metrics_v10_presence_bits_distinguish_absence_from_observed_zero() {
     let mut absent = peer_status_metrics(
         7,
         UnderlayProtocol::Tcp,
@@ -187,7 +336,7 @@ fn path_metrics_v9_presence_bits_distinguish_absence_from_observed_zero() {
         absent_wire.len(),
         FRAME_HEADER_LEN + PATH_METRICS_ENCODED_LEN
     );
-    assert_eq!(absent_wire[4], 9);
+    assert_eq!(absent_wire[4], 10);
     assert_eq!(
         &absent_wire[FRAME_HEADER_LEN + 64..FRAME_HEADER_LEN + 66],
         &[0, 0]
@@ -231,7 +380,7 @@ fn path_metrics_v9_presence_bits_distinguish_absence_from_observed_zero() {
 }
 
 #[test]
-fn path_metrics_v9_rate_authority_budget_is_bounded_canonically() {
+fn path_metrics_v10_rate_authority_budget_is_bounded_canonically() {
     let mut metrics = peer_status_metrics(
         7,
         UnderlayProtocol::Udp,
@@ -470,6 +619,13 @@ fn encoder_rejects_zero_port_ip_targets() {
                 stream_id: StreamId(7),
                 target: target.clone(),
                 demand: StreamDemandHint::Throughput,
+                return_plan: StreamReturnPlan {
+                    trigger_bytes: 58_400,
+                    candidate_total: 1,
+                    candidate_tier: PathUsage::Available,
+                    phase: StreamAttachmentPhase::Startup,
+                    candidate_ordinal: 0,
+                },
             },
             Frame::OpenDatagramFlow {
                 flow_id: DatagramFlowId(9),

@@ -8,6 +8,7 @@
 use super::*;
 
 pub(in crate::runtime) mod authentication;
+pub(in crate::runtime) mod authority;
 mod carrier_inventory;
 mod client_session;
 pub(super) mod commands;
@@ -36,18 +37,18 @@ pub(in crate::runtime) use model::{
     PacketPathAttachment, PacketPathSelectionInput, PathDeliveryStats, UdpPathCandidate,
 };
 pub(in crate::runtime) use ports::{
-    AcceptedServerDatagramFlow, CarrierDeliveryRateSample, OpenedReliableCarrierStream,
-    ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerCarrierPathRetirement,
-    ServerCarrierPathStateHandle, ServerCarrierPathStatusSnapshot, ServerCarrierPeer,
-    ServerDatagramOpenError, ServerDatagramOpenFailure, ServerDatagramOpenRequest,
-    ServerDatagramPort, ServerDatagramPortBackend, ServerDatagramRequest,
-    ServerDatagramSendOutcome, ServerDatagramTombstone, ServerDatagramTombstoneCache,
-    ServerDatagramWorkerMessage, ServerLocalPathProperties, ServerMppIngress,
-    ServerMppIngressObserver, ServerNewStreamPolicy, ServerPathValidation, ServerRealtimeFlowLease,
-    ServerSessionManagementSnapshot, ServerSessionRetirement, ServerStreamFrameRoute,
-    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPathAttachment, ServerStreamPort, ServerStreamPortBackend, ServerTargetAdmission,
-    fence_server_carrier_readiness,
+    AcceptedServerDatagramFlow, CarrierDeliveryRateSample, CarrierNativeWindowSample,
+    OpenedReliableCarrierStream, ServerCarrierPathApplyAuthority, ServerCarrierPathIdentity,
+    ServerCarrierPathRegistration, ServerCarrierPathRetirement, ServerCarrierPathStateHandle,
+    ServerCarrierPathStatusSnapshot, ServerCarrierPeer, ServerDatagramOpenError,
+    ServerDatagramOpenFailure, ServerDatagramOpenRequest, ServerDatagramPort,
+    ServerDatagramPortBackend, ServerDatagramRequest, ServerDatagramSendOutcome,
+    ServerDatagramTombstone, ServerDatagramTombstoneCache, ServerDatagramWorkerMessage,
+    ServerLocalPathProperties, ServerMppIngress, ServerMppIngressObserver, ServerNewStreamPolicy,
+    ServerPathValidation, ServerRealtimeFlowLease, ServerSessionManagementSnapshot,
+    ServerSessionRetirement, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
+    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort,
+    ServerStreamPortBackend, ServerTargetAdmission, fence_server_carrier_readiness,
 };
 #[cfg(test)]
 pub(super) use proof::*;

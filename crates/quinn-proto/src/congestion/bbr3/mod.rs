@@ -2,17 +2,18 @@ mod max_filter;
 
 use std::any::Any;
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
 
-use crate::RttEstimator;
 use crate::congestion::bbr3::max_filter::MaxFilter;
 use crate::congestion::{
-    BASE_DATAGRAM_SIZE, Controller, ControllerFactory, ControllerMetrics, RecoveryTransactionId,
-    SpaceId,
+    BandwidthSample, Controller, ControllerFactory, ControllerMetrics, RecoveryTransactionId,
+    SpaceId, BASE_DATAGRAM_SIZE,
 };
+use crate::RttEstimator;
 use crate::{Duration, Instant};
 
 /// equivalent to BBR.MaxBwFilterLen <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.5.6>
@@ -551,6 +552,10 @@ pub struct Bbr3 {
     /// The completed sample remains in `rs` after `on_end_acks` because Quinn performs loss
     /// detection after ending the ACK batch; the first packet callback of the next ACK replaces it.
     ack_epoch_open: bool,
+    /// Immutable provenance of the most recently completed delivery-rate sample.
+    /// Post-ACK loss processing may mutate `rs`, so external consumers must use
+    /// this separately retained record.
+    latest_completed_bandwidth_sample: Option<BandwidthSample>,
     /// equivalent to BBR.rounds_since_bw_probe: rounds since last bw probe state.
     rounds_since_bw_probe: u64,
     /// equivalent to BBR.bw_probe_wait: random wait time before entering probing state again
@@ -618,14 +623,8 @@ pub struct Bbr3 {
     completed_loss_decision_events: u64,
     /// Whether the completed Startup loss decision had congestion authority independent of the
     /// configured erasure contract (explicit ECN, persistent congestion, or unaligned evidence).
-    /// A compensated budget crossing alone is not such authority while capacity acquisition is
-    /// backlogged.
+    /// A compensated budget crossing alone is not such authority.
     completed_loss_round_raw_authority: bool,
-    /// Whether the exact completed compensated decision epoch remained application-limited both
-    /// in its delivery sample and when the ACK transaction closed. This preserves Startup's loss
-    /// escape only where its full-bandwidth plateau is unavailable, without allowing a stale
-    /// send-time application-limited watermark to terminate newly backlogged acquisition.
-    completed_loss_round_app_limited_authority: bool,
     /// Attributable ECN authority is independent of packet-loss records. Validated ambiguous ECN
     /// abandons undo but does not manufacture exempt loss bytes.
     ecn_congestion_in_round: bool,
@@ -704,7 +703,10 @@ impl Bbr3 {
             Ord::max(MIN_MAX_DATAGRAM_SIZE, current_mtu) as u64,
             MAX_DATAGRAM_SIZE,
         );
-        let initial_cwnd = config.initial_window;
+        let startup_target = config.startup_target;
+        let initial_cwnd = startup_target
+            .map(|target| config.initial_window.max(target.window))
+            .unwrap_or(config.initial_window);
         let startup_pacing_gain = config.startup_pacing_gain.unwrap_or(STARTUP_PACING_GAIN);
         let default_pacing_gain = config.default_pacing_gain.unwrap_or(DEFAULT_PACING_GAIN);
         let probe_bw_down_pacing_gain = config
@@ -722,9 +724,15 @@ impl Bbr3 {
             .probe_bw_up_cwnd_gain
             .unwrap_or(PROBE_BW_UP_CWND_GAIN);
         let probe_rtt_cwnd_gain = config.probe_rtt_cwnd_gain.unwrap_or(PROBE_RTT_CWND_GAIN);
-        // the calculation for initial pacing rate described here <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.2-5>
-        let nominal_bandwidth = initial_cwnd as f64 / 0.001;
-        let pacing_rate = startup_pacing_gain * nominal_bandwidth;
+        // Without an explicit sender target, retain the initial pacing-rate
+        // calculation from <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.2-5>.
+        let pacing_rate = startup_target.map_or_else(
+            || {
+                let nominal_bandwidth = initial_cwnd as f64 / 0.001;
+                startup_pacing_gain * nominal_bandwidth
+            },
+            |target| target.pacing_rate as f64,
+        );
         Self {
             smss,
             initial_cwnd,
@@ -799,6 +807,7 @@ impl Bbr3 {
             lost: 0,
             rs: None,
             ack_epoch_open: false,
+            latest_completed_bandwidth_sample: None,
             packets: Default::default(),
             rounds_since_bw_probe: 0,
             bw_probe_wait: Duration::ZERO,
@@ -836,7 +845,6 @@ impl Bbr3 {
             undo_loss_budget_had_open_predecessor: false,
             completed_loss_decision_events: 0,
             completed_loss_round_raw_authority: false,
-            completed_loss_round_app_limited_authority: false,
             ecn_congestion_in_round: false,
             explicit_congestion_in_round: false,
             loss_round_evidence_anchor: None,
@@ -858,14 +866,9 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRUpdateModelAndState <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.2.3>
-    fn update_model_and_state(
-        &mut self,
-        p: BbrPacket,
-        now: Instant,
-        connection_app_limited: bool,
-    ) {
+    fn update_model_and_state(&mut self, p: BbrPacket, now: Instant) {
         self.update_latest_delivery_signals();
-        self.update_congestion_signals(p, now, connection_app_limited);
+        self.update_congestion_signals(p, now);
         self.update_ack_aggregation(now);
         self.check_full_bw_reached();
         self.check_startup_done();
@@ -904,14 +907,17 @@ impl Bbr3 {
     }
 
     fn loss_budget_epoch_loss(&self, epoch: &LossBudgetEpoch) -> Option<u64> {
-        epoch.record_ids.iter().try_fold(epoch.anonymous_lost, |lost, id| {
-            let record = self.loss_budget_record(*id)?;
-            if record.exempt {
-                Some(lost)
-            } else {
-                lost.checked_add(record.bytes)
-            }
-        })
+        epoch
+            .record_ids
+            .iter()
+            .try_fold(epoch.anonymous_lost, |lost, id| {
+                let record = self.loss_budget_record(*id)?;
+                if record.exempt {
+                    Some(lost)
+                } else {
+                    lost.checked_add(record.bytes)
+                }
+            })
     }
 
     fn loss_budget_epoch_initial_reference(&self, epoch: &LossBudgetEpoch) -> u64 {
@@ -921,9 +927,14 @@ impl Bbr3 {
             .filter_map(|id| self.loss_budget_record(*id))
             .filter(|record| !record.exempt)
             .filter_map(|record| {
-                record
-                    .send_time
-                    .map(|send_time| (send_time, record.delivered, record.lost, record.tx_in_flight))
+                record.send_time.map(|send_time| {
+                    (
+                        send_time,
+                        record.delivered,
+                        record.lost,
+                        record.tx_in_flight,
+                    )
+                })
             })
             .min_by_key(|(send_time, delivered, lost, _)| (*send_time, *delivered, *lost))
             .map_or(self.initial_cwnd, |(_, _, _, tx_in_flight)| {
@@ -969,9 +980,7 @@ impl Bbr3 {
         Some((state, round_high))
     }
 
-    fn loss_budget_record_events<'a>(
-        records: impl Iterator<Item = &'a LossBudgetRecord>,
-    ) -> u64 {
+    fn loss_budget_record_events<'a>(records: impl Iterator<Item = &'a LossBudgetRecord>) -> u64 {
         let mut packets: Vec<(usize, u64)> = records
             .map(|record| (record.space as usize, record.packet_number))
             .collect();
@@ -1202,17 +1211,14 @@ impl Bbr3 {
             .loss_budget_next_record_id
             .checked_add(1)
             .expect("BBR3 loss-budget record identity exhausted");
-        let (send_time, delivered, lost, tx_in_flight) = packet.map_or(
-            (None, 0, 0, 0),
-            |packet| {
-                (
-                    Some(packet.send_time),
-                    packet.delivered,
-                    packet.lost,
-                    packet.tx_in_flight,
-                )
-            },
-        );
+        let (send_time, delivered, lost, tx_in_flight) = packet.map_or((None, 0, 0, 0), |packet| {
+            (
+                Some(packet.send_time),
+                packet.delivered,
+                packet.lost,
+                packet.tx_in_flight,
+            )
+        });
         let covered_by_raw_batch = self.loss_budget_batch_raw_action_taken;
         let raw_explicit = self.explicit_congestion_in_round;
         let raw_unknown = self.loss_round_evidence_unknown || covered_by_raw_batch;
@@ -1240,11 +1246,7 @@ impl Bbr3 {
         id
     }
 
-    fn exempt_loss_budget_records(
-        &mut self,
-        record_ids: &[u64],
-        authority: LossBudgetExemption,
-    ) {
+    fn exempt_loss_budget_records(&mut self, record_ids: &[u64], authority: LossBudgetExemption) {
         if self.loss_compensation_floor == 0.0 || record_ids.is_empty() {
             return;
         }
@@ -1284,12 +1286,13 @@ impl Bbr3 {
                 .checked_add(1)
                 .expect("BBR3 raw loss-authority generation exhausted");
         }
-        self.loss_budget_exempt_lost = self
-            .loss_budget_exempt_lost
-            .saturating_add(newly_exempt);
+        self.loss_budget_exempt_lost = self.loss_budget_exempt_lost.saturating_add(newly_exempt);
         if replay {
             let replayed = self.replay_loss_budget_journal();
-            debug_assert!(replayed.is_some(), "consumed loss must have a replay checkpoint");
+            debug_assert!(
+                replayed.is_some(),
+                "consumed loss must have a replay checkpoint"
+            );
         }
     }
 
@@ -1324,8 +1327,8 @@ impl Bbr3 {
                 })
             })
             .min_by_key(|anchor| (anchor.send_time, anchor.delivered, anchor.lost));
-        self.explicit_congestion_in_round = self.ecn_congestion_in_round
-            || open.iter().any(|record| record.raw_explicit);
+        self.explicit_congestion_in_round =
+            self.ecn_congestion_in_round || open.iter().any(|record| record.raw_explicit);
 
         let mut packets: Vec<(usize, u64)> = open
             .iter()
@@ -1386,7 +1389,6 @@ impl Bbr3 {
         self.completed_loss_round_is_high = false;
         self.completed_loss_decision_events = 0;
         self.completed_loss_round_raw_authority = false;
-        self.completed_loss_round_app_limited_authority = false;
         if let Some(rate_sample) = self.rs {
             self.bw_latest = [self.bw_latest, self.model_delivery_rate(rate_sample)]
                 .iter()
@@ -1403,19 +1405,12 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRUpdateCongestionSignals <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
-    fn update_congestion_signals(
-        &mut self,
-        p: BbrPacket,
-        now: Instant,
-        connection_app_limited: bool,
-    ) {
+    fn update_congestion_signals(&mut self, p: BbrPacket, now: Instant) {
         self.update_max_bw(p);
         let mut budget_high = false;
         let mut budget_is_app_limited = false;
         if self.round_start && self.loss_compensation_floor > 0.0 {
             budget_is_app_limited = self.rs.is_some_and(|sample| sample.is_app_limited);
-            self.completed_loss_round_app_limited_authority =
-                budget_is_app_limited && connection_app_limited;
             budget_high = self
                 .advance_compensated_loss_budget(budget_is_app_limited)
                 .unwrap_or(true);
@@ -1426,9 +1421,7 @@ impl Bbr3 {
                 || self.explicit_congestion_in_round
                 || self.loss_round_evidence_unknown;
             self.completed_loss_round_raw_authority = raw_loss_round;
-            self.loss_in_round
-                && raw_loss_round
-                && self.loss_round_requires_congestion_response()
+            self.loss_in_round && raw_loss_round && self.loss_round_requires_congestion_response()
         } else {
             false
         };
@@ -1554,11 +1547,8 @@ impl Bbr3 {
         } else {
             STARTUP_EXTRA_ACKED_FILTER_LEN
         };
-        self.extra_acked_filter.update_max_with_window(
-            self.round_count,
-            extra,
-            filter_len as u64,
-        );
+        self.extra_acked_filter
+            .update_max_with_window(self.round_count, extra, filter_len as u64);
         self.extra_acked = self.extra_acked_filter.get_max();
     }
 
@@ -1602,15 +1592,13 @@ impl Bbr3 {
         if self.full_bw_reached {
             return;
         }
-        // During backlogged acquisition, a finite compensated-budget crossing cannot safely
-        // distinguish random erasure placement from a queue; the ordinary full-bandwidth plateau
-        // remains the capacity exit. An application-limited completed epoch cannot use that
-        // plateau, so its exhausted envelope retains BBR's loss escape. Raw ECN, persistence, and
-        // unknown evidence remain eligible in either case.
-        if self.loss_compensation_floor > 0.0
-            && !self.completed_loss_round_raw_authority
-            && !self.completed_loss_round_app_limited_authority
-        {
+        // A compensated-budget crossing cannot distinguish authorized erasure
+        // from congestion, regardless of whether the completed epoch was
+        // application-limited. An app-limited epoch also cannot establish a
+        // full-bandwidth plateau. Only independent raw authority may take the
+        // high-loss Startup exit; once backlog appears, ordinary plateau
+        // detection remains available and can finish acquisition.
+        if self.loss_compensation_floor > 0.0 && !self.completed_loss_round_raw_authority {
             return;
         }
         let decision_events = if self.loss_compensation_floor == 0.0 {
@@ -1671,9 +1659,12 @@ impl Bbr3 {
         self.recovery_start_time = Some(now);
         self.recovery_start_round = self.round_count;
         self.in_recovery = true;
-        let next = self
-            .recovery_transaction
-            .map_or(1, |transaction| transaction.0.checked_add(1).expect("BBR3 recovery transaction exhausted"));
+        let next = self.recovery_transaction.map_or(1, |transaction| {
+            transaction
+                .0
+                .checked_add(1)
+                .expect("BBR3 recovery transaction exhausted")
+        });
         self.recovery_transaction = Some(RecoveryTransactionId::new(next));
         true
     }
@@ -2225,13 +2216,16 @@ impl Bbr3 {
         self.update_max_inflight();
         if self.full_bw_reached {
             if let Some(rate_sample) = self.rs {
-                self.cwnd = Ord::min(self.cwnd + rate_sample.newly_acked, self.max_inflight);
+                self.cwnd = Ord::min(
+                    self.cwnd.saturating_add(rate_sample.newly_acked),
+                    self.max_inflight,
+                );
             } else {
                 self.cwnd = Ord::min(self.cwnd, self.max_inflight);
             }
         } else if self.cwnd < self.max_inflight || self.delivered < self.initial_cwnd {
             if let Some(rate_sample) = self.rs {
-                self.cwnd += rate_sample.newly_acked;
+                self.cwnd = self.cwnd.saturating_add(rate_sample.newly_acked);
             }
         }
         self.cwnd = Ord::max(self.cwnd, self.min_pipe_cwnd);
@@ -2507,8 +2501,7 @@ impl Bbr3 {
         self.undo_bw_shortterm = self.bw_shortterm;
         self.undo_inflight_shortterm = self.inflight_shortterm;
         self.undo_inflight_longterm = self.inflight_longterm;
-        self.undo_loss_budget_raw_authority_generation =
-            self.loss_budget_raw_authority_generation;
+        self.undo_loss_budget_raw_authority_generation = self.loss_budget_raw_authority_generation;
         self.undo_loss_budget_had_open_predecessor = self
             .loss_budget_records
             .iter()
@@ -2571,10 +2564,8 @@ impl Bbr3 {
         self.prev_probe_too_high = true;
         self.bw_probe_samples = false;
         if !is_app_limited {
-            self.inflight_longterm = Ord::max(
-                tx_in_flight,
-                (self.target_inflight() as f64 * BETA) as u64,
-            );
+            self.inflight_longterm =
+                Ord::max(tx_in_flight, (self.target_inflight() as f64 * BETA) as u64);
         }
 
         if self.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
@@ -2644,13 +2635,7 @@ impl Bbr3 {
     /// Preserve the upstream draft test harness's compact send call while the local controller
     /// trait carries legacy delivery-snapshot inputs for BBRv1 compatibility.
     #[cfg(test)]
-    fn on_packet_sent(
-        &mut self,
-        now: Instant,
-        bytes: u16,
-        packet_number: u64,
-        space: SpaceId,
-    ) {
+    fn on_packet_sent(&mut self, now: Instant, bytes: u16, packet_number: u64, space: SpaceId) {
         let prior_in_flight = self.inflight;
         // The compact controller harness models an always-backlogged connection unless a test
         // installs C.app_limited directly. Do not feed that internal delivery watermark back as a
@@ -2856,8 +2841,29 @@ impl Controller for Bbr3 {
                     self.rs = Some(rate_sample);
                     self.finish_inflight_rtt_ack_epoch();
                     // UpdateOnACK consumes exactly this ACK's completed sample, exactly once.
-                    self.update_model_and_state(rate_sample.last_packet, now, app_limited);
+                    self.update_model_and_state(rate_sample.last_packet, now);
                     self.update_control_parameters();
+
+                    let next_revision =
+                        self.latest_completed_bandwidth_sample.map_or(1, |sample| {
+                            sample
+                                .revision
+                                .get()
+                                .checked_add(1)
+                                .expect("BBR3 bandwidth-sample revision exhausted")
+                        });
+                    self.latest_completed_bandwidth_sample = Some(BandwidthSample {
+                        revision: NonZeroU64::new(next_revision)
+                            .expect("BBR3 bandwidth-sample revision must be nonzero"),
+                        valid: valid_interval
+                            && rate_sample.interval != Duration::ZERO
+                            && rate_sample.delivery_rate.is_finite()
+                            && rate_sample.delivery_rate > 0.0,
+                        source_space: rate_sample.last_packet.space,
+                        source_packet_number: rate_sample.last_packet.packet_number,
+                        source_round: rate_sample.last_packet.round_count,
+                        app_limited: rate_sample.last_packet.is_app_limited,
+                    });
 
                     // Preserve the completed sample for post-ACK loss processing, but close the
                     // ACK-local accounting epoch so the next packet callback replaces it.
@@ -2953,13 +2959,7 @@ impl Controller for Bbr3 {
             // The transport owns this loss callback, but BBR no longer retains the packet's paired
             // delivery counters. Start/extend the loss round and force its conservative response;
             // omission of the extension preserves the draft's original missing-packet behavior.
-            self.record_loss_budget_packet(
-                None,
-                None,
-                lost_bytes_64,
-                space,
-                packet_number,
-            );
+            self.record_loss_budget_packet(None, None, lost_bytes_64, space, packet_number);
             self.loss_round_evidence_unknown = true;
             self.note_loss(space, packet_number);
             self.exempt_open_loss_round(LossBudgetExemption::Unknown);
@@ -2978,9 +2978,10 @@ impl Controller for Bbr3 {
             .loss_budget_undo_transactions
             .iter()
             .any(|entry| entry.transaction == transaction);
-        let unrelated_open_evidence = self.loss_budget_records.iter().any(|record| {
-            record.loss_round_open && record.transaction != Some(transaction)
-        });
+        let unrelated_open_evidence = self
+            .loss_budget_records
+            .iter()
+            .any(|record| record.loss_round_open && record.transaction != Some(transaction));
         let newer_raw_authority = self.loss_budget_raw_authority_generation
             != self.undo_loss_budget_raw_authority_generation;
         if budget_transaction {
@@ -3045,7 +3046,10 @@ impl Controller for Bbr3 {
                 // Refill before probing again; jumping directly into UP would
                 // skip the draft's one-round pipe-fill transition.
                 let restarted = self.start_probe_bw_refill();
-                debug_assert!(restarted, "spurious ProbeUP loss must cancel its pending edge");
+                debug_assert!(
+                    restarted,
+                    "spurious ProbeUP loss must cancel its pending edge"
+                );
             }
             _ => {}
         }
@@ -3106,9 +3110,14 @@ impl Controller for Bbr3 {
             congestion_window: self.window(),
             ssthresh: None,
             pacing_rate: Some(self.pacing_rate.round() as u64),
-            bandwidth_estimate: (self.max_bw > 0.0).then_some(self.max_bw.round() as u64),
+            bandwidth_estimate: (self.bw.is_finite() && self.bw > 0.0)
+                .then_some(self.bw.round() as u64),
             send_quantum: Some(self.send_quantum),
         }
+    }
+
+    fn latest_bandwidth_sample(&self) -> Option<BandwidthSample> {
+        self.latest_completed_bandwidth_sample
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
@@ -3135,6 +3144,7 @@ impl Controller for Bbr3 {
 #[derive(Debug, Clone)]
 pub struct Bbr3Config {
     initial_window: u64,
+    startup_target: Option<Bbr3StartupTarget>,
     loss_compensation_floor: f64,
     probe_rng_seed: Option<[u8; 16]>,
     startup_pacing_gain: Option<f64>,
@@ -3148,12 +3158,38 @@ pub struct Bbr3Config {
     default_cwnd_gain: Option<f64>,
 }
 
+/// A sender-local startup geometry contract.
+///
+/// This deliberately contains no bandwidth-model field. It controls only the
+/// initial congestion window and pacer; BBR still starts `bw` and `max_bw` at
+/// zero and replaces startup geometry with native delivery observations.
+#[derive(Debug, Clone, Copy)]
+struct Bbr3StartupTarget {
+    window: u64,
+    pacing_rate: u64,
+}
+
 impl Bbr3Config {
     /// Default limit on the amount of outstanding data in bytes.
     ///
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
     pub fn initial_window(&mut self, value: u64) -> &mut Self {
         self.initial_window = value;
+        self
+    }
+
+    /// Set paired sender-local startup window and pacing targets.
+    ///
+    /// `window` is a target rather than permission to shrink the generic QUIC
+    /// initial window. The pacing rate is exact and expressed in bytes per
+    /// second. Neither value seeds BBR's delivery-rate model.
+    pub fn initial_window_and_pacing_rate(&mut self, window: u64, pacing_rate: u64) -> &mut Self {
+        assert!(window > 0);
+        assert!(pacing_rate > 0);
+        self.startup_target = Some(Bbr3StartupTarget {
+            window,
+            pacing_rate,
+        });
         self
     }
 
@@ -3165,7 +3201,6 @@ impl Bbr3Config {
         self.loss_compensation_floor = value;
         self
     }
-
 }
 
 impl Default for Bbr3Config {
@@ -3174,6 +3209,7 @@ impl Default for Bbr3Config {
             // Bounded by the datagram size a path starts at, not [`MAX_DATAGRAM_SIZE`] (the
             // RFC 9000 ceiling), which would clamp 14720 up to 9x the intended window.
             initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            startup_target: None,
             // Keep the generic Quinn controller aligned with the BBR draft. MPTUNNEL's adapter
             // explicitly applies its sender-local policy after resolving path omission/override.
             loss_compensation_floor: 0.0,
@@ -3213,6 +3249,129 @@ mod test {
     type UndoSnapshot = (Option<BbrState>, f64, u64, u64);
     /// A loss episode: (pre-loss undo snapshot, post-loss state, post-loss inflight_longterm).
     type LossEpisode = (UndoSnapshot, BbrState, u64);
+
+    #[test]
+    fn controller_metrics_report_current_bounded_bandwidth() {
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
+        bbr.max_bw = 500_000_000.0;
+        bbr.bw_shortterm = 10_000_000.0;
+        bbr.bound_bw_for_model();
+
+        assert_eq!(bbr.bw, 10_000_000.0);
+        assert_eq!(
+            bbr.metrics().bandwidth_estimate,
+            Some(10_000_000),
+            "the exported sustainable estimate must follow the controller's current bounded bandwidth, not its stale probing maximum",
+        );
+    }
+
+    #[test]
+    fn completed_bandwidth_sample_has_exact_provenance_and_clone_semantics() {
+        let base = Instant::now();
+        let smss = BASE_DATAGRAM_SIZE;
+        let config = Arc::new(Bbr3Config::default());
+        let mut bbr = Bbr3::new(Arc::clone(&config), smss as u16);
+        let rtt = RttEstimator::new(Duration::from_millis(100));
+
+        assert_eq!(bbr.latest_bandwidth_sample(), None);
+
+        let initial_sent = base;
+        let data_sent = base + Duration::from_millis(10);
+        let acked_at = base + Duration::from_millis(100);
+        // Packet numbers are only unique within a space; the later Data packet
+        // must remain distinguishable from Initial packet 7.
+        let _ = <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            initial_sent,
+            smss as u16,
+            0,
+            7,
+            SpaceId::Initial,
+            false,
+        );
+        let _ = <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            data_sent,
+            smss as u16,
+            smss,
+            7,
+            SpaceId::Data,
+            false,
+        );
+        bbr.on_ack(
+            acked_at,
+            initial_sent,
+            smss,
+            7,
+            SpaceId::Initial,
+            false,
+            &rtt,
+        );
+        bbr.on_ack(acked_at, data_sent, smss, 7, SpaceId::Data, false, &rtt);
+        assert_eq!(
+            bbr.latest_bandwidth_sample(),
+            None,
+            "a partial ACK epoch must not publish provenance"
+        );
+        bbr.on_end_acks(acked_at, 0, false, Some(7), SpaceId::Data);
+
+        let first = bbr
+            .latest_bandwidth_sample()
+            .expect("completed valid sample");
+        assert_eq!(first.revision.get(), 1);
+        assert!(first.valid);
+        assert_eq!(first.source_space, SpaceId::Data);
+        assert_eq!(first.source_packet_number, 7);
+        assert_eq!(first.source_round, 0);
+        assert!(!first.app_limited);
+
+        // A completed sample with an interval below min_rtt is still published,
+        // but cannot be mistaken for valid capacity evidence.
+        bbr.min_rtt = Duration::from_millis(200);
+        let second_sent = base + Duration::from_millis(200);
+        let second_acked_at = second_sent + Duration::from_millis(100);
+        let _ = <Bbr3 as Controller>::on_packet_sent(
+            &mut bbr,
+            second_sent,
+            smss as u16,
+            0,
+            9,
+            SpaceId::Handshake,
+            true,
+        );
+        bbr.on_ack(
+            second_acked_at,
+            second_sent,
+            smss,
+            9,
+            SpaceId::Handshake,
+            true,
+            &rtt,
+        );
+        bbr.on_end_acks(second_acked_at, 0, true, Some(9), SpaceId::Handshake);
+
+        let second = bbr
+            .latest_bandwidth_sample()
+            .expect("completed invalid sample");
+        assert_eq!(second.revision.get(), 2);
+        assert!(!second.valid);
+        assert_eq!(second.source_space, SpaceId::Handshake);
+        assert_eq!(second.source_packet_number, 9);
+        assert_eq!(second.source_round, 1);
+        assert!(second.app_limited);
+
+        // Post-ACK loss handling is allowed to mutate the retained working
+        // rate sample, but not the externally published completed record.
+        bbr.rs
+            .as_mut()
+            .expect("retained working sample")
+            .is_app_limited = false;
+        assert_eq!(bbr.latest_bandwidth_sample(), Some(second));
+
+        assert_eq!(bbr.clone_box().latest_bandwidth_sample(), Some(second));
+        let fresh = Bbr3::new(config, smss as u16);
+        assert_eq!(fresh.latest_bandwidth_sample(), None);
+    }
 
     fn max_bw_epoch_sample(now: Instant, is_app_limited: bool) -> BbrRateSample {
         let packet = BbrPacket {
@@ -3266,10 +3425,7 @@ mod test {
     #[test]
     fn entering_probe_bw_opens_first_epoch_without_completing_a_probe_up() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.max_bw_filter.update_max(0, 10_000_000);
         bbr.max_bw = 10_000_000.0;
         bbr.full_bw_reached = true;
@@ -3292,10 +3448,7 @@ mod test {
     #[test]
     fn genuine_probe_up_exit_advances_once_on_next_normal_round() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cycle_count = 1;
         finish_normal_probe_up(&mut bbr, now);
         assert_eq!(bbr.cycle_count, 1);
@@ -3319,10 +3472,7 @@ mod test {
     #[test]
     fn app_limited_round_preserves_probe_up_epoch_until_normal_feedback_resumes() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cycle_count = 1;
         finish_normal_probe_up(&mut bbr, now);
         assert_eq!(
@@ -3349,10 +3499,7 @@ mod test {
     #[test]
     fn long_app_limited_pause_does_not_start_a_second_probe_before_epoch_consumption() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cycle_count = 1;
         finish_normal_probe_up(&mut bbr, now);
         let pending = Some(MaxBwAdvanceSource::ProbeUp);
@@ -3393,10 +3540,7 @@ mod test {
     #[test]
     fn precautionary_app_limited_feedback_defers_acceleration_until_epoch_consumption() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cycle_count = 1;
         finish_normal_probe_up(&mut bbr, now);
         bbr.prev_probe_precautionary = true;
@@ -3430,10 +3574,7 @@ mod test {
     #[test]
     fn probe_rtt_and_exit_residue_preserve_probe_up_epoch_until_normal_feedback() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cycle_count = 1;
         finish_normal_probe_up(&mut bbr, now);
         assert_eq!(
@@ -3480,10 +3621,7 @@ mod test {
     #[test]
     fn spurious_probe_up_loss_cancels_unconsumed_epoch_edge() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cycle_count = 1;
         bbr.full_bw_reached = true;
         bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
@@ -3512,10 +3650,7 @@ mod test {
     #[test]
     fn late_spurious_probe_up_loss_does_not_roll_back_consumed_epoch_edge() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cycle_count = 1;
         bbr.full_bw_reached = true;
         bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
@@ -3983,7 +4118,9 @@ mod test {
 
         bbr.on_end_acks(now, 0, false, Some(1), SpaceId::Data);
 
-        let completed = bbr.rs.expect("invalid sample remains available to loss handling");
+        let completed = bbr
+            .rs
+            .expect("invalid sample remains available to loss handling");
         assert!(!bbr.ack_epoch_open);
         assert_eq!(completed.interval, Duration::from_millis(100));
         assert_eq!(completed.delivery_rate, 0.0);
@@ -3997,15 +4134,7 @@ mod test {
         let second_sent = now + Duration::from_millis(10);
         let second_now = second_sent + Duration::from_millis(100);
         bbr.on_packet_sent(second_sent, smss as u16, 2, SpaceId::Data);
-        bbr.on_ack(
-            second_now,
-            second_sent,
-            smss,
-            2,
-            SpaceId::Data,
-            false,
-            &rtt,
-        );
+        bbr.on_ack(second_now, second_sent, smss, 2, SpaceId::Data, false, &rtt);
         let second_pending = bbr.rs.expect("second ACK-local sample");
         assert!(bbr.ack_epoch_open);
         assert_eq!(second_pending.last_end_seq, 2);
@@ -4068,15 +4197,7 @@ mod test {
         let next_sent = lost_sent + Duration::from_millis(110);
         let next_now = next_sent + Duration::from_millis(100);
         bbr.on_packet_sent(next_sent, smss as u16, 3, SpaceId::Data);
-        bbr.on_ack(
-            next_now,
-            next_sent,
-            smss,
-            3,
-            SpaceId::Data,
-            false,
-            &rtt,
-        );
+        bbr.on_ack(next_now, next_sent, smss, 3, SpaceId::Data, false, &rtt);
         let next_pending = bbr.rs.expect("next ACK replaces loss workspace");
         assert_eq!(next_pending.last_end_seq, 3);
         assert_eq!(next_pending.newly_acked, smss);
@@ -4115,15 +4236,7 @@ mod test {
             SpaceId::Data,
             false,
         );
-        bbr.on_ack(
-            acked_at,
-            first_sent,
-            smss,
-            1,
-            SpaceId::Data,
-            false,
-            &rtt,
-        );
+        bbr.on_ack(acked_at, first_sent, smss, 1, SpaceId::Data, false, &rtt);
         bbr.on_end_acks(acked_at, smss, false, Some(1), SpaceId::Data);
 
         bbr.on_packet_lost(smss as u16, 2, SpaceId::Data, acked_at);
@@ -4433,10 +4546,7 @@ mod test {
         assert_eq!(bbr.undo_state, None);
     }
 
-    fn startup_loss_gate_controller(
-        config: Bbr3Config,
-        sample_app_limited: bool,
-    ) -> Bbr3 {
+    fn startup_loss_gate_controller(config: Bbr3Config, sample_app_limited: bool) -> Bbr3 {
         let now = Instant::now();
         let smss = BASE_DATAGRAM_SIZE;
         let mut bbr = Bbr3::new(Arc::new(config), smss as u16);
@@ -4461,29 +4571,42 @@ mod test {
     }
 
     #[test]
-    fn compensated_app_limited_completed_decision_retains_startup_loss_exit() {
-        let mut bbr =
-            startup_loss_gate_controller(mptunnel_loss_profile_config(), true);
+    fn compensated_app_limited_completed_decision_cannot_end_startup() {
+        let mut bbr = startup_loss_gate_controller(mptunnel_loss_profile_config(), true);
+        bbr.full_bw = bbr.max_bw / 6.0;
         bbr.completed_loss_round_is_high = true;
         bbr.completed_loss_decision_events = STARTUP_FULL_LOSS_CNT;
         bbr.completed_loss_round_raw_authority = false;
-        bbr.completed_loss_round_app_limited_authority = true;
 
         bbr.check_startup_done();
 
-        assert_eq!(bbr.state, BbrState::Drain);
-        assert!(bbr.full_bw_reached);
-        assert_eq!(bbr.undo_state, Some(BbrState::Startup));
+        assert_eq!(
+            (
+                bbr.state,
+                bbr.full_bw_reached,
+                bbr.full_bw_now,
+                bbr.undo_state,
+                bbr.full_bw,
+                bbr.max_bw,
+            ),
+            (
+                BbrState::Startup,
+                false,
+                false,
+                None,
+                1_000_000.0,
+                6_000_000.0,
+            ),
+            "an application-limited compensated-loss epoch has no Startup-exit authority and must not freeze its low full-bandwidth baseline",
+        );
     }
 
     #[test]
     fn compensated_non_app_limited_completed_decision_defers_to_plateau() {
-        let mut bbr =
-            startup_loss_gate_controller(mptunnel_loss_profile_config(), false);
+        let mut bbr = startup_loss_gate_controller(mptunnel_loss_profile_config(), false);
         bbr.completed_loss_round_is_high = true;
         bbr.completed_loss_decision_events = STARTUP_FULL_LOSS_CNT;
         bbr.completed_loss_round_raw_authority = false;
-        bbr.completed_loss_round_app_limited_authority = false;
 
         bbr.check_startup_done();
 
@@ -4493,27 +4616,18 @@ mod test {
     }
 
     #[test]
-    fn compensated_completed_epoch_rejects_stale_app_limited_watermark() {
+    fn compensated_completed_epoch_never_derives_startup_authority_from_app_limited_state() {
         let now = Instant::now();
-        for (connection_app_limited, expected_authority) in [(false, false), (true, true)] {
+        for sample_app_limited in [false, true] {
             let mut bbr = Bbr3::new(
                 Arc::new(mptunnel_loss_profile_config()),
                 BASE_DATAGRAM_SIZE as u16,
             );
-            let sample = max_bw_epoch_sample(now, true);
+            let sample = max_bw_epoch_sample(now, sample_app_limited);
             bbr.delivered = sample.delivered;
             bbr.rs = Some(sample);
             bbr.update_latest_delivery_signals();
-            bbr.update_congestion_signals(
-                sample.last_packet,
-                now,
-                connection_app_limited,
-            );
-            assert_eq!(
-                bbr.completed_loss_round_app_limited_authority,
-                expected_authority,
-                "send-time app-limited evidence and current connection state must both qualify"
-            );
+            bbr.update_congestion_signals(sample.last_packet, now);
             bbr.in_recovery = true;
             bbr.recovery_start_round = 0;
             bbr.round_count = 2;
@@ -4522,12 +4636,8 @@ mod test {
             bbr.check_startup_done();
             assert_eq!(
                 bbr.state,
-                if expected_authority {
-                    BbrState::Drain
-                } else {
-                    BbrState::Startup
-                },
-                "a stale send-time watermark must not authorize the first backlogged epoch"
+                BbrState::Startup,
+                "compensated loss has no Startup-exit authority regardless of application-limited state"
             );
         }
     }
@@ -4538,13 +4648,11 @@ mod test {
         raw.completed_loss_round_is_high = true;
         raw.completed_loss_decision_events = STARTUP_FULL_LOSS_CNT;
         raw.completed_loss_round_raw_authority = true;
-        raw.completed_loss_round_app_limited_authority = false;
         raw.check_startup_done();
         assert_eq!(raw.state, BbrState::Drain);
 
         let mut zero = startup_loss_gate_controller(draft_bbr3_config(), false);
         zero.completed_loss_round_raw_authority = false;
-        zero.completed_loss_round_app_limited_authority = false;
         zero.check_startup_done();
         assert_eq!(zero.state, BbrState::Drain);
     }
@@ -4582,10 +4690,7 @@ mod test {
     #[test]
     fn packet_losses_share_one_recovery_transaction_until_it_is_abandoned() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.on_packet_sent(
             now - Duration::from_millis(2),
             BASE_DATAGRAM_SIZE as u16,
@@ -4634,10 +4739,7 @@ mod test {
     #[test]
     fn validated_ecn_in_same_recovery_taints_completed_late_loss_undo() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cwnd = 240_000;
         bbr.on_packet_sent(
             now - Duration::from_millis(2),
@@ -4677,10 +4779,7 @@ mod test {
     #[test]
     fn newer_ecn_recovery_supersedes_old_late_loss_transaction() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.cwnd = 240_000;
         bbr.on_packet_sent(
             now - Duration::from_millis(1),
@@ -4694,12 +4793,7 @@ mod test {
 
         let newer_sent = now + Duration::from_millis(1);
         bbr.check_recovery_done(newer_sent);
-        bbr.on_packet_sent(
-            newer_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            2,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(newer_sent, BASE_DATAGRAM_SIZE as u16, 2, SpaceId::Data);
         bbr.on_congestion_event(
             now + Duration::from_millis(2),
             newer_sent,
@@ -4726,10 +4820,7 @@ mod test {
     #[test]
     fn ambiguous_valid_ecn_taints_loss_undo_without_controller_attribution() {
         let now = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         assert!(bbr.enter_recovery(now, now - Duration::from_millis(1)));
         bbr.save_state_upon_loss();
         let transaction = bbr.undo_transaction.expect("loss undo transaction");
@@ -5061,7 +5152,7 @@ mod test {
                 break;
             }
             let can_send = inflight + MSS <= bbr.window();
-            let next_ack = flight.peek().map(|entry| entry.0.0);
+            let next_ack = flight.peek().map(|entry| entry.0 .0);
             let next_send_event = can_send.then_some(now_ns.max(next_send_ns));
             let next_ack_event = next_ack.map(|ack_ns| now_ns.max(ack_ns));
             let do_send = next_send_event
@@ -5146,7 +5237,6 @@ mod test {
                     bbr.inflight_rtt = bbr.min_rtt;
                     bbr.update_control_parameters();
                 }
-
             } else {
                 panic!("scripted variable-delay simulation stalled without packets in flight");
             }
@@ -5159,9 +5249,18 @@ mod test {
             }
         }
 
-        assert!(now_ns >= END_NS, "scripted simulation did not reach its deadline");
-        assert_eq!(bbr.lost, 0, "the scripted variable-delay ablation is lossless");
-        assert_eq!(injected, fast_tail, "fast-tail script did not match its arm");
+        assert!(
+            now_ns >= END_NS,
+            "scripted simulation did not reach its deadline"
+        );
+        assert_eq!(
+            bbr.lost, 0,
+            "the scripted variable-delay ablation is lossless"
+        );
+        assert_eq!(
+            injected, fast_tail,
+            "fast-tail script did not match its arm"
+        );
         VariableDelayRun {
             trace,
             state_transitions,
@@ -5172,8 +5271,7 @@ mod test {
         trace
             .iter()
             .filter(|point| {
-                point.at_ns >= from_s * 1_000_000_000
-                    && point.at_ns < to_s * 1_000_000_000
+                point.at_ns >= from_s * 1_000_000_000 && point.at_ns < to_s * 1_000_000_000
             })
             .map(|point| point.pacing_rate)
             .fold(f64::INFINITY, f64::min)
@@ -5183,8 +5281,7 @@ mod test {
         trace
             .iter()
             .filter(|point| {
-                point.at_ns >= from_s * 1_000_000_000
-                    && point.at_ns < to_s * 1_000_000_000
+                point.at_ns >= from_s * 1_000_000_000 && point.at_ns < to_s * 1_000_000_000
             })
             .map(|point| point.pacing_rate)
             .fold(0.0, f64::max)
@@ -5223,10 +5320,7 @@ mod test {
     #[test]
     fn inflight_rtt_rejects_fast_tail_and_ignores_standing_queue_samples() {
         let base = Instant::now();
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.max_bw = 6_000_000.0;
         bbr.min_rtt = Duration::from_micros(12_490);
         bbr.update_inflight_rtt(Duration::from_millis(100));
@@ -5263,10 +5357,7 @@ mod test {
 
     #[test]
     fn established_operational_rtt_rejects_one_low_flight_fast_tail() {
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.max_bw = 6_000_000.0;
         bbr.min_rtt = Duration::from_micros(12_490);
         bbr.update_inflight_rtt(Duration::from_millis(100));
@@ -5366,13 +5457,7 @@ mod test {
                 false,
                 &rtt,
             );
-            bbr.on_end_acks(
-                ack_at,
-                0,
-                true,
-                Some(epoch * 2 + 1),
-                SpaceId::Data,
-            );
+            bbr.on_end_acks(ack_at, 0, true, Some(epoch * 2 + 1), SpaceId::Data);
         }
         assert_eq!(
             bbr.inflight_rtt,
@@ -5412,15 +5497,7 @@ mod test {
         );
         let ack_at = base + Duration::from_millis(101);
         rtt.update(Duration::ZERO, Duration::from_millis(100));
-        bbr.on_ack(
-            ack_at,
-            base,
-            MSS,
-            0,
-            SpaceId::Data,
-            true,
-            &rtt,
-        );
+        bbr.on_ack(ack_at, base, MSS, 0, SpaceId::Data, true, &rtt);
         bbr.on_ack(
             ack_at,
             base + Duration::from_millis(1),
@@ -5433,7 +5510,10 @@ mod test {
         bbr.on_end_acks(ack_at, 0, true, Some(1), SpaceId::Data);
 
         assert_eq!(bbr.inflight_rtt_filter.len(), 1);
-        assert_eq!(bbr.inflight_rtt_filter.front(), Some(&Duration::from_millis(100)));
+        assert_eq!(
+            bbr.inflight_rtt_filter.front(),
+            Some(&Duration::from_millis(100))
+        );
         assert_eq!(bbr.inflight_rtt, Duration::from_secs(u64::MAX));
     }
 
@@ -5460,15 +5540,7 @@ mod test {
             bbr.app_limited = bbr.delivered.saturating_add(1);
             bbr.on_packet_sent(sent, MSS as u16, epoch, SpaceId::Data);
             rtt.update(Duration::ZERO, Duration::from_millis(50));
-            bbr.on_ack(
-                ack_at,
-                sent,
-                MSS,
-                epoch,
-                SpaceId::Data,
-                true,
-                &rtt,
-            );
+            bbr.on_ack(ack_at, sent, MSS, epoch, SpaceId::Data, true, &rtt);
             bbr.on_end_acks(ack_at, 0, true, Some(epoch), SpaceId::Data);
         }
 
@@ -5481,10 +5553,7 @@ mod test {
 
     #[test]
     fn every_ordinary_consumer_applies_full_gain_to_operational_bdp() {
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.max_bw = 6_000_000.0;
         bbr.bw = bbr.max_bw;
         bbr.min_rtt = Duration::from_micros(12_490);
@@ -5528,10 +5597,7 @@ mod test {
 
     #[test]
     fn inflight_rtt_ages_up_only_after_two_low_flight_ack_epochs() {
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.max_bw = 6_000_000.0;
         bbr.min_rtt = Duration::from_millis(100);
         bbr.update_inflight_rtt(Duration::from_millis(100));
@@ -5548,10 +5614,8 @@ mod test {
 
     #[test]
     fn inflight_rtt_is_low_jitter_neutral_and_probe_rtt_remains_raw() {
-        let mut conventional = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut conventional =
+            Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         conventional.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
         conventional.max_bw = 6_000_000.0;
         conventional.bw = conventional.max_bw;
@@ -5594,10 +5658,7 @@ mod test {
 
     #[test]
     fn operational_flight_remains_below_existing_loss_caps() {
-        let mut bbr = Bbr3::new(
-            Arc::new(Bbr3Config::default()),
-            BASE_DATAGRAM_SIZE as u16,
-        );
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
         bbr.full_bw_reached = true;
         bbr.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
         bbr.max_bw = 6_000_000.0;
@@ -5670,11 +5731,8 @@ mod test {
         let protected_delivered = trace_delivered_at(&protected_fast_tail, DELIVERY_CHECKPOINT_NS);
         let stable_same_time = trace_delivered_at(&stable, DELIVERY_CHECKPOINT_NS);
         let protected_same_time = protected_delivered;
-        let stable_down_ns = max_trace_down_residence_ns(
-            &stable.state_transitions,
-            8_000_000_000,
-            19_000_000_000,
-        );
+        let stable_down_ns =
+            max_trace_down_residence_ns(&stable.state_transitions, 8_000_000_000, 19_000_000_000);
         let protected_down_ns = max_trace_down_residence_ns(
             &protected_fast_tail.state_transitions,
             8_000_000_000,
@@ -5750,6 +5808,7 @@ mod test {
         let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let config = Bbr3Config {
             initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            startup_target: None,
             loss_compensation_floor: 0.0,
             probe_rng_seed: Some(seed),
             startup_pacing_gain: None,
@@ -5772,6 +5831,76 @@ mod test {
         assert_eq!(bbr3.rounds_since_bw_probe, 0);
         assert_eq!(bbr3.bw_probe_wait, Duration::from_millis(2461));
         assert_eq!(bbr3.reno_rounds_bound, 63);
+    }
+
+    #[test]
+    fn startup_target_changes_geometry_without_seeding_bandwidth_model() {
+        let mut config = Bbr3Config::default();
+        config.initial_window_and_pacing_rate(315_626, 3_125_001);
+        let bbr = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+
+        assert_eq!(bbr.initial_cwnd, 315_626);
+        assert_eq!(bbr.cwnd, 315_626);
+        assert_eq!(bbr.pacing_rate, 3_125_001.0);
+        assert_eq!(bbr.bw, 0.0);
+        assert_eq!(bbr.max_bw, 0.0);
+        assert_eq!(bbr.metrics().bandwidth_estimate, None);
+    }
+
+    #[test]
+    fn startup_target_window_cannot_shrink_generic_initial_window() {
+        let default = Bbr3::new(Arc::new(Bbr3Config::default()), BASE_DATAGRAM_SIZE as u16);
+        let mut config = Bbr3Config::default();
+        config.initial_window_and_pacing_rate(1, 1);
+        let targeted = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+
+        assert_eq!(targeted.initial_cwnd, default.initial_cwnd);
+        assert_eq!(targeted.cwnd, default.cwnd);
+        assert_eq!(targeted.pacing_rate, 1.0);
+        assert_eq!(targeted.metrics().bandwidth_estimate, None);
+    }
+
+    #[test]
+    fn startup_target_first_ack_saturates_window_arithmetic() {
+        let now = Instant::now();
+        let mut config = Bbr3Config::default();
+        config.initial_window_and_pacing_rate(u64::MAX - 600, 1);
+        let mut bbr = Bbr3::new(Arc::new(config), BASE_DATAGRAM_SIZE as u16);
+        let packet = BbrPacket {
+            delivered: 0,
+            delivered_time: now,
+            first_send_time: now,
+            send_time: now,
+            is_app_limited: false,
+            is_operational_rtt_evidence: false,
+            tx_in_flight: bbr.initial_cwnd,
+            packet_number: 0,
+            space: SpaceId::Data,
+            size: BASE_DATAGRAM_SIZE as u16,
+            lost: 0,
+            acknowledged: true,
+            stale: false,
+            round_count: 0,
+        };
+        bbr.rs = Some(BbrRateSample {
+            delivery_rate: 1.0,
+            is_app_limited: false,
+            interval: Duration::from_millis(1),
+            delivered: BASE_DATAGRAM_SIZE,
+            prior_delivered: 0,
+            send_elapsed: Duration::from_millis(1),
+            ack_elapsed: Duration::from_millis(1),
+            rtt: Duration::from_millis(1),
+            tx_in_flight: bbr.initial_cwnd,
+            newly_acked: BASE_DATAGRAM_SIZE,
+            lost: 0,
+            last_end_seq: 0,
+            last_packet: packet,
+        });
+
+        bbr.set_cwnd();
+
+        assert_eq!(bbr.cwnd, u64::MAX);
     }
 
     fn loss_floor_test_controller() -> Bbr3 {
@@ -5815,12 +5944,7 @@ mod test {
         // Connection::on_ack_received orders on_end_acks before detect_lost_packets. The separate
         // packet-number space keeps the held flight independent from the Data ACKs used below.
         for packet_number in 0..HELD_LOST + HELD_DELIVERED {
-            bbr.on_packet_sent(
-                base,
-                MSS as u16,
-                packet_number,
-                SpaceId::Handshake,
-            );
+            bbr.on_packet_sent(base, MSS as u16, packet_number, SpaceId::Handshake);
         }
         for packet_number in 0..SEED_DELIVERED {
             bbr.on_packet_sent(base, MSS as u16, packet_number, SpaceId::Data);
@@ -5856,15 +5980,7 @@ mod test {
                 bbr.on_packet_sent(sent, MSS as u16, packet_number, SpaceId::Data);
             }
             for packet_number in first_packet..first_packet + SEED_DELIVERED {
-                bbr.on_ack(
-                    acked,
-                    sent,
-                    MSS,
-                    packet_number,
-                    SpaceId::Data,
-                    false,
-                    &rtt,
-                );
+                bbr.on_ack(acked, sent, MSS, packet_number, SpaceId::Data, false, &rtt);
             }
             bbr.on_end_acks(
                 acked,
@@ -6068,18 +6184,8 @@ mod test {
         let base = Instant::now();
         let later = base + Duration::from_millis(1);
         let mut bbr = loss_floor_test_controller();
-        bbr.on_packet_sent(
-            base,
-            BASE_DATAGRAM_SIZE as u16,
-            0,
-            SpaceId::Initial,
-        );
-        bbr.on_packet_sent(
-            later,
-            BASE_DATAGRAM_SIZE as u16,
-            0,
-            SpaceId::Handshake,
-        );
+        bbr.on_packet_sent(base, BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Initial);
+        bbr.on_packet_sent(later, BASE_DATAGRAM_SIZE as u16, 0, SpaceId::Handshake);
 
         // Packet numbers are scoped to their spaces. Quinn may report the later-sent loss first,
         // so the aggregate anchor must be ordered by send time rather than callback order or PN.
@@ -6455,8 +6561,7 @@ mod test {
         bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 99, SpaceId::Data, ack_at);
         let final_sample = bbr.rs.expect("diluted final loss sample");
         assert!(
-            final_sample.lost as f64
-                <= final_sample.tx_in_flight as f64 * LOSS_THRESH,
+            final_sample.lost as f64 <= final_sample.tx_in_flight as f64 * LOSS_THRESH,
             "the final sample must not independently cross the raw threshold"
         );
         assert_eq!(bbr.state, BbrState::ProbeBw(ProbeBwSubstate::Up));
@@ -6538,7 +6643,7 @@ mod test {
         assert_eq!(bbr.effective_probe_loss_thresh(), LOSS_THRESH);
 
         bbr.loss_round_start = true;
-        bbr.update_congestion_signals(max_bw_epoch_sample(now, false).last_packet, now, false);
+        bbr.update_congestion_signals(max_bw_epoch_sample(now, false).last_packet, now);
         assert!(bbr.bw_shortterm.is_finite());
         assert!(!bbr.loss_in_round);
         assert!(!bbr.loss_round_evidence_unknown);
@@ -6562,12 +6667,7 @@ mod test {
         let now = base + Duration::from_millis(100);
         let mut bbr = loss_floor_test_controller();
 
-        bbr.on_packet_sent(
-            base,
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(base, BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data);
         bbr.on_packet_sent(
             base + Duration::from_micros(1),
             BASE_DATAGRAM_SIZE as u16,
@@ -6584,12 +6684,7 @@ mod test {
         // Quinn orders declarations within each packet-number space, not across spaces. These
         // callbacks describe exactly two ranges: Data 1..=2 and Handshake 1.
         bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now);
-        bbr.on_packet_lost(
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Handshake,
-            now,
-        );
+        bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Handshake, now);
         bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 2, SpaceId::Data, now);
 
         bbr.explicit_congestion_in_round = true;
@@ -6598,7 +6693,7 @@ mod test {
         sample.lost = 3 * BASE_DATAGRAM_SIZE;
         sample.tx_in_flight = 3 * BASE_DATAGRAM_SIZE;
         bbr.rs = Some(sample);
-        bbr.update_congestion_signals(sample.last_packet, now, false);
+        bbr.update_congestion_signals(sample.last_packet, now);
 
         assert_eq!(
             bbr.completed_loss_decision_events, 2,
@@ -6622,12 +6717,7 @@ mod test {
                 SpaceId::Data,
             );
             for packet_number in 1..=2 {
-                bbr.on_packet_lost(
-                    BASE_DATAGRAM_SIZE as u16,
-                    packet_number,
-                    SpaceId::Data,
-                    now,
-                );
+                bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, packet_number, SpaceId::Data, now);
             }
             bbr.on_congestion_event(
                 now,
@@ -6652,10 +6742,7 @@ mod test {
                 .iter()
                 .all(|record| !record.loss_round_open));
             assert!(!bbr.loss_in_round);
-            assert_eq!(
-                bbr.loss_budget_exempt_lost,
-                2 * BASE_DATAGRAM_SIZE
-            );
+            assert_eq!(bbr.loss_budget_exempt_lost, 2 * BASE_DATAGRAM_SIZE);
         }
     }
 
@@ -6667,7 +6754,10 @@ mod test {
         bbr.on_packet_lost(BASE_DATAGRAM_SIZE as u16, 999, SpaceId::Data, now);
         assert_eq!(bbr.loss_budget_exempt_lost, BASE_DATAGRAM_SIZE);
         assert_eq!(bbr.loss_budget_current_batch.len(), 1);
-        assert!(bbr.loss_budget_records.front().is_some_and(|record| record.exempt));
+        assert!(bbr
+            .loss_budget_records
+            .front()
+            .is_some_and(|record| record.exempt));
 
         bbr.on_congestion_event(
             now,
@@ -6705,7 +6795,10 @@ mod test {
             SpaceId::Data,
         );
         assert_eq!(bbr.loss_budget_exempt_lost, BASE_DATAGRAM_SIZE);
-        assert!(bbr.loss_budget_records.front().is_some_and(|record| record.exempt));
+        assert!(bbr
+            .loss_budget_records
+            .front()
+            .is_some_and(|record| record.exempt));
 
         // The packet bytes are reclassified exactly once, but genuine persistent authority is
         // newer than the recovery snapshot and must not be rolled back with the late loss proof.
@@ -6847,8 +6940,7 @@ mod test {
         // reference volume so the assertion isolates balance accounting from capacity rebasing.
         assert_eq!(bbr.advance_compensated_loss_budget(true), Some(false));
         let boundary = bbr.compensated_loss_boundary();
-        let charged_balance =
-            balance_before_loss - (1.0 - boundary) * BASE_DATAGRAM_SIZE as f64;
+        let charged_balance = balance_before_loss - (1.0 - boundary) * BASE_DATAGRAM_SIZE as f64;
         assert!((bbr.loss_budget_balance - charged_balance).abs() < f64::EPSILON);
 
         assert!(bbr.on_spurious_congestion_event(transaction));
@@ -6878,12 +6970,7 @@ mod test {
         bbr.loss_budget_balance = original_balance;
 
         let first_sent = now - Duration::from_millis(1);
-        bbr.on_packet_sent(
-            first_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(first_sent, BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data);
         let first = bbr
             .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
             .expect("first retained transaction");
@@ -6901,12 +6988,7 @@ mod test {
 
         let second_sent = now + Duration::from_millis(1);
         bbr.check_recovery_done(second_sent);
-        bbr.on_packet_sent(
-            second_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            2,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(second_sent, BASE_DATAGRAM_SIZE as u16, 2, SpaceId::Data);
         let second = bbr
             .on_packet_lost(
                 BASE_DATAGRAM_SIZE as u16,
@@ -6953,12 +7035,7 @@ mod test {
         // and therefore owns the cold envelope only while its evidence remains valid.
         bbr.inflight = 100 * BASE_DATAGRAM_SIZE;
         let first_sent = now;
-        bbr.on_packet_sent(
-            first_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(first_sent, BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data);
         let first = bbr
             .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
             .expect("high-flight cold transaction");
@@ -6975,12 +7052,7 @@ mod test {
         let second_sent = now + Duration::from_millis(1);
         bbr.check_recovery_done(second_sent);
         bbr.inflight = 0;
-        bbr.on_packet_sent(
-            second_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            2,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(second_sent, BASE_DATAGRAM_SIZE as u16, 2, SpaceId::Data);
         let second = bbr
             .on_packet_lost(
                 BASE_DATAGRAM_SIZE as u16,
@@ -7007,8 +7079,7 @@ mod test {
             * COMPENSATED_LOSS_BURST_ROUNDS
             * bbr.loss_compensation_floor
             * bbr.initial_cwnd as f64;
-        let expected_balance =
-            expected_capacity - (1.0 - boundary) * BASE_DATAGRAM_SIZE as f64;
+        let expected_balance = expected_capacity - (1.0 - boundary) * BASE_DATAGRAM_SIZE as f64;
         assert!((bbr.loss_budget_capacity - expected_capacity).abs() < f64::EPSILON);
         assert!((bbr.loss_budget_balance - expected_balance).abs() < f64::EPSILON);
     }
@@ -7018,12 +7089,7 @@ mod test {
         let now = Instant::now();
         let mut bbr = loss_floor_test_controller();
         let old_sent = now - Duration::from_millis(1);
-        bbr.on_packet_sent(
-            old_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(old_sent, BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data);
         let old = bbr
             .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
             .expect("old retained transaction");
@@ -7069,12 +7135,7 @@ mod test {
         let now = Instant::now();
         let mut bbr = loss_floor_test_controller();
         let sent = now - Duration::from_millis(1);
-        bbr.on_packet_sent(
-            sent,
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(sent, BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data);
         let transaction = bbr
             .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
             .expect("retained transaction");
@@ -7120,12 +7181,7 @@ mod test {
         bbr.inflight_longterm = 230_000;
 
         let older_sent = now - Duration::from_millis(1);
-        bbr.on_packet_sent(
-            older_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(older_sent, BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data);
         let older = bbr
             .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
             .expect("older retained transaction");
@@ -7138,18 +7194,16 @@ mod test {
             1,
             SpaceId::Data,
         );
-        assert!(bbr.loss_in_round, "the older native response must still be pending");
+        assert!(
+            bbr.loss_in_round,
+            "the older native response must still be pending"
+        );
 
         // A packet sent after T1's recovery start can be declared lost by a later timer before an
         // ACK closes T1's BBR loss round. T2 therefore snapshots model values that do not yet
         // contain T1's deferred lower-bound response.
         let current_sent = now + Duration::from_millis(1);
-        bbr.on_packet_sent(
-            current_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            2,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(current_sent, BASE_DATAGRAM_SIZE as u16, 2, SpaceId::Data);
         let current = bbr
             .on_packet_lost(
                 BASE_DATAGRAM_SIZE as u16,
@@ -7180,11 +7234,7 @@ mod test {
         bbr.rs = Some(sample);
         bbr.update_latest_delivery_signals();
         assert!(bbr.loss_round_start);
-        bbr.update_congestion_signals(
-            sample.last_packet,
-            now + Duration::from_millis(100),
-            false,
-        );
+        bbr.update_congestion_signals(sample.last_packet, now + Duration::from_millis(100));
         assert!(!bbr.loss_in_round);
         let responded_bw = bbr.bw_shortterm;
         let responded_inflight = bbr.inflight_shortterm;
@@ -7197,9 +7247,10 @@ mod test {
         );
         assert_eq!(bbr.bw_shortterm, responded_bw);
         assert_eq!(bbr.inflight_shortterm, responded_inflight);
-        assert!(bbr.loss_budget_records.iter().any(|record| {
-            record.transaction == Some(older) && !record.exempt
-        }));
+        assert!(bbr
+            .loss_budget_records
+            .iter()
+            .any(|record| { record.transaction == Some(older) && !record.exempt }));
     }
 
     #[test]
@@ -7207,12 +7258,7 @@ mod test {
         let now = Instant::now();
         let mut bbr = loss_floor_test_controller();
         let older_sent = now - Duration::from_millis(1);
-        bbr.on_packet_sent(
-            older_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            1,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(older_sent, BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data);
         let older = bbr
             .on_packet_lost(BASE_DATAGRAM_SIZE as u16, 1, SpaceId::Data, now)
             .expect("older retained transaction");
@@ -7239,12 +7285,7 @@ mod test {
         bbr.bw_shortterm = 8_000_000.0;
         bbr.inflight_shortterm = 220_000;
         bbr.inflight_longterm = 230_000;
-        bbr.on_packet_sent(
-            current_sent,
-            BASE_DATAGRAM_SIZE as u16,
-            2,
-            SpaceId::Data,
-        );
+        bbr.on_packet_sent(current_sent, BASE_DATAGRAM_SIZE as u16, 2, SpaceId::Data);
         let current = bbr
             .on_packet_lost(
                 BASE_DATAGRAM_SIZE as u16,
@@ -7277,9 +7318,10 @@ mod test {
         assert!(bbr.loss_budget_records.iter().any(|record| {
             record.transaction == Some(older) && !record.loss_round_open && !record.exempt
         }));
-        assert!(!bbr.loss_budget_records.iter().any(|record| {
-            record.transaction == Some(current) && record.loss_round_open
-        }));
+        assert!(!bbr
+            .loss_budget_records
+            .iter()
+            .any(|record| { record.transaction == Some(current) && record.loss_round_open }));
     }
 
     /// A.1: Exiting STARTUP on a bandwidth plateau.
@@ -10309,13 +10351,9 @@ mod test {
                     // Each 100-packet block contains exactly `percent` losses, while an affine
                     // permutation and per-block SplitMix rotation vary their local round placement.
                     let block = packet_number / 100;
-                    let mut rotation = block
-                        .wrapping_add(seed)
-                        .wrapping_add(0x9e37_79b9_7f4a_7c15);
-                    rotation = (rotation ^ (rotation >> 30))
-                        .wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                    rotation = (rotation ^ (rotation >> 27))
-                        .wrapping_mul(0x94d0_49bb_1331_11eb);
+                    let mut rotation = block.wrapping_add(seed).wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    rotation = (rotation ^ (rotation >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    rotation = (rotation ^ (rotation >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
                     rotation ^= rotation >> 31;
                     ((packet_number % 100) * 37 + rotation % 100) % 100 < percent
                 }
@@ -10512,11 +10550,7 @@ mod test {
         selected.iter().sum::<f64>() / selected.len() as f64
     }
 
-    fn observed_loss_between(
-        run: &ExogenousLossRun,
-        start_second: u64,
-        end_second: u64,
-    ) -> f64 {
+    fn observed_loss_between(run: &ExogenousLossRun, start_second: u64, end_second: u64) -> f64 {
         let end = run
             .points
             .iter()
@@ -10528,18 +10562,13 @@ mod test {
             .find(|point| point.second == start_second.saturating_sub(1))
             .expect("loss window beginning");
         let lost = end.lost_packets.saturating_sub(before.lost_packets);
-        let resolved = end
-            .resolved_packets
-            .saturating_sub(before.resolved_packets);
+        let resolved = end.resolved_packets.saturating_sub(before.resolved_packets);
         lost as f64 / resolved.max(1) as f64
     }
 
-    fn exogenous_goodput_model_floor(
-        observed_loss: f64,
-        service_bytes_per_second: f64,
-    ) -> f64 {
-        let probe_rtt_duty = 1.0
-            - (PROBE_RTT_DURATION_MS as f64 / 1_000.0) / PROBE_RTT_INTERVAL_SEC as f64;
+    fn exogenous_goodput_model_floor(observed_loss: f64, service_bytes_per_second: f64) -> f64 {
+        let probe_rtt_duty =
+            1.0 - (PROBE_RTT_DURATION_MS as f64 / 1_000.0) / PROBE_RTT_INTERVAL_SEC as f64;
         let pacing_duty = 1.0 - PACING_MARGIN_PERCENT / 100.0;
         service_bytes_per_second * (1.0 - observed_loss) * probe_rtt_duty * pacing_duty
     }
@@ -10560,10 +10589,7 @@ mod test {
 
     #[test]
     fn sustained_exogenous_loss_reproduces_progressive_decline_without_a_floor() {
-        for pattern in [
-            ExogenousLossPattern::Periodic,
-            ExogenousLossPattern::Burst,
-        ] {
+        for pattern in [ExogenousLossPattern::Periodic, ExogenousLossPattern::Burst] {
             let run = run_sustained_exogenous_loss(draft_bbr3_config(), pattern, 5);
             let early = mean_goodput(&run, 9, 13);
             let late = mean_goodput(&run, 36, 40);
@@ -10589,10 +10615,7 @@ mod test {
 
     #[test]
     fn explicit_loss_floor_sustains_periodic_and_burst_erasure() {
-        for pattern in [
-            ExogenousLossPattern::Periodic,
-            ExogenousLossPattern::Burst,
-        ] {
+        for pattern in [ExogenousLossPattern::Periodic, ExogenousLossPattern::Burst] {
             let mut config = Bbr3Config::default();
             config.loss_compensation_floor(0.05);
             let run = run_sustained_exogenous_loss(config, pattern, 5);
@@ -10629,8 +10652,7 @@ mod test {
             ExogenousLossPattern::Randomized,
             ExogenousLossPattern::BlockBalanced(0),
         ] {
-            let run =
-                run_sustained_exogenous_loss(mptunnel_loss_profile_config(), pattern, 10);
+            let run = run_sustained_exogenous_loss(mptunnel_loss_profile_config(), pattern, 10);
             let early = mean_goodput(&run, 9, 13);
             let late = mean_goodput(&run, 36, 40);
             eprintln!(
@@ -10732,12 +10754,7 @@ mod test {
         let late = mean_goodput(&run, 4, 5);
         let late_loss = observed_loss_between(&run, 4, 5);
         let window_quantum = 2.0 * BASE_DATAGRAM_SIZE as f64 / 2.0;
-        assert_exogenous_goodput_model(
-            late,
-            late_loss,
-            SERVICE_BYTES_PER_SECOND,
-            window_quantum,
-        );
+        assert_exogenous_goodput_model(late, late_loss, SERVICE_BYTES_PER_SECOND, window_quantum);
     }
 
     #[test]
@@ -10924,12 +10941,8 @@ mod test {
                 now_ns = now_ns.max(p.event_ns);
                 inflight -= MSS;
                 if p.lost {
-                    let transaction = bbr.on_packet_lost(
-                        MSS as u16,
-                        p.pn,
-                        SpaceId::Data,
-                        at(now_ns),
-                    );
+                    let transaction =
+                        bbr.on_packet_lost(MSS as u16, p.pn, SpaceId::Data, at(now_ns));
                     bbr.on_congestion_event(
                         at(now_ns),
                         at(p.send_ns),
@@ -10990,21 +11003,15 @@ mod test {
                 }
 
                 if restored {
-                    let high_rediscovered =
-                        (high_service - rate_quantum..=high_service + rate_quantum)
-                            .contains(&bbr.max_bw);
+                    let high_rediscovered = (high_service - rate_quantum
+                        ..=high_service + rate_quantum)
+                        .contains(&bbr.max_bw);
                     let old_flight_drained = flight
                         .iter()
                         .all(|packet| packet.post_restore && !packet.lost);
-                    if recovery_window_start.is_none()
-                        && high_rediscovered
-                        && old_flight_drained
-                    {
-                        recovery_window_start = Some((
-                            now_ns,
-                            bbr.delivered,
-                            bbr.loss_budget_exhaustions,
-                        ));
+                    if recovery_window_start.is_none() && high_rediscovered && old_flight_drained {
+                        recovery_window_start =
+                            Some((now_ns, bbr.delivered, bbr.loss_budget_exhaustions));
                     }
                     if recovery_window_start.is_some() {
                         recovery_window_min_bw = recovery_window_min_bw.min(bbr.max_bw);
@@ -11023,8 +11030,14 @@ mod test {
         }
 
         assert!(cut, "flow never reached PROBE_BW at the high rate to cut");
-        assert!(post_cut_tail_drop_bytes > 0, "the cut produced no genuine tail drop");
-        assert!(min_shortterm_after < cut_max_bw, "short-term loss response never engaged");
+        assert!(
+            post_cut_tail_drop_bytes > 0,
+            "the cut produced no genuine tail drop"
+        );
+        assert!(
+            min_shortterm_after < cut_max_bw,
+            "short-term loss response never engaged"
+        );
         if loss_compensation_floor.is_some() {
             assert!(
                 bbr.loss_budget_exhaustions > exhaustions_at_cut,
@@ -11033,8 +11046,7 @@ mod test {
         }
         let low_max_bw = low_max_bw.expect("controller never converged to reduced service");
         assert!(
-            (low_service - rate_quantum..=low_model_ceiling + rate_quantum)
-                .contains(&low_max_bw),
+            (low_service - rate_quantum..=low_model_ceiling + rate_quantum).contains(&low_max_bw),
             "low-service estimate {low_max_bw} is outside the corrected service model"
         );
         assert!(restore_delivered > cut_delivered && restore_round > cut_round);
@@ -11057,8 +11069,8 @@ mod test {
         let window_seconds = RECOVERY_WINDOW_NS as f64 / 1e9;
         let recovered_goodput =
             window_end_delivered.saturating_sub(window_start_delivered) as f64 / window_seconds;
-        let probe_rtt_duty = 1.0
-            - (PROBE_RTT_DURATION_MS as f64 / 1_000.0) / PROBE_RTT_INTERVAL_SEC as f64;
+        let probe_rtt_duty =
+            1.0 - (PROBE_RTT_DURATION_MS as f64 / 1_000.0) / PROBE_RTT_INTERVAL_SEC as f64;
         let pacing_duty = 1.0 - PACING_MARGIN_PERCENT / 100.0;
         let goodput_floor = high_service * probe_rtt_duty * pacing_duty;
         let window_quantum = MSS as f64 / window_seconds;
@@ -12694,6 +12706,440 @@ mod test {
             final_err < 0.10,
             "max_bw after subsequent probing ({max_bw_final}) should still be within 10% of the \
              simulated {BW} (rel err {final_err})"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CapacityRankingArm {
+        /// Quinn runs normally, with no multipath allocator above it.
+        NativeBacklogged,
+        /// The controller's current bounded estimate participates in the next allocation decision.
+        LiveBounded,
+        /// The same estimate is observed but does not participate in allocation.
+        ShadowOnly,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct QosDiscriminatorPoint {
+        rtt: u16,
+        service_mbps: u16,
+        backlog_bytes: u64,
+        assigned_quic_bytes: u64,
+        sent_quic_bytes: u64,
+        app_limited: bool,
+        cwnd_limited: bool,
+        cwnd: u64,
+        pending_bytes: u64,
+        flight_bytes: u64,
+        exported_bytes_per_second: Option<u64>,
+        retained_max_bytes_per_second: u64,
+        pacing_bytes_per_second: u64,
+        configured_loss_percent: u8,
+        lost_packets: u32,
+        resolved_packets: u32,
+        delivered_mbps: u16,
+        selected_path: &'static str,
+        state: BbrState,
+        round_count: u64,
+        budget_exhaustions: u64,
+    }
+
+    /// Deterministic packet quantum placement with exactly `percent` losses in every complete
+    /// 100-packet block. The round-dependent SplitMix rotation makes the 3--10% trace seeded rather
+    /// than periodically aligned with BBR's round boundary.
+    fn qos_discriminator_lost(rtt: u64, packet_in_service: u64, percent: u8) -> bool {
+        let mut rotation = rtt
+            .wrapping_add(0x6a09_e667_f3bc_c909)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        rotation = (rotation ^ (rotation >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        rotation = (rotation ^ (rotation >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        rotation ^= rotation >> 31;
+        ((packet_in_service % 100) * 37 + rotation % 100) % 100 < u64::from(percent)
+    }
+
+    /// Drives the real Quinn controller one ACK batch per 100ms packet-timed round. Packets that
+    /// cannot be served stay in native flight, so the single controller instance carries its queue,
+    /// delivery model, recovery state, and probe state across the 500 -> 10 -> 500 Mbit/s trace.
+    ///
+    /// The allocator is deliberately only a test surrogate: the companion mptunnel test proves that
+    /// the real projection and scheduler make the same high/low *ranking* decisions. This crate
+    /// cannot call that scheduler without a dependency cycle, so no claim is made about production
+    /// queue ownership or exact byte shares.
+    fn run_qos_discriminator(ranking: CapacityRankingArm) -> Vec<QosDiscriminatorPoint> {
+        const MSS: u64 = 1200;
+        const RTT_NS: u64 = 100_000_000;
+        const HIGH_BYTES_PER_SECOND: u64 = 62_500_000; // 500 Mbit/s
+        const LOW_BYTES_PER_SECOND: u64 = 1_250_000; // 10 Mbit/s
+        const ALTERNATE_BYTES_PER_SECOND: u64 = 12_500_000; // 100 Mbit/s
+        const BACKLOG_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        const TRACE_RTTS: u16 = 140;
+        const LOW_START_RTT: u16 = 40;
+        const RECOVERY_START_RTT: u16 = 70;
+        // Spans 3--10% and has an exact 6% arithmetic mean over each ten RTTs.
+        const LOSS_PERCENT: [u8; 10] = [3, 10, 4, 9, 5, 8, 6, 7, 3, 5];
+
+        #[derive(Clone, Copy)]
+        struct Packet {
+            number: u64,
+            sent_ns: u64,
+        }
+
+        let mut config = mptunnel_loss_profile_config();
+        config.probe_rng_seed = Some([0x6a; 16]);
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        let base = Instant::now();
+        let at = |offset_ns: u64| base + Duration::from_nanos(offset_ns);
+        let mut rtt_estimator = RttEstimator::new(Duration::from_nanos(RTT_NS));
+        let mut native_flight = 0u64;
+        let mut packets = VecDeque::<Packet>::new();
+        let mut tail_drops = VecDeque::<Packet>::new();
+        let mut next_packet_number = 0u64;
+        let mut previous_connection_app_limited = false;
+        let mut trace = Vec::with_capacity(usize::from(TRACE_RTTS));
+
+        for rtt in 0..TRACE_RTTS {
+            let now_ns = u64::from(rtt + 1) * RTT_NS;
+            let service_bytes_per_second = if (LOW_START_RTT..RECOVERY_START_RTT).contains(&rtt) {
+                LOW_BYTES_PER_SECOND
+            } else {
+                HIGH_BYTES_PER_SECOND
+            };
+            let loss_percent = LOSS_PERCENT[usize::from(rtt) % LOSS_PERCENT.len()];
+            // The QoS queue keeps two BDPs at its current service contract. A 500 -> 10 Mbit/s
+            // reconfiguration therefore drops excess queued work immediately instead of retaining
+            // ten seconds of the old high-rate flight and mislabeling that drain as controller
+            // recovery.
+            let buffer_packets = (2 * service_bytes_per_second as u128 * RTT_NS as u128
+                / 1_000_000_000
+                / MSS as u128) as usize;
+            let mut capacity_tail_drops = Vec::new();
+            while packets.len() > buffer_packets {
+                capacity_tail_drops.push(packets.pop_back().expect("queue above current buffer"));
+            }
+            let service_packets = (service_bytes_per_second as u128 * RTT_NS as u128
+                / 1_000_000_000
+                / MSS as u128) as usize;
+            let resolved = service_packets.min(packets.len());
+            let mut acked = Vec::with_capacity(resolved);
+            // Tail drops are declared one RTT after enqueue, while randomized erasures consume
+            // bottleneck service before being declared in the current ACK/loss batch.
+            let mut lost = tail_drops.drain(..).collect::<Vec<_>>();
+            lost.append(&mut capacity_tail_drops);
+            for packet_in_service in 0..resolved {
+                let packet = packets.pop_front().expect("bounded service population");
+                if qos_discriminator_lost(u64::from(rtt), packet_in_service as u64, loss_percent) {
+                    lost.push(packet);
+                } else {
+                    acked.push(packet);
+                }
+            }
+            lost.sort_unstable_by_key(|packet| packet.number);
+
+            for packet in &acked {
+                native_flight = native_flight.saturating_sub(MSS);
+                let sample_rtt = Duration::from_nanos(now_ns.saturating_sub(packet.sent_ns));
+                rtt_estimator.update(Duration::ZERO, sample_rtt);
+                bbr.on_ack(
+                    at(now_ns),
+                    at(packet.sent_ns),
+                    MSS,
+                    packet.number,
+                    SpaceId::Data,
+                    previous_connection_app_limited,
+                    &rtt_estimator,
+                );
+            }
+            if let Some(largest_acked) = acked.last().map(|packet| packet.number) {
+                bbr.on_end_acks(
+                    at(now_ns),
+                    native_flight,
+                    previous_connection_app_limited,
+                    Some(largest_acked),
+                    SpaceId::Data,
+                );
+            }
+
+            let mut loss_transactions = Vec::new();
+            for packet in &lost {
+                native_flight = native_flight.saturating_sub(MSS);
+                if let Some(transaction) =
+                    bbr.on_packet_lost(MSS as u16, packet.number, SpaceId::Data, at(now_ns))
+                {
+                    loss_transactions.push(transaction);
+                }
+            }
+            if let Some(largest_lost) = lost.last() {
+                bbr.on_congestion_event(
+                    at(now_ns),
+                    at(largest_lost.sent_ns),
+                    false,
+                    false,
+                    lost.len() as u64 * MSS,
+                    largest_lost.number,
+                    SpaceId::Data,
+                );
+                for transaction in loss_transactions {
+                    bbr.on_recovery_transaction_abandoned(transaction);
+                }
+            }
+
+            let controller_metrics = bbr.metrics();
+            let bounded_rate = controller_metrics
+                .bandwidth_estimate
+                .unwrap_or(HIGH_BYTES_PER_SECOND);
+            let selected_path = match ranking {
+                CapacityRankingArm::NativeBacklogged => "native-quic",
+                CapacityRankingArm::ShadowOnly => "quic",
+                CapacityRankingArm::LiveBounded if bounded_rate >= ALTERNATE_BYTES_PER_SECOND => {
+                    "quic"
+                }
+                CapacityRankingArm::LiveBounded => "tcp",
+            };
+            let assigned_quic_bytes = match ranking {
+                CapacityRankingArm::NativeBacklogged => BACKLOG_BYTES,
+                _ if selected_path == "quic" => bbr.window().saturating_mul(4),
+                _ => 4 * MSS,
+            };
+            let available_window = bbr.window().saturating_sub(native_flight);
+            let pacing_budget = controller_metrics
+                .pacing_rate
+                .unwrap_or(HIGH_BYTES_PER_SECOND)
+                .saturating_mul(RTT_NS)
+                / 1_000_000_000;
+            let sent_quic_bytes =
+                assigned_quic_bytes.min(available_window).min(pacing_budget) / MSS * MSS;
+            let app_limited = sent_quic_bytes == assigned_quic_bytes;
+            let cwnd_limited = sent_quic_bytes < assigned_quic_bytes
+                && available_window <= pacing_budget
+                && available_window < assigned_quic_bytes;
+            if cwnd_limited {
+                bbr.on_cwnd_limited();
+            }
+            let send_packets = sent_quic_bytes / MSS;
+            for packet_index in 0..send_packets {
+                let marks_app_limited = app_limited && packet_index + 1 == send_packets;
+                let _ = <Bbr3 as Controller>::on_packet_sent(
+                    &mut bbr,
+                    at(now_ns),
+                    MSS as u16,
+                    native_flight,
+                    next_packet_number,
+                    SpaceId::Data,
+                    marks_app_limited,
+                );
+                let packet = Packet {
+                    number: next_packet_number,
+                    sent_ns: now_ns,
+                };
+                if packets.len() < buffer_packets {
+                    packets.push_back(packet);
+                } else {
+                    tail_drops.push_back(packet);
+                }
+                native_flight = native_flight.saturating_add(MSS);
+                next_packet_number = next_packet_number.saturating_add(1);
+            }
+            previous_connection_app_limited = app_limited;
+
+            trace.push(QosDiscriminatorPoint {
+                rtt,
+                service_mbps: (service_bytes_per_second * 8 / 1_000_000) as u16,
+                backlog_bytes: BACKLOG_BYTES,
+                assigned_quic_bytes,
+                sent_quic_bytes,
+                app_limited,
+                cwnd_limited,
+                cwnd: bbr.window(),
+                pending_bytes: assigned_quic_bytes.saturating_sub(sent_quic_bytes),
+                flight_bytes: native_flight,
+                exported_bytes_per_second: controller_metrics.bandwidth_estimate,
+                retained_max_bytes_per_second: bbr.max_bw.max(0.0).round() as u64,
+                pacing_bytes_per_second: controller_metrics.pacing_rate.unwrap_or(0),
+                configured_loss_percent: loss_percent,
+                lost_packets: lost.len() as u32,
+                resolved_packets: (acked.len() + lost.len()) as u32,
+                delivered_mbps: ((acked.len() as u64 * MSS * 8 * 1_000_000_000
+                    / RTT_NS
+                    / 1_000_000)
+                    .min(u64::from(u16::MAX))) as u16,
+                selected_path,
+                state: bbr.state,
+                round_count: bbr.round_count,
+                budget_exhaustions: bbr.loss_budget_exhaustions,
+            });
+        }
+        trace
+    }
+
+    #[test]
+    fn qos_trace_discriminates_startup_escape_from_live_ranking_feedback() {
+        let native = run_qos_discriminator(CapacityRankingArm::NativeBacklogged);
+        let live = run_qos_discriminator(CapacityRankingArm::LiveBounded);
+        let shadow = run_qos_discriminator(CapacityRankingArm::ShadowOnly);
+
+        for (name, points) in [("native", &native), ("live", &live), ("shadow", &shadow)] {
+            eprintln!("{name}: {} per-RTT records", points.len());
+            assert_eq!(points.len(), 140);
+            assert_eq!(
+                points
+                    .iter()
+                    .map(|point| u64::from(point.configured_loss_percent))
+                    .sum::<u64>(),
+                840,
+                "the 3--10% trace must retain an exact 6% configured mean",
+            );
+            assert_eq!(
+                points
+                    .iter()
+                    .map(|point| point.configured_loss_percent)
+                    .min(),
+                Some(3)
+            );
+            assert_eq!(
+                points
+                    .iter()
+                    .map(|point| point.configured_loss_percent)
+                    .max(),
+                Some(10)
+            );
+        }
+
+        // The underfed live arm never exhausts its authorized 3--10% erasure
+        // budget. This keeps the trace focused on the allocator feedback loop,
+        // independently of Startup's raw-authority rule.
+        assert!(
+            live.iter().all(|point| point.budget_exhaustions == 0),
+            "the underfed live arm unexpectedly exhausted its authorized erasure budget",
+        );
+
+        // The native always-backlogged control must traverse the QoS step without losing its one
+        // controller lifetime, and must expose at least one cwnd-limited ProbeUp recovery round.
+        assert!(native.iter().all(|point| !point.app_limited));
+        let recovery_probe = native
+            .iter()
+            .find(|point| {
+                point.rtt >= 70
+                    && point.cwnd_limited
+                    && point.state == BbrState::ProbeBw(ProbeBwSubstate::Up)
+            })
+            .expect("native controller never entered a cwnd-limited ProbeUp after recovery");
+        let recovered = native
+            .iter()
+            .skip_while(|point| point.rtt < recovery_probe.rtt)
+            .find(|point| point.flight_bytes >= 6_250_000)
+            .expect("native controller never rebuilt one 500 Mbit/s by 100ms BDP of flight");
+        let recovery_start_rtt = native
+            .windows(2)
+            .find(|points| points[0].service_mbps < points[1].service_mbps)
+            .map(|points| points[1].rtt)
+            .expect("QoS trace never restored service");
+        let probe_end = native
+            .iter()
+            .skip_while(|point| point.rtt <= recovery_probe.rtt)
+            .find(|point| point.state != BbrState::ProbeBw(ProbeBwSubstate::Up))
+            .expect("recovery ProbeUp never reached an exit/abort observation");
+        let recovery_delta = recovered.rtt.saturating_sub(recovery_probe.rtt);
+        let recovery_sent_bytes = native
+            .iter()
+            .filter(|point| (recovery_start_rtt..=recovered.rtt).contains(&point.rtt))
+            .map(|point| point.sent_quic_bytes)
+            .sum::<u64>();
+        let observation_sent_bytes = native
+            .iter()
+            .filter(|point| (recovery_start_rtt..=recovery_probe.rtt).contains(&point.rtt))
+            .map(|point| point.sent_quic_bytes)
+            .sum::<u64>();
+        let achieved_handoff = native
+            .iter()
+            .filter(|point| point.rtt >= recovery_start_rtt)
+            .find(|point| point.delivered_mbps > 100)
+            .expect("native delivery never exceeded the 100 Mbit/s alternate");
+        let handoff_sent_bytes = native
+            .iter()
+            .filter(|point| (recovery_start_rtt..=achieved_handoff.rtt).contains(&point.rtt))
+            .map(|point| point.sent_quic_bytes)
+            .sum::<u64>();
+        assert!(
+            (12..=16).contains(&recovery_delta),
+            "ProbeUp recovery must follow its exponential cwnd-limited slope, not an invented slow linear ramp: {recovery_delta} RTTs",
+        );
+        let low_bounded = native
+            .iter()
+            .filter(|point| (40..84).contains(&point.rtt))
+            .filter_map(|point| point.exported_bytes_per_second)
+            .min()
+            .expect("low-service bounded estimate");
+        assert!(
+            recovery_probe.retained_max_bytes_per_second > low_bounded.saturating_mul(10),
+            "the retained maximum did not separate from the current low-service bound",
+        );
+        assert!(
+            recovery_probe.flight_bytes < 6_250_000
+                && recovery_probe.exported_bytes_per_second
+                    == Some(recovery_probe.retained_max_bytes_per_second),
+            "the ranking scalar did not expose the retained-max-versus-recovery-opportunity ambiguity",
+        );
+        let probe_timeline = native
+            .iter()
+            .filter(|point| (recovery_probe.rtt..=probe_end.rtt).contains(&point.rtt))
+            .map(|point| {
+                (
+                    point.rtt,
+                    point.state,
+                    point.app_limited,
+                    point.cwnd_limited,
+                    point.cwnd,
+                    point.flight_bytes,
+                    point.exported_bytes_per_second,
+                    point.pacing_bytes_per_second,
+                    point.configured_loss_percent,
+                    point.selected_path,
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "native recovery: low bounded={}B/s, retained={}B/s, ProbeUp RTT {}, sent {}B through ProbeUp entry, achieved >100Mbps at RTT {} after {}B sent, one-BDP RTT {}, delta {} RTTs, sent {}B through one-BDP recovery, exit/abort RTT {}, timeline={probe_timeline:?}",
+            low_bounded,
+            recovery_probe.retained_max_bytes_per_second,
+            recovery_probe.rtt,
+            observation_sent_bytes,
+            achieved_handoff.rtt,
+            handoff_sent_bytes,
+            recovered.rtt,
+            recovery_delta,
+            recovery_sent_bytes,
+            probe_end.rtt,
+        );
+
+        // Y is causal in this bounded surrogate: feeding a cold, lower-bound controller scalar back
+        // into ranking removes QUIC work, while observing the same scalar in shadow leaves Quinn fed.
+        // The companion test proves the real scheduler's ranking direction, not this byte allocation.
+        assert!(live
+            .iter()
+            .skip(1)
+            .any(|point| point.selected_path == "tcp" && point.app_limited));
+        let live_late_peak = live
+            .iter()
+            .filter(|point| point.rtt >= 120)
+            .filter_map(|point| point.exported_bytes_per_second)
+            .max()
+            .unwrap_or(0);
+        let shadow_late_peak = shadow
+            .iter()
+            .filter(|point| point.rtt >= 120)
+            .filter_map(|point| point.exported_bytes_per_second)
+            .max()
+            .unwrap_or(0);
+        let first_live_tcp = live
+            .iter()
+            .find(|point| point.selected_path == "tcp")
+            .map(|point| point.rtt);
+        eprintln!(
+            "surrogate allocation separation: first live TCP RTT={first_live_tcp:?}, live late peak={live_late_peak}B/s, shadow late peak={shadow_late_peak}B/s"
+        );
+        assert!(
+            shadow_late_peak > live_late_peak.saturating_mul(4),
+            "shadow-fed Quinn did not separate from circular live underfeeding: live={live_late_peak}, shadow={shadow_late_peak}",
         );
     }
 }

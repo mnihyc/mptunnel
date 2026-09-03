@@ -9,6 +9,31 @@ use crate::protocol::UnderlayProtocol;
 use std::time::{Duration, Instant};
 
 #[test]
+fn request_product_rate_epoch_has_one_frozen_half_open_authority_interval() {
+    let observed_at = Instant::now();
+    let horizon = Duration::from_millis(750);
+    let epoch = RequestProductRateEpoch::new(500_000_000.0, 10, observed_at, horizon)
+        .expect("valid Product epoch");
+
+    assert_eq!(epoch.observed_at, observed_at);
+    assert_eq!(epoch.expires_at, observed_at + horizon);
+    assert_eq!(epoch.fresh_rate_at(observed_at), Some(500_000_000.0));
+    assert_eq!(
+        epoch.fresh_rate_at(epoch.expires_at - Duration::from_nanos(1)),
+        Some(500_000_000.0)
+    );
+    assert_eq!(epoch.fresh_rate_at(epoch.expires_at), None);
+    assert_eq!(
+        RequestProductRateEpoch::new(f64::NAN, 1, observed_at, horizon),
+        None
+    );
+    assert_eq!(
+        RequestProductRateEpoch::new(0.0, 1, observed_at, horizon),
+        None
+    );
+}
+
+#[test]
 fn request_rate_coverage_uses_transport_evidence_requirements() {
     let mux_limits = MuxLimits::default();
     let tcp_measurement_target = reliable_request_ack_clock_measurement_target_bytes(mux_limits);

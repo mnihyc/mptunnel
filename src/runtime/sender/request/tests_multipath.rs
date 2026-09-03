@@ -1,12 +1,22 @@
 use super::super::test_support::{
-    client_test_context_with_paths, consume_client_path_proof_for_test, opened_test_relay_stream,
-    opened_test_relay_stream_with_underlay, seed_client_bulk_evidence_for_test,
+    client_test_context_with_paths, consume_client_path_proof_for_test,
+    mark_client_path_proof_fresh_for_test, opened_test_relay_stream,
+    opened_test_relay_stream_with_underlay, security, seed_client_bulk_evidence_for_test,
 };
 use super::*;
-use crate::model::capacity::{PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS};
+use crate::config::ResourceLimits;
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
+    TcpCapacityProofCandidate, adaptive_reliable_relay_reinjection_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_bulk_product_windows,
+    reliable_path_startup_sample_limit_bytes, reliable_product_feedback_window_bytes,
+    reliable_product_recovery_window_bytes,
+};
 use crate::model::path::{PathPolicy, next_carrier_path_instance_id};
 use crate::model::requalification::StreamPathQualification;
-use crate::model::request_evidence::RequestPerFlowRateModel;
+use crate::model::request_capacity::request_tcp_capacity_candidate_can_start_receipt;
+use crate::model::request_evidence::RequestProductRateEpoch;
+use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{PathId, PathUsage};
@@ -15,7 +25,9 @@ use crate::runtime::path::commands::{
     reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
 use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
+use crate::runtime::sender::queue::ReliableRelayQueuedWorkKind;
 use crate::runtime::stream::ReliableRelayRemoteSet;
+use crate::transport::PathSpec;
 use bytes::Bytes;
 
 fn data_frame(stream_id: StreamId, offset: u64, payload_bytes: usize) -> Frame {
@@ -163,7 +175,14 @@ async fn ordinary_data_does_not_borrow_a_successor_carriers_health() {
     assert!(predecessor_observation.shared_snapshot.is_none());
     assert!(!predecessor_observation.can_enqueue_stream_lane);
     assert!(matches!(
-        choose_observed_ordinary_data_path(&observation, TrafficClass::Latency, 4096, 0, &[]),
+        choose_observed_ordinary_data_path(
+            &observation,
+            TrafficClass::Latency,
+            4096,
+            0,
+            &[],
+            None,
+        ),
         ObservedOrdinaryPathChoice::Selected(instance) if instance == alternate
     ));
 }
@@ -196,7 +215,14 @@ async fn exact_current_unmeasured_attachment_keeps_startup_admission() {
     assert!(current_observation.can_enqueue_stream_lane);
     assert!(!current_observation.has_bulk_model_evidence);
     assert!(matches!(
-        choose_observed_ordinary_data_path(&observation, TrafficClass::Latency, 4096, 0, &[]),
+        choose_observed_ordinary_data_path(
+            &observation,
+            TrafficClass::Latency,
+            4096,
+            0,
+            &[],
+            None,
+        ),
         ObservedOrdinaryPathChoice::Selected(instance) if instance == current
     ));
 }
@@ -227,6 +253,14 @@ async fn sole_authoritative_gap_owner_keeps_its_proven_product_evidence() {
     let next = data_frame(stream_id, prior_bytes as u64, 4096);
     context.record_relay_path_send(owner, prior_bytes);
     let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .path_states
+        .get_mut(owner)
+        .set_product_rate_epoch(RequestProductRateEpoch::for_test(
+            qualified_sample.rate_bps(),
+            RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        ));
     controller.record_original_frame_for_test(owner, &prior);
 
     let plan = controller
@@ -237,9 +271,1109 @@ async fn sole_authoritative_gap_owner_keeps_its_proven_product_evidence() {
             TrafficClass::Throughput,
             RelaySendCause::StreamData,
             &[],
-            ReliableDataAckFrontierState::AuthoritativeGap,
+            ReliableDataAckFrontierState::Live,
         )
         .expect("measured sole owner remains inside ordinary Product admission");
+    assert_eq!(plan.target().1, owner);
+}
+
+fn fill_exact_original_product_debt(
+    controller: &mut RequestMultipathController,
+    instance: RelayPathInstance,
+    stream_id: StreamId,
+    bytes: usize,
+) {
+    let end = fill_exact_original_product_debt_at(controller, instance, stream_id, 0, bytes);
+    assert_eq!(end, bytes as u64);
+}
+
+fn fill_exact_original_product_debt_at(
+    controller: &mut RequestMultipathController,
+    instance: RelayPathInstance,
+    stream_id: StreamId,
+    mut offset: u64,
+    bytes: usize,
+) -> u64 {
+    let end = offset.saturating_add(bytes as u64);
+    while offset < end {
+        let payload_bytes = usize::try_from((end - offset).min(64 * 1024)).unwrap();
+        controller.record_original_frame_for_test(
+            instance,
+            &data_frame(stream_id, offset, payload_bytes),
+        );
+        offset += payload_bytes as u64;
+    }
+    offset
+}
+
+fn original_data_apply_plan(
+    remotes: &ReliableRelayRemoteSet,
+    target: RelayPathInstance,
+) -> RequestMultipathPlan {
+    RequestMultipathPlan {
+        target: RequestMultipathTarget {
+            membership_generation: remotes.membership_generation(),
+            instance: target,
+        },
+        product_mutation: RequestProductSendMutation::Data,
+        product_limit_bytes: None,
+        request_load_expectation: None,
+        request_proof_expectation: None,
+        path_eligibility_expectation: SmallVec::new(),
+        acquisition_attempt: None,
+        acquisition_guarded_quantum: false,
+    }
+}
+
+fn bounded_product_test_context(paths: &[&str]) -> ClientPathContext {
+    let product_window = 1024 * 1024;
+    let limits = ResourceLimits {
+        max_stream_window_bytes: product_window as u64,
+        max_repair_bytes: product_window,
+        max_reorder_bytes: product_window,
+        max_path_flight_bytes: product_window,
+        ..ResourceLimits::default()
+    };
+    ClientPathContext::new(
+        paths
+            .iter()
+            .map(|path| path.parse::<PathSpec>().expect("path"))
+            .collect(),
+        security(),
+        limits,
+    )
+    .expect("bounded Product context")
+}
+
+fn bounded_mixed_remote_set(
+    stream_id: StreamId,
+) -> (
+    ClientPathContext,
+    ReliableRelayRemoteSet,
+    RelayPathInstance,
+    RelayPathInstance,
+    crate::runtime::path::commands::ReliablePathCommandSender,
+    crate::runtime::path::commands::ReliablePathCommandReceivers,
+    crate::runtime::path::commands::ReliablePathCommandReceivers,
+) {
+    let context = bounded_product_test_context(&[
+        "tcp://127.0.0.1:10370?initial-srtt-s=0.02",
+        "quic://127.0.0.1:10371?initial-srtt-s=0.02",
+    ]);
+    let (tcp_commands, tcp_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
+    let tcp = remotes.paths[0].instance();
+    let (udp_commands, udp_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        udp_commands.clone(),
+    ));
+    let udp = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("UDP attachment")
+        .instance();
+    context.install_relay_path_instance_for_test(tcp);
+    context.install_relay_path_instance_for_test(udp);
+    (
+        context,
+        remotes,
+        tcp,
+        udp,
+        udp_commands,
+        tcp_receivers,
+        udp_receivers,
+    )
+}
+
+#[tokio::test]
+async fn request_product_acquisition_does_not_preempt_ordinary_completion_order() {
+    let stream_id = StreamId(377);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10375?initial-srtt-s=0.02&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10376?initial-srtt-s=0.5&initial-rate-mbps=1",
+        "tcp://127.0.0.1:10377?initial-srtt-s=0.005&initial-rate-mbps=1000",
+    ]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+
+    let (attachment_first_commands, mut attachment_first_receivers) =
+        reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(
+        stream_id,
+        1,
+        attachment_first_commands.clone(),
+    ));
+    let attachment_first = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("first additional attachment")
+        .instance();
+
+    let (attachment_second_commands, mut attachment_second_receivers) =
+        reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(
+        stream_id,
+        2,
+        attachment_second_commands,
+    ));
+    let attachment_second = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("second additional attachment")
+        .instance();
+
+    for receivers in [
+        &mut owner_receivers,
+        &mut attachment_first_receivers,
+        &mut attachment_second_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, attachment_first, attachment_second] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+
+    let mut controller = RequestMultipathController::new(stream_id);
+    for instance in [owner, attachment_first, attachment_second] {
+        controller.request.path_states.get_mut(instance);
+    }
+    controller.record_original_frame_for_test(owner, &data_frame(stream_id, 0, 4096));
+    let pending = data_frame(stream_id, 4096, 4096);
+    assert!(attachment_first_commands.can_enqueue_frame_now(&pending, TrafficClass::Throughput));
+
+    let observation = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&pending),
+        TrafficClass::Throughput,
+        4096,
+        true,
+        &controller.request.requalification,
+    );
+    let ordinary = choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+        observation: &observation,
+        lane: TrafficClass::Throughput,
+        frame: &pending,
+        cursor: 0,
+        avoid_instances: &[],
+        path_flights: Some(&controller.request.flights),
+        request_state: Some(RequestSchedulingState {
+            operation: controller.request.ack_clock_operation,
+            path_states: &controller.request.path_states,
+            flights: Some(&controller.request.flights),
+        }),
+        frontier_state: ReliableDataAckFrontierState::Live,
+    });
+    let BulkRelayPathChoice::Selected(ordinary_target) = ordinary else {
+        panic!("ordinary completion policy must select a live Product output: {ordinary:?}");
+    };
+    assert_ne!(
+        ordinary_target, attachment_first,
+        "the fixture must make attachment order disagree with ordinary completion order",
+    );
+
+    let planned = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &pending,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("ordinary Product placement remains schedulable");
+    assert_eq!(
+        planned.target().1,
+        ordinary_target,
+        "an acquisition cursor may bound eligibility, but cannot preempt ordinary ECF plus owner hysteresis",
+    );
+}
+
+#[tokio::test]
+async fn request_acquisition_writer_failure_skips_only_a_and_commits_same_tier_b() {
+    let stream_id = StreamId(378);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10378?initial-srtt-s=0.02",
+        "tcp://127.0.0.1:10379?initial-srtt-s=0.02",
+        "tcp://127.0.0.1:10380?initial-srtt-s=0.02",
+    ]);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+
+    let (a_commands, mut a_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, a_commands.clone()));
+    let a = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("same-tier candidate A")
+        .instance();
+
+    let (b_commands, mut b_receivers) = reliable_path_command_channels(1);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, b_commands.clone()));
+    let b = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("same-tier candidate B")
+        .instance();
+
+    for receivers in [&mut owner_receivers, &mut a_receivers, &mut b_receivers] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, a, b] {
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(owner, &data_frame(stream_id, 0, 4096));
+    let pending = data_frame(stream_id, 4096, 4096);
+
+    let plan_a = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &pending,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("cursor selects the first legal additional output");
+    assert_eq!(plan_a.target().1, a);
+    let apply_a = controller
+        .validate_request_acquisition_attempt(
+            &context,
+            &remotes,
+            &plan_a,
+            &pending,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            &[],
+        )
+        .expect("A token is current before writer reservation")
+        .expect("fresh Product acquisition has an apply snapshot");
+
+    // Another producer fills A's shared carrier writer after observation. The
+    // real reservation now fails, but this must invalidate only exact A; it
+    // cannot erase the already-bounded opportunity to try independent B.
+    a_commands
+        .try_enqueue_admitted_frame(
+            data_frame(StreamId(1378), 0, 4096),
+            TrafficClass::Throughput,
+        )
+        .expect("concurrent carrier work fills A's one-slot writer");
+    assert!(!a_commands.can_enqueue_frame_now(&pending, TrafficClass::Throughput));
+    assert!(matches!(
+        a_commands.try_reserve_admitted_frame(pending.clone(), TrafficClass::Throughput),
+        Err(crate::runtime::RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(
+        controller.fail_request_acquisition_attempt(&plan_a, Some(&apply_a)),
+        "recoverable A failure keeps the finite dispatch open for its sibling",
+    );
+
+    let plan_b = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &pending,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("same dispatch advances past failed A");
+    assert_eq!(plan_b.target().1, b);
+    let apply_b = controller
+        .validate_request_acquisition_attempt(
+            &context,
+            &remotes,
+            &plan_b,
+            &pending,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            &[],
+        )
+        .expect("A's changed writer legality is irrelevant to exact B authority")
+        .expect("B retains the dispatch's Product acquisition snapshot");
+    let command_b = b_commands
+        .try_reserve_admitted_frame(pending.clone(), TrafficClass::Throughput)
+        .expect("independent B writer remains available");
+    let load_claim = plan_b
+        .load_expectation()
+        .map(|(key, active, latency_sensitive)| {
+            assert_eq!(key, b.key);
+            context
+                .try_reserve_relay_path_load_if_unchanged(
+                    b,
+                    TrafficClass::Throughput,
+                    active,
+                    latency_sensitive,
+                )
+                .expect("B's observed load authority remains current")
+        });
+    let authority = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan_b,
+            &pending,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            load_claim.is_some(),
+        )
+        .expect("exact B Product authority is still current");
+    assert!(authority.has_headroom());
+
+    controller
+        .record_emitted_frame(&context, b, &pending, RelaySendCause::StreamData)
+        .expect("B receipt and flight commit before carrier publication");
+    controller.commit_request_acquisition_attempt(&plan_b, Some(&apply_b));
+    let b_position = remotes
+        .paths
+        .iter()
+        .position(|path| path.instance() == b)
+        .expect("B remains attached");
+    if let Some(claim) = load_claim {
+        remotes.paths[b_position].load_lease = Some(claim);
+    }
+    controller.commit_enqueued_request_product_send(
+        &context,
+        &pending,
+        &plan_b,
+        b_position,
+        remotes.paths.len(),
+    );
+    command_b.commit();
+
+    assert_eq!(
+        controller.request.flights.original_data_in_flight_bytes(a),
+        0
+    );
+    assert_eq!(
+        controller.request.flights.original_data_in_flight_bytes(b),
+        4096,
+        "only B owns the committed pending Product range",
+    );
+    let published = loop {
+        match try_recv_reliable_path_command(&mut b_receivers) {
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. })) => continue,
+            command => break command,
+        }
+    };
+    match published {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: emitted_stream,
+            offset: 4096,
+            payload,
+        })) => {
+            assert_eq!(emitted_stream, stream_id);
+            assert_eq!(payload.len(), 4096);
+        }
+        Some(ReliablePathCommand::SendFrame(frame)) => {
+            panic!("B published a non-Product frame: {frame:?}")
+        }
+        Some(_) => panic!("B published a non-frame command"),
+        None => panic!("B did not publish its committed Product frame"),
+    }
+}
+
+#[tokio::test]
+async fn request_apply_shared_stream_window_blocks_before_each_output_product_window() {
+    let stream_id = StreamId(370);
+    let (context, remotes, target, sibling, target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    let windows = reliable_bulk_product_windows(context.mux_limits);
+    assert_eq!(
+        windows.stream_resource_limit_bytes, windows.per_output_product_limit_bytes,
+        "the fixture isolates shared W with two half-full outputs",
+    );
+    let half = usize::try_from(windows.stream_resource_limit_bytes / 2).unwrap();
+    let mut controller = RequestMultipathController::new(stream_id);
+    let next_offset =
+        fill_exact_original_product_debt_at(&mut controller, target, stream_id, 0, half);
+    let next_offset =
+        fill_exact_original_product_debt_at(&mut controller, sibling, stream_id, next_offset, half);
+    let frame = data_frame(stream_id, next_offset, 4096);
+    let plan = original_data_apply_plan(&remotes, target);
+
+    let reservation = target_commands
+        .try_reserve_admitted_frame(frame.clone(), TrafficClass::Throughput)
+        .expect("the actual native writer reservation has headroom");
+    let authority = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &frame,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("exact target remains structurally eligible");
+    assert_eq!(
+        authority.position,
+        BulkCandidatePosition::ContiguousFrontier
+    );
+    assert_eq!(
+        authority.stream_outstanding_bytes,
+        authority.stream_limit_bytes,
+    );
+    assert!(authority.output_outstanding_bytes < authority.output.assignment_limit_bytes);
+    assert!(
+        !authority.has_headroom(),
+        "O_stream == W must fail even after the native reservation while O_i < P",
+    );
+    drop(reservation);
+}
+
+#[tokio::test]
+async fn request_apply_additional_output_uses_e_until_exact_qualification() {
+    let stream_id = StreamId(371);
+    let (context, remotes, owner, target, _target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    let mut controller = RequestMultipathController::new(stream_id);
+    let owner_bytes = 4096;
+    let target_entry =
+        fill_exact_original_product_debt_at(&mut controller, owner, stream_id, 0, owner_bytes);
+    let plan = original_data_apply_plan(&remotes, target);
+    let preview = data_frame(stream_id, target_entry, 4096);
+    let initial = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &preview,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("unqualified additional output has bounded acquisition authority");
+    assert_eq!(initial.position, BulkCandidatePosition::AdditionalPath);
+    assert!(initial.output.exploration_limit_bytes < initial.output.product_limit_bytes);
+    assert_eq!(
+        initial.output.assignment_limit_bytes,
+        initial.output.exploration_limit_bytes,
+    );
+
+    let exploration = usize::try_from(initial.output.exploration_limit_bytes).unwrap();
+    let next_offset = fill_exact_original_product_debt_at(
+        &mut controller,
+        target,
+        stream_id,
+        target_entry,
+        exploration,
+    );
+    let next = data_frame(stream_id, next_offset, 4096);
+    let exhausted = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &next,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("additional target remains structurally eligible");
+    assert!(!exhausted.has_headroom(), "O_i == E must fail closed");
+
+    seed_client_bulk_evidence_for_test(&context, target);
+    let sample = PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20))
+        .expect("qualified Product sample");
+    for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
+        context.mark_relay_path_rate_sample_for_test(target.key, sample);
+    }
+    let qualification_floor = reliable_path_startup_sample_limit_bytes(context.mux_limits);
+    assert!(qualification_floor < exploration as u64);
+    let qualification = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: target_entry,
+            end: target_entry + qualification_floor,
+        }],
+        Instant::now(),
+    );
+    assert_eq!(qualification.as_slice(), &[target]);
+    let target_state = controller.request.path_states.get_mut(target);
+    assert!(target_state.product_assignment_qualified());
+    target_state.mark_capacity_admitted();
+    target_state.set_product_rate_epoch(RequestProductRateEpoch::for_test(
+        sample.rate_bps(),
+        RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+    ));
+    let qualified = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &next,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("qualified additional target remains eligible");
+    assert_eq!(qualified.position, BulkCandidatePosition::AdditionalPath);
+    assert_eq!(
+        qualified.output.assignment_limit_bytes,
+        qualified.output.product_limit_bytes,
+    );
+    assert!(
+        qualified.has_headroom(),
+        "exact qualification expands E to P"
+    );
+}
+
+#[tokio::test]
+async fn request_apply_one_ack_and_sibling_product_evidence_do_not_qualify_additional_output() {
+    let stream_id = StreamId(372);
+    let (context, remotes, owner, target, _target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    let mut controller = RequestMultipathController::new(stream_id);
+    let owner_end = fill_exact_original_product_debt_at(&mut controller, owner, stream_id, 0, 4096);
+    let plan = original_data_apply_plan(&remotes, target);
+    let preview = data_frame(stream_id, owner_end, 4096);
+    let exploration = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &preview,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("bounded additional authority")
+        .output
+        .exploration_limit_bytes;
+    let next_offset = fill_exact_original_product_debt_at(
+        &mut controller,
+        target,
+        stream_id,
+        owner_end,
+        usize::try_from(exploration).unwrap(),
+    );
+    let one_ack = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: owner_end,
+            end: owner_end + 1,
+        }],
+        Instant::now(),
+    );
+    assert_eq!(one_ack.as_slice(), &[target]);
+    let target_state = controller
+        .request
+        .path_states
+        .get(target)
+        .expect("tagged target state");
+    assert!(target_state.product_path_use_proven());
+    assert!(!target_state.product_assignment_qualified());
+    let sibling_sample = PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20))
+        .expect("sibling Product sample");
+    for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
+        context.mark_relay_path_rate_sample_for_test(target.key, sibling_sample);
+    }
+    assert!(
+        context.relay_path_instance_has_bulk_model_evidence(target),
+        "the shared carrier record contains mature sibling Product evidence",
+    );
+
+    let next = data_frame(stream_id, next_offset, 4096);
+    let authority = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &next,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("additional target remains eligible");
+    assert_eq!(authority.position, BulkCandidatePosition::AdditionalPath);
+    assert_eq!(authority.output.assignment_limit_bytes, exploration);
+    assert!(
+        !authority.has_headroom(),
+        "one ACK bit and another stream's shared Product epoch cannot expand E to P",
+    );
+}
+
+#[tokio::test]
+async fn request_apply_recomputes_target_after_unrelated_sibling_retirement() {
+    let stream_id = StreamId(373);
+    let (context, mut remotes, sibling, target, target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    let controller = RequestMultipathController::new(stream_id);
+    let frame = data_frame(stream_id, 0, 4096);
+    let observation = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&frame),
+        TrafficClass::Throughput,
+        4096,
+        true,
+        &controller.request.requalification,
+    );
+    let plan = original_data_apply_plan(&remotes, target)
+        .with_eligibility_expectation(
+            &observation,
+            TrafficClass::Throughput,
+            Some(RequestSchedulingState {
+                operation: controller.request.ack_clock_operation,
+                path_states: &controller.request.path_states,
+                flights: Some(&controller.request.flights),
+            }),
+        )
+        .expect("both initial outputs are regular");
+    let reservation = target_commands
+        .try_reserve_admitted_frame(frame.clone(), TrafficClass::Throughput)
+        .expect("target writer reservation succeeds before sibling retirement");
+
+    assert_eq!(sibling.key.underlay, UnderlayProtocol::Tcp);
+    context.set_tcp_endpoint_control(sibling.key.index, ClientTcpEndpointControlState::Failed);
+    assert!(
+        !plan.target_retains_exact_eligibility(&context, TrafficClass::Throughput),
+        "the former whole-vector fence rejects unrelated retirement",
+    );
+    let prior_generation = plan.target().0;
+    drop(
+        remotes
+            .remove_path_instance(sibling)
+            .expect("retire only the unrelated sibling attachment"),
+    );
+    assert_ne!(remotes.membership_generation(), prior_generation);
+    assert!(
+        plan.target_position_for_apply(&remotes, TrafficClass::Throughput)
+            .is_some(),
+        "bulk apply follows exact target identity across unrelated membership retirement",
+    );
+    let authority = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &frame,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("fresh structural recheck retains the exact healthy target");
+    assert_eq!(authority.position, BulkCandidatePosition::FirstPath);
+    assert!(authority.has_headroom());
+    drop(reservation);
+}
+
+#[tokio::test]
+async fn request_bulk_apply_rejects_backup_displaced_by_fresh_regular_sibling() {
+    let stream_id = StreamId(376);
+    let (context, remotes, sibling, target, target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    for instance in [sibling, target] {
+        assert!(context.update_relay_path_usage_for_test(instance, 1, PathUsage::Backup));
+    }
+    let controller = RequestMultipathController::new(stream_id);
+    let frame = data_frame(stream_id, 0, 4096);
+    let plan = original_data_apply_plan(&remotes, target);
+    let reservation = target_commands
+        .try_reserve_admitted_frame(frame.clone(), TrafficClass::Throughput)
+        .expect("backup target writer reservation succeeds");
+
+    assert!(context.update_relay_path_usage_for_test(sibling, 2, PathUsage::Available));
+    assert!(
+        controller
+            .bulk_original_data_apply_authority(
+                &context,
+                &remotes,
+                &plan,
+                &frame,
+                TrafficClass::Throughput,
+                ReliableDataAckFrontierState::Live,
+                false,
+            )
+            .is_none(),
+        "a fresh regular tier must displace the planned backup before publication",
+    );
+    drop(reservation);
+}
+
+#[tokio::test]
+async fn request_apply_sole_current_tier_remains_additional_behind_stale_owner() {
+    let stream_id = StreamId(377);
+    let (context, remotes, owner, target, target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    let mut controller = RequestMultipathController::new(stream_id);
+    let next_offset =
+        fill_exact_original_product_debt_at(&mut controller, owner, stream_id, 0, 4096);
+    assert!(controller.mark_path_stale(owner));
+
+    let frame = data_frame(stream_id, next_offset, 4096);
+    let plan = original_data_apply_plan(&remotes, target);
+    let reservation = target_commands
+        .try_reserve_admitted_frame(frame.clone(), TrafficClass::Throughput)
+        .expect("the sole current-tier writer accepts the native reservation");
+    let authority = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &frame,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("the sole current-tier target remains structurally eligible");
+
+    assert_eq!(authority.position, BulkCandidatePosition::AdditionalPath);
+    assert_eq!(
+        authority.output.assignment_limit_bytes, authority.output.exploration_limit_bytes,
+        "a different exact stale owner keeps the sole current-tier target inside E",
+    );
+    assert!(
+        authority.output.exploration_limit_bytes < authority.output.product_limit_bytes,
+        "only exact qualification may expand an additional target from E to P",
+    );
+    drop(reservation);
+}
+
+#[tokio::test]
+async fn request_apply_same_key_successor_does_not_inherit_contiguous_frontier() {
+    let stream_id = StreamId(374);
+    let (context, remotes, target, _sibling, _target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    let predecessor = RelayPathInstance {
+        key: target.key,
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: target.attachment_id.wrapping_add(100),
+    };
+    assert_ne!(predecessor, target);
+    let mut controller = RequestMultipathController::new(stream_id);
+    let target_entry =
+        fill_exact_original_product_debt_at(&mut controller, predecessor, stream_id, 0, 4096);
+    let plan = original_data_apply_plan(&remotes, target);
+    let preview = data_frame(stream_id, target_entry, 4096);
+    let exploration = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &preview,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("same-key successor is eligible only as an additional output");
+    assert_eq!(exploration.position, BulkCandidatePosition::AdditionalPath);
+    let next_offset = fill_exact_original_product_debt_at(
+        &mut controller,
+        target,
+        stream_id,
+        target_entry,
+        usize::try_from(exploration.output.exploration_limit_bytes).unwrap(),
+    );
+    let next = data_frame(stream_id, next_offset, 4096);
+    let exhausted = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &next,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("same-key successor remains structurally eligible");
+    assert_eq!(exhausted.position, BulkCandidatePosition::AdditionalPath);
+    assert!(
+        !exhausted.has_headroom(),
+        "a reconnect cannot inherit the old incarnation's P-sized contiguous authority",
+    );
+}
+
+#[tokio::test]
+async fn request_apply_first_assignment_becomes_exact_contiguous_frontier() {
+    let stream_id = StreamId(375);
+    let (context, remotes, target, _sibling, _target_commands, _tcp_receivers, _udp_receivers) =
+        bounded_mixed_remote_set(stream_id);
+    let mut controller = RequestMultipathController::new(stream_id);
+    let plan = original_data_apply_plan(&remotes, target);
+    let first = data_frame(stream_id, 0, 4096);
+    let first_authority = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &first,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("empty stream has one leading assignment authority");
+    assert_eq!(first_authority.position, BulkCandidatePosition::FirstPath);
+    assert_eq!(
+        first_authority.output.assignment_limit_bytes,
+        first_authority.output.product_limit_bytes,
+    );
+    assert!(first_authority.has_headroom());
+
+    controller.record_original_frame_for_test(target, &first);
+    let next = data_frame(stream_id, 4096, 4096);
+    let contiguous = controller
+        .bulk_original_data_apply_authority(
+            &context,
+            &remotes,
+            &plan,
+            &next,
+            TrafficClass::Throughput,
+            ReliableDataAckFrontierState::Live,
+            false,
+        )
+        .expect("the exact first owner becomes the contiguous frontier");
+    assert_eq!(
+        contiguous.position,
+        BulkCandidatePosition::ContiguousFrontier
+    );
+    assert_eq!(
+        contiguous.output.assignment_limit_bytes,
+        contiguous.output.product_limit_bytes,
+    );
+    assert!(contiguous.has_headroom());
+}
+
+#[tokio::test]
+async fn active_ack_clock_original_data_rechecks_downshifted_product_window_and_ack_reopens() {
+    let context = client_test_context_with_paths(&["tcp://127.0.0.1:10270?initial-srtt-s=0.1"]);
+    let stream_id = StreamId(184);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let remotes = ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 8);
+    let owner = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(owner);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.request.ack_clock_operation = Some(RequestAckClockOperation::Owner {
+        candidate: owner,
+        target_bytes: 16 * 1024 * 1024,
+    });
+    let preview = data_frame(stream_id, 0, 4096);
+    let initial_observation = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&preview),
+        TrafficClass::Throughput,
+        4096,
+        true,
+        &controller.request.requalification,
+    );
+    let downshifted_window = request_original_data_authority_snapshot(
+        &initial_observation,
+        owner,
+        None,
+        TrafficClass::Throughput,
+        Some(RequestSchedulingState {
+            operation: controller.request.ack_clock_operation,
+            path_states: &controller.request.path_states,
+            flights: Some(&controller.request.flights),
+        }),
+        false,
+    )
+    .expect("exact request authority")
+    .data_level_limit_bytes as usize;
+    fill_exact_original_product_debt(&mut controller, owner, stream_id, downshifted_window);
+    let observation = observe_request_relay_scheduling(
+        &context,
+        stream_id,
+        remotes.membership_generation(),
+        &remotes.paths,
+        Some(&preview),
+        TrafficClass::Throughput,
+        4096,
+        true,
+        &controller.request.requalification,
+    );
+    let plan = RequestMultipathPlan {
+        target: RequestMultipathTarget {
+            membership_generation: remotes.membership_generation(),
+            instance: owner,
+        },
+        product_mutation: RequestProductSendMutation::OriginalData {
+            candidate: owner,
+            target_bytes: 16 * 1024 * 1024,
+            payload_bytes: 4096,
+            entry_offset: downshifted_window as u64,
+            foreign_optional_ranges: 0,
+            foreign_optional_bytes: 0,
+        },
+        product_limit_bytes: None,
+        request_load_expectation: None,
+        request_proof_expectation: None,
+        path_eligibility_expectation: SmallVec::new(),
+        acquisition_attempt: None,
+        acquisition_guarded_quantum: false,
+    }
+    .with_eligibility_expectation(
+        &observation,
+        TrafficClass::Throughput,
+        Some(RequestSchedulingState {
+            operation: controller.request.ack_clock_operation,
+            path_states: &controller.request.path_states,
+            flights: Some(&controller.request.flights),
+        }),
+    )
+    .expect("measurement plan captures exact Product authority");
+    assert_eq!(plan.product_limit_bytes, Some(downshifted_window as u64));
+
+    assert!(
+        !controller.plan_retains_exact_product_headroom(&plan),
+        "an active ACK-clock owner is still OriginalData and cannot continue when exact O == downshifted P",
+    );
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 0,
+            end: 64 * 1024,
+        }],
+        Instant::now(),
+    );
+    assert!(
+        controller.plan_retains_exact_product_headroom(&plan),
+        "exact DataACK debt release reopens the same immutable Product envelope",
+    );
+}
+
+#[tokio::test]
+async fn sole_request_product_window_exhausts_until_exact_data_ack_reopens_it() {
+    let context = client_test_context_with_paths(&["quic://127.0.0.1:10267?initial-srtt-s=0.1"]);
+    let stream_id = StreamId(178);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
+        8,
+    );
+    let owner = remotes.paths[0].instance();
+    seed_client_bulk_evidence_for_test(&context, owner);
+    let product_window = reliable_product_feedback_window_bytes(
+        context.reliable_path_snapshot_for_instance(owner),
+        TrafficClass::Throughput,
+        context.mux_limits,
+    );
+    let mut controller = RequestMultipathController::new(stream_id);
+    fill_exact_original_product_debt(&mut controller, owner, stream_id, product_window);
+
+    let next = data_frame(stream_id, product_window as u64, 4096);
+    assert!(
+        matches!(
+            controller.plan_relay_path_send(
+                &context,
+                &mut remotes,
+                &next,
+                TrafficClass::Throughput,
+                RelaySendCause::StreamData,
+                &[],
+            ),
+            Err(RequestMultipathPlanError::ServiceBlocked)
+        ),
+        "a sole path cannot bypass exact per-stream Product debt O == P"
+    );
+
+    let ack = OffsetRange::new(0, product_window as u64).expect("complete Product ACK");
+    controller.apply_product_ack(&context, &remotes, &[ack], Instant::now());
+    let reopened = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &next,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("exact Data ACK releases Product authority");
+    assert_eq!(reopened.target().1, owner);
+}
+
+#[tokio::test]
+async fn latency_request_cannot_bypass_exact_product_window() {
+    let context = client_test_context_with_paths(&["quic://127.0.0.1:10268?initial-srtt-s=0.1"]);
+    let stream_id = StreamId(179);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
+        8,
+    );
+    let owner = remotes.paths[0].instance();
+    seed_client_bulk_evidence_for_test(&context, owner);
+    let product_window = reliable_product_feedback_window_bytes(
+        context.reliable_path_snapshot_for_instance(owner),
+        TrafficClass::Latency,
+        context.mux_limits,
+    );
+    let mut controller = RequestMultipathController::new(stream_id);
+    fill_exact_original_product_debt(&mut controller, owner, stream_id, product_window);
+
+    let next = data_frame(stream_id, product_window as u64, 4096);
+    assert!(
+        matches!(
+            controller.plan_relay_path_send(
+                &context,
+                &mut remotes,
+                &next,
+                TrafficClass::Latency,
+                RelaySendCause::StreamData,
+                &[],
+            ),
+            Err(RequestMultipathPlanError::ServiceBlocked)
+        ),
+        "latency priority may bypass ranking, never the Product O < P authority"
+    );
+}
+
+#[tokio::test]
+async fn request_product_debt_isolated_from_sibling_stream_carrier_aggregate() {
+    let context = client_test_context_with_paths(&["quic://127.0.0.1:10269?initial-srtt-s=0.1"]);
+    let stream_id = StreamId(180);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Udp, 0, commands),
+        8,
+    );
+    let owner = remotes.paths[0].instance();
+    seed_client_bulk_evidence_for_test(&context, owner);
+    let sibling_bytes = reliable_product_feedback_window_bytes(
+        context.reliable_path_snapshot_for_instance(owner),
+        TrafficClass::Throughput,
+        context.mux_limits,
+    );
+    context.record_relay_path_send(owner, sibling_bytes);
+
+    let mut controller = RequestMultipathController::new(stream_id);
+    let first = data_frame(stream_id, 0, 4096);
+    let plan = controller
+        .plan_relay_path_send(
+            &context,
+            &mut remotes,
+            &first,
+            TrafficClass::Throughput,
+            RelaySendCause::StreamData,
+            &[],
+        )
+        .expect("this stream has O=0 even when the carrier aggregate is full");
     assert_eq!(plan.target().1, owner);
 }
 
@@ -309,16 +1443,19 @@ async fn request_plan_revalidates_exact_health_after_same_key_replacement() {
             .reliable_path_snapshot_for_instance(successor)
             .is_some()
     );
-    let (key, active_flows, active_latency_flows) =
+    let (_key, active_flows, active_latency_flows) =
         plan.load_expectation().expect("unowned selected path load");
-    let stale_plan_load_claim = context
-        .try_reserve_relay_path_load_if_unchanged(
-            key,
-            TrafficClass::Latency,
-            active_flows,
-            active_latency_flows,
-        )
-        .expect("configured-slot load remains reservable across replacement");
+    assert!(
+        context
+            .try_reserve_relay_path_load_if_unchanged(
+                selected,
+                TrafficClass::Latency,
+                active_flows,
+                active_latency_flows,
+            )
+            .is_none(),
+        "a predecessor plan cannot reserve successor load"
+    );
     let reserved_predecessor_command = selected_commands
         .try_reserve_admitted_frame(frame.clone(), TrafficClass::Latency)
         .expect("the predecessor queue can still reserve before exact apply validation");
@@ -327,7 +1464,6 @@ async fn request_plan_revalidates_exact_health_after_same_key_replacement() {
         "apply must reject the observed predecessor even though attachment membership did not change",
     );
     drop(reserved_predecessor_command);
-    drop(stale_plan_load_claim);
     match try_recv_reliable_path_command(&mut selected_receivers) {
         None => {}
         Some(ReliablePathCommand::SendFrame(published)) if published == frame => {
@@ -451,6 +1587,46 @@ fn request_apply_eligibility_preserves_only_schedulable_regular_backup_classes()
             }
         }
     }
+}
+
+#[tokio::test]
+async fn control_only_request_path_cannot_authorize_withdrawing_a_payload_owner() {
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10274",
+        "quic://127.0.0.1:10275?control-only=true",
+    ]);
+    let stream_id = StreamId(176);
+    let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        alternate_commands,
+    ));
+    let alternate = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("control-only alternate")
+        .instance();
+    for instance in [owner, alternate] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    let controller = RequestMultipathController::new(stream_id);
+
+    assert!(
+        !controller.has_reinjection_path(&context, &remotes, owner, TrafficClass::Throughput,),
+        "a control-only attachment cannot be the payload-recovery survivor",
+    );
+    assert_eq!(
+        controller.owner_capable_instances(&context, &remotes, TrafficClass::Throughput),
+        vec![owner],
+        "tail-recovery ownership must use the same payload eligibility as request dispatch",
+    );
 }
 
 #[tokio::test]
@@ -853,11 +2029,12 @@ async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
     assert_eq!(replacement.key, old.key);
     assert_ne!(replacement, old);
     context.install_relay_path_instance_for_test(replacement);
-    assert!(
-        controller
-            .reinjection_avoid_instances(&frame, RelaySendCause::AckGapReinjection, &remotes,)
-            .is_empty(),
-        "an original attachment that is no longer live cannot exclude its replacement",
+    let avoid =
+        controller.reinjection_avoid_instances(&frame, RelaySendCause::AckGapReinjection, &remotes);
+    assert_eq!(
+        avoid,
+        vec![old],
+        "un-DataACKed ownership remains exact to the retired incarnation",
     );
 
     let selected = controller
@@ -867,14 +2044,14 @@ async fn ack_gap_avoidance_does_not_exclude_a_same_key_replacement() {
             &frame,
             TrafficClass::Throughput,
             RelaySendCause::AckGapReinjection,
-            &[old],
+            &avoid,
         )
         .expect("the replacement is a distinct carrier output");
     assert_eq!(remotes.paths[selected].instance(), replacement);
 }
 
 #[tokio::test]
-async fn ack_gap_repair_history_does_not_exhaust_non_original_outputs() {
+async fn ack_gap_repair_history_remains_avoided_until_data_ack() {
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
         "quic://127.0.0.1:10252?initial-srtt-s=0.015&initial-rate-mbps=250",
@@ -945,8 +2122,8 @@ async fn ack_gap_repair_history_does_not_exhaust_non_original_outputs() {
         controller.reinjection_avoid_instances(&frame, RelaySendCause::AckGapReinjection, &remotes);
     assert_eq!(
         avoid,
-        vec![original],
-        "repair history is duplicate suppression evidence, not a permanent path blacklist",
+        vec![original, first_repair, second_repair],
+        "every unresolved exact copy remains ineligible for same-incarnation retry",
     );
     assert!(matches!(
         controller.choose_lowest_eta_relay_path(
@@ -957,30 +2134,46 @@ async fn ack_gap_repair_history_does_not_exhaust_non_original_outputs() {
             RelaySendCause::AckGapReinjection,
             &avoid,
         ),
-        Err(RequestMultipathPlanError::ServiceBlocked)
+        Err(RequestMultipathPlanError::OutputUnavailable)
     ));
     controller
         .request
         .flights
         .age_reinjected_flights_for_test(Duration::from_secs(1));
-    let selected = controller
-        .choose_lowest_eta_relay_path(
+    let aged_avoid =
+        controller.reinjection_avoid_instances(&frame, RelaySendCause::AckGapReinjection, &remotes);
+    assert_eq!(
+        aged_avoid, avoid,
+        "native suppression expiry cannot release exact Product ownership",
+    );
+    assert!(matches!(
+        controller.choose_lowest_eta_relay_path(
             &context,
             &remotes,
             &frame,
             TrafficClass::Throughput,
             RelaySendCause::AckGapReinjection,
-            &avoid,
-        )
-        .expect("a live non-original attachment remains available");
+            &aged_avoid,
+        ),
+        Err(RequestMultipathPlanError::OutputUnavailable)
+    ));
+    controller
+        .request
+        .flights
+        .release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 4096,
+        }]);
     assert!(
-        [first_repair, second_repair].contains(&remotes.paths[selected].instance()),
-        "the repair must use a non-original live attachment",
+        controller
+            .reinjection_avoid_instances(&frame, RelaySendCause::AckGapReinjection, &remotes)
+            .is_empty(),
+        "Product DataACK is the event that releases every exact copy",
     );
 }
 
 #[tokio::test]
-async fn portable_quic_repair_waits_for_exact_stream_flight_but_failure_recovery_does_not() {
+async fn portable_quic_repair_uses_exact_k_despite_unrelated_product_flight() {
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
         "quic://127.0.0.1:10252?initial-srtt-s=0.01&initial-rate-mbps=300",
@@ -1010,17 +2203,17 @@ async fn portable_quic_repair_waits_for_exact_stream_flight_but_failure_recovery
     let quic_original = data_frame(stream_id, 4096, 4096);
     controller.record_original_frame_for_test(quic, &quic_original);
 
-    assert!(matches!(
-        controller.choose_lowest_eta_relay_path(
+    let selected = controller
+        .choose_lowest_eta_relay_path(
             &context,
             &remotes,
             &repair,
             TrafficClass::Throughput,
             RelaySendCause::AckGapReinjection,
             &[original],
-        ),
-        Err(RequestMultipathPlanError::ServiceBlocked)
-    ));
+        )
+        .expect("unrelated Product flight consumes K but does not hard-veto repair");
+    assert_eq!(remotes.paths[selected].instance(), quic);
     drop(remotes.remove_path_instance(original));
     let selected = controller
         .choose_lowest_eta_relay_path(
@@ -1050,12 +2243,12 @@ async fn portable_quic_repair_waits_for_exact_stream_flight_but_failure_recovery
             RelaySendCause::AckGapReinjection,
             &[original],
         )
-        .expect("Data ACK drains exact QUIC-stream ownership");
+        .expect("Data ACK restores the Product bytes consumed by unrelated flight");
     assert_eq!(remotes.paths[selected].instance(), quic);
 }
 
 #[tokio::test]
-async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
+async fn repair_uses_reserved_lane_while_writer_has_unrelated_dequeued_bytes() {
     let context = client_test_context_with_paths(&[
         "tcp://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
         "quic://127.0.0.1:10252?initial-srtt-s=0.01&initial-rate-mbps=300",
@@ -1094,17 +2287,18 @@ async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
     let controller = RequestMultipathController::new(stream_id);
     let repair = data_frame(stream_id, 0, 4096);
 
-    assert!(matches!(
-        controller.choose_lowest_eta_relay_path(
+    assert!(quic_commands_for_writer.can_enqueue_reinjection_frame_now(&repair));
+    let selected = controller
+        .choose_lowest_eta_relay_path(
             &context,
             &remotes,
             &repair,
             TrafficClass::Throughput,
             RelaySendCause::AckGapReinjection,
             &[original],
-        ),
-        Err(RequestMultipathPlanError::ServiceBlocked)
-    ));
+        )
+        .expect("actual reinjection-lane capacity, not unrelated dequeued bytes, owns admission");
+    assert_eq!(remotes.paths[selected].instance(), quic);
     quic_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&dequeued));
     let selected = controller
         .choose_lowest_eta_relay_path(
@@ -1115,12 +2309,12 @@ async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
             RelaySendCause::AckGapReinjection,
             &[original],
         )
-        .expect("flushed writer batch reopens repair eligibility");
+        .expect("writer drain does not change already-valid repair eligibility");
     assert_eq!(remotes.paths[selected].instance(), quic);
 }
 
 #[tokio::test]
-async fn unbound_reinjection_requires_idle_but_measured_recovery_may_use_busy() {
+async fn native_backlog_ranks_repair_but_cannot_veto_exact_k() {
     let context = client_test_context_with_paths(&[
         "quic://127.0.0.1:10251?initial-srtt-s=0.02&initial-rate-mbps=200",
         "tcp://127.0.0.1:10252?initial-srtt-s=0.002&initial-rate-mbps=1000",
@@ -1193,11 +2387,11 @@ async fn unbound_reinjection_requires_idle_but_measured_recovery_may_use_busy() 
             RelaySendCause::AckGapReinjection,
             &[original],
         )
-        .expect("the idle TCP carrier remains eligible");
+        .expect("a K-valid carrier remains eligible despite sampled native backlog");
     assert_eq!(
         remotes.paths[selected].instance(),
-        idle,
-        "unbound repair must not queue behind native flight on a faster TCP carrier",
+        busy,
+        "native backlog remains ETA evidence, but cannot make the faster K-valid carrier unavailable",
     );
 
     // Production attachments publish their exact carrier instance before rate
@@ -1235,10 +2429,7 @@ async fn capacity_reference_is_the_fastest_mature_attached_path() {
         .request
         .path_states
         .get_mut(tcp)
-        .set_per_flow_rate(RequestPerFlowRateModel {
-            rate_bps: 120_000_000.0,
-            delivery_samples: 10,
-        });
+        .set_product_rate_epoch(RequestProductRateEpoch::for_test(120_000_000.0, 10));
     assert_eq!(
         context
             .reliable_path_snapshot(tcp.key)
@@ -1250,17 +2441,14 @@ async fn capacity_reference_is_the_fastest_mature_attached_path() {
             .request
             .path_states
             .get(tcp)
-            .and_then(|state| state.per_flow_rate())
+            .and_then(|state| state.product_rate_epoch())
             .is_some()
     );
     controller
         .request
         .path_states
         .get_mut(udp)
-        .set_per_flow_rate(RequestPerFlowRateModel {
-            rate_bps: 240_000_000.0,
-            delivery_samples: 10,
-        });
+        .set_product_rate_epoch(RequestProductRateEpoch::for_test(240_000_000.0, 10));
 
     let (reference, model) = controller
         .request_capacity_reference(&context, &remotes)
@@ -1278,6 +2466,166 @@ async fn capacity_reference_is_the_fastest_mature_attached_path() {
 }
 
 #[tokio::test]
+async fn normal_product_planning_does_not_enqueue_an_automatic_tcp_capacity_train() {
+    let context = client_test_context_with_paths(&[
+        "quic://127.0.0.1:10380?initial-srtt-s=0.02&initial-rate-mbps=500",
+        "tcp://127.0.0.1:10381?initial-srtt-s=0.08&initial-rate-mbps=500",
+    ]);
+    let stream_id = StreamId(183);
+    let (reference_commands, mut reference_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            reference_commands,
+        ),
+        8,
+    );
+    let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
+    remotes.attach(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Tcp,
+        0,
+        candidate_commands,
+    ));
+    consume_client_path_proof_for_test(&mut reference_receivers);
+    consume_client_path_proof_for_test(&mut candidate_receivers);
+
+    let reference = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("QUIC reference attachment")
+        .instance();
+    let candidate = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Tcp)
+        .expect("TCP candidate attachment")
+        .instance();
+    seed_client_bulk_evidence_for_test(&context, reference);
+    context.install_relay_path_instance_for_test(candidate);
+    context.mark_tcp_path_open_success(
+        candidate.key.index,
+        Duration::from_millis(20),
+        TrafficClass::Throughput,
+    );
+    mark_client_path_proof_fresh_for_test(&context, &remotes, candidate, Duration::from_millis(20));
+
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .path_states
+        .qualify_product_assignment_for_test(reference);
+    let reference_state = controller.request.path_states.get_mut(reference);
+    reference_state.mark_product_path_use_proven();
+    reference_state.mark_capacity_admitted();
+    reference_state.set_product_rate_epoch(RequestProductRateEpoch::for_test(
+        200_000_000.0,
+        RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+    ));
+    assert_eq!(
+        controller
+            .request_capacity_reference(&context, &remotes)
+            .map(|(instance, _)| instance),
+        Some(reference),
+        "the fixture must expose the mature reference that triggered the legacy automatic train",
+    );
+    assert!(
+        !context.relay_path_instance_has_bulk_model_evidence(candidate),
+        "the candidate must still require exact per-output Product evidence",
+    );
+    assert!(!context.reliable_relay_has_latency_pressure());
+    assert!(
+        context.automatic_bulk_path_count(UnderlayProtocol::Tcp, None) > 0,
+        "the legacy automatic campaign must see the configured TCP candidate",
+    );
+    assert!(request_tcp_capacity_candidate_can_start_receipt(
+        context
+            .reliable_path_snapshot_for_instance(candidate)
+            .expect("candidate snapshot"),
+    ));
+    assert!(
+        remotes
+            .paths
+            .iter()
+            .find(|path| path.instance() == candidate)
+            .expect("candidate attachment")
+            .stream
+            .can_enqueue_work_lane_now(ReliableWorkClass::Data, TrafficClass::Throughput),
+    );
+
+    let frame = data_frame(stream_id, 0, 4096);
+    let _ = controller.plan_relay_path_send(
+        &context,
+        &mut remotes,
+        &frame,
+        TrafficClass::Throughput,
+        RelaySendCause::StreamData,
+        &[],
+    );
+    consume_client_path_proof_for_test(&mut candidate_receivers);
+    mark_client_path_proof_fresh_for_test(&context, &remotes, candidate, Duration::from_millis(20));
+
+    let _ = controller.plan_relay_path_send(
+        &context,
+        &mut remotes,
+        &frame,
+        TrafficClass::Throughput,
+        RelaySendCause::StreamData,
+        &[],
+    );
+
+    while let Some(command) = try_recv_reliable_path_command(&mut candidate_receivers) {
+        assert!(
+            !matches!(command, ReliablePathCommand::SendTcpCapacityProbe(_)),
+            "normal Product planning must not inject an offset-free PATH_CAPACITY train before bounded exact Product acquisition",
+        );
+    }
+}
+
+#[test]
+fn tcp_capacity_receipt_does_not_create_request_product_evidence() {
+    let target = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 184,
+    };
+    let accepted_at = Instant::now();
+    let mut controller = RequestMultipathController::new(StreamId(184));
+
+    controller.apply_request_tcp_capacity_event(RequestTcpCapacityEvent::CarrierProofAccepted {
+        target,
+        token: 1,
+        proof: TcpCapacityProofCandidate {
+            token: 1,
+            train_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            received_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            rate_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            proof_elapsed: Duration::from_millis(20),
+            receipt_rate_bps: 200_000_000,
+            rate_bps: 200_000_000,
+            accepted_at,
+            expires_at: accepted_at + Duration::from_secs(1),
+        },
+    });
+
+    let state = controller
+        .request
+        .path_states
+        .get(target)
+        .expect("the legacy receipt installs a target record");
+    assert!(
+        !state.has_product_evidence(),
+        "an offset-free carrier receipt cannot create, seed, or qualify exact per-output Product evidence",
+    );
+}
+
+#[tokio::test]
 async fn capacity_reference_ignores_immature_higher_rate_samples() {
     let (context, remotes, tcp, udp) = mixed_remote_set().await;
     seed_client_bulk_evidence_for_test(&context, tcp);
@@ -1287,18 +2635,12 @@ async fn capacity_reference_ignores_immature_higher_rate_samples() {
         .request
         .path_states
         .get_mut(tcp)
-        .set_per_flow_rate(RequestPerFlowRateModel {
-            rate_bps: 100_000_000.0,
-            delivery_samples: 10,
-        });
+        .set_product_rate_epoch(RequestProductRateEpoch::for_test(100_000_000.0, 10));
     controller
         .request
         .path_states
         .get_mut(udp)
-        .set_per_flow_rate(RequestPerFlowRateModel {
-            rate_bps: 900_000_000.0,
-            delivery_samples: 1,
-        });
+        .set_product_rate_epoch(RequestProductRateEpoch::for_test(900_000_000.0, 1));
     assert_eq!(
         context
             .reliable_path_snapshot(tcp.key)
@@ -1310,7 +2652,7 @@ async fn capacity_reference_ignores_immature_higher_rate_samples() {
             .request
             .path_states
             .get(tcp)
-            .and_then(|state| state.per_flow_rate())
+            .and_then(|state| state.product_rate_epoch())
             .is_some()
     );
 
@@ -1320,6 +2662,158 @@ async fn capacity_reference_ignores_immature_higher_rate_samples() {
             .map(|value| value.0),
         Some(tcp)
     );
+}
+
+#[tokio::test]
+async fn capacity_reference_ignores_faster_expired_product_epoch() {
+    let (context, remotes, tcp, udp) = mixed_remote_set().await;
+    seed_client_bulk_evidence_for_test(&context, tcp);
+    seed_client_bulk_evidence_for_test(&context, udp);
+    let now = Instant::now();
+    let mut controller = RequestMultipathController::new(StreamId(17));
+    controller
+        .request
+        .path_states
+        .get_mut(tcp)
+        .set_product_rate_epoch(
+            RequestProductRateEpoch::new(100_000_000.0, 10, now, Duration::from_secs(60))
+                .expect("fresh TCP epoch"),
+        );
+    controller
+        .request
+        .path_states
+        .get_mut(udp)
+        .set_product_rate_epoch(
+            RequestProductRateEpoch::new(
+                900_000_000.0,
+                10,
+                now - Duration::from_secs(2),
+                Duration::from_secs(1),
+            )
+            .expect("expired UDP epoch"),
+        );
+
+    assert_eq!(
+        controller
+            .request_capacity_reference(&context, &remotes)
+            .map(|value| value.0),
+        Some(tcp),
+        "expired rate is retained diagnostically but cannot size a new measurement",
+    );
+}
+
+#[test]
+fn request_product_rate_after_expiry_starts_a_new_unblended_epoch() {
+    let instance = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 991,
+    };
+    let observed_at = Instant::now();
+    let expired = RequestProductRateEpoch::new(
+        1_000_000.0,
+        100,
+        observed_at - Duration::from_secs(2),
+        Duration::from_secs(1),
+    )
+    .expect("expired diagnostic epoch");
+    let mut controller = RequestMultipathController::new(StreamId(181));
+    controller
+        .request
+        .path_states
+        .get_mut(instance)
+        .set_product_rate_epoch(expired);
+    let sample = PathRateSample::new(1024 * 1024, Duration::from_millis(20))
+        .expect("fresh exact Product sample");
+    controller.record_request_per_flow_rate_sample(
+        instance,
+        sample,
+        false,
+        observed_at,
+        Duration::from_secs(1),
+    );
+
+    let epoch = controller
+        .request
+        .path_states
+        .get(instance)
+        .and_then(|state| state.product_rate_epoch())
+        .expect("new Product authority epoch");
+    assert_eq!(epoch.rate_bps, sample.rate_bps());
+    assert_eq!(epoch.delivery_samples, 1);
+    assert_eq!(epoch.observed_at, observed_at);
+    assert_eq!(epoch.expires_at, observed_at + Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn expired_request_product_epoch_resets_successor_boundary_only_once() {
+    let (context, remotes, _tcp, udp) = mixed_remote_set().await;
+    context.install_relay_path_instance_for_test(udp);
+    let stream_id = StreamId(182);
+    let now = Instant::now();
+    let expired = RequestProductRateEpoch::new(
+        1_000_000.0,
+        100,
+        now - Duration::from_secs(2),
+        Duration::from_secs(1),
+    )
+    .expect("expired diagnostic epoch");
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .path_states
+        .get_mut(udp)
+        .set_product_rate_epoch(expired);
+
+    let first_bytes = PATH_OPEN_SCORE_BYTES / 2;
+    let second_bytes = PATH_OPEN_SCORE_BYTES - first_bytes;
+    let first = data_frame(stream_id, 0, first_bytes);
+    let second = data_frame(stream_id, first_bytes as u64, second_bytes);
+    controller.record_original_frame_for_test(udp, &first);
+    controller.record_original_frame_for_test(udp, &second);
+
+    let first_ack_at = now + Duration::from_millis(10);
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 0,
+            end: first_bytes as u64,
+        }],
+        first_ack_at,
+    );
+    assert!(
+        controller
+            .request
+            .path_states
+            .get(udp)
+            .and_then(|state| state.product_rate_epoch())
+            .is_some_and(|epoch| epoch.fresh_rate_at(first_ack_at).is_none()),
+        "one sub-floor ACK retains only the expired diagnostic epoch",
+    );
+
+    let second_ack_at = now + Duration::from_millis(20);
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: first_bytes as u64,
+            end: PATH_OPEN_SCORE_BYTES as u64,
+        }],
+        second_ack_at,
+    );
+    let successor = controller
+        .request
+        .path_states
+        .get(udp)
+        .and_then(|state| state.product_rate_epoch())
+        .expect("cumulative post-expiry ACKs cross the unchanged rate floor");
+    assert_eq!(successor.delivery_samples, 1);
+    assert_eq!(successor.observed_at, second_ack_at);
+    assert!(successor.fresh_rate_at(second_ack_at).is_some());
 }
 
 #[tokio::test]
@@ -1366,6 +2860,568 @@ async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
         controller
             .latest_unacked_ranges_for_path_instance(udp)
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unique_sub_floor_product_ack_proves_use_but_not_assignment_qualification() {
+    let (context, remotes, _tcp, udp) = mixed_remote_set().await;
+    let stream_id = StreamId(171);
+    let payload_bytes = 4096;
+    let frame = data_frame(stream_id, 0, payload_bytes);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(udp, &frame);
+    let range = OffsetRange {
+        start: 0,
+        end: payload_bytes as u64,
+    };
+
+    let progress = controller.apply_product_ack(&context, &remotes, &[range], Instant::now());
+    assert_eq!(progress.as_slice(), &[udp]);
+    let state = controller
+        .request
+        .path_states
+        .get(udp)
+        .expect("exact-path state");
+    assert!(
+        state.product_path_use_proven(),
+        "one uniquely attributed Product ACK proves exact path use",
+    );
+    assert!(
+        !state.product_assignment_qualified(),
+        "one uniquely attributed Product ACK proves path use, but exact assignment qualification requires the full Product-volume floor",
+    );
+    assert!(
+        !state.capacity_admitted(),
+        "sub-floor progress is bounded acquisition evidence, not a rate qualification",
+    );
+    assert!(state.product_rate_epoch().is_none());
+
+    let replay = controller.apply_product_ack(&context, &remotes, &[range], Instant::now());
+    assert!(replay.as_slice().is_empty());
+    let state = controller
+        .request
+        .path_states
+        .get(udp)
+        .expect("retained exact-path state");
+    assert!(
+        !state.product_assignment_qualified(),
+        "a duplicate Data ACK cannot advance Product qualification",
+    );
+    assert!(!state.capacity_admitted());
+    assert!(state.product_rate_epoch().is_none());
+}
+
+#[test]
+fn rejected_request_qualification_admission_installs_no_flight() {
+    let stream_id = StreamId(170);
+    let owner = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: next_carrier_path_instance_id(),
+        attachment_id: 170,
+    };
+
+    let mut revoked = RequestMultipathController::new(stream_id);
+    revoked
+        .request
+        .path_states
+        .get_mut(owner)
+        .reset_for_requalification();
+    assert_eq!(
+        revoked.record_original_frame_with_qualification(
+            owner,
+            &data_frame(stream_id, 0, 8),
+            true,
+            MuxLimits::default(),
+        ),
+        Err(ProductQualificationAdmissionError::AuthorityRevoked),
+    );
+    assert_eq!(
+        revoked
+            .request
+            .flights
+            .total_original_data_in_flight_bytes(),
+        0
+    );
+
+    let mut oversized = RequestMultipathController::new(stream_id);
+    let mut small_quantum = MuxLimits::default();
+    small_quantum.max_reliable_relay_chunk_bytes = 4;
+    assert_eq!(
+        oversized.record_original_frame_with_qualification(
+            owner,
+            &data_frame(stream_id, 0, 8),
+            true,
+            small_quantum,
+        ),
+        Err(ProductQualificationAdmissionError::QuantumExceedsMaximum),
+    );
+    assert_eq!(
+        oversized
+            .request
+            .flights
+            .total_original_data_in_flight_bytes(),
+        0,
+    );
+
+    let mut overlap = RequestMultipathController::new(stream_id);
+    let frame = data_frame(stream_id, 0, 8);
+    assert_eq!(
+        overlap
+            .record_original_frame_with_qualification(owner, &frame, true, MuxLimits::default(),),
+        Ok(8),
+    );
+    let before = overlap
+        .request
+        .flights
+        .total_original_data_in_flight_bytes();
+    assert_eq!(
+        overlap
+            .record_original_frame_with_qualification(owner, &frame, true, MuxLimits::default(),),
+        Err(ProductQualificationAdmissionError::OverlapsOutstandingTag),
+    );
+    assert_eq!(
+        overlap
+            .request
+            .flights
+            .total_original_data_in_flight_bytes(),
+        before,
+        "a rejected overlapping admission cannot install a second flight",
+    );
+}
+
+#[tokio::test]
+async fn request_final_product_quantum_tags_only_the_remaining_floor_byte() {
+    let (context, remotes, tcp, _udp) = mixed_remote_set().await;
+    let stream_id = StreamId(172);
+    let floor = reliable_path_startup_sample_limit_bytes(MuxLimits::default());
+    assert!(floor > 1);
+    let prefix_bytes = usize::try_from(floor - 1).expect("test floor fits usize");
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(tcp, &data_frame(stream_id, 0, prefix_bytes));
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 0,
+            end: floor - 1,
+        }],
+        Instant::now(),
+    );
+    let before_final = controller
+        .request
+        .path_states
+        .get(tcp)
+        .expect("qualification generation")
+        .product_qualification_invariant();
+    assert_eq!(before_final.verified_bytes, floor - 1);
+    assert_eq!(before_final.outstanding_tag_bytes, 0);
+    assert!(
+        !controller
+            .request
+            .path_states
+            .get(tcp)
+            .expect("qualification generation")
+            .product_assignment_qualified()
+    );
+
+    let final_quantum_bytes = 4096;
+    let final_start = floor - 1;
+    let final_end = final_start + final_quantum_bytes as u64;
+    controller.record_original_frame_for_test(
+        tcp,
+        &data_frame(stream_id, final_start, final_quantum_bytes),
+    );
+    let after_commit = controller
+        .request
+        .path_states
+        .get(tcp)
+        .expect("final qualification tag")
+        .product_qualification_invariant();
+    assert_eq!(after_commit.verified_bytes, floor - 1);
+    assert_eq!(after_commit.outstanding_tag_bytes, 1);
+    assert_eq!(
+        controller
+            .request
+            .flights
+            .original_data_in_flight_bytes(tcp),
+        final_quantum_bytes as u64,
+        "the full ordinary quantum enters O_i while only its residual prefix is tagged",
+    );
+
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: floor,
+            end: final_end,
+        }],
+        Instant::now(),
+    );
+    let after_surplus = controller
+        .request
+        .path_states
+        .get(tcp)
+        .expect("retained one-byte qualification tag");
+    assert!(!after_surplus.product_assignment_qualified());
+    assert_eq!(
+        after_surplus
+            .product_qualification_invariant()
+            .verified_bytes,
+        floor - 1,
+        "untagged exact Product remains eligible for rate sampling but cannot advance V",
+    );
+
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: final_start,
+            end: floor,
+        }],
+        Instant::now(),
+    );
+    let qualified = controller
+        .request
+        .path_states
+        .get(tcp)
+        .expect("qualified exact output");
+    assert!(qualified.product_assignment_qualified());
+    assert_eq!(
+        qualified.product_qualification_invariant().verified_bytes,
+        floor
+    );
+}
+
+#[tokio::test]
+async fn request_qualification_survives_capacity_retirement_but_not_stale_lifecycle() {
+    let (context, remotes, tcp, _udp) = mixed_remote_set().await;
+    let stream_id = StreamId(173);
+    let floor = reliable_path_startup_sample_limit_bytes(MuxLimits::default());
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(
+        tcp,
+        &data_frame(
+            stream_id,
+            0,
+            usize::try_from(floor).expect("test floor fits usize"),
+        ),
+    );
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 0,
+            end: floor,
+        }],
+        Instant::now(),
+    );
+    {
+        let state = controller.request.path_states.get_mut(tcp);
+        assert!(state.product_assignment_qualified());
+        state.mark_tcp_capacity_proven();
+        state.mark_capacity_admitted();
+    }
+    assert!(!controller.revoke_request_tcp_capacity_measurement(tcp, false));
+    assert!(
+        controller
+            .request
+            .path_states
+            .get(tcp)
+            .expect("retained active state")
+            .product_assignment_qualified(),
+        "carrier capacity retirement cannot falsify exact Product-volume history",
+    );
+
+    let predecessor = data_frame(stream_id, floor, 4096);
+    controller.record_original_frame_for_test(tcp, &predecessor);
+    let retained_debt = controller
+        .request
+        .flights
+        .original_data_in_flight_bytes(tcp);
+    assert_eq!(retained_debt, 4096);
+    assert!(controller.mark_path_stale(tcp));
+    let stale = controller
+        .request
+        .path_states
+        .get(tcp)
+        .expect("stale exact state");
+    assert!(!stale.product_assignment_qualified());
+    assert_eq!(stale.product_qualification_invariant().floor_bytes, None);
+    assert_eq!(
+        controller
+            .request
+            .flights
+            .original_data_in_flight_bytes(tcp),
+        retained_debt,
+        "stale entry scrubs qualification metadata without deleting O_i",
+    );
+
+    let predecessor_ack = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: floor,
+            end: floor + 4096,
+        }],
+        Instant::now(),
+    );
+    assert!(predecessor_ack.is_empty());
+    assert!(
+        !controller
+            .request
+            .path_states
+            .get(tcp)
+            .expect("stale exact state")
+            .product_assignment_qualified()
+    );
+}
+
+#[tokio::test]
+async fn request_detach_scrubs_qualification_without_deleting_product_debt() {
+    let (context, mut remotes, owner, _survivor) = mixed_remote_set().await;
+    let stream_id = StreamId(175);
+    let payload_bytes = 4096;
+    let frame = data_frame(stream_id, 0, payload_bytes);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(owner, &frame);
+    assert_eq!(
+        controller
+            .request
+            .path_states
+            .get(owner)
+            .expect("active qualification generation")
+            .product_qualification_invariant()
+            .outstanding_tag_bytes,
+        payload_bytes as u64,
+    );
+
+    drop(remotes.remove_path_instance(owner));
+    controller.reconcile_request_attachment_membership(&remotes);
+    assert!(
+        controller.request.path_states.get(owner).is_none(),
+        "detach removes the exact predecessor's qualification generation",
+    );
+    assert_eq!(
+        controller
+            .request
+            .flights
+            .original_data_in_flight_bytes(owner),
+        payload_bytes as u64,
+        "detach preserves unresolved O_i for ACK release and recovery",
+    );
+
+    let predecessor_ack = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 0,
+            end: payload_bytes as u64,
+        }],
+        Instant::now(),
+    );
+    assert!(predecessor_ack.is_empty());
+    assert!(
+        controller.request.path_states.get(owner).is_none(),
+        "a detached predecessor ACK cannot recreate qualification state",
+    );
+    assert_eq!(
+        controller
+            .request
+            .flights
+            .original_data_in_flight_bytes(owner),
+        0,
+        "the predecessor ACK still releases its retained Product debt",
+    );
+}
+
+#[tokio::test]
+async fn accepted_request_reinjection_removes_only_overlapping_tag_weight() {
+    let (_context, _remotes, owner, repair) = mixed_remote_set().await;
+    let stream_id = StreamId(174);
+    let floor = reliable_path_startup_sample_limit_bytes(MuxLimits::default());
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(
+        owner,
+        &data_frame(
+            stream_id,
+            0,
+            usize::try_from(floor).expect("test floor fits usize"),
+        ),
+    );
+    let overlap_bytes = 4096_u64.min(floor);
+    controller.record_reinjected_frame_for_test(
+        repair,
+        &data_frame(stream_id, 0, usize::try_from(overlap_bytes).unwrap()),
+    );
+    let state = controller
+        .request
+        .path_states
+        .get(owner)
+        .expect("original qualification state");
+    let invariant = state.product_qualification_invariant();
+    assert_eq!(invariant.verified_bytes, 0);
+    assert_eq!(invariant.outstanding_tag_bytes, floor - overlap_bytes);
+    assert_eq!(
+        state.product_qualification_deficit_bytes(),
+        Some(overlap_bytes),
+    );
+    assert_eq!(
+        controller
+            .request
+            .flights
+            .original_data_in_flight_bytes(owner),
+        floor,
+        "accepted recovery changes qualification attribution, not Product ownership",
+    );
+}
+
+#[tokio::test]
+async fn request_load_becomes_idle_only_after_final_unique_original_ack() {
+    let (context, remotes, owner, repair) = mixed_remote_set().await;
+    let stream_id = StreamId(17);
+    let first = data_frame(stream_id, 0, 1024);
+    let second = data_frame(stream_id, 1024, 1024);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .flights
+        .record_original_frame_instance(owner, &first);
+    controller
+        .request
+        .flights
+        .record_original_frame_instance(owner, &second);
+    controller
+        .request
+        .flights
+        .record_reinjection_frame_instance(repair, &second);
+
+    let partial = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange { start: 0, end: 512 }],
+        Instant::now(),
+    );
+    assert!(partial.idle_original_data_instances.is_empty());
+
+    let replay = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange { start: 0, end: 512 }],
+        Instant::now(),
+    );
+    assert!(replay.idle_original_data_instances.is_empty());
+
+    let first_complete = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 512,
+            end: 1024,
+        }],
+        Instant::now(),
+    );
+    assert!(first_complete.idle_original_data_instances.is_empty());
+
+    let final_release = controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 1024,
+            end: 2048,
+        }],
+        Instant::now(),
+    );
+    assert_eq!(
+        final_release.idle_original_data_instances.as_slice(),
+        &[owner],
+        "only the exact OriginalData owner becomes idle; its reinjection copy never owns load",
+    );
+}
+
+#[tokio::test]
+async fn request_requalification_ack_on_authenticated_sibling_resolves_pending_target() {
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "quic://127.0.0.1:10252"]);
+    let stream_id = StreamId(182);
+    let payload_bytes = 4096;
+    let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream(stream_id, 0, candidate_commands),
+        8,
+    );
+    let candidate = remotes.paths[0].instance();
+    let (sibling_commands, mut sibling_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        sibling_commands,
+    ));
+    let sibling = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("authenticated sibling return carrier")
+        .instance();
+    consume_client_path_proof_for_test(&mut candidate_receivers);
+    consume_client_path_proof_for_test(&mut sibling_receivers);
+    context.install_relay_path_instance_for_test(candidate);
+    context.install_relay_path_instance_for_test(sibling);
+
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    let old = send_stream
+        .send_data(Bytes::from(vec![0x35; payload_bytes]))
+        .expect("candidate Product source");
+    let sibling_source = send_stream
+        .send_data(Bytes::from(vec![0x36; payload_bytes]))
+        .expect("sibling Product source");
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller.record_original_frame_for_test(candidate, &old);
+    controller.record_original_frame_for_test(sibling, &sibling_source);
+    assert!(controller.mark_path_stale(candidate));
+    assert!(matches!(
+        controller.try_enqueue_requalification_probe(
+            &context,
+            &remotes,
+            &send_stream,
+            TrafficClass::Throughput,
+            payload_bytes,
+        ),
+        Ok(attempt) if attempt.published_payload_bytes() == Some(payload_bytes)
+    ));
+    let probe = match try_recv_reliable_path_command(&mut candidate_receivers) {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamRequalifyData {
+            probe_id,
+            offset,
+            payload,
+            ..
+        })) => StreamRequalificationProbe {
+            id: probe_id,
+            offset,
+            payload_bytes: payload.len() as u32,
+        },
+        _ => panic!("candidate receives the pending exact probe"),
+    };
+
+    assert!(
+        controller.acknowledge_requalification_probe(sibling, probe),
+        "the exact pending tuple, not its authenticated return carrier, identifies the target"
+    );
+    assert!(
+        controller
+            .request
+            .requalification
+            .state(candidate)
+            .acquiring()
+    );
+    assert_eq!(
+        controller.request.requalification.state(sibling),
+        StreamPathQualification::Qualified,
+        "the ACK carrier is not the requalification target"
     );
 }
 
@@ -1419,7 +3475,7 @@ async fn request_requalification_needs_exact_probe_then_fresh_original_ack() {
             TrafficClass::Throughput,
             payload_bytes,
         ),
-        Ok(Some(bytes)) if bytes == payload_bytes
+        Ok(attempt) if attempt.published_payload_bytes() == Some(payload_bytes)
     ));
     let probe = match try_recv_reliable_path_command(&mut tcp_receivers) {
         Some(ReliablePathCommand::SendFrame(Frame::StreamRequalifyData {
@@ -1451,17 +3507,21 @@ async fn request_requalification_needs_exact_probe_then_fresh_original_ack() {
         }]
     );
 
-    assert!(!controller.acknowledge_requalification_probe(udp, probe,));
     assert!(!controller.acknowledge_requalification_probe(
-        tcp,
+        udp,
         StreamRequalificationProbe {
             id: probe.id + 1,
             ..probe
         },
     ));
     assert!(controller.path_is_stale(tcp));
-    assert!(controller.acknowledge_requalification_probe(tcp, probe));
+    assert!(controller.acknowledge_requalification_probe(udp, probe));
     assert!(controller.request.requalification.state(tcp).acquiring());
+    assert_eq!(
+        controller.request.requalification.state(udp),
+        StreamPathQualification::Qualified,
+        "the authenticated ACK carrier is not the forward probe target"
+    );
 
     let old_progress = controller.apply_product_ack(
         &context,
@@ -1536,7 +3596,7 @@ async fn quic_only_stale_fallback_can_requalify_without_a_qualified_source() {
             TrafficClass::Throughput,
             payload_bytes,
         ),
-        Ok(Some(bytes)) if bytes == payload_bytes
+        Ok(attempt) if attempt.published_payload_bytes() == Some(payload_bytes)
     ));
     let probe = match try_recv_reliable_path_command(&mut receivers) {
         Some(ReliablePathCommand::SendFrame(Frame::StreamRequalifyData {
@@ -1647,7 +3707,7 @@ async fn requalification_skips_draining_and_full_stale_attachments() {
             TrafficClass::Throughput,
             4096,
         ),
-        Ok(Some(4096))
+        Ok(attempt) if attempt.published_payload_bytes() == Some(4096)
     ));
     assert!(try_recv_reliable_path_command(&mut draining_receivers).is_none());
     assert!(matches!(
@@ -1715,7 +3775,7 @@ async fn all_full_stale_requalification_returns_bounded_backpressure() {
             TrafficClass::Throughput,
             4096,
         ),
-        Err(crate::runtime::RuntimeError::SenderServiceBlocked)
+        Ok(attempt) if attempt.is_capacity_blocked()
     ));
     assert!(controller.requalification_deadline().is_none());
     assert!(controller.path_is_stale(first));
@@ -1776,7 +3836,14 @@ async fn stale_path_is_not_selected_for_new_request_data() {
             .can_enqueue_stream_lane
     );
     assert!(matches!(
-        choose_observed_ordinary_data_path(&observation, TrafficClass::Latency, 4096, 0, &[]),
+        choose_observed_ordinary_data_path(
+            &observation,
+            TrafficClass::Latency,
+            4096,
+            0,
+            &[],
+            None,
+        ),
         ObservedOrdinaryPathChoice::Selected(instance) if instance == udp
     ));
 
@@ -1872,6 +3939,9 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
         .find(|path| path.key().underlay == UnderlayProtocol::Udp)
         .expect("UDP attachment")
         .instance();
+    for instance in [tcp, udp] {
+        context.install_relay_path_instance_for_test(instance);
+    }
     let first = data_frame(stream_id, 0, 4096);
     let second = data_frame(stream_id, 4096, 4096);
     let mut controller = RequestMultipathController::new(stream_id);
@@ -1890,7 +3960,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
     assert!(controller.mark_path_stale(tcp));
     assert_eq!(
         controller
-            .path_recovery_state(&remotes, tcp, Duration::from_secs(60))
+            .path_recovery_state(&context, &remotes, tcp, TrafficClass::Throughput,)
             .uncovered_ranges,
         vec![OffsetRange {
             start: 4096,
@@ -1916,7 +3986,7 @@ async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
     assert!(controller.path_is_stale(tcp));
     assert_eq!(
         controller
-            .path_recovery_state(&remotes, tcp, Duration::from_secs(60))
+            .path_recovery_state(&context, &remotes, tcp, TrafficClass::Throughput,)
             .uncovered_ranges,
         vec![OffsetRange {
             start: 4096,
@@ -1948,6 +4018,9 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
         .find(|path| path.key().underlay == UnderlayProtocol::Udp)
         .expect("UDP attachment")
         .instance();
+    for instance in [tcp, udp] {
+        context.install_relay_path_instance_for_test(instance);
+    }
     consume_client_path_proof_for_test(&mut tcp_receivers);
     consume_client_path_proof_for_test(&mut udp_receivers);
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
@@ -1965,7 +4038,8 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
         .record_reinjection_frame_instance(udp, &frame);
     assert!(controller.mark_path_stale(tcp));
 
-    let recovery = controller.path_recovery_state(&remotes, tcp, Duration::from_secs(1));
+    let recovery =
+        controller.path_recovery_state(&context, &remotes, tcp, TrafficClass::Throughput);
     assert!(
         recovery.uncovered_ranges.is_empty(),
         "the current exact-range recovery copy suppresses a duplicate"
@@ -1981,7 +4055,7 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
         .age_reinjected_flights_for_test(Duration::from_secs(2));
     assert_eq!(
         controller
-            .path_recovery_state(&remotes, tcp, Duration::from_secs(1))
+            .path_recovery_state(&context, &remotes, tcp, TrafficClass::Throughput,)
             .uncovered_ranges,
         vec![OffsetRange {
             start: 0,
@@ -1996,7 +4070,7 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
         controller.path_is_stale(tcp),
         "sole-survivor scheduling keeps stale evidence until exact requalification"
     );
-    assert!(!controller.has_reinjection_path(&remotes, tcp));
+    assert!(!controller.has_reinjection_path(&context, &remotes, tcp, TrafficClass::Throughput,));
     assert!(matches!(
         controller.try_enqueue_requalification_probe(
             &context,
@@ -2005,7 +4079,7 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
             TrafficClass::Throughput,
             4096,
         ),
-        Ok(Some(4096))
+        Ok(attempt) if attempt.published_payload_bytes() == Some(4096)
     ));
     assert!(matches!(
         try_recv_reliable_path_command(&mut tcp_receivers),
@@ -2016,6 +4090,459 @@ async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
 }
 
 #[tokio::test]
+async fn accepted_request_copy_owns_exact_reserve_until_data_ack() {
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10301?initial-srtt-s=0.05&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10302?initial-srtt-s=0.01&initial-rate-mbps=500",
+    ]);
+    let stream_id = StreamId(230);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(
+        stream_id,
+        1,
+        target_commands.clone(),
+    ));
+    let target = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("recovery target")
+        .instance();
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    consume_client_path_proof_for_test(&mut target_receivers);
+    for instance in [owner, target] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    seed_client_bulk_evidence_for_test(&context, target);
+
+    let limits = context.mux_limits;
+    let mut controller = RequestMultipathController::new(stream_id);
+    let target_path = remotes
+        .paths
+        .iter()
+        .find(|path| path.instance() == target)
+        .expect("exact target path");
+    let snapshot = controller
+        .request_reinjection_target_snapshot(&context, &remotes, target_path)
+        .expect("published exact target Product authority");
+    let pending_bytes =
+        reliable_product_recovery_window_bytes(Some(snapshot), TrafficClass::Throughput, limits)
+            .max(
+                adaptive_reliable_relay_reinjection_bytes(
+                    Some(snapshot),
+                    TrafficClass::Throughput,
+                    limits,
+                )
+                .max(reliable_bulk_carrier_feed_quantum_bytes(limits)),
+            );
+    let repair = data_frame(stream_id, 0, pending_bytes);
+    target_commands
+        .try_enqueue_reinjection_frame(repair.clone(), TrafficClass::Throughput)
+        .expect("accepted target command remains pending");
+
+    controller.record_original_frame_for_test(owner, &repair);
+    let (_, accepted_deadline) = controller
+        .request
+        .flights
+        .record_reinjection_frame_instance_with_suppression_interval(
+            target,
+            &repair,
+            Duration::ZERO,
+        );
+    assert!(accepted_deadline.is_some_and(|deadline| deadline <= Instant::now()));
+    assert_eq!(
+        controller.accepted_reinjected_data_bytes(target),
+        pending_bytes,
+        "a retry deadline never releases the same exact reliable target's accepted Product debt",
+    );
+    let sender_queue = ReliableRelaySenderQueue::default();
+    let (target_selection, target_service_exhausted) = controller.reinjection_path_snapshot(
+        &context,
+        &remotes,
+        &[owner],
+        &sender_queue,
+        4096,
+        limits,
+    );
+    assert!(
+        target_selection.is_none() && target_service_exhausted,
+        "the accepted un-DataACKed copy consumes the exact target reserve after its retry deadline",
+    );
+    let next_gap = data_frame(stream_id, pending_bytes as u64, 4096);
+    controller.record_original_frame_for_test(owner, &next_gap);
+    let persistent = controller.data_ack_gap_reinjection_service_model(
+        &context,
+        &remotes,
+        &next_gap,
+        TrafficClass::Throughput,
+        &sender_queue,
+        4096,
+        limits,
+    );
+    assert!(persistent.reinjection_target.is_none());
+    assert!(persistent.target_service_exhausted);
+
+    let pending = recv_reliable_path_command(&mut target_receivers)
+        .await
+        .expect("pending recovery command");
+    target_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&pending));
+    assert_eq!(
+        controller
+            .reinjection_path_snapshot(&context, &remotes, &[owner], &sender_queue, 4096, limits,)
+            .0
+            .map(|(instance, _, _)| instance),
+        None,
+        "native command release cannot mint same-incarnation Product recovery authority",
+    );
+
+    controller.apply_product_ack(
+        &context,
+        &remotes,
+        &[OffsetRange {
+            start: 0,
+            end: pending_bytes as u64,
+        }],
+        Instant::now(),
+    );
+    assert_eq!(controller.accepted_reinjected_data_bytes(target), 0);
+    assert_eq!(
+        controller
+            .reinjection_path_snapshot(&context, &remotes, &[owner], &sender_queue, 4096, limits,)
+            .0
+            .map(|(instance, _, _)| instance),
+        Some(target),
+        "Data ACK releases the exact Product repair debt and restores target service",
+    );
+}
+
+#[tokio::test]
+async fn request_recovery_skips_exhausted_fast_target_for_free_second_target() {
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10311?initial-srtt-s=0.08&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10312?initial-srtt-s=0.005&initial-rate-mbps=1000",
+        "tcp://127.0.0.1:10313?initial-srtt-s=0.04&initial-rate-mbps=200",
+    ]);
+    let stream_id = StreamId(231);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (fast_commands, mut fast_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, fast_commands));
+    let fast = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("fast recovery target")
+        .instance();
+    let (free_commands, mut free_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, free_commands));
+    let free = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("free second target")
+        .instance();
+    for receivers in [
+        &mut owner_receivers,
+        &mut fast_receivers,
+        &mut free_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, fast, free] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    for instance in [fast, free] {
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+
+    let limits = context.mux_limits;
+    let mut controller = RequestMultipathController::new(stream_id);
+    let sender_queue = ReliableRelaySenderQueue::default();
+    let fast_path = remotes
+        .paths
+        .iter()
+        .find(|path| path.instance() == fast)
+        .expect("fast recovery target path");
+    let fast_snapshot = controller
+        .request_reinjection_target_snapshot(&context, &remotes, fast_path)
+        .expect("fast target must publish exact Product authority");
+    assert!(fast_snapshot.data_level_limit_bytes > 0);
+    assert_eq!(
+        controller
+            .reinjection_path_snapshot(&context, &remotes, &[owner], &sender_queue, 4096, limits,)
+            .0
+            .map(|(instance, _, _)| instance),
+        Some(fast),
+        "the fixture's fastest target must win before its service is consumed",
+    );
+    let occupied_bytes = reliable_product_recovery_window_bytes(
+        Some(fast_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    )
+    .max(
+        adaptive_reliable_relay_reinjection_bytes(
+            Some(fast_snapshot),
+            TrafficClass::Throughput,
+            limits,
+        )
+        .max(reliable_bulk_carrier_feed_quantum_bytes(limits)),
+    );
+    let repair = data_frame(stream_id, 0, occupied_bytes);
+    controller.record_original_frame_for_test(owner, &repair);
+    controller
+        .request
+        .flights
+        .record_reinjection_frame_instance_with_suppression_interval(
+            fast,
+            &repair,
+            Duration::from_secs(60),
+        );
+
+    assert_eq!(
+        controller
+            .reinjection_path_snapshot(&context, &remotes, &[owner], &sender_queue, 4096, limits,)
+            .0
+            .map(|(instance, _, _)| instance),
+        Some(free),
+        "stale/failure recovery must skip a faster target whose service window is exhausted",
+    );
+    let persistent_gap = data_frame(stream_id, occupied_bytes as u64, 4096);
+    controller.record_original_frame_for_test(owner, &persistent_gap);
+    let persistent = controller.data_ack_gap_reinjection_service_model(
+        &context,
+        &remotes,
+        &persistent_gap,
+        TrafficClass::Throughput,
+        &sender_queue,
+        4096,
+        limits,
+    );
+    assert_eq!(
+        persistent
+            .reinjection_target
+            .map(|(target, _)| target.instance),
+        Some(free),
+        "persistent ACK-gap recovery must make the same target-service decision",
+    );
+}
+
+#[tokio::test]
+async fn bound_request_repair_consumes_only_its_exact_targets_emergency_reserve() {
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10321?initial-srtt-s=0.05&initial-rate-mbps=100",
+        "tcp://127.0.0.1:10322?initial-srtt-s=0.01&initial-rate-mbps=500",
+        "tcp://127.0.0.1:10323?initial-srtt-s=0.02&initial-rate-mbps=300",
+    ]);
+    let stream_id = StreamId(232);
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, first_commands));
+    let first = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 1)
+        .expect("first recovery target")
+        .instance();
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 2, second_commands));
+    let second = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().index == 2)
+        .expect("second recovery target")
+        .instance();
+    for receivers in [
+        &mut owner_receivers,
+        &mut first_receivers,
+        &mut second_receivers,
+    ] {
+        consume_client_path_proof_for_test(receivers);
+    }
+    for instance in [owner, first, second] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    for instance in [first, second] {
+        seed_client_bulk_evidence_for_test(&context, instance);
+    }
+
+    let limits = context.mux_limits;
+    let mut controller = RequestMultipathController::new(stream_id);
+    let first_path = remotes
+        .paths
+        .iter()
+        .find(|path| path.instance() == first)
+        .expect("first exact target path");
+    let second_path = remotes
+        .paths
+        .iter()
+        .find(|path| path.instance() == second)
+        .expect("second exact target path");
+    let first_snapshot = controller
+        .request_reinjection_target_snapshot(&context, &remotes, first_path)
+        .expect("first target must publish exact Product authority");
+    let second_snapshot = controller
+        .request_reinjection_target_snapshot(&context, &remotes, second_path)
+        .expect("second target must publish exact Product authority");
+    let first_window = reliable_product_recovery_window_bytes(
+        Some(first_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    );
+    let second_window = reliable_product_recovery_window_bytes(
+        Some(second_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert_eq!(
+        first_window, second_window,
+        "the configured path-flight cap makes both ordinary windows identical",
+    );
+    let emergency_quantum = adaptive_reliable_relay_reinjection_bytes(
+        Some(first_snapshot),
+        TrafficClass::Throughput,
+        limits,
+    )
+    .max(reliable_bulk_carrier_feed_quantum_bytes(limits));
+
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    let first_original = data_frame(stream_id, 0, first_window);
+    let repair = data_frame(stream_id, first_window as u64, emergency_quantum);
+    sender_queue.push_critical_reinjection_with_cause(
+        repair.clone(),
+        RelaySendCause::ClientPathFailureReinjection(ClientReinjectionOutputIdentity {
+            instance: first,
+        }),
+    );
+    let (_, queued_front) = sender_queue.front().expect("bound repair queue front");
+    let ReliableRelayQueuedWorkKind::Reinjection { cause, .. } = queued_front.kind else {
+        panic!("critical bound repair must remain at the queue front");
+    };
+    assert_eq!(
+        cause.client_target(),
+        Some(first),
+        "request recovery stores an exact target before carrier dispatch",
+    );
+
+    controller.record_original_frame_for_test(first, &first_original);
+    controller.record_original_frame_for_test(owner, &repair);
+    let selected = controller
+        .reinjection_path_snapshot(
+            &context,
+            &remotes,
+            &[owner],
+            &sender_queue,
+            limits.max_repair_bytes,
+            limits,
+        )
+        .0
+        .map(|(instance, _, _)| instance);
+    assert_eq!(
+        selected,
+        Some(second),
+        "a queued quantum bound to target A consumes only A's exact emergency reserve; target B retains its independent reserve",
+    );
+    let persistent = controller.data_ack_gap_reinjection_service_model(
+        &context,
+        &remotes,
+        &repair,
+        TrafficClass::Throughput,
+        &sender_queue,
+        limits.max_repair_bytes,
+        limits,
+    );
+    assert_eq!(
+        persistent
+            .reinjection_target
+            .map(|(target, _)| target.instance),
+        Some(second),
+        "persistent-gap selection must use the same exact-target queue view as failure recovery",
+    );
+}
+
+#[tokio::test]
+async fn committed_request_recovery_copy_survives_target_drain_until_retry_deadline() {
+    let stream_id = StreamId(22);
+    let context = client_test_context_with_paths(&[
+        "tcp://127.0.0.1:10251",
+        "quic://127.0.0.1:10252",
+        "tcp://127.0.0.1:10253",
+    ]);
+    let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, owner_commands), 8);
+    let owner = remotes.paths[0].instance();
+    let (copy_commands, _copy_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        copy_commands.clone(),
+    ));
+    let copy = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("QUIC recovery copy")
+        .instance();
+    let (survivor_commands, _survivor_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream(stream_id, 1, survivor_commands));
+    let survivor = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Tcp && path.key().index == 1)
+        .expect("TCP recovery survivor")
+        .instance();
+    for instance in [owner, copy, survivor] {
+        context.install_relay_path_instance_for_test(instance);
+    }
+    let frame = data_frame(stream_id, 0, 4096);
+    let mut controller = RequestMultipathController::new(stream_id);
+    controller
+        .request
+        .flights
+        .record_original_frame_instance(owner, &frame);
+    controller
+        .request
+        .flights
+        .record_reinjection_frame_instance(copy, &frame);
+    assert!(controller.mark_path_stale(owner));
+
+    copy_commands.begin_path_drain();
+    let recovery =
+        controller.path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput);
+    assert!(
+        recovery.uncovered_ranges.is_empty(),
+        "an already-committed request copy remains transport-owned during ordered drain",
+    );
+    assert!(
+        recovery.retry_deadline.is_some(),
+        "the committed request copy suppresses only until its bounded retry deadline",
+    );
+
+    drop(remotes.remove_path_instance(copy));
+    assert_eq!(
+        controller
+            .path_recovery_state(&context, &remotes, owner, TrafficClass::Throughput,)
+            .uncovered_ranges,
+        vec![OffsetRange {
+            start: 0,
+            end: 4096,
+        }],
+        "exact detach revokes the old copy while the healthy survivor makes recovery ready",
+    );
+}
+
+#[tokio::test]
 async fn missing_owner_detection_is_fenced_by_attachment_instance() {
     let context = client_test_context_with_paths(&["tcp://127.0.0.1:10251"]);
     let stream_id = StreamId(31);
@@ -2023,6 +4550,7 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
     let mut remotes =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, first_commands), 8);
     let old_instance = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(old_instance);
     let frame = data_frame(stream_id, 0, 4096);
     let mut controller = RequestMultipathController::new(stream_id);
     controller
@@ -2039,6 +4567,7 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
     let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
     remotes.attach(opened_test_relay_stream(stream_id, 0, replacement_commands));
     let replacement = remotes.paths[0].instance();
+    context.install_relay_path_instance_for_test(replacement);
     assert_eq!(replacement.key, old_instance.key);
     assert_ne!(replacement, old_instance);
     let observation = controller.data_ack_gap_reinjection_model(
@@ -2063,7 +4592,7 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
     );
     assert_eq!(
         controller
-            .path_recovery_state(&remotes, old_instance, Duration::from_secs(1))
+            .path_recovery_state(&context, &remotes, old_instance, TrafficClass::Throughput,)
             .uncovered_ranges,
         vec![OffsetRange {
             start: 0,
@@ -2077,7 +4606,7 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
         .flights
         .record_reinjection_frame_instance(replacement, &frame);
     let current_recovery =
-        controller.path_recovery_state(&remotes, old_instance, Duration::from_secs(1));
+        controller.path_recovery_state(&context, &remotes, old_instance, TrafficClass::Throughput);
     assert!(current_recovery.uncovered_ranges.is_empty());
     assert!(current_recovery.retry_deadline.is_some());
 
@@ -2087,7 +4616,7 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
         .age_reinjected_flights_for_test(Duration::from_secs(2));
     assert_eq!(
         controller
-            .path_recovery_state(&remotes, old_instance, Duration::from_secs(1))
+            .path_recovery_state(&context, &remotes, old_instance, TrafficClass::Throughput,)
             .uncovered_ranges,
         vec![OffsetRange {
             start: 0,

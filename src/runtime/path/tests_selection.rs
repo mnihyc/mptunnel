@@ -1,8 +1,6 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
-use crate::model::capacity::{
-    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, adaptive_reliable_relay_inflight_bytes,
-};
+use crate::model::capacity::{MAX_RELIABLE_SERVICE_QUANTUM_BYTES, reliable_bulk_product_windows};
 use crate::model::path::next_carrier_path_instance_id;
 use crate::protocol::PathUsage;
 use crate::runtime::path::{PacketPathAttachment, PacketPathSelectionInput};
@@ -69,48 +67,58 @@ fn seed_native_packet_evidence(
 }
 
 #[test]
-fn authenticated_output_uses_startup_prior_before_exact_measurement() {
-    let path = "quic://127.0.0.1:12700"
-        .parse::<PathSpec>()
-        .expect("test UDP path");
-    let security = ClientSecurityConfig::for_test(
-        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("test secret"),
-    );
-    let context = ClientPathContext::new(vec![path], security, ResourceLimits::default())
-        .expect("test path context");
-    let instance = RelayPathInstance {
-        key: RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: 0,
+fn request_bulk_discovery_publishes_only_the_configured_planning_product_window() {
+    let context = packet_path_context(&["tcp://127.0.0.1:12701", "quic://127.0.0.1:12702"]);
+    let instances = [
+        RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            path_instance_id: next_carrier_path_instance_id(),
+            attachment_id: 1,
         },
-        path_instance_id: next_carrier_path_instance_id(),
-        attachment_id: 1,
-    };
+        RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            path_instance_id: next_carrier_path_instance_id(),
+            attachment_id: 2,
+        },
+    ];
+    for instance in instances {
+        context.install_relay_path_instance_for_test(instance);
+    }
 
-    let admission = context.reliable_stream_source_admission(
-        [(instance, false)],
-        TrafficClass::Latency,
+    let observation = context.observe_reliable_request_paths(
+        instances.map(|instance| (instance, None)),
         PATH_OPEN_SCORE_BYTES,
+        true,
     );
-    let snapshot = admission
-        .selected_path
-        .expect("authenticated output remains available before measurement");
-
-    assert_eq!(snapshot.state, SchedulerPathState::Suspect);
-    assert_eq!(snapshot.id, PathId(0));
-    assert_eq!(
-        admission.window_bytes,
-        adaptive_reliable_relay_inflight_bytes(
-            Some(snapshot),
-            TrafficClass::Latency,
-            context.mux_limits,
-        )
+    let planning_product_limit =
+        reliable_bulk_product_windows(context.mux_limits).per_output_product_limit_bytes;
+    assert!(!observation.bulk_candidates.is_empty());
+    assert!(
+        [UnderlayProtocol::Tcp, UnderlayProtocol::Udp]
+            .into_iter()
+            .all(|underlay| observation
+                .bulk_candidates
+                .iter()
+                .any(|candidate| candidate.key.underlay == underlay))
     );
-    assert!(admission.window_bytes > 0);
+    assert!(observation.bulk_candidates.iter().all(|candidate| {
+        candidate.snapshot.data_level_limit_bytes == planning_product_limit
+            && candidate.snapshot.data_level_bytes_in_flight == 0
+    }));
+    assert!(observation.paths.iter().all(|path| {
+        path.shared_snapshot
+            .is_some_and(|snapshot| snapshot.data_level_limit_bytes == 0)
+    }));
 }
 
 #[test]
-fn physical_replacement_preserves_logical_configured_slot_load() {
+fn physical_replacement_clears_predecessor_load_and_stale_drop_cannot_release_successor() {
     let context = packet_path_context(&["tcp://127.0.0.1:12710"]);
     let key = RelayPathKey {
         underlay: UnderlayProtocol::Tcp,
@@ -122,9 +130,9 @@ fn physical_replacement_preserves_logical_configured_slot_load() {
         attachment_id: 1,
     };
     context.install_relay_path_instance_for_test(predecessor);
-    let lease = context
-        .try_reserve_relay_path_load_if_unchanged(key, TrafficClass::Throughput, 0, 0)
-        .expect("logical path load reservation");
+    let mut predecessor_lease = context
+        .try_reserve_relay_path_load_if_unchanged(predecessor, TrafficClass::Throughput, 0, 0)
+        .expect("predecessor path load reservation");
     let successor = RelayPathInstance {
         key,
         path_instance_id: next_carrier_path_instance_id(),
@@ -140,7 +148,7 @@ fn physical_replacement_preserves_logical_configured_slot_load() {
     let successor_snapshot = context
         .reliable_path_snapshot_for_instance(successor)
         .expect("successor exact health");
-    assert_eq!(successor_snapshot.active_flows, 1);
+    assert_eq!(successor_snapshot.active_flows, 0);
     let observation =
         context.observe_reliable_request_paths([(successor, None)], PATH_OPEN_SCORE_BYTES, false);
     assert_eq!(observation.paths[0].instance, successor);
@@ -149,10 +157,52 @@ fn physical_replacement_preserves_logical_configured_slot_load() {
             .shared_snapshot
             .expect("exact successor observation")
             .active_flows,
+        0,
+    );
+    assert!(
+        !predecessor_lease.bind_to_instance(successor.path_instance_id),
+        "an exact predecessor lease cannot rebind to a successor",
+    );
+    assert_eq!(
+        context
+            .reliable_path_snapshot_for_instance(successor)
+            .expect("failed rebind leaves successor unchanged")
+            .active_flows,
+        0,
+    );
+
+    let successor_lease = context
+        .try_reserve_relay_path_load_if_unchanged(successor, TrafficClass::Throughput, 0, 0)
+        .expect("successor path load reservation");
+    assert_eq!(
+        context
+            .reliable_path_snapshot_for_instance(successor)
+            .expect("successor owns its own load")
+            .active_flows,
         1,
     );
 
-    drop(lease);
+    predecessor_lease.set_recorded_lane(TrafficClass::Latency);
+    assert_eq!(
+        context
+            .reliable_path_snapshot_for_instance(successor)
+            .expect("successor lane load remains exact")
+            .active_latency_sensitive_flows,
+        0,
+        "a predecessor lane change must not reclassify successor load",
+    );
+
+    drop(predecessor_lease);
+    assert_eq!(
+        context
+            .reliable_path_snapshot_for_instance(successor)
+            .expect("successor remains current")
+            .active_flows,
+        1,
+        "dropping a predecessor lease must not release successor load",
+    );
+
+    drop(successor_lease);
     assert_eq!(
         context
             .reliable_path_snapshot_for_instance(successor)
@@ -180,11 +230,14 @@ fn packet_candidates_require_the_current_instance_and_do_not_consume_product_sta
         record.measured_rate_bps = Some(8_000_000_000.0);
         record.delivery_samples = 100;
         record.product_delivery_rate_bps = Some(9_000_000_000.0);
+        record.product_delivery_samples = 100;
         record.product_delivery_sample_bytes =
             (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).saturating_mul(2);
         let sample_at = Instant::now();
         record.last_delivery_at = Some(sample_at);
         record.delivery_rate_expires_at = Some(sample_at + Duration::from_secs(1));
+        record.product_last_delivery_at = Some(sample_at);
+        record.product_delivery_rate_expires_at = Some(sample_at + Duration::from_secs(1));
         record.active_flows = 7;
         record.active_latency_sensitive_flows = 3;
         record.relay_queue_bytes = 64 * 1024;

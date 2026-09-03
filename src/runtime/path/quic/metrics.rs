@@ -26,22 +26,18 @@ pub(in crate::runtime) struct QuicAckPollDiagnostics {
     pub(in crate::runtime) non_app_limited_sample_count: u64,
     pub(in crate::runtime) timed_non_app_limited_sample_count: u64,
     pub(in crate::runtime) carrier_app_limited: bool,
-    pub(in crate::runtime) delivery_evidence_written_delta: u64,
-    pub(in crate::runtime) delivery_evidence_newly_acked_bytes: u64,
-    pub(in crate::runtime) delivery_evidence_pending_ack_bytes: u64,
-    pub(in crate::runtime) pending_sample_bytes: u64,
-    pub(in crate::runtime) pending_sample_count: u64,
-    pub(in crate::runtime) pending_sample_elapsed: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct UdpPathMetrics {
+    pub(in crate::runtime) controller_path_epoch: u64,
     pub(in crate::runtime) direction: PathMetricDirection,
     pub(in crate::runtime) srtt: Duration,
     pub(in crate::runtime) rttvar: Duration,
     pub(in crate::runtime) rtt_observed: bool,
     pub(in crate::runtime) delivery_rate_bps: f64,
     pub(in crate::runtime) pacing_rate_bps: f64,
+    pub(in crate::runtime) controller_bandwidth_bps: Option<u64>,
     pub(in crate::runtime) inflight_hi: usize,
     pub(in crate::runtime) bytes_in_flight: usize,
     pub(in crate::runtime) pending_bytes: usize,
@@ -50,14 +46,14 @@ pub(in crate::runtime) struct UdpPathMetrics {
     /// Native QUIC congestion-controller app-limited state. Placement-proof
     /// freshness remains independent in `bulk_proof_expires_at`.
     pub(in crate::runtime) app_limited: bool,
+    /// A full bounded window of connection-wide, non-app-limited native ACKs
+    /// has qualified this carrier. This never identifies Product bytes.
     pub(in crate::runtime) ack_derived_data_seen: bool,
     pub(in crate::runtime) delivery_sample_count: u64,
     pub(in crate::runtime) delivery_sample_bytes: u64,
     pub(in crate::runtime) last_delivery_sample_at: Option<Instant>,
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
     pub(in crate::runtime) bulk_proof_expires_at: Option<Instant>,
-    // The latest accepted strict sample is kept separate from cumulative model
-    // state so diagnostics can audit its carrier-clock denominator directly.
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) latest_delivery_sample_bytes: u64,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
@@ -68,6 +64,21 @@ pub(in crate::runtime) struct UdpPathMetrics {
     pub(in crate::runtime) latest_rate_sample_elapsed: Option<Duration>,
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) ack_poll: QuicAckPollDiagnostics,
+}
+
+#[derive(Debug, Default)]
+struct QuicControllerPublicationCursor {
+    previous: Option<(u64, Option<u64>)>,
+}
+
+impl QuicControllerPublicationCursor {
+    fn changed(&mut self, metrics: UdpPathMetrics) -> bool {
+        let current = (
+            metrics.controller_path_epoch,
+            metrics.controller_bandwidth_bps.filter(|rate| *rate > 0),
+        );
+        self.previous.replace(current) != Some(current)
+    }
 }
 
 pub(super) async fn run_server_quic_path_metrics(
@@ -81,18 +92,59 @@ pub(super) async fn run_server_quic_path_metrics(
     #[cfg(feature = "lab-diagnostics")]
     let session_id = path_registration.session_id();
     let mut tracker = UdpPathMetricTracker::default();
+    let Some(native_authority) = connection.native_rate_authority() else {
+        connection.close();
+        return;
+    };
+    let mut authority_changed = native_authority.accepted_change_cursor();
+    let _ = *authority_changed.borrow_and_update();
+    let mut controller_publication = QuicControllerPublicationCursor::default();
     let mut delivery_rate_sample = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_metrics_poll_at = None;
-    let delivery_activity = connection.delivery_activity_notify();
+    let write_activity = connection.write_activity_notify();
     loop {
-        let activity_started = delivery_activity.notified();
+        let activity_started = write_activity.notified();
         tokio::pin!(activity_started);
         activity_started.as_mut().enable();
         if connection.is_closed() {
             return;
         }
-        let metrics = connection.tx_metrics(&mut tracker, PathMetricDirection::ServerToClient);
+        let (metrics, native_shape) = match connection.tx_metrics(&mut tracker) {
+            Ok(sample) => sample,
+            Err(error) if error.is_retryable_publication() => {
+                tokio::select! {
+                    _ = authority_changed.changed() => {}
+                    _ = tokio::time::sleep(QUIC_TIMER_GRANULARITY) => {}
+                    _ = &mut activity_started => {}
+                }
+                continue;
+            }
+            Err(_) => {
+                connection.close();
+                return;
+            }
+        };
+        let shape_publication = native_authority.commit_if_current(native_shape.stamp(), || {
+            // Only the O(1) registry-slot replacement occurs under the native
+            // fence. Fanout is stamped and revision-guarded below, so a large
+            // stream population cannot stall Quinn activation/publication.
+            context
+                .reliable_streams
+                .stage_native_scheduling_shape(&path_registration, native_shape)
+        });
+        match shape_publication {
+            Ok(true) => context
+                .reliable_streams
+                .fanout_native_scheduling_shape(&path_registration, native_shape),
+            Ok(false) => {}
+            Err(error) if error.is_retryable_publication() => continue,
+            Err(_) => {
+                connection.close();
+                return;
+            }
+        }
+        let controller_state_changed = controller_publication.changed(metrics);
         let previous_delivery_rate_sample = delivery_rate_sample;
         delivery_rate_sample = retained_quic_delivery_rate_sample(delivery_rate_sample, metrics);
         #[cfg(feature = "lab-diagnostics")]
@@ -111,7 +163,7 @@ pub(super) async fn run_server_quic_path_metrics(
             poll_elapsed,
         );
 
-        if quic_path_metrics_should_publish_local_sender(metrics)
+        if quic_path_metrics_should_publish_local_sender(metrics, controller_state_changed)
             || (previous_delivery_rate_sample.is_some() && delivery_rate_sample.is_none())
         {
             #[cfg(feature = "lab-diagnostics")]
@@ -125,7 +177,7 @@ pub(super) async fn run_server_quic_path_metrics(
                 lab_diagnostic(
                     "quic_carrier_rate_sample",
                     format_args!(
-                        "session_id={} path_id={} path_instance_id={} direction={:?} rate_source=quic_send_ack_max sample_bytes={} sample_count={} carrier_elapsed_us={} sample_elapsed_us={} raw_rate_bps={} published_rate_bps={} poll_elapsed_us={} total_sample_count={} total_sample_bytes={} app_limited={}",
+                        "session_id={} path_id={} path_instance_id={} direction={:?} rate_source=native_ack_clock sample_bytes={} sample_count={} carrier_elapsed_us={} sample_elapsed_us={} raw_rate_bps={} published_rate_bps={} poll_elapsed_us={} total_sample_count={} total_sample_bytes={} app_limited={}",
                         session_id.0,
                         path_id.0,
                         path_instance_id.as_u64(),
@@ -145,10 +197,11 @@ pub(super) async fn run_server_quic_path_metrics(
             }
             context
                 .reliable_streams
-                .record_local_path_metrics_with_delivery_rate_sample(
+                .record_local_path_metrics_with_native_epoch(
                     &path_registration,
                     path_metrics_from_quic_path(path_id, metrics, delivery_rate_sample),
                     false,
+                    Some(metrics.controller_path_epoch),
                     delivery_rate_sample,
                 );
         }
@@ -159,6 +212,7 @@ pub(super) async fn run_server_quic_path_metrics(
                 // the write instant would only republish pre-delivery state.
                 tokio::time::sleep(quic_path_metrics_ack_interval(metrics)).await;
             }
+            _ = authority_changed.changed() => {}
         }
     }
 }
@@ -168,19 +222,16 @@ fn retained_quic_delivery_rate_sample(
     metrics: UdpPathMetrics,
 ) -> Option<CarrierDeliveryRateSample> {
     let Some(observed_at) = metrics.last_delivery_sample_at else {
-        // The tracker clears this only at a path-evidence epoch reset. That is
-        // the causal boundary that clears a retained expired sidecar.
+        // Only a native path-evidence epoch reset removes this marker. That is
+        // the causal boundary allowed to clear a retained diagnostic sample.
         return None;
     };
     let Some(expires_at) = metrics.bulk_proof_expires_at else {
-        // Expiry deliberately removes placement authority while retaining the
-        // immutable diagnostic sample. Do not fall through to mutable RTT-aged
-        // PathMetrics or erase its provenance.
+        // Expiry revokes placement authority but keeps the immutable sample
+        // for diagnostics until the native path epoch itself changes.
         return previous;
     };
     if previous.is_some_and(|sample| sample.observed_at == observed_at) {
-        // App-limited shape polls can refresh current pacing/RTT without a new
-        // qualified ACK sample. Preserve the whole prior sample epoch bundle.
         return previous;
     }
     Some(CarrierDeliveryRateSample {
@@ -195,8 +246,14 @@ fn retained_quic_delivery_rate_sample(
     })
 }
 
-fn quic_path_metrics_should_publish_local_sender(metrics: UdpPathMetrics) -> bool {
-    metrics.delivery_sample_count > 0 || metrics.ack_derived_data_seen
+fn quic_path_metrics_should_publish_local_sender(
+    metrics: UdpPathMetrics,
+    controller_state_changed: bool,
+) -> bool {
+    // A fresh path epoch must clear an older live controller value even before
+    // Product delivery proof is reacquired. Stable idle controller state does
+    // not needlessly walk every bound response-stream registry entry.
+    controller_state_changed || metrics.delivery_sample_count > 0 || metrics.ack_derived_data_seen
 }
 
 #[cfg(feature = "lab-diagnostics")]
@@ -208,25 +265,26 @@ pub(super) fn log_quic_ack_poll_diagnostics(
     poll_elapsed: Duration,
 ) {
     let ack = metrics.ack_poll;
-    if ack.newly_lost_bytes > 0
-        || ack.newly_acked_bytes > 0
-        || ack.delivery_evidence_written_delta > 0
-        || ack.pending_sample_bytes > 0
-    {
+    if ack.newly_lost_bytes > 0 || ack.newly_acked_bytes > 0 {
         lab_diagnostic(
             "quic_carrier_ack_poll",
             format_args!(
-                "session_id={} path_id={} path_instance_id={} direction={:?} poll_elapsed_us={} srtt_us={} rttvar_us={} congestion_window_bytes={} bytes_in_flight={} pending_bytes={} pacing_rate_bps={} loss_ppm={} newly_lost_bytes={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
+                "session_id={} path_id={} path_instance_id={} direction={:?} path_epoch={} poll_elapsed_us={} srtt_us={} rttvar_us={} congestion_window_bytes={} bytes_in_flight={} pending_bytes={} controller_bandwidth_bps={} pacing_rate_bps={} loss_ppm={} newly_lost_bytes={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={}",
                 session_id.0,
                 path_id.0,
                 path_instance_id,
                 metrics.direction,
+                metrics.controller_path_epoch,
                 poll_elapsed.as_micros(),
                 metrics.srtt.as_micros(),
                 metrics.rttvar.as_micros(),
                 metrics.inflight_hi,
                 metrics.bytes_in_flight,
                 metrics.pending_bytes,
+                metrics
+                    .controller_bandwidth_bps
+                    .map(|rate| rate.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 metrics.pacing_rate_bps.round() as u64,
                 metrics.loss_ppm.unwrap_or(0),
                 ack.newly_lost_bytes,
@@ -238,18 +296,6 @@ pub(super) fn log_quic_ack_poll_diagnostics(
                 ack.non_app_limited_sample_count,
                 ack.timed_non_app_limited_sample_count,
                 ack.carrier_app_limited,
-                ack.delivery_evidence_written_delta,
-                ack.delivery_evidence_newly_acked_bytes,
-                ack.delivery_evidence_pending_ack_bytes,
-                ack.pending_sample_bytes,
-                ack.pending_sample_count,
-                ack.pending_sample_elapsed.as_micros(),
-                metrics
-                    .bulk_proof_expires_at
-                    .map(|expires_at| expires_at
-                        .saturating_duration_since(Instant::now())
-                        .as_micros())
-                    .unwrap_or(0),
             ),
         );
     }
@@ -261,9 +307,8 @@ fn path_metrics_from_quic_path(
     delivery_rate_sample: Option<CarrierDeliveryRateSample>,
 ) -> PathMetrics {
     let now = Instant::now();
-    // The retained sidecar is the immutable qualified ACK epoch. Current
-    // shape polls may update RTT, flight, and Quinn pacing, but cannot relabel
-    // those values as belonging to an older delivery sample.
+    // Current shape polls may update RTT, flight, and Quinn pacing, but only
+    // the immutable full-window ACK epoch may carry native rate authority.
     let qualified_rate_epoch = delivery_rate_sample.filter(|sample| {
         sample.sample_count > 0 && sample.sample_bytes > 0 && sample.observed_at <= now
     });
@@ -295,9 +340,11 @@ fn path_metrics_from_quic_path(
         metric_epoch: metric_epoch_now(),
         metric_age_us: qualified_rate_epoch
             .map(|sample| {
-                let seen = sample.observed_at;
-                let micros = now.saturating_duration_since(seen).as_micros();
-                u32::try_from(micros).unwrap_or(u32::MAX)
+                u32::try_from(
+                    now.saturating_duration_since(sample.observed_at)
+                        .as_micros(),
+                )
+                .unwrap_or(u32::MAX)
             })
             .unwrap_or(0),
         rate_valid_for_us,
@@ -325,7 +372,11 @@ fn path_metrics_from_quic_path(
                 / QUIC_INITIAL_WINDOW_PACKETS as f64)
                 .clamp(0.0, 1.0),
         ),
-        app_limited: qualified_rate_epoch.is_none() && metrics.app_limited,
+        // Application-limited is current Quinn controller state. The retained
+        // delivery epoch below owns rate provenance only and cannot rewrite it.
+        app_limited: metrics.app_limited,
+        // This flag is generic native carrier evidence in PathMetrics; MPP
+        // Product completion remains independently DataACK-derived.
         has_ack_derived_data_sample: rate_observed || metrics.ack_derived_data_seen,
         data_sample_count: qualified_rate_epoch.map_or(0, |sample| sample.sample_count),
         data_sample_bytes: qualified_rate_epoch.map_or(0, |sample| sample.sample_bytes),

@@ -3,8 +3,9 @@ use crate::model::capacity::{
     MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES, MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES,
     PathRateSample, QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
     RELIABLE_INITIAL_RTT, RELIABLE_INITIAL_WINDOW_PACKETS, UDP_BASELINE_PACKET_PAYLOAD_BYTES,
-    adaptive_reliable_relay_inflight_bytes, product_delivery_samples_override_startup_prior,
+    reliable_product_feedback_window_bytes,
 };
+use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::model::timing::{transport_pto_from_ms, transport_pto_from_snapshot};
 use crate::mux::MuxLimits;
@@ -191,7 +192,7 @@ pub(in crate::runtime) fn apply_bulk_latency_isolation(
         return;
     }
     let isolation_bytes =
-        adaptive_reliable_relay_inflight_bytes(None, TrafficClass::Latency, mux_limits) as u64;
+        reliable_product_feedback_window_bytes(None, TrafficClass::Latency, mux_limits) as u64;
     for observation in observations {
         let latency_flows = u64::from(observation.active_latency_sensitive_flows);
         observation.relay_queue_bytes = observation
@@ -332,10 +333,14 @@ fn endpoint_only_startup_observation_for_scoring(
         measured_rate_bps: None,
         measured_loss_rate: None,
         delivery_samples: 0,
+        delivery_sample_bytes: 0,
         product_delivery_rate_bps: None,
+        product_delivery_samples: 0,
         product_delivery_sample_bytes: 0,
         last_delivery_at: None,
         delivery_rate_expires_at: None,
+        product_last_delivery_at: None,
+        product_delivery_rate_expires_at: None,
         carrier_srtt_ms: validated_timing.and_then(|timing| timing.2),
         carrier_rttvar_ms: validated_timing.and_then(|timing| timing.3),
         carrier_loss_rate: None,
@@ -596,11 +601,15 @@ pub(in crate::runtime) fn packet_path_snapshot(
         ClientPathObservation {
             measured_rate_bps: None,
             delivery_samples: 0,
+            delivery_sample_bytes: 0,
             product_delivery_rate_bps: None,
+            product_delivery_samples: 0,
             product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
             delivery_rate_expires_at: None,
+            product_last_delivery_at: None,
+            product_delivery_rate_expires_at: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
             relay_bytes_in_flight: 0,
@@ -620,13 +629,12 @@ pub(in crate::runtime) fn path_snapshot_with_id(
         RateHint::Unlimited => 1_000_000_000_000.0,
         RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     };
-    let product_delivery_samples = reliable_product_delivery_samples(path, observation);
-    let product_progress_rate_bps = (product_delivery_samples > 0
-        && observation.product_delivery_sample_bytes > 0)
-        .then_some(observation.product_delivery_rate_bps)
-        .flatten();
-    let has_durable_product_progress =
-        client_path_observation_has_durable_product_progress(path, observation);
+    // The health record retains the raw Product point for diagnostics and
+    // smoothing. Completion/ranking sees it only through the established
+    // Product service-quantum qualification boundary.
+    let product_progress_rate_bps =
+        client_path_observation_qualified_product_completion_rate(path, observation);
+    let has_durable_product_progress = product_progress_rate_bps.is_some();
     let carrier_capacity_rate_bps = observation.carrier_delivery_rate_bps.filter(|_| {
         path.underlay != UnderlayProtocol::Tcp
             || bulk_candidate_has_native_carrier_rate_evidence(path, observation)
@@ -634,10 +642,7 @@ pub(in crate::runtime) fn path_snapshot_with_id(
     let (delivery_rate_bps, rate_scope) = if let Some(rate) = carrier_capacity_rate_bps {
         (rate, PathRateScope::PathCapacity)
     } else if let Some(rate) = product_progress_rate_bps {
-        if path.underlay == UnderlayProtocol::Tcp
-            && !product_delivery_samples_override_startup_prior(product_delivery_samples)
-            && hinted_delivery_rate_bps > rate
-        {
+        if hinted_delivery_rate_bps >= rate {
             (hinted_delivery_rate_bps, PathRateScope::PathCapacity)
         } else {
             (rate, PathRateScope::PerFlowGoodput)
@@ -699,10 +704,10 @@ pub(in crate::runtime) fn path_snapshot_with_id(
         carrier_inflight_limit_bytes: observation.carrier_inflight_limit_bytes,
         data_level_limit_bytes: 0,
         confidence,
-        // App-limited qualifies the rate sample that produced this model; it
-        // is not an instantaneous idle test. Outstanding product or carrier
-        // flight must not silently promote a lower-bound rate to capacity.
-        app_limited: observation.carrier_app_limited,
+        // This local scheduler bit is current native underfill, not retained
+        // delivery-epoch provenance. Unknown capability fails closed for the
+        // request-only QUIC acquisition tie-break.
+        app_limited: observation.carrier_current_app_limited == Some(true),
     }
 }
 
@@ -749,40 +754,60 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     direction: PathMetricDirection,
     now: Instant,
 ) -> PathMetrics {
-    let carrier_data_sample_count = if snapshot.underlay == UnderlayProtocol::Udp {
-        observation.carrier_delivery_samples
-    } else {
-        0
-    };
-    let data_sample_count = observation
-        .delivery_samples
-        .saturating_add(carrier_data_sample_count);
-    let has_ack_derived_data_sample =
-        data_sample_count > 0 || observation.carrier_ack_derived_data_seen;
     // Preserve the authority epoch selected by `path_snapshot_with_id` rather
-    // than guessing it from equal numeric rates. Startup priors have no rate
-    // authority; carrier, Product, and generic samples retain only the
-    // remaining lifetime of their immutable source deadline.
+    // than guessing it from equal numeric rates. Startup priors and a live
+    // controller opportunity have no detached rate authority; carrier,
+    // Product, and generic samples retain only their immutable source lifetime.
     let carrier_rate_selected = snapshot.carrier_delivery_rate_bps.is_some();
+    let native_authority_selected =
+        carrier_rate_selected && observation.native_carrier_authority_basis.is_some();
     let product_rate_selected = !carrier_rate_selected
         && snapshot.product_progress_rate_bps.is_some()
         && snapshot.rate_scope == PathRateScope::PerFlowGoodput;
     let generic_rate_selected = !carrier_rate_selected
         && snapshot.product_progress_rate_bps.is_none()
         && observation.measured_rate_bps.is_some();
-    let (rate_observed_at, rate_expires_at) = if carrier_rate_selected {
-        (
-            observation.carrier_last_delivery_at,
-            observation.carrier_bulk_proof_expires_at,
-        )
-    } else if product_rate_selected || generic_rate_selected {
-        (
-            observation.last_delivery_at,
-            observation.delivery_rate_expires_at,
-        )
-    } else {
-        (None, None)
-    };
+    let wire_delivery_rate_bps = snapshot.delivery_rate_bps.max(1.0);
+    let (rate_observed_at, rate_expires_at, data_sample_count, data_sample_bytes) =
+        if native_authority_selected {
+            // Native C0/Bop is endpoint-local central authority, not a
+            // transferable ACK epoch. Publish no synthetic sample/freshness
+            // provenance alongside its numeric diagnostic value.
+            (None, None, 0, 0)
+        } else if carrier_rate_selected {
+            (
+                observation.carrier_last_delivery_at,
+                observation.carrier_bulk_proof_expires_at,
+                if snapshot.underlay == UnderlayProtocol::Udp {
+                    observation.carrier_delivery_samples
+                } else {
+                    0
+                },
+                if snapshot.underlay == UnderlayProtocol::Udp {
+                    observation.carrier_delivery_sample_bytes
+                } else {
+                    0
+                },
+            )
+        } else if product_rate_selected {
+            (
+                observation.product_last_delivery_at,
+                observation.product_delivery_rate_expires_at,
+                observation.product_delivery_samples,
+                observation.product_delivery_sample_bytes,
+            )
+        } else if generic_rate_selected {
+            (
+                observation.last_delivery_at,
+                observation.delivery_rate_expires_at,
+                observation.delivery_samples,
+                observation.delivery_sample_bytes,
+            )
+        } else {
+            (None, None, 0, 0)
+        };
+    let has_ack_derived_data_sample = !native_authority_selected
+        && (data_sample_count > 0 || observation.carrier_ack_derived_data_seen);
     let has_rate_epoch = rate_observed_at
         .zip(rate_expires_at)
         .is_some_and(|(observed_at, _)| observed_at <= now);
@@ -798,13 +823,14 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
     let pacing_rate_observed = has_rate_epoch
         && carrier_rate_selected
         && !observation.explicit_carrier_capacity_proof
+        && !native_authority_selected
         && observation.carrier_pacing_rate_bps.is_some();
     let pacing_rate_bps = if pacing_rate_observed {
         observation
             .carrier_pacing_rate_bps
-            .unwrap_or(snapshot.delivery_rate_bps)
+            .unwrap_or(wire_delivery_rate_bps)
     } else {
-        snapshot.delivery_rate_bps
+        wire_delivery_rate_bps
     };
     // Diagnostic publication is deliberately broader than scheduler loss
     // authority. In particular, native QUIC congestion observations remain
@@ -827,7 +853,7 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         srtt_us: millis_to_micros_u32(snapshot.srtt_ms),
         rttvar_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
         jitter_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
-        delivery_rate_bps: snapshot.delivery_rate_bps.max(1.0).round() as u64,
+        delivery_rate_bps: wire_delivery_rate_bps.round() as u64,
         pacing_rate_bps: pacing_rate_bps.max(1.0).round() as u64,
         pacing_rate_observed,
         loss_ppm: diagnostic_loss_rate
@@ -845,14 +871,12 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         inflight_limit_bytes: snapshot.carrier_inflight_limit_bytes,
         inflight_hi_bytes: snapshot.carrier_inflight_limit_bytes,
         confidence_ppm: ratio_to_ppm(snapshot.confidence),
-        app_limited: snapshot.app_limited,
+        // PATH_METRICS carries immutable delivery-epoch qualification, never
+        // this sender's live local controller state.
+        app_limited: observation.carrier_app_limited,
         has_ack_derived_data_sample,
         data_sample_count,
-        data_sample_bytes: if snapshot.underlay == UnderlayProtocol::Udp {
-            observation.carrier_delivery_sample_bytes
-        } else {
-            0
-        },
+        data_sample_bytes,
     }
 }
 
@@ -901,9 +925,18 @@ pub(in crate::runtime) fn path_model_confidence(observation: ClientPathObservati
         // one ordinary ACK. Product admission durability is modeled separately.
         return 1.0;
     }
+    if observation.native_carrier_authority_basis
+        == Some(CarrierRateAuthorityBasis::NativeOperational)
+    {
+        // Exact native operational authority is strong without pretending it
+        // came from an MPP/ACK evidence window. StartupPrior deliberately
+        // retains ordinary startup confidence below.
+        return 1.0;
+    }
     let delivery_confidence = (f64::from(
         observation
             .delivery_samples
+            .saturating_add(observation.product_delivery_samples)
             .saturating_add(observation.carrier_delivery_samples),
     ) / RELIABLE_INITIAL_WINDOW_PACKETS as f64)
         .clamp(0.0, 1.0);
@@ -1011,6 +1044,7 @@ pub(in crate::runtime) fn bulk_candidate_has_ack_data_evidence(
 ) -> bool {
     reliable_product_delivery_samples(path, observation) > 0
         || observation.last_delivery_at.is_some()
+        || observation.product_last_delivery_at.is_some()
         || (path.underlay == UnderlayProtocol::Udp
             && (observation.carrier_delivery_samples > 0
                 || observation.carrier_last_delivery_at.is_some()
@@ -1029,7 +1063,10 @@ pub(in crate::runtime) fn bulk_candidate_has_native_carrier_rate_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    (observation.explicit_carrier_capacity_proof && observation.carrier_delivery_rate_bps.is_some())
+    (observation.native_carrier_authority_basis.is_some()
+        && observation.carrier_delivery_rate_bps.is_some())
+        || (observation.explicit_carrier_capacity_proof
+            && observation.carrier_delivery_rate_bps.is_some())
         || carrier_has_durable_delivery_window(path, observation)
 }
 
@@ -1076,7 +1113,19 @@ fn client_path_observation_has_durable_product_progress(
     observation: ClientPathObservation,
 ) -> bool {
     reliable_product_delivery_samples(path, observation) > 0
+        && observation
+            .product_delivery_rate_bps
+            .is_some_and(|rate| rate.is_finite() && rate > 0.0)
         && observation.product_delivery_sample_bytes >= product_delivery_sample_floor_bytes()
+}
+
+fn client_path_observation_qualified_product_completion_rate(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+) -> Option<f64> {
+    client_path_observation_has_durable_product_progress(path, observation)
+        .then_some(observation.product_delivery_rate_bps)
+        .flatten()
 }
 
 pub(in crate::runtime) fn bulk_candidate_has_sender_delivery_evidence(
@@ -1089,8 +1138,10 @@ pub(in crate::runtime) fn bulk_candidate_has_sender_delivery_evidence(
 
 fn observation_has_sender_delivery_evidence(observation: ClientPathObservation) -> bool {
     observation.delivery_samples > 0
+        || observation.product_delivery_samples > 0
         || observation.carrier_delivery_samples > 0
         || observation.last_delivery_at.is_some()
+        || observation.product_last_delivery_at.is_some()
         || observation.carrier_last_delivery_at.is_some()
         || observation.carrier_ack_derived_data_seen
         || observation.measured_rate_bps.is_some()
@@ -1104,13 +1155,8 @@ fn product_delivery_sample_floor_bytes() -> u64 {
     (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
-fn reliable_product_delivery_samples(path: &PathSpec, observation: ClientPathObservation) -> u32 {
-    match path.underlay {
-        UnderlayProtocol::Udp => observation
-            .delivery_samples
-            .saturating_sub(observation.datagram_feedback_samples),
-        UnderlayProtocol::Tcp => observation.delivery_samples,
-    }
+fn reliable_product_delivery_samples(_path: &PathSpec, observation: ClientPathObservation) -> u32 {
+    observation.product_delivery_samples
 }
 
 pub(in crate::runtime) fn udp_reliable_stream_loss_reinjection_penalty_ms(
@@ -1150,11 +1196,15 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
     pub(in crate::runtime) measured_loss_rate: Option<f64>,
     pub(in crate::runtime) delivery_samples: u32,
+    pub(in crate::runtime) delivery_sample_bytes: u64,
     pub(in crate::runtime) product_delivery_rate_bps: Option<f64>,
+    pub(in crate::runtime) product_delivery_samples: u32,
     pub(in crate::runtime) product_delivery_sample_bytes: u64,
     pub(in crate::runtime) datagram_feedback_samples: u32,
     pub(in crate::runtime) last_delivery_at: Option<Instant>,
     pub(in crate::runtime) delivery_rate_expires_at: Option<Instant>,
+    pub(in crate::runtime) product_last_delivery_at: Option<Instant>,
+    pub(in crate::runtime) product_delivery_rate_expires_at: Option<Instant>,
     pub(in crate::runtime) active_flows: u32,
     pub(in crate::runtime) active_latency_sensitive_flows: u32,
     pub(in crate::runtime) relay_bytes_in_flight: u64,
@@ -1175,9 +1225,15 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) carrier_delivery_window_covered: bool,
     pub(in crate::runtime) carrier_last_delivery_at: Option<Instant>,
     pub(in crate::runtime) carrier_bulk_proof_expires_at: Option<Instant>,
+    /// Immutable qualification of the retained carrier delivery-rate epoch.
     pub(in crate::runtime) carrier_app_limited: bool,
+    /// Current exact local native-controller state; unavailable is `None`.
+    pub(in crate::runtime) carrier_current_app_limited: Option<bool>,
     pub(in crate::runtime) carrier_ack_derived_data_seen: bool,
     pub(in crate::runtime) explicit_carrier_capacity_proof: bool,
+    /// Endpoint-local central QUIC C0/Bop provenance. It qualifies NativeMode
+    /// scheduling without fabricating an ACK sample or transferable epoch.
+    pub(in crate::runtime) native_carrier_authority_basis: Option<CarrierRateAuthorityBasis>,
     pub(in crate::runtime) path_proof_success: bool,
 }
 
@@ -1193,11 +1249,15 @@ impl Default for ClientPathObservation {
             measured_rate_bps: None,
             measured_loss_rate: None,
             delivery_samples: 0,
+            delivery_sample_bytes: 0,
             product_delivery_rate_bps: None,
+            product_delivery_samples: 0,
             product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
             delivery_rate_expires_at: None,
+            product_last_delivery_at: None,
+            product_delivery_rate_expires_at: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
             relay_bytes_in_flight: 0,
@@ -1219,8 +1279,10 @@ impl Default for ClientPathObservation {
             carrier_last_delivery_at: None,
             carrier_bulk_proof_expires_at: None,
             carrier_app_limited: true,
+            carrier_current_app_limited: None,
             carrier_ack_derived_data_seen: false,
             explicit_carrier_capacity_proof: false,
+            native_carrier_authority_basis: None,
             path_proof_success: false,
         }
     }

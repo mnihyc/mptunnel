@@ -15,7 +15,8 @@ use super::io::{
     ReliableAckGapReinjectionProgress, ReliablePathStalenessObservation,
     ReliableResponsePathStaleness, apply_and_write_ready_stream_data_batch,
     begin_reliable_stream_ack, collect_ready_stream_data_batch, pending_stream_fin_ready,
-    read_reliable_relay_payload, receive_stream_fin, resize_reliable_relay_buffer,
+    read_reliable_relay_payload, receive_stream_fin, reconcile_accepted_copy_wake,
+    resize_reliable_relay_buffer, retain_accepted_copy_wake,
     stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
     stream_data_range_already_delivered, stream_final_offset_tail_reinjection_frames_normalized,
     stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
@@ -24,25 +25,20 @@ use super::io::{
 use crate::lab_diagnostics::{
     lab_assert_server_sender_service_balanced, lab_diagnostic, lab_perf_flush, lab_perf_record,
 };
-use crate::model::admission::{
-    ReliableDataAckFrontierState, reliable_relay_source_staging_headroom,
-};
+use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit,
     adaptive_reliable_relay_reinjection_bytes, relay_lane_startup_chunk_bytes,
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
-    reliable_relay_sender_dispatch_budget, reliable_stream_advertised_window_bytes,
-    reliable_stream_initial_advertised_window_bytes,
+    reliable_relay_buffer_len, reliable_relay_sender_dispatch_budget,
+    reliable_stream_advertised_window_bytes, reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::{
     reliable_data_ack_gap_timing, reliable_data_ack_recovery_deadline,
-    reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
-    sender_service_retry_delay,
+    reliable_relay_tail_reinjection_delay, sender_service_retry_delay,
 };
-use crate::model::work::ReliableWorkClass;
 use crate::model::work::{
-    reliable_critical_tail_reinjection_is_over_budget,
-    reliable_critical_tail_reinjection_limit_bytes, reliable_reinjection_service_limit_bytes,
+    RangeRecoveryState, ReliableWorkClass, reliable_critical_tail_reinjection_is_over_budget,
+    reliable_critical_tail_reinjection_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
@@ -70,9 +66,9 @@ use crate::runtime::sender::{
 use crate::runtime::stream::response::ResponseDataAckRecoveryCandidate;
 use crate::runtime::stream::{
     AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement, ReliablePathStream,
-    ReliableRecvProgress, ServerReliableStreamRegistry, arm_carrier_capacity_notifies,
-    reliable_relay_recv_progress_resend_active, reliable_stream_recv_progress_interval,
-    wait_for_carrier_capacity_notifies,
+    ReliableRecvProgress, RequalificationAttempt, ServerReliableStreamRegistry,
+    arm_carrier_capacity_notifies, reliable_relay_recv_progress_resend_active,
+    reliable_stream_recv_progress_interval, wait_for_carrier_capacity_notifies,
 };
 use crate::runtime::telemetry::{ObservedProductIo, RuntimeTelemetry};
 use crate::scheduler::{PathSnapshot, TrafficClass};
@@ -369,28 +365,28 @@ fn stream_ack_is_authoritative_contiguous_prefix(
         && matches!(ranges, [range] if range.start == 0 && range.end == frontier)
 }
 
-// Response ordered-owner debt
-fn reliable_relay_data_ack_outstanding_bytes(
-    lane: TrafficClass,
-    ack_frontier: u64,
-    next_offset: u64,
-) -> usize {
-    if !lane.is_bulk() || ack_frontier >= next_offset {
-        return 0;
-    }
-    // This is a tail guard, not reinjection debt. It blocks alternate OriginalData and
-    // missing-owner failover while lower original-data bytes are unresolved, but it
-    // must not make the live leading path itself inadmissible.
-    usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
-}
-
 // Response reinjection deadlines
 fn reliable_relay_current_data_ack_outstanding_bytes(
-    lane: TrafficClass,
+    _lane: TrafficClass,
     send_stream: &ReliableSendStream,
-    ack_frontier: u64,
+    _ack_frontier: u64,
 ) -> usize {
-    reliable_relay_data_ack_outstanding_bytes(lane, ack_frontier, send_stream.next_offset())
+    // The retained send cache is the exact unique Product debt after all
+    // complete and incomplete DataACK releases. It applies in every lane.
+    send_stream.reinjection_bytes()
+}
+
+fn reliable_relay_response_source_staging_headroom(
+    _lane: TrafficClass,
+    product_window_bytes: usize,
+    retained_product_bytes: usize,
+    queued_original_data_bytes: usize,
+) -> usize {
+    // `product_window_bytes` is already the chosen exact output tier's sum P,
+    // bounded by the stream/reorder/repair resource envelope. Source bytes do
+    // not acquire another authority before Data Sequence assignment.
+    product_window_bytes
+        .saturating_sub(retained_product_bytes.saturating_add(queued_original_data_bytes))
 }
 
 fn reliable_relay_tail_reinjection_deadline(
@@ -830,13 +826,58 @@ fn response_sender_wait_state(
     }
 }
 
+/// Arms the carrier release edge before response credit is revalidated.
+///
+/// `Notify::notify_waiters` is not retained for a waiter created afterward.
+/// The response actor therefore has to establish this observation before the
+/// synchronous credit check that can race with a writer release.
+fn arm_response_sender_capacity_wait(
+    notifies: Vec<Arc<tokio::sync::Notify>>,
+) -> Option<impl std::future::Future<Output = ()> + Send> {
+    arm_carrier_capacity_notifies(notifies)
+}
+
 // Response reinjection output selection
 fn reliable_failed_original_tail_reinjection_ready(
-    path_stream: &ReliablePathStream,
+    recovery: &RangeRecoveryState,
     send_stream: &ReliableSendStream,
 ) -> bool {
-    send_stream.reinjection_bytes() > 0
-        && !path_stream.uncovered_failed_original_ranges().is_empty()
+    send_stream.reinjection_bytes() > 0 && !recovery.uncovered_ranges.is_empty()
+}
+
+/// Whether the exact lowest retained Product range has a structurally eligible
+/// output other than every output already carrying that range.
+///
+/// This is owner-relative by construction. A draining owner is not counted as
+/// a target, but it also cannot erase the one healthy output that can recover
+/// its bytes. Queue, flight, rate, and pacing capacity remain apply-time gates.
+fn has_distinct_response_reinjection_alternative(
+    path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
+    complete: bool,
+    ranges: &[OffsetRange],
+    ack_frontier: u64,
+) -> bool {
+    let preview = if stream_ack_ranges_expose_authoritative_gap(complete, ranges) {
+        send_stream
+            .retransmission_frames_for_normalized_ack_gaps(ranges, 1)
+            .into_iter()
+            .next()
+    } else if complete && ack_frontier < send_stream.next_offset() {
+        send_stream
+            .retransmission_frames_for_ranges(
+                &[OffsetRange {
+                    start: ack_frontier,
+                    end: send_stream.next_offset(),
+                }],
+                1,
+            )
+            .into_iter()
+            .next()
+    } else {
+        None
+    };
+    preview.is_some_and(|frame| path_stream.has_reinjection_path_for_frame(&frame))
 }
 
 fn response_recovery_output_identity(
@@ -862,7 +903,7 @@ fn mark_response_path_staleness(
             let identity = response_recovery_output_identity(*candidate);
             ReliablePathStalenessObservation::new(
                 identity,
-                path_stream.has_nonstale_reinjection_alternative(identity),
+                path_stream.has_nonstale_reinjection_alternative(identity, lane),
                 Some(candidate.key.underlay),
                 path_stream.response_output_snapshot(identity, lane),
             )
@@ -870,7 +911,7 @@ fn mark_response_path_staleness(
         .collect::<SmallVec<[_; 4]>>();
     let mut marked_stale = false;
     for stale in staleness.stale_paths(&observations, data_ack_progress_outputs) {
-        if path_stream.mark_response_output_stale(stale) {
+        if path_stream.mark_response_output_stale(stale, lane) {
             marked_stale = true;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -958,6 +999,7 @@ fn prefix_reinjection_frames_with_available_output_classified(
 fn prefix_live_reinjection_frames_with_carrier_credit(
     response_sender: &ServerResponseSenderService,
     path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
     reinjection_frames: Vec<Frame>,
     cause: RelaySendCause,
 ) -> (Vec<Frame>, Option<u64>) {
@@ -967,7 +1009,7 @@ fn prefix_live_reinjection_frames_with_carrier_credit(
         // Live-tail recovery prefers a drained carrier but retains bounded
         // liveness when every alternate carries unrelated shared work.
         if response_sender
-            .reinjection_path_snapshot_for_frame(path_stream, &frame, cause)
+            .reinjection_path_snapshot_for_frame(path_stream, send_stream, &frame, cause)
             .is_none()
         {
             return (
@@ -1008,6 +1050,7 @@ struct ServerDataAckReinjectionOutcome {
     persistent_ready: bool,
     has_multipath_alternative: bool,
     has_measured_target: bool,
+    target_service_exhausted: bool,
     base_limit: usize,
     service_limit: usize,
     tail_recovery_candidate: Option<ResponseDataAckRecoveryCandidate>,
@@ -1040,6 +1083,46 @@ fn server_ack_gap_timer_deadline(
         .map(tokio::time::Instant::from_std)
 }
 
+#[cfg(feature = "lab-diagnostics")]
+fn lab_server_response_recovery_wake(
+    stream_id: StreamId,
+    wake: &'static str,
+    ack_frontier: u64,
+    sent_offset: u64,
+    consumed_deadline: Option<Instant>,
+    successor_deadline: Option<Instant>,
+    observed_at: Instant,
+) {
+    let deadline_late_us = consumed_deadline
+        .map(|deadline| {
+            observed_at
+                .saturating_duration_since(deadline)
+                .as_micros()
+                .to_string()
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let successor_deadline_in_us = successor_deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(observed_at)
+                .as_micros()
+                .to_string()
+        })
+        .unwrap_or_else(|| "none".to_string());
+    lab_diagnostic(
+        "server_response_recovery_wake",
+        format_args!(
+            "stream_id={} wake={} ack_frontier={} sent_offset={} deadline_late_us={} successor_deadline_in_us={}",
+            stream_id.0,
+            wake,
+            ack_frontier,
+            sent_offset,
+            deadline_late_us,
+            successor_deadline_in_us,
+        ),
+    );
+}
+
 /// Evaluates the retained response Data ACK state as one recovery lifecycle.
 ///
 /// ACK receipt, timer expiry, carrier-capacity release, and output-model
@@ -1063,10 +1146,17 @@ fn evaluate_server_data_ack_reinjection(
 ) -> ServerDataAckReinjectionOutcome {
     let complete = authoritative_ack.complete();
     let ranges = authoritative_ack.ranges();
-    let has_multipath_alternative = path_stream.has_multipath_reinjection_alternative();
     let base_limit =
         adaptive_reliable_relay_reinjection_bytes(send_path_snapshot, relay_lane, mux_limits);
     let exposes_gap = stream_ack_ranges_expose_authoritative_gap(complete, ranges);
+    let has_multipath_alternative = exposes_gap
+        && has_distinct_response_reinjection_alternative(
+            path_stream,
+            send_stream,
+            complete,
+            ranges,
+            ack_frontier,
+        );
     let original_flight = exposes_gap
         .then(|| path_stream.data_ack_recovery_candidate(ack_frontier))
         .flatten();
@@ -1122,6 +1212,7 @@ fn evaluate_server_data_ack_reinjection(
             persistent_ready,
             has_multipath_alternative,
             has_measured_target,
+            target_service_exhausted: false,
             base_limit,
             service_limit: 0,
             tail_recovery_candidate: original_flight,
@@ -1129,10 +1220,12 @@ fn evaluate_server_data_ack_reinjection(
         };
     };
 
-    let service_limit = reliable_reinjection_service_limit_bytes(
-        Some(target.snapshot),
-        response_sender.bytes(),
-        send_stream.reinjection_bytes(),
+    let service_limit = response_sender.reinjection_service_limit_for_target(
+        path_stream,
+        send_stream,
+        target.identity,
+        target.snapshot,
+        false,
         mux_limits,
     );
     let frames = stream_ack_gap_reinjection_frames_normalized(
@@ -1144,17 +1237,18 @@ fn evaluate_server_data_ack_reinjection(
         has_multipath_alternative,
         true,
     );
+    #[cfg(feature = "lab-diagnostics")]
+    let recovery_extent = frames
+        .first()
+        .and_then(reliable_stream_frame_extent)
+        .map(|(start, end, _)| (start, end));
     let frame_count = frames.len();
-    let retry_after = reliable_data_retransmission_interval(
-        Some(target.snapshot.underlay),
-        Some(target.snapshot),
-    );
     let cause =
         RelaySendCause::persistent_server_ack_gap_reinjection(target.identity, target.snapshot);
     let mut queued = 0usize;
-    for frame in frames {
+    for (frame_index, frame) in frames.into_iter().enumerate() {
         let accepted = if response_sender.has_queued_reinjection_overlap(&frame)
-            || path_stream.has_recent_reinjection_overlap(&frame, retry_after)
+            || path_stream.has_recent_reinjection_overlap(&frame)
         {
             false
         } else {
@@ -1172,20 +1266,54 @@ fn evaluate_server_data_ack_reinjection(
                 stream_id.0, accepted,
             ),
         );
-    }
-    if queued > 0 {
-        progress.record_reinjection_queued(retry_after);
+        if !accepted && frame_index == 0 {
+            break;
+        }
     }
     #[cfg(feature = "lab-diagnostics")]
     if queued > 0 {
+        let (gap_start, gap_end) = recovery_extent.unwrap_or((ack_frontier, ack_frontier));
+        let (owner_underlay, owner_path_id, owner_incarnation, owner_age_us) = original_flight
+            .map(|owner| {
+                (
+                    format!("{:?}", owner.key.underlay),
+                    owner.key.path_id.0.to_string(),
+                    owner.output_incarnation.to_string(),
+                    observed_at
+                        .saturating_duration_since(owner.sent_at)
+                        .as_micros()
+                        .to_string(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    "none".to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                )
+            });
+        let deadline_late_us = candidate_gap_deadline
+            .map(|deadline| observed_at.saturating_duration_since(deadline).as_micros())
+            .unwrap_or(0);
         lab_diagnostic(
             "server_data_ack_recovery",
             format_args!(
-                "stream_id={} ack_frontier={} ranges={} target_underlay={:?} frame_count={} queued={} base_limit={} service_limit={}",
+                "stream_id={} ack_frontier={} ranges={} gap_start={} gap_end={} owner_underlay={} owner_path_id={} owner_incarnation={} owner_age_us={} target_underlay={:?} target_path_id={} target_incarnation={} target_eta_us={} deadline_late_us={} frame_count={} queued={} base_limit={} service_limit={}",
                 stream_id.0,
                 ack_frontier,
                 ranges.len(),
+                gap_start,
+                gap_end,
+                owner_underlay,
+                owner_path_id,
+                owner_incarnation,
+                owner_age_us,
                 target.snapshot.underlay,
+                target.identity.key.path_id.0,
+                target.identity.incarnation,
+                target.completion.as_micros(),
+                deadline_late_us,
                 frame_count,
                 queued,
                 base_limit,
@@ -1200,6 +1328,9 @@ fn evaluate_server_data_ack_reinjection(
         persistent_ready,
         has_multipath_alternative,
         has_measured_target,
+        target_service_exhausted: persistent_ready
+            && service_limit == 0
+            && send_stream.reinjection_bytes() > 0,
         base_limit,
         service_limit,
         tail_recovery_candidate: original_flight,
@@ -1225,6 +1356,7 @@ impl TailReinjectionEnqueueOutcome {
 fn enqueue_reliable_tail_reinjection_with_ack_horizon(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
+    failed_original_ranges: &[OffsetRange],
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] stream_id: StreamId,
     send_stream: &ReliableSendStream,
     last_send_ack_ranges: &[OffsetRange],
@@ -1256,28 +1388,31 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
     let mut reinjection_cause = RelaySendCause::AckGapReinjection;
     let mut reinjection_frames = Vec::new();
     let mut blocked_frontier_offset = None;
-    let failed_original_ranges = path_stream.uncovered_failed_original_ranges();
     if !failed_original_ranges.is_empty() {
         let reinjection_path = send_stream
-            .retransmission_frames_for_ranges(&failed_original_ranges, 1)
+            .retransmission_frames_for_ranges(failed_original_ranges, 1)
             .into_iter()
             .next()
             .and_then(|preview| {
                 response_sender.reinjection_path_snapshot_for_frame(
                     path_stream,
+                    send_stream,
                     &preview,
                     RelaySendCause::PathFailureReinjection,
                 )
-            })
-            .map(|(_, snapshot)| snapshot);
-        let failed_original_limit = reliable_reinjection_service_limit_bytes(
-            reinjection_path,
-            response_sender.bytes(),
-            send_stream.reinjection_bytes(),
-            mux_limits,
-        );
+            });
+        let failed_original_limit = reinjection_path.map_or(0, |(identity, snapshot)| {
+            response_sender.reinjection_service_limit_for_target(
+                path_stream,
+                send_stream,
+                identity,
+                snapshot,
+                false,
+                mux_limits,
+            )
+        });
         reinjection_frames = send_stream
-            .retransmission_frames_for_ranges(&failed_original_ranges, failed_original_limit);
+            .retransmission_frames_for_ranges(failed_original_ranges, failed_original_limit);
         if !reinjection_frames.is_empty() {
             critical_tail_reinjection = true;
             reinjection_limit = failed_original_limit;
@@ -1292,7 +1427,13 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
         && (last_send_ack_complete || no_ack_frontier_failed_original_tail)
     {
         if stream_ack_ranges_expose_authoritative_gap(last_send_ack_complete, last_send_ack_ranges)
-            && path_stream.has_multipath_reinjection_alternative()
+            && has_distinct_response_reinjection_alternative(
+                path_stream,
+                send_stream,
+                last_send_ack_complete,
+                last_send_ack_ranges,
+                last_send_ack_frontier,
+            )
         {
             // ACK silence grants one liveness quantum. Persistent gap service
             // is driven separately from retained ACK evidence and a measured
@@ -1316,6 +1457,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 prefix_live_reinjection_frames_with_carrier_credit(
                     response_sender,
                     path_stream,
+                    send_stream,
                     gap_source_frames,
                     RelaySendCause::AckGapReinjection,
                 );
@@ -1370,7 +1512,13 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 last_send_ack_frontier,
             )
             && last_send_ack_frontier < send_stream.next_offset()
-            && path_stream.has_multipath_reinjection_alternative()
+            && has_distinct_response_reinjection_alternative(
+                path_stream,
+                send_stream,
+                last_send_ack_complete,
+                last_send_ack_ranges,
+                last_send_ack_frontier,
+            )
         {
             // A live carrier still owns native recovery. One MPP quantum is
             // enough to race the blocking frontier without creating a second
@@ -1391,6 +1539,7 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 prefix_live_reinjection_frames_with_carrier_credit(
                     response_sender,
                     path_stream,
+                    send_stream,
                     tail_source_frames,
                     RelaySendCause::TailReinjection,
                 );
@@ -1436,11 +1585,9 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
     );
     let mut reinjection_count = 0usize;
     let mut reinjection_pending = false;
-    let live_reinjection_retry_after =
-        reliable_relay_tail_reinjection_delay(tail_reinjection_path_snapshot);
     for frame in reinjection_frames {
         if response_sender.has_queued_reinjection_overlap(&frame)
-            || path_stream.has_recent_reinjection_overlap(&frame, live_reinjection_retry_after)
+            || path_stream.has_recent_reinjection_overlap(&frame)
         {
             reinjection_pending = true;
             continue;
@@ -1479,9 +1626,11 @@ fn enqueue_reliable_tail_reinjection(
     max_frame_payload_bytes: usize,
     last_send_ack_frontier: u64,
 ) -> TailReinjectionEnqueueOutcome {
+    let failed_original_recovery = path_stream.failed_original_recovery_state();
     enqueue_reliable_tail_reinjection_with_ack_horizon(
         response_sender,
         path_stream,
+        &failed_original_recovery.uncovered_ranges,
         stream_id,
         send_stream,
         last_send_ack_ranges,
@@ -1518,6 +1667,7 @@ async fn drain_server_response_sender_ready(
     mux_limits: MuxLimits,
     sender_dispatch_byte_budget: usize,
     sender_dispatch_item_budget: usize,
+    tail_copy_wake_at: &mut Option<Instant>,
     stats: &mut PathDeliveryStats,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] session_id: SessionId,
 ) -> Result<bool, RuntimeError> {
@@ -1545,6 +1695,9 @@ async fn drain_server_response_sender_ready(
             Err(err) => return Err(err),
         };
         dispatched_items = dispatched_items.saturating_add(1);
+        if let Some(deadline) = dispatch.accepted_copy_deadline {
+            retain_accepted_copy_wake(tail_copy_wake_at, deadline);
+        }
         if dispatch.lane == ReliableWorkClass::Reinjection {
             #[cfg(feature = "lab-diagnostics")]
             {
@@ -1744,6 +1897,7 @@ where
     let mut response_path_staleness_dirty = true;
     let mut response_recovery_dirty = true;
     let mut response_range_recovery_deadline = None::<Instant>;
+    let mut tail_copy_wake_at = None::<Instant>;
     let mut response_recovery_capacity_blocked = false;
     let mut last_recv_progress_sent_at = Instant::now();
     let mut last_send_ack_progress_at = Instant::now();
@@ -1767,6 +1921,7 @@ where
     let mut send_buffer_reservation = session_send_buffer.stream_reservation();
     let mut send_buffer_updates = session_send_buffer.subscribe();
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
+    let mut response_requalification_capacity_wait = None;
     let mut no_output_since: Option<Instant> = None;
     let mut last_sender_dispatch_byte_budget =
         relay_lane_startup_chunk_bytes(close.lane, mux_limits)
@@ -1821,6 +1976,7 @@ where
             && response_sender.is_empty()
             && (!pending_local_fin || close.sent)
             && (!has_live_output || request_ack_publication.current_generation_is_fully_published())
+            && !path_stream.has_pending_request_requalification_ack()
             && path_stream.output_membership_generation() == observed_output_membership_generation
         {
             break Ok(stats);
@@ -1852,6 +2008,8 @@ where
         let response_lane = response_demand_update.lane;
         if response_lane != previous_response_lane {
             path_stream.set_lane(response_lane);
+            response_path_staleness_dirty = true;
+            response_recovery_dirty = true;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_response_lane_changed",
@@ -1901,8 +2059,8 @@ where
             .next_deadline()
             .is_some_and(|deadline| deadline <= Instant::now());
         if response_path_staleness_dirty || response_path_staleness_due {
-            let response_path_staleness_candidates =
-                path_stream.data_ack_recovery_candidates(last_send_ack.horizon().unwrap_or(0));
+            let response_path_staleness_candidates = path_stream
+                .data_ack_recovery_candidates(last_send_ack.horizon().unwrap_or(0), response_lane);
             if mark_response_path_staleness(
                 &mut response_path_staleness,
                 path_stream,
@@ -1915,29 +2073,68 @@ where
             response_data_ack_progress_outputs.clear();
             response_path_staleness_dirty = false;
         }
-        match response_sender.try_send_requalification_probe(
-            path_stream,
-            &send_stream,
-            response_lane,
-            mux_limits,
-        ) {
-            Ok(true) => response_sender_retry_at = None,
-            Ok(false) => {}
-            Err(RuntimeError::SenderServiceBlocked) => {
-                response_sender_retry_at = Some(
-                    tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot),
-                );
-            }
-            Err(err) if reliable_path_error_is_migratable(&err) => {}
-            Err(err) => break Err(err),
+        if response_requalification_capacity_wait.is_none() {
+            let response_requalification_attempt = match response_sender
+                .try_send_requalification_probe(
+                    path_stream,
+                    &send_stream,
+                    response_lane,
+                    mux_limits,
+                ) {
+                Ok(attempt) => attempt,
+                Err(err) if reliable_path_error_is_migratable(&err) => RequalificationAttempt::Idle,
+                Err(err) => break Err(err),
+            };
+            response_requalification_capacity_wait =
+                response_requalification_attempt.into_capacity_wait();
         }
+        let response_requalification_capacity_blocked =
+            response_requalification_capacity_wait.is_some();
         let response_recovery_generation = response_sender.stale_response_recovery_generation();
         if response_recovery_generation != observed_response_recovery_generation {
             observed_response_recovery_generation = response_recovery_generation;
             response_recovery_dirty = true;
         }
-        let response_range_recovery_due =
-            response_range_recovery_deadline.is_some_and(|deadline| deadline <= Instant::now());
+        let accepted_copy_observation = path_stream.earliest_reinjection_suppression_deadline();
+        #[cfg(feature = "lab-diagnostics")]
+        let accepted_copy_wake_before = tail_copy_wake_at;
+        let accepted_copy_observed_at = Instant::now();
+        let tail_copy_due = reconcile_accepted_copy_wake(
+            &mut tail_copy_wake_at,
+            accepted_copy_observation,
+            accepted_copy_observed_at,
+        );
+        if tail_copy_due {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_server_response_recovery_wake(
+                stream_id,
+                "accepted_copy",
+                last_send_ack_frontier,
+                send_stream.next_offset(),
+                accepted_copy_wake_before,
+                tail_copy_wake_at,
+                accepted_copy_observed_at,
+            );
+            // Stale-owner recovery and generic/failure tail recovery share the
+            // same accepted-copy expiry. Make the stale range driver consume
+            // this serialized turn before ACK-gap and tail evaluation.
+            response_recovery_dirty = true;
+        }
+        let response_range_observed_at = Instant::now();
+        let response_range_recovery_due = response_range_recovery_deadline
+            .is_some_and(|deadline| deadline <= response_range_observed_at);
+        #[cfg(feature = "lab-diagnostics")]
+        if response_range_recovery_due {
+            lab_server_response_recovery_wake(
+                stream_id,
+                "stale_range",
+                last_send_ack_frontier,
+                send_stream.next_offset(),
+                response_range_recovery_deadline,
+                None,
+                response_range_observed_at,
+            );
+        }
         let response_recovery_due = response_recovery_dirty || response_range_recovery_due;
         let output_membership_generation = path_stream.output_membership_generation();
         let output_membership_changed =
@@ -1980,13 +2177,23 @@ where
             }
         }
         let max_data_publication_pending = path_stream.has_pending_max_data_publication();
+        let request_requalification_ack_pending =
+            path_stream.has_pending_request_requalification_ack();
         let authoritative_data_ack_gap = stream_ack_ranges_expose_authoritative_gap(
             last_send_ack.complete(),
             last_send_ack.ranges(),
         );
+        let has_distinct_ack_gap_reinjection_alternative = authoritative_data_ack_gap
+            && has_distinct_response_reinjection_alternative(
+                path_stream,
+                &send_stream,
+                last_send_ack.complete(),
+                last_send_ack.ranges(),
+                last_send_ack_frontier,
+            );
         let ack_gap_capacity_wait_arm_active = server_ack_gap_capacity_wait_arm_active(
             authoritative_data_ack_gap,
-            path_stream.has_multipath_reinjection_alternative(),
+            has_distinct_ack_gap_reinjection_alternative,
         );
         let mut response_state_capacity_notifies = if response_recovery_due
             || response_recovery_capacity_blocked
@@ -2006,9 +2213,22 @@ where
                 }
             }
         }
+        if request_requalification_ack_pending {
+            for notify in path_stream.pending_request_requalification_ack_capacity_notifies() {
+                if !response_state_capacity_notifies
+                    .iter()
+                    .any(|current| Arc::ptr_eq(current, &notify))
+                {
+                    response_state_capacity_notifies.push(notify);
+                }
+            }
+        }
         let response_state_capacity_wait =
             arm_carrier_capacity_notifies(response_state_capacity_notifies);
         let has_response_state_capacity_wait = response_state_capacity_wait.is_some();
+        if request_requalification_ack_pending {
+            let _ = path_stream.retry_pending_request_requalification_ack()?;
+        }
         if max_data_publication_pending
             && let Some(published_offset) = path_stream.retry_pending_max_data().published_offset
         {
@@ -2027,7 +2247,6 @@ where
         }
         response_sender.discard_unusable_tail_reinjections(path_stream);
         if response_sender.discard_stale_persistent_ack_gap_reinjections(path_stream) > 0 {
-            ack_gap_reinjection.release_reinjection_attempt();
             response_sender_retry_at = None;
         }
         let ack_gap_recovery = evaluate_server_data_ack_reinjection(
@@ -2053,12 +2272,17 @@ where
             ack_gap_recovery.has_measured_target,
         );
         let max_data_publication_blocked = path_stream.has_pending_max_data_publication();
+        let request_requalification_ack_blocked =
+            path_stream.has_pending_request_requalification_ack();
         let response_state_capacity_blocked = response_recovery_capacity_blocked
             || max_data_publication_blocked
-            || ack_gap_missing_target_wait_active;
+            || request_requalification_ack_blocked
+            || ack_gap_missing_target_wait_active
+            || ack_gap_recovery.target_service_exhausted;
         let has_request_ack_capacity_wait = request_ack_capacity_wait.is_some();
-        let response_requalification_deadline = path_stream
-            .response_requalification_deadline()
+        let response_requalification_deadline = (!response_requalification_capacity_blocked)
+            .then(|| path_stream.response_requalification_deadline())
+            .flatten()
             .map(tokio::time::Instant::from_std);
         let response_path_recovery_deadline = response_path_staleness
             .next_deadline()
@@ -2087,9 +2311,28 @@ where
                 + reliable_stream_recv_progress_interval(request_feedback_path_snapshot),
         );
         let recv_progress_ack_update_pending = remote_open && recv_progress.ack_update_pending();
-        let has_tail_reinjection_alternative = path_stream.has_multipath_reinjection_alternative();
+        let has_tail_reinjection_alternative = has_distinct_response_reinjection_alternative(
+            path_stream,
+            &send_stream,
+            last_send_ack.complete(),
+            last_send_ack.ranges(),
+            last_send_ack_frontier,
+        );
+        let failed_original_recovery = path_stream.failed_original_recovery_state();
+        let accepted_copy_deadline = tail_copy_wake_at
+            .map(tokio::time::Instant::from_std)
+            .into_iter()
+            .chain(
+                failed_original_recovery
+                    .retry_deadline
+                    .map(tokio::time::Instant::from_std),
+            )
+            .min();
         let failed_original_tail_reinjection_ready =
-            reliable_failed_original_tail_reinjection_ready(path_stream, &send_stream);
+            reliable_failed_original_tail_reinjection_ready(
+                &failed_original_recovery,
+                &send_stream,
+            );
         let contiguous_live_tail = stream_ack_is_authoritative_contiguous_prefix(
             last_send_ack.complete(),
             last_send_ack.ranges(),
@@ -2138,7 +2381,34 @@ where
             .map_or(tail_timer_deadline, |deadline| {
                 deadline.min(tail_timer_deadline)
             });
-        let tail_reinjection_active = tail_timer_active || ack_gap_reinjection_deadline.is_some();
+        let tail_reinjection_deadline = accepted_copy_deadline
+            .map_or(tail_reinjection_deadline, |deadline| {
+                deadline.min(tail_reinjection_deadline)
+            });
+        let tail_reinjection_active = tail_timer_active
+            || ack_gap_reinjection_deadline.is_some()
+            || accepted_copy_deadline.is_some();
+        if tail_copy_due {
+            let outcome = enqueue_reliable_tail_reinjection_with_ack_horizon(
+                &mut response_sender,
+                path_stream,
+                &failed_original_recovery.uncovered_ranges,
+                stream_id,
+                &send_stream,
+                last_send_ack.ranges(),
+                last_send_ack.complete(),
+                last_send_ack.horizon(),
+                tail_reinjection_path_snapshot,
+                response_lane,
+                mux_limits,
+                performance,
+                path_stream.max_frame_payload_bytes,
+                last_send_ack_frontier,
+            );
+            if outcome.queued > 0 {
+                response_sender_retry_at = None;
+            }
+        }
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
             send_path_snapshot,
             response_lane,
@@ -2151,15 +2421,15 @@ where
             response_classifier_path,
             mux_limits,
         );
-        let source_staging_headroom = reliable_relay_source_staging_headroom(
+        let source_staging_headroom = reliable_relay_response_source_staging_headroom(
             response_lane,
+            inflight_limit,
             data_ack_outstanding_bytes,
             response_sender.data_bytes(),
-            reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
-            mux_limits,
         );
         // Source bytes do not receive a data sequence or path assignment until
-        // dispatch; the shared Data-ACK/reorder envelope bounds this staging.
+        // dispatch; exact chosen-tier Product P and retained/queued Product O
+        // bound staging under the shared stream/reorder/repair envelope.
         let source_read_ceiling = reliable_relay_buffer_len(mux_limits)
             .min(path_stream.max_frame_payload_bytes)
             .min(sender_queue_limit)
@@ -2213,6 +2483,12 @@ where
         if response_sender_retry_at.is_some_and(|deadline| deadline <= now) {
             response_sender_retry_at = None;
         }
+        let response_sender_queue_nonempty = !response_sender.is_empty();
+        let carrier_capacity_wait = if response_sender_queue_nonempty {
+            arm_response_sender_capacity_wait(path_stream.capacity_notifies())
+        } else {
+            None
+        };
         let queued_front_has_carrier_credit = response_sender.front_has_carrier_credit_at_frontier(
             path_stream,
             &send_stream,
@@ -2222,7 +2498,7 @@ where
             server_data_ack_frontier_state(&last_send_ack),
         );
         let sender_wait = response_sender_wait_state(
-            !response_sender.is_empty(),
+            response_sender_queue_nonempty,
             response_sender.queued_send_ready(),
             queued_front_has_carrier_credit,
             response_sender_retry_at,
@@ -2233,12 +2509,8 @@ where
         let queued_send_blocked = sender_wait.blocked;
         let queued_send_ready = sender_wait.ready;
         let queued_send_retry_deadline = sender_wait.retry_at.unwrap_or(now);
-        let carrier_capacity_notifies = if sender_wait.subscribe_capacity {
-            path_stream.capacity_notifies()
-        } else {
-            Vec::new()
-        };
-        let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
+        let has_carrier_capacity_wait =
+            sender_wait.subscribe_capacity && carrier_capacity_wait.is_some();
         let queued_send_blocks_source_read =
             queued_send_blocked || response_recovery_capacity_blocked;
         let can_read_by_flow = source_read_ceiling > 0
@@ -2289,15 +2561,45 @@ where
         }
         _ = tokio::time::sleep_until(tail_reinjection_deadline), if tail_reinjection_active => {
             let now = tokio::time::Instant::now();
+            if tail_copy_wake_at
+                .is_some_and(|deadline| tokio::time::Instant::from_std(deadline) <= now)
+            {
+                // The durable actor-owned one-shot is consumed only at the
+                // loop's serialized recovery point. Committing a successor
+                // copy here could otherwise let this expired deadline mask
+                // the successor's later immutable wake.
+                continue;
+            }
             if ack_gap_reinjection_deadline.is_some_and(|deadline| deadline <= now) {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_server_response_recovery_wake(
+                    stream_id,
+                    "ack_gap",
+                    last_send_ack_frontier,
+                    send_stream.next_offset(),
+                    ack_gap_reinjection_deadline.map(tokio::time::Instant::into_std),
+                    None,
+                    now.into_std(),
+                );
                 // Retained ACK recovery is evaluated only at the loop's single
                 // ownership point, including when this deadline is the wake.
                 continue;
             }
             let tail_timer_due = tail_timer_active && tail_timer_deadline <= now;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_server_response_recovery_wake(
+                stream_id,
+                "tail",
+                last_send_ack_frontier,
+                send_stream.next_offset(),
+                Some(tail_reinjection_deadline.into_std()),
+                None,
+                now.into_std(),
+            );
             enqueue_reliable_tail_reinjection_with_ack_horizon(
                 &mut response_sender,
                 path_stream,
+                &failed_original_recovery.uncovered_ranges,
                 stream_id,
                 &send_stream,
                 last_send_ack.ranges(),
@@ -2328,6 +2630,7 @@ where
                 mux_limits,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
+                &mut tail_copy_wake_at,
                 &mut stats,
                 session_id,
             )
@@ -2338,6 +2641,9 @@ where
             }
             continue;
         }
+        // Server input interleaves Product frames with ordered attachment
+        // lifecycle. It must remain polled after Product half-close and while
+        // response flight is empty so carrier retirement can complete.
         frame = async {
             #[cfg(feature = "lab-diagnostics")]
             let recv_started = Instant::now();
@@ -2354,7 +2660,7 @@ where
                 );
             }
             result
-        }, if remote_open || send_stream.reinjection_bytes() > 0 => {
+        } => {
             let frame = frame?;
             response_sender_retry_at = None;
             match frame {
@@ -2670,13 +2976,9 @@ where
                             performance.optional_reinjection_budget_percent,
                         ),
                     );
-                    let live_reinjection_retry_after =
-                        reliable_relay_tail_reinjection_delay(tail_reinjection_path_snapshot);
                     for frame in reinjection_frames {
-                        let queued = if path_stream.has_recent_reinjection_overlap(
-                            &frame,
-                            live_reinjection_retry_after,
-                        ) || response_sender.has_queued_reinjection_overlap(&frame)
+                        let queued = if path_stream.has_recent_reinjection_overlap(&frame)
+                            || response_sender.has_queued_reinjection_overlap(&frame)
                         {
                             false
                         } else if critical_tail_reinjection {
@@ -2793,14 +3095,15 @@ where
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
-                path_stream,
+                    path_stream,
                     data_ack_outstanding_bytes,
                     server_data_ack_frontier_state(&last_send_ack),
                     &mut send_stream,
                     response_lane,
-                mux_limits,
-                sender_dispatch_byte_budget,
+                    mux_limits,
+                    sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
+                    &mut tail_copy_wake_at,
                     &mut stats,
                     session_id,
                 )
@@ -2894,14 +3197,9 @@ where
                 let _ = blocked_frontier_offset;
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = same_output_frontier_retransmit;
-                let live_reinjection_retry_after =
-                    reliable_relay_tail_reinjection_delay(tail_reinjection_path_snapshot);
                 let mut reinjection_count = 0usize;
                 for frame in reinjection_frames {
-                    let queued = if path_stream.has_recent_reinjection_overlap(
-                        &frame,
-                        live_reinjection_retry_after,
-                    ) {
+                    let queued = if path_stream.has_recent_reinjection_overlap(&frame) {
                         false
                     } else {
                         response_sender
@@ -2950,14 +3248,15 @@ where
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
-                path_stream,
+                    path_stream,
                     data_ack_outstanding_bytes,
                     server_data_ack_frontier_state(&last_send_ack),
                     &mut send_stream,
                     response_lane,
-                mux_limits,
-                sender_dispatch_byte_budget,
+                    mux_limits,
+                    sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
+                    &mut tail_copy_wake_at,
                     &mut stats,
                     session_id,
                 )
@@ -2969,7 +3268,11 @@ where
             }
             continue;
         }
-        _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked && has_carrier_capacity_notify => {
+        _ = async move {
+            if let Some(wait) = carrier_capacity_wait {
+                wait.await;
+            }
+        }, if queued_send_blocked && has_carrier_capacity_wait => {
             response_sender_retry_at = None;
             if response_recovery_capacity_blocked {
                 response_recovery_dirty = true;
@@ -2995,6 +3298,16 @@ where
             if response_recovery_capacity_blocked {
                 response_recovery_dirty = true;
             }
+            continue;
+        }
+        _ = async {
+            if let Some(wait) = response_requalification_capacity_wait.as_mut() {
+                wait.as_mut().await;
+            }
+        }, if response_requalification_capacity_blocked => {
+            // Requalification owns only this exact maintenance wake. Ordinary
+            // Product work never inherits its blockage or retry state.
+            response_requalification_capacity_wait = None;
             continue;
         }
         _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {
@@ -3042,14 +3355,15 @@ where
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
-                path_stream,
+                    path_stream,
                     data_ack_outstanding_bytes,
                     server_data_ack_frontier_state(&last_send_ack),
                     &mut send_stream,
                     response_lane,
-                mux_limits,
-                sender_dispatch_byte_budget,
+                    mux_limits,
+                    sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
+                    &mut tail_copy_wake_at,
                     &mut stats,
                     session_id,
                 )
@@ -3084,6 +3398,7 @@ where
                 mux_limits,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
+                &mut tail_copy_wake_at,
                 &mut stats,
                 session_id,
             )
@@ -3109,6 +3424,7 @@ where
                 mux_limits,
                 sender_dispatch_byte_budget,
                 sender_dispatch_item_budget,
+                &mut tail_copy_wake_at,
                 &mut stats,
                 session_id,
             )
@@ -3173,12 +3489,12 @@ where
                     )
                     && response_sender.data_bytes() < sender_dispatch_byte_budget
                 {
-                    let source_staging_headroom = reliable_relay_source_staging_headroom(
+                    let source_staging_headroom =
+                        reliable_relay_response_source_staging_headroom(
                             response_lane,
+                            inflight_limit,
                             data_ack_outstanding_bytes,
                             response_sender.data_bytes(),
-                            reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
-                            mux_limits,
                         );
                     if source_staging_headroom == 0 {
                         break;
@@ -3252,14 +3568,15 @@ where
                     );
                     if drain_server_response_sender_ready(
                         &mut response_sender,
-                path_stream,
+                        path_stream,
                         data_ack_outstanding_bytes,
                         server_data_ack_frontier_state(&last_send_ack),
                         &mut send_stream,
                         response_lane,
-                mux_limits,
-                sender_dispatch_byte_budget,
+                        mux_limits,
+                        sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
+                        &mut tail_copy_wake_at,
                         &mut stats,
                         session_id,
                     )
@@ -3276,9 +3593,7 @@ where
     };
     if result.is_ok() && pending_local_fin && !close.sent {
         while result.is_ok() {
-            if response_sender.discard_stale_persistent_ack_gap_reinjections(path_stream) > 0 {
-                ack_gap_reinjection.release_reinjection_attempt();
-            }
+            response_sender.discard_stale_persistent_ack_gap_reinjections(path_stream);
             if response_sender.is_empty() {
                 break;
             }
@@ -3297,6 +3612,7 @@ where
                 mux_limits,
                 last_sender_dispatch_byte_budget,
                 last_sender_dispatch_item_budget,
+                &mut tail_copy_wake_at,
                 &mut stats,
                 session_id,
             )

@@ -136,6 +136,161 @@ async fn assert_quic_ping_round_trip(client: &Connection, server: &Connection, n
     server_stream.await.expect("server stream task");
 }
 
+#[test]
+fn native_controller_rate_conversion_is_positive_and_checked() {
+    let largest_bytes_per_second = u64::MAX / 8;
+
+    assert_eq!(
+        checked_positive_bytes_per_second_to_bits_per_second(None),
+        None
+    );
+    assert_eq!(
+        checked_positive_bytes_per_second_to_bits_per_second(Some(0)),
+        None,
+        "a post-round zero is not positive native authority",
+    );
+    assert_eq!(
+        checked_positive_bytes_per_second_to_bits_per_second(Some(1)),
+        Some(8)
+    );
+    assert_eq!(
+        checked_positive_bytes_per_second_to_bits_per_second(Some(largest_bytes_per_second)),
+        Some(largest_bytes_per_second * 8),
+    );
+    assert_eq!(
+        checked_positive_bytes_per_second_to_bits_per_second(Some(largest_bytes_per_second + 1,)),
+        None,
+        "overflow must remove the invalid sample instead of saturating it into authority",
+    );
+    assert_eq!(
+        checked_positive_bytes_per_second_to_bits_per_second(Some(u64::MAX)),
+        None
+    );
+}
+
+#[tokio::test]
+async fn active_controller_snapshot_fence_and_wake_are_coherent_and_non_consuming() {
+    let mux_limits = MuxLimits::default();
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let accepted = tokio::spawn(async move { server.accept().await.expect("server connection") });
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let client_connection = client
+        .connect(server_addr)
+        .await
+        .expect("client connection");
+    let _server_connection = accepted.await.expect("accept task");
+
+    let fence = client_connection.native_controller_activation_fence();
+    let notify = client_connection.native_controller_authority_notify();
+    tokio::time::timeout(Duration::from_millis(100), notify.notified())
+        .await
+        .expect("initial activation wake is durable");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    while tokio::time::timeout(Duration::from_millis(1), notify.notified())
+        .await
+        .is_ok()
+    {}
+
+    let first = client_connection.native_controller_authority_snapshot();
+    let second = client_connection.native_controller_authority_snapshot();
+    let shape = client_connection.native_controller_shape_snapshot();
+    let expected_path = client_connection.connection.active_path_snapshot();
+    let expected_controller_metrics = expected_path.congestion.metrics();
+    assert_eq!(first, second, "inspection clone is source-state preserving");
+    assert_eq!(first.controller(), second.controller());
+    assert_eq!(
+        shape.activation(),
+        first.activation(),
+        "one active-PathData shape read carries the exact installed A"
+    );
+    assert_eq!(
+        shape.controller(),
+        first.controller(),
+        "one active-PathData shape read carries the exact installed I"
+    );
+    assert_eq!(shape.smoothed_rtt(), expected_path.smoothed_rtt);
+    assert_eq!(shape.rtt_variance(), expected_path.rtt_variance);
+    assert_eq!(shape.bytes_in_flight(), expected_path.bytes_in_flight);
+    assert_eq!(shape.app_limited(), expected_path.app_limited);
+    assert_eq!(
+        shape.congestion_window(),
+        expected_controller_metrics.congestion_window
+    );
+    assert_eq!(
+        shape.operational_rate_bps().map(NonZeroU64::get),
+        expected_controller_metrics
+            .bandwidth_estimate
+            .and_then(|rate| rate.checked_mul(8))
+    );
+    assert_eq!(
+        shape.pacing_rate_bps().map(NonZeroU64::get),
+        expected_controller_metrics
+            .pacing_rate
+            .and_then(|rate| rate.checked_mul(8))
+    );
+    let aggregate = client_connection.congestion_metrics();
+    assert_eq!(aggregate.path_epoch, shape.controller().opaque_serial());
+    assert_eq!(aggregate.congestion_window, shape.congestion_window());
+    assert_eq!(aggregate.bytes_in_flight, Some(shape.bytes_in_flight()));
+    assert_eq!(aggregate.app_limited, shape.app_limited());
+    assert_ne!(first.activation().opaque_serial(), 0);
+    assert_eq!(
+        first.controller().opaque_serial(),
+        second.controller().opaque_serial(),
+        "opaque controller projection preserves equality without adding semantics"
+    );
+    assert_eq!(
+        fence
+            .with_current(|state| state)
+            .expect("activation fence read"),
+        quinn::congestion::ControllerActivationState::Live(first.activation())
+    );
+    match first.kind() {
+        super::super::NativeControllerObservationKind::Absent => {
+            assert_eq!(first.operational_rate_bps(), None)
+        }
+        super::super::NativeControllerObservationKind::Valid => {
+            assert!(first.operational_rate_bps().is_some())
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), notify.notified())
+            .await
+            .is_err(),
+        "congestion_state inspection clone must not publish A or B_op"
+    );
+
+    client_connection
+        .connection
+        .close(quinn::VarInt::from_u32(0), b"test complete");
+    assert_eq!(
+        fence
+            .with_current(|state| state)
+            .expect("closed activation fence"),
+        quinn::congestion::ControllerActivationState::Terminal(
+            quinn::congestion::ControllerActivationTerminal::ConnectionClosed,
+        )
+    );
+    tokio::time::timeout(Duration::from_millis(100), notify.notified())
+        .await
+        .expect("connection terminalization wakes the authority coordinator");
+}
+
 #[tokio::test]
 async fn quic_carrier_rejects_wrong_independent_tls_identity_before_product_frames() {
     let mux_limits = MuxLimits::default();
@@ -581,6 +736,7 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     assert_quic_ping_round_trip(&client_connection, &server_connection, 90).await;
     let before_migration = client_connection.congestion_metrics();
     let server_before_migration = server_connection.congestion_metrics();
+    let server_shape_before_migration = server_connection.native_controller_shape_snapshot();
     let before_stats = client_connection.stats();
 
     let first = first_port.port().min(second_port.port());
@@ -606,6 +762,7 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     assert_quic_ping_round_trip(&client_connection, &server_connection, 91).await;
     let after_first_migration = client_connection.congestion_metrics();
     let server_after_first_migration = server_connection.congestion_metrics();
+    let server_shape_after_first_migration = server_connection.native_controller_shape_snapshot();
     let after_first_stats = client_connection.stats();
     assert_eq!(
         after_first_migration.path_epoch, before_migration.path_epoch,
@@ -614,6 +771,16 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     assert_eq!(
         server_after_first_migration.path_epoch, server_before_migration.path_epoch,
         "same-IP client rebinding must retain the server's QUIC congestion epoch"
+    );
+    assert_eq!(
+        server_shape_after_first_migration.controller(),
+        server_shape_before_migration.controller(),
+        "same-IP clone retains controller I"
+    );
+    assert_ne!(
+        server_shape_after_first_migration.activation(),
+        server_shape_before_migration.activation(),
+        "the installed same-I clone receives a distinct checked A"
     );
     assert!(
         after_first_stats.path.sent_packets > before_stats.path.sent_packets,
@@ -638,6 +805,7 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     assert_quic_ping_round_trip(&client_connection, &server_connection, 92).await;
     let after_second_migration = client_connection.congestion_metrics();
     let server_after_second_migration = server_connection.congestion_metrics();
+    let server_shape_after_second_migration = server_connection.native_controller_shape_snapshot();
     let after_second_stats = client_connection.stats();
     assert_eq!(
         after_second_migration.path_epoch, before_migration.path_epoch,
@@ -646,6 +814,16 @@ async fn quic_destination_port_migration_preserves_connection_streams_and_native
     assert_eq!(
         server_after_second_migration.path_epoch, server_before_migration.path_epoch,
         "repeated same-IP rebinding must keep the server's native epoch warm"
+    );
+    assert_eq!(
+        server_shape_after_second_migration.controller(),
+        server_shape_before_migration.controller(),
+        "repeated locator changes retain controller I"
+    );
+    assert_ne!(
+        server_shape_after_second_migration.activation(),
+        server_shape_after_first_migration.activation(),
+        "each installed same-I PathData receives its own checked A"
     );
     assert!(
         after_second_stats.path.sent_packets > after_first_stats.path.sent_packets,

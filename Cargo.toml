@@ -84,4 +84,5 @@ rcgen = "0.14.8"
 tokio = { version = "1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
+quinn = { path = "crates/quinn" }
 quinn-proto = { path = "crates/quinn-proto" }

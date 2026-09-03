@@ -46,7 +46,7 @@ use crate::product::{
     TargetResolutionMode, TunL3AddressPlan, TunL3AllocationSpec, TunL3ServerSpec, VerifiedRuleSet,
 };
 use crate::transport::encrypted::{SharedTransportSecret, TcpClientTlsConfig, TcpServerTlsConfig};
-use crate::transport::{EndpointParseError, LossPolicyPercent, PathSpecParseError};
+use crate::transport::{EndpointParseError, LossPolicyPercent, PathSpecParseError, RateHint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -421,6 +421,7 @@ struct SessionFileConfig {
 #[serde(deny_unknown_fields)]
 struct ProductFlowFileConfig {
     idle_timeout_s: Option<ConfigSeconds>,
+    initial_rate_mbps: Option<ConfigInitialRateMbps>,
     optional_reinjection_budget_percent: Option<u16>,
     quic_loss_compensation_percent: Option<ConfigLossCompensationPercent>,
 }
@@ -428,6 +429,9 @@ struct ProductFlowFileConfig {
 impl ProductFlowFileConfig {
     fn mpp_defaults(self) -> MppFilePerformance {
         MppFilePerformance {
+            initial_rate: self
+                .initial_rate_mbps
+                .map_or(RateHint::Unknown, ConfigInitialRateMbps::rate_hint),
             runtime: MppPerformanceConfig {
                 optional_reinjection_budget_percent: self
                     .optional_reinjection_budget_percent
@@ -449,6 +453,60 @@ impl ProductFlowFileConfig {
                 )),
             },
         }
+    }
+}
+
+/// A positive global MPP startup-rate prior expressed in decimal Mbit/s.
+///
+/// Scaling is completed at the file boundary so every inherited path carries
+/// the same exact bits-per-second representation as a path-URI rate hint.
+#[derive(Debug, Clone, Copy)]
+struct ConfigInitialRateMbps(u64);
+
+impl ConfigInitialRateMbps {
+    const fn rate_hint(self) -> RateHint {
+        RateHint::BitsPerSecond(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigInitialRateMbps {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RateVisitor;
+
+        impl Visitor<'_> for RateVisitor {
+            type Value = ConfigInitialRateMbps;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a positive integer Mbit/s rate that fits in u64 bits/second")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value == 0 {
+                    return Err(E::custom("initial_rate_mbps must be greater than zero"));
+                }
+                value
+                    .checked_mul(1_000_000)
+                    .map(ConfigInitialRateMbps)
+                    .ok_or_else(|| E::custom("initial_rate_mbps overflows u64 bits/second"))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let value = u64::try_from(value)
+                    .map_err(|_| E::custom("initial_rate_mbps must be greater than zero"))?;
+                self.visit_u64(value)
+            }
+        }
+
+        deserializer.deserialize_any(RateVisitor)
     }
 }
 
@@ -521,6 +579,7 @@ impl<'de> Deserialize<'de> for ConfigLossCompensationPercent {
 
 #[derive(Debug, Clone, Copy)]
 struct MppFilePerformance {
+    initial_rate: RateHint,
     runtime: MppPerformanceConfig,
     quic_loss_compensation: LossPolicyPercent,
 }
@@ -1244,6 +1303,7 @@ struct MppPerformanceFileConfig {
 impl MppPerformanceFileConfig {
     fn into_config(self, fallback: MppFilePerformance) -> MppFilePerformance {
         MppFilePerformance {
+            initial_rate: fallback.initial_rate,
             runtime: MppPerformanceConfig {
                 optional_reinjection_budget_percent: self
                     .optional_reinjection_budget_percent
@@ -1795,6 +1855,7 @@ struct MppPathFileConfig {
 
 fn parse_named_path_specs(
     values: Vec<MppPathFileConfig>,
+    initial_rate: RateHint,
     quic_loss_compensation: LossPolicyPercent,
 ) -> Result<Vec<NamedPathConfig>, ConfigFileError> {
     values
@@ -1802,6 +1863,11 @@ fn parse_named_path_specs(
         .map(|value| {
             let mut spec: crate::transport::PathSpec =
                 value.endpoint.parse().map_err(ConfigFileError::PathSpec)?;
+            if !spec.metadata.initial_rate_explicit {
+                spec.metadata.initial_rate = initial_rate;
+            }
+            spec.validate_quic_initial_rate_target()
+                .map_err(ConfigFileError::PathSpec)?;
             if spec.underlay == crate::protocol::UnderlayProtocol::Udp
                 && spec.metadata.loss_compensation.is_none()
             {
@@ -2174,8 +2240,11 @@ fn parse_outbounds(
                 let performance = performance
                     .unwrap_or_default()
                     .into_config(default_mpp_performance);
-                let named_paths =
-                    parse_named_path_specs(paths, performance.quic_loss_compensation)?;
+                let named_paths = parse_named_path_specs(
+                    paths,
+                    performance.initial_rate,
+                    performance.quic_loss_compensation,
+                )?;
                 if named_paths.is_empty() {
                     return Err(ConfigFileError::MppOutboundRequiresPath(name));
                 }
@@ -3102,7 +3171,11 @@ fn build_node_services(
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
                 let performance = performance.into_config(default_mpp_performance);
-                let paths = parse_named_path_specs(paths, performance.quic_loss_compensation)?;
+                let paths = parse_named_path_specs(
+                    paths,
+                    performance.initial_rate,
+                    performance.quic_loss_compensation,
+                )?;
                 if paths.is_empty() {
                     return Err(ConfigFileError::MppInboundRequiresPath);
                 }
@@ -3129,8 +3202,11 @@ fn build_node_services(
             } => {
                 let name = canonical_config_name(&name)?;
                 validate_unique_inbound_name(&name, &mut inbound_names)?;
-                let paths =
-                    parse_named_path_specs(paths, default_mpp_performance.quic_loss_compensation)?;
+                let paths = parse_named_path_specs(
+                    paths,
+                    default_mpp_performance.initial_rate,
+                    default_mpp_performance.quic_loss_compensation,
+                )?;
                 if paths.is_empty() {
                     return Err(ConfigFileError::MppInboundRequiresPath);
                 }

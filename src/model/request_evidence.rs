@@ -4,7 +4,9 @@
 //! bounded evidence without reading sockets, queues, or mutable path state.
 
 use super::ack_clock::reliable_data_ack_rate_coverage_floor_bytes;
-use super::capacity::{PATH_OPEN_SCORE_BYTES, PathRateSample};
+use super::capacity::{
+    PATH_OPEN_SCORE_BYTES, PathRateSample, product_delivery_samples_override_startup_prior,
+};
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
 use std::time::Instant;
@@ -16,6 +18,7 @@ pub(crate) struct RequestPathRateEvidence {
     pending_first_sent_at: Instant,
     pending_latest_sent_at: Instant,
     previous_window_acked_at: Option<Instant>,
+    successor_boundary_epoch: Option<(Instant, Instant)>,
 }
 
 pub(crate) enum RequestPathRateEvidenceUpdate {
@@ -26,10 +29,61 @@ pub(crate) enum RequestPathRateEvidenceUpdate {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RequestPerFlowRateModel {
+/// Per-output Product goodput proven by one exact request Data-ACK epoch.
+///
+/// Expiry is frozen when the ACK is observed. The retained scalar remains
+/// diagnostic history; numeric authority always goes through `fresh_rate_at`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RequestProductRateEpoch {
     pub(crate) rate_bps: f64,
     pub(crate) delivery_samples: u32,
+    pub(crate) observed_at: Instant,
+    pub(crate) expires_at: Instant,
+}
+
+impl RequestProductRateEpoch {
+    pub(crate) fn new(
+        rate_bps: f64,
+        delivery_samples: u32,
+        observed_at: Instant,
+        freshness_horizon: std::time::Duration,
+    ) -> Option<Self> {
+        (rate_bps.is_finite() && rate_bps > 0.0)
+            .then(|| observed_at.checked_add(freshness_horizon))
+            .flatten()
+            .map(|expires_at| Self {
+                rate_bps,
+                delivery_samples,
+                observed_at,
+                expires_at,
+            })
+    }
+
+    pub(crate) fn fresh_rate_at(self, now: Instant) -> Option<f64> {
+        (self.observed_at <= now && now < self.expires_at).then_some(self.rate_bps)
+    }
+
+    /// Returns achieved Product completion service only after the exact
+    /// request-output epoch has crossed its established sample boundary.
+    /// `fresh_rate_at` intentionally remains available to the producer for
+    /// raw EWMA history and diagnostics; scheduler authority uses this view.
+    pub(crate) fn qualified_completion_rate_at(self, now: Instant) -> Option<f64> {
+        product_delivery_samples_override_startup_prior(self.delivery_samples)
+            .then(|| self.fresh_rate_at(now))
+            .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(rate_bps: f64, delivery_samples: u32) -> Self {
+        let observed_at = Instant::now() - std::time::Duration::from_secs(1);
+        Self::new(
+            rate_bps,
+            delivery_samples,
+            observed_at,
+            std::time::Duration::from_secs(60 * 60),
+        )
+        .expect("valid test Product rate epoch")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +100,7 @@ impl RequestPathRateEvidence {
             pending_first_sent_at: first_sent_at,
             pending_latest_sent_at: first_sent_at,
             previous_window_acked_at: None,
+            successor_boundary_epoch: None,
         }
     }
 
@@ -108,6 +163,19 @@ impl RequestPathRateEvidence {
     pub(crate) fn seed_ack_boundary(&mut self, acked_at: Instant) {
         self.pending_bytes = 0;
         self.previous_window_acked_at = Some(acked_at);
+    }
+
+    /// Starts acquisition after one expired published Product epoch exactly
+    /// once. Repeated sub-floor ACKs retain their pending bytes until the
+    /// unchanged coverage floor is reached; a later distinct expired epoch
+    /// receives its own boundary reset.
+    pub(crate) fn seed_successor_epoch_boundary(&mut self, epoch: RequestProductRateEpoch) {
+        let identity = (epoch.observed_at, epoch.expires_at);
+        if self.successor_boundary_epoch == Some(identity) {
+            return;
+        }
+        self.seed_ack_boundary(epoch.expires_at);
+        self.successor_boundary_epoch = Some(identity);
     }
 }
 

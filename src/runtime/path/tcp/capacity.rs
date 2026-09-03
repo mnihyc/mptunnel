@@ -435,7 +435,7 @@ impl ClientPathState {
         }
         let mut health = self.health().lock().expect("client path health lock");
         let record = health.tcp_record_mut(path_index)?;
-        record.maintain(now);
+        record.mutate_eligibility(|record| record.maintain(now));
         let record = health.tcp_record_mut(path_index)?;
         // Distinct TCP sockets have independent ordering. The path capsule owns
         // exact identity while the session budget bounds their cumulative cost.

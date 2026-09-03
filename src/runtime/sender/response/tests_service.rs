@@ -1,17 +1,280 @@
 use super::*;
-use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
+use crate::model::capacity::reliable_path_startup_sample_limit_bytes;
+use crate::model::path::CarrierPathKey;
+use crate::protocol::{Frame, OffsetRange, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_channels,
-    try_recv_reliable_path_command,
+    reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
 use crate::runtime::stream::ReliablePathStreamOutput;
+use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
 use bytes::Bytes;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 struct FixedFixture {
     stream: ReliablePathStream,
     commands: crate::runtime::path::commands::ReliablePathCommandSender,
     receivers: ReliablePathCommandReceivers,
+}
+
+struct ResponseAcquisitionFixture {
+    limits: MuxLimits,
+    binding: Arc<ResponseStreamBinding>,
+    stream: ReliablePathStream,
+    owner: CarrierPathKey,
+    first_additional: CarrierPathKey,
+    second_additional: CarrierPathKey,
+    owner_commands: crate::runtime::path::commands::ReliablePathCommandSender,
+    first_commands: crate::runtime::path::commands::ReliablePathCommandSender,
+    second_commands: crate::runtime::path::commands::ReliablePathCommandSender,
+    owner_receivers: ReliablePathCommandReceivers,
+    first_receivers: ReliablePathCommandReceivers,
+    second_receivers: ReliablePathCommandReceivers,
+}
+
+fn response_acquisition_fixture(queue_capacity: usize) -> ResponseAcquisitionFixture {
+    let limits = MuxLimits::default();
+    let owner = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let first_additional = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let second_additional = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(2),
+    };
+    let (owner_commands, owner_receivers) = reliable_path_command_channels(queue_capacity);
+    let binding = ResponseStreamBinding::new_with_limits(
+        SessionId(31),
+        owner.underlay,
+        owner.path_id,
+        owner_commands.clone(),
+        TrafficClass::Throughput,
+        limits,
+    );
+    let (first_commands, first_receivers) = reliable_path_command_channels(queue_capacity);
+    assert_eq!(
+        binding.attach(
+            first_additional.underlay,
+            first_additional.path_id,
+            first_commands.clone(),
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let (second_commands, second_receivers) = reliable_path_command_channels(queue_capacity);
+    assert_eq!(
+        binding.attach(
+            second_additional.underlay,
+            second_additional.path_id,
+            second_commands.clone(),
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let (_frames_tx, frames) = mpsc::channel(1);
+    let stream = ReliablePathStream {
+        stream_id: StreamId(31),
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames.into(),
+    };
+    ResponseAcquisitionFixture {
+        limits,
+        binding,
+        stream,
+        owner,
+        first_additional,
+        second_additional,
+        owner_commands,
+        first_commands,
+        second_commands,
+        owner_receivers,
+        first_receivers,
+        second_receivers,
+    }
+}
+
+fn establish_qualified_response_owner(
+    fixture: &ResponseAcquisitionFixture,
+    send_stream: &mut ReliableSendStream,
+) {
+    let floor = reliable_path_startup_sample_limit_bytes(fixture.limits);
+    let floor_bytes = usize::try_from(floor).expect("response qualification floor fits usize");
+    let qualification = send_stream
+        .send_data(Bytes::from(vec![0x41; floor_bytes]))
+        .expect("assign exact response qualification range");
+    fixture
+        .binding
+        .record_original_flight(fixture.owner, &qualification);
+    let exact_ack = [OffsetRange {
+        start: 0,
+        end: floor,
+    }];
+    fixture.binding.release_normalized_acked_ranges(&exact_ack);
+    send_stream
+        .apply_ack(&exact_ack)
+        .expect("release exact response qualification range");
+
+    let retained_frontier = send_stream
+        .send_data(Bytes::from_static(b"f"))
+        .expect("retain one live ordinary-owner byte");
+    fixture
+        .binding
+        .record_original_flight(fixture.owner, &retained_frontier);
+    fixture
+        .binding
+        .set_output_product_model_for_test(fixture.owner, 500_000_000.0, 1.0);
+}
+
+fn fill_response_data_queue(
+    commands: &crate::runtime::path::commands::ReliablePathCommandSender,
+    offset: u64,
+) {
+    commands
+        .try_enqueue_stream_ordered_frame(
+            Frame::StreamData {
+                stream_id: StreamId(999),
+                offset,
+                payload: Bytes::from_static(b"blocked"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("fill exact response carrier data queue");
+}
+
+#[test]
+fn stale_quic_requalification_backpressure_is_target_local_to_ready_tcp_data() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(32);
+    let tcp = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let quic = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(4);
+    let binding = ResponseStreamBinding::new_with_limits(
+        SessionId(32),
+        tcp.underlay,
+        tcp.path_id,
+        tcp_commands,
+        TrafficClass::Throughput,
+        limits,
+    );
+    let (quic_commands, mut quic_receivers) = reliable_path_command_channels(1);
+    assert_eq!(
+        binding.attach(
+            quic.underlay,
+            quic.path_id,
+            quic_commands.clone(),
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let (_frames_tx, frames) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames.into(),
+    };
+
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let retained = send_stream
+        .send_data(Bytes::from_static(b"retained"))
+        .expect("retain one exact Product range for requalification");
+    binding.record_original_flight(tcp, &retained);
+    let quic_target = binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == quic)
+        .expect("attached QUIC response target");
+    assert!(binding.mark_output_stale(
+        ServerReinjectionOutputIdentity {
+            key: quic,
+            incarnation: quic_target.observation.incarnation,
+        },
+        TrafficClass::Throughput,
+    ));
+    quic_commands
+        .try_enqueue_reinjection_frame(
+            Frame::StreamData {
+                stream_id: StreamId(999),
+                offset: 0,
+                payload: Bytes::from_static(b"fill-stale-quic"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("fill only the stale QUIC reinjection queue");
+
+    let mut sender = ServerResponseSenderService::new(SessionId(32), stream_id);
+    sender.enqueue_data_for_lane(
+        Bytes::from_static(b"ordinary-tcp"),
+        TrafficClass::Throughput,
+    );
+    let requalification = sender
+        .try_send_requalification_probe(
+            &path_stream,
+            &send_stream,
+            TrafficClass::Throughput,
+            limits,
+        )
+        .expect("target-local QUIC requalification result");
+    assert!(
+        requalification.is_capacity_blocked(),
+        "target-local QUIC requalification backpressure must not request a global sender retry"
+    );
+
+    let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            data_ack_outstanding_bytes,
+        )
+        .expect("independent healthy TCP writer remains work-conserving");
+    assert_eq!(dispatch.selected_path, Some(tcp));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut tcp_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }))
+            if payload == Bytes::from_static(b"ordinary-tcp")
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut quic_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: StreamId(999),
+            ..
+        }))
+    ));
+}
+
+fn mark_response_output_backup(binding: &ResponseStreamBinding, key: CarrierPathKey) {
+    let target = binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == key)
+        .expect("attached response backup target");
+    assert!(binding.update_peer_path_usage_for_test(
+        key,
+        target.observation.path_instance_id,
+        1,
+        PathUsage::Backup,
+    ));
 }
 
 fn fixed_fixture(queue_capacity: usize, limits: MuxLimits) -> FixedFixture {
@@ -112,6 +375,108 @@ fn dispatching_data_commits_mux_offset_queue_and_carrier_work() {
 }
 
 #[test]
+fn unresolved_return_plan_splits_trace_quantum_and_ack_does_not_refill_it() {
+    let fixture = response_acquisition_fixture(8);
+    fixture
+        .binding
+        .install_unresolved_response_startup_for_test(
+            58_400,
+            3,
+            PathUsage::Available,
+            fixture.owner,
+        );
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+
+    for (proposal, expected) in [(208usize, 208usize), (14_600, 14_600), (65_536, 43_592)] {
+        sender.enqueue_data_for_lane(Bytes::from(vec![0x51; proposal]), TrafficClass::Throughput);
+        let dispatch = sender
+            .dispatch_next(
+                &fixture.stream,
+                &mut send_stream,
+                TrafficClass::Throughput,
+                fixture.limits,
+            )
+            .expect("dispatch the startup-bounded trace quantum");
+        assert_eq!(dispatch.payload_bytes, expected);
+    }
+
+    assert_eq!(send_stream.next_offset(), 58_400);
+    assert_eq!(sender.data_bytes(), 65_536 - 43_592);
+    assert!(
+        !sender.front_has_carrier_credit_at_frontier(
+            &fixture.stream,
+            &send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            send_stream.reinjection_bytes(),
+            ReliableDataAckFrontierState::Live,
+        ),
+        "readiness preview must observe the same exhausted prefix as apply",
+    );
+    assert!(matches!(
+        sender.dispatch_next(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+
+    send_stream
+        .apply_ack(&[OffsetRange {
+            start: 0,
+            end: 58_400,
+        }])
+        .expect("ack the entire tentative prefix");
+    assert_eq!(send_stream.next_offset(), 58_400);
+    assert!(
+        !sender.front_has_carrier_credit_at_frontier(
+            &fixture.stream,
+            &send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            0,
+            ReliableDataAckFrontierState::Live,
+        ),
+        "Data ACK cannot refund a cumulative startup coordinate",
+    );
+    assert!(matches!(
+        sender.dispatch_next(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+}
+
+#[test]
+fn canonical_singleton_preserves_the_exact_trace_dispatch_sequence() {
+    let fixture = response_acquisition_fixture(8);
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+
+    for proposal in [208usize, 14_600, 65_536] {
+        sender.enqueue_data_for_lane(Bytes::from(vec![0x52; proposal]), TrafficClass::Throughput);
+        let dispatch = sender
+            .dispatch_next(
+                &fixture.stream,
+                &mut send_stream,
+                TrafficClass::Throughput,
+                fixture.limits,
+            )
+            .expect("canonical singleton retains ordinary dispatch");
+        assert_eq!(dispatch.payload_bytes, proposal);
+    }
+
+    assert_eq!(send_stream.next_offset(), 208 + 14_600 + 65_536);
+    assert_eq!(sender.data_bytes(), 0);
+}
+
+#[test]
 fn unavailable_carrier_does_not_advance_mux_or_consume_data() {
     let limits = MuxLimits::default();
     let fixture = fixed_fixture(1, limits);
@@ -137,14 +502,278 @@ fn unavailable_carrier_does_not_advance_mux_or_consume_data() {
 }
 
 #[test]
+fn acquisition_skips_a_blocked_nondominated_regular_and_visits_its_sibling() {
+    let mut fixture = response_acquisition_fixture(1);
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+    establish_qualified_response_owner(&fixture, &mut send_stream);
+    fill_response_data_queue(&fixture.first_commands, 10_000);
+    fixture.binding.set_output_product_model_for_test(
+        fixture.second_additional,
+        600_000_000.0,
+        0.5,
+    );
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
+    let outstanding = send_stream.reinjection_bytes();
+
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            outstanding,
+        )
+        .expect("ordinary ECF selects an eligible faster sibling");
+
+    assert_eq!(
+        dispatch.selected_path,
+        Some(fixture.second_additional),
+        "acquisition accounting must preserve ordinary completion placement",
+    );
+    assert!(try_recv_reliable_path_command(&mut fixture.owner_receivers).is_none());
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.second_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+}
+
+#[test]
+fn response_acquisition_writer_race_skips_failed_regular_and_commits_sibling() {
+    let mut fixture = response_acquisition_fixture(1);
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+    establish_qualified_response_owner(&fixture, &mut send_stream);
+    fixture
+        .binding
+        .set_output_product_model_for_test(fixture.first_additional, 600_000_000.0, 0.5);
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    sender.fill_response_acquisition_writer_before_reservation_for_test(fixture.first_additional);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
+    let outstanding = send_stream.reinjection_bytes();
+
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            outstanding,
+        )
+        .expect("the finite acquisition scan continues after a writer race");
+    assert_eq!(dispatch.selected_path, Some(fixture.second_additional));
+    assert!(try_recv_reliable_path_command(&mut fixture.owner_receivers).is_none());
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.first_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: StreamId(u64::MAX),
+            ..
+        }))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.second_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }))
+            if payload == Bytes::from_static(b"next")
+    ));
+}
+
+#[test]
+fn response_acquisition_regular_membership_blocks_backup_acquisition() {
+    let mut fixture = response_acquisition_fixture(1);
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+    establish_qualified_response_owner(&fixture, &mut send_stream);
+    mark_response_output_backup(&fixture.binding, fixture.second_additional);
+    fill_response_data_queue(&fixture.owner_commands, 20_000);
+    fill_response_data_queue(&fixture.first_commands, 30_000);
+    let next_offset = send_stream.next_offset();
+    let outstanding = send_stream.reinjection_bytes();
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
+
+    assert!(matches!(
+        sender.dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            outstanding,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert_eq!(
+        send_stream.next_offset(),
+        next_offset,
+        "a transiently blocked regular tier cannot turn an unqualified backup into the response acquisition tier",
+    );
+    assert!(try_recv_reliable_path_command(&mut fixture.second_receivers).is_none());
+}
+
+#[test]
+fn response_acquisition_blockage_keeps_a_qualified_owner_work_conserving() {
+    let mut fixture = response_acquisition_fixture(1);
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+    establish_qualified_response_owner(&fixture, &mut send_stream);
+    fill_response_data_queue(&fixture.first_commands, 40_000);
+    fill_response_data_queue(&fixture.second_commands, 50_000);
+    let outstanding = send_stream.reinjection_bytes();
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
+
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            outstanding,
+        )
+        .expect("blocked acquisition must not stall an independently usable qualified owner");
+
+    assert_eq!(dispatch.selected_path, Some(fixture.owner));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.owner_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+}
+
+#[test]
+fn response_acquisition_does_not_bypass_the_ordinary_ecf_owner() {
+    let mut fixture = response_acquisition_fixture(4);
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+    establish_qualified_response_owner(&fixture, &mut send_stream);
+    fixture
+        .binding
+        .set_output_historical_product_model_for_test(fixture.first_additional, 100_000.0, 500.0);
+    mark_response_output_backup(&fixture.binding, fixture.second_additional);
+    let outstanding = send_stream.reinjection_bytes();
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
+
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            outstanding,
+        )
+        .expect("ordinary ECF owner has Product and writer authority");
+
+    assert_eq!(
+        dispatch.selected_path,
+        Some(fixture.owner),
+        "an unqualified, materially slower additional output must not acquire Product ahead of the qualified current ECF owner",
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.owner_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }))
+            if payload == Bytes::from_static(b"next")
+    ));
+    assert!(try_recv_reliable_path_command(&mut fixture.first_receivers).is_none());
+}
+
+#[test]
+fn response_acquisition_defers_when_only_ordinary_ecf_placement_remains() {
+    let mut fixture = response_acquisition_fixture(4);
+    fixture
+        .binding
+        .set_output_product_model_for_test(fixture.owner, 5_000_000.0, 500.0);
+    fixture
+        .binding
+        .set_output_product_model_for_test(fixture.first_additional, 500_000_000.0, 1.0);
+    mark_response_output_backup(&fixture.binding, fixture.second_additional);
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+
+    sender.enqueue_data_for_lane(Bytes::from_static(b"first"), TrafficClass::Throughput);
+    let first = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            0,
+        )
+        .expect("ordinary completion placement establishes the first owner");
+    assert_eq!(
+        first.selected_path,
+        Some(fixture.first_additional),
+        "acquisition must not preempt ordinary first-owner selection",
+    );
+
+    sender.enqueue_data_for_lane(Bytes::from_static(b"second"), TrafficClass::Throughput);
+    let outstanding = send_stream.reinjection_bytes();
+    let second = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            outstanding,
+        )
+        .expect("ordinary ECF remains authoritative after the first placement");
+    assert_eq!(
+        second.selected_path,
+        Some(fixture.owner),
+        "with no admissible additional probe, ordinary completion placement remains authoritative",
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.first_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.owner_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+}
+
+#[test]
+fn response_acquisition_later_flight_remains_additional_until_deficit_is_satisfied() {
+    let mut fixture = response_acquisition_fixture(4);
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+    establish_qualified_response_owner(&fixture, &mut send_stream);
+    fixture
+        .binding
+        .set_output_product_model_for_test(fixture.first_additional, 600_000_000.0, 0.5);
+    mark_response_output_backup(&fixture.binding, fixture.second_additional);
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+
+    for payload in [Bytes::from_static(b"one"), Bytes::from_static(b"two")] {
+        sender.enqueue_data_for_lane(payload, TrafficClass::Throughput);
+        let outstanding = send_stream.reinjection_bytes();
+        let dispatch = sender
+            .dispatch_next_with_data_ack_outstanding(
+                &fixture.stream,
+                &mut send_stream,
+                TrafficClass::Throughput,
+                fixture.limits,
+                outstanding,
+            )
+            .expect("the same lower-frontier-relative additional output retains a deficit");
+        assert_eq!(dispatch.selected_path, Some(fixture.first_additional));
+    }
+
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.first_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.first_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+}
+
+#[test]
 fn critical_reinjection_preempts_later_original_data() {
     let limits = MuxLimits::default();
     let mut fixture = fixed_fixture(4, limits);
     let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
     let mut send_stream = ReliableSendStream::new(StreamId(31), limits);
+    send_stream
+        .send_data(Bytes::from_static(b"old"))
+        .expect("establish retransmittable Product debt");
     sender.enqueue_data_for_lane(Bytes::from_static(b"new"), TrafficClass::Throughput);
     sender.enqueue_critical_reinjection_frame_with_cause(
-        reinjection_frame(100, 3),
+        reinjection_frame(0, 3),
         RelaySendCause::AckGapReinjection,
     );
 
@@ -158,12 +787,12 @@ fn critical_reinjection_preempts_later_original_data() {
         .expect("critical reinjection dispatch");
 
     assert_eq!(dispatch.lane, ReliableWorkClass::Reinjection);
-    assert_eq!(send_stream.next_offset(), 0);
+    assert_eq!(send_stream.next_offset(), 3);
     assert_eq!(sender.data_bytes(), 3);
     assert!(matches!(
         try_recv_reliable_path_command(&mut fixture.receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
-            offset: 100,
+            offset: 0,
             ..
         }))
     ));
@@ -223,7 +852,7 @@ fn published_product_queue_is_shared_stream_state() {
 }
 
 #[test]
-fn stale_output_recovery_admits_disjoint_ranges_and_retries_exact_ranges() {
+fn stale_output_recovery_releases_k_only_by_data_ack_and_never_retries_same_target() {
     let limits = MuxLimits {
         max_payload_bytes: 4096,
         max_repair_bytes: 8192,
@@ -248,7 +877,8 @@ fn stale_output_recovery_admits_disjoint_ranges_and_retries_exact_ranges() {
         TrafficClass::Throughput,
         limits,
     );
-    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+    let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
+    let alternate_commands_for_backlog = alternate_commands.clone();
     binding.attach(
         alternate.underlay,
         alternate.path_id,
@@ -283,7 +913,7 @@ fn stale_output_recovery_admits_disjoint_ranges_and_retries_exact_ranges() {
         .expect("assign second response range");
     binding.record_original_flight(initial, &first);
     binding.record_original_flight(initial, &second);
-    assert!(binding.mark_output_stale(identity));
+    assert!(binding.mark_output_stale(identity, TrafficClass::Throughput));
 
     let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
     assert!(
@@ -303,28 +933,192 @@ fn stale_output_recovery_admits_disjoint_ranges_and_retries_exact_ranges() {
         "a current recovery copy exposes its exact-range retry deadline"
     );
     assert!(
-        recovery.queued,
-        "a current copy cannot delay a disjoint never-attempted range"
+        !recovery.queued && recovery.blocked_for_carrier_capacity,
+        "one live accepted copy consumes the target-wide emergency reserve across disjoint stale ranges",
+    );
+    assert_eq!(sender.bytes(), 0);
+    let first_command = try_recv_reliable_path_command(&mut alternate_receivers)
+        .expect("receive first recovery command");
+    assert!(matches!(
+        first_command,
+        ReliablePathCommand::SendFrame(Frame::StreamData { .. })
+    ));
+    alternate_receivers
+        .release_pending_command_bytes(reliable_path_command_pending_bytes(&first_command));
+    let first_ack = [OffsetRange {
+        start: 0,
+        end: 4096,
+    }];
+    binding.release_normalized_acked_ranges(&first_ack);
+    let _ = send_stream.apply_ack(&first_ack);
+
+    assert!(
+        sender
+            .drive_stale_output_recovery(&stream, &send_stream, limits)
+            .queued,
+        "Data ACK and native queue release restore service for the next disjoint range",
     );
     assert_eq!(sender.bytes(), 4096);
     let second_dispatch = sender
         .dispatch_next(&stream, &mut send_stream, TrafficClass::Throughput, limits)
         .expect("dispatch second exact-range recovery");
     assert_eq!(second_dispatch.selected_path, Some(alternate));
+    let second_command = try_recv_reliable_path_command(&mut alternate_receivers)
+        .expect("receive second recovery command");
+    assert!(matches!(
+        second_command,
+        ReliablePathCommand::SendFrame(Frame::StreamData { .. })
+    ));
+    alternate_commands_for_backlog
+        .try_enqueue_stream_ordered_frame(
+            Frame::StreamData {
+                stream_id: StreamId(999),
+                offset: 0,
+                payload: Bytes::from(vec![0x77; 4096]),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("queue unrelated native work above the modeled recovery window");
 
     binding.age_reinjected_flights_for_test(Duration::from_secs(2));
+    let native_backlog = sender.drive_stale_output_recovery(&stream, &send_stream, limits);
     assert!(
-        sender
-            .drive_stale_output_recovery(&stream, &send_stream, limits)
-            .queued,
-        "an unacknowledged exact range is eligible after its recovery interval"
+        !native_backlog.queued && native_backlog.blocked_for_carrier_capacity,
+        "deadline expiry cannot renew recovery while the same copy remains in native backlog",
     );
-    let retry_dispatch = sender
+    alternate_receivers
+        .release_pending_command_bytes(reliable_path_command_pending_bytes(&second_command));
+    let unrelated_command = try_recv_reliable_path_command(&mut alternate_receivers)
+        .expect("receive unrelated native backlog");
+    alternate_receivers
+        .release_pending_command_bytes(reliable_path_command_pending_bytes(&unrelated_command));
+    let expired_retry = sender.drive_stale_output_recovery(&stream, &send_stream, limits);
+    assert!(
+        !expired_retry.queued && expired_retry.blocked_for_carrier_capacity,
+        "timer and unrelated native-backlog release cannot renew the same target's Product authority; blocked={} deadline={:?} queued_bytes={}",
+        expired_retry.blocked_for_carrier_capacity,
+        expired_retry.retry_deadline,
+        sender.bytes(),
+    );
+}
+
+#[test]
+fn stale_output_recovery_falls_through_exhausted_target_reserve() {
+    let limits = MuxLimits {
+        max_payload_bytes: 4096,
+        max_repair_bytes: 8192,
+        max_path_flight_bytes: 4096,
+        max_reliable_relay_chunk_bytes: 4096,
+        ..MuxLimits::default()
+    };
+    let initial = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let fast_exhausted = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let fallback = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(2),
+    };
+    let (initial_commands, _initial_receivers) = reliable_path_command_channels(8);
+    let binding = crate::runtime::stream::response::ResponseStreamBinding::new_with_limits(
+        SessionId(31),
+        initial.underlay,
+        initial.path_id,
+        initial_commands,
+        TrafficClass::Throughput,
+        limits,
+    );
+    let (fast_commands, mut fast_receivers) = reliable_path_command_channels(8);
+    let (fallback_commands, mut fallback_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        fast_exhausted.underlay,
+        fast_exhausted.path_id,
+        fast_commands,
+        TrafficClass::Throughput,
+    );
+    binding.attach(
+        fallback.underlay,
+        fallback.path_id,
+        fallback_commands,
+        TrafficClass::Throughput,
+    );
+    binding.mark_output_path_proven_for_test(fast_exhausted);
+    binding.mark_output_path_proven_for_test(fallback);
+    binding.set_output_product_model_for_test(fast_exhausted, 500_000_000.0, 5.0);
+    binding.set_output_product_model_for_test(fallback, 20_000_000.0, 50.0);
+
+    let identity = binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == initial)
+        .map(|target| ServerReinjectionOutputIdentity {
+            key: initial,
+            incarnation: target.observation.incarnation,
+        })
+        .expect("initial output identity");
+    let (_frames_tx, frames) = mpsc::channel(1);
+    let stream = ReliablePathStream {
+        stream_id: StreamId(31),
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: limits.max_payload_bytes,
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frames.into(),
+    };
+    let mut send_stream = ReliableSendStream::new(StreamId(31), limits);
+    let first_failed = send_stream
+        .send_data(Bytes::from(vec![0x31; 4096]))
+        .expect("assign first failed response range");
+    let second_failed = send_stream
+        .send_data(Bytes::from(vec![0x32; 4096]))
+        .expect("assign second failed response range");
+    binding.record_original_flight(initial, &first_failed);
+    binding.record_original_flight(initial, &second_failed);
+    binding.record_reinjected_flight(fast_exhausted, &reinjection_frame(8192, 4096));
+    assert!(binding.mark_output_stale(identity, TrafficClass::Throughput));
+
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    let recovery = sender.drive_stale_output_recovery(&stream, &send_stream, limits);
+    assert!(
+        recovery.queued,
+        "recovery must skip the fastest exhausted survivor and keep searching regular alternates",
+    );
+    assert!(
+        sender.front_has_carrier_credit_at_frontier(
+            &stream,
+            &send_stream,
+            TrafficClass::Throughput,
+            limits,
+            0,
+            ReliableDataAckFrontierState::Live,
+        ),
+        "front readiness must exclude its own queued reinjection bytes from exact-target reserve revalidation",
+    );
+
+    let dispatch = sender
         .dispatch_next(&stream, &mut send_stream, TrafficClass::Throughput, limits)
-        .expect("retry exact range on the surviving output");
-    assert_eq!(
-        retry_dispatch.selected_path,
-        Some(alternate),
-        "retry may reuse the same live survivor while remaining distinct from the stale owner"
+        .expect("dispatch fallback stale-output recovery");
+    assert_eq!(dispatch.selected_path, Some(fallback));
+    assert_eq!(sender.stale_response_recovery_generation(), 1);
+    assert!(try_recv_reliable_path_command(&mut fast_receivers).is_none());
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fallback_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        })) if payload.len() == 4096
+    ));
+
+    let exhausted = sender.drive_stale_output_recovery(&stream, &send_stream, limits);
+    assert!(
+        !exhausted.queued && exhausted.blocked_for_carrier_capacity,
+        "once both regular alternates hold live recovery reserve, reevaluation must block instead of spinning",
     );
+    assert!(exhausted.retry_deadline.is_some());
 }

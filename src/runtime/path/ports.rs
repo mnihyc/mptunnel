@@ -4,13 +4,15 @@
 //! policy objects. The stream layer consumes these values and owns offsets,
 //! reinjection, and attachment behavior.
 
+use super::authority::NativeCarrierSchedulingShapeSnapshot;
 use super::commands::ReliablePathCommandSender;
-use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_instance_id};
+use crate::model::carrier_rate_authority::CarrierRateAuthorityStamp;
+use crate::model::path::{CarrierPathInstanceId, PathPolicy, try_next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{
     CloseReason, Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus,
-    SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    SessionId, StreamDemandHint, StreamId, StreamReturnPlan, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
@@ -21,7 +23,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// A positive-ACK, non-application-limited delivery sample for one carrier.
@@ -42,6 +44,53 @@ pub(in crate::runtime) struct CarrierDeliveryRateSample {
     /// Three-PTO expiry frozen from the transport timing observed in the same
     /// ACK epoch. Later app-limited RTT polls cannot rewrite this lifetime.
     pub(in crate::runtime) expires_at: std::time::Instant,
+}
+
+/// One immutable native carrier-window observation.
+///
+/// The raw carrier metric may remain available for diagnostics after this
+/// sample expires. Product admission consumes only this frozen authority: a
+/// later RTT observation cannot extend or shorten its lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct CarrierNativeWindowSample {
+    pub(in crate::runtime) inflight_limit_bytes: u64,
+    pub(in crate::runtime) observed_at: std::time::Instant,
+    pub(in crate::runtime) expires_at: std::time::Instant,
+}
+
+impl CarrierNativeWindowSample {
+    pub(in crate::runtime) fn new(
+        inflight_limit_bytes: u64,
+        observed_at: std::time::Instant,
+        freshness_horizon: std::time::Duration,
+    ) -> Option<Self> {
+        (inflight_limit_bytes > 0)
+            .then(|| observed_at.checked_add(freshness_horizon))
+            .flatten()
+            .map(|expires_at| Self {
+                inflight_limit_bytes,
+                observed_at,
+                expires_at,
+            })
+    }
+
+    pub(in crate::runtime) fn fresh_at(self, now: std::time::Instant) -> bool {
+        self.observed_at <= now && now < self.expires_at
+    }
+
+    pub(in crate::runtime) fn from_path_metrics_at(
+        metrics: PathMetrics,
+        observed_at: std::time::Instant,
+    ) -> Option<Self> {
+        Self::new(
+            metrics.inflight_limit_bytes,
+            observed_at,
+            crate::model::timing::transport_rate_sample_freshness_horizon(
+                std::time::Duration::from_micros(u64::from(metrics.srtt_us.max(1))),
+                std::time::Duration::from_micros(u64::from(metrics.rttvar_us)),
+            ),
+        )
+    }
 }
 
 /// Stable notification that the complete authenticated MPP session became
@@ -452,7 +501,126 @@ pub(in crate::runtime) struct ServerCarrierPathStatusSnapshot {
     pub(in crate::runtime) usage: Option<PathUsage>,
     pub(in crate::runtime) metrics: Option<PathMetrics>,
     pub(in crate::runtime) carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    /// Exact structural generation for state/usage/retirement qualification.
+    /// `None` is the fail-closed exhausted state.
+    pub(in crate::runtime) eligibility_epoch: Option<u64>,
+    /// Endpoint-local NativeMode authority and activation-coherent shape.
+    /// This never crosses the peer wire; lineage ACK diagnostics above do not
+    /// alter it.
+    pub(in crate::runtime) native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
     pub(in crate::runtime) source: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ServerCarrierPathApplySnapshot {
+    pub(in crate::runtime) eligibility_epoch: Option<u64>,
+    pub(in crate::runtime) native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
+}
+
+#[derive(Debug)]
+struct ServerCarrierPathApplyState {
+    eligibility_epoch: Option<u64>,
+    native_scheduling_shape: Option<NativeCarrierSchedulingShapeSnapshot>,
+}
+
+/// Exact per-carrier structural/Native publication fence.
+///
+/// Registry transitions publish here while holding their owner lock. Packet
+/// publication holds this fence through its first irreversible queue mutation,
+/// so structural eligibility cannot change after validation. This owns the
+/// registry's one shape copy; it is not another rate/controller authority.
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct ServerCarrierPathApplyAuthority {
+    inner: Arc<Mutex<ServerCarrierPathApplyState>>,
+}
+
+impl ServerCarrierPathApplyAuthority {
+    pub(in crate::runtime) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ServerCarrierPathApplyState {
+                eligibility_epoch: Some(1),
+                native_scheduling_shape: None,
+            })),
+        }
+    }
+
+    pub(in crate::runtime) fn snapshot(&self) -> ServerCarrierPathApplySnapshot {
+        let state = self
+            .inner
+            .lock()
+            .expect("server carrier apply-authority lock");
+        ServerCarrierPathApplySnapshot {
+            eligibility_epoch: state.eligibility_epoch,
+            native_scheduling_shape: state.native_scheduling_shape,
+        }
+    }
+
+    pub(in crate::runtime) fn advance_eligibility_epoch(&self) {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("server carrier apply-authority lock");
+        state.eligibility_epoch = state
+            .eligibility_epoch
+            .and_then(|epoch| epoch.checked_add(1));
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_eligibility_epoch_for_test(&self, epoch: Option<u64>) {
+        self.inner
+            .lock()
+            .expect("server carrier apply-authority lock")
+            .eligibility_epoch = epoch;
+    }
+
+    pub(in crate::runtime) fn stage_native_scheduling_shape(
+        &self,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("server carrier apply-authority lock");
+        if let Some(previous) = state.native_scheduling_shape {
+            if shape.stamp().revision() < previous.stamp().revision()
+                || (shape.stamp().revision() == previous.stamp().revision()
+                    && shape.stamp() != previous.stamp())
+            {
+                return false;
+            }
+        }
+        if state.native_scheduling_shape == Some(shape) {
+            false
+        } else {
+            state.native_scheduling_shape = Some(shape);
+            true
+        }
+    }
+
+    /// Hold structural identity and the registry's current shape through one
+    /// Product apply. Native callers acquire their rate-authority fence first.
+    pub(in crate::runtime) fn commit_if_current<R>(
+        &self,
+        expected_eligibility_epoch: u64,
+        expected_native_stamp: Option<CarrierRateAuthorityStamp>,
+        commit: impl FnOnce(Option<NativeCarrierSchedulingShapeSnapshot>) -> R,
+    ) -> Option<R> {
+        let state = self
+            .inner
+            .lock()
+            .expect("server carrier apply-authority lock");
+        if state.eligibility_epoch != Some(expected_eligibility_epoch) {
+            return None;
+        }
+        if let Some(expected) = expected_native_stamp
+            && !state
+                .native_scheduling_shape
+                .is_some_and(|shape| shape.stamp() == expected)
+        {
+            return None;
+        }
+        Some(commit(state.native_scheduling_shape))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -620,6 +788,7 @@ impl ServerMppIngress {
 }
 
 /// Completion authority for one exact carrier's ordered attachment retirement.
+#[derive(Clone)]
 pub(in crate::runtime) struct ServerCarrierPathRetirement {
     completed: watch::Receiver<bool>,
 }
@@ -651,7 +820,9 @@ struct ServerCarrierPathRegistrationInner {
     principal_permit: PrincipalPermit,
     observed_ingress: Option<ServerCarrierObservedIngress>,
     session_retirement: ServerSessionRetirement,
+    apply_authority: ServerCarrierPathApplyAuthority,
     validation: Arc<AtomicBool>,
+    retirement: ServerCarrierPathRetirement,
 }
 
 #[derive(Debug, Clone)]
@@ -731,6 +902,10 @@ impl ServerCarrierPathRegistration {
         self.inner.session_retirement.clone()
     }
 
+    pub(in crate::runtime) fn apply_authority(&self) -> ServerCarrierPathApplyAuthority {
+        self.inner.apply_authority.clone()
+    }
+
     /// Returns a fresh challenge until this carrier instance is validated.
     pub(in crate::runtime) fn path_validation_challenge(
         &self,
@@ -763,7 +938,8 @@ impl ServerCarrierPathRegistration {
     }
 
     pub(in crate::runtime) fn begin_retirement(&self) -> ServerCarrierPathRetirement {
-        self.inner.backend.retire_carrier_path(self.inner.identity)
+        let _ = self.inner.backend.retire_carrier_path(self.inner.identity);
+        self.inner.retirement.clone()
     }
 
     fn belongs_to(&self, port: &ServerStreamPort) -> bool {
@@ -811,6 +987,7 @@ pub(in crate::runtime) struct ServerStreamOpenRequest {
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) target: TargetAddr,
     pub(in crate::runtime) initial_demand: StreamDemandHint,
+    pub(in crate::runtime) return_plan: StreamReturnPlan,
     pub(in crate::runtime) attachment: ServerStreamPathAttachment,
     pub(in crate::runtime) mux_limits: MuxLimits,
 }
@@ -860,7 +1037,11 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         &self,
         identity: ServerCarrierPathIdentity,
         local: ServerLocalPathProperties,
+        initial_peer_usage: Option<PathUsage>,
+        native_capacity_epoch: u64,
+        apply_authority: ServerCarrierPathApplyAuthority,
         principal_permit: PrincipalPermit,
+        retirement_completion: watch::Sender<bool>,
     ) -> Result<ServerSessionRetirement, RuntimeError>;
 
     fn retire_carrier_path(
@@ -923,7 +1104,21 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         native_drain_observed: bool,
+        native_capacity_epoch: Option<u64>,
+        native_window_sample: Option<CarrierNativeWindowSample>,
         delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    );
+
+    fn stage_native_scheduling_shape(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> bool;
+
+    fn fanout_native_scheduling_shape(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        shape: NativeCarrierSchedulingShapeSnapshot,
     );
 
     fn record_path_proof_success(
@@ -933,6 +1128,11 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
     );
 
     fn peer_status_snapshot(&self, session_id: SessionId) -> Vec<PeerPathStatus>;
+
+    fn carrier_path_statuses(
+        &self,
+        identities: &[ServerCarrierPathIdentity],
+    ) -> Vec<Option<ServerCarrierPathStatusSnapshot>>;
 
     fn management_snapshot(&self) -> ServerStreamManagementSnapshot;
 }
@@ -1013,11 +1213,42 @@ impl ServerStreamPort {
             underlay,
             path_id,
             local,
+            None,
+            0,
             principal_permit,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn register_carrier_path_with_observed_peer_and_authority(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        local: ServerLocalPathProperties,
+        peer_usage: PathUsage,
+        native_capacity_epoch: u64,
+        principal_permit: PrincipalPermit,
+        peer: ServerCarrierPeer,
+        configured_path: Option<Arc<str>>,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        self.register_carrier_path_with_observed_ingress(
+            session_id,
+            underlay,
+            path_id,
+            local,
+            Some(peer_usage),
+            native_capacity_epoch,
+            principal_permit,
+            Some(ServerCarrierObservedIngress {
+                peer,
+                configured_path,
+            }),
+        )
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn register_carrier_path_with_observed_peer(
         &self,
@@ -1034,6 +1265,8 @@ impl ServerStreamPort {
             underlay,
             path_id,
             local,
+            None,
+            0,
             principal_permit,
             Some(ServerCarrierObservedIngress {
                 peer,
@@ -1049,6 +1282,8 @@ impl ServerStreamPort {
         underlay: UnderlayProtocol,
         path_id: PathId,
         local: ServerLocalPathProperties,
+        initial_peer_usage: Option<PathUsage>,
+        native_capacity_epoch: u64,
         principal_permit: PrincipalPermit,
         observed_ingress: Option<ServerCarrierObservedIngress>,
     ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
@@ -1056,11 +1291,20 @@ impl ServerStreamPort {
             session_id,
             underlay,
             path_id,
-            path_instance_id: next_carrier_path_instance_id(),
+            path_instance_id: try_next_carrier_path_instance_id()
+                .ok_or(RuntimeError::ExactIdentityExhausted)?,
         };
-        let session_retirement =
-            self.backend
-                .activate_carrier_path(identity, local, principal_permit.clone())?;
+        let (retirement_completion, retirement) = watch::channel(false);
+        let apply_authority = ServerCarrierPathApplyAuthority::new();
+        let session_retirement = self.backend.activate_carrier_path(
+            identity,
+            local,
+            initial_peer_usage,
+            native_capacity_epoch,
+            apply_authority.clone(),
+            principal_permit.clone(),
+            retirement_completion,
+        )?;
         Ok(ServerCarrierPathRegistration {
             inner: Arc::new(ServerCarrierPathRegistrationInner {
                 backend: self.backend.clone(),
@@ -1070,7 +1314,9 @@ impl ServerStreamPort {
                 principal_permit,
                 observed_ingress,
                 session_retirement,
+                apply_authority,
                 validation: Arc::new(AtomicBool::new(false)),
+                retirement: ServerCarrierPathRetirement::pending(retirement),
             }),
         })
     }
@@ -1256,13 +1502,77 @@ impl ServerStreamPort {
         native_drain_observed: bool,
         delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) {
+        self.record_local_path_metrics_with_native_epoch(
+            registration,
+            metrics,
+            native_drain_observed,
+            None,
+            delivery_rate_sample,
+        );
+    }
+
+    pub(in crate::runtime) fn record_local_path_metrics_with_native_epoch(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        metrics: PathMetrics,
+        native_drain_observed: bool,
+        native_capacity_epoch: Option<u64>,
+        delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    ) {
+        let native_window_sample =
+            CarrierNativeWindowSample::from_path_metrics_at(metrics, std::time::Instant::now());
+        self.record_local_path_metrics_with_native_evidence(
+            registration,
+            metrics,
+            native_drain_observed,
+            native_capacity_epoch,
+            native_window_sample,
+            delivery_rate_sample,
+        );
+    }
+
+    pub(in crate::runtime) fn record_local_path_metrics_with_native_evidence(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        metrics: PathMetrics,
+        native_drain_observed: bool,
+        native_capacity_epoch: Option<u64>,
+        native_window_sample: Option<CarrierNativeWindowSample>,
+        delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    ) {
         if registration.belongs_to(self) {
             self.backend.record_local_path_metrics(
                 registration.inner.identity,
                 metrics,
                 native_drain_observed,
+                native_capacity_epoch,
+                native_window_sample,
                 delivery_rate_sample,
             );
+        }
+    }
+
+    pub(in crate::runtime) fn stage_native_scheduling_shape(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) -> bool {
+        if registration.belongs_to(self) {
+            self.backend
+                .stage_native_scheduling_shape(registration.inner.identity, shape)
+        } else {
+            false
+        }
+    }
+
+    pub(in crate::runtime) fn fanout_native_scheduling_shape(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        shape: NativeCarrierSchedulingShapeSnapshot,
+    ) {
+        if registration.belongs_to(self) {
+            self.backend
+                .fanout_native_scheduling_shape(registration.inner.identity, shape);
         }
     }
 
@@ -1285,6 +1595,13 @@ impl ServerStreamPort {
         self.backend.peer_status_snapshot(session_id)
     }
 
+    pub(in crate::runtime) fn carrier_path_statuses(
+        &self,
+        identities: &[ServerCarrierPathIdentity],
+    ) -> Vec<Option<ServerCarrierPathStatusSnapshot>> {
+        self.backend.carrier_path_statuses(identities)
+    }
+
     pub(in crate::runtime) fn management_snapshot(&self) -> ServerStreamManagementSnapshot {
         self.backend.management_snapshot()
     }
@@ -1298,7 +1615,17 @@ pub(in crate::runtime) struct OpenedReliableCarrierStream {
     pub(in crate::runtime) lane: TrafficClass,
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
+    /// Non-evidentiary configured/startup prior retained when every measured
+    /// attachment epoch has expired.
+    pub(in crate::runtime) portable_startup: PathSnapshot,
     pub(in crate::runtime) startup: PathSnapshot,
+    /// Native window captured with the attachment's carrier observation.
+    /// Its lifetime is independent from `startup_metrics` delivery-rate age.
+    pub(in crate::runtime) startup_native_window: Option<CarrierNativeWindowSample>,
+    /// Attachment-time carrier metrics retain the immutable native evidence
+    /// lifetime. Fixed Product outputs must not turn their scalar snapshot into
+    /// permanent rate or congestion-window authority.
+    pub(in crate::runtime) startup_metrics: Option<PathMetrics>,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,

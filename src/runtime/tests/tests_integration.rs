@@ -1270,15 +1270,6 @@ async fn ranged_tcp_bounded_pool_rotates_active_members_one_successor_at_a_time(
     let product = tokio::spawn(handle_socks5_client_stream(product_server, context.clone()));
     open_socks5_tcp_tunnel(&mut product_client, target_addr).await;
 
-    {
-        let health = context.health().lock().expect("bounded-pool health");
-        assert_eq!(
-            health.tcp.iter().map(|path| path.active_flows).sum::<u32>(),
-            1,
-            "one carrier must own the live Product attachment"
-        );
-    }
-
     // The hop interval makes replacement eligible. Ordered retirement may
     // detach and recover an active Product attachment, but the logical stream
     // must remain continuous.
@@ -1622,6 +1613,15 @@ async fn path_probe_skips_udp_path_with_active_session() {
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
     context.mark_udp_path_open_success(0, Duration::from_millis(5));
+    let _session_load = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("active UDP session load");
 
     probe_client_paths(&context, Duration::from_millis(20)).await;
 
@@ -2478,14 +2478,26 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         wait_for_tcp_ready_count(&context, 1).await;
 
         let stream_id = StreamId(0);
+        let initial_tcp_instance = context.tcp_sessions[0]
+            .connection_instance_id()
+            .expect("live TCP instance");
+        let mut initial_tcp_attachment =
+            arm_client_relay_attachment_commits_for_test(initial_tcp_instance, stream_id);
         let mut first_abort = arm_server_udp_stream_abort_for_test(context.session_id, stream_id);
         let (mut client, ingress) = duplex(256 * 1024);
         let product = tokio::spawn(handle_socks5_client_stream(ingress, context.clone()));
         open_socks5_tcp_tunnel(&mut client, target_addr).await;
+        let committed_tcp = tokio::time::timeout(
+            Duration::from_millis(750),
+            initial_tcp_attachment.wait_committed(),
+        )
+        .await
+        .expect("initial client TCP attachment commit timeout");
+        assert_eq!(committed_tcp.path_instance_id, initial_tcp_instance);
         assert_eq!(
             context.health().lock().expect("health lock").tcp[0].active_flows,
-            1,
-            "the established logical flow must begin on TCP"
+            0,
+            "an attachment without committed OriginalData is membership, not active path demand"
         );
 
         probe_client_paths(&context, Duration::from_millis(500)).await;
@@ -2529,7 +2541,6 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         );
         let (tcp_instance, quic_instance, quic_failures) = {
             let health = context.health().lock().expect("health lock");
-            assert_eq!(health.tcp[0].active_flows, 1);
             assert_eq!(health.udp[0].path_instance_id(), Some(quic_instance));
             assert!(health.udp[0].accepts_product_commit(quic_instance));
             (
@@ -2555,10 +2566,6 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
             context.tcp_sessions[0].connection_instance_id(),
             Some(tcp_instance),
             "TCP must survive the QUIC request-stream failure"
-        );
-        assert_eq!(
-            context.health().lock().expect("health lock").tcp[0].active_flows,
-            1
         );
 
         let pre_pto_deadline = aborted_at + pto.saturating_sub(Duration::from_millis(3));
@@ -2710,11 +2717,21 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
         .await
         .expect("first response");
     assert_eq!(&first_response, b"pong");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if health_context.health().lock().expect("health lock").tcp[0].active_flows == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request OriginalData demand did not become idle after its ACK");
     let active_before_outage =
         health_context.health().lock().expect("health lock").tcp[0].active_flows;
     assert_eq!(
-        active_before_outage, 1,
-        "one live Product attachment must own one path-load lease"
+        active_before_outage, 0,
+        "an idle live Product attachment must not publish active path demand"
     );
 
     tcp_server.abort();
@@ -2983,7 +3000,11 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
         }),
         "the lower-latency carrier must lead initial Product placement"
     );
-    let health_context = context.clone();
+    let expected_instance = context.tcp_sessions[1]
+        .connection_instance_id()
+        .expect("low-latency carrier instance");
+    let mut expected_attachment =
+        arm_client_relay_attachment_commits_for_test(expected_instance, StreamId(0));
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -3009,14 +3030,12 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     let mut response = [0u8; 10];
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
-    let low_latency_active_flows = {
-        let health = health_context.health().lock().expect("health lock");
-        health.tcp[1].active_flows
-    };
-    assert_eq!(
-        low_latency_active_flows, 1,
-        "the Product stream must attach to the leading carrier"
-    );
+    let attachment =
+        tokio::time::timeout(Duration::from_secs(1), expected_attachment.wait_committed())
+            .await
+            .expect("low-latency attachment commit");
+    assert_eq!(attachment.path_instance_id, expected_instance);
+    assert_eq!(attachment.key.index, 1);
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
     let mut payload = [0u8; 4];
@@ -3024,7 +3043,6 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     assert_eq!(&payload, b"pong");
 
     handler.await.expect("join").expect("handler");
-    drop(health_context);
     low_latency_server
         .await
         .expect("low latency server join")
@@ -3093,7 +3111,11 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
         accepted_rx.recv().await.expect("second ready TCP carrier"),
     ]);
     assert_eq!(ready_paths, HashSet::from([0, 1]));
-    let health_context = context.clone();
+    let expected_instance = context.tcp_sessions[0]
+        .connection_instance_id()
+        .expect("interactive carrier instance");
+    let mut expected_attachment =
+        arm_client_relay_attachment_commits_for_test(expected_instance, StreamId(0));
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -3119,15 +3141,12 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let mut response = [0u8; 10];
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
-    let active_flows = {
-        let health = health_context.health().lock().expect("health lock");
-        (health.tcp[0].active_flows, health.tcp[1].active_flows)
-    };
-    assert_eq!(
-        active_flows,
-        (1, 0),
-        "ReliableAuto must start its interactive Product stream on the latency carrier"
-    );
+    let attachment =
+        tokio::time::timeout(Duration::from_secs(1), expected_attachment.wait_committed())
+            .await
+            .expect("interactive attachment commit");
+    assert_eq!(attachment.path_instance_id, expected_instance);
+    assert_eq!(attachment.key.index, 0);
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
     let mut payload = [0u8; 4];
@@ -3135,7 +3154,6 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
     assert_eq!(&payload, b"pong");
 
     handler.await.expect("join").expect("handler");
-    drop(health_context);
     low_latency_server
         .await
         .expect("low latency server join")
@@ -3161,6 +3179,11 @@ async fn socks5_ingress_uses_a_ready_carrier_while_another_endpoint_is_unavailab
     )
     .expect("ctx");
     probe_client_paths(&context, Duration::from_secs(2)).await;
+    let expected_instance = context.tcp_sessions[1]
+        .connection_instance_id()
+        .expect("available carrier instance");
+    let mut expected_attachment =
+        arm_client_relay_attachment_commits_for_test(expected_instance, StreamId(0));
     let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
@@ -3187,10 +3210,15 @@ async fn socks5_ingress_uses_a_ready_carrier_while_another_endpoint_is_unavailab
     let mut response = [0u8; 10];
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+    let attachment =
+        tokio::time::timeout(Duration::from_secs(1), expected_attachment.wait_committed())
+            .await
+            .expect("available-carrier attachment commit");
+    assert_eq!(attachment.path_instance_id, expected_instance);
+    assert_eq!(attachment.key.index, 1);
     {
         let health = health_context.health().lock().expect("health lock");
         assert!(!health.tcp[0].has_physical_carrier());
-        assert_eq!(health.tcp[1].active_flows, 1);
     }
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");

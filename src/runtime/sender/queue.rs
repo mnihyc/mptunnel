@@ -5,6 +5,7 @@
 
 use super::{RelaySendCause, ServerReinjectionOutputIdentity};
 use crate::model::capacity::reliable_relay_buffer_len;
+use crate::model::path::RelayPathInstance;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
@@ -72,6 +73,108 @@ impl ReliableRelaySenderQueue {
 
     pub(in crate::runtime) fn data_bytes(&self) -> usize {
         self.data_bytes
+    }
+
+    /// All queued ReinjectedData, regardless of whether it is target-bound.
+    ///
+    /// This aggregate remains appropriate for connection resource and repair
+    /// budgets. Exact-target recovery admission must instead use
+    /// `request_target_queued_reinjection_bytes`.
+    pub(in crate::runtime) fn reinjection_bytes(&self) -> usize {
+        self.critical_reinjection
+            .iter()
+            .chain(self.reinjection.iter())
+            .fold(0usize, |bytes, work| {
+                bytes.saturating_add(work.payload_bytes)
+            })
+    }
+
+    /// Queued ReinjectedData that consumes one exact request target's
+    /// recovery authority.
+    ///
+    /// Target-unbound repair is conservatively charged to every candidate;
+    /// repair already bound to another exact incarnation is excluded. Raw
+    /// Data and control are source-held work, not target-assigned debt. A
+    /// dispatch revalidation excludes its own front intent before testing the
+    /// post-reservation target authority.
+    pub(in crate::runtime) fn request_target_queued_reinjection_bytes(
+        &self,
+        target: RelayPathInstance,
+        exclude_front: bool,
+    ) -> usize {
+        let mut reinjection_bytes = 0usize;
+        let exclude_first_reinjection = exclude_front
+            && self
+                .front()
+                .is_some_and(|(lane, _)| lane == ReliableWorkClass::Reinjection);
+        let mut skipped_front = false;
+        for work in self
+            .critical_reinjection
+            .iter()
+            .chain(self.reinjection.iter())
+        {
+            if exclude_first_reinjection && !skipped_front {
+                skipped_front = true;
+                continue;
+            }
+            let ReliableRelayQueuedWorkKind::Reinjection { cause, .. } = &work.kind else {
+                debug_assert!(false, "reinjection lane must contain Reinjection work");
+                continue;
+            };
+            if cause
+                .request_reinjection_target()
+                .is_some_and(|bound| bound != target)
+            {
+                continue;
+            }
+            // Unbound repair conservatively consumes every candidate reserve;
+            // bound repair consumes only its exact target's reserve.
+            reinjection_bytes = reinjection_bytes.saturating_add(work.payload_bytes);
+        }
+        reinjection_bytes
+    }
+
+    /// Queued ReinjectedData that consumes one exact response target's
+    /// recovery authority.
+    ///
+    /// The response queue belongs to one logical stream. Target-unbound repair
+    /// is therefore charged to every candidate, while a persistent ACK-gap
+    /// batch already bound to another exact output incarnation is excluded.
+    /// Data/control never consumes target repair authority. Apply-time
+    /// revalidation may exclude only the front repair intent being reserved.
+    pub(in crate::runtime) fn response_target_queued_reinjection_bytes(
+        &self,
+        target: ServerReinjectionOutputIdentity,
+        exclude_front: bool,
+    ) -> usize {
+        let mut reinjection_bytes = 0usize;
+        let exclude_first_reinjection = exclude_front
+            && self
+                .front()
+                .is_some_and(|(lane, _)| lane == ReliableWorkClass::Reinjection);
+        let mut skipped_front = false;
+        for work in self
+            .critical_reinjection
+            .iter()
+            .chain(self.reinjection.iter())
+        {
+            if exclude_first_reinjection && !skipped_front {
+                skipped_front = true;
+                continue;
+            }
+            let ReliableRelayQueuedWorkKind::Reinjection { cause, .. } = &work.kind else {
+                debug_assert!(false, "reinjection lane must contain Reinjection work");
+                continue;
+            };
+            if cause
+                .response_reinjection_target()
+                .is_some_and(|bound| bound != target)
+            {
+                continue;
+            }
+            reinjection_bytes = reinjection_bytes.saturating_add(work.payload_bytes);
+        }
+        reinjection_bytes
     }
 
     pub(in crate::runtime) fn push_final_control(&mut self, frame: Frame) -> u64 {
@@ -285,6 +388,34 @@ impl ReliableRelaySenderQueue {
         released
     }
 
+    pub(in crate::runtime) fn discard_unavailable_client_path_recovery_reinjections(
+        &mut self,
+        target_is_live: impl Fn(crate::model::path::RelayPathInstance) -> bool,
+    ) -> usize {
+        let discard = |queue: &mut VecDeque<ReliableRelayQueuedWork>| {
+            let mut released = 0usize;
+            queue.retain(|work| {
+                let keep = match &work.kind {
+                    ReliableRelayQueuedWorkKind::Reinjection { cause, .. }
+                        if cause.client_path_recovery_is_bound() =>
+                    {
+                        cause.client_target().is_some_and(&target_is_live)
+                    }
+                    _ => true,
+                };
+                if !keep {
+                    released = released.saturating_add(work.payload_bytes);
+                }
+                keep
+            });
+            released
+        };
+        let released =
+            discard(&mut self.critical_reinjection).saturating_add(discard(&mut self.reinjection));
+        self.bytes = self.bytes.saturating_sub(released);
+        released
+    }
+
     pub(in crate::runtime) fn discard_resolved_stale_path_reinjections(
         &mut self,
         path_is_stale: impl Fn(crate::model::path::RelayPathInstance) -> bool,
@@ -483,13 +614,12 @@ fn discard_resolved_stale_path_reinjection_queue(
 ) -> usize {
     let mut released = 0usize;
     queue.retain(|work| {
-        let keep = !matches!(
-            &work.kind,
-            ReliableRelayQueuedWorkKind::Reinjection {
-                cause: RelaySendCause::StalePathReinjection(path),
-                ..
-            } if !path_is_stale(*path)
-        );
+        let keep = match &work.kind {
+            ReliableRelayQueuedWorkKind::Reinjection { cause, .. } => {
+                cause.stale_request_owner().is_none_or(path_is_stale)
+            }
+            _ => true,
+        };
         if !keep {
             released = released.saturating_add(work.payload_bytes);
         }
@@ -592,8 +722,8 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_limit(
     inflight_limit
         .max(reliable_relay_buffer_len(mux_limits))
         .min(mux_limits.max_repair_bytes)
+        .min(mux_limits.max_reorder_bytes)
         .min(stream_window)
-        .min(mux_limits.max_path_flight_bytes)
         .max(1)
 }
 

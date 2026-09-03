@@ -13,7 +13,7 @@ use crate::model::request_capacity::{
     request_tcp_capacity_candidate_can_start_receipt, request_tcp_capacity_measurement_geometry,
     request_tcp_capacity_measurement_lease,
 };
-use crate::model::request_evidence::RequestPerFlowRateModel;
+use crate::model::request_evidence::RequestProductRateEpoch;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::model::work::ReliableWorkClass;
 use crate::protocol::{StreamId, UnderlayProtocol};
@@ -236,7 +236,7 @@ impl RequestTcpCapacityController {
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         lane: TrafficClass,
-        reference: Option<(RelayPathInstance, RequestPerFlowRateModel)>,
+        reference: Option<(RelayPathInstance, RequestProductRateEpoch)>,
     ) {
         if !lane.is_bulk() || context.reliable_relay_has_latency_pressure() {
             return;

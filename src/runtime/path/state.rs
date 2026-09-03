@@ -5,12 +5,14 @@
 
 use super::client_session::{ClientSessionLifecycle, ClientSessionRetirement};
 use super::commands::CapacityProbeCommandTicket;
-use super::health::{ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView};
+use super::health::{
+    ClientPathHealth, ClientPathHealthRecord, RelayPathLoadOwner, RequestCapacityReconciliationView,
+};
 #[cfg(test)]
 use super::model::PathDeliveryStats;
 use super::model::{
     ClientPathObservation, UdpDatagramPathObservation, path_observation_is_idle_for_probe,
-    path_records_have_schedulable_alternative,
+    path_record_failure_cooldown, path_records_have_schedulable_alternative,
 };
 #[cfg(test)]
 use super::proof::PathProofObservation;
@@ -23,6 +25,7 @@ use super::tcp::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
 use super::*;
 use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+use crate::model::timing::path_open_pto_multiplier;
 use crate::protocol::{DatagramFlowId, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::TrafficClass;
@@ -107,7 +110,7 @@ impl ClientPathState {
     ) -> Option<R> {
         let mut health = self.health.lock().expect("client path health lock");
         let record = health.path_record_mut(key)?;
-        let result = mutation(record);
+        let result = record.mutate_eligibility(mutation);
         Some(result)
     }
 
@@ -173,7 +176,9 @@ impl ClientPathState {
             .expect("client carrier lifecycle lock");
         let mut health = self.health.lock().expect("client path health lock");
         if let Some(record) = health.path_record_mut(RelayPathKey { underlay, index }) {
-            record.install_peer_usage(path_instance_id, sequence, usage);
+            record.mutate_eligibility(|record| {
+                record.install_peer_usage(path_instance_id, sequence, usage);
+            });
         }
     }
 
@@ -193,10 +198,12 @@ impl ClientPathState {
     /// owner-held lifecycle transaction. The caller already owns the QUIC
     /// connection slot, establishing the global order
     /// `connection owner -> carrier lifecycle -> health`.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn publish_udp_peer_path_usage_committed(
         &self,
         index: usize,
         path_instance_id: CarrierPathInstanceId,
+        native_capacity_epoch: u64,
         sequence: u64,
         usage: PathUsage,
         carrier_is_live: impl FnOnce() -> bool,
@@ -213,7 +220,9 @@ impl ClientPathState {
         let Some(record) = health.udp.get_mut(index) else {
             return false;
         };
-        record.install_peer_usage(path_instance_id, sequence, usage);
+        record.mutate_eligibility(|record| {
+            record.install_udp_peer_usage(path_instance_id, native_capacity_epoch, sequence, usage);
+        });
         publish_owner();
         true
     }
@@ -236,12 +245,30 @@ impl ClientPathState {
         let has_schedulable_alternative =
             path_records_have_schedulable_alternative(&health.udp, index, now);
         let marked = health.udp.get_mut(index).is_some_and(|record| {
-            record.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
+            record.mutate_eligibility(|record| {
+                record.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
+            })
         });
         // The connection owner is authoritative for physical membership even
         // when an exact callback already published the same health failure.
         retire_owner();
         marked
+    }
+
+    /// Freezes the complete establishment-transaction clock from the exact
+    /// live owner before failure clears its native RTT variation. This clock
+    /// bounds successor attempts; it is not a probe period or health sample.
+    pub(in crate::runtime) fn udp_path_owner_reconciliation_interval_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Option<Duration> {
+        let health = self.health.lock().expect("client path health lock");
+        let record = health
+            .udp
+            .get(index)
+            .filter(|record| record.path_instance_id() == Some(path_instance_id))?;
+        Some(path_record_failure_cooldown(record).saturating_mul(path_open_pto_multiplier(None)))
     }
 
     pub(in crate::runtime) fn mark_udp_path_establishment_failure_if_current(
@@ -263,7 +290,9 @@ impl ClientPathState {
         if !current.accepts_endpoint_failure_for_expected_owner(expected_path_instance_id) {
             return false;
         }
-        current.mark_failure(now, has_schedulable_alternative);
+        current.mutate_eligibility(|current| {
+            current.mark_failure(now, has_schedulable_alternative);
+        });
         true
     }
 
@@ -285,12 +314,14 @@ impl ClientPathState {
                 .tcp
                 .get_mut(publication.path_index)
                 .expect("TCP carrier actor must have one health record");
-            record.install_tcp_peer_usage(
-                publication.path_id,
-                publication.path_instance_id,
-                publication.peer_usage_sequence,
-                publication.peer_usage,
-            );
+            record.mutate_eligibility(|record| {
+                record.install_tcp_peer_usage(
+                    publication.path_id,
+                    publication.path_instance_id,
+                    publication.peer_usage_sequence,
+                    publication.peer_usage,
+                );
+            });
             publish_readiness();
         }
         if let Some(readiness_rtt) = publication.readiness_rtt {
@@ -331,12 +362,14 @@ impl ClientPathState {
             if record.path_instance_id() != Some(predecessor_instance_id) {
                 return false;
             }
-            record.install_tcp_peer_usage(
-                publication.path_id,
-                publication.path_instance_id,
-                publication.peer_usage_sequence,
-                publication.peer_usage,
-            );
+            record.mutate_eligibility(|record| {
+                record.install_tcp_peer_usage(
+                    publication.path_id,
+                    publication.path_instance_id,
+                    publication.peer_usage_sequence,
+                    publication.peer_usage,
+                );
+            });
             publish_readiness();
         }
         if let Some(readiness_rtt) = publication.readiness_rtt {
@@ -384,7 +417,9 @@ impl ClientPathState {
                 .tcp
                 .get_mut(index)
                 .expect("TCP carrier actor must have one health record");
-            record.mark_failure(now, has_schedulable_alternative);
+            record.mutate_eligibility(|record| {
+                record.mark_failure(now, has_schedulable_alternative);
+            });
         });
     }
 
@@ -437,7 +472,9 @@ impl ClientPathState {
         let Some(current) = health.path_record_mut(key) else {
             return false;
         };
-        current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
+        current.mutate_eligibility(|current| {
+            current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
+        })
     }
 
     pub(in crate::runtime) fn retire_path_instance_planned(
@@ -453,7 +490,7 @@ impl ClientPathState {
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
-        record.retire_planned_instance(path_instance_id)
+        record.mutate_eligibility(|record| record.retire_planned_instance(path_instance_id))
     }
 
     pub(in crate::runtime) fn begin_path_instance_planned_retirement(
@@ -469,7 +506,8 @@ impl ClientPathState {
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
-        record.begin_planned_instance_retirement(path_instance_id)
+        record
+            .mutate_eligibility(|record| record.begin_planned_instance_retirement(path_instance_id))
     }
 
     /// Linearization point between an accepted Product value and physical
@@ -498,13 +536,48 @@ impl ClientPathState {
         &self.request_tcp_capacity_probe
     }
 
-    fn release_relay_path_load(&self, key: RelayPathKey, lane: TrafficClass) -> bool {
+    fn release_relay_path_load(
+        &self,
+        key: RelayPathKey,
+        owner: RelayPathLoadOwner,
+        lane: TrafficClass,
+    ) -> bool {
         let mut health = self.health.lock().expect("client path health lock");
         let Some(record) = health.path_record_mut(key) else {
             return false;
         };
-        record.release_load(lane);
+        if !record.release_load_for_owner(owner, lane) {
+            return false;
+        }
         self.active_product_flows.load(Ordering::Relaxed) == 0 && health.is_product_quiescent()
+    }
+
+    fn change_relay_path_lane_load(
+        &self,
+        key: RelayPathKey,
+        owner: RelayPathLoadOwner,
+        from: TrafficClass,
+        to: TrafficClass,
+    ) -> bool {
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .path_record_mut(key)
+            .is_some_and(|record| record.change_lane_load_for_owner(owner, from, to))
+    }
+
+    fn bind_relay_path_load_to_instance(
+        &self,
+        key: RelayPathKey,
+        owner: RelayPathLoadOwner,
+        path_instance_id: CarrierPathInstanceId,
+        lane: TrafficClass,
+    ) -> bool {
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .path_record_mut(key)
+            .is_some_and(|record| record.bind_load_to_instance(owner, path_instance_id, lane))
     }
 }
 
@@ -662,12 +735,14 @@ impl RequestCapacityProbeCampaignBudget {
 
 /// Cancellation-safe ownership of one logical flow's shared path load.
 ///
-/// The initial attachment acquires a lease before I/O and transfers it with the
-/// attachment. Additional paths acquire one only after unique product bytes
-/// commit. Dropping any transaction owner rolls the scheduler load back.
+/// Opening an attachment acquires a prospective lease before I/O, but retains
+/// it only while that open transaction is in flight. An attachment owns path
+/// load only after unique product bytes commit. Dropping any transaction owner
+/// rolls the scheduler load back.
 pub(in crate::runtime) struct RelayPathLoadLease {
     state: Arc<ClientPathState>,
     key: RelayPathKey,
+    owner: RelayPathLoadOwner,
     lane: TrafficClass,
     tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
 }
@@ -692,19 +767,46 @@ impl RelayPathLoadLease {
     pub(super) fn new(
         state: Arc<ClientPathState>,
         key: RelayPathKey,
+        owner: RelayPathLoadOwner,
         lane: TrafficClass,
         tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
     ) -> Self {
         Self {
             state,
             key,
+            owner,
             lane,
             tcp_carrier_groups,
         }
     }
 
     pub(in crate::runtime) fn set_recorded_lane(&mut self, lane: TrafficClass) {
+        if self.lane == lane {
+            return;
+        }
+        let _ = self
+            .state
+            .change_relay_path_lane_load(self.key, self.owner, self.lane, lane);
         self.lane = lane;
+    }
+
+    /// Converts an open-phase anti-stampede claim into exact physical demand.
+    /// A concurrent replacement makes the bind fail rather than projecting the
+    /// claim onto an unrelated successor.
+    pub(in crate::runtime) fn bind_to_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        if !self.state.bind_relay_path_load_to_instance(
+            self.key,
+            self.owner,
+            path_instance_id,
+            self.lane,
+        ) {
+            return false;
+        }
+        self.owner = RelayPathLoadOwner::ExactInstance(path_instance_id);
+        true
     }
 
     pub(in crate::runtime) fn key(&self) -> RelayPathKey {
@@ -714,7 +816,9 @@ impl RelayPathLoadLease {
 
 impl Drop for RelayPathLoadLease {
     fn drop(&mut self) {
-        let product_quiescent = self.state.release_relay_path_load(self.key, self.lane);
+        let product_quiescent = self
+            .state
+            .release_relay_path_load(self.key, self.owner, self.lane);
         if product_quiescent {
             self.tcp_carrier_groups.publish_change();
         }
@@ -928,19 +1032,17 @@ impl ClientPathContext {
         lane: TrafficClass,
     ) -> Option<RelayPathLoadLease> {
         let now = Instant::now();
-        let reserved = self
+        let owner = self
             .commit_if_session_active(|| {
                 self.state
-                    .mutate_path_eligibility(key, |record| record.reserve_load(lane, now))
-                    .unwrap_or(false)
+                    .mutate_path_eligibility(key, |record| record.reserve_current_load(lane, now))
+                    .flatten()
             })
-            .ok()?;
-        if !reserved {
-            return None;
-        }
+            .ok()??;
         Some(RelayPathLoadLease::new(
             self.state.clone(),
             key,
+            owner,
             lane,
             self.tcp_carrier_groups.clone(),
         ))
@@ -961,7 +1063,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.mark_open_success(elapsed, lane);
+            current.mutate_eligibility(|current| current.mark_open_success(elapsed, lane));
         }
     }
 
@@ -979,7 +1081,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.mark_reserved_open_success(elapsed);
+            current.mutate_eligibility(|current| current.mark_reserved_open_success(elapsed));
         }
     }
 
@@ -1015,7 +1117,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.mark_success(elapsed);
+            current.mutate_eligibility(|current| current.mark_success(elapsed));
         }
     }
 
@@ -1029,24 +1131,10 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
             .is_some_and(|record| {
-                record.maintain(now);
+                record.mutate_eligibility(|record| record.maintain(now));
                 !record.manual_disabled
                     && path_observation_is_idle_for_probe(record.observation_at(now))
             })
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn release_tcp_path_load(&self, index: usize, lane: TrafficClass) {
-        if let Some(current) = self
-            .state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .tcp
-            .get_mut(index)
-        {
-            current.release_load(lane);
-        }
     }
 
     pub(in crate::runtime) fn mark_udp_stream_reserved_open_success_for_instance(
@@ -1122,22 +1210,6 @@ impl ClientPathContext {
         }
     }
 
-    pub(in crate::runtime) fn change_relay_path_lane_load(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-        from: TrafficClass,
-        to: TrafficClass,
-    ) {
-        if from == to {
-            return;
-        }
-        let mut health = self.state.health.lock().expect("client path health lock");
-        if let Some(current) = health.path_record_mut(RelayPathKey { underlay, index }) {
-            current.change_lane_load(from, to);
-        }
-    }
-
     pub(in crate::runtime) fn mark_relay_path_rate_sample(
         &self,
         instance: RelayPathInstance,
@@ -1182,6 +1254,7 @@ impl ClientPathContext {
         &self,
         underlay: UnderlayProtocol,
         index: usize,
+        path_instance_id: CarrierPathInstanceId,
         observation: PathProofObservation,
     ) {
         let mut health = self.state.health.lock().expect("client path health lock");
@@ -1190,7 +1263,7 @@ impl ClientPathContext {
             UnderlayProtocol::Udp => &mut health.udp,
         };
         if let Some(current) = records.get_mut(index) {
-            current.mark_path_proof_success(observation);
+            current.mark_path_proof_success(path_instance_id, observation);
         }
     }
 
@@ -1222,7 +1295,9 @@ impl ClientPathContext {
         let has_schedulable_alternative =
             health.tcp_records_have_schedulable_alternative(index, now);
         if let Some(current) = health.tcp_record_mut(index) {
-            current.mark_failure(now, has_schedulable_alternative);
+            current.mutate_eligibility(|current| {
+                current.mark_failure(now, has_schedulable_alternative);
+            });
         }
     }
 
@@ -1312,20 +1387,6 @@ impl ClientPathContext {
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn release_udp_path_load(&self, index: usize) {
-        if let Some(current) = self
-            .state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .udp
-            .get_mut(index)
-        {
-            current.release_load(TrafficClass::RealtimeDatagram);
-        }
-    }
-
-    #[cfg(test)]
     pub(in crate::runtime) fn mark_udp_datagram_path_delivery(
         &self,
         index: usize,
@@ -1393,7 +1454,9 @@ impl ClientPathContext {
         let has_schedulable_alternative =
             path_records_have_schedulable_alternative(&health.udp, index, now);
         if let Some(current) = health.udp.get_mut(index) {
-            current.mark_failure(now, has_schedulable_alternative);
+            current.mutate_eligibility(|current| {
+                current.mark_failure(now, has_schedulable_alternative);
+            });
         }
     }
 }

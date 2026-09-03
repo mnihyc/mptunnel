@@ -21,12 +21,15 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame};
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::path::{CarrierDeliveryRateSample, ServerCarrierPathRegistration};
+use crate::runtime::path::{
+    CarrierDeliveryRateSample, CarrierNativeWindowSample, ServerCarrierPathRegistration,
+};
 use std::time::{Duration, Instant};
 
 pub(in crate::runtime::path::tcp) struct ServerTcpEvidenceState {
     tcp_metrics: Option<TcpMetricPublisher>,
     local_metrics: Option<PathMetrics>,
+    native_window_sample: Option<CarrierNativeWindowSample>,
     delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     native_drain_observed: bool,
     sender_refresh_pending: bool,
@@ -40,9 +43,13 @@ impl ServerTcpEvidenceState {
         local_metrics: Option<PathMetrics>,
         mux_limits: MuxLimits,
     ) -> Self {
+        let observed_at = Instant::now();
         Self {
             tcp_metrics,
             local_metrics,
+            native_window_sample: local_metrics.and_then(|metrics| {
+                CarrierNativeWindowSample::from_path_metrics_at(metrics, observed_at)
+            }),
             delivery_rate_sample: None,
             native_drain_observed: false,
             sender_refresh_pending: false,
@@ -139,6 +146,7 @@ impl ServerTcpEvidenceState {
                 .queue_bytes()
                 .is_some_and(|queue_bytes| queue_bytes > 0);
         let observed_at = Instant::now();
+        self.observe_native_window_sample_at(observation, observed_at);
         self.observe_delivery_rate_sample_at(observation, observed_at);
         self.native_drain_observed = observation.has_native_drain_evidence();
         let Some(mut metrics) = merge_local_tcp_metrics(self.local_metrics, observation) else {
@@ -150,12 +158,43 @@ impl ServerTcpEvidenceState {
         self.local_metrics = Some(metrics);
         context
             .reliable_streams
-            .record_local_path_metrics_with_delivery_rate_sample(
+            .record_local_path_metrics_with_native_evidence(
                 path_registration,
                 metrics,
                 self.native_drain_observed,
+                None,
+                self.native_window_sample,
                 self.delivery_rate_sample,
             );
+    }
+
+    fn observe_native_window_sample_at(
+        &mut self,
+        observation: super::super::metrics::TcpNativeObservation,
+        observed_at: Instant,
+    ) {
+        let Some(inflight_limit_bytes) = observation.inflight_limit_bytes() else {
+            // A partial RTT/queue/rate poll may update retained diagnostics,
+            // but absence of a native window cannot refresh its authority.
+            return;
+        };
+        let srtt_us = observation
+            .srtt_us()
+            .or_else(|| self.local_metrics.map(|metrics| metrics.srtt_us))
+            .unwrap_or(1)
+            .max(1);
+        let rttvar_us = observation
+            .rttvar_us()
+            .or_else(|| self.local_metrics.map(|metrics| metrics.rttvar_us))
+            .unwrap_or(srtt_us / 8);
+        self.native_window_sample = CarrierNativeWindowSample::new(
+            inflight_limit_bytes,
+            observed_at,
+            transport_rate_sample_freshness_horizon(
+                Duration::from_micros(u64::from(srtt_us)),
+                Duration::from_micros(u64::from(rttvar_us)),
+            ),
+        );
     }
 
     fn observe_delivery_rate_sample_at(

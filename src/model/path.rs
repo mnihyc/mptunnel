@@ -9,6 +9,26 @@ use std::time::Instant;
 
 static NEXT_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+fn carrier_path_instance_identity_is_available_in(next: &AtomicU64) -> bool {
+    next.load(Ordering::Acquire) != 0
+}
+
+/// Allocates one non-zero identity and permanently changes `0` into the
+/// exhausted state. `u64::MAX` is issued exactly once before that transition.
+fn try_allocate_carrier_path_instance_id(next: &AtomicU64) -> Option<CarrierPathInstanceId> {
+    let mut current = next.load(Ordering::Acquire);
+    loop {
+        if current == 0 {
+            return None;
+        }
+        let successor = current.checked_add(1).unwrap_or(0);
+        match next.compare_exchange_weak(current, successor, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(CarrierPathInstanceId::from_raw(current)),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Endpoint-local scheduling restrictions for one configured carrier path.
 ///
 /// These values never cross the wire: each endpoint applies the policy attached
@@ -110,9 +130,23 @@ impl CarrierPathInstanceId {
     }
 }
 
-/// Allocates process-unique carrier lifetime identity across all path owners.
+/// Allocates a process-unique carrier lifetime identity across all path owners.
+/// Exhaustion is permanent because reusing any prior value would cross carrier
+/// lifetime evidence and flight ownership.
+pub(crate) fn try_next_carrier_path_instance_id() -> Option<CarrierPathInstanceId> {
+    try_allocate_carrier_path_instance_id(&NEXT_CARRIER_PATH_INSTANCE_ID)
+}
+
+/// Whether a new physical carrier can still receive an exact process-wide
+/// lifetime identity. Exhaustion is absorbing, so callers may use this to
+/// suppress establishment I/O and maintenance without reserving an identity.
+pub(crate) fn carrier_path_instance_identity_is_available() -> bool {
+    carrier_path_instance_identity_is_available_in(&NEXT_CARRIER_PATH_INSTANCE_ID)
+}
+
+#[cfg(test)]
 pub(crate) fn next_carrier_path_instance_id() -> CarrierPathInstanceId {
-    CarrierPathInstanceId::from_raw(NEXT_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel))
+    try_next_carrier_path_instance_id().expect("test process carrier identity space")
 }
 
 #[cfg(test)]

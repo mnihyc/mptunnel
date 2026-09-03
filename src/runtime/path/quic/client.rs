@@ -15,7 +15,13 @@ use super::metrics::{quic_path_metrics_ack_interval, quic_path_metrics_poll_inte
 use crate::config::ClientSecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::path::{CarrierPathInstanceId, RelayPathKey, next_carrier_path_instance_id};
+#[cfg(test)]
+use crate::model::path::next_carrier_path_instance_id;
+use crate::model::path::{
+    CarrierPathInstanceId, RelayPathKey, carrier_path_instance_identity_is_available,
+    try_next_carrier_path_instance_id,
+};
+use crate::model::timing::path_open_timeout;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
@@ -25,7 +31,7 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::path::model::path_startup_snapshot;
+use crate::runtime::path::model::{path_startup_metrics, path_startup_snapshot};
 use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
 use crate::runtime::peer_status::{
@@ -41,11 +47,11 @@ use crate::transport::{
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 
 // RFC 8305's default keeps a blackholed family from monopolizing setup without
 // opening every resolver answer in one socket/TLS burst.
@@ -155,12 +161,166 @@ fn next_quic_address_attempt_at(
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientUdpPathSessionHandle {
     runtime: ClientUdpPathSessionRuntime,
-    connection: Arc<AsyncMutex<Option<ClientUdpPathConnection>>>,
+    owner: Arc<ClientUdpPathOwner>,
     #[cfg(test)]
     retryable_open_failure_hook:
         Arc<std::sync::Mutex<Option<ClientUdpRetryableOpenFailureTestHook>>>,
     #[cfg(test)]
     accepted_open_hook: Arc<std::sync::Mutex<Option<ClientUdpAcceptedOpenTestHook>>>,
+}
+
+/// Durable, coalescing wake source for configured QUIC carrier ownership.
+///
+/// The generation is diagnostic only. Ownership remains in each exact path
+/// slot, while one watch source lets the client service reconcile every
+/// missing slot without turning optional measurement into a liveness owner.
+#[derive(Debug)]
+pub(in crate::runtime) struct ClientUdpCarrierReconciliation {
+    changes: watch::Sender<u64>,
+}
+
+impl ClientUdpCarrierReconciliation {
+    pub(in crate::runtime) fn new() -> Arc<Self> {
+        let (changes, _) = watch::channel(0);
+        Arc::new(Self { changes })
+    }
+
+    pub(in crate::runtime) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn publish_change(&self) {
+        self.changes.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        *self.changes.borrow()
+    }
+}
+
+struct ClientUdpPathOwner {
+    connection: AsyncMutex<Option<ClientUdpPathConnection>>,
+    vacancy: Mutex<ClientUdpOwnerVacancy>,
+    reconciliation: Arc<ClientUdpCarrierReconciliation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientUdpOwnerVacancy {
+    retry_interval: Duration,
+    not_before: tokio::time::Instant,
+}
+
+impl ClientUdpPathOwner {
+    fn new(
+        reconciliation: Arc<ClientUdpCarrierReconciliation>,
+        retry_interval: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            connection: AsyncMutex::new(None),
+            vacancy: Mutex::new(ClientUdpOwnerVacancy {
+                retry_interval,
+                not_before: tokio::time::Instant::now(),
+            }),
+            reconciliation,
+        })
+    }
+
+    fn reconciliation_deadline(&self) -> Option<tokio::time::Instant> {
+        self.reconciliation_deadline_with_identity_availability(
+            carrier_path_instance_identity_is_available(),
+        )
+    }
+
+    fn reconciliation_deadline_with_identity_availability(
+        &self,
+        identity_available: bool,
+    ) -> Option<tokio::time::Instant> {
+        if !identity_available {
+            return None;
+        }
+        let current = self.connection.try_lock().ok()?;
+        current.is_none().then(|| self.vacancy_not_before())
+    }
+
+    fn vacancy_not_before(&self) -> tokio::time::Instant {
+        self.vacancy
+            .lock()
+            .expect("client QUIC owner-vacancy lock")
+            .not_before
+    }
+
+    fn reconciliation_attempt_timeout(&self) -> Duration {
+        self.vacancy
+            .lock()
+            .expect("client QUIC owner-vacancy lock")
+            .retry_interval
+    }
+
+    fn set_vacancy(&self, retry_interval: Option<Duration>, not_before: tokio::time::Instant) {
+        let mut vacancy = self.vacancy.lock().expect("client QUIC owner-vacancy lock");
+        if let Some(retry_interval) = retry_interval {
+            vacancy.retry_interval = retry_interval;
+        }
+        vacancy.not_before = not_before;
+    }
+
+    fn publish_reconciliation_change(&self) {
+        self.reconciliation.publish_change();
+    }
+}
+
+/// Cancellation-safe ownership of one unpublished physical candidate.
+///
+/// Dropping a failed or cancelled candidate does not publish its identity. It
+/// instead preserves a durable vacancy and defers the next attempt by the
+/// exact path owner's bounded establishment transaction clock.
+struct ClientUdpCandidateClaim {
+    owner: Arc<ClientUdpPathOwner>,
+    retry_interval: Duration,
+    committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientUdpEnsureMode {
+    Demand,
+    Reconciliation,
+}
+
+impl ClientUdpCandidateClaim {
+    fn new(owner: Arc<ClientUdpPathOwner>) -> Self {
+        let retry_interval = owner.reconciliation_attempt_timeout();
+        Self {
+            owner,
+            retry_interval,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    fn finish_uncommitted(&mut self, identity_available: bool) {
+        if self.committed {
+            return;
+        }
+        self.committed = true;
+        if !identity_available {
+            return;
+        }
+        self.owner
+            .set_vacancy(None, tokio::time::Instant::now() + self.retry_interval);
+        self.owner.publish_reconciliation_change();
+    }
+}
+
+impl Drop for ClientUdpCandidateClaim {
+    fn drop(&mut self) {
+        self.finish_uncommitted(carrier_path_instance_identity_is_available());
+    }
 }
 
 #[cfg(test)]
@@ -192,9 +352,17 @@ impl std::fmt::Debug for ClientUdpPathSessionHandle {
 
 impl ClientUdpPathSessionHandle {
     pub(in crate::runtime) fn new(runtime: ClientUdpPathSessionRuntime) -> Self {
+        let retry_interval = path_open_timeout(
+            Some(path_startup_snapshot(
+                runtime.path(),
+                PathId(runtime.path_index as u16),
+            )),
+            false,
+        );
+        let owner = ClientUdpPathOwner::new(runtime.reconciliation.clone(), retry_interval);
         Self {
             runtime,
-            connection: Arc::new(AsyncMutex::new(None)),
+            owner,
             #[cfg(test)]
             retryable_open_failure_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -221,12 +389,27 @@ impl ClientUdpPathSessionHandle {
         Ok(newly_connected.then(|| (carrier.path_instance_id, carrier.connection.rtt())))
     }
 
+    /// Reconciles configured physical ownership without manufacturing an
+    /// optional probe measurement. Native metrics begin only after the fresh
+    /// authenticated owner is published.
+    pub(in crate::runtime) async fn reconcile_connection_owner(&self) -> Result<(), RuntimeError> {
+        let deadline = tokio::time::Instant::now() + self.owner.reconciliation_attempt_timeout();
+        self.ensure_connection_with_status_inner(deadline, ClientUdpEnsureMode::Reconciliation)
+            .await
+            .map(|_| ())
+    }
+
+    pub(in crate::runtime) fn reconciliation_deadline(&self) -> Option<tokio::time::Instant> {
+        self.owner.reconciliation_deadline()
+    }
+
     pub(in crate::runtime) async fn open_stream(
         &self,
         stream_id: StreamId,
         target: TargetAddr,
         lane: TrafficClass,
         initial_demand: StreamDemandHint,
+        return_plan: crate::protocol::StreamReturnPlan,
         open_deadline: tokio::time::Instant,
         advertised_recv_max_offset: u64,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
@@ -263,6 +446,7 @@ impl ClientUdpPathSessionHandle {
                     target.clone(),
                     lane,
                     initial_demand,
+                    return_plan,
                     advertised_recv_max_offset,
                     self.runtime.clone(),
                 ),
@@ -439,24 +623,48 @@ impl ClientUdpPathSessionHandle {
         &self,
         open_deadline: tokio::time::Instant,
     ) -> Result<(ClientUdpCarrierInstance, bool), RuntimeError> {
+        self.ensure_connection_with_status_inner(open_deadline, ClientUdpEnsureMode::Demand)
+            .await?
+            .ok_or(RuntimeError::ReliablePathSessionClosed)
+    }
+
+    async fn ensure_connection_with_status_inner(
+        &self,
+        open_deadline: tokio::time::Instant,
+        mode: ClientUdpEnsureMode,
+    ) -> Result<Option<(ClientUdpCarrierInstance, bool)>, RuntimeError> {
         self.runtime.state.session_lifecycle().ensure_active()?;
-        let mut current = self.connection.lock().await;
+        // Keep this claim storage older than the owner guard: on cancellation
+        // or failure the exact owner mutex is released before Drop advertises
+        // the still-vacant slot to reconciliation.
+        let mut candidate_claim: Option<ClientUdpCandidateClaim>;
+        let mut current = self.owner.connection.lock().await;
         self.runtime.state.session_lifecycle().ensure_active()?;
         if let Some(failed) = current
             .as_ref()
             .filter(|connection| connection.carrier.connection.is_closed())
             .map(|connection| connection.carrier.path_instance_id)
+            && self.retire_connection_owner_locked(&mut current, failed)
         {
-            self.retire_connection_owner_locked(&mut current, failed);
+            self.owner.publish_reconciliation_change();
         }
         if let Some(connection) = current.as_ref() {
             return self
                 .runtime
                 .state
                 .session_lifecycle()
-                .commit_if_active(|| (connection.carrier.clone(), false))
+                .commit_if_active(|| Some((connection.carrier.clone(), false)))
                 .map_err(RuntimeError::RemoteClosed);
         }
+        if !carrier_path_instance_identity_is_available() {
+            return Err(RuntimeError::ExactIdentityExhausted);
+        }
+        if mode == ClientUdpEnsureMode::Reconciliation
+            && self.owner.vacancy_not_before() > tokio::time::Instant::now()
+        {
+            return Ok(None);
+        }
+        candidate_claim = Some(ClientUdpCandidateClaim::new(self.owner.clone()));
         let mut pending = Some(connect_client_udp_path(&self.runtime, open_deadline).await?);
         let carrier = pending
             .as_ref()
@@ -467,6 +675,7 @@ impl ClientUdpPathSessionHandle {
             .as_ref()
             .expect("new QUIC carrier awaits health publication")
             .peer_usage;
+        let native_capacity_epoch = carrier.connection.native_capacity_epoch();
         let published = self
             .runtime
             .state
@@ -475,6 +684,7 @@ impl ClientUdpPathSessionHandle {
                 self.runtime.state.publish_udp_peer_path_usage_committed(
                     self.runtime.path_index,
                     carrier.path_instance_id,
+                    native_capacity_epoch,
                     0,
                     peer_usage,
                     || !carrier.connection.is_closed(),
@@ -495,8 +705,12 @@ impl ClientUdpPathSessionHandle {
         current
             .as_mut()
             .expect("published QUIC carrier has one physical owner")
-            .start_background_tasks(&self.runtime);
-        Ok((carrier, true))
+            .start_background_tasks(&self.runtime, Arc::downgrade(&self.owner));
+        candidate_claim
+            .as_mut()
+            .expect("new QUIC carrier owns an unpublished candidate claim")
+            .commit();
+        Ok(Some((carrier, true)))
     }
 
     fn retire_connection_owner_locked(
@@ -504,31 +718,17 @@ impl ClientUdpPathSessionHandle {
         current: &mut Option<ClientUdpPathConnection>,
         failed: CarrierPathInstanceId,
     ) -> bool {
-        if !current
-            .as_ref()
-            .is_some_and(|connection| connection.carrier.path_instance_id == failed)
-        {
-            return false;
-        }
-        let mut retired = None;
-        self.runtime.state.settle_udp_path_instance_failure(
-            self.runtime.path_index,
-            failed,
-            || {
-                retired = current.take();
-            },
-        );
-        if let Some(connection) = retired {
-            connection.carrier.connection.close();
-            true
-        } else {
-            false
-        }
+        retire_client_udp_connection_owner_locked(&self.runtime, &self.owner, current, failed)
     }
 
     async fn retire_failed_connection_instance(&self, failed: CarrierPathInstanceId) -> bool {
-        let mut current = self.connection.lock().await;
-        self.retire_connection_owner_locked(&mut current, failed)
+        let mut current = self.owner.connection.lock().await;
+        let retired = self.retire_connection_owner_locked(&mut current, failed);
+        drop(current);
+        if retired {
+            self.owner.publish_reconciliation_change();
+        }
+        retired
     }
 
     /// Compatibility path for IP-tunnel open, whose settlement remains
@@ -560,7 +760,7 @@ impl ClientUdpPathSessionHandle {
             }
             ClientUdpErrorDisposition::Operation => {
                 let physically_closed = {
-                    let current = self.connection.lock().await;
+                    let current = self.owner.connection.lock().await;
                     current.as_ref().is_some_and(|connection| {
                         connection.carrier.path_instance_id == path_instance_id
                             && connection.carrier.connection.is_closed()
@@ -579,7 +779,7 @@ impl ClientUdpPathSessionHandle {
     }
 
     async fn try_commit_opened_instance(&self, path_instance_id: CarrierPathInstanceId) -> bool {
-        let current = self.connection.lock().await;
+        let current = self.owner.connection.lock().await;
         let Some(connection) = current.as_ref().filter(|connection| {
             connection.carrier.path_instance_id == path_instance_id
                 && !connection.carrier.connection.is_closed()
@@ -647,7 +847,7 @@ impl ClientUdpPathSessionHandle {
         previous: CarrierPathInstanceId,
     ) {
         let connection = {
-            let current = self.connection.lock().await;
+            let current = self.owner.connection.lock().await;
             match current.as_ref() {
                 Some(connection) if connection.carrier.path_instance_id == previous => {
                     connection.carrier.connection.clone()
@@ -656,6 +856,59 @@ impl ClientUdpPathSessionHandle {
             }
         };
         connection.wait_closed().await;
+    }
+}
+
+fn retire_client_udp_connection_owner_locked(
+    runtime: &ClientUdpPathSessionRuntime,
+    owner: &ClientUdpPathOwner,
+    current: &mut Option<ClientUdpPathConnection>,
+    failed: CarrierPathInstanceId,
+) -> bool {
+    if !current
+        .as_ref()
+        .is_some_and(|connection| connection.carrier.path_instance_id == failed)
+    {
+        return false;
+    }
+    let retry_interval = runtime
+        .state
+        .udp_path_owner_reconciliation_interval_for_instance(runtime.path_index, failed);
+    let mut retired = None;
+    runtime
+        .state
+        .settle_udp_path_instance_failure(runtime.path_index, failed, || {
+            retired = current.take();
+        });
+    let Some(connection) = retired else {
+        return false;
+    };
+
+    // Release the exact owner's authentication and diagnostic registrations
+    // before advertising the vacancy to a successor. The detached native-close
+    // observer is instance-fenced, so a delayed N callback cannot reach N+1.
+    drop(connection);
+    owner.set_vacancy(retry_interval, tokio::time::Instant::now());
+    true
+}
+
+async fn retire_closed_client_udp_connection_owner(
+    runtime: ClientUdpPathSessionRuntime,
+    owner: Weak<ClientUdpPathOwner>,
+    failed: CarrierPathInstanceId,
+) {
+    let Some(owner) = owner.upgrade() else {
+        return;
+    };
+    let mut current = owner.connection.lock().await;
+    let exact_native_close = current.as_ref().is_some_and(|connection| {
+        connection.carrier.path_instance_id == failed && connection.carrier.connection.is_closed()
+    });
+    let retired = exact_native_close
+        && retire_client_udp_connection_owner_locked(&runtime, &owner, &mut current, failed);
+    drop(current);
+    if retired {
+        owner.publish_reconciliation_change();
     }
 }
 
@@ -679,6 +932,7 @@ pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) authenticated_carriers:
         crate::runtime::path::AuthenticatedCarrierInventory,
     pub(in crate::runtime) ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub,
+    pub(in crate::runtime) reconciliation: Arc<ClientUdpCarrierReconciliation>,
 }
 
 impl ClientUdpPathSessionRuntime {
@@ -713,7 +967,6 @@ struct ClientUdpPathConnection {
     peer_usage: PathUsage,
     _authenticated_carrier: Option<crate::runtime::path::AuthenticatedCarrierRegistration>,
     startup: Option<ClientUdpPathConnectionStartup>,
-    lifecycle_task: Option<tokio::task::JoinHandle<()>>,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
     control_task: Option<tokio::task::JoinHandle<()>>,
     port_migration_task: Option<tokio::task::JoinHandle<()>>,
@@ -729,7 +982,11 @@ impl ClientUdpPathConnection {
     /// Starts exact-instance observers only after the physical owner and its
     /// health identity are atomically visible. The caller still holds the
     /// connection-owner mutex, so no Product open can overtake startup.
-    fn start_background_tasks(&mut self, runtime: &ClientUdpPathSessionRuntime) {
+    fn start_background_tasks(
+        &mut self,
+        runtime: &ClientUdpPathSessionRuntime,
+        owner: Weak<ClientUdpPathOwner>,
+    ) {
         let ClientUdpPathConnectionStartup {
             control_send,
             control_recv,
@@ -740,31 +997,21 @@ impl ClientUdpPathConnection {
             .expect("new QUIC carrier starts its observers exactly once");
         let path_instance_id = self.carrier.path_instance_id;
         let connection = self.carrier.connection.clone();
-        let authenticated_carrier = self
-            ._authenticated_carrier
-            .take()
-            .expect("published QUIC carrier owns one authenticated registration");
+        debug_assert!(self._authenticated_carrier.is_some());
         let retirement = runtime.state.session_retirement();
         let lifecycle_connection = connection.clone();
-        let lifecycle_state = runtime.state.clone();
-        let path_index = runtime.path_index;
-        self.lifecycle_task = Some(tokio::spawn(async move {
+        let lifecycle_runtime = runtime.clone();
+        tokio::spawn(async move {
             tokio::select! {
                 biased;
                 _reason = retirement.wait() => {
-                    lifecycle_state.mark_path_instance_data_plane_failure(
-                        RelayPathKey {
-                            underlay: UnderlayProtocol::Udp,
-                            index: path_index,
-                        },
-                        path_instance_id,
-                    );
                     lifecycle_connection.close();
                 }
                 _ = lifecycle_connection.wait_closed() => {}
             }
-            drop(authenticated_carrier);
-        }));
+            retire_closed_client_udp_connection_owner(lifecycle_runtime, owner, path_instance_id)
+                .await;
+        });
         self.metrics_task = Some(spawn_client_udp_path_metrics(
             runtime.clone(),
             connection.clone(),
@@ -812,9 +1059,6 @@ impl ClientUdpPathConnection {
 impl Drop for ClientUdpPathConnection {
     fn drop(&mut self) {
         self.carrier.connection.close();
-        if let Some(task) = self.lifecycle_task.take() {
-            task.abort();
-        }
         if let Some(task) = self.metrics_task.take() {
             task.abort();
         }
@@ -827,6 +1071,14 @@ impl Drop for ClientUdpPathConnection {
     }
 }
 
+fn commit_client_native_health_projection<R>(
+    authority: &crate::runtime::path::authority::NativeCarrierRateAuthorityHandle,
+    shape: crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot,
+    publish: impl FnOnce() -> R,
+) -> Result<R, crate::runtime::path::authority::NativeCarrierRateAuthorityRuntimeError> {
+    authority.commit_if_current(shape.stamp(), publish)
+}
+
 fn spawn_client_udp_path_metrics(
     runtime: ClientUdpPathSessionRuntime,
     connection: UdpPathConnection,
@@ -834,11 +1086,17 @@ fn spawn_client_udp_path_metrics(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tracker = UdpPathMetricTracker::default();
+        let Some(native_authority) = connection.native_rate_authority() else {
+            connection.close();
+            return;
+        };
+        let mut authority_changed = native_authority.accepted_change_cursor();
+        let _ = *authority_changed.borrow_and_update();
         #[cfg(feature = "lab-diagnostics")]
         let mut last_metrics_poll_at = None;
-        let delivery_activity = connection.delivery_activity_notify();
+        let write_activity = connection.write_activity_notify();
         loop {
-            let activity_started = delivery_activity.notified();
+            let activity_started = write_activity.notified();
             tokio::pin!(activity_started);
             activity_started.as_mut().enable();
             if connection.is_closed() {
@@ -856,18 +1114,27 @@ fn spawn_client_udp_path_metrics(
                             .unwrap_or_else(|| "unknown".to_string()),
                     ),
                 );
-                if !connection.is_locally_closed() {
-                    runtime.state.mark_path_instance_data_plane_failure(
-                        RelayPathKey {
-                            underlay: UnderlayProtocol::Udp,
-                            index: runtime.path_index,
-                        },
-                        path_instance_id,
-                    );
-                }
+                // The exact native-lifecycle observer owns the atomic
+                // health+owner-slot transition and durable reconciliation
+                // wake. Metrics are sampled evidence and must not race that
+                // ownership transaction or clear its retry-clock inputs.
                 return;
             }
-            let metrics = connection.tx_metrics(&mut tracker, PathMetricDirection::ClientToServer);
+            let (metrics, native_shape) = match connection.tx_metrics(&mut tracker) {
+                Ok(sample) => sample,
+                Err(error) if error.is_retryable_publication() => {
+                    tokio::select! {
+                        _ = authority_changed.changed() => {}
+                        _ = tokio::time::sleep(crate::model::capacity::QUIC_TIMER_GRANULARITY) => {}
+                        _ = &mut activity_started => {}
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    connection.close();
+                    return;
+                }
+            };
             #[cfg(feature = "lab-diagnostics")]
             let metrics_poll_at = Instant::now();
             #[cfg(feature = "lab-diagnostics")]
@@ -883,20 +1150,41 @@ fn spawn_client_udp_path_metrics(
                 metrics,
                 poll_elapsed,
             );
-            let _ = runtime.state.mutate_path_model(
-                crate::model::path::RelayPathKey {
-                    underlay: crate::protocol::UnderlayProtocol::Udp,
-                    index: runtime.path_index,
-                },
-                |record| {
-                    record.mark_quic_path_metrics(path_instance_id, metrics);
+            let projection = commit_client_native_health_projection(
+                native_authority.as_ref(),
+                native_shape,
+                || {
+                    // Lock order is Quinn activation fence -> central authority ->
+                    // client path model. This closure performs no Quinn read.
+                    runtime.state.mutate_path_model(
+                        crate::model::path::RelayPathKey {
+                            underlay: crate::protocol::UnderlayProtocol::Udp,
+                            index: runtime.path_index,
+                        },
+                        |record| {
+                            record.mark_quic_native_authority_metrics(
+                                path_instance_id,
+                                metrics,
+                                native_shape,
+                            );
+                        },
+                    )
                 },
             );
+            match projection {
+                Ok(_) => {}
+                Err(error) if error.is_retryable_publication() => continue,
+                Err(_) => {
+                    connection.close();
+                    return;
+                }
+            }
             tokio::select! {
                 _ = tokio::time::sleep(quic_path_metrics_poll_interval(metrics)) => {}
                 _ = &mut activity_started => {
                     tokio::time::sleep(quic_path_metrics_ack_interval(metrics)).await;
                 }
+                _ = authority_changed.changed() => {}
             }
         }
     })
@@ -924,6 +1212,9 @@ async fn connect_client_udp_path(
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientUdpPathConnection, RuntimeError> {
     runtime.state.session_lifecycle().ensure_active()?;
+    if !carrier_path_instance_identity_is_available() {
+        return Err(RuntimeError::ExactIdentityExhausted);
+    }
     let connect = async {
         let remote_port = runtime.path().endpoint.ports().select().map_err(|error| {
             RuntimeError::Io(std::io::Error::other(format!(
@@ -1023,7 +1314,24 @@ async fn connect_client_udp_path(
                 }
                 Err(error) => return Err(error),
             };
-        let path_instance_id = next_carrier_path_instance_id();
+        let path_instance_id =
+            try_next_carrier_path_instance_id().ok_or(RuntimeError::ExactIdentityExhausted)?;
+        let path_id = PathId(runtime.path_index as u16);
+        let startup_prior_bps =
+            path_startup_metrics(runtime.path(), path_id, PathMetricDirection::ClientToServer)
+                .delivery_rate_bps;
+        connection
+            .bind_native_rate_authority(
+                crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+                    path_instance_id,
+                    PathMetricDirection::ClientToServer,
+                ),
+                startup_prior_bps,
+            )
+            .await
+            .map_err(|_| {
+                RuntimeError::Protocol("failed to bind client QUIC native rate authority")
+            })?;
         Ok(ClientUdpPathConnection {
             endpoint,
             carrier: ClientUdpCarrierInstance {
@@ -1037,7 +1345,6 @@ async fn connect_client_udp_path(
                 control_recv,
                 canonical_remote,
             }),
-            lifecycle_task: None,
             metrics_task: None,
             control_task: None,
             port_migration_task: None,
@@ -1307,6 +1614,7 @@ async fn open_client_udp_stream_on_connection(
     target: TargetAddr,
     lane: TrafficClass,
     initial_demand: StreamDemandHint,
+    return_plan: crate::protocol::StreamReturnPlan,
     advertised_recv_max_offset: u64,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
@@ -1316,6 +1624,7 @@ async fn open_client_udp_stream_on_connection(
         stream_id,
         target,
         demand: initial_demand,
+        return_plan,
     };
     udp_path_write_frame(&mut send, &open, runtime.codec_limits).await?;
     // Initial opens publish the logical receive owner's starting credit.
@@ -1345,6 +1654,12 @@ async fn open_client_udp_stream_on_connection(
         runtime.mux_limits,
         runtime.codec_limits,
     ));
+    let commands =
+        commands.with_native_rate_authority(carrier.connection.native_rate_authority().ok_or(
+            RuntimeError::Protocol(
+                "client QUIC stream opened before native rate authority binding",
+            ),
+        )?);
     let stream_frame_queue =
         udp_reliable_stream_frame_queue(runtime.codec_limits, runtime.mux_limits);
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
@@ -1375,7 +1690,10 @@ async fn open_client_udp_stream_on_connection(
             runtime.codec_limits,
             runtime.mux_limits,
         ),
+        portable_startup: startup,
         startup,
+        startup_native_window: None,
+        startup_metrics: None,
         commands,
         mux_limits: runtime.mux_limits,
         frames: frames_rx,

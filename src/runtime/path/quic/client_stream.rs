@@ -242,7 +242,7 @@ async fn handle_client_udp_stream_input(
                         underlay: crate::protocol::UnderlayProtocol::Udp,
                         index: path_index,
                     },
-                    |record| record.mark_path_proof_success(observation),
+                    |record| record.mark_path_proof_success(path_instance_id, observation),
                 );
             }
         }

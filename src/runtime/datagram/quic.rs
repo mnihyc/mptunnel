@@ -537,10 +537,10 @@ impl UdpDatagramClientAssociation {
         {
             return Ok(position);
         }
-        // Logical Product load is reserved before carrier I/O and owned by
-        // this exact association-path value. Physical carrier replacement may
-        // change telemetry identity, but cannot create or release this load.
-        let load_lease = self
+        // Reserve prospective load before carrier I/O, then bind it exactly to
+        // the authenticated datagram carrier below. A replacement cannot
+        // inherit the association's scheduler demand.
+        let mut load_lease = self
             .context
             .reserve_relay_path_load(
                 RelayPathKey {
@@ -552,6 +552,9 @@ impl UdpDatagramClientAssociation {
             .ok_or(RuntimeError::NoSchedulableUdpPath)?;
         let session =
             open_udp_datagram_session_on_path(&self.context, path_index, open_deadline).await?;
+        if !load_lease.bind_to_instance(session.path_instance_id()) {
+            return Err(RuntimeError::ReliablePathRetired);
+        }
         self.paths.push(UdpDatagramAssociationPath {
             session,
             pacer: UdpDatagramPacer::new(),

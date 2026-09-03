@@ -47,6 +47,227 @@ impl quinn::congestion::Controller for FixedPacingController {
     }
 }
 
+#[derive(Clone)]
+struct MutableOperationalController(Arc<AtomicU64>);
+
+impl quinn::congestion::Controller for MutableOperationalController {
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: quinn::congestion::SpaceId,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        12_000
+    }
+
+    fn metrics(&self) -> quinn::congestion::ControllerMetrics {
+        let mut metrics = quinn::congestion::ControllerMetrics::default();
+        metrics.congestion_window = self.window();
+        metrics.bandwidth_estimate =
+            NonZeroU64::new(self.0.load(Ordering::Relaxed)).map(NonZeroU64::get);
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlledNativeState {
+    bandwidth_estimate: Option<u64>,
+    sample: Option<quinn::congestion::BandwidthSample>,
+}
+
+#[derive(Clone)]
+struct ControlledNativeController {
+    state: Arc<Mutex<ControlledNativeState>>,
+    congestion_window: u64,
+    pacing_rate: u64,
+}
+
+impl ControlledNativeController {
+    fn new(
+        congestion_window: u64,
+        pacing_rate: u64,
+        bandwidth_estimate: Option<u64>,
+        sample: Option<quinn::congestion::BandwidthSample>,
+    ) -> (Self, Arc<Mutex<ControlledNativeState>>) {
+        let state = Arc::new(Mutex::new(ControlledNativeState {
+            bandwidth_estimate,
+            sample,
+        }));
+        (
+            Self {
+                state: state.clone(),
+                congestion_window,
+                pacing_rate,
+            },
+            state,
+        )
+    }
+}
+
+impl quinn::congestion::Controller for ControlledNativeController {
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: quinn::congestion::SpaceId,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        self.congestion_window
+    }
+
+    fn metrics(&self) -> quinn::congestion::ControllerMetrics {
+        let state = *self.state.lock().expect("controlled native state");
+        let mut metrics = quinn::congestion::ControllerMetrics::default();
+        metrics.congestion_window = self.congestion_window;
+        metrics.pacing_rate = Some(self.pacing_rate);
+        metrics.bandwidth_estimate = state.bandwidth_estimate;
+        metrics
+    }
+
+    fn latest_bandwidth_sample(&self) -> Option<quinn::congestion::BandwidthSample> {
+        self.state.lock().expect("controlled native state").sample
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.congestion_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+fn controlled_sample(
+    revision: u64,
+    valid: bool,
+    source_space: quinn::congestion::SpaceId,
+    source_packet_number: u64,
+    source_round: u64,
+    app_limited: bool,
+) -> quinn::congestion::BandwidthSample {
+    quinn::congestion::BandwidthSample {
+        revision: NonZeroU64::new(revision).expect("nonzero sample revision"),
+        valid,
+        source_space,
+        source_packet_number,
+        source_round,
+        app_limited,
+    }
+}
+
+fn controlled_instrumented_controller(
+    inner: ControlledNativeController,
+    startup_target: Option<QuicStartupTarget>,
+    telemetry: Arc<QuicCarrierTelemetry>,
+) -> InstrumentedController {
+    let path_telemetry = telemetry.allocate_path_telemetry();
+    InstrumentedController::for_path(
+        Box::new(inner),
+        LossPolicyPercent::default(),
+        startup_target,
+        telemetry,
+        path_telemetry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_controlled_sample(
+    controller: &mut InstrumentedController,
+    state: &Arc<Mutex<ControlledNativeState>>,
+    revision: u64,
+    valid: bool,
+    source_space: quinn::congestion::SpaceId,
+    source_packet_number: u64,
+    source_round: u64,
+    app_limited: bool,
+    bandwidth_estimate: Option<u64>,
+) {
+    *state.lock().expect("controlled native state") = ControlledNativeState {
+        bandwidth_estimate,
+        sample: Some(controlled_sample(
+            revision,
+            valid,
+            source_space,
+            source_packet_number,
+            source_round,
+            app_limited,
+        )),
+    };
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        false,
+        Some(source_packet_number),
+        quinn::congestion::SpaceId::Data,
+    );
+}
+
+async fn live_test_controller_activation() -> quinn::congestion::ControllerActivation {
+    let mux_limits = crate::mux::MuxLimits::default();
+    let server = crate::transport::quic::Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server address"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        crate::transport::quic::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local address");
+    let accepted = tokio::spawn(async move { server.accept().await.expect("server connection") });
+    let client = crate::transport::quic::Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client address"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        crate::transport::quic::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let client_connection = client
+        .connect(server_addr)
+        .await
+        .expect("client connection");
+    let server_connection = accepted.await.expect("server task");
+    let activation = client_connection
+        .native_controller_authority_snapshot()
+        .activation();
+    client_connection.close();
+    server_connection.close();
+    activation
+}
+
 #[derive(Debug, Default)]
 struct ForwardedCallbacks {
     sent_space: Option<quinn::congestion::SpaceId>,
@@ -178,6 +399,546 @@ fn instrumented_controller_forwards_pacing_rate_through_clones() {
 }
 
 #[test]
+fn candidate_allocation_does_not_publish_active_identity_or_consume_ack_cursor() {
+    let telemetry = QuicCarrierTelemetry::default();
+    assert_eq!(telemetry.current_path_epoch(), 0);
+    let path = telemetry.allocate_path_telemetry();
+    path.publish_ack_batch(
+        QuicAckTelemetryTotals {
+            delivery_clock_epoch: 1,
+            acked_bytes: 1200,
+            sample_count: 1,
+            ..QuicAckTelemetryTotals::default()
+        },
+        0,
+        false,
+    );
+    assert_eq!(telemetry.current_path_epoch(), 0);
+    assert_eq!(path.snapshot().newly_acked_bytes, Some(1200));
+    assert_eq!(
+        path.snapshot().newly_acked_bytes,
+        None,
+        "only the owning metrics snapshot advances the ACK cursor"
+    );
+}
+
+#[tokio::test]
+async fn valid_same_activation_rate_changes_wake_once_and_absence_never_clears() {
+    let rate = Arc::new(AtomicU64::new(100));
+    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let notify = telemetry.native_authority_notify();
+    let mut controller = InstrumentedController::new(
+        Box::new(MutableOperationalController(rate.clone())),
+        telemetry,
+    );
+    assert_eq!(controller.last_valid_operational_rate_bps, Some(800));
+
+    rate.store(200, Ordering::Relaxed);
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        false,
+        None,
+        quinn::congestion::SpaceId::Data,
+    );
+    tokio::time::timeout(Duration::from_millis(100), notify.notified())
+        .await
+        .expect("a changed valid B_op wakes the coordinator");
+    assert_eq!(controller.last_valid_operational_rate_bps, Some(1_600));
+
+    rate.store(0, Ordering::Relaxed);
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        false,
+        None,
+        quinn::congestion::SpaceId::Data,
+    );
+    assert_eq!(
+        controller.last_valid_operational_rate_bps,
+        Some(1_600),
+        "absence must not clear the last valid change-detector state"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), notify.notified())
+            .await
+            .is_err(),
+        "absence is no authority event"
+    );
+
+    rate.store(200, Ordering::Relaxed);
+    let _inspection_clone = controller.clone_box();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), notify.notified())
+            .await
+            .is_err(),
+        "inspection clone neither detects nor publishes a rate change"
+    );
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        false,
+        None,
+        quinn::congestion::SpaceId::Data,
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), notify.notified())
+            .await
+            .is_err(),
+        "the same valid value after absence is not a fabricated fresh update"
+    );
+}
+
+#[tokio::test]
+async fn finite_startup_authority_requires_two_post_ready_data_rounds() {
+    const WINDOW: u64 = 77_777;
+    const PACING_BYTES_PER_SECOND: u64 = 12_345;
+    const OPERATIONAL_BYTES_PER_SECOND: u64 = 55_000;
+    const FLOOR: u64 = 100;
+    let activation = live_test_controller_activation().await;
+    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let notify = telemetry.native_authority_notify();
+    let initial_sample =
+        controlled_sample(1, true, quinn::congestion::SpaceId::Data, FLOOR, 1, false);
+    let (inner, state) = ControlledNativeController::new(
+        WINDOW,
+        PACING_BYTES_PER_SECOND,
+        Some(OPERATIONAL_BYTES_PER_SECOND),
+        Some(initial_sample),
+    );
+    let target = QuicStartupTarget {
+        window_bytes: WINDOW,
+        pacing_bytes_per_second: PACING_BYTES_PER_SECOND,
+    };
+    let mut controller = controlled_instrumented_controller(inner, Some(target), telemetry.clone());
+    controller.on_activated(activation);
+
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::PreReady
+    );
+    let authority = controller
+        .native_authority_snapshot()
+        .expect("activated authority snapshot");
+    assert_eq!(authority.kind(), NativeControllerObservationKind::Absent);
+    assert_eq!(authority.operational_rate_bps(), None);
+    let shape = controller
+        .native_shape_snapshot(
+            Duration::from_millis(80),
+            Duration::from_millis(5),
+            4_321,
+            1_200,
+            false,
+        )
+        .expect("activated shape snapshot");
+    assert_eq!(shape.operational_rate_bps(), None);
+    assert_eq!(shape.congestion_window(), WINDOW);
+    assert_eq!(
+        shape.pacing_rate_bps().map(NonZeroU64::get),
+        Some(PACING_BYTES_PER_SECOND * 8)
+    );
+    assert_eq!(controller.window(), WINDOW);
+    assert_eq!(controller.pacing_rate(), Some(PACING_BYTES_PER_SECOND));
+    assert_eq!(controller.metrics().congestion_window, WINDOW);
+    assert_eq!(
+        controller.metrics().pacing_rate,
+        Some(PACING_BYTES_PER_SECOND)
+    );
+
+    *state.lock().expect("controlled native state") = ControlledNativeState {
+        bandwidth_estimate: Some(OPERATIONAL_BYTES_PER_SECOND),
+        sample: Some(controlled_sample(
+            2,
+            true,
+            quinn::congestion::SpaceId::Data,
+            FLOOR + 1,
+            2,
+            false,
+        )),
+    };
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        false,
+        Some(FLOOR + 1),
+        quinn::congestion::SpaceId::Data,
+    );
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::PreReady
+    );
+    assert_eq!(
+        controller.last_bandwidth_sample_revision,
+        NonZeroU64::new(2)
+    );
+
+    controller.on_application_ready();
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::AwaitFloor
+    );
+    *state.lock().expect("controlled native state") = ControlledNativeState {
+        bandwidth_estimate: Some(OPERATIONAL_BYTES_PER_SECOND),
+        sample: Some(controlled_sample(
+            3,
+            true,
+            quinn::congestion::SpaceId::Data,
+            FLOOR + 2,
+            3,
+            false,
+        )),
+    };
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        false,
+        Some(FLOOR + 2),
+        quinn::congestion::SpaceId::Data,
+    );
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::AwaitFloor
+    );
+    assert_eq!(
+        controller
+            .native_authority_snapshot()
+            .expect("pre-floor authority snapshot")
+            .operational_rate_bps(),
+        None
+    );
+    assert_eq!(
+        controller
+            .native_shape_snapshot(
+                Duration::from_millis(80),
+                Duration::from_millis(5),
+                4_321,
+                1_200,
+                false,
+            )
+            .expect("pre-floor shape snapshot")
+            .operational_rate_bps(),
+        None
+    );
+
+    controller.on_packet_sent(
+        Instant::now(),
+        1_200,
+        0,
+        FLOOR,
+        quinn::congestion::SpaceId::Data,
+        false,
+    );
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::AwaitFirst {
+            floor_packet_number: FLOOR
+        }
+    );
+
+    publish_controlled_sample(
+        &mut controller,
+        &state,
+        4,
+        true,
+        quinn::congestion::SpaceId::Data,
+        FLOOR - 1,
+        6,
+        false,
+        Some(OPERATIONAL_BYTES_PER_SECOND),
+    );
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::AwaitFirst {
+            floor_packet_number: FLOOR
+        }
+    );
+    publish_controlled_sample(
+        &mut controller,
+        &state,
+        5,
+        true,
+        quinn::congestion::SpaceId::Data,
+        FLOOR,
+        7,
+        false,
+        Some(OPERATIONAL_BYTES_PER_SECOND),
+    );
+    let armed = StartupAuthorityState::Armed {
+        floor_packet_number: FLOOR,
+        first_source_round: 7,
+    };
+    assert_eq!(controller.startup_authority, armed);
+    assert_eq!(
+        controller
+            .native_authority_snapshot()
+            .expect("armed authority snapshot")
+            .operational_rate_bps(),
+        None,
+        "one exact eligible round is not yet native authority"
+    );
+
+    let clone = controller
+        .clone_box()
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("instrumented clone");
+    assert_eq!(clone.startup_authority, armed);
+    assert_eq!(
+        clone.last_bandwidth_sample_revision,
+        controller.last_bandwidth_sample_revision
+    );
+
+    for (revision, valid, space, packet, round, app_limited, rate) in [
+        (
+            6,
+            true,
+            quinn::congestion::SpaceId::Data,
+            FLOOR + 1,
+            7,
+            false,
+            Some(OPERATIONAL_BYTES_PER_SECOND),
+        ),
+        (
+            7,
+            true,
+            quinn::congestion::SpaceId::Data,
+            FLOOR + 2,
+            8,
+            true,
+            Some(OPERATIONAL_BYTES_PER_SECOND),
+        ),
+        (
+            8,
+            false,
+            quinn::congestion::SpaceId::Data,
+            FLOOR + 3,
+            8,
+            false,
+            Some(OPERATIONAL_BYTES_PER_SECOND),
+        ),
+        (
+            9,
+            true,
+            quinn::congestion::SpaceId::Handshake,
+            FLOOR + 4,
+            8,
+            false,
+            Some(OPERATIONAL_BYTES_PER_SECOND),
+        ),
+        (
+            10,
+            true,
+            quinn::congestion::SpaceId::Data,
+            FLOOR - 1,
+            8,
+            false,
+            Some(OPERATIONAL_BYTES_PER_SECOND),
+        ),
+        (
+            11,
+            true,
+            quinn::congestion::SpaceId::Data,
+            FLOOR + 5,
+            8,
+            false,
+            Some(0),
+        ),
+    ] {
+        publish_controlled_sample(
+            &mut controller,
+            &state,
+            revision,
+            valid,
+            space,
+            packet,
+            round,
+            app_limited,
+            rate,
+        );
+        assert_eq!(
+            controller.startup_authority, armed,
+            "ineligible and same-round samples are absence, not revocation"
+        );
+    }
+    *state.lock().expect("controlled native state") = ControlledNativeState {
+        bandwidth_estimate: Some(OPERATIONAL_BYTES_PER_SECOND),
+        sample: None,
+    };
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        false,
+        None,
+        quinn::congestion::SpaceId::Data,
+    );
+    assert_eq!(controller.startup_authority, armed);
+
+    publish_controlled_sample(
+        &mut controller,
+        &state,
+        12,
+        true,
+        quinn::congestion::SpaceId::Data,
+        FLOOR + 6,
+        8,
+        false,
+        Some(OPERATIONAL_BYTES_PER_SECOND),
+    );
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::Operational
+    );
+    assert_eq!(
+        controller.last_valid_operational_rate_bps,
+        Some(OPERATIONAL_BYTES_PER_SECOND * 8)
+    );
+    tokio::time::timeout(Duration::from_millis(100), notify.notified())
+        .await
+        .expect("the structural handoff wake is durable without a waiter");
+    assert_eq!(
+        controller
+            .native_authority_snapshot()
+            .expect("operational authority snapshot")
+            .operational_rate_bps()
+            .map(NonZeroU64::get),
+        Some(OPERATIONAL_BYTES_PER_SECOND * 8)
+    );
+
+    *state.lock().expect("controlled native state") = ControlledNativeState {
+        bandwidth_estimate: None,
+        sample: None,
+    };
+    controller.on_end_acks(
+        Instant::now(),
+        0,
+        true,
+        None,
+        quinn::congestion::SpaceId::Data,
+    );
+    assert_eq!(
+        controller.startup_authority,
+        StartupAuthorityState::Operational,
+        "idle absence cannot restore the configured prior"
+    );
+    assert_eq!(
+        controller.last_valid_operational_rate_bps,
+        Some(OPERATIONAL_BYTES_PER_SECOND * 8)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), notify.notified())
+            .await
+            .is_err(),
+        "absence and an already-completed handoff publish no extra wake"
+    );
+
+    let fresh = controller
+        .fresh_path_box(Instant::now(), 1_400)
+        .expect("fresh path controller")
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("fresh instrumented controller");
+    assert_eq!(fresh.startup_target, Some(target));
+    assert_eq!(fresh.startup_authority, StartupAuthorityState::AwaitFloor);
+    assert_eq!(fresh.last_bandwidth_sample_revision, None);
+}
+
+#[tokio::test]
+async fn startup_authority_bypass_and_retained_clone_readiness_are_exact() {
+    const WINDOW: u64 = 64_000;
+    const PACING_BYTES_PER_SECOND: u64 = 25_000;
+    const OPERATIONAL_BYTES_PER_SECOND: u64 = 75_000;
+    let activation = live_test_controller_activation().await;
+
+    for initial_rate in [
+        crate::transport::RateHint::Unknown,
+        crate::transport::RateHint::Unlimited,
+    ] {
+        let metadata = crate::transport::PathMetadata {
+            initial_rate,
+            ..Default::default()
+        };
+        let target = metadata
+            .quic_startup_target()
+            .expect("valid omitted or unlimited target");
+        assert_eq!(target, None);
+        let telemetry = Arc::new(QuicCarrierTelemetry::default());
+        let (inner, _) = ControlledNativeController::new(
+            WINDOW,
+            PACING_BYTES_PER_SECOND,
+            Some(OPERATIONAL_BYTES_PER_SECOND),
+            None,
+        );
+        let mut controller = controlled_instrumented_controller(inner, target, telemetry);
+        controller.on_activated(activation);
+        assert_eq!(controller.startup_authority, StartupAuthorityState::Bypass);
+        assert_eq!(
+            controller
+                .native_authority_snapshot()
+                .expect("bypass authority snapshot")
+                .operational_rate_bps()
+                .map(NonZeroU64::get),
+            Some(OPERATIONAL_BYTES_PER_SECOND * 8)
+        );
+        let shape = controller
+            .native_shape_snapshot(
+                Duration::from_millis(100),
+                Duration::from_millis(10),
+                1_234,
+                1_200,
+                false,
+            )
+            .expect("bypass shape snapshot");
+        assert_eq!(shape.congestion_window(), WINDOW);
+        assert_eq!(
+            shape.pacing_rate_bps().map(NonZeroU64::get),
+            Some(PACING_BYTES_PER_SECOND * 8)
+        );
+        assert_eq!(
+            shape.operational_rate_bps().map(NonZeroU64::get),
+            Some(OPERATIONAL_BYTES_PER_SECOND * 8)
+        );
+        controller.on_application_ready();
+        controller.on_packet_sent(
+            Instant::now(),
+            1_200,
+            0,
+            1,
+            quinn::congestion::SpaceId::Data,
+            false,
+        );
+        assert_eq!(controller.startup_authority, StartupAuthorityState::Bypass);
+    }
+
+    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let (inner, _) = ControlledNativeController::new(WINDOW, PACING_BYTES_PER_SECOND, None, None);
+    let target = QuicStartupTarget {
+        window_bytes: WINDOW,
+        pacing_bytes_per_second: PACING_BYTES_PER_SECOND,
+    };
+    let mut active = controlled_instrumented_controller(inner, Some(target), telemetry.clone());
+    active.on_activated(activation);
+    let mut retained = active
+        .clone_box()
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("retained instrumented clone");
+    assert_eq!(retained.startup_authority, StartupAuthorityState::PreReady);
+    active.on_application_ready();
+    assert_eq!(active.startup_authority, StartupAuthorityState::AwaitFloor);
+    assert_eq!(
+        retained.startup_authority,
+        StartupAuthorityState::PreReady,
+        "an inactive clone changes only when it is installed"
+    );
+    retained.on_activated(activation);
+    assert_eq!(
+        retained.startup_authority,
+        StartupAuthorityState::AwaitFloor,
+        "late activation reconciles connection-scoped readiness"
+    );
+}
+
+#[test]
 fn production_initial_and_fresh_paths_both_construct_bbr3() {
     let now = Instant::now();
     let controller = quinn::congestion::ControllerFactory::build(
@@ -216,7 +977,117 @@ fn production_initial_and_fresh_paths_both_construct_bbr3() {
 }
 
 #[test]
-fn path_loss_compensation_constructs_initial_and_fresh_bbr3_without_reusing_initial_rate() {
+fn omitted_and_unlimited_startup_rate_preserve_exact_bbr3_defaults() {
+    let now = Instant::now();
+    let default = quinn::congestion::ControllerFactory::build(
+        Arc::new(quinn::congestion::Bbr3Config::default()),
+        now,
+        1200,
+    );
+    let default_metrics = default.metrics();
+
+    for initial_rate in [
+        crate::transport::RateHint::Unknown,
+        crate::transport::RateHint::Unlimited,
+    ] {
+        let metadata = crate::transport::PathMetadata {
+            initial_srtt_ms: Some(17),
+            initial_rate,
+            ..Default::default()
+        };
+        let controller = quinn::congestion::ControllerFactory::build(
+            Arc::new(InstrumentedBbrConfig::for_path(&metadata)),
+            now,
+            1200,
+        )
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("instrumented production controller");
+        assert_eq!(controller.initial_window(), default.initial_window());
+        assert_eq!(
+            controller.metrics().pacing_rate,
+            default_metrics.pacing_rate
+        );
+        assert_eq!(controller.metrics().bandwidth_estimate, None);
+        assert_eq!(controller.last_valid_operational_rate_bps, None);
+    }
+}
+
+#[test]
+fn finite_startup_rate_sets_exact_geometry_without_fabricating_bandwidth() {
+    let now = Instant::now();
+    let metadata = crate::transport::PathMetadata {
+        initial_srtt_ms: Some(101),
+        initial_rate: crate::transport::RateHint::BitsPerSecond(25_000_003),
+        ..Default::default()
+    };
+    let controller = quinn::congestion::ControllerFactory::build(
+        Arc::new(InstrumentedBbrConfig::for_path(&metadata)),
+        now,
+        1200,
+    )
+    .into_any()
+    .downcast::<InstrumentedController>()
+    .expect("instrumented production controller");
+
+    // ceil(25_000_003 bit/s * 101 ms / 8_000) and ceil(rate / 8).
+    assert_eq!(controller.initial_window(), 315_626);
+    assert_eq!(controller.window(), 315_626);
+    assert_eq!(controller.metrics().pacing_rate, Some(3_125_001));
+    assert_eq!(controller.metrics().bandwidth_estimate, None);
+    assert_eq!(controller.last_valid_operational_rate_bps, None);
+
+    let fresh = controller
+        .fresh_path_box(now + Duration::from_secs(1), 1400)
+        .expect("fresh controller")
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("fresh instrumented controller");
+    assert_eq!(fresh.initial_window(), 315_626);
+    assert_eq!(fresh.window(), 315_626);
+    assert_eq!(fresh.metrics().pacing_rate, Some(3_125_001));
+    assert_eq!(fresh.metrics().bandwidth_estimate, None);
+    assert_eq!(fresh.last_valid_operational_rate_bps, None);
+}
+
+#[test]
+fn finite_startup_rate_uses_333ms_default_and_never_shrinks_iw10() {
+    let now = Instant::now();
+    let metadata = crate::transport::PathMetadata {
+        initial_rate: crate::transport::RateHint::BitsPerSecond(1_000_001),
+        ..Default::default()
+    };
+    let controller = quinn::congestion::ControllerFactory::build(
+        Arc::new(InstrumentedBbrConfig::for_path(&metadata)),
+        now,
+        1200,
+    );
+    assert_eq!(controller.initial_window(), 41_626);
+    assert_eq!(controller.metrics().pacing_rate, Some(125_001));
+    assert_eq!(controller.metrics().bandwidth_estimate, None);
+
+    let tiny = crate::transport::PathMetadata {
+        initial_srtt_ms: Some(1),
+        initial_rate: crate::transport::RateHint::BitsPerSecond(8),
+        ..Default::default()
+    };
+    let tiny = quinn::congestion::ControllerFactory::build(
+        Arc::new(InstrumentedBbrConfig::for_path(&tiny)),
+        now,
+        1200,
+    );
+    let default = quinn::congestion::ControllerFactory::build(
+        Arc::new(quinn::congestion::Bbr3Config::default()),
+        now,
+        1200,
+    );
+    assert_eq!(tiny.initial_window(), default.initial_window());
+    assert_eq!(tiny.metrics().pacing_rate, Some(1));
+    assert_eq!(tiny.metrics().bandwidth_estimate, None);
+}
+
+#[test]
+fn path_loss_compensation_and_startup_target_construct_initial_and_fresh_bbr3() {
     fn assert_bbr3_loss_compensation(controller: &InstrumentedController, expected: &str) {
         let bbr3 = controller
             .inner
@@ -247,6 +1118,9 @@ fn path_loss_compensation_constructs_initial_and_fresh_bbr3_without_reusing_init
     .expect("instrumented production controller");
     assert_eq!(controller.loss_compensation.ppm(), 51_234);
     assert_bbr3_loss_compensation(&controller, "loss_compensation_floor: 0.051234");
+    assert_eq!(controller.initial_window(), 1_040_625);
+    assert_eq!(controller.metrics().pacing_rate, Some(3_125_000));
+    assert_eq!(controller.metrics().bandwidth_estimate, None);
     let fresh = controller
         .fresh_path_box(now + Duration::from_secs(1), 1400)
         .expect("fresh controller")
@@ -255,6 +1129,9 @@ fn path_loss_compensation_constructs_initial_and_fresh_bbr3_without_reusing_init
         .expect("fresh instrumented controller");
     assert_eq!(fresh.loss_compensation.ppm(), 51_234);
     assert_bbr3_loss_compensation(&fresh, "loss_compensation_floor: 0.051234");
+    assert_eq!(fresh.initial_window(), 1_040_625);
+    assert_eq!(fresh.metrics().pacing_rate, Some(3_125_000));
+    assert_eq!(fresh.metrics().bandwidth_estimate, None);
     let rate_only = crate::transport::PathMetadata {
         initial_rate: crate::transport::RateHint::BitsPerSecond(25_000_000),
         ..Default::default()
@@ -269,6 +1146,9 @@ fn path_loss_compensation_constructs_initial_and_fresh_bbr3_without_reusing_init
     .expect("default instrumented controller");
     assert_eq!(default_controller.loss_compensation.ppm(), 100_000);
     assert_bbr3_loss_compensation(&default_controller, "loss_compensation_floor: 0.1");
+    assert_eq!(default_controller.initial_window(), 1_040_625);
+    assert_eq!(default_controller.metrics().pacing_rate, Some(3_125_000));
+    assert_eq!(default_controller.metrics().bandwidth_estimate, None);
 
     let disabled = "quic://example.com:443?loss-compensation-percent=0"
         .parse::<crate::transport::PathSpec>()
@@ -401,7 +1281,6 @@ fn fresh_network_path_keeps_owner_and_isolates_stale_callbacks() {
     );
     let mut old = InstrumentedController::new(inner, telemetry.clone());
     let old_epoch = old.path_telemetry.path_epoch;
-    telemetry.record_delivery_evidence_written(1200);
 
     let mut fresh = old
         .fresh_path_box(base + Duration::from_secs(1), 1400)
@@ -431,11 +1310,6 @@ fn fresh_network_path_keeps_owner_and_isolates_stale_callbacks() {
     assert_eq!(before_current_ack.newly_acked_bytes, None);
     assert_eq!(before_current_ack.lost_bytes, 0);
     assert_eq!(before_current_ack.bytes_in_flight, None);
-    assert_eq!(
-        telemetry.delivery_evidence_pending_ack_bytes(),
-        1200,
-        "a retired path callback cannot consume current delivery evidence"
-    );
 
     fresh.accumulate_ack_telemetry(base + Duration::from_secs(1), 1200, false);
     fresh.finish_ack_telemetry(
@@ -444,7 +1318,6 @@ fn fresh_network_path_keeps_owner_and_isolates_stale_callbacks() {
         false,
     );
     assert_eq!(fresh.snapshot().newly_acked_bytes, Some(1200));
-    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 0);
 }
 
 #[test]
@@ -462,65 +1335,35 @@ fn instrumented_controller_preserves_compact_bbr_delivery_state() {
 }
 
 #[tokio::test]
-async fn first_unacknowledged_product_write_wakes_idle_metrics() {
+async fn first_write_activity_wakes_idle_metrics_without_byte_attribution() {
     let telemetry = QuicCarrierTelemetry::default();
-    let activity = telemetry.delivery_activity_notify();
+    let activity = telemetry.write_activity_notify();
     let started = activity.notified();
     tokio::pin!(started);
     started.as_mut().enable();
 
-    telemetry.record_delivery_evidence_written(64 * 1024);
+    telemetry.record_write_activity();
 
     tokio::time::timeout(Duration::from_secs(1), &mut started)
         .await
-        .expect("idle QUIC metrics wake when product delivery becomes active");
-    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 64 * 1024);
+        .expect("idle QUIC metrics wake when application writing becomes active");
 }
 
 #[test]
-fn native_ack_reconciles_pending_delivery_evidence() {
-    let telemetry = QuicCarrierTelemetry::default();
-    let path_telemetry = telemetry.allocate_path_telemetry();
-    telemetry.record_delivery_evidence_written(64 * 1024);
-    assert_eq!(telemetry.delivery_evidence_written_bytes(), 64 * 1024);
-    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 64 * 1024);
+fn native_ack_without_product_provenance_cannot_confirm_product_delivery() {
+    let base = Instant::now();
+    let (mut controller, telemetry) = test_instrumented_controller(base);
+
+    controller.telemetry.record_write_activity();
+    controller.accumulate_ack_telemetry(base, 1_200, false);
+    controller.finish_ack_telemetry(base + Duration::from_millis(10), 0, false);
+
+    let snapshot = telemetry.snapshot();
     assert_eq!(
-        telemetry.delivery_evidence_pending_ack_bytes(),
-        64 * 1024,
-        "send-credit reads must not consume ACK evidence"
+        snapshot.newly_acked_bytes,
+        Some(1_200),
+        "the ACK remains visible only as native packet telemetry"
     );
-
-    path_telemetry.publish_ack_batch(
-        QuicAckTelemetryTotals {
-            acked_bytes: 16 * 1024,
-            sample_count: 1,
-            ..QuicAckTelemetryTotals::default()
-        },
-        48 * 1024,
-        false,
-    );
-    assert_eq!(
-        telemetry.reconcile_delivery_evidence_ack(path_telemetry.path_epoch, 16 * 1024),
-        16 * 1024
-    );
-    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 48 * 1024);
-    assert_eq!(path_telemetry.bytes_in_flight(), Some(48 * 1024));
-}
-
-#[test]
-fn cancelled_delivery_evidence_removes_only_unacknowledged_bytes() {
-    let telemetry = QuicCarrierTelemetry::default();
-    let path_telemetry = telemetry.allocate_path_telemetry();
-    telemetry.record_delivery_evidence_written(64 * 1024);
-    assert_eq!(
-        telemetry.reconcile_delivery_evidence_ack(path_telemetry.path_epoch, 48 * 1024),
-        48 * 1024
-    );
-
-    telemetry.record_delivery_evidence_cancelled(64 * 1024);
-
-    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 0);
-    assert_eq!(telemetry.delivery_evidence_cancelled_bytes(), 16 * 1024);
 }
 
 #[test]
@@ -566,10 +1409,6 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
                         } else {
                             0
                         },
-                        timed_non_app_limited_delivery_evidence_acked_bytes: 0,
-                        timed_non_app_limited_delivery_evidence_sample_count: 0,
-                        timed_non_app_limited_delivery_evidence_elapsed_nanos: 0,
-                        delivery_evidence_acked_bytes: 0,
                     },
                     0,
                     !non_app_limited,
@@ -734,7 +1573,6 @@ fn quic_coalesced_snapshot_exposes_only_current_delivery_clock_epoch() {
     let base = Instant::now();
     let (mut controller, telemetry) = test_instrumented_controller(base);
 
-    controller.telemetry.record_delivery_evidence_written(900);
     controller.accumulate_ack_telemetry(base, 100, false);
     controller.accumulate_ack_telemetry(base + Duration::from_millis(10), 100, false);
     controller.finish_ack_telemetry(base + Duration::from_millis(100), 700, false);
@@ -748,18 +1586,6 @@ fn quic_coalesced_snapshot_exposes_only_current_delivery_clock_epoch() {
     assert_eq!(coalesced.delivery_clock_epoch, 2);
     assert_eq!(coalesced.newly_acked_bytes, Some(900));
     assert_eq!(coalesced.timed_non_app_limited_acked_bytes, Some(600));
-    assert_eq!(
-        coalesced.timed_non_app_limited_delivery_evidence_acked_bytes, 600,
-        "app-limited Product ACKs and the completed prior clock cannot enter the current timed epoch"
-    );
-    assert_eq!(
-        coalesced.timed_non_app_limited_delivery_evidence_sample_count,
-        2
-    );
-    assert_eq!(
-        coalesced.timed_non_app_limited_delivery_evidence_elapsed,
-        Duration::from_millis(5)
-    );
     assert_eq!(coalesced.timed_non_app_limited_delivery_sample_count, 2);
     assert_eq!(
         coalesced.non_app_limited_ack_elapsed,
@@ -776,10 +1602,9 @@ fn quic_coalesced_snapshot_exposes_only_current_delivery_clock_epoch() {
 }
 
 #[test]
-fn quic_mixed_app_limited_batch_omits_ambiguous_timed_product_attribution() {
+fn quic_mixed_app_limited_batch_keeps_only_native_ack_classification() {
     let base = Instant::now();
     let (mut controller, telemetry) = test_instrumented_controller(base);
-    controller.telemetry.record_delivery_evidence_written(300);
     controller.accumulate_ack_telemetry(base, 100, false);
     controller.accumulate_ack_telemetry(base + Duration::from_millis(5), 100, true);
     controller.accumulate_ack_telemetry(base + Duration::from_millis(10), 100, false);
@@ -787,23 +1612,10 @@ fn quic_mixed_app_limited_batch_omits_ambiguous_timed_product_attribution() {
 
     let mixed = telemetry.snapshot();
     assert_eq!(mixed.delivery_clock_epoch, 1);
-    assert_eq!(mixed.delivery_evidence_newly_acked_bytes, Some(300));
     assert_eq!(mixed.timed_non_app_limited_acked_bytes, Some(200));
     assert_eq!(
         mixed.non_app_limited_ack_elapsed,
         Some(Duration::from_millis(10))
-    );
-    assert_eq!(
-        mixed.timed_non_app_limited_delivery_evidence_acked_bytes, 0,
-        "aggregate Product attribution cannot be guessed across mixed app-limited packet classes"
-    );
-    assert_eq!(
-        mixed.timed_non_app_limited_delivery_evidence_sample_count,
-        0
-    );
-    assert_eq!(
-        mixed.timed_non_app_limited_delivery_evidence_elapsed,
-        Duration::ZERO
     );
 }
 
@@ -811,7 +1623,6 @@ fn quic_mixed_app_limited_batch_omits_ambiguous_timed_product_attribution() {
 fn quic_final_non_app_batch_publishes_before_delivery_clock_closes() {
     let base = Instant::now();
     let (mut controller, telemetry) = test_instrumented_controller(base);
-    controller.telemetry.record_delivery_evidence_written(200);
     controller.accumulate_ack_telemetry(base, 100, false);
     controller.accumulate_ack_telemetry(base + Duration::from_millis(10), 100, false);
     controller.finish_ack_telemetry(base + Duration::from_millis(100), 0, true);
@@ -819,18 +1630,7 @@ fn quic_final_non_app_batch_publishes_before_delivery_clock_closes() {
     let closing = telemetry.snapshot();
     assert_eq!(closing.delivery_clock_epoch, 1);
     assert!(closing.app_limited);
-    assert_eq!(
-        closing.timed_non_app_limited_delivery_evidence_acked_bytes,
-        200
-    );
-    assert_eq!(
-        closing.timed_non_app_limited_delivery_evidence_sample_count,
-        2
-    );
-    assert_eq!(
-        closing.timed_non_app_limited_delivery_evidence_elapsed,
-        Duration::from_millis(10)
-    );
+    assert_eq!(closing.timed_non_app_limited_acked_bytes, Some(200));
 
     controller.finish_ack_telemetry(base + Duration::from_millis(110), 0, true);
     assert_eq!(telemetry.snapshot().delivery_clock_epoch, 1);
@@ -839,10 +1639,6 @@ fn quic_final_non_app_batch_publishes_before_delivery_clock_closes() {
     controller.finish_ack_telemetry(base + Duration::from_millis(130), 0, false);
     let reopened = telemetry.snapshot();
     assert_eq!(reopened.delivery_clock_epoch, 2);
-    assert_eq!(
-        reopened.timed_non_app_limited_delivery_evidence_acked_bytes,
-        0
-    );
 }
 
 #[test]

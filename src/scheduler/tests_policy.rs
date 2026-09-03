@@ -179,3 +179,31 @@ fn latency_sensitive_streams_validate_suspect_low_latency_path() {
     assert_eq!(interactive.map(|score| score.path_id), Some(PathId(0)));
     assert_eq!(bulk.map(|score| score.path_id), Some(PathId(1)));
 }
+
+#[test]
+fn material_completion_advantage_uses_eta_beyond_timing_uncertainty() {
+    let blocked = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 100.0, mbps(100.0));
+    let mut available = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, mbps(100.0));
+    available.queue_bytes = 1024 * 1024;
+
+    assert!(
+        !path_has_material_completion_advantage(100.0, blocked, 50.0, available),
+        "a clearly earlier available path remains work-conserving even with a longer queue",
+    );
+    assert!(
+        path_has_material_completion_advantage(50.0, blocked, 100.0, available),
+        "ETA already accounts for queue work, so the material lead needs no second queue test",
+    );
+
+    let mut queued_blocked = blocked;
+    queued_blocked.queue_bytes = 2 * 1024 * 1024;
+    assert!(
+        path_has_material_completion_advantage(
+            666.0,
+            queued_blocked,
+            1_155.0,
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, mbps(100.0)),
+        ),
+        "reducing the available raw queue cannot reverse a still-material ETA disadvantage",
+    );
+}

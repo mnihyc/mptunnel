@@ -5,6 +5,10 @@ use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{CloseReason, DatagramFlowId, Frame};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::authority::{
+    NativeCarrierRateAuthorityBinding, NativeCarrierRateAuthorityHandle,
+    NativeCarrierRateAuthorityRuntimeError,
+};
 use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
 };
@@ -27,6 +31,7 @@ pub(in crate::runtime) struct UdpPathEndpoint {
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct UdpPathConnection {
     pub(super) connection: quic_transport::Connection,
+    native_rate_authority: NativeCarrierRateAuthorityBinding,
 }
 
 #[derive(Debug)]
@@ -182,15 +187,119 @@ impl UdpPathEndpoint {
 
 impl UdpPathConnection {
     fn new(connection: quic_transport::Connection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            native_rate_authority: NativeCarrierRateAuthorityBinding::default(),
+        }
+    }
+
+    /// Bind this physical connection's local-sender direction exactly once.
+    /// Every clone shares the same OnceLock and therefore the same coordinator.
+    pub(super) async fn bind_native_rate_authority(
+        &self,
+        scope: crate::model::carrier_rate_authority::CarrierRateAuthorityScope,
+        startup_prior_bps: u64,
+    ) -> Result<Arc<NativeCarrierRateAuthorityHandle>, NativeCarrierRateAuthorityRuntimeError> {
+        if let Some(bound) = self.native_rate_authority.requested_scope_is_bound(scope)? {
+            return Ok(bound);
+        }
+
+        // All callers reach this bind point only after the MPP authentication
+        // and path handshake. Establish the controller's post-authentication
+        // packet boundary before constructing the native rate authority.
+        self.connection.mark_application_ready();
+
+        loop {
+            let candidate = match NativeCarrierRateAuthorityHandle::construct(
+                scope,
+                startup_prior_bps,
+                self.connection.clone(),
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) if error.is_retryable_publication() => {
+                    // Construction races a controller install/rollback. Yield
+                    // so the enclosing connection/authentication deadline and
+                    // shutdown futures remain pollable under sustained churn.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let (bound, won_initialization) =
+                self.native_rate_authority.install(scope, candidate)?;
+            if won_initialization {
+                self.spawn_native_rate_authority_publisher(bound.clone());
+            }
+            return Ok(bound);
+        }
+    }
+
+    pub(super) fn native_rate_authority(&self) -> Option<Arc<NativeCarrierRateAuthorityHandle>> {
+        self.native_rate_authority.get()
+    }
+
+    fn spawn_native_rate_authority_publisher(
+        &self,
+        authority: Arc<NativeCarrierRateAuthorityHandle>,
+    ) {
+        let connection = self.clone();
+        let changed = self.connection.native_controller_authority_notify();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = changed.notified() => {}
+                    _ = connection.wait_closed() => return,
+                }
+                loop {
+                    match authority.refresh() {
+                        Ok(publication) => {
+                            // Keep this accepted result available at the
+                            // boundary for the next-stage registry fanout.
+                            let _accepted_snapshot = publication.snapshot();
+                            if publication.transition()
+                                == crate::model::carrier_rate_authority::CarrierRateAuthorityTransition::Terminal
+                            {
+                                return;
+                            }
+                            break;
+                        }
+                        Err(error) if error.is_retryable_publication() => {
+                            tokio::select! {
+                                _ = tokio::task::yield_now() => {}
+                                _ = connection.wait_closed() => return,
+                            }
+                            continue;
+                        }
+                        Err(error) if error.is_transport_terminal() => return,
+                        Err(NativeCarrierRateAuthorityRuntimeError::Authority(
+                            crate::model::carrier_rate_authority::CarrierRateAuthorityError::WrongMode,
+                        )) => return,
+                        Err(error) => {
+                            // A malformed source or broken serialization
+                            // contract must not leave this carrier selectable
+                            // with stale Native authority.
+                            crate::observability::process_event!(
+                                Warn,
+                                "quic",
+                                "native_rate_authority_failed",
+                                "native QUIC carrier-rate authority failed closed: {error:?}"
+                            );
+                            connection.close();
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub(super) fn remote_address(&self) -> SocketAddr {
         self.connection.remote_address()
     }
 
-    pub(super) fn delivery_activity_notify(&self) -> Arc<tokio::sync::Notify> {
-        self.connection.delivery_activity_notify()
+    pub(super) fn write_activity_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.connection.write_activity_notify()
     }
 
     pub(super) fn is_locally_closed(&self) -> bool {

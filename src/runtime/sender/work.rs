@@ -64,6 +64,17 @@ pub(in crate::runtime) struct ClientReinjectionOutputIdentity {
     pub(in crate::runtime::sender) instance: RelayPathInstance,
 }
 
+impl ClientReinjectionOutputIdentity {
+    #[cfg(test)]
+    pub(in crate::runtime) const fn new(instance: RelayPathInstance) -> Self {
+        Self { instance }
+    }
+
+    pub(in crate::runtime) fn instance(self) -> RelayPathInstance {
+        self.instance
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::runtime) struct ServerReinjectionOutputIdentity {
     pub(in crate::runtime) key: CarrierPathKey,
@@ -94,6 +105,11 @@ pub(in crate::runtime) enum RelaySendCause {
     CompletionTailReinjection(ClientReinjectionOutputIdentity),
     PathFailureReinjection,
     StalePathReinjection(RelayPathInstance),
+    ClientPathFailureReinjection(ClientReinjectionOutputIdentity),
+    ClientStalePathReinjection {
+        owner: RelayPathInstance,
+        target: ClientReinjectionOutputIdentity,
+    },
     StaleResponsePathReinjection(ServerReinjectionOutputIdentity),
 }
 
@@ -109,10 +125,12 @@ impl RelaySendCause {
             | Self::PersistentServerAckGapReinjection(_) => "persistent_ack_gap_reinjection",
             Self::TailReinjection => "tail_reinjection",
             Self::CompletionTailReinjection(_) => "completion_tail_reinjection",
-            Self::PathFailureReinjection => "path_failure_reinjection",
-            Self::StalePathReinjection(_) | Self::StaleResponsePathReinjection(_) => {
-                "stale_path_reinjection"
+            Self::PathFailureReinjection | Self::ClientPathFailureReinjection(_) => {
+                "path_failure_reinjection"
             }
+            Self::StalePathReinjection(_)
+            | Self::ClientStalePathReinjection { .. }
+            | Self::StaleResponsePathReinjection(_) => "stale_path_reinjection",
         }
     }
 
@@ -127,6 +145,8 @@ impl RelaySendCause {
                 | Self::CompletionTailReinjection(_)
                 | Self::PathFailureReinjection
                 | Self::StalePathReinjection(_)
+                | Self::ClientPathFailureReinjection(_)
+                | Self::ClientStalePathReinjection { .. }
                 | Self::StaleResponsePathReinjection(_)
         )
     }
@@ -144,23 +164,46 @@ impl RelaySendCause {
         matches!(self, Self::AckGapReinjection) || self.is_persistent_ack_gap_reinjection()
     }
 
-    /// Recovery that already owns a bounded retry may use carrier queue
-    /// capacity without requiring unrelated shared-carrier work to drain.
-    pub(in crate::runtime::sender) fn permits_busy_carrier_recovery(self) -> bool {
-        self.is_persistent_ack_gap_reinjection()
-            || matches!(
-                self,
-                Self::TailReinjection
-                    | Self::CompletionTailReinjection(_)
-                    | Self::PathFailureReinjection
-                    | Self::StalePathReinjection(_)
-                    | Self::StaleResponsePathReinjection(_)
-            )
-    }
-
     pub(in crate::runtime::sender) fn persistent_client_target(self) -> Option<RelayPathInstance> {
         match self {
             Self::PersistentClientAckGapReinjection(batch) => Some(batch.target.instance),
+            _ => None,
+        }
+    }
+
+    pub(in crate::runtime::sender) fn client_target(self) -> Option<RelayPathInstance> {
+        self.persistent_client_target().or(match self {
+            Self::ClientPathFailureReinjection(target)
+            | Self::ClientStalePathReinjection { target, .. } => Some(target.instance),
+            _ => None,
+        })
+    }
+
+    /// Exact request output already selected before Product queue dispatch.
+    ///
+    /// Ordinary ACK-gap, tail, and failure repair remains target-unbound until
+    /// request scheduling selects an output. Completion-tail repair carries
+    /// the same pre-commit target identity as persistent-gap and path-recovery
+    /// repair, even though its dispatch path has a separate completion rule.
+    pub(in crate::runtime::sender) fn request_reinjection_target(
+        self,
+    ) -> Option<RelayPathInstance> {
+        self.client_target()
+            .or_else(|| self.completion_tail_target().map(|target| target.instance))
+    }
+
+    pub(in crate::runtime::sender) fn client_path_recovery_is_bound(self) -> bool {
+        matches!(
+            self,
+            Self::ClientPathFailureReinjection(_) | Self::ClientStalePathReinjection { .. }
+        )
+    }
+
+    pub(in crate::runtime::sender) fn stale_request_owner(self) -> Option<RelayPathInstance> {
+        match self {
+            Self::StalePathReinjection(owner) | Self::ClientStalePathReinjection { owner, .. } => {
+                Some(owner)
+            }
             _ => None,
         }
     }
@@ -181,6 +224,17 @@ impl RelaySendCause {
             Self::PersistentServerAckGapReinjection(batch) => Some(batch.target),
             _ => None,
         }
+    }
+
+    /// Exact response output already selected before Product queue dispatch.
+    ///
+    /// Response path-failure, stale-owner, tail, and ordinary ACK-gap repair
+    /// remains target-unbound until response scheduling selects an output.
+    /// Only a persistent server ACK-gap batch carries a pre-commit target.
+    pub(in crate::runtime::sender) fn response_reinjection_target(
+        self,
+    ) -> Option<ServerReinjectionOutputIdentity> {
+        self.persistent_server_target()
     }
 
     pub(in crate::runtime::sender) fn persistent_ack_gap_reinjection_expired(
@@ -231,4 +285,7 @@ impl RelaySendCause {
 pub(in crate::runtime) struct RelaySendOutcome {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) path_key: RelayPathKey,
+    /// Absolute immutable expiry of the accepted ReinjectedData copy, if this
+    /// dispatch committed one.
+    pub(in crate::runtime) accepted_copy_deadline: Option<Instant>,
 }

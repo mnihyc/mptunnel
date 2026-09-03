@@ -252,8 +252,7 @@ pub(in crate::runtime) fn stream_final_offset_tail_reinjection_frames_normalized
     send_stream.retransmission_frames_after_normalized_ack_frontier(ranges, byte_limit)
 }
 
-/// Persistent-gap identity and the immutable repeat deadline of its most
-/// recently accepted target-bound reinjection attempt.
+/// Persistent-gap identity and its immutable first-recovery deadline.
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct ReliableAckGapReinjectionProgress {
     first_gap_start: Option<u64>,
@@ -261,7 +260,41 @@ pub(in crate::runtime) struct ReliableAckGapReinjectionProgress {
     loss_at: Option<Instant>,
     fallback_at: Option<Instant>,
     candidate_deadline: Option<Instant>,
-    next_reinjection_at: Option<Instant>,
+}
+
+/// Reconciles the actor's durable accepted-copy wake with one exact ledger
+/// observation. A prior due deadline is returned once, while the observation
+/// atomically installs any disjoint still-live successor deadline.
+pub(in crate::runtime) fn reconcile_accepted_copy_wake(
+    wake_at: &mut Option<Instant>,
+    observed: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let due = accepted_copy_wake_is_due(*wake_at, now);
+    *wake_at = observed;
+    due
+}
+
+/// A committed accepted-copy deadline takes precedence over topology work at
+/// the exact due boundary.
+pub(in crate::runtime) fn accepted_copy_wake_is_due(
+    wake_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    wake_at.is_some_and(|deadline| deadline <= now)
+}
+
+/// Retains the earliest deadline returned by successful carrier commits in
+/// the current actor turn. This closes the interval between command commit
+/// and the next ledger observation, including when the deadline has already
+/// elapsed before that observation.
+pub(in crate::runtime) fn retain_accepted_copy_wake(
+    wake_at: &mut Option<Instant>,
+    accepted_copy_deadline: Instant,
+) {
+    *wake_at = Some(wake_at.map_or(accepted_copy_deadline, |current| {
+        current.min(accepted_copy_deadline)
+    }));
 }
 
 /// One exact attachment with authoritative outstanding OriginalData.
@@ -309,8 +342,14 @@ impl<Candidate> ReliablePathStalenessObservation<Candidate> {
 /// restart its clock.
 #[derive(Debug)]
 pub(in crate::runtime) struct ReliablePathStaleness<Candidate> {
-    clocks: SmallVec<[(Candidate, Instant); 4]>,
+    clocks: SmallVec<[ReliablePathStalenessClock<Candidate>; 4]>,
     next_deadline: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct ReliablePathStalenessClock<Candidate> {
+    candidate: Candidate,
+    deadline: Instant,
 }
 
 impl<Candidate> Default for ReliablePathStaleness<Candidate> {
@@ -327,6 +366,10 @@ pub(in crate::runtime) type ReliableResponsePathStaleness =
     ReliablePathStaleness<ServerReinjectionOutputIdentity>;
 
 impl<Candidate: Copy + Eq> ReliablePathStaleness<Candidate> {
+    fn refresh_next_deadline(&mut self) {
+        self.next_deadline = self.clocks.iter().map(|clock| clock.deadline).min();
+    }
+
     pub(in crate::runtime) fn stale_paths(
         &mut self,
         observations: &[ReliablePathStalenessObservation<Candidate>],
@@ -345,14 +388,13 @@ impl<Candidate: Copy + Eq> ReliablePathStaleness<Candidate> {
         made_progress: &[Candidate],
         now: Instant,
     ) -> SmallVec<[Candidate; 4]> {
-        self.clocks.retain(|(candidate, _)| {
+        self.clocks.retain(|clock| {
             observations.iter().any(|observation| {
-                observation.candidate == *candidate && observation.has_reinjection_path
+                observation.candidate == clock.candidate && observation.has_reinjection_path
             })
         });
 
         let mut stale = SmallVec::<[Candidate; 4]>::new();
-        let mut next_deadline = None;
         for observation in observations
             .iter()
             .filter(|observation| observation.has_reinjection_path)
@@ -360,29 +402,25 @@ impl<Candidate: Copy + Eq> ReliablePathStaleness<Candidate> {
             if stale.contains(&observation.candidate) {
                 continue;
             }
-            let Some((_, first_seen_at)) = self
+            let Some(clock) = self
                 .clocks
                 .iter_mut()
-                .find(|(candidate, _)| *candidate == observation.candidate)
+                .find(|clock| clock.candidate == observation.candidate)
             else {
-                self.clocks.push((observation.candidate, now));
-                let deadline = now + observation.persistence;
-                next_deadline =
-                    Some(next_deadline.map_or(deadline, |current: Instant| current.min(deadline)));
+                self.clocks.push(ReliablePathStalenessClock {
+                    candidate: observation.candidate,
+                    deadline: now + observation.persistence,
+                });
                 continue;
             };
             if made_progress.contains(&observation.candidate) {
-                *first_seen_at = now;
+                clock.deadline = now + observation.persistence;
             }
-            let deadline = *first_seen_at + observation.persistence;
-            if deadline <= now {
+            if clock.deadline <= now {
                 stale.push(observation.candidate);
-            } else {
-                next_deadline =
-                    Some(next_deadline.map_or(deadline, |current: Instant| current.min(deadline)));
             }
         }
-        self.next_deadline = next_deadline;
+        self.refresh_next_deadline();
         stale
     }
 }
@@ -411,7 +449,6 @@ impl ReliableAckGapReinjectionProgress {
                 self.loss_at = None;
                 self.fallback_at = None;
                 self.candidate_deadline = None;
-                self.next_reinjection_at = None;
             }
             if let Some(loss_at) = observed_timing.loss_at {
                 self.loss_at = Some(self.loss_at.map_or(loss_at, |current| current.min(loss_at)));
@@ -460,7 +497,7 @@ impl ReliableAckGapReinjectionProgress {
         normalized_ranges: &[OffsetRange],
         has_multipath_reinjection_alternative: bool,
         measured_reinjection_ready: bool,
-        now: Instant,
+        _now: Instant,
     ) -> bool {
         if !self.retain_gap_identity(
             complete,
@@ -472,40 +509,11 @@ impl ReliableAckGapReinjectionProgress {
         if !measured_reinjection_ready {
             return false;
         }
-        if self
-            .next_reinjection_at
-            .is_some_and(|next_reinjection_at| now < next_reinjection_at)
-        {
-            return false;
-        }
         true
     }
 
-    pub(in crate::runtime) fn record_reinjection_queued(&mut self, retry_after: Duration) {
-        self.record_reinjection_queued_at(Instant::now(), retry_after);
-    }
-
-    fn record_reinjection_queued_at(&mut self, now: Instant, retry_after: Duration) {
-        if self.first_gap_start.is_some() {
-            self.next_reinjection_at = now.checked_add(retry_after).or(Some(now));
-        }
-    }
-
-    pub(in crate::runtime) fn release_reinjection_attempt(&mut self) {
-        self.next_reinjection_at = None;
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn repeat_reinjection_deadline(&self) -> Option<Instant> {
-        self.next_reinjection_at
-    }
-
     pub(in crate::runtime) fn next_reinjection_deadline(&self) -> Option<Instant> {
-        match (self.candidate_deadline, self.next_reinjection_at) {
-            (Some(candidate), Some(repeat)) => Some(candidate.max(repeat)),
-            (Some(candidate), None) => Some(candidate),
-            (None, repeat) => repeat,
-        }
+        self.candidate_deadline
     }
 
     fn clear(&mut self) {
@@ -514,7 +522,6 @@ impl ReliableAckGapReinjectionProgress {
         self.loss_at = None;
         self.fallback_at = None;
         self.candidate_deadline = None;
-        self.next_reinjection_at = None;
     }
 
     fn retain_gap_identity(
@@ -537,7 +544,6 @@ impl ReliableAckGapReinjectionProgress {
             self.loss_at = None;
             self.fallback_at = None;
             self.candidate_deadline = None;
-            self.next_reinjection_at = None;
         }
         has_multipath_reinjection_alternative
     }

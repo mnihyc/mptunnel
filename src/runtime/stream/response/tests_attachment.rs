@@ -1,11 +1,15 @@
 use super::super::next_server_carrier_path_instance_id;
-use super::super::test_support::{binding_for_underlay, output_entry_for_key, stream_data_frame};
+use super::super::test_support::{
+    binding_for_underlay, qualify_product_assignment, stream_data_frame, with_output_entry_for_key,
+};
 use super::{
     ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
     ResponseProductRateEpoch, ResponseStreamAttachOutcome,
 };
 use crate::model::path::{CarrierPathKey, PathPolicy};
+use crate::mux::MuxLimits;
 use crate::protocol::{Frame, OffsetRange, PathId, PathUsage, StreamId, UnderlayProtocol};
+use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
@@ -18,6 +22,142 @@ fn alternate_key(underlay: UnderlayProtocol) -> CarrierPathKey {
         underlay,
         path_id: PathId(1),
     }
+}
+
+#[test]
+fn output_incarnation_exhaustion_fails_before_new_membership_publication() {
+    let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    binding
+        .outputs
+        .lock()
+        .expect("response outputs")
+        .next_output_incarnation = Some(u64::MAX);
+
+    let last_key = alternate_key(UnderlayProtocol::Udp);
+    let (last_commands, _last_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding
+            .try_attach_output(ResponseOutputAttachment {
+                key: last_key,
+                path_instance_id: next_server_carrier_path_instance_id(),
+                local_policy: PathPolicy::default(),
+                commands: last_commands,
+                state: ResponseOutputAttachmentState::default(),
+            })
+            .expect("MAX remains one valid exact incarnation"),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    {
+        let outputs = binding.outputs.lock().expect("response outputs");
+        assert_eq!(outputs.next_output_incarnation, None);
+        assert_eq!(
+            outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == last_key)
+                .expect("MAX-incarnation output")
+                .incarnation,
+            u64::MAX,
+        );
+    }
+
+    let entries_before = binding
+        .outputs
+        .lock()
+        .expect("response outputs")
+        .entries
+        .iter()
+        .map(|entry| (entry.key, entry.path_instance_id, entry.incarnation))
+        .collect::<Vec<_>>();
+    let membership_before = binding.output_membership_generation();
+    let model_before = binding.response_model_generation();
+    for path_id in [PathId(2), PathId(3)] {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        assert!(matches!(
+            binding.try_attach_output(ResponseOutputAttachment {
+                key: CarrierPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    path_id,
+                },
+                path_instance_id: next_server_carrier_path_instance_id(),
+                local_policy: PathPolicy::default(),
+                commands,
+                state: ResponseOutputAttachmentState::default(),
+            }),
+            Err(RuntimeError::ExactIdentityExhausted),
+        ));
+        let outputs = binding.outputs.lock().expect("response outputs");
+        assert_eq!(
+            outputs
+                .entries
+                .iter()
+                .map(|entry| (entry.key, entry.path_instance_id, entry.incarnation))
+                .collect::<Vec<_>>(),
+            entries_before,
+        );
+        assert!(outputs.entries.iter().any(|entry| entry.key == initial));
+        drop(outputs);
+        assert_eq!(binding.output_membership_generation(), membership_before);
+        assert_eq!(binding.response_model_generation(), model_before);
+    }
+}
+
+#[test]
+fn output_incarnation_exhaustion_preserves_closed_predecessor() {
+    let (binding, key, predecessor_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    drop(predecessor_receivers);
+    let (identity_before, qualification_before, counters_before) = {
+        let mut outputs = binding.outputs.lock().expect("response outputs");
+        outputs.next_output_incarnation = None;
+        let predecessor = outputs.entries.first().expect("closed predecessor");
+        assert!(predecessor.commands.is_closed());
+        (
+            (predecessor.path_instance_id, predecessor.incarnation),
+            predecessor.product_qualification.invariant(),
+            (
+                predecessor.original_data_in_flight_bytes,
+                predecessor.bytes_in_flight,
+                outputs.original_data_in_flight_bytes,
+            ),
+        )
+    };
+    let membership_before = binding.output_membership_generation();
+    let model_before = binding.response_model_generation();
+
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        binding.try_attach_output(ResponseOutputAttachment {
+            key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            local_policy: PathPolicy::default(),
+            commands,
+            state: ResponseOutputAttachmentState::default(),
+        }),
+        Err(RuntimeError::ExactIdentityExhausted),
+    ));
+
+    let outputs = binding.outputs.lock().expect("response outputs");
+    assert_eq!(outputs.entries.len(), 1);
+    let predecessor = outputs.entries.first().expect("preserved predecessor");
+    assert_eq!(
+        (predecessor.path_instance_id, predecessor.incarnation),
+        identity_before,
+    );
+    assert_eq!(
+        predecessor.product_qualification.invariant(),
+        qualification_before
+    );
+    assert_eq!(
+        (
+            predecessor.original_data_in_flight_bytes,
+            predecessor.bytes_in_flight,
+            outputs.original_data_in_flight_bytes,
+        ),
+        counters_before,
+    );
+    drop(outputs);
+    assert_eq!(binding.output_membership_generation(), membership_before);
+    assert_eq!(binding.response_model_generation(), model_before);
 }
 
 #[test]
@@ -45,38 +185,46 @@ fn live_output_tracks_real_carrier_receiver_lifetime_and_reattachment() {
 #[test]
 fn output_load_registration_tracks_lane_change_and_withdrawal() {
     let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let entry = output_entry_for_key(&binding, key);
-    assert_eq!(entry.commands.active_flow_counts(), (1, 0));
+    let (commands, path_instance_id) = with_output_entry_for_key(&binding, key, |entry| {
+        (entry.commands.clone(), entry.path_instance_id)
+    });
+    assert_eq!(commands.active_flow_counts(), (0, 0));
 
     binding.set_lane(TrafficClass::Latency);
-    assert_eq!(entry.commands.active_flow_counts(), (1, 1));
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+
+    binding.record_original_flight(key, &stream_data_frame(4_096));
+    assert_eq!(commands.active_flow_counts(), (1, 1));
+
+    binding.set_lane(TrafficClass::Throughput);
+    assert_eq!(commands.active_flow_counts(), (1, 0));
 
     let incarnation = binding
-        .begin_path_detach(key, entry.path_instance_id)
+        .begin_path_detach(key, path_instance_id)
         .map(|outcome| match outcome {
             ResponsePathDetachOutcome::Begun(incarnation) => incarnation,
             ResponsePathDetachOutcome::Pending(_) => panic!("first detach must begin withdrawal"),
         })
         .expect("attached output begins withdrawal");
-    assert_eq!(entry.commands.active_flow_counts(), (0, 0));
+    assert_eq!(commands.active_flow_counts(), (0, 0));
 
-    binding.complete_path_detach(key, entry.path_instance_id, incarnation);
-    assert_eq!(entry.commands.active_flow_counts(), (0, 0));
+    binding.complete_path_detach(key, path_instance_id, incarnation);
+    assert_eq!(commands.active_flow_counts(), (0, 0));
 }
 
 #[test]
 fn exact_carrier_cannot_reattach_while_ordered_detach_is_pending() {
     let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let entry = output_entry_for_key(&binding, key);
+    let path_instance_id = with_output_entry_for_key(&binding, key, |entry| entry.path_instance_id);
     let incarnation = binding
-        .begin_path_detach(key, entry.path_instance_id)
+        .begin_path_detach(key, path_instance_id)
         .map(|outcome| match outcome {
             ResponsePathDetachOutcome::Begun(incarnation) => incarnation,
             ResponsePathDetachOutcome::Pending(_) => panic!("first detach must begin withdrawal"),
         })
         .expect("begin ordered detach");
     assert_eq!(
-        binding.begin_path_detach(key, entry.path_instance_id),
+        binding.begin_path_detach(key, path_instance_id),
         Some(ResponsePathDetachOutcome::Pending(incarnation)),
         "repeated control input must share the existing ordered detach"
     );
@@ -84,7 +232,7 @@ fn exact_carrier_cannot_reattach_while_ordered_detach_is_pending() {
     assert_eq!(
         binding.attach_output(ResponseOutputAttachment {
             key,
-            path_instance_id: entry.path_instance_id,
+            path_instance_id,
             local_policy: PathPolicy::default(),
             commands,
             state: ResponseOutputAttachmentState::default(),
@@ -101,7 +249,49 @@ fn exact_carrier_cannot_reattach_while_ordered_detach_is_pending() {
             .len(),
         1
     );
-    binding.complete_path_detach(key, entry.path_instance_id, incarnation);
+    binding.complete_path_detach(key, path_instance_id, incarnation);
+}
+
+#[test]
+fn successor_can_coexist_with_exact_predecessor_detach() {
+    let (binding, key, _predecessor_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let predecessor_path_instance_id =
+        with_output_entry_for_key(&binding, key, |entry| entry.path_instance_id);
+    let predecessor_incarnation = match binding
+        .begin_path_detach(key, predecessor_path_instance_id)
+        .expect("predecessor begins ordered detach")
+    {
+        ResponsePathDetachOutcome::Begun(incarnation) => incarnation,
+        ResponsePathDetachOutcome::Pending(_) => panic!("first detach must begin withdrawal"),
+    };
+    let successor_instance = next_server_carrier_path_instance_id();
+    let (successor_commands, _successor_receivers) = reliable_path_command_channels(8);
+
+    assert_eq!(
+        binding.attach_output(ResponseOutputAttachment {
+            key,
+            path_instance_id: successor_instance,
+            local_policy: PathPolicy::default(),
+            commands: successor_commands,
+            state: ResponseOutputAttachmentState::default(),
+        }),
+        ResponseStreamAttachOutcome::Attached,
+        "a distinct physical successor does not reuse predecessor ownership"
+    );
+    let targets = binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].observation.path_instance_id, successor_instance);
+    assert!(binding.has_output_incarnation(key, predecessor_incarnation));
+
+    binding.complete_path_detach(key, predecessor_path_instance_id, predecessor_incarnation);
+    assert!(!binding.has_output_incarnation(key, predecessor_incarnation));
+    assert_eq!(
+        binding.sender_path_targets(TrafficClass::Throughput, 1)[0]
+            .observation
+            .path_instance_id,
+        successor_instance,
+        "exact predecessor cleanup cannot remove its successor"
+    );
 }
 
 #[test]
@@ -134,10 +324,10 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
     let stream_id = StreamId(7);
     let established_max_offset = 4096;
     let (binding, initial, mut initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let initial_entry = output_entry_for_key(&binding, initial);
+    let initial_commands =
+        with_output_entry_for_key(&binding, initial, |entry| entry.commands.clone());
     for nonce in 0..8 {
-        initial_entry
-            .commands
+        initial_commands
             .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
             .expect("fill initial output priority queue");
     }
@@ -211,7 +401,8 @@ fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
 #[test]
 fn sole_surviving_response_output_is_restored_from_stale_placement() {
     let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let initial_entry = output_entry_for_key(&binding, initial);
+    let initial_incarnation =
+        with_output_entry_for_key(&binding, initial, |entry| entry.incarnation);
     let alternate = alternate_key(UnderlayProtocol::Udp);
     let (alternate_commands, alternate_receivers) = reliable_path_command_channels(8);
     assert_eq!(
@@ -225,9 +416,9 @@ fn sole_surviving_response_output_is_restored_from_stale_placement() {
     );
     let initial_identity = ServerReinjectionOutputIdentity {
         key: initial,
-        incarnation: initial_entry.incarnation,
+        incarnation: initial_incarnation,
     };
-    assert!(binding.mark_output_stale(initial_identity));
+    assert!(binding.mark_output_stale(initial_identity, TrafficClass::Throughput,));
     assert!(
         binding
             .sender_path_targets(TrafficClass::Throughput, 1)
@@ -321,10 +512,9 @@ fn retained_ack_uses_updates_only_for_caught_up_outputs() {
 fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
     let stream_id = StreamId(7);
     let (binding, initial, mut receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let entry = output_entry_for_key(&binding, initial);
+    let commands = with_output_entry_for_key(&binding, initial, |entry| entry.commands.clone());
     for nonce in 0..8 {
-        entry
-            .commands
+        commands
             .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
             .expect("fill response priority queue");
     }
@@ -411,8 +601,9 @@ fn retained_ack_publication_status_excludes_a_detached_fence() {
     assert!(mixed.published, "the original live output remains fenced");
     assert!(mixed.pending, "the new output still needs cumulative state");
 
-    let initial_entry = output_entry_for_key(&binding, initial);
-    binding.detach(initial, &initial_entry.commands);
+    let initial_commands =
+        with_output_entry_for_key(&binding, initial, |entry| entry.commands.clone());
+    binding.detach(initial, &initial_commands);
     let only_blocked_output = binding.retry_pending_ack(1, &cumulative);
     assert!(!only_blocked_output.published);
     assert!(only_blocked_output.pending);
@@ -432,7 +623,8 @@ fn request_feedback_ingress_is_non_owning_and_exact_to_path_instance() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    let feedback_instance = output_entry_for_key(&binding, feedback).path_instance_id;
+    let feedback_instance =
+        with_output_entry_for_key(&binding, feedback, |entry| entry.path_instance_id);
 
     assert!(binding.record_request_feedback_ingress(feedback, feedback_instance));
     let targets = binding.sender_path_targets(TrafficClass::Control, 1);
@@ -455,7 +647,7 @@ fn request_feedback_ingress_is_non_owning_and_exact_to_path_instance() {
         ResponseStreamAttachOutcome::Attached
     );
     assert_ne!(
-        output_entry_for_key(&binding, feedback).path_instance_id,
+        with_output_entry_for_key(&binding, feedback, |entry| entry.path_instance_id),
         feedback_instance
     );
     assert!(!binding.record_request_feedback_ingress(feedback, feedback_instance));
@@ -482,15 +674,18 @@ fn duplicate_live_output_preserves_identity_and_rejects_a_different_channel() {
         ResponseStreamAttachOutcome::Attached
     );
     assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
-    let before = output_entry_for_key(&binding, key);
+    let before = with_output_entry_for_key(&binding, key, |entry| {
+        (entry.path_instance_id, entry.incarnation)
+    });
 
     assert_eq!(
         binding.attach(key.underlay, key.path_id, commands, TrafficClass::Latency,),
         ResponseStreamAttachOutcome::Attached
     );
-    let after = output_entry_for_key(&binding, key);
-    assert_eq!(after.path_instance_id, before.path_instance_id);
-    assert_eq!(after.incarnation, before.incarnation);
+    with_output_entry_for_key(&binding, key, |after| {
+        assert_eq!(after.path_instance_id, before.0);
+        assert_eq!(after.incarnation, before.1);
+    });
     assert_eq!(binding.lane(), TrafficClass::Latency);
     assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
 
@@ -505,8 +700,8 @@ fn duplicate_live_output_preserves_identity_and_rejects_a_different_channel() {
         ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
     );
     assert_eq!(
-        output_entry_for_key(&binding, key).incarnation,
-        before.incarnation
+        with_output_entry_for_key(&binding, key, |entry| entry.incarnation),
+        before.1
     );
 }
 
@@ -524,6 +719,15 @@ fn closed_output_replacement_resets_evidence_and_cannot_credit_old_flights() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
+    {
+        let mut outputs = binding.outputs.lock().expect("response outputs lock");
+        let entry = outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .expect("attached response output");
+        qualify_product_assignment(entry, MuxLimits::default());
+    }
     let frame = stream_data_frame(4096);
     binding.record_original_flight(key, &frame);
     {
@@ -541,8 +745,11 @@ fn closed_output_replacement_resets_evidence_and_cannot_credit_old_flights() {
             Duration::from_secs(60),
         );
     }
-    let before = output_entry_for_key(&binding, key);
-    assert!(before.product_rate_epoch.is_some());
+    let before = with_output_entry_for_key(&binding, key, |entry| {
+        assert!(entry.product_rate_epoch.is_some());
+        assert!(entry.product_qualification.qualified());
+        (entry.path_instance_id, entry.incarnation)
+    });
     drop(receivers);
 
     let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
@@ -555,30 +762,35 @@ fn closed_output_replacement_resets_evidence_and_cannot_credit_old_flights() {
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
-    let replacement = output_entry_for_key(&binding, key);
-    assert_ne!(replacement.path_instance_id, before.path_instance_id);
-    assert_ne!(replacement.incarnation, before.incarnation);
-    assert_eq!(replacement.bytes_in_flight, 0);
-    assert_eq!(replacement.original_data_in_flight_bytes, 0);
-    assert!(replacement.product_rate_epoch.is_none());
-    assert!(replacement.tcp_product_rate_evidence.is_none());
-    assert!(replacement.local_path_metrics.is_none());
-    assert!(replacement.peer_path_metrics.is_none());
-    assert!(replacement.peer_usage.is_none());
+    with_output_entry_for_key(&binding, key, |replacement| {
+        assert_ne!(replacement.path_instance_id, before.0);
+        assert_ne!(replacement.incarnation, before.1);
+        assert_eq!(replacement.bytes_in_flight, 0);
+        assert_eq!(replacement.original_data_in_flight_bytes, 0);
+        assert!(replacement.product_rate_epoch.is_none());
+        assert!(replacement.tcp_product_rate_evidence.is_none());
+        assert!(replacement.local_path_metrics.is_none());
+        assert!(replacement.peer_path_metrics.is_none());
+        assert!(replacement.peer_usage.is_none());
+        assert_eq!(replacement.product_qualification.deficit_bytes(), None);
+        assert!(!replacement.product_qualification.qualified());
+    });
 
     binding.release_normalized_acked_ranges(&[OffsetRange {
         start: 0,
         end: 4096,
     }]);
-    let replacement = output_entry_for_key(&binding, key);
-    assert_eq!(replacement.original_data_acked_bytes, 0);
-    assert_eq!(replacement.delivery_samples, 0);
+    with_output_entry_for_key(&binding, key, |replacement| {
+        assert_eq!(replacement.original_data_acked_bytes, 0);
+        assert_eq!(replacement.delivery_samples, 0);
+        assert!(!replacement.product_qualification.qualified());
+    });
 }
 
 #[test]
 fn peer_path_usage_rejects_stale_sequences_and_wrong_instances() {
     let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let path_instance_id = output_entry_for_key(&binding, key).path_instance_id;
+    let path_instance_id = with_output_entry_for_key(&binding, key, |entry| entry.path_instance_id);
     let generation = binding.response_model_generation();
 
     assert!(binding.update_peer_path_usage_for_instance(
@@ -616,7 +828,8 @@ fn peer_path_usage_rejects_stale_sequences_and_wrong_instances() {
         PathUsage::Available,
     ));
     assert_eq!(binding.response_model_generation(), generation + 2);
-    let entry = output_entry_for_key(&binding, key);
-    assert_eq!(entry.peer_usage, Some(PathUsage::Available));
-    assert_eq!(entry.peer_usage_sequence, Some(3));
+    with_output_entry_for_key(&binding, key, |entry| {
+        assert_eq!(entry.peer_usage, Some(PathUsage::Available));
+        assert_eq!(entry.peer_usage_sequence, Some(3));
+    });
 }

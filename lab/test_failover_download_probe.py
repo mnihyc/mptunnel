@@ -12,10 +12,23 @@ from failover_download_probe import (
     read_failover_marker_elapsed,
     run_download_worker,
     watch_failover_marker,
+    write_started_file,
 )
 
 
 class FailoverDownloadMarkerTests(unittest.TestCase):
+    def test_started_marker_retains_unix_time_and_adds_monotonic_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "started"
+
+            write_started_file(marker, timestamp=123.5, monotonic=45.25)
+
+            self.assertEqual(marker.read_text(encoding="ascii").splitlines(), [
+                "123.500000000",
+                "45250",
+                "123500",
+            ])
+
     def test_marker_converts_shared_monotonic_timestamp_to_probe_elapsed(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "fault.marker"

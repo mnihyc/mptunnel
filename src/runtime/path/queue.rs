@@ -1,3 +1,4 @@
+use super::authority::NativeCarrierRateAuthorityHandle;
 use super::commands::{
     ReliablePathCommand, RequestTcpCapacityProbeRequest, TcpCapacityProbeCommand,
 };
@@ -39,6 +40,7 @@ pub(in crate::runtime) struct ReliablePathCommandSender {
     reinjection: mpsc::Sender<QueuedReliablePathCommand>,
     data: mpsc::Sender<QueuedReliablePathCommand>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
+    native_rate_authority: Option<Arc<NativeCarrierRateAuthorityHandle>>,
 }
 
 pub(in crate::runtime) struct ReliablePathCommandReceivers {
@@ -66,7 +68,7 @@ enum ReliablePathCommandDrainPhase {
     Complete,
 }
 
-/// Live logical-flow load for one ordered carrier writer queue.
+/// Backlogged logical-flow demand for one ordered carrier writer queue.
 ///
 /// TCP multiplexed streams share this registration domain. Native QUIC streams
 /// use separate writer queues, so independent QUIC streams do not create false
@@ -79,30 +81,53 @@ pub(in crate::runtime) struct ReliablePathLoadRegistration {
 #[derive(Debug)]
 struct ReliablePathLoadRegistrationInner {
     metrics: Arc<ReliablePathCommandQueueMetrics>,
-    lane: Mutex<Option<TrafficClass>>,
+    lane: Mutex<TrafficClass>,
+    active: AtomicBool,
 }
 
 impl ReliablePathLoadRegistration {
     pub(in crate::runtime) fn set_lane(&self, lane: TrafficClass) {
         let mut current = self.lane();
-        let Some(previous) = *current else {
-            return;
-        };
+        let previous = *current;
         if previous == lane {
             return;
         }
-        self.inner.metrics.change_flow_lane(previous, lane);
-        *current = Some(lane);
+        // Activation/deactivation also serialize on `lane`, so the packed
+        // queue counts always move from the exact lane that owns them.
+        if self.inner.active.load(Ordering::Acquire) {
+            self.inner.metrics.change_flow_lane(previous, lane);
+        }
+        *current = lane;
     }
 
-    pub(in crate::runtime) fn deactivate(&self) {
-        let mut current = self.lane();
-        if let Some(lane) = current.take() {
-            self.inner.metrics.release_flow(lane);
+    pub(in crate::runtime) fn activate(&self) {
+        if self.inner.active.load(Ordering::Acquire) {
+            return;
+        }
+        let lane = self.lane();
+        if !self.inner.active.load(Ordering::Relaxed) {
+            self.inner.metrics.register_flow(*lane);
+            self.inner.active.store(true, Ordering::Release);
         }
     }
 
-    fn lane(&self) -> std::sync::MutexGuard<'_, Option<TrafficClass>> {
+    pub(in crate::runtime) fn deactivate(&self) {
+        if !self.inner.active.load(Ordering::Acquire) {
+            return;
+        }
+        let lane = self.lane();
+        if self.inner.active.load(Ordering::Relaxed) {
+            self.inner.metrics.release_flow(*lane);
+            self.inner.active.store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn is_active(&self) -> bool {
+        self.inner.active.load(Ordering::Acquire)
+    }
+
+    fn lane(&self) -> std::sync::MutexGuard<'_, TrafficClass> {
         self.inner
             .lane
             .lock()
@@ -112,12 +137,11 @@ impl ReliablePathLoadRegistration {
 
 impl Drop for ReliablePathLoadRegistrationInner {
     fn drop(&mut self) {
-        let lane = self
+        let lane = *self
             .lane
             .get_mut()
-            .expect("reliable path load registration lock")
-            .take();
-        if let Some(lane) = lane {
+            .expect("reliable path load registration lock");
+        if *self.active.get_mut() {
             self.metrics.release_flow(lane);
         }
     }
@@ -212,7 +236,7 @@ pub(in crate::runtime) struct ReliablePathFrameReservation<'a> {
     permit: Option<mpsc::Permit<'a, QueuedReliablePathCommand>>,
     frame: Option<Frame>,
     datagram_retirement: Option<Arc<ReliablePathDatagramRetirementFence>>,
-    bytes: usize,
+    accounted_bytes: Option<usize>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     #[cfg(feature = "lab-diagnostics")]
     lane: TrafficClass,
@@ -232,7 +256,10 @@ impl ReliablePathFrameReservation<'_> {
             self.frame.as_ref().expect("reserved reliable path frame"),
         )
         .unwrap_or(StreamId(0));
-        self.metrics.add_pending_bytes(self.bytes);
+        let accounted_bytes = self
+            .accounted_bytes
+            .take()
+            .expect("reserved reliable path byte ownership");
         self.permit
             .take()
             .expect("reserved reliable path queue permit")
@@ -241,7 +268,7 @@ impl ReliablePathFrameReservation<'_> {
                     ReliablePathCommand::SendFrame(
                         self.frame.take().expect("reserved reliable path frame"),
                     ),
-                    self.bytes,
+                    accounted_bytes,
                     self.metrics.clone(),
                 )
                 .with_datagram_retirement(self.datagram_retirement.take()),
@@ -256,9 +283,17 @@ impl ReliablePathFrameReservation<'_> {
                 stream_id.0,
                 self.lane,
                 self.effective_lane,
-                self.bytes,
+                accounted_bytes,
             ),
         );
+    }
+}
+
+impl Drop for ReliablePathFrameReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(accounted_bytes) = self.accounted_bytes.take() {
+            self.metrics.release_accounted_bytes(accounted_bytes as u64);
+        }
     }
 }
 
@@ -335,6 +370,18 @@ impl Default for ReliablePathCarrierLifecycle {
 impl ReliablePathCarrierLifecycle {
     fn is_active(&self) -> bool {
         self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_ACTIVE
+    }
+
+    /// The queue reservation is the admission linearization point. Active
+    /// carriers accept every command, planned drains retain only settlement
+    /// and control, and terminal carriers accept no new work of either kind.
+    fn admits_new_command(&self, requires_product_admission: bool) -> bool {
+        match self.phase.load(Ordering::Acquire) {
+            RELIABLE_PATH_CARRIER_ACTIVE => true,
+            RELIABLE_PATH_CARRIER_DRAINING => !requires_product_admission,
+            RELIABLE_PATH_CARRIER_TERMINAL_FAILED | RELIABLE_PATH_CARRIER_TERMINAL_RETIRED => false,
+            _ => false,
+        }
     }
 
     fn begin_drain(&self) {
@@ -655,8 +702,7 @@ impl ReliablePathCommandQueueMetrics {
     }
 
     fn add_pending_bytes(&self, bytes: usize) {
-        self.pending_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.pending_bytes.fetch_add(bytes as u64, Ordering::AcqRel);
     }
 
     fn release_accounted_bytes(&self, pending_bytes: u64) {
@@ -833,6 +879,23 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    /// Attach the physical QUIC connection's one native rate authority before
+    /// this sender is cloned into Product scheduling state.
+    pub(in crate::runtime) fn with_native_rate_authority(
+        mut self,
+        authority: Arc<NativeCarrierRateAuthorityHandle>,
+    ) -> Self {
+        self.native_rate_authority = Some(authority);
+        self
+    }
+
+    /// Native QUIC scheduling authority, absent for generic and TCP queues.
+    pub(in crate::runtime) fn native_rate_authority(
+        &self,
+    ) -> Option<&Arc<NativeCarrierRateAuthorityHandle>> {
+        self.native_rate_authority.as_ref()
+    }
+
     /// Stops fresh application work at the carrier-instance boundary without
     /// preventing ordered control needed to settle work already admitted.
     pub(in crate::runtime) fn begin_path_drain(&self) {
@@ -860,15 +923,17 @@ impl ReliablePathCommandSender {
         }
     }
 
-    pub(in crate::runtime) fn register_flow(
+    /// Retains a flow's lane without publishing demand until unique original
+    /// data is committed to this exact writer queue.
+    pub(in crate::runtime) fn register_inactive_flow(
         &self,
         lane: TrafficClass,
     ) -> ReliablePathLoadRegistration {
-        self.metrics.register_flow(lane);
         ReliablePathLoadRegistration {
             inner: Arc::new(ReliablePathLoadRegistrationInner {
                 metrics: self.metrics.clone(),
-                lane: Mutex::new(Some(lane)),
+                lane: Mutex::new(lane),
+                active: AtomicBool::new(false),
             }),
         }
     }
@@ -908,10 +973,64 @@ impl ReliablePathCommandSender {
             .saturating_sub(self.control.capacity())
     }
 
+    fn ensure_new_command_admitted(
+        &self,
+        requires_product_admission: bool,
+    ) -> Result<(), RuntimeError> {
+        if self
+            .metrics
+            .lifecycle
+            .admits_new_command(requires_product_admission)
+        {
+            Ok(())
+        } else {
+            Err(RuntimeError::ReliablePathSessionClosed)
+        }
+    }
+
+    /// Waits for bounded queue capacity without becoming blind to a carrier
+    /// lifecycle transition. The second admission check, after reservation,
+    /// is the linearization boundary for a transition racing queue capacity.
+    async fn reserve_command_queue<'a>(
+        &'a self,
+        queue: &'a mpsc::Sender<QueuedReliablePathCommand>,
+        requires_product_admission: bool,
+    ) -> Option<mpsc::Permit<'a, QueuedReliablePathCommand>> {
+        loop {
+            let changed = self.metrics.lifecycle.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self
+                .metrics
+                .lifecycle
+                .admits_new_command(requires_product_admission)
+            {
+                return None;
+            }
+
+            tokio::select! {
+                permit = queue.reserve() => {
+                    let permit = permit.ok()?;
+                    if self
+                        .metrics
+                        .lifecycle
+                        .admits_new_command(requires_product_admission)
+                    {
+                        return Some(permit);
+                    }
+                    drop(permit);
+                    return None;
+                }
+                _ = &mut changed => {}
+            }
+        }
+    }
+
     pub(in crate::runtime) fn retire_accepted_stream(
         &self,
         stream_id: StreamId,
     ) -> Result<(), RuntimeError> {
+        self.ensure_new_command_admitted(false)?;
         self.retirement
             .send(ReliablePathRetirementCommand::RetireAcceptedStream(
                 stream_id,
@@ -926,6 +1045,7 @@ impl ReliablePathCommandSender {
         stream_id: StreamId,
         reason: ResetReason,
     ) -> Result<(), RuntimeError> {
+        self.ensure_new_command_admitted(false)?;
         self.retirement
             .send(ReliablePathRetirementCommand::ResetAcceptedStream { stream_id, reason })
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)
@@ -935,6 +1055,7 @@ impl ReliablePathCommandSender {
         &self,
         attachment_id: u64,
     ) -> Result<(), RuntimeError> {
+        self.ensure_new_command_admitted(false)?;
         self.retirement
             .send(ReliablePathRetirementCommand::RetireDatagramAttachment(
                 attachment_id,
@@ -946,6 +1067,7 @@ impl ReliablePathCommandSender {
         &self,
         flow_id: DatagramFlowId,
     ) -> Result<(), RuntimeError> {
+        self.ensure_new_command_admitted(false)?;
         let retirement = self.metrics.retire_datagram_flow(flow_id);
         self.retirement
             .send(ReliablePathRetirementCommand::RetireServerDatagramFlow {
@@ -971,8 +1093,11 @@ impl ReliablePathCommandSender {
             _ => None,
         };
         let requires_product_admission = reliable_path_command_requires_product_admission(&command);
-        let result = match self.control.reserve().await {
-            Ok(permit) if !requires_product_admission || self.metrics.lifecycle.is_active() => {
+        let result = match self
+            .reserve_command_queue(&self.control, requires_product_admission)
+            .await
+        {
+            Some(permit) => {
                 permit.send(QueuedReliablePathCommand::new(
                     command,
                     0,
@@ -986,7 +1111,7 @@ impl ReliablePathCommandSender {
                 }
                 Ok(())
             }
-            Ok(_) | Err(_) => Err(mpsc::error::SendError(command)),
+            None => Err(mpsc::error::SendError(command)),
         };
         #[cfg(feature = "lab-diagnostics")]
         {
@@ -1034,15 +1159,15 @@ impl ReliablePathCommandSender {
         let requires_product_admission = reliable_path_command_requires_product_admission(&command);
         self.metrics.add_pending_bytes(pending_bytes);
         let queued = QueuedReliablePathCommand::new(command, pending_bytes, self.metrics.clone());
-        let permit = match self.priority.reserve().await {
-            Ok(permit) => permit,
-            Err(_) => {
+        let permit = match self
+            .reserve_command_queue(&self.priority, requires_product_admission)
+            .await
+        {
+            Some(permit) => permit,
+            None => {
                 return Err(mpsc::error::SendError(queued.into_rejected_command()));
             }
         };
-        if requires_product_admission && !self.metrics.lifecycle.is_active() {
-            return Err(mpsc::error::SendError(queued.into_rejected_command()));
-        }
         permit.send(queued);
         Ok(())
     }
@@ -1087,12 +1212,15 @@ impl ReliablePathCommandSender {
         let requires_product_admission = reliable_path_command_requires_product_admission(&command);
         self.metrics.add_pending_bytes(pending_bytes);
         let queued = QueuedReliablePathCommand::new(command, pending_bytes, self.metrics.clone());
-        let result = match queue.reserve().await {
-            Ok(permit) if !requires_product_admission || self.metrics.lifecycle.is_active() => {
+        let result = match self
+            .reserve_command_queue(queue, requires_product_admission)
+            .await
+        {
+            Some(permit) => {
                 permit.send(queued);
                 Ok(())
             }
-            Ok(_) | Err(_) => Err(mpsc::error::SendError(queued.into_rejected_command())),
+            None => Err(mpsc::error::SendError(queued.into_rejected_command())),
         };
         #[cfg(feature = "lab-diagnostics")]
         {
@@ -1343,7 +1471,11 @@ impl ReliablePathCommandSender {
             Err(err) => {
                 let error = match err {
                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        if requires_product_admission && !self.metrics.lifecycle.is_active() {
+                        if !self
+                            .metrics
+                            .lifecycle
+                            .admits_new_command(requires_product_admission)
+                        {
                             RuntimeError::ReliablePathSessionClosed
                         } else {
                             RuntimeError::SenderServiceBlocked
@@ -1374,7 +1506,11 @@ impl ReliablePathCommandSender {
                 return Err(error);
             }
         };
-        if requires_product_admission && !self.metrics.lifecycle.is_active() {
+        if !self
+            .metrics
+            .lifecycle
+            .admits_new_command(requires_product_admission)
+        {
             drop(permit);
             return Err(RuntimeError::ReliablePathSessionClosed);
         }
@@ -1385,11 +1521,12 @@ impl ReliablePathCommandSender {
                 return Err(error);
             }
         };
+        self.metrics.add_pending_bytes(bytes);
         Ok(ReliablePathFrameReservation {
             permit: Some(permit),
             frame: Some(frame),
             datagram_retirement,
-            bytes,
+            accounted_bytes: Some(bytes),
             metrics: self.metrics.clone(),
             #[cfg(feature = "lab-diagnostics")]
             lane,
@@ -1428,8 +1565,8 @@ impl ReliablePathCommandSender {
         self.metrics.capacity_released.clone()
     }
 
-    pub(in crate::runtime) fn control_frame_queue_is_closed(&self) -> bool {
-        self.priority.is_closed()
+    pub(in crate::runtime) fn control_frame_admission_is_closed(&self) -> bool {
+        self.priority.is_closed() || !self.metrics.lifecycle.admits_new_command(false)
     }
 
     pub(in crate::runtime) fn reinjection_frame_queue_is_closed(&self) -> bool {
@@ -1526,7 +1663,6 @@ fn reliable_path_frame_requires_product_admission(frame: &Frame) -> bool {
         Frame::OpenStream { .. }
             | Frame::StreamData { .. }
             | Frame::StreamRequalifyData { .. }
-            | Frame::StreamRequalifyAck { .. }
             | Frame::StreamFin { .. }
             | Frame::OpenDatagramFlow { .. }
             | Frame::DatagramData { .. }
@@ -1586,6 +1722,7 @@ pub(in crate::runtime) fn reliable_path_command_channels(
             reinjection: reinjection_tx,
             data: data_tx,
             metrics: metrics.clone(),
+            native_rate_authority: None,
         },
         ReliablePathCommandReceivers {
             retirement: retirement_rx,
@@ -2039,6 +2176,7 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> Option<StreamId> {
         | Frame::StreamRequalifyData { stream_id, .. }
         | Frame::StreamRequalifyAck { stream_id, .. }
         | Frame::StreamMaxData { stream_id, .. }
+        | Frame::StreamReturnPlanFinal { stream_id, .. }
         | Frame::StreamFin { stream_id, .. }
         | Frame::StreamDetach { stream_id }
         | Frame::StreamReset { stream_id, .. } => Some(*stream_id),
@@ -2085,6 +2223,7 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::StreamRequalifyData { .. } => "stream_requalify_data",
         Frame::StreamRequalifyAck { .. } => "stream_requalify_ack",
         Frame::StreamMaxData { .. } => "stream_max_data",
+        Frame::StreamReturnPlanFinal { .. } => "stream_return_plan_final",
         Frame::StreamFin { .. } => "stream_fin",
         Frame::StreamDetach { .. } => "stream_detach",
         Frame::StreamReset { .. } => "stream_reset",

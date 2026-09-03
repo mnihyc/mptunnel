@@ -210,3 +210,33 @@ fn release_package_links_and_bundles_the_exhaustive_reference() {
     assert!(package_readme.contains("examples/config.reference.toml"));
     assert!(release_contract.contains("examples/config.reference.toml"));
 }
+
+#[test]
+fn shipped_flow_defaults_are_visible_but_remain_unconfigured() {
+    let examples = [
+        REFERENCE,
+        include_str!("../examples/client.toml"),
+        include_str!("../examples/server.toml"),
+    ];
+    for key in [
+        "idle_timeout_s",
+        "initial_rate_mbps",
+        "optional_reinjection_budget_percent",
+        "quic_loss_compensation_percent",
+    ] {
+        for example in examples {
+            assert!(
+                example
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("# {key} ="))),
+                "shipped configuration does not expose commented [flow] key {key}"
+            );
+            assert!(
+                example
+                    .lines()
+                    .all(|line| !line.trim_start().starts_with(&format!("{key} ="))),
+                "shipped configuration unexpectedly configures [flow] key {key}"
+            );
+        }
+    }
+}

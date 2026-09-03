@@ -4,18 +4,23 @@
 
 use super::ack_clock::apply_response_ack_clock_release_samples;
 use super::attachment::ResponseDispatchTarget;
+use super::snapshot::{server_native_bulk_output_snapshot_at, server_output_payload_schedulable};
 use super::{ResponseStreamBinding, ResponseStreamOutputs};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::{reliable_path_startup_sample_limit_bytes, reliable_relay_buffer_len};
 use crate::model::path::CarrierPathKey;
+use crate::model::product_qualification::ProductQualificationReceipt;
 use crate::model::requalification::StreamPathQualification;
 use crate::model::response::CarrierPathFlightDebt;
+use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::{
-    CarrierWorkKind, RangeRecoveryState, ambiguous_flight_intervals, flight_interval_bytes,
-    flight_intervals_overlap, split_flight_interval_by_ack,
+    CarrierWorkKind, RangeRecoveryState, ReliableReinjectionTargetWork, ambiguous_flight_intervals,
+    flight_interval_bytes, reliable_reinjection_service_limit_bytes, split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
-    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
+    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_accounted_bytes,
+    reliable_stream_frame_extent,
 };
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use crate::runtime::RuntimeError;
@@ -40,6 +45,11 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) sent_at: Instant,
     pub(super) kind: CarrierWorkKind,
     pub(super) evidence_eligible: bool,
+    /// Exact, generation-fenced authority for Product qualification bytes.
+    /// Reinjection copies and untagged OriginalData carry no authority.
+    pub(super) qualification_receipt: Option<ProductQualificationReceipt>,
+    /// Frozen from the selected carrier's exact snapshot at command commit.
+    pub(super) reinjection_suppression_deadline: Option<Instant>,
 }
 
 /// Lowest original Data Sequence flight currently blocking cumulative delivery.
@@ -68,6 +78,7 @@ impl CarrierPathFlight {
         bytes: usize,
         sent_at: Instant,
         kind: CarrierWorkKind,
+        reinjection_suppression_interval: Option<Duration>,
     ) -> Self {
         Self {
             key,
@@ -77,19 +88,37 @@ impl CarrierPathFlight {
             sent_at,
             kind,
             evidence_eligible: true,
+            qualification_receipt: None,
+            reinjection_suppression_deadline: reinjection_suppression_interval
+                .and_then(|interval| sent_at.checked_add(interval))
+                .or(reinjection_suppression_interval.map(|_| sent_at)),
         }
+    }
+
+    pub(in crate::runtime::stream) fn reinjected_data_bytes(self) -> Option<usize> {
+        (self.kind == CarrierWorkKind::ReinjectedData).then_some(self.bytes)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(in crate::runtime) struct CarrierPathReleasedFlight {
     pub(super) flight: CarrierPathFlight,
     pub(super) path_proving: bool,
+    /// Exact overlap that cannot advance qualification. The surrounding
+    /// released bytes may still move current-generation tag weight into V.
+    pub(super) qualification_ambiguous_ranges: SmallVec<[OffsetRange; 2]>,
 }
 
 impl CarrierPathReleasedFlight {
-    pub(in crate::runtime::stream) fn fixed_output_sample(self) -> (usize, Instant, bool) {
-        (self.flight.bytes, self.flight.sent_at, self.path_proving)
+    pub(in crate::runtime::stream) fn fixed_output_sample(
+        self,
+    ) -> (usize, Instant, CarrierWorkKind, bool) {
+        (
+            self.flight.bytes,
+            self.flight.sent_at,
+            self.flight.kind,
+            self.path_proving,
+        )
     }
 }
 
@@ -258,15 +287,15 @@ impl ResponseStreamBinding {
             })
     }
 
-    /// Returns the earliest authoritative OriginalData flight below the ACK
-    /// horizon for every exact output that can still prove progress.
-    ///
-    /// Output lifetime and flight evidence are matched by incarnation. An
-    /// output already withdrawn from OriginalData placement is recovery work,
-    /// not another staleness observation.
+    /// Returns the earliest current-epoch OriginalData flight below a complete
+    /// authoritative Data ACK horizon for every exact output that can still
+    /// prove progress. Output lifetime and flight evidence are matched by
+    /// incarnation. An output already withdrawn from OriginalData placement is
+    /// recovery work, not another staleness observation.
     pub(in crate::runtime) fn data_ack_recovery_candidates(
         &self,
         authoritative_horizon: u64,
+        lane: TrafficClass,
     ) -> SmallVec<[ResponseDataAckRecoveryCandidate; 4]> {
         if authoritative_horizon == 0 {
             return SmallVec::new();
@@ -279,7 +308,12 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .filter(|entry| {
-                !entry.commands.is_closed() && !entry.qualification.stale_for_original_data()
+                server_output_payload_schedulable(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                ) && !entry.qualification.stale_for_original_data()
             })
             .map(|entry| ((entry.key, entry.incarnation), false))
             .collect::<SmallVec<[_; 4]>>();
@@ -327,12 +361,22 @@ impl ResponseStreamBinding {
     }
 
     pub(in crate::runtime) fn has_multipath_reinjection_alternative(&self) -> bool {
-        self.outputs
+        let lane = self.lane();
+        let outputs = self
+            .outputs
             .lock()
-            .expect("server reliable stream binding lock")
+            .expect("server reliable stream binding lock");
+        outputs
             .entries
             .iter()
-            .filter(|entry| !entry.commands.is_closed())
+            .filter(|entry| {
+                server_output_payload_schedulable(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                ) && !entry.qualification.stale_for_original_data()
+            })
             .take(2)
             .count()
             > 1
@@ -341,29 +385,35 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn has_nonstale_reinjection_alternative(
         &self,
         candidate: ServerReinjectionOutputIdentity,
+        lane: TrafficClass,
     ) -> bool {
-        self.outputs
+        let outputs = self
+            .outputs
             .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .iter()
-            .any(|entry| {
-                !entry.commands.is_closed()
-                    && !entry.qualification.stale_for_original_data()
-                    && (entry.key != candidate.key || entry.incarnation != candidate.incarnation)
-            })
+            .expect("server reliable stream binding lock");
+        outputs.entries.iter().any(|entry| {
+            server_output_payload_schedulable(
+                entry,
+                outputs.data_level_queue_bytes,
+                lane,
+                self.mux_limits,
+            ) && !entry.qualification.stale_for_original_data()
+                && (entry.key != candidate.key || entry.incarnation != candidate.incarnation)
+        })
     }
 
     pub(in crate::runtime) fn mark_output_stale(
         &self,
         identity: ServerReinjectionOutputIdentity,
+        lane: TrafficClass,
     ) -> bool {
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let data_level_queue_bytes = outputs.data_level_queue_bytes;
         let has_nonstale_alternative = outputs.entries.iter().any(|entry| {
-            !entry.commands.is_closed()
+            server_output_payload_schedulable(entry, data_level_queue_bytes, lane, self.mux_limits)
                 && !entry.qualification.stale_for_original_data()
                 && (entry.key != identity.key || entry.incarnation != identity.incarnation)
         });
@@ -373,7 +423,12 @@ impl ResponseStreamBinding {
         let changed = outputs.entries.iter_mut().any(|entry| {
             if entry.key == identity.key
                 && entry.incarnation == identity.incarnation
-                && !entry.commands.is_closed()
+                && server_output_payload_schedulable(
+                    entry,
+                    data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                )
                 && !entry.qualification.stale_for_original_data()
             {
                 entry.qualification = StreamPathQualification::Stale {
@@ -383,6 +438,7 @@ impl ResponseStreamBinding {
                 entry.tcp_product_rate_evidence = None;
                 entry.delivery_samples = 0;
                 entry.original_data_acked_bytes = 0;
+                entry.product_qualification.revoke();
                 true
             } else {
                 false
@@ -422,6 +478,7 @@ impl ResponseStreamBinding {
 
     pub(in crate::runtime) fn stale_original_outputs(
         &self,
+        lane: TrafficClass,
     ) -> Vec<ServerReinjectionOutputIdentity> {
         let outputs = self
             .outputs
@@ -430,13 +487,16 @@ impl ResponseStreamBinding {
         let stale_outputs = outputs
             .entries
             .iter()
-            .filter(|entry| {
-                !entry.commands.is_closed() && entry.qualification.stale_for_original_data()
-            })
+            .chain(outputs.detaching.iter())
+            .filter(|entry| entry.qualification.stale_for_original_data())
             .filter(|stale| {
                 outputs.entries.iter().any(|entry| {
-                    !entry.commands.is_closed()
-                        && !entry.qualification.stale_for_original_data()
+                    server_output_payload_schedulable(
+                        entry,
+                        outputs.data_level_queue_bytes,
+                        lane,
+                        self.mux_limits,
+                    ) && !entry.qualification.stale_for_original_data()
                         && (entry.key != stale.key || entry.incarnation != stale.incarnation)
                 })
             })
@@ -469,18 +529,21 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn stale_original_recovery_state(
         &self,
         identity: ServerReinjectionOutputIdentity,
-        retry_after: Duration,
+        lane: TrafficClass,
     ) -> RangeRecoveryState {
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let owner_is_stale = outputs.entries.iter().any(|entry| {
-            entry.key == identity.key
-                && entry.incarnation == identity.incarnation
-                && !entry.commands.is_closed()
-                && entry.qualification.stale_for_original_data()
-        });
+        let owner_is_stale = outputs
+            .entries
+            .iter()
+            .chain(outputs.detaching.iter())
+            .any(|entry| {
+                entry.key == identity.key
+                    && entry.incarnation == identity.incarnation
+                    && entry.qualification.stale_for_original_data()
+            });
         if !owner_is_stale {
             return RangeRecoveryState::default();
         }
@@ -488,14 +551,29 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .filter(|entry| {
-                !entry.commands.reinjection_frame_queue_is_closed()
-                    && !entry.qualification.stale_for_original_data()
+                server_output_payload_schedulable(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                ) && !entry.qualification.stale_for_original_data()
             })
             .map(|entry| (entry.key, entry.incarnation))
             .collect::<Vec<_>>();
         if available_outputs.is_empty() {
             return RangeRecoveryState::default();
         }
+        // Existing exact copies retain their native recovery ownership through
+        // ordered drain. Current structural eligibility gates only whether a
+        // new recovery commitment can be made; exact detach/failure removes
+        // an accepted copy from duplicate-suppression authority.
+        let actor_attached_outputs = outputs
+            .entries
+            .iter()
+            .chain(outputs.detaching.iter())
+            .filter(|entry| entry.key != identity.key || entry.incarnation != identity.incarnation)
+            .map(|entry| (entry.key, entry.incarnation))
+            .collect::<Vec<_>>();
         drop(outputs);
         let flights = self
             .flights
@@ -517,11 +595,11 @@ impl ResponseStreamBinding {
             }
             for flight in path_flights {
                 if flight.kind != CarrierWorkKind::ReinjectedData
-                    || !available_outputs.contains(&(flight.key, flight.output_incarnation))
+                    || !actor_attached_outputs.contains(&(flight.key, flight.output_incarnation))
                 {
                     continue;
                 }
-                let Some(deadline) = flight.sent_at.checked_add(retry_after) else {
+                let Some(deadline) = flight.reinjection_suppression_deadline else {
                     continue;
                 };
                 if deadline > now {
@@ -570,12 +648,19 @@ impl ResponseStreamBinding {
 
     pub(in crate::runtime) fn has_reinjection_path_for_frame(&self, frame: &Frame) -> bool {
         let avoid_outputs = self.flight_outputs_overlapping_frame(frame);
+        let lane = self.lane();
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
         outputs.entries.iter().any(|entry| {
-            !entry.commands.is_closed() && !avoid_outputs.contains(&(entry.key, entry.incarnation))
+            server_output_payload_schedulable(
+                entry,
+                outputs.data_level_queue_bytes,
+                lane,
+                self.mux_limits,
+            ) && !entry.qualification.stale_for_original_data()
+                && !avoid_outputs.contains(&(entry.key, entry.incarnation))
         })
     }
 
@@ -584,25 +669,34 @@ impl ResponseStreamBinding {
         if owner_outputs.is_empty() {
             return false;
         }
-        self.outputs
+        let avoid_outputs = self.flight_outputs_overlapping_frame(frame);
+        let lane = self.lane();
+        let outputs = self
+            .outputs
             .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .iter()
-            .any(|entry| {
-                !entry.commands.is_closed()
-                    && !owner_outputs.contains(&(entry.key, entry.incarnation))
-            })
+            .expect("server reliable stream binding lock");
+        outputs.entries.iter().any(|entry| {
+            server_output_payload_schedulable(
+                entry,
+                outputs.data_level_queue_bytes,
+                lane,
+                self.mux_limits,
+            ) && !entry.qualification.stale_for_original_data()
+                && !avoid_outputs.contains(&(entry.key, entry.incarnation))
+        })
     }
 
-    pub(in crate::runtime) fn has_recent_reinjection_overlap(
+    #[cfg(test)]
+    pub(in crate::runtime) fn has_recent_reinjection_overlap(&self, frame: &Frame) -> bool {
+        self.reinjection_suppression_deadline(frame).is_some()
+    }
+
+    /// Earliest frozen accepted-copy expiry overlapping one exact range.
+    pub(in crate::runtime) fn reinjection_suppression_deadline(
         &self,
         frame: &Frame,
-        retry_after: Duration,
-    ) -> bool {
-        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
-            return false;
-        };
+    ) -> Option<Instant> {
+        let (start, end, _) = reliable_stream_frame_extent(frame)?;
         let now = Instant::now();
         let outputs = self
             .outputs
@@ -624,15 +718,122 @@ impl ResponseStreamBinding {
             start,
             end,
             now,
-            retry_after,
             |key, incarnation| live_outputs.contains(&(key, incarnation)),
         )
+    }
+
+    /// Earliest immutable expiry of any accepted ReinjectedData copy still
+    /// owned by this actor's exact active-or-draining attachment set.
+    pub(in crate::runtime) fn earliest_reinjection_suppression_deadline(&self) -> Option<Instant> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let actor_attached_outputs = outputs
+            .entries
+            .iter()
+            .chain(outputs.detaching.iter())
+            .map(|entry| (entry.key, entry.incarnation))
+            .collect::<Vec<_>>();
+        drop(outputs);
+        let now = Instant::now();
+        self.flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .values()
+            .flat_map(|flights| flights.iter())
+            .filter(|flight| {
+                flight.kind == CarrierWorkKind::ReinjectedData
+                    && actor_attached_outputs.contains(&(flight.key, flight.output_incarnation))
+            })
+            .filter_map(|flight| flight.reinjection_suppression_deadline)
+            .filter(|deadline| *deadline > now)
+            .min()
+    }
+
+    /// Exact accepted ReinjectedData bytes whose frozen native-recovery
+    /// ownership remains live on one output incarnation.
+    #[cfg(test)]
+    pub(in crate::runtime) fn live_reinjected_data_in_flight_bytes_at(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+        now: Instant,
+    ) -> usize {
+        self.flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .values()
+            .flat_map(|flights| flights.iter())
+            .filter(|flight| {
+                flight.kind == CarrierWorkKind::ReinjectedData
+                    && flight.key == identity.key
+                    && flight.output_incarnation == identity.incarnation
+                    && flight
+                        .reinjection_suppression_deadline
+                        .is_some_and(|deadline| deadline > now)
+            })
+            .fold(0usize, |bytes, flight| bytes.saturating_add(flight.bytes))
+    }
+
+    /// Every exact accepted ReinjectedData byte that consumes K on one
+    /// currently selectable output incarnation.
+    ///
+    /// A native recovery/suppression deadline can make a different exact
+    /// incarnation eligible; it cannot release this target's Product recovery
+    /// authority. Product DataACK releases the retained bytes; terminal
+    /// targets are no longer selectable, and replacements receive a distinct
+    /// incarnation.
+    pub(in crate::runtime) fn accepted_reinjected_data_in_flight_bytes_at(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+    ) -> usize {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if !outputs
+            .entries
+            .iter()
+            .any(|entry| entry.key == identity.key && entry.incarnation == identity.incarnation)
+        {
+            return 0;
+        }
+        self.retained_reinjected_data_bytes_for_identity(identity)
+    }
+
+    /// Raw retained range ownership after one exact target has already been
+    /// validated under the output lock. Detached-flight records remain in the
+    /// DataACK ledger for ambiguity/accounting, but cannot consume K because
+    /// their target incarnation is no longer selectable.
+    fn retained_reinjected_data_bytes_for_identity(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+    ) -> usize {
+        self.flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .values()
+            .flat_map(|flights| flights.iter())
+            .filter(|flight| {
+                flight.kind == CarrierWorkKind::ReinjectedData
+                    && flight.key == identity.key
+                    && flight.output_incarnation == identity.incarnation
+            })
+            .fold(0usize, |bytes, flight| bytes.saturating_add(flight.bytes))
     }
 
     /// Returns every unacknowledged OriginalData range whose exact output no
     /// longer exists, excluding bytes already reinjected on a live output.
     /// Native recovery remains responsible for ranges whose output is live.
+    #[cfg(test)]
     pub(in crate::runtime) fn uncovered_failed_original_ranges(&self) -> Vec<OffsetRange> {
+        self.failed_original_recovery_state().uncovered_ranges
+    }
+
+    /// Failed-owner due ranges and the earliest exact accepted-copy expiry are
+    /// observed under one flight snapshot so the actor can wake precisely.
+    pub(in crate::runtime) fn failed_original_recovery_state(&self) -> RangeRecoveryState {
+        let lane = self.lane();
         let outputs = self
             .outputs
             .lock()
@@ -640,11 +841,18 @@ impl ResponseStreamBinding {
         let available_outputs = outputs
             .entries
             .iter()
-            .filter(|entry| !entry.commands.is_closed())
+            .filter(|entry| {
+                server_output_payload_schedulable(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                ) && !entry.qualification.stale_for_original_data()
+            })
             .map(|entry| (entry.key, entry.incarnation))
             .collect::<Vec<_>>();
         if available_outputs.is_empty() {
-            return Vec::new();
+            return RangeRecoveryState::default();
         }
         // A detaching output remains the authoritative owner until this actor
         // applies its ordered detach event after all preceding ACKs.
@@ -675,39 +883,63 @@ impl ResponseStreamBinding {
                 .collect(),
         );
         if failed_original_ranges.is_empty() {
-            return Vec::new();
+            return RangeRecoveryState::default();
         }
-        let live_reinjected_ranges = normalize_offset_ranges(
-            flights
-                .iter()
-                .flat_map(|(start, path_flights)| {
-                    path_flights.iter().filter_map(|flight| {
-                        (flight.kind == CarrierWorkKind::ReinjectedData
-                            && available_outputs.contains(&(flight.key, flight.output_incarnation)))
-                        .then_some(OffsetRange {
-                            start: *start,
-                            end: flight.end,
-                        })
-                    })
-                })
-                .collect(),
-        );
-        offset_ranges_not_covered(&failed_original_ranges, &live_reinjected_ranges)
+        let now = Instant::now();
+        let mut retry_deadline = None;
+        let mut live_reinjected_ranges = Vec::new();
+        for (start, path_flights) in flights.iter() {
+            for flight in path_flights {
+                let Some(deadline) = flight.reinjection_suppression_deadline else {
+                    continue;
+                };
+                if flight.kind != CarrierWorkKind::ReinjectedData
+                    || deadline <= now
+                    || !actor_attached_outputs.contains(&(flight.key, flight.output_incarnation))
+                    || !failed_original_ranges
+                        .iter()
+                        .any(|original| original.start < flight.end && *start < original.end)
+                {
+                    continue;
+                }
+                retry_deadline =
+                    Some(retry_deadline.map_or(deadline, |current: Instant| current.min(deadline)));
+                live_reinjected_ranges.push(OffsetRange {
+                    start: *start,
+                    end: flight.end,
+                });
+            }
+        }
+        let live_reinjected_ranges = normalize_offset_ranges(live_reinjected_ranges);
+        RangeRecoveryState {
+            uncovered_ranges: offset_ranges_not_covered(
+                &failed_original_ranges,
+                &live_reinjected_ranges,
+            ),
+            retry_deadline,
+        }
     }
 
     pub(in crate::runtime) fn has_untracked_data_reinjection_path_for_frame(
         &self,
         frame: &Frame,
     ) -> bool {
-        if !self.flight_outputs_overlapping_frame(frame).is_empty() {
+        if !self.all_flight_outputs_overlapping_frame(frame).is_empty() {
             return false;
         }
-        !self
+        let lane = self.lane();
+        let outputs = self
             .outputs
             .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .is_empty()
+            .expect("server reliable stream binding lock");
+        outputs.entries.iter().any(|entry| {
+            server_output_payload_schedulable(
+                entry,
+                outputs.data_level_queue_bytes,
+                lane,
+                self.mux_limits,
+            ) && !entry.qualification.stale_for_original_data()
+        })
     }
 
     pub(in crate::runtime) fn release_normalized_acked_ranges(
@@ -789,22 +1021,65 @@ impl ResponseStreamBinding {
         let mut data_ack_progress_outputs = SmallVec::<[ServerReinjectionOutputIdentity; 4]>::new();
         let mut path_samples =
             HashMap::<(CarrierPathKey, u64), (u64, u64, Instant, Instant)>::new();
-        for (_, release) in released {
+        for (released_start, release) in released {
             let flight = release.flight;
+            let released_range = OffsetRange {
+                start: released_start,
+                end: flight.end,
+            };
             let identity = (flight.key, flight.output_incarnation);
-            if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
-                entry.key == flight.key && entry.incarnation == flight.output_incarnation
-            }) {
+            if flight.kind.is_original_transmission() {
+                // Shared Product debt survives output detach/replacement and is
+                // released only by the exact MPP DataACK transaction.
+                outputs.original_data_in_flight_bytes = outputs
+                    .original_data_in_flight_bytes
+                    .checked_sub(flight.bytes as u64)
+                    .expect("response shared OriginalData debt covers released flight");
+            }
+            let ResponseStreamOutputs {
+                entries, detaching, ..
+            } = &mut *outputs;
+            if let Some(entry) = entries
+                .iter_mut()
+                .chain(detaching.iter_mut())
+                .find(|entry| {
+                    entry.key == flight.key && entry.incarnation == flight.output_incarnation
+                })
+            {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
                 if flight.kind.is_original_transmission() {
+                    let prior_original_flight = entry.original_data_in_flight_bytes;
                     entry.original_data_in_flight_bytes = entry
                         .original_data_in_flight_bytes
                         .saturating_sub(flight.bytes as u64);
+                    if prior_original_flight > 0 && entry.original_data_in_flight_bytes == 0 {
+                        entry.load_registration.deactivate();
+                    }
                 }
-                let product_evidence_eligible = release.path_proving
+                let unambiguous_qualification_ranges = offset_ranges_not_covered(
+                    &[released_range],
+                    &release.qualification_ambiguous_ranges,
+                );
+                let has_unambiguous_original = flight.kind.is_original_transmission()
+                    && !unambiguous_qualification_ranges.is_empty();
+                let current_generation_original = has_unambiguous_original
+                    && flight.evidence_eligible
                     && entry
                         .qualification
                         .observe_unique_original_progress(flight.sent_at);
+                if let Some(receipt) = flight.qualification_receipt {
+                    for ambiguous in &release.qualification_ambiguous_ranges {
+                        entry
+                            .product_qualification
+                            .release_ambiguous(receipt, *ambiguous);
+                    }
+                    if current_generation_original {
+                        for exact in unambiguous_qualification_ranges {
+                            entry.product_qualification.release_exact(receipt, exact);
+                        }
+                    }
+                }
+                let product_evidence_eligible = release.path_proving && current_generation_original;
                 if product_evidence_eligible {
                     let progress_identity = ServerReinjectionOutputIdentity {
                         key: flight.key,
@@ -831,10 +1106,15 @@ impl ResponseStreamBinding {
             }
         }
         apply_response_ack_clock_release_samples(&mut outputs, path_samples, now);
+        let mut delivery_sample_outputs = SmallVec::<[ServerReinjectionOutputIdentity; 4]>::new();
         for hole in ordering_update.newly_contiguous {
             if !hole.path_proving {
                 continue;
             }
+            let identity = ServerReinjectionOutputIdentity {
+                key: hole.key,
+                incarnation: hole.output_incarnation,
+            };
             if let Some(entry) = outputs
                 .entries
                 .iter_mut()
@@ -843,7 +1123,9 @@ impl ResponseStreamBinding {
                 && entry
                     .qualification
                     .observe_unique_original_progress(hole.sent_at)
+                && !delivery_sample_outputs.contains(&identity)
             {
+                delivery_sample_outputs.push(identity);
                 entry.delivery_samples = entry.delivery_samples.saturating_add(1);
                 changed = true;
             }
@@ -866,15 +1148,34 @@ impl ResponseStreamBinding {
         outputs: &mut ResponseStreamOutputs,
         target_index: usize,
         frame: &Frame,
-    ) {
+    ) -> Result<(), RuntimeError> {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
-            return;
+            return Err(RuntimeError::SenderServiceBlocked);
         };
-        let (key, output_incarnation, evidence_eligible) = {
+        let max_quantum_bytes = u64::try_from(reliable_relay_buffer_len(self.mux_limits))
+            .map_err(|_| RuntimeError::SenderServiceBlocked)?;
+        let (key, output_incarnation, evidence_eligible, qualification_receipt) = {
             let entry = outputs
                 .entries
                 .get_mut(target_index)
                 .expect("validated response output index");
+            let evidence_eligible = !entry.qualification.stale_for_original_data();
+            let qualification_receipt = if evidence_eligible {
+                entry
+                    .product_qualification
+                    .tag_admitted_original(
+                        reliable_path_startup_sample_limit_bytes(self.mux_limits),
+                        max_quantum_bytes,
+                        OffsetRange { start: offset, end },
+                    )
+                    .map_err(|_| RuntimeError::SenderServiceBlocked)?
+            } else {
+                None
+            };
+            // No recoverable operation follows qualification mutation.
+            if entry.original_data_in_flight_bytes == 0 {
+                entry.load_registration.activate();
+            }
             entry.original_data_in_flight_bytes = entry
                 .original_data_in_flight_bytes
                 .saturating_add(bytes as u64);
@@ -882,9 +1183,13 @@ impl ResponseStreamBinding {
             (
                 entry.key,
                 entry.incarnation,
-                !entry.qualification.stale_for_original_data(),
+                evidence_eligible,
+                qualification_receipt,
             )
         };
+        outputs.original_data_in_flight_bytes = outputs
+            .original_data_in_flight_bytes
+            .saturating_add(bytes as u64);
         self.flights
             .lock()
             .expect("server reliable stream flight lock")
@@ -898,11 +1203,14 @@ impl ResponseStreamBinding {
                 sent_at: Instant::now(),
                 kind: CarrierWorkKind::OriginalData,
                 evidence_eligible,
+                qualification_receipt,
+                reinjection_suppression_deadline: None,
             });
         // Keep path counters and the exact range ledger in one published model
         // generation so a concurrent measurement plan cannot mix the views.
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 
     pub(in crate::runtime) fn try_enqueue_reinjected_frame_for_target(
@@ -910,36 +1218,127 @@ impl ResponseStreamBinding {
         target: &ResponseDispatchTarget,
         frame: &Frame,
         lane: TrafficClass,
-    ) -> Result<(), RuntimeError> {
+        queued_reinjection_bytes: usize,
+        reinjection_debt_bytes: usize,
+    ) -> Result<Instant, RuntimeError> {
+        self.try_enqueue_reinjected_frame_for_target_with_after_reserve(
+            target,
+            frame,
+            lane,
+            queued_reinjection_bytes,
+            reinjection_debt_bytes,
+            || {},
+        )
+    }
+
+    fn try_enqueue_reinjected_frame_for_target_with_after_reserve(
+        &self,
+        target: &ResponseDispatchTarget,
+        frame: &Frame,
+        lane: TrafficClass,
+        queued_reinjection_bytes: usize,
+        reinjection_debt_bytes: usize,
+        after_reserve: impl FnOnce(),
+    ) -> Result<Instant, RuntimeError> {
         if !self.response_stream_open.load(Ordering::Acquire) {
             return Err(RuntimeError::SenderServiceBlocked);
         }
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        if !self.response_stream_open.load(Ordering::Acquire) {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        let Some(target_index) = outputs.entries.iter().position(|entry| {
+        let target_matches = |entry: &super::attachment::ResponseStreamOutputEntry| {
             entry.key == target.key
                 && entry.path_instance_id == target.path_instance_id
                 && entry.incarnation == target.incarnation
-        }) else {
-            return Err(RuntimeError::SenderServiceBlocked);
         };
-        let commands = outputs.entries[target_index].commands.clone();
+        let commands = {
+            let outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            if !self.response_stream_open.load(Ordering::Acquire) {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            outputs
+                .entries
+                .iter()
+                .find(|entry| target_matches(entry))
+                .map(|entry| entry.commands.clone())
+                .ok_or(RuntimeError::SenderServiceBlocked)?
+        };
         let command = commands.try_reserve_reinjection_frame(frame.clone(), lane)?;
-        self.record_product_flight_with_outputs(
-            &mut outputs,
-            target.key,
-            target.incarnation,
-            &commands,
-            frame,
-            CarrierWorkKind::ReinjectedData,
-        );
-        command.commit();
-        Ok(())
+        after_reserve();
+        let native_authority = commands.native_rate_authority().cloned();
+        let expected_native_stamp = target.native_authority_stamp;
+        let commit = || {
+            let mut outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            if !self.response_stream_open.load(Ordering::Acquire) {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            let Some(target_index) = outputs.entries.iter().position(target_matches) else {
+                return Err(RuntimeError::SenderServiceBlocked);
+            };
+            let entry = &outputs.entries[target_index];
+            let snapshot = if let Some(stamp) = expected_native_stamp {
+                let shape = entry
+                    .native_scheduling_shape
+                    .filter(|shape| shape.stamp() == stamp)
+                    .ok_or(RuntimeError::SenderServiceBlocked)?;
+                server_native_bulk_output_snapshot_at(
+                    entry,
+                    outputs.data_level_queue_bytes,
+                    lane,
+                    self.mux_limits,
+                    Some(shape),
+                )
+            } else {
+                outputs
+                    .snapshot_for_instance(target.key, target.incarnation, lane, self.mux_limits)
+                    .ok_or(RuntimeError::SenderServiceBlocked)?
+            };
+            let accepted_reinjection_bytes =
+                self.retained_reinjected_data_bytes_for_identity(ServerReinjectionOutputIdentity {
+                    key: target.key,
+                    incarnation: target.incarnation,
+                });
+            let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
+            let exact_service = reliable_reinjection_service_limit_bytes(
+                ReliableReinjectionTargetWork::new(
+                    Some(snapshot),
+                    queued_reinjection_bytes,
+                    accepted_reinjection_bytes,
+                ),
+                payload_bytes.min(reinjection_debt_bytes),
+                self.mux_limits,
+            );
+            if exact_service < payload_bytes {
+                // Dropping the uncommitted reservation returns carrier capacity.
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            let suppression_interval =
+                reliable_data_retransmission_interval(Some(target.key.underlay), Some(snapshot));
+            let accepted_at = Instant::now();
+            self.record_product_flight_with_outputs(
+                &mut outputs,
+                target.key,
+                target.incarnation,
+                &commands,
+                frame,
+                CarrierWorkKind::ReinjectedData,
+                Some((accepted_at, suppression_interval)),
+            )?;
+            command.commit();
+            Ok(accepted_at
+                .checked_add(suppression_interval)
+                .unwrap_or(accepted_at))
+        };
+        match (native_authority, expected_native_stamp) {
+            (Some(authority), Some(stamp)) => authority
+                .commit_if_current(stamp, commit)
+                .map_err(|_| RuntimeError::SenderServiceBlocked)?,
+            (None, None) => commit(),
+            _ => Err(RuntimeError::SenderServiceBlocked),
+        }
     }
 
     #[cfg(test)]
@@ -960,6 +1359,7 @@ impl ResponseStreamBinding {
             frame,
             CarrierWorkKind::OriginalData,
         )
+        .expect("test OriginalData flight must satisfy qualification bounds")
     }
 
     #[cfg(test)]
@@ -980,6 +1380,7 @@ impl ResponseStreamBinding {
             frame,
             CarrierWorkKind::ReinjectedData,
         )
+        .expect("test reinjection flight must be recordable")
     }
 
     #[cfg(test)]
@@ -993,6 +1394,9 @@ impl ResponseStreamBinding {
             for flight in path_flights {
                 if flight.kind == CarrierWorkKind::ReinjectedData {
                     flight.sent_at = sent_at;
+                    flight.reinjection_suppression_deadline = flight
+                        .reinjection_suppression_deadline
+                        .and_then(|deadline| deadline.checked_sub(age));
                 }
             }
         }
@@ -1022,11 +1426,21 @@ impl ResponseStreamBinding {
         planned_commands: &ReliablePathCommandSender,
         frame: &Frame,
         kind: CarrierWorkKind,
-    ) {
+    ) -> Result<(), RuntimeError> {
+        let lane = self.lane();
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let reinjection_suppression = (kind == CarrierWorkKind::ReinjectedData).then(|| {
+            let accepted_at = Instant::now();
+            let snapshot =
+                outputs.snapshot_for_instance(key, output_incarnation, lane, self.mux_limits);
+            (
+                accepted_at,
+                reliable_data_retransmission_interval(Some(key.underlay), snapshot),
+            )
+        });
         self.record_product_flight_with_outputs(
             &mut outputs,
             key,
@@ -1034,9 +1448,11 @@ impl ResponseStreamBinding {
             planned_commands,
             frame,
             kind,
-        );
+            reinjection_suppression,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_product_flight_with_outputs(
         &self,
         outputs: &mut ResponseStreamOutputs,
@@ -1045,10 +1461,15 @@ impl ResponseStreamBinding {
         planned_commands: &ReliablePathCommandSender,
         frame: &Frame,
         kind: CarrierWorkKind,
-    ) {
+        reinjection_suppression: Option<(Instant, Duration)>,
+    ) -> Result<(), RuntimeError> {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
-            return;
+            return Err(RuntimeError::SenderServiceBlocked);
         };
+        let max_quantum_bytes = u64::try_from(reliable_relay_buffer_len(self.mux_limits))
+            .map_err(|_| RuntimeError::SenderServiceBlocked)?;
+        let range = OffsetRange { start: offset, end };
+        let mut qualification_receipt = None;
         let (recorded_incarnation, evidence_eligible) = if let Some(entry) = outputs
             .entries
             .iter_mut()
@@ -1056,6 +1477,20 @@ impl ResponseStreamBinding {
         {
             let incarnation_matches = entry.incarnation == output_incarnation;
             if kind.is_original_transmission() {
+                if incarnation_matches && !entry.qualification.stale_for_original_data() {
+                    qualification_receipt = entry
+                        .product_qualification
+                        .tag_admitted_original(
+                            reliable_path_startup_sample_limit_bytes(self.mux_limits),
+                            max_quantum_bytes,
+                            range,
+                        )
+                        .map_err(|_| RuntimeError::SenderServiceBlocked)?;
+                }
+                // Qualification mutation is the last recoverable operation.
+                if entry.original_data_in_flight_bytes == 0 {
+                    entry.load_registration.activate();
+                }
                 entry.original_data_in_flight_bytes = entry
                     .original_data_in_flight_bytes
                     .saturating_add(bytes as u64);
@@ -1070,23 +1505,70 @@ impl ResponseStreamBinding {
         } else {
             (output_incarnation, false)
         };
-        self.flights
+        if kind.is_original_transmission() {
+            outputs.original_data_in_flight_bytes = outputs
+                .original_data_in_flight_bytes
+                .saturating_add(bytes as u64);
+        }
+        let reinjection_suppression_deadline = reinjection_suppression
+            .and_then(|(accepted_at, interval)| accepted_at.checked_add(interval))
+            .or(reinjection_suppression.map(|(accepted_at, _)| accepted_at));
+        let mut flights = self
+            .flights
             .lock()
-            .expect("server reliable stream flight lock")
-            .entry(offset)
-            .or_default()
-            .push(CarrierPathFlight {
-                key,
-                output_incarnation: recorded_incarnation,
-                end,
-                bytes,
-                sent_at: Instant::now(),
-                kind,
-                evidence_eligible,
-            });
+            .expect("server reliable stream flight lock");
+        if kind == CarrierWorkKind::ReinjectedData {
+            // An accepted duplicate destroys uniqueness only for the exact
+            // OriginalData receipts whose current flights overlap this range.
+            // Bare-range broadcast would let one attachment erase another's
+            // same-DSN generation.
+            let receipts = flights
+                .range(..end)
+                .flat_map(|(start, path_flights)| {
+                    path_flights.iter().filter_map(move |flight| {
+                        (flight.kind.is_original_transmission()
+                            && *start < end
+                            && flight.end > offset)
+                            .then_some((
+                                flight.key,
+                                flight.output_incarnation,
+                                flight.qualification_receipt?,
+                            ))
+                    })
+                })
+                .collect::<SmallVec<[_; 4]>>();
+            for (owner_key, owner_incarnation, receipt) in receipts {
+                let ResponseStreamOutputs {
+                    entries, detaching, ..
+                } = &mut *outputs;
+                if let Some(owner) = entries
+                    .iter_mut()
+                    .chain(detaching.iter_mut())
+                    .find(|entry| entry.key == owner_key && entry.incarnation == owner_incarnation)
+                {
+                    owner
+                        .product_qualification
+                        .release_ambiguous(receipt, range);
+                }
+            }
+        }
+        flights.entry(offset).or_default().push(CarrierPathFlight {
+            key,
+            output_incarnation: recorded_incarnation,
+            end,
+            bytes,
+            sent_at: reinjection_suppression
+                .map(|(accepted_at, _)| accepted_at)
+                .unwrap_or_else(Instant::now),
+            kind,
+            evidence_eligible,
+            qualification_receipt,
+            reinjection_suppression_deadline,
+        });
         // The generation becomes visible only after the matching exact range.
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 
     pub(super) fn invalidate_path_flight_evidence(
@@ -1126,6 +1608,12 @@ impl ResponseStreamBinding {
         &self,
         frame: &Frame,
     ) -> Vec<(CarrierPathKey, u64)> {
+        // Product DataACK or exact terminal detach—not a native retry timer—
+        // releases one target incarnation from same-range avoidance.
+        self.all_flight_outputs_overlapping_frame(frame)
+    }
+
+    fn all_flight_outputs_overlapping_frame(&self, frame: &Frame) -> Vec<(CarrierPathKey, u64)> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
@@ -1137,10 +1625,9 @@ impl ResponseStreamBinding {
         for (_, path_flights) in flights.range(..end) {
             for flight in path_flights {
                 let output = (flight.key, flight.output_incarnation);
-                if flight.end <= start || outputs.contains(&output) {
-                    continue;
+                if flight.end > start && !outputs.contains(&output) {
+                    outputs.push(output);
                 }
-                outputs.push(output);
             }
         }
         outputs
@@ -1275,17 +1762,33 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
             if bytes == 0 {
                 continue;
             }
+            let qualification_ambiguous_ranges = ambiguous_intervals
+                .iter()
+                .filter_map(|(ambiguous_start, ambiguous_end)| {
+                    OffsetRange::new(
+                        acked_start.max(*ambiguous_start),
+                        acked_end.min(*ambiguous_end),
+                    )
+                })
+                .collect::<SmallVec<[_; 2]>>();
             released.push((
                 acked_start,
                 CarrierPathReleasedFlight {
                     flight: CarrierPathFlight {
                         end: acked_end,
                         bytes,
+                        qualification_receipt: flight.qualification_receipt.and_then(|receipt| {
+                            receipt.intersect(OffsetRange {
+                                start: acked_start,
+                                end: acked_end,
+                            })
+                        }),
                         ..flight
                     },
                     path_proving: flight.evidence_eligible
                         && flight.kind.is_original_transmission()
-                        && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end),
+                        && qualification_ambiguous_ranges.is_empty(),
+                    qualification_ambiguous_ranges,
                 },
             ));
         }
@@ -1300,6 +1803,12 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
                 .push(CarrierPathFlight {
                     end: retained_end,
                     bytes,
+                    qualification_receipt: flight.qualification_receipt.and_then(|receipt| {
+                        receipt.intersect(OffsetRange {
+                            start: retained_start,
+                            end: retained_end,
+                        })
+                    }),
                     ..flight
                 });
         }
@@ -1312,12 +1821,12 @@ pub(in crate::runtime::stream) fn product_flights_have_recent_reinjection_overla
     start: u64,
     end: u64,
     now: Instant,
-    retry_after: Duration,
     mut live: impl FnMut(CarrierPathKey, u64) -> bool,
-) -> bool {
+) -> Option<Instant> {
     if start >= end {
-        return false;
+        return None;
     }
+    let mut earliest_deadline = None;
     for (&offset, path_flights) in flights.range(..end) {
         for flight in path_flights {
             if offset >= end || flight.end <= start {
@@ -1328,12 +1837,16 @@ pub(in crate::runtime::stream) fn product_flights_have_recent_reinjection_overla
             {
                 continue;
             }
-            if now.saturating_duration_since(flight.sent_at) < retry_after {
-                return true;
+            if let Some(deadline) = flight.reinjection_suppression_deadline
+                && deadline > now
+            {
+                earliest_deadline = Some(
+                    earliest_deadline.map_or(deadline, |current: Instant| current.min(deadline)),
+                );
             }
         }
     }
-    false
+    earliest_deadline
 }
 
 #[cfg(test)]

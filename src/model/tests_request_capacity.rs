@@ -9,10 +9,8 @@ fn request_tcp_capacity_geometry_requires_mature_service_and_full_pipe() {
     let mux_limits = MuxLimits::default();
     let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 1_000_000.0);
     candidate.carrier_inflight_limit_bytes = 32 * 1024 * 1024;
-    let mature_service = RequestPerFlowRateModel {
-        rate_bps: 100_000_000.0,
-        delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-    };
+    let mature_service =
+        RequestProductRateEpoch::for_test(100_000_000.0, RELIABLE_INITIAL_WINDOW_PACKETS as u32);
     let envelope = reliable_capacity_measurement_session_limit_bytes(mux_limits);
 
     let geometry =
@@ -40,7 +38,7 @@ fn request_tcp_capacity_geometry_requires_mature_service_and_full_pipe() {
     assert!(
         request_tcp_capacity_measurement_geometry(
             candidate,
-            RequestPerFlowRateModel {
+            RequestProductRateEpoch {
                 delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32 - 1,
                 ..mature_service
             },

@@ -9,7 +9,9 @@ use crate::protocol::{
 };
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::path::quic::client::ClientUdpPathSessionRuntime;
+use crate::runtime::path::quic::client::{
+    ClientUdpCarrierReconciliation, ClientUdpPathSessionRuntime,
+};
 use crate::runtime::path::quic::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
     udp_path_finish_stream, udp_path_read_frame, udp_path_write_frame,
@@ -132,6 +134,7 @@ impl ServerControlFixture {
             peer_status_snapshot: PeerStatusSnapshotSource::new(|| Some(Vec::new())),
             authenticated_carriers: crate::runtime::path::AuthenticatedCarrierInventory::default(),
             ip_tunnels: crate::runtime::tun_l3::ClientIpTunnelHub::default(),
+            reconciliation: ClientUdpCarrierReconciliation::new(),
         };
         let client_carrier = CarrierSocket::system(CarrierSocketRequest {
             path: &client_path,
@@ -311,12 +314,33 @@ async fn open_server_ip_tunnel_actor(
             .expect("read IP tunnel opener"),
         Frame::OpenIpTunnel { tunnel_id }
     );
+    let native_scope = crate::model::carrier_rate_authority::CarrierRateAuthorityScope::new(
+        path_registration.path_instance_id(),
+        crate::protocol::PathMetricDirection::ServerToClient,
+    );
+    let startup_rate_bps = path_registration
+        .initial_metrics()
+        .map_or(1_000_000, |metrics| metrics.delivery_rate_bps.max(1));
+    let native_rate_authority = fixture
+        ._server_connection
+        .bind_native_rate_authority(native_scope, startup_rate_bps)
+        .await
+        .expect("bind server test QUIC native authority");
+    let _ = stage_current_server_native_scheduling_shape(
+        &context,
+        &path_registration,
+        &native_rate_authority,
+        native_scope,
+    )
+    .await
+    .expect("stage server test QUIC native shape");
     let actor = tokio::spawn(handle_server_udp_ip_tunnel(
         server_send,
         server_recv,
         context.clone(),
         path_registration,
         tunnel_id,
+        native_rate_authority,
     ));
     assert!(matches!(
         udp_path_read_frame(&mut client_recv, context.codec_limits)
@@ -530,6 +554,7 @@ async fn server_quic_session_close_retires_sibling_carrier_and_retained_datagram
                 stream_id: StreamId(982),
                 target: TargetAddr::Ip(reliable_target_addr),
                 initial_demand: StreamDemandHint::Latency,
+                return_plan: Default::default(),
                 attachment: ServerStreamPathAttachment {
                     path_registration: control_registration.clone(),
                     commands: reliable_commands,

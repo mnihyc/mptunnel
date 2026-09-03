@@ -126,6 +126,8 @@ RFC, configuration, public documentation, or release changes:
   authority model;
 - request/fixed-output typed `RateHint` cleanup outside SEEN-2;
 - repeatability and benefit of stale-path requalification reinjection; and
+- exact target-bound queue authority for the currently target-unbound generic
+  request/response live-tail path; and
 - evaluator or harness features beyond what is necessary to execute the
   already-frozen acceptance cells.
 

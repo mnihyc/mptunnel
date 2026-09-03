@@ -1,12 +1,15 @@
 # SEEN acceptance ledger
 
-Status: internal execution ledger; not a release or competitiveness claim.
+Status: internal execution ledger; production baseline `93e6284` is
+release-RED, not a release or competitiveness claim.
 
 This document freezes the defect boundary established on 2026-09-03. A
-symptom already listed here is **SEEN**. A newly discovered independent defect
-or model change is **UNSEEN** and may be recorded, but must not be implemented
-without explicit approval. A causal detail of a SEEN symptom is not a new
-issue by itself; an independently applicable authority or architecture is.
+symptom already listed here is **SEEN**. On the user's later instruction, the
+entire formerly held UNSEEN batch was promoted into the finite v0.4.7 SEEN
+plan. A causal detail of a listed symptom remains part of that issue rather
+than silently creating a renewable scope. A genuinely new issue found after
+this promotion is recorded for a later candidate; it does not extend v0.4.7.
+The finite execution contract is `docs-dev/V0_4_7_FINITE_CLOSURE.md`.
 
 ## Why earlier milestones were premature
 
@@ -39,18 +42,21 @@ closed only as one of:
    impossible under the stated invariant, with a concrete counterexample or
    trace explaining the actual owner;
 4. **model-constrained**: implementation matches the RFC, but the requested
-   stronger behavior needs a separately named model change; or
+   stronger behavior cannot be supplied under the stated resources; this
+   rejects the candidate when the behavior is an acceptance requirement; or
 5. **open**: any causal or acceptance question remains.
 
 Only the complete frozen SEEN matrix can make a release candidate acceptable.
 An isolated commit milestone never does.
 
-Every numeric threshold in this ledger and the corresponding runtime model is
-an advisory observation, confidence, ranking, probing, or reconsideration hint.
-It MUST NOT become a hard bandwidth ceiling, an ordinary-work admission cap,
-or a permanent path ban. A physical resource limit explicitly configured by
-the operator remains a resource contract, not an inferred performance
-threshold.
+Every numeric network-performance threshold in this ledger and the
+corresponding runtime model—including an extra-traffic percentage—is an
+advisory observation, confidence, cost, ranking, probing, or reconsideration
+hint. It MUST NOT become a hard bandwidth ceiling, an ordinary-work or
+recovery admission cap, or a permanent path ban. Finite copy cardinality must
+come from protocol structure, not a percentage gate. Explicit memory, queue,
+session, and connection maxima remain operator resource contracts rather than
+inferred network thresholds.
 
 ## Frozen SEEN ledger
 
@@ -62,16 +68,16 @@ threshold.
 | SEEN-3 | Sparse Data ACK allegedly erased receiver reorder debt | Disproved | `S - A = O + H <= W`; no code change |
 | SEEN-4 | Response settlement waited on local application delivery | Implementation-fixed / matrix-pending | MPP-frontier trigger separated from local write; `444fb38` |
 | SEEN-5 | Finite request replacement/ghost lifecycle | Disproved on current build | One fixed request, one attempt, complete body, no replacement; no code change |
-| SEEN-6A | Persistent live-owner ACK-gap repair could renew critical authority | Fixed | Zero/partial/full cumulative-budget RED/GREEN; `0b50e9a` |
-| SEEN-6B | HTTP/3 migration left QUIC latency priority diagnostic-only | Fixed | Actual Quinn priority RED/GREEN plus ordinary two-run non-downgrade; `a9450d8` |
+| SEEN-6A | Persistent live-owner ACK-gap repair could renew critical authority | Safety defect fixed; authority model promoted for redesign | `0b50e9a` proves and stops renewable repair, but its hard percentage budget violates hints-only semantics; redesign with structural frontier-epoch copy cardinality under P1 |
+| SEEN-6B | HTTP/3 migration left QUIC latency priority diagnostic-only | Implementation-fixed / matrix-pending | Actual Quinn priority RED/GREEN plus ordinary two-run non-downgrade; `a9450d8` cannot waive native-HOL or final matrix gates |
 | SEEN-6C | QUIC-only sustained bulk/read-gap and loaded-latency mechanism | Model-constrained; encompassing acceptance remains open | Current same-native-stream gap is attributed to ordered QUIC recovery; this does not close cold/warm, recovery, upload, or concurrent behavior |
-| SEEN-6D1 | TCP-only loaded interactive latency while bulk occupies every configured TCP carrier | Model-constrained | Current unified matrix: 303.372 Mbps bulk but 1,417 ms interactive p95 versus 522 ms raw TCP and 538 ms V2Ray; exact diagnostics show zero MPP command wait and hundreds of KiB to MiB of already-native FIFO debt. A later priority frame cannot overtake that prefix without a hard handoff bound or another ordering domain |
+| SEEN-6D1 | TCP-only loaded interactive latency while bulk occupies every configured TCP carrier | Current model-constrained; promoted P2 decision open | Current unified matrix: 303.372 Mbps bulk but 1,417 ms interactive p95 versus 522 ms raw TCP and 538 ms V2Ray; exact diagnostics show zero MPP command wait and hundreds of KiB to MiB of already-native FIFO debt. A later priority frame cannot overtake that prefix without a hard handoff bound or another ordering domain |
 | SEEN-6D2 | TCP-only cold/warm ramp, sustained single-stream service, and impairment recovery | Open; current bulk cell GREEN | The current unified matrix disproves a sustained aggregate collapse in its one realization, but the separately reported cold/warm and recovery trajectories remain to be closed by their existing gates |
-| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Implementation-fixed / post-accounting gate pending; wider matrix open | `53d9ab5` restores bounded live-owner frontier authority; `dc4853d` installs the advisory completion race and its follow-up removes duplicate owner payload accounting. The 360.800 Mbps / 0.679 s run predates that follow-up and is not its acceptance evidence |
+| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Captured execution matches current RFC; promoted P1 model correction open | `93e6284` fixes owner double-counting. A clean diagnostic replay still produced a 1.064233-second gap through RFC-conforming sequential repair, proving that timer tweaks are not the remaining decision |
 | SEEN-6F | QUIC-only 10 -> 500 recovery and cold/warm first-object behavior | Open | The user-observed slow recovery and size-dependent startup trajectory require ordinary-build timing evidence |
 | SEEN-6G | TCP, QUIC, and default single-thread plus Cloudflare-style download/upload behavior | Open | Acceptance requires stable/burstable short and sustained work; aggregate bulk goodput alone is insufficient |
 | SEEN-6H | Matched raw TCP, V2Ray/Xray, and Hysteria2 comparison under the declared changing 3--10% loss schedule | Matrix measured; acceptance remains open | One current six-way ordinary-build cohort is complete and valid; MPP bulk is competitive, but SEEN-6D loaded TCP latency fails, so the cohort cannot authorize release |
-| SEEN-7 | Retired peer rows, port projection, Evidence unknown/stale semantics, directional Suspect state | Retirement fixed; remaining current claims disproved | Absolute retirement core `e0e70e7` plus exact native-terminal-result follow-up retained in checkpoint `3a6d0ea`; later projection audit and focused tests found no additional defect |
+| SEEN-7 | Retired peer rows, port projection, Evidence unknown/stale semantics, directional Suspect state | Retirement component fixed; P7 truthfulness gate open | Absolute retirement core `e0e70e7` plus exact native-terminal-result follow-up retained in checkpoint `3a6d0ea`; current mapping, absence, staleness, direction, sorting, and browser projection remain assigned to P7 |
 
 The tracked tree at `a9450d8` contains no uncommitted production correction.
 The non-release checkpoint `3a6d0ea` preserves the complete v10 integration
@@ -79,45 +85,26 @@ before the isolated SEEN corrections and is not itself an accepted candidate.
 
 ## Current SEEN-6E causal boundary
 
-The ordinary mixed recovery artifact contains a real 1.688-second positive-read
-callback gap during the QUIC impairment window. Healthy TCP transmits tens of
-megabytes during that interval, so lack of alternate service, host pressure,
-and continued fresh placement onto QUIC are excluded. The current diagnostic
-trace shows:
+At `93e6284`, two valid ordinary repetitions disagreed at the application
+tail: 0.812670 versus 3.580808 seconds maximum positive-read gap. The latter
+pinned the 64-MiB Product window while native transports continued service, so
+one favorable repetition cannot close the issue.
 
-1. original placement moves from QUIC to TCP shortly after the abrupt rate
-   cut;
-2. a lower Data Sequence range already committed to QUIC remains unresolved;
-3. the receiver therefore cannot release later TCP-delivered ranges;
-4. QUIC is withdrawn from new placement after the existing three-recovery-
-   interval rule; and
-5. stale-owner repair is then admitted on TCP and contiguous delivery resumes.
+A focused diagnostic replay then isolated one 14,600-byte missing Product
+range. The captured execution followed the current RFC: hole evidence took
+571 ms to arise and 184 ms to return, fallback added 99 ms, and three distinct
+TCP copies were admitted sequentially at roughly 273-, 253-, and 256-ms
+intervals. Product-command wait was zero, writer handoff was 1--2 ms, and the
+third domain delivered after another 251 ms, producing a 1.064233-second gap.
 
-This is a Product head-of-line and recovery-latency failure, not a congestion-
-controller throughput failure. Shortening the stale timer, treating a rate
-sample as packet loss, or bypassing the cumulative optional-traffic ledger is
-not a justified fix. History and symbolic review identified an intended
-one-frontier-quantum live-owner race that `0b50e9a` accidentally removed while
-correctly bounding cumulative optional repair. Commit `53d9ab5` restores that
-component invariant, but its ordinary mixed-recovery repetitions remain
-unstable, so it is an intermediary checkpoint rather than an accepted
-correction.
-
-The next exact trace proved a narrower timing-model defect: before the owner
-fallback, the implementation compared an alternate's predicted delivery with
-the fallback timer rather than comparing alternate and owner delivery from one
-observation. Commit `dc4853d` installed that advisory race, but final audit
-then found its owner projection charged the already-accepted frontier payload
-twice. The focused follow-up removes that duplicate term in both directions;
-the owner estimate still conservatively contains aggregate later owner debt
-and is not claimed as exact byte-position proof. The correction can remove
-only the timer remainder (about 89 ms in the captured run); it cannot solve the
-preceding evidence delay or native ordered-service wait. Its affected ordinary
-mixed-recovery gate before the accounting follow-up passed at 360.800 Mbps
-with a 0.679-second maximum positive read gap; that stochastic result must not
-be attributed to the comparator and does not waive the wider matrix. The proof
-and commit verdicts are recorded in
-`docs-dev/RECENT_SEEN_CHANGE_REFLECTION.md` and `PROGRESS.md`.
+This proves the timer and actor-wakeup hypotheses wrong for that replay. It
+does not prove every recovery execution correct, nor does it prove concurrent
+copies faster under a shared bottleneck. P1 must replace the hard percentage
+admission semantics with a structural live-copy identity, then adjudicate
+sequential, staggered, and concurrent service against joint offered load.
+`dc4853d` and `93e6284` remain exact local comparator/accounting corrections;
+their broad performance benefit is not claimed. Full detail is in
+`docs-dev/RECENT_SEEN_CHANGE_REFLECTION.md` and the finite closure plan.
 
 Fixing this causal cell does not close the wider SEEN-6 matrix. The retained
 matrix still requires, for TCP-only, QUIC-only, and default TCP+QUIC:
@@ -135,33 +122,26 @@ before this ledger was frozen. Missing evidence cannot reclassify them as new
 scope. Each causal correction must remain isolated, but every cell remains
 open until it is run against the ordinary candidate build.
 
-## Held UNSEEN batch
+## Promoted SEEN batch
 
-These items are recorded for later decision and are not authorized for code,
-RFC, configuration, public documentation, or release changes:
+The formerly held batch is now authorized and finite. Promotion does not
+presume that each item requires production code; deterministic processing may
+close one as disproved, unreachable, model-constrained, or stale fixture debt.
 
-- 31 deterministic pre-v10/full-suite fixture expectations that remain test or
-  conformance debt, not proven production defects;
-- `retained_tail_uses_only_a_measured_earlier_completion`, whose stale fixture
-  treats an unscoped sibling per-flow sample as exact Product authority;
-- `confidence_and_durable_progress_use_explicit_sample_thresholds` and
-  `fresh_product_point_rate_requires_epoch_and_lifetime_floors_for_completion_authority`,
-  whose stale fixtures treat an ACK-byte floor as Product durability;
-- exact all-stage carrier-work and peer-service-frontier accounting;
-- the RFC `STREAM_ACK(..., services)` service-frontier wire/input mismatch;
-- exact `STREAM_MAX_DATA` publication cadence and partial local-write
-  consumption semantics;
-- a temporal service guarantee for the lowest outstanding Data Sequence range
-  after abrupt owner service collapse;
-- multiple native ordering domains for one logical QUIC stream;
-- generic scheduler score/admission terms that may not match RFC 15.1's typed
-  authority model;
-- request/fixed-output typed `RateHint` cleanup outside SEEN-2;
-- repeatability and benefit of stale-path requalification reinjection; and
-- exact target-bound queue authority for the currently target-unbound generic
-  request/response live-tail path; and
-- evaluator or harness features beyond what is necessary to execute the
-  already-frozen acceptance cells.
+| Item | Promoted scope | Why it is necessary / finite closure |
+| --- | --- | --- |
+| SEEN-P1 | Lowest-frontier temporal service and the hard optional-repair percentage gate | Necessary: exact diagnostics show RFC-conforming sequential copies contribute observed delay, while a percentage currently denies recovery as a hard cap. Replace budget authority with structural live-copy identity, then prove or reject each service policy under coupled load. |
+| SEEN-P2 | Sufficiency of native ordering domains, including a possible additional QUIC/TCP domain | Already triggered for TCP by SEEN-6D1; P1 may also trigger QUIC. Prove current-domain sufficiency, validate one clean domain design, or reject the candidate as model-constrained. |
+| SEEN-P3 | Request/fixed-output typed rate hints, omitted-hint startup, and stale-path requalification | Necessary: cold/warm startup and restart-dependent 10-to-500 recovery are reported SEEN symptoms. Close with exact authority chronology and restart-free recovery. |
+| SEEN-P4 | Generic score/admission conformance, uncertainty, flapping, and overlapping contention | Necessary at L3 for reported default-path sway and marginal path swaps. Overlapping latent-factor inference is processed by proving it necessary or irrelevant to v0.4.7; it is not automatically implemented. |
+| SEEN-P5 | Version-10 `STREAM_ACK(..., services)`, `STREAM_MAX_DATA`, partial local writes, target-bound tail authority, and service-frontier accounting | Necessary protocol/conformance audit. Each item needs a reachable current-model RED/GREEN or an explicit unreachable/irrelevant proof; no compatibility branch. |
+| SEEN-P6 | 32 current pre-v10/full-suite failures, including the three named stale fixtures | Necessary for release/CI truthfulness, not presumed production defects. Map each premise to the current RFC, then update stale tests or fix a reachable product mismatch. |
+| SEEN-P7 | Exact all-stage metrics, path/incarnation projection, and recovery-score observability | Necessary for the already reported stale/zero/reversed/mapping diagnostics and for causal release evidence. Unsupported values remain unavailable rather than synthesized. |
+| SEEN-P8 | Final TCP, QUIC, default, short-object, single-stream, concurrent down/up, recovery, and matched-baseline matrix | Necessary release gate. Three complete valid cohorts, with at most two additional whole cohorts only for conflicting paired signs; no isolated lucky reruns. |
+
+An evaluator or harness extension with no direct need in P1--P8 is processed as
+irrelevant and rejected from v0.4.7. The existing runner may receive only the
+minimum instrumentation needed to execute an already-listed gate.
 
 Previously focused-green components remain conditional evidence rather than
 release acceptance: native QUIC authority/recovery, application-limited
@@ -173,10 +153,11 @@ subject to the ordinary SEEN-6 composition matrix above.
 
 ## Deterministic next step
 
-1. Continue the remaining frozen SEEN-6 acceptance cells one at a time; a
-   newly exposed causal defect is still SEEN only when it is necessary to
-   explain one of those already-reported failures.
-2. Preserve each already-GREEN cell as a non-downgrade gate; do not tune a
-   timer or score to manufacture a later pass.
-3. Record independent findings in the held UNSEEN batch, but do not implement
-   them without consent.
+1. Commit the explicit reflection and finite plan without production changes.
+2. Process the exact atomic order T01--T13 in
+   `docs-dev/V0_4_7_FINITE_CLOSURE.md`. Generic score/admission and typed rate
+   authority precede P1 because owner/alternate projections consume them.
+3. Preserve each earlier focused GREEN as a non-downgrade gate. Do not tune a
+   timer, percentage, score, or test condition to manufacture a later pass.
+4. A failed or unresolved required package rejects v0.4.7; it cannot create a
+   new package or an isolated lucky rerun.

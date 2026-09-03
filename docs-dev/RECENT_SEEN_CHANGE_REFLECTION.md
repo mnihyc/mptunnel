@@ -14,7 +14,7 @@ ordered-delivery stalls.
 
 The corrected rule is deterministic:
 
-1. Freeze the already-SEEN symptom and its acceptance cell.
+1. Freeze the complete promoted SEEN scope and its acceptance cells.
 2. Capture an exact causal trace.
 3. State the invariant and symbolic counterexample before production code.
 4. Demonstrate the exact pre-change RED without sleeps or random timing.
@@ -32,68 +32,79 @@ that statistical gate must not be used to invent or tune the model.
 | Commit | Intended correction | Evidence boundary | Verdict |
 | --- | --- | --- | --- |
 | `38286aa` | Stop response acquisition state from overriding ordinary ECF placement. | Exact service RED/GREEN; full runtime matrix remains open. | Retain; matrix-pending. |
-| `a4679b5` | Keep a configured TCP startup-rate hint bound to the exact response output rather than replacing it with untyped telemetry. | Correctness RED/GREEN is strong. With the hint omitted, the 350.75 Kbit/s discovery prior remains until qualified Product evidence, so cold/warm TCP performance still needs explicit scrutiny. | Retain as the RFC correction; performance-pending. Redesign the typed native-evidence adapter if the runtime gate fails rather than restoring untyped telemetry. |
+| `a4679b5` | Keep a configured TCP startup-rate hint bound to the exact response output rather than replacing it with untyped telemetry. | The explicit-hint plumbing has a strong RED/GREEN. The same commit also demoted fresh kernel/peer response evidence and uses `max(C0, qualified Product receipt)`; with no hint the 350.75-Kbit/s prior can persist, while a high hint can resist a QoS downshift. | Split verdict: retain the provenance correction; do not accept the bundled response-rate authority policy until the startup/recovery transaction proves or replaces it. |
 | `842a0cc` | Apply the same ordinary ECF rule to request OriginalData and remove acquisition-order arbitration. | Direction-symmetric RED/GREEN; runtime composition remains open. | Retain; matrix-pending. |
 | `444fb38` | Publish MPP ACK/startup control after Product acceptance without waiting for a blocked local application write. | Exact blocked-sink RED/GREEN; it changes no scheduler or congestion control. | Retain; matrix-pending. |
-| `0b50e9a` | Bound renewable live-owner repair by cumulative optional authority and stop a proven repair flood. | Anti-amplification core is correct, but deleting the exhausted-credit frontier floor introduced non-monotonic liveness. | Retain only with its bounded liveness successor; never accept this commit alone. |
-| `a9450d8` | Apply the selected latency priority to the actual Quinn stream. | Exact native-priority RED/GREEN and two ordinary non-downgrade runs. | Retain; accepted component. |
-| `53d9ab5` | Restore one bounded live-owner frontier opportunity and preserve its exact owner, target, epoch, and wake lifecycle. | Component proofs are real, but three ordinary mixed-recovery runs remained unstable. The 28-file commit combines several mechanisms in one causal family, which weakens attribution. | Retain as an intermediary checkpoint only; runtime acceptance is RED. |
+| `0b50e9a` | Bound renewable live-owner repair by cumulative optional authority and stop a proven repair flood. | The pre-change flood is exact evidence for non-renewal. The cumulative percentage is nevertheless a hard recovery-admission gate, which violates the rule that extra-traffic percentages are hints. | Retain as an attribution checkpoint, not a final authority model. Preserve non-renewal while replacing percentage-gated liveness with structural copy identity. |
+| `a9450d8` | Apply the selected latency priority to the actual Quinn stream. | Exact native-priority RED/GREEN and two ordinary non-downgrade runs; priority still cannot preempt bytes already accepted into one native ordered stream. | Retain as an isolated focused-GREEN checkpoint; wider native-HOL and release-matrix acceptance remain open. |
+| `53d9ab5` | Restore one bounded live-owner frontier opportunity and preserve its exact owner, target, epoch, and wake lifecycle. | Exact target/epoch/wake ownership is useful, but the hard over-credit token and sequential percentage-gated service are not final under hint semantics. The 28-file change also weakens attribution. | Retain as an intermediary attribution checkpoint; redesign the authority model before release. Runtime acceptance is RED. |
+| `dc4853d` | Compare an alternate with projected owner delivery rather than with an unrelated authority timer. | The timer says when fallback authority exists, not when the accepted bytes will arrive. The comparator is advisory and aggregate; it is not an exact byte-position oracle. | Retain the local timing correction inside the authority redesign; runtime acceptance remains RED. |
+| `93e6284` | Do not charge the already accepted owner frontier as new payload a second time. | Both request and response exact tests proved duplicate Product/native debt. The diagnostic replay did not show this comparator winning, so no broad runtime gain is attributed to it. | Retain the accounting correction; affected runtime evidence remains pending. |
 
-There is no evidence for a blanket revert. `a4679b5` is the strongest bounded
-candidate for response-side TCP startup underestimation when no initial-rate
-hint is configured. `0b50e9a` plus `53d9ab5` is a correctness composition, not
-a sustained-performance solution. None of these changes directly explains a
-native QUIC congestion-rate collapse.
+There is no evidence for a blanket revert: that would restore exact placement,
+control-progress, priority, repair-renewal, and debt-accounting defects. There
+is also no basis for accepting every commit wholesale. `a4679b5` combines one
+valid provenance correction with an unresolved rate-authority policy;
+`0b50e9a` and `53d9ab5` combine valid anti-renewal/identity mechanisms with a
+hard percentage authority model that must be replaced. None of these local
+proofs, by itself, establishes sustained or startup performance.
+
+## Why the conflicting policies existed
+
+The generic jitter, loss, confidence, `Suspect`, and active-flow score terms
+predate RFC 15.1's exact carrier-work `D` and typed `C/U` model. They were
+reasonable heuristic proxies for contention and uncertainty when exact inputs
+did not exist. With exact `D`, `C`, and incumbent uncertainty now specified,
+the same terms double-represent evidence and can reverse the RFC completion
+order. Their historical intent must be preserved through typed inputs and
+deadband, not by retaining duplicate penalties.
+
+The hard ECF/completion-horizon admission branches were introduced to protect
+receive-hole and reorder exposure. The current model now has explicit Product
+window/headroom and configured queue/session resource contracts for that
+safety. A numeric ETA comparison is ranking evidence, not resource ownership;
+using it to reject otherwise lifecycle-valid Product work crosses that layer
+boundary. Each reachable branch still needs an exact RED before production is
+changed.
+
+The optional percentage gate was introduced to stop duplicate wire
+amplification, and the pre-change flood proves that goal necessary. Its defect
+is not conservatism but authority: a cumulative percentage makes a performance
+hint decide whether recovery is permitted at all. The replacement must retain
+explicit copy identity, bounded simultaneous work, and wire accounting; simply
+deleting the guard would reintroduce the original flood.
 
 ## Current SEEN-6E proof boundary
 
-For the captured blocking range `[900003768, 900069304)`, the original QUIC
-placement was not caused by stale evidence: its predicted completion was
-887.996 ms versus 891.256 ms for the best TCP candidate. The authoritative
-gap became visible 1.318 s after assignment. At that observation:
+At clean commit `93e6284`, two valid ordinary repetitions disagreed: one had a
+0.812670-second maximum read gap and the other a 3.580808-second gap. That is
+enough to reject both single-run acceptance and any claim that the owner-debt
+correction solved the end-to-end symptom.
 
-```text
-owner QUIC completion     1378.287 ms
-best TCP completion        781.328 ms
-owner fallback remaining    about 89 ms
-```
+The focused diagnostic replay then isolated the exact missing range
+`[634464056, 634478656)`, 14,600 bytes. QUIC won original placement by only
+7.535 ms and entered its writer in 2 ms. The client exposed the hole 571 ms
+later; evidence reached the server actor after another 184 ms; existing owner
+fallback added 99 ms. Three distinct TCP domains then accepted exact copies
+sequentially, with immutable retry intervals of 273.364, 252.699, and 256.246
+ms. Product-command wait was zero, native writer handoff was 1--2 ms, and the
+third domain delivered the frontier 251 ms after handoff. The resulting
+application gap was 1.064233 seconds.
 
-The current early-repair rule compares alternate delivery with the time at
-which fallback authority fires:
+This trace proves that the implementation followed the current RFC. It also
+proves that another timer tweak, queue-wakeup tweak, same-domain retry, or
+owner reset cannot be justified from this failure. The remaining question is
+the authority model: whether a structurally finite frontier epoch may expose
+one exact copy to each distinct native ordering domain concurrently. That is
+a proposal, not an accepted fix. It first requires a symbolic safety proof for
+identity, non-renewal, native admission, direction symmetry, and bounded copy
+cardinality, followed by the exact pre/post counterexample.
 
-```text
-max(now, loss_at) + S_alt < fallback_at
-```
-
-This compares delivery with a timer, not with owner delivery. The bounded
-advisory race for frontier `M` is:
-
-```text
-max(now, loss_at) + S_alt(M) < now + S_owner(0), with M already in D_owner
-```
-
-The loss and fallback epochs remain evidence/liveness hints; they are not rate
-caps or path-capacity limits. Before fallback, a measured completion advantage
-can advance optional repair. At or after fallback, the existing bounded
-liveness authority remains available even without that advantage. If either
-comparable projection is absent, the fallback hint remains the conservative
-evaluation point.
-
-The owner's exact OriginalData debt already contains `M`; charging `M` again
-would count the same work twice. Portable native telemetry can leave later
-owner offsets in `D_owner`, so `S_owner(0)` is a conservative total-outstanding
-projection rather than an exact byte-position oracle. It may authorize bounded
-optional repair early; it cannot cap ordinary work or prove native failure.
-
-For the trace above, the corrected comparison can remove only the remaining
-approximately 89 ms wait. It cannot remove the preceding 1.318 s evidence
-delay or guarantee that a copy already admitted behind native ordered work
-will overtake it. Once all existing native ordering domains contain the same
-missing range, stronger service guarantees require a separately approved
-architecture change; they are not a timing-threshold tweak.
-
-The immediate-prior-path hypothesis is disproved for this trace. That TCP path
-had 488,534 queued bytes versus one 65,536-byte quantum, so existing queue
-hysteresis would still have selected QUIC. Replacing the exact lower owner
-with last-selected stickiness would be an UNSEEN scheduler policy with no
-dominance proof and is excluded from this transaction.
+The extra-traffic percentage may rank the cost of that operation but cannot
+deny it as a hard admission budget. Conversely, the proposal cannot claim a
+finite delivery bound when every native domain supplies zero service. Nor may
+it assume that concurrent copies leave native service times unchanged: shared
+bottlenecks can make the copies slow one another. Its conditional service
+claim must therefore be expressed against the induced joint load and proved
+under both independent and shared-resource cases; physical non-service remains
+an honest theoretical constraint.

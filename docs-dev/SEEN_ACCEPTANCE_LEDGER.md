@@ -59,7 +59,7 @@ An isolated commit milestone never does.
 | SEEN-6B | HTTP/3 migration left QUIC latency priority diagnostic-only | Fixed | Actual Quinn priority RED/GREEN plus ordinary two-run non-downgrade; `a9450d8` |
 | SEEN-6C | QUIC-only sustained bulk/read-gap and loaded-latency mechanism | Model-constrained; encompassing acceptance remains open | Current same-native-stream gap is attributed to ordered QUIC recovery; this does not close cold/warm, recovery, upload, or concurrent behavior |
 | SEEN-6D | TCP-only cold/warm ramp, sustain, loaded latency, and recovery | Open; some bulk cells GREEN | Existing bulk/startup/gap improvement does not yet prove the complete reported timing and concurrency behavior |
-| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Open; current causal priority | Healthy TCP carries later offsets while an earlier QUIC-owned Product range blocks contiguous delivery |
+| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Open; current causal priority | `53d9ab5` restores the bounded live-owner frontier invariant but remains runtime-RED; the next isolated correction is the proven owner-versus-alternate completion race |
 | SEEN-6F | QUIC-only 10 -> 500 recovery and cold/warm first-object behavior | Open | The user-observed slow recovery and size-dependent startup trajectory require ordinary-build timing evidence |
 | SEEN-6G | TCP, QUIC, and default single-thread plus Cloudflare-style download/upload behavior | Open | Acceptance requires stable/burstable short and sustained work; aggregate bulk goodput alone is insufficient |
 | SEEN-6H | Matched raw TCP, V2Ray/Xray, and Hysteria2 comparison under the declared changing 3--10% loss schedule | Open | No release-wide competitiveness conclusion has yet satisfied the frozen comparison contract |
@@ -90,9 +90,18 @@ controller throughput failure. Shortening the stale timer, treating a rate
 sample as packet loss, or bypassing the cumulative optional-traffic ledger is
 not a justified fix. History and symbolic review identified an intended
 one-frontier-quantum live-owner race that `0b50e9a` accidentally removed while
-correctly bounding cumulative optional repair. The bounded restoration is
-being implemented and reviewed as this SEEN-6E transaction; it has no runtime
-benefit claim until the ordinary mixed recovery gate passes.
+correctly bounding cumulative optional repair. Commit `53d9ab5` restores that
+component invariant, but its ordinary mixed-recovery repetitions remain
+unstable, so it is an intermediary checkpoint rather than an accepted
+correction.
+
+The next exact trace proves a narrower timing-model defect: before the owner
+fallback, the implementation compares an alternate's predicted delivery with
+the fallback timer rather than comparing alternate and owner delivery for the
+same frontier. That correction can remove only the timer remainder (about
+89 ms in the captured run); it cannot solve the preceding evidence delay or
+native ordered-service wait. The proof and commit verdicts are recorded in
+`docs-dev/RECENT_SEEN_CHANGE_REFLECTION.md`.
 
 Fixing this causal cell does not close the wider SEEN-6 matrix. The retained
 matrix still requires, for TCP-only, QUIC-only, and default TCP+QUIC:
@@ -143,8 +152,9 @@ subject to the ordinary SEEN-6 composition matrix above.
 
 ## Deterministic next step
 
-1. Finish the bounded SEEN-6E live-owner frontier transaction, including its
-   symmetric deterministic RED/GREEN proofs and independent diff review.
+1. Correct the bounded SEEN-6E owner-versus-alternate completion race,
+   including symmetric deterministic RED/GREEN proofs and independent diff
+   review.
 2. Commit that correction alone, then rerun only its ordinary mixed recovery
    gate; do not tune a timer or score to manufacture a pass.
 3. Keep SEEN-6E visibly open unless both the component proof and affected

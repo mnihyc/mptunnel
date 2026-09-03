@@ -597,6 +597,89 @@ fn ack_gap_reinjection_requires_authoritative_ack_gap_shape() {
 }
 
 #[test]
+fn final_ack_extent_uses_the_exact_lowest_hole_across_frame_boundaries() {
+    assert_eq!(
+        normalized_stream_ack_first_uncovered_extent(
+            &[
+                OffsetRange { start: 0, end: 20 },
+                OffsetRange {
+                    start: 80,
+                    end: 100
+                },
+            ],
+            160,
+        ),
+        Some((20, 80)),
+    );
+    assert_eq!(
+        normalized_stream_ack_first_uncovered_extent(&[OffsetRange { start: 0, end: 100 }], 160,),
+        Some((100, 160)),
+    );
+    assert_eq!(
+        normalized_stream_ack_first_uncovered_extent(&[], 160),
+        Some((0, 160)),
+    );
+}
+
+#[test]
+fn exact_cached_prefix_crosses_storage_chunks_without_changing_the_scored_extent() {
+    let stream_id = StreamId(776);
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream
+        .send_data(Bytes::from(vec![0x61; 1024]))
+        .expect("cache 1 KiB first chunk");
+    send_stream
+        .send_data(Bytes::from(vec![0x62; 63 * 1024]))
+        .expect("cache 63 KiB second chunk");
+
+    let frames = exact_contiguous_retransmission_frames(
+        &send_stream,
+        OffsetRange {
+            start: 0,
+            end: 64 * 1024,
+        },
+    )
+    .expect("storage chunking cannot shorten an exact cached Product prefix");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        reliable_stream_frame_extent(&frames[0]),
+        Some((0, 1024, 1024))
+    );
+    assert_eq!(
+        reliable_stream_frame_extent(&frames[1]),
+        Some((1024, 64 * 1024, 63 * 1024)),
+    );
+}
+
+#[test]
+fn exact_cached_prefix_fails_closed_at_a_retention_hole() {
+    let stream_id = StreamId(777);
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream
+        .send_data(Bytes::from(vec![0x63; 64 * 1024]))
+        .expect("cache Product data");
+    send_stream
+        .apply_ack(&[OffsetRange {
+            start: 1024,
+            end: 2048,
+        }])
+        .expect("release a middle cache slice");
+
+    assert!(
+        exact_contiguous_retransmission_frames(
+            &send_stream,
+            OffsetRange {
+                start: 0,
+                end: 64 * 1024,
+            },
+        )
+        .is_none(),
+        "a range model may not score or bind bytes absent from retained cache",
+    );
+}
+
+#[test]
 fn shared_relay_ack_transaction_rejects_extent_before_stream_mutation() {
     let mut send_stream = ReliableSendStream::new(StreamId(77), MuxLimits::default());
     send_stream

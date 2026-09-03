@@ -395,6 +395,7 @@ pub(super) fn response_completion_snapshot(
 
 /// Selects a carrier for connection control or reinjection. New data uses
 /// `select_response_data_path` because it additionally owns Data-ACK ordering.
+#[cfg(test)]
 pub(super) fn select_response_frame_path(
     targets: &[ResponseSenderPathTarget],
     lane: TrafficClass,
@@ -403,7 +404,27 @@ pub(super) fn select_response_frame_path(
     avoid_outputs: &[ResponseOutputIdentity],
     reinjection_cause: Option<RelaySendCause>,
 ) -> Option<ResponseSenderPathTarget> {
-    let payload_bytes = crate::protocol::frame::reliable_stream_frame_accounted_bytes(frame);
+    select_response_frame_path_for_extent(
+        targets,
+        lane,
+        frame,
+        emit_mode,
+        avoid_outputs,
+        reinjection_cause,
+        crate::protocol::frame::reliable_stream_frame_accounted_bytes(frame),
+    )
+}
+
+pub(super) fn select_response_frame_path_for_extent(
+    targets: &[ResponseSenderPathTarget],
+    lane: TrafficClass,
+    frame: &Frame,
+    emit_mode: CarrierEmitMode,
+    avoid_outputs: &[ResponseOutputIdentity],
+    reinjection_cause: Option<RelaySendCause>,
+    scoring_payload_bytes: usize,
+) -> Option<ResponseSenderPathTarget> {
+    let payload_bytes = scoring_payload_bytes;
     let ack_gap_reinjection = reinjection_cause.is_some_and(RelaySendCause::is_ack_gap_reinjection);
     let path_failure_reinjection = matches!(
         reinjection_cause,
@@ -419,7 +440,7 @@ pub(super) fn select_response_frame_path(
     let requires_measured_reinjection_target =
         reinjection_cause.is_some_and(RelaySendCause::is_persistent_ack_gap_reinjection);
     let exact_reinjection_target =
-        reinjection_cause.and_then(RelaySendCause::persistent_server_target);
+        reinjection_cause.and_then(RelaySendCause::response_reinjection_target);
     let can_enqueue = |target: &&ResponseSenderPathTarget, require_product_drain: bool| {
         if reinjection_cause.is_some() {
             return target.can_enqueue_reinjection_frame(frame)
@@ -503,7 +524,13 @@ pub(super) fn select_response_frame_path(
                 .or_else(|| select(allow_backup, avoid_existing, true, false))
                 .or_else(|| select(allow_backup, avoid_existing, false, false));
         }
-        if matches!(reinjection_cause, Some(RelaySendCause::TailReinjection)) {
+        if matches!(
+            reinjection_cause,
+            Some(
+                RelaySendCause::TailReinjection
+                    | RelaySendCause::ResponseCompletionTailReinjection(_)
+            )
+        ) {
             // The bounded live-tail probe prefers an output with no unresolved
             // OriginalData for this stream. Native work remains completion
             // evidence and cannot veto recovery on a queue-admissible target.
@@ -519,8 +546,12 @@ pub(super) fn select_response_frame_path(
     };
 
     let prefer_distinct = reinjection_cause.is_some() && !avoid_outputs.is_empty();
-    let require_distinct = (matches!(reinjection_cause, Some(RelaySendCause::TailReinjection))
-        || ack_gap_reinjection
+    let require_distinct = (matches!(
+        reinjection_cause,
+        Some(
+            RelaySendCause::TailReinjection | RelaySendCause::ResponseCompletionTailReinjection(_)
+        )
+    ) || ack_gap_reinjection
         || stale_response_path_reinjection)
         && !avoid_outputs.is_empty();
     if require_distinct {

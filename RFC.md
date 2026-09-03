@@ -1689,7 +1689,8 @@ or a bounded live-tail condition. It MUST remain within:
 - retained unacknowledged ranges;
 - exact carrier and attachment identity;
 - repeat-delay suppression; and
-- the cumulative extra-traffic envelope in Section 15.
+- the cumulative extra-traffic envelope, except for the explicitly bounded
+  cause-specific critical authorities in Section 15.2.
 
 Missing MPP progress alone does not authorize unbounded copies. Native
 transport recovery continues independently.
@@ -4628,10 +4629,12 @@ These are MPP estimates. They do not read, reset, or replace a native TCP RTO
 or QUIC PTO.
 
 After a Data ACK transaction in either direction leaves a retained complete
-snapshot with an omitted range, define two absolute clocks from the exact
-original flight's assignment epoch: `loss_at` is that epoch plus the local MPP
-Data-ACK threshold, and `fallback_at` is that epoch plus the MPP recovery
-interval. The thresholds are:
+snapshot with an omitted range, define two absolute clocks for every exact
+OriginalData assignment span participating in the candidate extent:
+`loss_at_j` is that span's immutable assignment epoch plus the local MPP
+Data-ACK threshold, and `fallback_at_j` is that epoch plus the MPP recovery
+interval. The aggregate candidate clocks are the maximum corresponding
+absolute deadlines, as specified below. The thresholds are:
 
 - `5/4 * SRTT` for TCP; or
 - `9/8 * SRTT` for QUIC;
@@ -4643,10 +4646,10 @@ captured shared carrier-ledger generation. If the alternate cannot win that
 absolute comparison, the
 retained gap waits until `fallback_at`. At or after `fallback_at`, an eligible
 distinct alternate may perform bounded optional repair without a completion
-gain. Expiration authorizes another race; it is not evidence that the
-alternate is faster or that native recovery failed, and it does not waive the
-cumulative optional-reinjection budget while the original carrier remains
-live.
+gain. Crossing `fallback_at` makes the first shared live-owner attempt token
+eligible without a completion gain. It neither proves native failure nor
+waives optional credit beyond the exact frontier floor defined below. Later
+attempts follow the same shared-token rule.
 
 The repair uses exact target `t`'s current published Product envelope `P_t`,
 already bounded by shared `W` and the configured repair and path-flight
@@ -4663,14 +4666,78 @@ R_t = B_t + U_s + J_t
 K_t = repair_cap_t - R_t                 (saturating at zero)
 ```
 
-For a persistent authoritative gap whose exact original carrier remains live,
-let `C_s` be the sending direction's remaining cumulative optional-reinjection
-credit after applying the minimum useful-attempt rule. The effective repair
-limit is `L_t = min(K_t, C_s)`. This preserves the complete target service
-window when funded without converting ACK silence into proof that the native
-reliable owner failed. Exact terminal carrier failure uses the separate
-cause-bounded critical recovery authority and is not capped by `C_s`; its bytes
-remain charged against later optional work.
+For one logical-stream send direction `s`, let `C_s` be remaining cumulative
+optional-reinjection credit after the minimum-useful-attempt rule. Let `G_s` be
+its single non-accumulating live-owner attempt token, shared by authoritative-
+gap and contiguous-tail recovery. For byte `x`, let `O_s(x)` be the complete
+set of live exact OriginalData output incarnations covering it and let
+`A_s(x)` be the complete set of exact output incarnations with unresolved
+OriginalData or accepted ReinjectedData covering it. Let `V_s` be the maximal
+retained contiguous prefix from the lowest uncovered byte on which `O_s(x)`
+is the same non-empty singleton and `A_s(x)` is unchanged. A cache or
+application-write boundary alone does not end `V_s`; a retained-data hole,
+ambiguous owner, non-live owner, or exact identity-set change does. Let `H_s`
+be the uncovered bytes in the exact lowest retained Product frontier, let
+`Q_s^r` be the direction's common immutable repair quantum captured for target
+ranking, and let `M_s = min(Q_s^r, H_s, V_s)`. After selecting a bound target,
+Apply defines:
+
+```text
+F_t = min(K_t, A_t^r, M_s)
+```
+
+Thus Apply may shrink the ranked frontier for exact target capacity but may
+never enlarge or skip it, and the complete bound service prefix is capped by
+`V_s`. For target-unbound tail work, the serialized queue
+uses its bounded unassigned capacity and quantum
+`F_u = min(K_u, A_u^r, H_s)`; native dispatch later revalidates exact `K_t`
+before commitment.
+
+For every OriginalData assignment span `j` intersecting `M_s`, retain its
+immutable assignment time `a_j` and applicable owner recovery interval
+`R_o,j`. The exact owner-fallback boundary is
+`fallback_at = max_j(a_j + R_o,j)`; the early loss boundary is aggregated from
+its corresponding absolute per-span deadlines. Therefore post-fallback
+authority begins only after every byte in the ranked prefix has matured.
+
+Before `fallback_at`, a completion-winning authoritative-gap attempt has
+`L_t = min(K_t, V_s, C_s)`. At or after `fallback_at`, it has:
+
+```text
+L_t = min(K_t, V_s, max(C_s, F_t))
+D_t = max(0, L_t - C_s) <= F_t
+```
+
+If `G_s` is consumed, or the owner boundary has not elapsed, the over-credit
+floor is unavailable but funded work remains
+`L_t = min(K_t, V_s, C_s)` and has
+`D_t = 0`. Thus the frontier floor replaces, and never adds to, optional
+credit; it does not suspend cumulative optional service. A full persistent-gap
+target window remains optional and cumulative only within the same exact
+identity-uniform prefix. Since `F_t <= M_s`, any accepted suffix after `F_t`
+has `D_t = 0` and is funded entirely by cumulative credit. Every suffix slice
+MUST remain retained and unacknowledged, keep the same exact identity sets,
+exclude frozen target `t`, and pass fresh exact Product and native admission;
+the first overlap, rejection, or identity change ends the prefix without
+skipping ahead. Exact terminal carrier failure uses separate cause-bounded
+critical authority, is not capped by `C_s`, and remains charged against later
+optional work.
+
+Successful admission of a live-owner gap or tail repair batch to the
+serialized Product queue at or after `fallback_at` while `G_s` is available --
+optional, partly critical, or critical -- consumes `G_s`. Optional-funded
+service admitted before `fallback_at` or while that token is already closed
+neither requires nor renews it. A later abandoned
+native-writer attempt therefore retains a consumed token until its fixed
+interval expires. Queue removal, copy expiry, target
+replacement or churn, gap/tail reclassification, metric or evidence
+publication, and actor reevaluation cannot renew it. With no contiguous unique
+Data-ACK frontier progress, exactly one successor token becomes available only
+after the accepted attempt's fixed MPP recovery interval; missed intervals do
+not accumulate. Contiguous unique Data-ACK frontier progress restarts a full
+no-progress interval and cannot move an existing deadline earlier. Sparse
+suffix ACK release does not restart it. Gap and tail observations cannot each
+spend a token in the same interval.
 
 `B_t` is queued ReinjectedData bound to exact target `t`; `U_s` is
 target-unbound queued ReinjectedData in the current stream and direction; and
@@ -4704,44 +4771,59 @@ multi-frame cumulative publication consists only of positive, incomplete
 frames and cannot establish an omission. Later incomplete updates may fill a
 gap already established below a retained complete snapshot's horizon, but
 cannot extend that horizon or create negative evidence. Both directions use
-the exact unique original flight's assignment epoch. For the same exact gap
-and assignment, later owner observations may move `loss_at` or `fallback_at`
-earlier but MUST NOT restart either clock later. Alternate eligibility and
+the immutable epochs of every exact OriginalData assignment span in the
+candidate extent. For the same exact gap and assignment spans, later owner
+observations may move a threshold-derived deadline earlier but MUST NOT restart
+an assignment epoch or aggregate clock later. Alternate eligibility and
 service-pressure projection are evaluated from the current target; a departed
 target's early projection MUST NOT be inherited by its replacement. Without exact
 ownership or a live measured distinct alternate no target-bound repair is
 sent; when an eligible alternate cannot win early, ACK silence waits until the
 one-interval `fallback_at` rather than erasing that fallback.
 
-Recovery target ranking and commitment MUST refer to the same lowest-missing
-frontier quantum. The first committed repair frame on the selected target has
-the exact offset, payload extent, normalized `M_c`, and shared carrier-ledger
-generation whose `S_c` rank authorized that target. If that frame cannot be
-committed because it overlaps queued or recent
+Recovery target ranking and commitment MUST refer to the same lowest-missing,
+identity-uniform frontier. Decide ranks candidate targets using the common
+captured payload `M_s`; after selection, Apply may shrink the ranked frontier
+floor only to exact `F_t`. A separately funded suffix may extend total service
+to `L_t` only under the rules below.
+The first committed repair frame has the same lowest offset, normalized
+frontier identity, and shared carrier-ledger generation whose `S_c` rank
+authorized that target, and its payload MUST NOT exceed `M_s`. If that frame
+cannot be committed because it overlaps queued or recent
 repair work, the evaluation MUST stop without publishing later omitted ranges.
 After the frontier quantum is committed, the sender may fill the remainder of
-the same bounded effective target service window `L_t` behind it. A larger
+the same bounded effective target service window `L_t` behind it only while
+the frozen target remains absent from the unchanged `A_s(x)` set. A larger
 coalesced batch or whole-window throughput estimate MUST NOT replace the exact
 frontier-quantum carrier rank as the primary target objective.
 
-When a persistent-gap reinjection attempt is accepted by a selected alternate,
-its repeat deadline is fixed from that alternate's observed MPP recovery
-interval. The stream actor wakes at the earlier of that deadline and the
-original owner's live-tail deadline. If the same authoritative gap remains, a
-later attempt reselects a currently measured alternate and again remains
-bounded by its available Product service window. Advancement or resolution of
-the lowest missing frontier clears the prior attempt deadline. Thus a degraded
-original owner cannot impose its longer recovery clock on an already accepted
-reinjection attempt, while mutable later measurements cannot postpone that
-attempt's deadline. ACK receipt, either recovery deadline, carrier-capacity
-release, and output-model publication all return through the same stream-owner
-evaluation of the retained authoritative gap. Only a newly received Data ACK
-may arm the separate original-owner silence fallback; polling or another wake
-cannot restart that silence clock.
+When a target-bound live-owner gap or completion-tail repair batch is accepted,
+its immutable next-attempt deadline is fixed from the selected alternate's
+observed MPP recovery interval. An accepted target-unbound tail instead fixes
+the then-observed original-owner tail interval. If one serialized batch admits
+frames with different exact targets or owners, its fixed interval is the
+maximum of every actually admitted frame's applicable interval; rejected or
+overlapping suffixes contribute nothing. The shared token remains
+unavailable until that deadline and requires no contiguous unique Data-ACK
+frontier progress. Target or evidence changes cannot move it. Contiguous
+unique Data-ACK frontier progress restarts a full interval; sparse suffix ACK
+release does not. Advancement or resolution clears obsolete exact-gap
+identity but does not create immediate repair authority. A later target-bound
+attempt reselects a currently measured alternate and remains bounded by its
+available Product service window. Thus a degraded original owner cannot impose
+its longer recovery clock on an already accepted target-bound attempt, while
+mutable later measurements cannot postpone any accepted attempt's deadline.
+ACK receipt, recovery deadlines, carrier-capacity release, and output-model
+publication all return through the same stream-owner evaluation. Polling or
+another wake cannot restart either silence clock.
 
-A contiguous live tail without an authoritative gap may send one bounded probe
-after one MPP recovery interval. Another repair requires another full interval
-without MPP Data ACK progress.
+A contiguous live tail without an authoritative gap uses the same `G_s`.
+After the owner boundary it may cross remaining optional credit by at most
+bound `F_t` or unassigned `F_u`; a larger admitted tail remains bounded by
+`C_s` and its corresponding `K_t` or `K_u`, and unbound native dispatch still
+revalidates exact `K_t`. Admission while the token is available consumes the
+same opportunity as gap repair. Another over-credit attempt requires the
+shared full no-progress interval.
 
 For the finite-drain rule below, MPP Data ACK progress means newly
 acknowledged unique Product bytes. Receipt or republication of an unchanged or
@@ -4751,15 +4833,25 @@ OriginalData range's assignment age.
 Once the sending application fixes a final offset, a remaining exact
 OriginalData range also has an immutable finite-drain age from its original
 assignment. After one owning-path MPP recovery interval, the sender MAY race
-one bounded quantum of that range on a distinct output when both outputs have
-current carrier service evidence and the ordinary `S/U` rank favors the
-alternate outside its uncertainty deadband. Partial Data ACK progress shrinks
-the retained range but does not rewrite any remaining original Product flight's
-assignment time.
+one bounded over-credit frontier quantum of that range on a distinct output
+when both outputs have current carrier service evidence and the ordinary `S/U`
+rank favors the alternate outside its uncertainty deadband. A larger suffix is
+permitted only when separately funded by cumulative optional credit and bounded
+by the same exact-target and identity-uniform-prefix rules above. Partial Data
+ACK progress shrinks the retained range but does not rewrite any remaining
+original Product flight's assignment time.
 This finite-tail rule does not mark the original attachment stale, withdraw it
 from ordinary placement, or replace native recovery. Exact range identity,
 repeat-delay suppression, shared credit, queue, flight, repair, reorder, and
 extra-traffic bounds continue to apply.
+
+When response finite-tail Decide ranks and sizes an exact alternate output,
+the serialized intent MUST carry that exact output incarnation and a finite
+validity deadline through Apply and native dispatch. Dispatch revalidates its
+current Product and native admission and either commits that same output or
+cancels the intent for fresh evaluation; it MUST NOT silently retarget the
+already-ranked batch. Exact output replacement or validity expiry removes the
+intent so it cannot remain as an impossible Product-queue head.
 
 For placement persistence, a distinct structural Product alternative exists
 only when, after excluding the candidate owner, ordinary regular-before-backup
@@ -5058,13 +5150,12 @@ exact carrier-instance failure is session-wide.
 
 If cumulative extra-traffic credit is exhausted, exact terminal carrier
 failure may use one bounded target Product service window so that the budget
-cannot deadlock correctness recovery. A persistent authoritative gap on a live
-original carrier remains optional and waits for new credit, Data ACK progress,
-or exact terminal failure. A live-tail event without an authoritative gap
-remains limited to one critical recovery quantum. Critical work remains
-bounded by retained ranges, exact flight identity, queue and flight limits,
-repeat-delay suppression, and a distinct output while the original carrier is
-live. Its bytes remain charged and reduce later optional reinjection authority.
+cannot deadlock correctness recovery. While the original carrier remains
+live, a persistent gap's full target window is optional, but after the owner
+boundary one exact frontier quantum may cross exhausted or partial credit by
+the shared-token rule. A live tail uses the same token and quantum. Every byte
+remains charged. Exact retained ranges, queue, flight, distinct-output, target-
+capacity, and repeat-delay bounds continue to apply.
 
 ### 15.3 Datagram retry
 

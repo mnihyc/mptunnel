@@ -6,7 +6,6 @@
 
 use super::super::queue::ReliableRelaySenderQueue;
 use super::super::work::{ClientReinjectionOutputIdentity, RelaySendCause};
-use super::RequestDataAckGapObservation;
 use super::scheduling::{
     BulkRelayFrameRequest, BulkRelayPathChoice, ObservedBulkPathCandidate,
     ObservedOrdinaryPathChoice, RequestRelayPathObservation, RequestRelaySchedulingObservation,
@@ -16,6 +15,10 @@ use super::scheduling::{
 };
 use super::tcp_capacity::{
     RequestTcpCapacityController, RequestTcpCapacityEvent, RequestTcpCapacityRetirement,
+};
+use super::{
+    RequestCompletionTailTarget, RequestCompletionTailTargetObservation,
+    RequestDataAckGapObservation,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -43,7 +46,8 @@ use crate::model::timing::{
     transport_rate_sample_freshness_horizon,
 };
 use crate::model::work::{
-    RangeRecoveryState, ReliableReinjectionTargetWork, reliable_reinjection_service_limit_bytes,
+    RangeRecoveryState, ReliableLiveOwnerFrontier, ReliableReinjectionTargetWork,
+    reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
@@ -734,7 +738,14 @@ impl RequestMultipathController {
         preview: &Frame,
         lane: TrafficClass,
     ) -> RequestDataAckGapObservation {
-        self.data_ack_gap_reinjection_model_with_service(context, remotes, preview, lane, None)
+        self.data_ack_gap_reinjection_model_with_service(
+            context,
+            remotes,
+            preview,
+            lane,
+            reliable_stream_frame_accounted_bytes(preview),
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -753,6 +764,29 @@ impl RequestMultipathController {
             remotes,
             preview,
             lane,
+            reliable_stream_frame_accounted_bytes(preview),
+            Some((sender_queue, reinjection_debt_bytes, mux_limits)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn data_ack_gap_reinjection_service_model_for_extent(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        preview: &Frame,
+        lane: TrafficClass,
+        sender_queue: &ReliableRelaySenderQueue,
+        reinjection_debt_bytes: usize,
+        mux_limits: MuxLimits,
+        scoring_payload_bytes: usize,
+    ) -> RequestDataAckGapObservation {
+        self.data_ack_gap_reinjection_model_with_service(
+            context,
+            remotes,
+            preview,
+            lane,
+            scoring_payload_bytes,
             Some((sender_queue, reinjection_debt_bytes, mux_limits)),
         )
     }
@@ -763,6 +797,7 @@ impl RequestMultipathController {
         remotes: &ReliableRelayRemoteSet,
         preview: &Frame,
         lane: TrafficClass,
+        scoring_payload_bytes: usize,
         service: Option<(&ReliableRelaySenderQueue, usize, MuxLimits)>,
     ) -> RequestDataAckGapObservation {
         let original_flight = self
@@ -783,20 +818,40 @@ impl RequestMultipathController {
         let live_instances = remotes.path_instances();
         let mut avoid_instances = self.request.flights.sent_instances_for_frame(preview);
         avoid_instances.retain(|instance| live_instances.contains(instance));
+        let target_model_pending = remotes.paths.iter().any(|path| {
+            let instance = path.instance();
+            !avoid_instances.contains(&instance)
+                && path.stream.product_admission_active()
+                && !self
+                    .request
+                    .requalification
+                    .stale_for_original_data(instance)
+                && (!context.relay_path_instance_has_bulk_model_evidence(instance)
+                    || self
+                        .request_reinjection_target_snapshot(context, remotes, path)
+                        .is_none())
+        });
         let mut target_service_exhausted = false;
         let reinjection_path = loop {
-            let Some(position) = self
-                .choose_lowest_eta_relay_path(
-                    context,
-                    remotes,
-                    preview,
-                    lane,
-                    RelaySendCause::PersistentAckGapReinjection,
-                    &avoid_instances,
-                )
-                .ok()
-            else {
-                break None;
+            let position = match self.choose_lowest_eta_relay_path_for_extent(
+                context,
+                remotes,
+                preview,
+                lane,
+                RelaySendCause::PersistentAckGapReinjection,
+                &avoid_instances,
+                scoring_payload_bytes,
+            ) {
+                Ok(position) => position,
+                Err(RequestMultipathPlanError::ServiceBlocked) => {
+                    // Structural eligibility and measured Product evidence
+                    // were present, but every exact alternate's native queue
+                    // was full. Preserve that distinction so the actor waits
+                    // on capacity rather than an unrelated model publication.
+                    target_service_exhausted = true;
+                    break None;
+                }
+                Err(_) => break None,
             };
             let path = &remotes.paths[position];
             let instance = path.instance();
@@ -828,11 +883,7 @@ impl RequestMultipathController {
                     continue;
                 }
             }
-            let Some(score) = scheduler::score_path(
-                snapshot,
-                lane,
-                reliable_stream_frame_accounted_bytes(preview),
-            ) else {
+            let Some(score) = scheduler::score_path(snapshot, lane, scoring_payload_bytes) else {
                 break None;
             };
             if !score.eta_ms.is_finite() {
@@ -856,6 +907,9 @@ impl RequestMultipathController {
                 .map_or(0, |(_, _, _, accepted)| accepted),
             reinjection_completion: reinjection_path.map(|(_, _, completion, _)| completion),
             target_service_exhausted: target_service_exhausted && reinjection_path.is_none(),
+            target_model_pending: target_model_pending && reinjection_path.is_none(),
+            uniform_frontier_extent_bytes: 0,
+            owner_recovery_timing: None,
         }
     }
 
@@ -915,6 +969,16 @@ impl RequestMultipathController {
             .original_transmission_instances_for_frame(frame, live_instances)
     }
 
+    pub(super) fn live_owner_uniform_frontier(
+        &self,
+        range: OffsetRange,
+        live_instances: &[RelayPathInstance],
+    ) -> Option<ReliableLiveOwnerFrontier<RelayPathInstance>> {
+        self.request
+            .flights
+            .live_owner_uniform_frontier(range, live_instances)
+    }
+
     pub(super) fn tail_reinjection_owner_keys(
         &self,
         frame: &Frame,
@@ -940,6 +1004,164 @@ impl RequestMultipathController {
         frame: &Frame,
         lane: TrafficClass,
     ) -> Option<ClientReinjectionOutputIdentity> {
+        self.tail_reinjection_earlier_completion_target_from_model(
+            context,
+            remotes,
+            frame,
+            lane,
+            reliable_stream_frame_accounted_bytes(frame),
+            self.data_ack_gap_reinjection_model(context, remotes, frame, lane),
+        )
+        .map(|(identity, _)| identity)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tail_reinjection_earlier_completion_service_target(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        sender_queue: &ReliableRelaySenderQueue,
+        reinjection_debt_bytes: usize,
+        mux_limits: MuxLimits,
+    ) -> Option<RequestCompletionTailTarget> {
+        self.tail_reinjection_earlier_completion_service_target_for_extent(
+            context,
+            remotes,
+            frame,
+            lane,
+            sender_queue,
+            reinjection_debt_bytes,
+            mux_limits,
+            reliable_stream_frame_accounted_bytes(frame),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tail_reinjection_earlier_completion_service_target_for_extent(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        sender_queue: &ReliableRelaySenderQueue,
+        reinjection_debt_bytes: usize,
+        mux_limits: MuxLimits,
+        scoring_payload_bytes: usize,
+    ) -> Option<RequestCompletionTailTarget> {
+        let model = self.data_ack_gap_reinjection_model_with_service(
+            context,
+            remotes,
+            frame,
+            lane,
+            scoring_payload_bytes,
+            Some((sender_queue, reinjection_debt_bytes, mux_limits)),
+        );
+        let (identity, snapshot) = self.tail_reinjection_earlier_completion_target_from_model(
+            context,
+            remotes,
+            frame,
+            lane,
+            scoring_payload_bytes,
+            model,
+        )?;
+        self.completion_tail_target_observation(
+            identity,
+            snapshot,
+            model.reinjection_target_flight_bytes,
+            sender_queue,
+            reinjection_debt_bytes,
+            mux_limits,
+        )
+        .target
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tail_reinjection_fallback_service_target_observation_for_extent(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        sender_queue: &ReliableRelaySenderQueue,
+        reinjection_debt_bytes: usize,
+        mux_limits: MuxLimits,
+        scoring_payload_bytes: usize,
+    ) -> RequestCompletionTailTargetObservation {
+        let model = self.data_ack_gap_reinjection_model_with_service(
+            context,
+            remotes,
+            frame,
+            lane,
+            scoring_payload_bytes,
+            Some((sender_queue, reinjection_debt_bytes, mux_limits)),
+        );
+        let target_service_exhausted = model.target_service_exhausted;
+        let reinjection_target_flight_bytes = model.reinjection_target_flight_bytes;
+        let Some((identity, snapshot)) = model.reinjection_target else {
+            return RequestCompletionTailTargetObservation {
+                target: None,
+                target_service_exhausted,
+                waiting_for_path_model_publication: model.target_model_pending,
+            };
+        };
+        let mut observation = self.completion_tail_target_observation(
+            identity,
+            snapshot,
+            reinjection_target_flight_bytes,
+            sender_queue,
+            reinjection_debt_bytes,
+            mux_limits,
+        );
+        observation.target_service_exhausted |= target_service_exhausted;
+        observation.waiting_for_path_model_publication |= model.target_model_pending;
+        observation
+    }
+
+    fn completion_tail_target_observation(
+        &self,
+        identity: ClientReinjectionOutputIdentity,
+        snapshot: PathSnapshot,
+        reinjection_target_flight_bytes: usize,
+        sender_queue: &ReliableRelaySenderQueue,
+        reinjection_debt_bytes: usize,
+        mux_limits: MuxLimits,
+    ) -> RequestCompletionTailTargetObservation {
+        let queued = sender_queue.request_target_queued_reinjection_bytes(identity.instance, false);
+        let service_limit_bytes = reliable_reinjection_service_limit_bytes(
+            ReliableReinjectionTargetWork::new(
+                Some(snapshot),
+                queued,
+                reinjection_target_flight_bytes,
+            ),
+            reinjection_debt_bytes,
+            mux_limits,
+        );
+        RequestCompletionTailTargetObservation {
+            target: (service_limit_bytes > 0).then_some(RequestCompletionTailTarget {
+                identity,
+                snapshot,
+                service_limit_bytes,
+                recovery_interval: reliable_data_retransmission_interval(
+                    Some(snapshot.underlay),
+                    Some(snapshot),
+                ),
+            }),
+            target_service_exhausted: service_limit_bytes == 0,
+            waiting_for_path_model_publication: false,
+        }
+    }
+
+    fn tail_reinjection_earlier_completion_target_from_model(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        scoring_payload_bytes: usize,
+        model: RequestDataAckGapObservation,
+    ) -> Option<(ClientReinjectionOutputIdentity, PathSnapshot)> {
         let (original_instance, _) = self
             .request
             .flights
@@ -949,13 +1171,11 @@ impl RequestMultipathController {
             return None;
         }
         let original = context.reliable_path_snapshot_for_instance(original_instance)?;
-        let model = self.data_ack_gap_reinjection_model(context, remotes, frame, lane);
-        let (target, _) = model.reinjection_target?;
+        let (target, alternate) = model.reinjection_target?;
         if !context.relay_path_instance_has_bulk_model_evidence(target.instance) {
             return None;
         }
-        let alternate = context.reliable_path_snapshot_for_instance(target.instance)?;
-        let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
+        let payload_bytes = scoring_payload_bytes;
         let original_score = scheduler::score_path(original, lane, payload_bytes)?;
         let alternate_score = scheduler::score_path(alternate, lane, payload_bytes)?;
         if alternate_score.eta_ms >= original_score.eta_ms {
@@ -968,7 +1188,7 @@ impl RequestMultipathController {
             alternate,
             payload_bytes,
         ))
-        .then_some(target)
+        .then_some((target, alternate))
     }
 
     #[cfg(test)]
@@ -1739,11 +1959,12 @@ impl RequestMultipathController {
         let prepared = self.prepare_relay_path_decision(context, remotes, frame, cause)?;
         if let Some(target) = cause.completion_tail_target() {
             require_active_exact_attachment(remotes, target.instance)?;
-            if self.tail_reinjection_earlier_completion_target(context, remotes, frame, lane)
-                != Some(target)
-            {
-                return Err(RequestMultipathPlanError::OutputUnavailable);
-            }
+            // Decide ranked this exact target with the common frontier M.
+            // Apply may have shrunk the queued frame to F, so repeating that
+            // comparison here would answer a different question and could
+            // discard the already bound winner.  The ordinary planning and
+            // native reservation below still revalidate exact attachment,
+            // owner avoidance, current Product headroom, and queue capacity.
         }
         let scoring_payload_bytes = reliable_stream_frame_accounted_bytes(frame);
         let observe_bulk_admission = prepared.unique_data_payload_bytes.is_some()
@@ -2552,17 +2773,17 @@ impl RequestMultipathController {
         })
     }
 
-    pub(super) fn discard_stale_persistent_ack_gap_reinjections(
+    pub(super) fn discard_stale_bound_reinjections(
         &self,
         sender_queue: &mut ReliableRelaySenderQueue,
         remotes: &ReliableRelayRemoteSet,
     ) -> usize {
         let live_instances = remotes.path_instances();
-        sender_queue.discard_stale_persistent_ack_gap_reinjections(|cause| {
+        sender_queue.discard_stale_bound_reinjections(|cause| {
             cause
                 .persistent_client_target()
                 .is_none_or(|target| live_instances.contains(&target))
-                && cause.persistent_server_target().is_none()
+                && cause.server_bound_target().is_none()
         })
     }
 
@@ -2704,6 +2925,28 @@ impl RequestMultipathController {
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
     ) -> Result<usize, RequestMultipathPlanError> {
+        self.choose_lowest_eta_relay_path_for_extent(
+            context,
+            remotes,
+            frame,
+            lane,
+            cause,
+            avoid_instances,
+            reliable_stream_frame_accounted_bytes(frame),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn choose_lowest_eta_relay_path_for_extent(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: TrafficClass,
+        cause: RelaySendCause,
+        avoid_instances: &[RelayPathInstance],
+        payload_bytes: usize,
+    ) -> Result<usize, RequestMultipathPlanError> {
         let ack_gap_reinjection = cause.is_ack_gap_reinjection();
         let completion_tail_target = cause.completion_tail_target();
         let requires_measured_reinjection_target = cause.is_persistent_ack_gap_reinjection();
@@ -2720,7 +2963,6 @@ impl RequestMultipathController {
             RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
         );
         let requires_distinct_output = live_tail_recovery || ack_gap_reinjection;
-        let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
         let operation_path_in_scope = |path: &ReliableRelayRemotePath| {
             !self
                 .request

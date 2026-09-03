@@ -41,6 +41,7 @@ use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, reliable_relay_buffer_len,
     reliable_relay_sender_dispatch_budget, reliable_stream_initial_advertised_window_bytes,
 };
+use crate::model::multipath::{LiveOwnerRecoveryWake, live_owner_recovery_wake};
 use crate::model::timing::{sender_service_retry_delay, transport_pto_from_snapshot};
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::performance::MppPerformanceConfig;
@@ -79,6 +80,22 @@ async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
+}
+
+fn request_live_owner_tail_wake(
+    retained_live_tail: bool,
+    owner_fallback_deadline: Option<Instant>,
+    epoch_deadline: Option<Instant>,
+    observed_at: Instant,
+) -> LiveOwnerRecoveryWake {
+    live_owner_recovery_wake(
+        retained_live_tail
+            .then_some(owner_fallback_deadline)
+            .flatten(),
+        epoch_deadline,
+        0,
+        observed_at,
+    )
 }
 
 fn reliable_relay_client_ack_gap_path_model_wait_active(
@@ -1239,11 +1256,40 @@ where
         } else {
             path_snapshot
         };
+        let retained_request_live_tail = state.progress.last_send_ack.complete()
+            && state.progress.last_send_ack_frontier < send_stream.next_offset()
+            && send_stream.reinjection_bytes() > 0
+            && remotes.path_keys().len() > 1;
+        let live_owner_tail_observed_at = Instant::now();
+        let live_owner_tail_floor_ready = retained_request_live_tail
+            && sender.live_owner_frontier_floor_ready(live_owner_tail_observed_at);
+        let live_owner_tail_optional_credit =
+            sender.reinjection_extra_event_budget_remaining(context.mux_limits);
+        let persistent_product_stall = state
+            .progress
+            .last_product_stall_attempt_at
+            .is_some_and(|attempted_at| attempted_at >= stall_progress_anchor);
         // After source staging drains, `next_offset` is the assigned final
         // offset; racing sooner would put duplicate work ahead of unique data.
-        if !state.endpoint.local_open
+        let completion_tail_candidate = !state.endpoint.local_open
             && sender_queue.data_bytes() == 0
-            && sender.enqueue_completion_tail_reinjection(
+            && retained_request_live_tail;
+        // Arm before exact-target selection: Notify edges are not retained if
+        // the native writer releases capacity between Decide and select.
+        let completion_tail_capacity_wait = completion_tail_candidate
+            .then(|| {
+                arm_carrier_capacity_notifies(
+                    remotes
+                        .paths
+                        .iter()
+                        .flat_map(|path| path.stream.capacity_notifies())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten();
+        let has_completion_tail_capacity_wait = completion_tail_capacity_wait.is_some();
+        let completion_tail_outcome = if completion_tail_candidate {
+            sender.enqueue_completion_tail_reinjection(
                 &mut sender_queue,
                 context,
                 &remotes,
@@ -1253,7 +1299,19 @@ where
                 state.progress.last_send_ack_frontier,
                 request_lane,
             )
-        {
+        } else {
+            Default::default()
+        };
+        let completion_tail_path_model_publication = completion_tail_outcome
+            .waiting_for_path_model_publication
+            .then(|| {
+                context
+                    .arm_path_model_publication(path_model_generation_before_recovery_observation)
+            });
+        let has_completion_tail_path_model_publication =
+            completion_tail_path_model_publication.is_some();
+        if completion_tail_outcome.queued {
+            state.progress.sender_retry_at = None;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "request_completion_tail_reinjection",
@@ -1267,6 +1325,31 @@ where
                 ),
             );
         }
+        if (live_owner_tail_optional_credit > 0 || live_owner_tail_floor_ready)
+            && persistent_product_stall
+            && sender.enqueue_tail_reinjection(
+                &mut sender_queue,
+                context,
+                &remotes,
+                &send_stream,
+                state.progress.last_send_ack.ranges(),
+                state.progress.last_send_ack.complete(),
+                Some(send_stream.next_offset()),
+                state.progress.last_send_ack_frontier,
+                request_lane,
+            )
+        {
+            state.progress.sender_retry_at = None;
+        }
+        let live_owner_tail_wake = request_live_owner_tail_wake(
+            retained_request_live_tail,
+            sender.completion_tail_owner_fallback_deadline(),
+            sender.live_owner_frontier_floor_deadline(),
+            Instant::now(),
+        );
+        let live_owner_tail_reinjection_at = live_owner_tail_wake
+            .deadline
+            .map(tokio::time::Instant::from_std);
         let stall_deadline = reliable_relay_product_stall_deadline(
             stall_progress_anchor,
             state.progress.last_product_stall_attempt_at,
@@ -1300,7 +1383,7 @@ where
             &remotes,
             request_lane,
         );
-        if sender.discard_stale_persistent_ack_gap_reinjections(&mut sender_queue, &remotes) > 0 {
+        if sender.discard_stale_bound_reinjections(&mut sender_queue, &remotes) > 0 {
             state.progress.sender_retry_at = None;
         }
         if sender.discard_resolved_stale_path_reinjections(&mut sender_queue, &remotes) > 0 {
@@ -1617,6 +1700,28 @@ where
                 continue;
             }
             _ = async move {
+                if let Some(wait) = completion_tail_capacity_wait {
+                    wait.await;
+                }
+            }, if completion_tail_outcome.blocked_for_carrier_capacity && has_completion_tail_capacity_wait => {
+                // A due finite tail remains owned by the actor while its exact
+                // alternate is full. Re-evaluate the same frontier when native
+                // capacity is released; no polling clock is introduced.
+                continue;
+            }
+            _ = async move {
+                if let Some(publication) = completion_tail_path_model_publication {
+                    publication.await;
+                }
+            }, if completion_tail_outcome.waiting_for_path_model_publication
+                && has_completion_tail_path_model_publication => {
+                // EOF completion work has horizon zero, so the ordinary
+                // pre-horizon staleness scan cannot own this edge. Re-enter
+                // the exact tail decision when owner/alternate Product
+                // evidence or path availability is published.
+                continue;
+            }
+            _ = async move {
                 if let Some(wait) = request_recovery_capacity_wait {
                     wait.await;
                 }
@@ -1738,6 +1843,12 @@ where
             _ = wait_for_optional_deadline(data_ack_reinjection_at), if data_ack_reinjection_at.is_some() => {
                 // The next loop iteration owns evaluation and preserves the
                 // due retained gap if no target is currently eligible.
+                continue;
+            }
+            _ = wait_for_optional_deadline(live_owner_tail_reinjection_at), if live_owner_tail_reinjection_at.is_some() => {
+                // The immutable shared epoch has elapsed. The next serialized
+                // loop revalidates the retained tail and its exact owners;
+                // mutable product-stall clocks cannot postpone this wake.
                 continue;
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {

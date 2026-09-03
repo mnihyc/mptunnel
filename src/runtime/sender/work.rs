@@ -88,7 +88,7 @@ pub(in crate::runtime) struct PersistentClientAckGapBatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct PersistentServerAckGapBatch {
+pub(in crate::runtime) struct ServerBoundReinjectionBatch {
     pub(in crate::runtime::sender) target: ServerReinjectionOutputIdentity,
     pub(in crate::runtime::sender) expires_at: Instant,
 }
@@ -100,9 +100,10 @@ pub(in crate::runtime) enum RelaySendCause {
     AckGapReinjection,
     PersistentAckGapReinjection,
     PersistentClientAckGapReinjection(PersistentClientAckGapBatch),
-    PersistentServerAckGapReinjection(PersistentServerAckGapBatch),
+    PersistentServerAckGapReinjection(ServerBoundReinjectionBatch),
     TailReinjection,
     CompletionTailReinjection(ClientReinjectionOutputIdentity),
+    ResponseCompletionTailReinjection(ServerBoundReinjectionBatch),
     PathFailureReinjection,
     StalePathReinjection(RelayPathInstance),
     ClientPathFailureReinjection(ClientReinjectionOutputIdentity),
@@ -124,7 +125,9 @@ impl RelaySendCause {
             | Self::PersistentClientAckGapReinjection(_)
             | Self::PersistentServerAckGapReinjection(_) => "persistent_ack_gap_reinjection",
             Self::TailReinjection => "tail_reinjection",
-            Self::CompletionTailReinjection(_) => "completion_tail_reinjection",
+            Self::CompletionTailReinjection(_) | Self::ResponseCompletionTailReinjection(_) => {
+                "completion_tail_reinjection"
+            }
             Self::PathFailureReinjection | Self::ClientPathFailureReinjection(_) => {
                 "path_failure_reinjection"
             }
@@ -143,6 +146,7 @@ impl RelaySendCause {
                 | Self::PersistentServerAckGapReinjection(_)
                 | Self::TailReinjection
                 | Self::CompletionTailReinjection(_)
+                | Self::ResponseCompletionTailReinjection(_)
                 | Self::PathFailureReinjection
                 | Self::StalePathReinjection(_)
                 | Self::ClientPathFailureReinjection(_)
@@ -217,11 +221,12 @@ impl RelaySendCause {
         }
     }
 
-    pub(in crate::runtime::sender) fn persistent_server_target(
+    pub(in crate::runtime::sender) fn server_bound_target(
         self,
     ) -> Option<ServerReinjectionOutputIdentity> {
         match self {
-            Self::PersistentServerAckGapReinjection(batch) => Some(batch.target),
+            Self::PersistentServerAckGapReinjection(batch)
+            | Self::ResponseCompletionTailReinjection(batch) => Some(batch.target),
             _ => None,
         }
     }
@@ -230,30 +235,28 @@ impl RelaySendCause {
     ///
     /// Response path-failure, stale-owner, tail, and ordinary ACK-gap repair
     /// remains target-unbound until response scheduling selects an output.
-    /// Only a persistent server ACK-gap batch carries a pre-commit target.
+    /// Persistent server ACK-gap and response completion-tail batches carry a
+    /// pre-commit target because both already ranked an exact common extent.
     pub(in crate::runtime::sender) fn response_reinjection_target(
         self,
     ) -> Option<ServerReinjectionOutputIdentity> {
-        self.persistent_server_target()
+        self.server_bound_target()
     }
 
-    pub(in crate::runtime::sender) fn persistent_ack_gap_reinjection_expired(
-        self,
-        now: Instant,
-    ) -> bool {
+    pub(in crate::runtime::sender) fn bound_reinjection_expired(self, now: Instant) -> bool {
         match self {
             Self::PersistentClientAckGapReinjection(batch) => now >= batch.expires_at,
             Self::PersistentServerAckGapReinjection(batch) => now >= batch.expires_at,
+            Self::ResponseCompletionTailReinjection(batch) => now >= batch.expires_at,
             _ => false,
         }
     }
 
-    pub(in crate::runtime::sender) fn persistent_ack_gap_reinjection_deadline(
-        self,
-    ) -> Option<Instant> {
+    pub(in crate::runtime::sender) fn bound_reinjection_deadline(self) -> Option<Instant> {
         match self {
             Self::PersistentClientAckGapReinjection(batch) => Some(batch.expires_at),
             Self::PersistentServerAckGapReinjection(batch) => Some(batch.expires_at),
+            Self::ResponseCompletionTailReinjection(batch) => Some(batch.expires_at),
             _ => None,
         }
     }
@@ -273,7 +276,18 @@ impl RelaySendCause {
         target: ServerReinjectionOutputIdentity,
         snapshot: PathSnapshot,
     ) -> Self {
-        Self::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
+        Self::PersistentServerAckGapReinjection(ServerBoundReinjectionBatch {
+            target,
+            expires_at: Instant::now()
+                + reliable_data_retransmission_interval(None, Some(snapshot)),
+        })
+    }
+
+    pub(in crate::runtime) fn response_completion_tail_reinjection(
+        target: ServerReinjectionOutputIdentity,
+        snapshot: PathSnapshot,
+    ) -> Self {
+        Self::ResponseCompletionTailReinjection(ServerBoundReinjectionBatch {
             target,
             expires_at: Instant::now()
                 + reliable_data_retransmission_interval(None, Some(snapshot)),

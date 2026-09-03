@@ -24,6 +24,28 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
 use tokio::sync::{Notify, mpsc};
 
+#[test]
+fn request_live_tail_uses_the_immutable_shared_epoch_as_its_actor_wake() {
+    let observed_at = Instant::now();
+    let epoch_deadline = observed_at + Duration::from_millis(50);
+
+    assert_eq!(
+        request_live_owner_tail_wake(true, None, Some(epoch_deadline), observed_at),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: Some(epoch_deadline),
+        },
+    );
+    assert_eq!(
+        request_live_owner_tail_wake(false, None, Some(epoch_deadline), observed_at),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: None,
+        },
+        "an old stream epoch is not an independent cause without a retained live tail",
+    );
+}
+
 #[derive(Default)]
 struct BlockedLocalDeliveryState {
     accepted: Mutex<Vec<u8>>,

@@ -6,8 +6,9 @@
 use super::state::RequestProductQualificationReceipt;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::work::{
-    CarrierWorkKind, RangeRecoveryState, ambiguous_flight_intervals, flight_interval_bytes,
-    flight_intervals_overlap, split_flight_interval_by_ack,
+    CarrierWorkKind, RangeRecoveryState, ReliableFlightSpan, ReliableLiveOwnerFrontier,
+    ambiguous_flight_intervals, flight_interval_bytes, flight_intervals_overlap,
+    reliable_live_owner_uniform_frontier, split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
     normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
@@ -48,6 +49,35 @@ pub(in crate::runtime) struct RequestFlightLedger {
 }
 
 impl RequestFlightLedger {
+    /// Exact actor-attached live-owner/accepted-copy shape at the lowest
+    /// recovery frontier.  Storage chunk boundaries do not divide the result.
+    pub(in crate::runtime) fn live_owner_uniform_frontier(
+        &self,
+        range: OffsetRange,
+        actor_attached_instances: &[RelayPathInstance],
+    ) -> Option<ReliableLiveOwnerFrontier<RelayPathInstance>> {
+        reliable_live_owner_uniform_frontier(
+            range,
+            self.flights
+                .range(..range.end)
+                .flat_map(|(start, flights)| {
+                    flights.iter().filter_map(move |flight| {
+                        (flight.end > range.start
+                            && actor_attached_instances.contains(&flight.instance))
+                        .then_some(ReliableFlightSpan {
+                            range: OffsetRange {
+                                start: *start,
+                                end: flight.end,
+                            },
+                            identity: flight.instance,
+                            kind: flight.kind,
+                            sent_at: flight.sent_at,
+                        })
+                    })
+                }),
+        )
+    }
+
     /// One retained OriginalData range for a non-owning requalification copy.
     ///
     /// The owner need not itself be Qualified: when every attachment is stale,

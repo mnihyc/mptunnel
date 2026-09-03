@@ -7,16 +7,22 @@
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReliableAckGapReinjectionProgress,
     ReliablePathStalenessObservation, ReliableRequestPathStaleness, begin_reliable_stream_ack,
-    stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
+    exact_contiguous_retransmission_frames, normalized_stream_ack_first_gap,
+    preserve_reinjection_frontier_quantum, stream_ack_ranges_expose_authoritative_gap,
     update_reinjection_authoritative_ack_snapshot,
 };
 use super::lifecycle::RelayAdditionalPathOpenTask;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
+use crate::model::multipath::live_owner_gap_recovery_wake;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::timing::reliable_data_ack_gap_timing;
-use crate::model::work::{ReliableReinjectionTargetWork, reliable_reinjection_service_limit_bytes};
+use crate::model::timing::reliable_data_retransmission_interval;
+use crate::model::work::{
+    ReliableReinjectionTargetWork, flight_interval_bytes,
+    reliable_live_frontier_reinjection_limit_bytes, reliable_live_gap_reinjection_authority,
+    reliable_reinjection_service_limit_bytes,
+};
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
 use crate::protocol::{OffsetRange, StreamId};
@@ -549,6 +555,15 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     }
     let base_reinjection_limit =
         adaptive_reliable_relay_reinjection_bytes(path_snapshot, relay_lane, context.mux_limits);
+    if base_reinjection_limit == 0
+        || context.mux_limits.max_repair_bytes == 0
+        || context.mux_limits.max_path_flight_bytes == 0
+    {
+        return ClientDataAckReinjectionOutcome {
+            has_multipath_alternative: has_multipath_reinjection_alternative,
+            ..ClientDataAckReinjectionOutcome::default()
+        };
+    }
     let reinjection_event_budget =
         sender.reinjection_extra_event_budget_remaining(context.mux_limits);
     let reinjection = sender.data_ack_gap_reinjection_model(
@@ -564,19 +579,38 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     let original_path_timing = reinjection.original_path_timing;
     let reinjection_target = reinjection.reinjection_target;
     let has_measured_reinjection_target = reinjection_target.is_some();
+    let target_reinjection_quantum =
+        reinjection_target.map_or(base_reinjection_limit, |(_, snapshot)| {
+            adaptive_reliable_relay_reinjection_bytes(
+                Some(snapshot),
+                relay_lane,
+                context.mux_limits,
+            )
+        });
+    let frontier_extent = normalized_stream_ack_first_gap(authoritative_ack_ranges)
+        .map_or(0, |(start, end)| flight_interval_bytes(start, end))
+        .min(reinjection.uniform_frontier_extent_bytes);
+    let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
+        target_reinjection_quantum,
+        base_reinjection_limit,
+        frontier_extent,
+        send_stream.reinjection_bytes(),
+        context.mux_limits,
+    );
+    if reinjection_target.is_some() && frontier_limit == 0 {
+        return ClientDataAckReinjectionOutcome {
+            has_multipath_alternative: has_multipath_reinjection_alternative,
+            has_measured_target: true,
+            target_service_exhausted: reinjection.target_service_exhausted,
+            ..ClientDataAckReinjectionOutcome::default()
+        };
+    }
     let ack_gap_original_underlay = original_path_timing
         .map(|snapshot| snapshot.underlay)
-        .or(reinjection.original_underlay)
-        .or(path_snapshot.map(|snapshot| snapshot.underlay));
+        .or(reinjection.original_underlay);
     let observed_at = Instant::now();
     let observed_gap_timing = has_live_original_path
-        .then(|| {
-            reliable_data_ack_gap_timing(
-                reinjection.original_assignment_at,
-                ack_gap_original_underlay,
-                original_path_timing,
-            )
-        })
+        .then_some(reinjection.owner_recovery_timing)
         .flatten();
     let candidate_gap_deadline = state.progress.ack_gap_reinjection.observe_recovery_timing(
         authoritative_ack_complete,
@@ -601,7 +635,14 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     // its full measured target service window remains subject to the sender's
     // cumulative optional-reinjection credit. Missing, failed, or
     // declared-stale owners retain their separate exact-range recovery.
-    let reinjection_limit = if reinjection.target_service_exhausted {
+    let owner_recovery_deadline = state
+        .progress
+        .ack_gap_reinjection
+        .original_owner_recovery_deadline();
+    let owner_recovery_ready =
+        owner_recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
+    let live_owner_frontier_floor_ready = sender.live_owner_frontier_floor_ready(observed_at);
+    let target_service_limit = if reinjection.target_service_exhausted {
         0
     } else if persistent_ack_gap_reinjection_ready {
         let (target, snapshot) =
@@ -614,10 +655,29 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             send_stream.reinjection_bytes(),
             context.mux_limits,
         )
-        .min(reinjection_event_budget)
     } else {
-        base_reinjection_limit.min(reinjection_event_budget)
+        base_reinjection_limit
     };
+    let (reinjection_limit, critical_frontier_reinjection) = if ack_gap_reinjection_ready {
+        reliable_live_gap_reinjection_authority(
+            target_service_limit,
+            reinjection_event_budget,
+            frontier_limit,
+            persistent_ack_gap_reinjection_ready && owner_recovery_ready,
+            live_owner_frontier_floor_ready,
+        )
+    } else {
+        // Optional credit funds a copy only after the retained completion
+        // cause T_c. It changes the service branch, not the temporal
+        // authority to race a still-live native owner.
+        (0, false)
+    };
+    let reinjection_retry_after = reinjection_target.map_or_else(
+        || reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing),
+        |(_, snapshot)| {
+            reliable_data_retransmission_interval(Some(snapshot.underlay), Some(snapshot))
+        },
+    );
     let ack_gap_reinjection_cause = if persistent_ack_gap_reinjection_ready {
         let (target, snapshot) =
             reinjection_target.expect("persistent reinjection requires a measured path");
@@ -625,20 +685,25 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     } else {
         RelaySendCause::AckGapReinjection
     };
-    let reinjection_frames = stream_ack_gap_reinjection_frames_normalized(
-        send_stream,
-        authoritative_ack_ranges,
-        reinjection_limit,
-        base_reinjection_limit,
-        authoritative_ack_complete,
-        has_multipath_reinjection_alternative,
-        persistent_ack_gap_reinjection_ready,
-    );
+    let reinjection_frames = normalized_stream_ack_first_gap(authoritative_ack_ranges)
+        .and_then(|(frontier, _)| {
+            let applied_extent = reinjection_limit.min(reinjection.uniform_frontier_extent_bytes);
+            exact_contiguous_retransmission_frames(
+                send_stream,
+                OffsetRange {
+                    start: frontier,
+                    end: frontier.saturating_add(applied_extent as u64),
+                },
+            )
+        })
+        .map(|frames| preserve_reinjection_frontier_quantum(frames, frontier_limit))
+        .unwrap_or_default();
     let frame_count = reinjection_frames.len();
     let persistent_ack_gap_reinjection =
         persistent_ack_gap_reinjection_ready && !reinjection_frames.is_empty();
     let mut accepted_copy_deadline = None::<Instant>;
-    for (frame_index, frame) in reinjection_frames.into_iter().enumerate() {
+    let mut accepted_live_owner_reinjection = false;
+    for frame in reinjection_frames {
         let live_copy_deadline = sender.reinjection_suppression_deadline_for_frame(&frame, remotes);
         accepted_copy_deadline = match (accepted_copy_deadline, live_copy_deadline) {
             (Some(current), Some(deadline)) => Some(current.min(deadline)),
@@ -649,6 +714,13 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             || sender_queue.has_queued_reinjection_overlap(&frame)
         {
             false
+        } else if critical_frontier_reinjection {
+            sender.enqueue_critical_reinjection_frame(
+                sender_queue,
+                frame,
+                ack_gap_reinjection_cause,
+            );
+            true
         } else if persistent_ack_gap_reinjection {
             sender.enqueue_reinjection_frame_with_priority(
                 sender_queue,
@@ -675,9 +747,22 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             ),
         );
         if queued {
+            accepted_live_owner_reinjection = true;
             state.progress.sender_retry_at = None;
-        } else if frame_index == 0 {
+        } else {
             break;
+        }
+    }
+    if accepted_live_owner_reinjection {
+        // L/D/target/F were fixed by the observation above; acceptance is the
+        // linearization point for the temporal token.  An optional-credit
+        // batch before fallback leaves G open, while a boundary-crossing batch
+        // consumes it and prevents an immediate second floor batch.
+        let accepted_at = Instant::now();
+        if owner_recovery_deadline.is_some_and(|deadline| accepted_at >= deadline)
+            && sender.live_owner_frontier_floor_ready(accepted_at)
+        {
+            sender.record_live_owner_frontier_floor_attempt(accepted_at, reinjection_retry_after);
         }
     }
     let timer_active = stream_ack_ranges_expose_authoritative_gap(
@@ -689,15 +774,21 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             .ack_gap_reinjection
             .next_reinjection_deadline()
             .is_some();
-    let next_deadline = state
-        .progress
-        .ack_gap_reinjection
-        .next_reinjection_deadline();
-    let candidate_wake = timer_active
-        .then_some(next_deadline)
-        .flatten()
-        .filter(|deadline| *deadline > observed_at)
-        .map(tokio::time::Instant::from_std);
+    let live_owner_wake = if timer_active {
+        live_owner_gap_recovery_wake(
+            state
+                .progress
+                .ack_gap_reinjection
+                .next_reinjection_deadline(),
+            owner_recovery_deadline,
+            reinjection_event_budget,
+            sender.live_owner_frontier_floor_deadline(),
+            observed_at,
+        )
+    } else {
+        Default::default()
+    };
+    let candidate_wake = live_owner_wake.deadline.map(tokio::time::Instant::from_std);
     let accepted_copy_wake = accepted_copy_deadline.map(tokio::time::Instant::from_std);
     state.progress.data_ack_reinjection_at =
         candidate_wake.into_iter().chain(accepted_copy_wake).min();
@@ -753,11 +844,15 @@ pub(super) fn apply_client_stream_ack(
     for instance in ack_outcome.idle_original_data_instances.iter().copied() {
         remotes.depublish_path_instance_load(instance);
     }
+    let previous_ack_frontier = state.progress.last_send_ack_frontier;
     update_reinjection_authoritative_ack_snapshot(
         &mut state.progress.last_send_ack,
         &validated_ack,
     );
     state.progress.last_send_ack_frontier = send_stream.data_ack_frontier();
+    if state.progress.last_send_ack_frontier > previous_ack_frontier {
+        sender.record_live_owner_data_ack_frontier_progress(Instant::now());
+    }
     let data_ack_progress_paths = ack_outcome.data_ack_progress_paths;
     let ack = ack_outcome.mux;
     sender_queue.release_normalized_acked_reinjections(normalized_ranges);

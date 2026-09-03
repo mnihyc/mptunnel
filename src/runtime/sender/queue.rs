@@ -309,13 +309,13 @@ impl ReliableRelaySenderQueue {
         }
     }
 
-    pub(super) fn persistent_ack_gap_reinjection_deadline(&self) -> Option<Instant> {
+    pub(super) fn bound_reinjection_deadline(&self) -> Option<Instant> {
         self.critical_reinjection
             .iter()
             .chain(self.reinjection.iter())
             .filter_map(|work| match &work.kind {
                 ReliableRelayQueuedWorkKind::Reinjection { cause, .. } => {
-                    cause.persistent_ack_gap_reinjection_deadline()
+                    cause.bound_reinjection_deadline()
                 }
                 _ => None,
             })
@@ -369,21 +369,18 @@ impl ReliableRelaySenderQueue {
         released
     }
 
-    pub(in crate::runtime) fn discard_stale_persistent_ack_gap_reinjections(
+    pub(in crate::runtime) fn discard_stale_bound_reinjections(
         &mut self,
         usable: impl Fn(RelaySendCause) -> bool,
     ) -> usize {
         let now = Instant::now();
-        let released = discard_stale_persistent_ack_gap_reinjection_queue(
-            &mut self.critical_reinjection,
-            now,
-            &usable,
-        )
-        .saturating_add(discard_stale_persistent_ack_gap_reinjection_queue(
-            &mut self.reinjection,
-            now,
-            &usable,
-        ));
+        let released =
+            discard_stale_bound_reinjection_queue(&mut self.critical_reinjection, now, &usable)
+                .saturating_add(discard_stale_bound_reinjection_queue(
+                    &mut self.reinjection,
+                    now,
+                    &usable,
+                ));
         self.bytes = self.bytes.saturating_sub(released);
         released
     }
@@ -573,7 +570,9 @@ fn discard_unusable_tail_reinjection_queue(
         };
         let tail_reinjection = matches!(
             cause,
-            RelaySendCause::TailReinjection | RelaySendCause::CompletionTailReinjection(_)
+            RelaySendCause::TailReinjection
+                | RelaySendCause::CompletionTailReinjection(_)
+                | RelaySendCause::ResponseCompletionTailReinjection(_)
         );
         let keep = !tail_reinjection || usable(frame);
         if !keep {
@@ -584,7 +583,7 @@ fn discard_unusable_tail_reinjection_queue(
     released
 }
 
-fn discard_stale_persistent_ack_gap_reinjection_queue(
+fn discard_stale_bound_reinjection_queue(
     queue: &mut VecDeque<ReliableRelayQueuedWork>,
     now: Instant,
     usable: &impl Fn(RelaySendCause) -> bool,
@@ -594,12 +593,8 @@ fn discard_stale_persistent_ack_gap_reinjection_queue(
         let ReliableRelayQueuedWorkKind::Reinjection { cause, .. } = &work.kind else {
             return true;
         };
-        let bound = matches!(
-            cause,
-            RelaySendCause::PersistentClientAckGapReinjection(_)
-                | RelaySendCause::PersistentServerAckGapReinjection(_)
-        );
-        let keep = !bound || (!cause.persistent_ack_gap_reinjection_expired(now) && usable(*cause));
+        let bound = cause.bound_reinjection_deadline().is_some();
+        let keep = !bound || (!cause.bound_reinjection_expired(now) && usable(*cause));
         if !keep {
             released = released.saturating_add(work.payload_bytes);
         }

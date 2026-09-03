@@ -4,7 +4,7 @@ use crate::mux::stream::{
     ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
     validate_stream_ack,
 };
-use crate::protocol::frame::normalize_offset_ranges;
+use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
@@ -188,12 +188,38 @@ pub(in crate::runtime) fn stream_ack_gap_reinjection_frames_normalized(
     }
 }
 
+/// Builds only the exact lowest omitted Product extent. This is the bounded
+/// liveness floor; a larger persistent-gap service window is produced by the
+/// separate helper above after this frontier wins admission.
+pub(in crate::runtime) fn stream_ack_gap_frontier_reinjection_frames_normalized(
+    send_stream: &ReliableSendStream,
+    ranges: &[OffsetRange],
+    byte_limit: usize,
+    complete: bool,
+    has_multipath_reinjection_alternative: bool,
+    ack_gap_reinjection_ready: bool,
+) -> Vec<Frame> {
+    if !stream_ack_ranges_expose_authoritative_gap(complete, ranges)
+        || !stream_ack_gap_reinjection_allowed(
+            complete,
+            has_multipath_reinjection_alternative,
+            ack_gap_reinjection_ready,
+        )
+    {
+        return Vec::new();
+    }
+    let Some((start, end)) = normalized_stream_ack_first_gap(ranges) else {
+        return Vec::new();
+    };
+    send_stream.retransmission_frames_for_ranges(&[OffsetRange { start, end }], byte_limit)
+}
+
 /// Keeps recovery observe/decide/apply on the same lowest-missing quantum.
 ///
 /// Persistent recovery may fill a larger target service window after target
 /// selection. Regenerating that window must not coalesce the first range past
 /// the payload extent whose completion selected and authorized the target.
-fn preserve_reinjection_frontier_quantum(
+pub(in crate::runtime) fn preserve_reinjection_frontier_quantum(
     frames: Vec<Frame>,
     frontier_frame_limit: usize,
 ) -> Vec<Frame> {
@@ -224,6 +250,31 @@ fn preserve_reinjection_frontier_quantum(
     }
     preserved.extend(frames);
     preserved
+}
+
+/// Returns the cached frames for one exact contiguous Product range, or fails
+/// closed if retained cache coverage has any hole.
+///
+/// Frame boundaries are storage details: callers score the requested byte
+/// extent, then use the real first frame only as the native enqueue witness.
+pub(in crate::runtime) fn exact_contiguous_retransmission_frames(
+    send_stream: &ReliableSendStream,
+    range: OffsetRange,
+) -> Option<Vec<Frame>> {
+    if range.is_empty() {
+        return None;
+    }
+    let byte_limit = usize::try_from(range.end.saturating_sub(range.start)).ok()?;
+    let frames = send_stream.retransmission_frames_for_ranges(&[range], byte_limit);
+    let mut cursor = range.start;
+    for frame in &frames {
+        let (start, end, _) = reliable_stream_frame_extent(frame)?;
+        if start != cursor || end > range.end || start >= end {
+            return None;
+        }
+        cursor = end;
+    }
+    (cursor == range.end).then_some(frames)
 }
 
 pub(in crate::runtime) fn stream_final_offset_tail_reinjection_frames_normalized(
@@ -516,6 +567,10 @@ impl ReliableAckGapReinjectionProgress {
         self.candidate_deadline
     }
 
+    pub(in crate::runtime) fn original_owner_recovery_deadline(&self) -> Option<Instant> {
+        self.fallback_at
+    }
+
     fn clear(&mut self) {
         self.first_gap_start = None;
         self.original_assignment_at = None;
@@ -549,7 +604,7 @@ impl ReliableAckGapReinjectionProgress {
     }
 }
 
-pub(super) fn normalized_stream_ack_first_gap(
+pub(in crate::runtime) fn normalized_stream_ack_first_gap(
     normalized_ranges: &[OffsetRange],
 ) -> Option<(u64, u64)> {
     debug_assert!(
@@ -571,6 +626,34 @@ pub(super) fn normalized_stream_ack_first_gap(
         cursor = range.end;
     }
     None
+}
+
+/// Returns the exact lowest Product interval omitted below a known horizon.
+/// Unlike an interior ACK gap, a final retained suffix is authoritative once
+/// the stream's final offset is known.
+pub(super) fn normalized_stream_ack_first_uncovered_extent(
+    normalized_ranges: &[OffsetRange],
+    horizon: u64,
+) -> Option<(u64, u64)> {
+    debug_assert!(
+        normalized_ranges
+            .windows(2)
+            .all(|ranges| ranges[0].end < ranges[1].start)
+    );
+    let mut cursor = 0_u64;
+    for range in normalized_ranges {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start > cursor {
+            return (cursor < horizon).then_some((cursor, range.start.min(horizon)));
+        }
+        cursor = range.end.min(horizon);
+        if cursor >= horizon {
+            return None;
+        }
+    }
+    (cursor < horizon).then_some((cursor, horizon))
 }
 
 pub(in crate::runtime) fn resize_reliable_relay_buffer(

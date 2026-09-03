@@ -6,7 +6,7 @@
 use super::ResponseOutputIdentity;
 use super::multipath::ResponseDataDispatchTarget;
 use super::response_reinjection_avoid_outputs;
-use super::scheduling::{response_completion_snapshot, select_response_frame_path};
+use super::scheduling::{response_completion_snapshot, select_response_frame_path_for_extent};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
@@ -37,6 +37,9 @@ pub(super) struct ResponseReinjectionServiceModel<'a> {
     pub(super) queue: &'a ReliableRelaySenderQueue,
     pub(super) exclude_front_work: bool,
     pub(super) reinjection_debt_bytes: usize,
+    /// Native dispatch needs the whole already-serialized frame. Decide only
+    /// needs a positive target window because Apply may shrink its preview.
+    pub(super) require_full_frame: bool,
 }
 
 fn response_reinjection_target_has_service_credit(
@@ -52,7 +55,7 @@ fn response_reinjection_target_has_service_credit(
         key: target.observation.key,
         incarnation: target.observation.incarnation,
     };
-    reliable_reinjection_service_limit_bytes(
+    let available = reliable_reinjection_service_limit_bytes(
         ReliableReinjectionTargetWork::new(
             Some(response_completion_snapshot(target)),
             service_model
@@ -65,7 +68,12 @@ fn response_reinjection_target_has_service_credit(
         ),
         payload_bytes.min(service_model.reinjection_debt_bytes),
         binding.mux_limits(),
-    ) >= payload_bytes
+    );
+    if service_model.require_full_frame {
+        available >= payload_bytes
+    } else {
+        available > 0
+    }
 }
 
 pub(super) fn select_switchable_response_target(
@@ -77,13 +85,36 @@ pub(super) fn select_switchable_response_target(
     reinjection_cause: Option<RelaySendCause>,
     reinjection_service_model: Option<ResponseReinjectionServiceModel<'_>>,
 ) -> Option<ResponseSenderPathTarget> {
+    select_switchable_response_target_for_extent(
+        stream,
+        lane,
+        frame,
+        emit_mode,
+        avoid_outputs,
+        reinjection_cause,
+        reinjection_service_model,
+        reliable_stream_frame_accounted_bytes(frame),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_switchable_response_target_for_extent(
+    stream: &ReliablePathStream,
+    lane: TrafficClass,
+    frame: &Frame,
+    emit_mode: CarrierEmitMode,
+    avoid_outputs: &[ResponseOutputIdentity],
+    reinjection_cause: Option<RelaySendCause>,
+    reinjection_service_model: Option<ResponseReinjectionServiceModel<'_>>,
+    scoring_payload_bytes: usize,
+) -> Option<ResponseSenderPathTarget> {
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         return None;
     };
     let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
     let mut exhausted_outputs = Vec::<ResponseOutputIdentity>::new();
     loop {
-        let targets = binding.sender_path_targets(lane, payload_bytes);
+        let targets = binding.sender_path_targets(lane, scoring_payload_bytes);
         if targets.is_empty() {
             return None;
         }
@@ -97,13 +128,14 @@ pub(super) fn select_switchable_response_target(
         if targets.is_empty() {
             return None;
         }
-        let target = select_response_frame_path(
+        let target = select_response_frame_path_for_extent(
             &targets,
             lane,
             frame,
             emit_mode,
             avoid_outputs,
             reinjection_cause,
+            scoring_payload_bytes,
         )?;
         if matches!(frame, Frame::StreamData { .. })
             && let Some(service_model) = reinjection_service_model
@@ -384,6 +416,7 @@ pub(super) fn emit_response_frame_from_sender_service(
                             lane,
                             queued_reinjection_bytes,
                             service_model.reinjection_debt_bytes,
+                            reinjection_cause.and_then(RelaySendCause::bound_reinjection_deadline),
                         )
                         .map(Some)
                 } else {

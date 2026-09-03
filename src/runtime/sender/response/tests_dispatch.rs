@@ -205,6 +205,7 @@ fn fixed_reinjection_remains_charged_after_queue_drain_until_data_ack() {
                 queue: &queue,
                 exclude_front_work: false,
                 reinjection_debt_bytes: 1,
+                require_full_frame: true,
             }),
         )
     };
@@ -437,6 +438,7 @@ fn reinjection_prefers_a_path_without_the_original_range() {
             queue: &queue,
             exclude_front_work: false,
             reinjection_debt_bytes: 4096,
+            require_full_frame: true,
         }),
     )
     .expect("alternate accepts reinjection");
@@ -515,6 +517,7 @@ fn timer_expiry_does_not_retry_an_unresolved_range_on_the_same_outputs() {
             queue: &queue,
             exclude_front_work: false,
             reinjection_debt_bytes: 4096,
+            require_full_frame: true,
         }),
     );
 
@@ -578,6 +581,7 @@ fn timer_expiry_can_move_unresolved_repair_to_a_different_exact_output() {
             queue: &queue,
             exclude_front_work: false,
             reinjection_debt_bytes: 4096,
+            require_full_frame: true,
         }),
     )
     .expect("a distinct exact output remains eligible after the recovery interval");

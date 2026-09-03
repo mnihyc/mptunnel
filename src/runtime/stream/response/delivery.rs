@@ -15,8 +15,10 @@ use crate::model::requalification::StreamPathQualification;
 use crate::model::response::CarrierPathFlightDebt;
 use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::{
-    CarrierWorkKind, RangeRecoveryState, ReliableReinjectionTargetWork, ambiguous_flight_intervals,
-    flight_interval_bytes, reliable_reinjection_service_limit_bytes, split_flight_interval_by_ack,
+    CarrierWorkKind, RangeRecoveryState, ReliableFlightSpan, ReliableLiveOwnerFrontier,
+    ReliableReinjectionTargetWork, ambiguous_flight_intervals, flight_interval_bytes,
+    reliable_live_owner_uniform_frontier, reliable_reinjection_service_limit_bytes,
+    split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
     normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_accounted_bytes,
@@ -1220,6 +1222,7 @@ impl ResponseStreamBinding {
         lane: TrafficClass,
         queued_reinjection_bytes: usize,
         reinjection_debt_bytes: usize,
+        bound_expires_at: Option<Instant>,
     ) -> Result<Instant, RuntimeError> {
         self.try_enqueue_reinjected_frame_for_target_with_after_reserve(
             target,
@@ -1227,6 +1230,7 @@ impl ResponseStreamBinding {
             lane,
             queued_reinjection_bytes,
             reinjection_debt_bytes,
+            bound_expires_at,
             || {},
         )
     }
@@ -1238,6 +1242,7 @@ impl ResponseStreamBinding {
         lane: TrafficClass,
         queued_reinjection_bytes: usize,
         reinjection_debt_bytes: usize,
+        bound_expires_at: Option<Instant>,
         after_reserve: impl FnOnce(),
     ) -> Result<Instant, RuntimeError> {
         if !self.response_stream_open.load(Ordering::Acquire) {
@@ -1318,6 +1323,9 @@ impl ResponseStreamBinding {
             let suppression_interval =
                 reliable_data_retransmission_interval(Some(target.key.underlay), Some(snapshot));
             let accepted_at = Instant::now();
+            if bound_expires_at.is_some_and(|deadline| accepted_at >= deadline) {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
             self.record_product_flight_with_outputs(
                 &mut outputs,
                 target.key,
@@ -1611,6 +1619,56 @@ impl ResponseStreamBinding {
         // Product DataACK or exact terminal detach—not a native retry timer—
         // releases one target incarnation from same-range avoidance.
         self.all_flight_outputs_overlapping_frame(frame)
+    }
+
+    /// Exact active-or-draining live-owner/accepted-copy shape at the lowest
+    /// recovery frontier.  Output incarnation is part of the identity, so a
+    /// reconnect cannot inherit an older generation's ownership.
+    pub(in crate::runtime) fn live_owner_uniform_frontier(
+        &self,
+        range: OffsetRange,
+    ) -> Option<ReliableLiveOwnerFrontier<ServerReinjectionOutputIdentity>> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let actor_attached_outputs = outputs
+            .entries
+            .iter()
+            .chain(outputs.detaching.iter())
+            .map(|entry| ServerReinjectionOutputIdentity {
+                key: entry.key,
+                incarnation: entry.incarnation,
+            })
+            .collect::<Vec<_>>();
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        let frontier = reliable_live_owner_uniform_frontier(
+            range,
+            flights.range(..range.end).flat_map(|(start, flights)| {
+                flights.iter().filter_map(|flight| {
+                    let identity = ServerReinjectionOutputIdentity {
+                        key: flight.key,
+                        incarnation: flight.output_incarnation,
+                    };
+                    (flight.end > range.start && actor_attached_outputs.contains(&identity))
+                        .then_some(ReliableFlightSpan {
+                            range: OffsetRange {
+                                start: *start,
+                                end: flight.end,
+                            },
+                            identity,
+                            kind: flight.kind,
+                            sent_at: flight.sent_at,
+                        })
+                })
+            }),
+        );
+        drop(flights);
+        drop(outputs);
+        frontier
     }
 
     fn all_flight_outputs_overlapping_frame(&self, frame: &Frame) -> Vec<(CarrierPathKey, u64)> {

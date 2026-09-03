@@ -5,6 +5,7 @@ use crate::model::path::CarrierPathKey;
 use crate::model::timing::{ReliableDataAckGapTiming, transport_pto_from_snapshot};
 use crate::mux::stream::validate_stream_ack;
 use crate::outbound::OutboundConfig;
+use crate::performance::ResourceLimits;
 use crate::product::{
     EgressAction, InboundId, InitialDemand, RouteAction, RouteMatchSpec, RouteRuleSpec, RouteStage,
     RuleId,
@@ -68,6 +69,69 @@ fn server_ack_gap_timer_uses_the_evaluation_epoch() {
         server_ack_gap_timer_deadline(Some(deadline), deadline),
         None,
         "a deadline already due at evaluation belongs to the current evaluation rather than a new timer",
+    );
+}
+
+#[test]
+fn live_owner_wake_requires_both_cause_and_shared_epoch_without_losing_due_state() {
+    let observed_at = Instant::now();
+    let cause_deadline = tokio::time::Instant::from_std(observed_at + Duration::from_millis(10));
+    let epoch_deadline = observed_at + Duration::from_millis(20);
+
+    assert_eq!(
+        server_live_owner_recovery_wake(Some(cause_deadline), Some(epoch_deadline), 0, observed_at,),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: Some(epoch_deadline),
+        },
+        "live-owner eligibility is the conjunction of the cause clock and shared epoch",
+    );
+    assert_eq!(
+        server_live_owner_recovery_wake(
+            Some(cause_deadline),
+            Some(epoch_deadline),
+            0,
+            observed_at + Duration::from_millis(15),
+        ),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: Some(epoch_deadline),
+        },
+        "an accepted live-owner attempt retains the already-due cause and wakes exactly at its immutable successor epoch",
+    );
+
+    let due_at = observed_at + Duration::from_millis(30);
+    assert_eq!(
+        server_live_owner_recovery_wake(Some(cause_deadline), Some(epoch_deadline), 0, due_at),
+        LiveOwnerRecoveryWake {
+            due: true,
+            deadline: None,
+        },
+        "a due epoch remains an explicit evaluation fact instead of disappearing with its past timer",
+    );
+    assert_eq!(
+        server_live_owner_recovery_wake(None, Some(epoch_deadline), 0, due_at),
+        LiveOwnerRecoveryWake {
+            due: false,
+            deadline: None,
+        },
+        "the shared epoch is only a gate and cannot wake without a retained recovery cause",
+    );
+}
+
+#[test]
+fn optional_live_owner_service_does_not_wait_for_the_frontier_floor_epoch() {
+    let observed_at = Instant::now();
+    let due_cause = tokio::time::Instant::from_std(observed_at - Duration::from_millis(1));
+    let epoch_deadline = observed_at + Duration::from_millis(20);
+
+    assert_eq!(
+        server_live_owner_recovery_wake(Some(due_cause), Some(epoch_deadline), 1, observed_at),
+        LiveOwnerRecoveryWake {
+            due: true,
+            deadline: Some(epoch_deadline),
+        },
+        "cumulative optional credit remains usable while the over-credit floor token is closed",
     );
 }
 
@@ -1475,6 +1539,8 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
             optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
+        Some(Instant::now()),
+        Some(Instant::now()),
         128,
     );
     assert_eq!(outcome.queued, 1);
@@ -1543,7 +1609,7 @@ fn sparse_authoritative_ack_reinjects_the_lowest_live_path_gap() {
         binding.attach(
             reinjection_key.underlay,
             reinjection_key.path_id,
-            reinjection_commands,
+            reinjection_commands.clone(),
             TrafficClass::Latency,
         ),
         ResponseStreamAttachOutcome::Attached
@@ -2864,7 +2930,7 @@ fn live_original_without_data_ack_waits_for_authoritative_gap() {
         binding.attach(
             reinjection_key.underlay,
             reinjection_key.path_id,
-            reinjection_commands,
+            reinjection_commands.clone(),
             TrafficClass::Throughput,
         ),
         ResponseStreamAttachOutcome::Attached
@@ -3202,6 +3268,101 @@ fn failed_original_tail_reinjection_does_not_duplicate_queued_reinjection_range(
         "already queued ReinjectedData should count as a pending reinjection attempt so the tail timer backs off"
     );
     assert_eq!(response_sender.bytes(), queued_bytes_after_first);
+}
+
+#[test]
+fn failed_original_tail_scan_skips_an_overlapped_range_but_repairs_a_later_range() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(229);
+    let failed_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let surviving_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (failed_commands, _failed_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(229),
+        failed_key.underlay,
+        failed_key.path_id,
+        failed_commands.clone(),
+        TrafficClass::Throughput,
+    );
+    let (surviving_commands, _surviving_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            surviving_key.underlay,
+            surviving_key.path_id,
+            surviving_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: surviving_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let first = send_stream
+        .prepare_data(Bytes::from(vec![0x41; 64]))
+        .expect("prepare first failed range");
+    send_stream
+        .commit_prepared_data(&first)
+        .expect("commit first failed range");
+    let middle = send_stream
+        .prepare_data(Bytes::from(vec![0x42; 64]))
+        .expect("prepare surviving range");
+    send_stream
+        .commit_prepared_data(&middle)
+        .expect("commit surviving range");
+    let later = send_stream
+        .prepare_data(Bytes::from(vec![0x43; 64]))
+        .expect("prepare later failed range");
+    send_stream
+        .commit_prepared_data(&later)
+        .expect("commit later failed range");
+    binding.record_original_flight(failed_key, &first);
+    binding.record_original_flight(surviving_key, &middle);
+    binding.record_original_flight(failed_key, &later);
+    binding.detach(failed_key, &failed_commands);
+
+    let mut response_sender = ServerResponseSenderService::new(SessionId(229), stream_id);
+    response_sender.enqueue_critical_reinjection_frame_with_cause(
+        first,
+        RelaySendCause::PathFailureReinjection,
+    );
+    let queued_before = response_sender.bytes();
+    let outcome = enqueue_reliable_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        stream_id,
+        &send_stream,
+        &[],
+        false,
+        None,
+        TrafficClass::Throughput,
+        limits,
+        MppPerformanceConfig::default(),
+        path_stream.max_frame_payload_bytes,
+        0,
+    );
+
+    assert_eq!(outcome.queued, 1);
+    assert!(outcome.pending);
+    assert_eq!(
+        response_sender.bytes(),
+        queued_before + 64,
+        "an overlap in the first failed range cannot suppress disjoint later failed-owner repair",
+    );
 }
 
 #[test]
@@ -3602,6 +3763,14 @@ async fn live_tail_reinjection_uses_repair_headroom_before_new_data() {
         },
     );
     response_sender.record_delivered_data(1024);
+    let optional_budget = response_sender.reinjection_extra_event_budget_remaining(limits);
+    assert!(optional_budget > 0);
+    response_sender.record_reinjection_for_test(optional_budget);
+    assert_eq!(
+        response_sender.reinjection_extra_event_budget_remaining(limits),
+        0,
+        "fixture must distinguish critical live-tail authority from optional repair credit",
+    );
     response_sender.enqueue_data_for_lane(
         Bytes::from_static(b"new response data"),
         TrafficClass::Throughput,
@@ -3787,7 +3956,7 @@ async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_repair_
 }
 
 #[tokio::test]
-async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit() {
+async fn live_owner_final_tail_does_not_become_path_failure_when_alternate_lacks_credit() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(125);
     let original_key = CarrierPathKey {
@@ -3806,7 +3975,7 @@ async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit()
         original_commands,
         TrafficClass::Latency,
     );
-    let (reinjection_commands, _reinjection_receivers) = reliable_path_command_channels(1);
+    let (reinjection_commands, mut reinjection_receivers) = reliable_path_command_channels(1);
     let reinjection_commands_for_fill = reinjection_commands.clone();
     assert_eq!(
         binding.attach(
@@ -3837,7 +4006,13 @@ async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit()
         .commit_prepared_data(&frame)
         .expect("commit original-transmission path data");
     binding.record_original_flight(original_key, &frame);
-    let ack_ranges = [OffsetRange { start: 0, end: 128 }];
+    let ack_ranges = [
+        OffsetRange { start: 0, end: 64 },
+        OffsetRange {
+            start: 80,
+            end: 128,
+        },
+    ];
     let _ = send_stream.apply_ack(&ack_ranges);
 
     let mut response_sender = ServerResponseSenderService::new_with_performance(
@@ -3848,24 +4023,33 @@ async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit()
         },
     );
     response_sender.record_delivered_data(128);
+    binding.age_original_flights_for_test(Duration::from_secs(1));
 
-    let (reinjection_frames, blocked_frontier_offset, same_output_frontier_retransmit) =
-        prefix_final_tail_reinjection_frames_with_available_output(
-            &path_stream,
-            stream_final_offset_tail_reinjection_frames_normalized(
-                &send_stream,
-                &ack_ranges,
-                64,
-                true,
-                true,
-            ),
-        );
-    assert_eq!(blocked_frontier_offset, None);
-    assert!(!same_output_frontier_retransmit);
-    assert_eq!(reinjection_frames.len(), 1);
-    for frame in reinjection_frames {
-        let _ = response_sender.enqueue_critical_tail_reinjection_frame(frame);
-    }
+    let accepted_at = Instant::now();
+    let outcome = enqueue_live_response_final_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &ack_ranges,
+        64,
+        limits,
+        accepted_at,
+    );
+    assert_eq!(outcome.blocked_frontier_offset, None);
+    assert_eq!(outcome.frontier_limit, 16);
+    assert!(
+        outcome.service_limit > outcome.frontier_limit,
+        "available optional credit may remain after the exact lowest owner-uniform FIN frontier",
+    );
+    assert_eq!(
+        outcome.queued, 1,
+        "one bound decision cannot cross the acknowledged coverage hole into a disjoint owner interval",
+    );
+    assert_eq!(response_sender.bytes(), outcome.frontier_limit);
+    assert!(
+        !response_sender.live_owner_frontier_floor_ready(accepted_at),
+        "accepted live-owner FIN-tail work must consume the gap/tail shared epoch",
+    );
 
     reinjection_commands_for_fill
         .try_enqueue_reinjection_frame(
@@ -3878,31 +4062,504 @@ async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit()
         )
         .expect("test setup fills alternate repair headroom");
 
-    response_sender
-        .dispatch_next_with_data_ack_outstanding(
+    assert!(matches!(
+        response_sender.dispatch_next_with_data_ack_outstanding(
             &path_stream,
             &mut send_stream,
             TrafficClass::Latency,
             limits,
             0,
-        )
-        .expect("final-tail reinjection must use the original path when the alternate has no queue credit");
-
-    let command = try_recv_reliable_path_command(&mut original_receivers)
-        .expect("expected final-tail reinjection on the original path");
-    match command {
-        ReliablePathCommand::SendFrame(Frame::StreamData {
-            offset, payload, ..
-        }) => {
-            assert_eq!(offset, 128);
-            assert_eq!(payload.len(), 64);
-        }
-        _ => panic!("expected final-tail reinjected STREAM_DATA"),
-    }
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut original_receivers).is_none(),
+        "a live owner's FIN tail cannot acquire path-failure authority to retransmit on its original carrier",
+    );
+    response_sender.clear_queued_work_for_test();
+    assert!(
+        try_recv_reliable_path_command(&mut reinjection_receivers).is_some(),
+        "fixture must release the alternate carrier's command credit",
+    );
+    let remaining_optional_credit =
+        response_sender.reinjection_extra_event_budget_remaining(limits);
+    response_sender.record_reinjection_for_test(remaining_optional_credit);
+    assert_eq!(
+        response_sender.reinjection_extra_event_budget_remaining(limits),
+        0,
+        "same-epoch non-renewal requires isolating the over-credit floor from independently valid optional service",
+    );
+    let same_epoch = enqueue_live_response_final_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &ack_ranges,
+        64,
+        limits,
+        Instant::now(),
+    );
+    assert_eq!(
+        same_epoch.queued, 0,
+        "queue removal and renewed carrier credit cannot mint a second FIN-tail attempt in the same epoch",
+    );
 }
 
 #[tokio::test]
-async fn final_tail_reinjection_uses_only_available_path() {
+async fn bound_response_fin_capacity_release_wakes_and_retries_the_exact_tail() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(230);
+    let owner_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let alternate_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(230),
+        owner_key.underlay,
+        owner_key.path_id,
+        owner_commands,
+        TrafficClass::Throughput,
+    );
+    let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(1);
+    assert_eq!(
+        binding.attach(
+            alternate_key.underlay,
+            alternate_key.path_id,
+            alternate_commands.clone(),
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    for key in [owner_key, alternate_key] {
+        binding.mark_output_path_proven_for_test(key);
+        record_server_delivery_evidence(&binding, key);
+    }
+    alternate_commands
+        .try_enqueue_reinjection_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 4096,
+                payload: Bytes::from_static(b"full"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("fill the sole alternate native queue");
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: owner_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let tail = send_stream
+        .prepare_data(Bytes::from(vec![0x55; 4096]))
+        .expect("prepare final response tail");
+    send_stream
+        .commit_prepared_data(&tail)
+        .expect("commit final response tail");
+    binding.record_original_flight(owner_key, &tail);
+    binding.age_original_flights_for_test(Duration::from_secs(1));
+    let mut response_sender = ServerResponseSenderService::new(SessionId(230), stream_id);
+
+    // The actor arms this exact edge before synchronous target selection.
+    let wait = arm_carrier_capacity_notifies(path_stream.response_recovery_capacity_notifies())
+        .expect("bound FIN has an alternate carrier capacity edge");
+    let blocked = enqueue_live_response_final_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &[],
+        4096,
+        limits,
+        Instant::now(),
+    );
+    assert_eq!(blocked.queued, 0);
+    assert!(blocked.blocked_for_carrier_capacity);
+
+    let filler = try_recv_reliable_path_command(&mut alternate_receivers)
+        .expect("release the full alternate queue");
+    alternate_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&filler));
+    tokio::time::timeout(Duration::from_millis(50), wait)
+        .await
+        .expect("the pre-armed bound-FIN capacity wake cannot be lost");
+
+    let retried = enqueue_live_response_final_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &[],
+        4096,
+        limits,
+        Instant::now(),
+    );
+    assert_eq!(retried.queued, 1);
+    assert!(!retried.blocked_for_carrier_capacity);
+}
+
+#[test]
+fn response_fin_keeps_its_exact_decide_target_across_metric_churn() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(226);
+    let owner_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let selected_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let challenger_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(2),
+    };
+    let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(226),
+        owner_key.underlay,
+        owner_key.path_id,
+        owner_commands,
+        TrafficClass::Throughput,
+    );
+    let (selected_commands, mut selected_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            selected_key.underlay,
+            selected_key.path_id,
+            selected_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let (challenger_commands, mut challenger_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            challenger_key.underlay,
+            challenger_key.path_id,
+            challenger_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    for key in [owner_key, selected_key, challenger_key] {
+        binding.mark_output_path_proven_for_test(key);
+    }
+    record_server_delivery_evidence_with_srtt(&binding, owner_key, 80_000);
+    record_server_delivery_evidence_with_srtt(&binding, selected_key, 10_000);
+    record_server_delivery_evidence_with_srtt(&binding, challenger_key, 100_000);
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: owner_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let frame = send_stream
+        .prepare_data(Bytes::from(vec![0x5a; 4096]))
+        .expect("prepare final response tail");
+    send_stream
+        .commit_prepared_data(&frame)
+        .expect("commit final response tail");
+    binding.record_original_flight(owner_key, &frame);
+    binding.age_original_flights_for_test(Duration::from_secs(1));
+
+    let mut zero_authority_sender = ServerResponseSenderService::new(SessionId(226), stream_id);
+    let zero_authority = enqueue_live_response_final_tail_reinjection(
+        &mut zero_authority_sender,
+        &path_stream,
+        &send_stream,
+        &[],
+        0,
+        limits,
+        Instant::now(),
+    );
+    assert_eq!(zero_authority.queued, 0);
+    assert_eq!(zero_authority.frontier_limit, 0);
+    assert_eq!(
+        zero_authority_sender.completion_tail_owner_fallback_deadline(),
+        None
+    );
+    for zero_resource_limits in [
+        MuxLimits {
+            max_repair_bytes: 0,
+            ..limits
+        },
+        MuxLimits {
+            max_path_flight_bytes: 0,
+            ..limits
+        },
+    ] {
+        let mut zero_resource_sender = ServerResponseSenderService::new(SessionId(226), stream_id);
+        let outcome = enqueue_live_response_final_tail_reinjection(
+            &mut zero_resource_sender,
+            &path_stream,
+            &send_stream,
+            &[],
+            4096,
+            zero_resource_limits,
+            Instant::now(),
+        );
+        assert_eq!(outcome.queued, 0);
+        assert_eq!(outcome.frontier_limit, 0);
+        assert_eq!(
+            zero_resource_sender.completion_tail_owner_fallback_deadline(),
+            None,
+            "zero Product authority cannot manufacture M=1 or mutate its owner epoch",
+        );
+    }
+
+    let mut response_sender = ServerResponseSenderService::new(SessionId(226), stream_id);
+    let response_targets = binding.sender_path_targets(TrafficClass::Throughput, 4096);
+    let identity_for = |key| {
+        response_targets
+            .iter()
+            .find(|candidate| candidate.observation.key == key)
+            .map(|candidate| ServerReinjectionOutputIdentity {
+                key,
+                incarnation: candidate.observation.incarnation,
+            })
+            .expect("attached response identity")
+    };
+    let owner_identity = identity_for(owner_key);
+    let selected_identity = identity_for(selected_key);
+    let owner_interval = reliable_data_retransmission_interval(
+        Some(owner_key.underlay),
+        path_stream.response_output_snapshot(owner_identity, path_stream.current_lane()),
+    );
+    let selected_snapshot = path_stream
+        .response_output_snapshot(selected_identity, path_stream.current_lane())
+        .expect("selected response snapshot");
+    let selected_interval =
+        reliable_data_retransmission_interval(Some(selected_key.underlay), Some(selected_snapshot));
+    assert!(
+        selected_interval < owner_interval,
+        "fixture requires asymmetric owner and selected-target R",
+    );
+    let observed_at = Instant::now();
+    let outcome = enqueue_live_response_final_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &[],
+        4096,
+        limits,
+        observed_at,
+    );
+    assert_eq!(outcome.queued, 1);
+    let accepted_by = Instant::now();
+    let successor_deadline = response_sender
+        .live_owner_frontier_floor_deadline()
+        .expect("accepted response FIN consumes G");
+    assert!(
+        successor_deadline >= observed_at + selected_interval
+            && successor_deadline <= accepted_by + selected_interval
+            && successor_deadline < observed_at + owner_interval,
+        "response FIN successor G uses selected target R_t rather than owner R",
+    );
+
+    record_server_delivery_evidence_with_srtt(&binding, selected_key, 200_000);
+    record_server_delivery_evidence_with_srtt(&binding, challenger_key, 1_000);
+    let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
+    let dispatch = response_sender
+        .dispatch_next_with_data_ack_outstanding(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            data_ack_outstanding_bytes,
+        )
+        .expect("the exact FIN target remains dispatchable");
+    assert_eq!(dispatch.selected_path, Some(selected_key));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut selected_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ref payload,
+            ..
+        })) if payload.len() == 4096
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut challenger_receivers).is_none(),
+        "Apply/dispatch cannot reselect the now-better path after FIN bound its Decide target",
+    );
+}
+
+#[test]
+fn response_live_fin_tail_stops_at_an_already_queued_frontier_copy() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(225);
+    let original_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let reinjection_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (original_commands, _original_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(225),
+        original_key.underlay,
+        original_key.path_id,
+        original_commands,
+        TrafficClass::Latency,
+    );
+    let (reinjection_commands, _reinjection_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            reinjection_key.underlay,
+            reinjection_key.path_id,
+            reinjection_commands,
+            TrafficClass::Latency,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    record_server_delivery_evidence(&binding, reinjection_key);
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Latency,
+        underlay: original_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let prefix = send_stream
+        .prepare_data(Bytes::from(vec![0x51; 64]))
+        .expect("prepare acknowledged prefix");
+    send_stream
+        .commit_prepared_data(&prefix)
+        .expect("commit acknowledged prefix");
+    let first_tail = send_stream
+        .prepare_data(Bytes::from(vec![0x52; 64]))
+        .expect("prepare lowest tail frame");
+    send_stream
+        .commit_prepared_data(&first_tail)
+        .expect("commit lowest tail frame");
+    let later_tail = send_stream
+        .prepare_data(Bytes::from(vec![0x53; 64]))
+        .expect("prepare later tail frame");
+    send_stream
+        .commit_prepared_data(&later_tail)
+        .expect("commit later tail frame");
+    for frame in [&prefix, &first_tail, &later_tail] {
+        binding.record_original_flight(original_key, frame);
+    }
+    let ack_ranges = [OffsetRange { start: 0, end: 64 }];
+    let _ = send_stream.apply_ack(&ack_ranges);
+
+    let mut response_sender = ServerResponseSenderService::new(SessionId(225), stream_id);
+    response_sender
+        .enqueue_critical_reinjection_frame_with_cause(first_tail, RelaySendCause::TailReinjection);
+    let queued_before = response_sender.bytes();
+    binding.age_original_flights_for_test(Duration::from_secs(1));
+    let outcome = enqueue_live_response_final_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        &send_stream,
+        &ack_ranges,
+        128,
+        limits,
+        Instant::now(),
+    );
+    assert_eq!(outcome.queued, 0);
+    assert!(outcome.pending);
+    assert_eq!(
+        response_sender.bytes(),
+        queued_before,
+        "an occupied lowest frontier must stop the FIN batch; later tail extents cannot consume the live-owner opportunity",
+    );
+}
+
+#[test]
+fn detached_response_owner_uses_its_own_underlay_recovery_default() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(227);
+    let owner_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let current_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(227),
+        owner_key.underlay,
+        owner_key.path_id,
+        owner_commands.clone(),
+        TrafficClass::Latency,
+    );
+    let (current_commands, _current_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            current_key.underlay,
+            current_key.path_id,
+            current_commands,
+            TrafficClass::Latency,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Latency,
+        underlay: current_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx.into(),
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let frame = send_stream
+        .prepare_data(Bytes::from(vec![0x61; 64]))
+        .expect("prepare owner frame");
+    send_stream
+        .commit_prepared_data(&frame)
+        .expect("commit owner frame");
+    binding.record_original_flight(owner_key, &frame);
+    binding.detach(owner_key, &owner_commands);
+
+    let unrelated_current = PathSnapshot::new(
+        current_key.path_id,
+        current_key.underlay,
+        20.0,
+        500_000_000.0,
+    );
+    assert_eq!(
+        response_live_owner_recovery_interval_for_frame(
+            &path_stream,
+            &frame,
+            Some(unrelated_current),
+        ),
+        reliable_data_retransmission_interval(Some(UnderlayProtocol::Tcp), None),
+        "a missing exact owner observation must retain that owner's transport clock instead of borrowing the current output's snapshot",
+    );
+}
+
+#[tokio::test]
+async fn exact_terminal_tail_reinjection_uses_only_available_path() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(126);
     let original_key = CarrierPathKey {
@@ -3964,8 +4621,16 @@ async fn final_tail_reinjection_uses_only_available_path() {
     assert!(same_output_frontier_retransmit);
     assert_eq!(reinjection_frames.len(), 1);
     for frame in reinjection_frames {
-        let _ = response_sender.enqueue_critical_tail_reinjection_frame(frame);
+        response_sender.enqueue_critical_reinjection_frame_with_cause(
+            frame,
+            RelaySendCause::PathFailureReinjection,
+        );
     }
+
+    assert!(
+        response_sender.live_owner_frontier_floor_ready(Instant::now()),
+        "exact terminal-failure repair remains independent of the live-owner epoch",
+    );
 
     response_sender
         .dispatch_next_with_data_ack_outstanding(
@@ -4273,7 +4938,7 @@ fn failed_original_tail_reinjection_is_not_blocked_by_optional_budget() {
 }
 
 #[test]
-fn ack_gap_timer_retransmission_obeys_optional_budget() {
+fn authoritative_gap_retains_one_critical_frontier_quantum_when_optional_budget_is_exhausted() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(102);
     let original_key = CarrierPathKey {
@@ -4297,7 +4962,7 @@ fn ack_gap_timer_retransmission_obeys_optional_budget() {
         binding.attach(
             reinjection_key.underlay,
             reinjection_key.path_id,
-            reinjection_commands,
+            reinjection_commands.clone(),
             TrafficClass::Throughput,
         ),
         ResponseStreamAttachOutcome::Attached
@@ -4334,6 +4999,8 @@ fn ack_gap_timer_retransmission_obeys_optional_budget() {
         },
     ];
     let _ = send_stream.apply_ack(&ack_ranges);
+    let ack_frontier = send_stream.data_ack_frontier();
+    assert_eq!(ack_frontier, 1024);
 
     let mut response_sender = ServerResponseSenderService::new_with_performance(
         SessionId(102),
@@ -4364,14 +5031,82 @@ fn ack_gap_timer_retransmission_obeys_optional_budget() {
             optional_reinjection_budget_percent: 5,
         },
         path_stream.max_frame_payload_bytes,
-        4096,
+        ack_frontier,
     );
 
     assert_eq!(
-        outcome.queued, 0,
-        "a persistent authoritative gap on a live owner is optional acceleration even when the generic tail timer observes it",
+        outcome.queued, 1,
+        "stronger authoritative gap evidence must retain the one-interval liveness floor already granted to a contiguous live tail",
     );
     assert!(!outcome.pending);
+    assert_eq!(
+        response_sender.bytes(),
+        1024,
+        "exhausted optional credit may authorize only the exact blocking frontier quantum, not a target service window",
+    );
+
+    response_sender.clear_queued_work_for_test();
+    binding.detach(reinjection_key, &reinjection_commands);
+    let replacement_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(2),
+    };
+    let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            replacement_key.underlay,
+            replacement_key.path_id,
+            replacement_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    record_server_delivery_evidence(&binding, replacement_key);
+    let switched_target = enqueue_reliable_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        stream_id,
+        &send_stream,
+        &ack_ranges,
+        true,
+        None,
+        TrafficClass::Throughput,
+        limits,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 5,
+        },
+        path_stream.max_frame_payload_bytes,
+        ack_frontier,
+    );
+    assert_eq!(
+        switched_target.queued, 0,
+        "changing the eligible target cannot mint another live-owner opportunity",
+    );
+
+    let contiguous_ranges = [OffsetRange {
+        start: 0,
+        end: ack_frontier,
+    }];
+    let changed_evidence = enqueue_reliable_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        stream_id,
+        &send_stream,
+        &contiguous_ranges,
+        true,
+        None,
+        TrafficClass::Throughput,
+        limits,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 5,
+        },
+        path_stream.max_frame_payload_bytes,
+        ack_frontier,
+    );
+    assert_eq!(
+        changed_evidence.queued, 0,
+        "changing the same blocked frontier from gap evidence to live-tail silence cannot mint another opportunity",
+    );
 }
 
 #[test]
@@ -4394,7 +5129,8 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         original_commands,
         TrafficClass::Throughput,
     );
-    let (reinjection_commands, mut reinjection_receivers) = reliable_path_command_channels(8);
+    let (reinjection_commands, mut reinjection_receivers) = reliable_path_command_channels(1);
+    let reinjection_commands_for_clock_churn = reinjection_commands.clone();
     assert_eq!(
         binding.attach(
             reinjection_key.underlay,
@@ -4475,12 +5211,6 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
     let mut authoritative_ack = AuthoritativeStreamAckSnapshot::default();
     update_reinjection_authoritative_ack_snapshot(&mut authoritative_ack, &validated_ack);
     let modeled_path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
-    let owner_timing_path = PathSnapshot::new(
-        original_key.path_id,
-        original_key.underlay,
-        80.0,
-        400_000_000.0,
-    );
     let slow_send_path = PathSnapshot::new(
         original_key.path_id,
         original_key.underlay,
@@ -4494,6 +5224,120 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
     )
     .min(path_stream.max_frame_payload_bytes);
     assert!(scored_frontier_bytes < quantum);
+
+    let clock_sender = ServerResponseSenderService::new(SessionId(103), stream_id);
+    let present = clock_sender
+        .ack_gap_reinjection_path_snapshot(
+            &path_stream,
+            &send_stream,
+            &ack_ranges,
+            scored_frontier_bytes,
+        )
+        .expect("exact-M owner timing remains observable with a target");
+    assert!(present.target.is_some());
+    let mut clock_progress = ReliableAckGapReinjectionProgress::default();
+    let clock_observed_at = Instant::now();
+    let _ = clock_progress.observe_recovery_timing(
+        true,
+        &ack_ranges,
+        true,
+        Some(present.owner_recovery_timing),
+        present.target.map(|target| target.completion),
+        clock_observed_at,
+    );
+    let retained_owner_deadline = clock_progress
+        .original_owner_recovery_deadline()
+        .expect("first exact-M observation installs immutable owner fallback");
+    reinjection_commands_for_clock_churn
+        .try_enqueue_reinjection_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: u64::MAX - 1,
+                payload: Bytes::from_static(b"full"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("fill the only exact alternate after timing observation");
+    record_server_delivery_evidence_with_srtt(&binding, original_key, 500_000);
+    let absent = clock_sender
+        .ack_gap_reinjection_path_snapshot(
+            &path_stream,
+            &send_stream,
+            &ack_ranges,
+            scored_frontier_bytes,
+        )
+        .expect("target loss cannot erase exact-M owner timing");
+    assert!(absent.target.is_none());
+    let _ = clock_progress.observe_recovery_timing(
+        true,
+        &ack_ranges,
+        true,
+        Some(absent.owner_recovery_timing),
+        None,
+        Instant::now(),
+    );
+    assert_eq!(
+        clock_progress.original_owner_recovery_deadline(),
+        Some(retained_owner_deadline),
+        "target disappearance and worse mutable owner metrics cannot postpone T_f",
+    );
+    let filler = try_recv_reliable_path_command(&mut reinjection_receivers)
+        .expect("release exact alternate after target-loss observation");
+    reinjection_receivers
+        .release_pending_command_bytes(reliable_path_command_pending_bytes(&filler));
+    let reappeared = clock_sender
+        .ack_gap_reinjection_path_snapshot(
+            &path_stream,
+            &send_stream,
+            &ack_ranges,
+            scored_frontier_bytes,
+        )
+        .expect("owner timing remains observable when target returns");
+    assert!(reappeared.target.is_some());
+    let _ = clock_progress.observe_recovery_timing(
+        true,
+        &ack_ranges,
+        true,
+        Some(reappeared.owner_recovery_timing),
+        reappeared.target.map(|target| target.completion),
+        Instant::now(),
+    );
+    assert_eq!(
+        clock_progress.original_owner_recovery_deadline(),
+        Some(retained_owner_deadline),
+        "target reappearance cannot begin a later owner epoch",
+    );
+    record_server_delivery_evidence_with_srtt(&binding, original_key, 80_000);
+
+    for zero_authority_limits in [
+        MuxLimits::from(ResourceLimits {
+            max_repair_bytes: 0,
+            ..ResourceLimits::default()
+        }),
+        MuxLimits::from(ResourceLimits {
+            max_path_flight_bytes: 0,
+            ..ResourceLimits::default()
+        }),
+    ] {
+        let mut zero_sender = ServerResponseSenderService::new(SessionId(103), stream_id);
+        let mut zero_progress = ReliableAckGapReinjectionProgress::default();
+        let zero = evaluate_server_data_ack_reinjection(
+            &mut zero_sender,
+            &path_stream,
+            &send_stream,
+            &mut zero_progress,
+            &authoritative_ack,
+            ack_frontier,
+            Some(modeled_path),
+            TrafficClass::Throughput,
+            zero_authority_limits,
+            stream_id,
+        );
+        assert_eq!(zero.frame_count, 0);
+        assert_eq!(zero.queued, 0);
+        assert_eq!(zero_progress.next_reinjection_deadline(), None);
+        assert_eq!(zero_sender.live_owner_frontier_floor_deadline(), None);
+    }
 
     let mut response_sender = ServerResponseSenderService::new_with_performance(
         SessionId(103),
@@ -4516,7 +5360,6 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &mut progress,
         &authoritative_ack,
         ack_frontier,
-        Some(owner_timing_path),
         Some(modeled_path),
         TrafficClass::Throughput,
         limits,
@@ -4574,7 +5417,6 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &mut exhausted_progress,
         &authoritative_ack,
         ack_frontier,
-        Some(modeled_path),
         Some(slow_send_path),
         TrafficClass::Throughput,
         limits,
@@ -4593,12 +5435,22 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         "pre-armed live-owner ACK-gap recovery must be due",
     );
     assert!(!exhausted.target_service_exhausted);
+    assert!(exhausted.frame_count > 0);
+    assert!(exhausted.queued > 0);
     assert_eq!(
-        exhausted.frame_count, 0,
-        "a persistent ACK gap on a live reliable owner is optional acceleration and cannot bypass exhausted cumulative credit",
+        exhausted_response_sender.bytes(),
+        scored_frontier_bytes,
+        "exhausted optional credit may authorize only the exact blocking frontier quantum",
     );
-    assert_eq!(exhausted.queued, 0);
-    assert_eq!(exhausted_response_sender.bytes(), 0);
+    let response_epoch_deadline = exhausted_response_sender
+        .live_owner_frontier_floor_deadline()
+        .expect("accepted response repair starts one shared recovery epoch");
+    exhausted_response_sender.record_delivered_data(quantum);
+    assert_eq!(
+        exhausted_response_sender.live_owner_frontier_floor_deadline(),
+        Some(response_epoch_deadline),
+        "a newly acknowledged sparse suffix may fund optional credit but cannot postpone the blocked lower frontier's epoch",
+    );
 
     let mut partial_response_sender = ServerResponseSenderService::new_with_performance(
         SessionId(103),
@@ -4623,7 +5475,6 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &mut exhausted_progress,
         &authoritative_ack,
         ack_frontier,
-        Some(modeled_path),
         Some(slow_send_path),
         TrafficClass::Throughput,
         limits,
@@ -4638,36 +5489,52 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
     assert!(partial.queued > 0);
     assert_eq!(
         partial_response_sender.bytes(),
-        partial_credit,
-        "accepted persistent-gap payload must not exceed the exact remaining cumulative credit",
+        quantum,
+        "Apply is capped by the lowest owner-uniform gap even when cumulative credit is larger",
     );
     assert_eq!(
         partial_response_sender.reinjection_extra_event_budget_remaining(limits),
-        0,
+        partial_credit - quantum,
+        "credit that cannot cross the owner-uniform boundary remains for a new decision",
     );
     let serialized_bytes = partial_response_sender.bytes();
     partial_response_sender.clear_queued_work_for_test();
     assert_eq!(partial_response_sender.bytes(), 0);
-    let serialized = evaluate_server_data_ack_reinjection(
+    let residual_optional = evaluate_server_data_ack_reinjection(
         &mut partial_response_sender,
         &path_stream,
         &send_stream,
         &mut exhausted_progress,
         &authoritative_ack,
         ack_frontier,
-        Some(modeled_path),
         Some(slow_send_path),
         TrafficClass::Throughput,
         limits,
         stream_id,
     );
-    assert_eq!(serialized.frame_count, 0);
-    assert_eq!(serialized.queued, 0);
+    assert!(residual_optional.frame_count > 0);
+    assert!(residual_optional.queued > 0);
     assert_eq!(
         partial_response_sender.bytes(),
-        0,
-        "a serialized response evaluation cannot renew a fixed repair quantum after prior queued work leaves, before unique Data ACK progress funds it",
+        partial_credit - quantum,
+        "unused C that could not cross U remains valid for the next independently ranked transaction",
     );
+    partial_response_sender.clear_queued_work_for_test();
+    let exhausted_again = evaluate_server_data_ack_reinjection(
+        &mut partial_response_sender,
+        &path_stream,
+        &send_stream,
+        &mut exhausted_progress,
+        &authoritative_ack,
+        ack_frontier,
+        Some(slow_send_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+    assert_eq!(exhausted_again.frame_count, 0);
+    assert_eq!(exhausted_again.queued, 0);
+    assert_eq!(partial_response_sender.bytes(), 0);
     assert!(serialized_bytes > 0);
 
     response_sender.record_delivered_data(quantum.saturating_mul(9));
@@ -4703,13 +5570,15 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &mut progress,
         &authoritative_ack,
         ack_frontier,
-        Some(modeled_path),
         Some(slow_send_path),
         TrafficClass::Throughput,
         limits,
         stream_id,
     );
-    assert!(blocked.frame_count >= 4);
+    assert!(
+        blocked.frame_count >= 2,
+        "the target-bound transaction contains only the lowest owner-uniform gap",
+    );
     assert_eq!(
         blocked.queued, 0,
         "a blocked frontier quantum must not enqueue later service-window repairs"
@@ -4720,6 +5589,45 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         "later repair ranges must remain untouched until the frontier commits"
     );
 
+    blocked_response_sender.clear_queued_work_for_test();
+    let candidate_frames = stream_ack_gap_reinjection_frames_normalized(
+        &send_stream,
+        authoritative_ack.ranges(),
+        quantum.saturating_mul(5),
+        scored_frontier_bytes,
+        true,
+        true,
+        true,
+    );
+    assert!(candidate_frames.len() >= 3);
+    blocked_response_sender.enqueue_critical_reinjection_frame_with_cause(
+        candidate_frames[1].clone(),
+        RelaySendCause::AckGapReinjection,
+    );
+    let middle_blocked_bytes = blocked_response_sender.bytes();
+    let middle_blocked = evaluate_server_data_ack_reinjection(
+        &mut blocked_response_sender,
+        &path_stream,
+        &send_stream,
+        &mut progress,
+        &authoritative_ack,
+        ack_frontier,
+        Some(slow_send_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+    assert!(
+        middle_blocked.frame_count >= 2,
+        "a later sparse gap requires a new target decision rather than joining this batch",
+    );
+    assert_eq!(middle_blocked.queued, 1);
+    assert_eq!(
+        blocked_response_sender.bytes(),
+        middle_blocked_bytes.saturating_add(scored_frontier_bytes),
+        "a blocked middle response chunk may retain the committed frontier but must stop before later omitted ranges",
+    );
+
     let outcome = evaluate_server_data_ack_reinjection(
         &mut response_sender,
         &path_stream,
@@ -4727,7 +5635,6 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &mut progress,
         &authoritative_ack,
         ack_frontier,
-        Some(modeled_path),
         Some(slow_send_path),
         TrafficClass::Throughput,
         limits,
@@ -4735,13 +5642,15 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
     );
 
     assert!(
-        outcome.queued >= 4,
-        "a proven recovery-copy timeout may fill the measured target window behind the scored frontier quantum"
+        outcome.queued >= 2,
+        "a proven recovery-copy timeout may fill the owner-uniform extent behind the scored frontier quantum"
     );
-    assert!(
-        response_sender.bytes() > scored_frontier_bytes,
-        "persistent timer service must not collapse back to one liveness quantum"
+    assert_eq!(
+        response_sender.bytes(),
+        quantum,
+        "optional L-M service may fill U but cannot cross into the next sparse gap"
     );
+    assert!(response_sender.bytes() > scored_frontier_bytes);
     assert!(outcome.persistent_ready);
     assert!(progress.next_reinjection_deadline().is_some());
     let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
@@ -4830,12 +5739,6 @@ fn draining_response_owner_retains_one_distinct_ack_gap_recovery_target() {
     update_reinjection_authoritative_ack_snapshot(&mut authoritative_ack, &validated_ack);
 
     original_commands.begin_path_drain();
-    let owner_snapshot = PathSnapshot::new(
-        original_key.path_id,
-        original_key.underlay,
-        100.0,
-        10_000_000.0,
-    );
     let target_snapshot = PathSnapshot::new(
         reinjection_key.path_id,
         reinjection_key.underlay,
@@ -4857,7 +5760,6 @@ fn draining_response_owner_retains_one_distinct_ack_gap_recovery_target() {
         &mut progress,
         &authoritative_ack,
         0,
-        Some(owner_snapshot),
         Some(target_snapshot),
         TrafficClass::Throughput,
         limits,

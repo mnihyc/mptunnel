@@ -523,7 +523,14 @@ fn committed_response_copy_deadline_is_not_recomputed_from_later_path_timing() {
     let target = ResponseDispatchTarget::from(&selected);
     let accepted_before = Instant::now();
     let committed_deadline = binding
-        .try_enqueue_reinjected_frame_for_target(&target, &frame, TrafficClass::Throughput, 0, 4096)
+        .try_enqueue_reinjected_frame_for_target(
+            &target,
+            &frame,
+            TrafficClass::Throughput,
+            0,
+            4096,
+            None,
+        )
         .expect("actual carrier command commitment");
     let accepted_after = Instant::now();
     assert!(
@@ -1097,6 +1104,7 @@ fn response_reinjection_revalidates_exact_k_after_carrier_reservation() {
             TrafficClass::Throughput,
             0,
             1,
+            None,
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -1141,6 +1149,7 @@ fn native_reinjection_final_precommit_rejects_stale_generation_after_real_reserv
             TrafficClass::Throughput,
             0,
             4_096,
+            None,
             || {
                 assert!(
                     fixture.commands.pending_bytes() > 0,
@@ -1194,6 +1203,49 @@ fn native_reinjection_final_precommit_rejects_stale_generation_after_real_reserv
     assert!(fixture.commands.pending_bytes() > 0);
     drop(reservation);
     assert_eq!(fixture.commands.pending_bytes(), 0);
+}
+
+#[test]
+fn bound_response_reinjection_rejects_expiry_after_native_reservation() {
+    let mut fixture = native_response_binding_fixture(1, None);
+    let target: ResponseDispatchTarget = fixture
+        .binding
+        .sender_path_targets(TrafficClass::Throughput, 4_096)
+        .into_iter()
+        .find(|candidate| candidate.observation.key == fixture.key)
+        .expect("current fenced Native response target")
+        .into();
+    let frame = stream_data_frame_at(0, 4_096);
+    let expires_at = Instant::now() + Duration::from_millis(10);
+
+    let result = fixture
+        .binding
+        .try_enqueue_reinjected_frame_for_target_with_after_reserve(
+            &target,
+            &frame,
+            TrafficClass::Throughput,
+            0,
+            4_096,
+            Some(expires_at),
+            || {
+                assert!(
+                    fixture.commands.pending_bytes() > 0,
+                    "the native writer slot is reserved before the expiry boundary",
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            },
+        );
+
+    assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
+    assert_eq!(fixture.commands.pending_bytes(), 0);
+    assert!(try_recv_reliable_path_command(&mut fixture.receivers).is_none());
+    assert!(
+        fixture
+            .binding
+            .flight_outputs_overlapping_frame(&frame)
+            .is_empty(),
+        "a bound batch that expires during reservation cannot publish Product flight state",
+    );
 }
 
 #[test]

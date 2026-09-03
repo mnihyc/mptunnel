@@ -2,11 +2,14 @@ use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
 use crate::model::admission::ReliableDataAckFrontierState;
+use crate::model::capacity::PathRateSample;
 use crate::model::capacity::{reliable_product_feedback_window_bytes, reliable_relay_buffer_len};
+use crate::model::timing::reliable_relay_tail_reinjection_delay;
 use crate::model::work::{
     ReliableReinjectionTargetWork, ReliableWorkClass,
     reliable_critical_tail_reinjection_limit_bytes, reliable_reinjection_service_limit_bytes,
 };
+use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{PathId, SessionId};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
@@ -876,6 +879,14 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
     let mut sender = RequestSenderService::new(stream_id);
     sender.record_original_frame_for_test(tcp, &acknowledged);
     sender.record_original_frame_for_test(tcp, &live_tail);
+    let optional_budget = sender.reinjection_extra_event_budget_remaining(limits);
+    assert!(optional_budget > 0);
+    sender.record_reinjection_for_test(optional_budget);
+    assert_eq!(
+        sender.reinjection_extra_event_budget_remaining(limits),
+        0,
+        "fixture must distinguish critical live-tail authority from optional repair credit",
+    );
     let ack_ranges = [OffsetRange { start: 0, end: 64 }];
     let _ = send_stream.apply_ack(&ack_ranges);
 
@@ -938,6 +949,731 @@ async fn client_live_tail_uses_retained_send_extent_beyond_ack_snapshot() {
         try_recv_reliable_path_command(&mut tcp_receivers).is_none(),
         "the bounded probe must use the distinct live attachment"
     );
+}
+
+#[tokio::test]
+async fn client_live_tail_stops_at_an_already_queued_frontier_copy() {
+    let stream_id = StreamId(226);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:11341", "quic://127.0.0.1:11342"]);
+    let (tcp_commands, mut tcp_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, tcp_commands),
+        8,
+    );
+    consume_client_path_proof_for_test(&mut tcp_receivers);
+    let tcp = remotes.paths[0].instance();
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            udp_commands,
+        )),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut udp_receivers);
+    let udp = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        })
+        .expect("UDP tail-recovery path");
+    seed_client_bulk_evidence_for_test(&context, tcp);
+    seed_client_bulk_evidence_for_test(&context, udp);
+
+    let limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let prefix = send_stream
+        .send_data(Bytes::from(vec![0x41; 64]))
+        .expect("acknowledged prefix");
+    let first_tail = send_stream
+        .send_data(Bytes::from(vec![0x42; 64]))
+        .expect("lowest retained tail frame");
+    let later_tail = send_stream
+        .send_data(Bytes::from(vec![0x43; 64]))
+        .expect("later retained tail frame");
+    let mut sender = RequestSenderService::new(stream_id);
+    for frame in [&prefix, &first_tail, &later_tail] {
+        sender.record_original_frame_for_test(tcp, frame);
+    }
+    let ack_ranges = [OffsetRange { start: 0, end: 64 }];
+    let _ = send_stream.apply_ack(&ack_ranges);
+    let recovery_interval =
+        reliable_relay_tail_reinjection_delay(context.reliable_path_snapshot(tcp.key));
+    tokio::time::sleep(recovery_interval + Duration::from_millis(10)).await;
+
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    sender.enqueue_critical_reinjection_frame(
+        &mut sender_queue,
+        first_tail,
+        RelaySendCause::TailReinjection,
+    );
+    let queued_before = sender_queue.bytes();
+    assert!(!sender.enqueue_tail_reinjection(
+        &mut sender_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        &ack_ranges,
+        true,
+        Some(send_stream.next_offset()),
+        64,
+        TrafficClass::Latency,
+    ));
+    assert_eq!(
+        sender_queue.bytes(),
+        queued_before,
+        "an occupied lowest frontier must stop the batch; later tail extents cannot consume the live-owner opportunity",
+    );
+}
+
+#[tokio::test]
+async fn completion_tail_apply_shrinks_to_exact_target_service_before_consuming_epoch() {
+    let stream_id = StreamId(227);
+    let resource_limits = ResourceLimits {
+        max_repair_bytes: 4096,
+        max_path_flight_bytes: 4096,
+        ..ResourceLimits::default()
+    };
+    let limits = MuxLimits::from(resource_limits);
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11351?initial-srtt-s=0.005&initial-rate-mbps=1",
+            "quic://127.0.0.1:11352?initial-srtt-s=0.04&initial-rate-mbps=500",
+            "tcp://127.0.0.1:11353?initial-srtt-s=0.04&initial-rate-mbps=500",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("path"))
+        .collect(),
+        security(),
+        resource_limits,
+    )
+    .expect("context");
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
+        8,
+    );
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(1);
+    let target_commands_for_fill = target_commands.clone();
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            target_commands,
+        )),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut target_receivers);
+    let target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        })
+        .expect("completion-tail target");
+    let (unmeasured_commands, mut unmeasured_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Tcp,
+            1,
+            unmeasured_commands,
+        )),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut unmeasured_receivers);
+    let unmeasured = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        })
+        .expect("unmeasured completion-tail alternate");
+    context.install_relay_path_instance_for_test(owner);
+    context.install_relay_path_instance_for_test(target);
+    context.install_relay_path_instance_for_test(unmeasured);
+    context.mark_tcp_path_open_success(
+        owner.key.index,
+        Duration::from_millis(5),
+        TrafficClass::Throughput,
+    );
+    context.mark_udp_path_open_success(target.key.index, Duration::from_millis(40));
+    context.mark_tcp_path_open_success(
+        unmeasured.key.index,
+        Duration::from_millis(40),
+        TrafficClass::Throughput,
+    );
+    context.mark_relay_path_rate_sample_for_test(
+        owner.key,
+        PathRateSample::new(64 * 1024, Duration::from_millis(524)).expect("slow owner sample"),
+    );
+
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let retained = send_stream
+        .send_data(Bytes::from(vec![0x55; 4096]))
+        .expect("retained tail");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &retained);
+    let mut model_wait_sender = RequestSenderService::new(stream_id);
+    model_wait_sender.record_original_frame_for_test(owner, &retained);
+    let mut queue = ReliableRelaySenderQueue::default();
+    let owner_interval = reliable_data_retransmission_interval(
+        Some(owner.key.underlay),
+        context.reliable_path_snapshot_for_instance(owner),
+    );
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+    let observed_generation = context.path_model_generation();
+    let model_wait = model_wait_sender.enqueue_completion_tail_reinjection(
+        &mut queue,
+        &context,
+        &remotes,
+        &send_stream,
+        &[],
+        true,
+        0,
+        TrafficClass::Throughput,
+    );
+    assert!(!model_wait.queued);
+    assert!(!model_wait.blocked_for_carrier_capacity);
+    assert!(
+        model_wait.waiting_for_path_model_publication,
+        "a due horizon-zero EOF tail without measured alternate Product evidence must retain a publication wake",
+    );
+    let model_publication = context.arm_path_model_publication(observed_generation);
+    context.mark_relay_path_rate_sample_for_test(
+        target.key,
+        PathRateSample::new(64 * 1024, Duration::from_micros(1049)).expect("fast target sample"),
+    );
+    tokio::time::timeout(Duration::from_millis(50), model_publication)
+        .await
+        .expect("completion-tail model publication cannot be lost after the due observation");
+
+    let initial_target = sender
+        .multipath
+        .tail_reinjection_earlier_completion_service_target(
+            &context,
+            &remotes,
+            &retained,
+            TrafficClass::Throughput,
+            &queue,
+            send_stream.reinjection_bytes(),
+            limits,
+        )
+        .expect("faster alternate has positive exact service");
+    assert_eq!(initial_target.identity.instance, target);
+    let initial_service = initial_target.service_limit_bytes;
+    assert!(initial_service > 32, "service={initial_service}");
+    sender.enqueue_critical_reinjection_frame(
+        &mut queue,
+        Frame::StreamData {
+            stream_id,
+            offset: 1_000_000,
+            payload: Bytes::from(vec![0x33; initial_service - 32]),
+        },
+        RelaySendCause::CompletionTailReinjection(ClientReinjectionOutputIdentity {
+            instance: target,
+        }),
+    );
+    let queued_before = queue.reinjection_bytes();
+    let mut exhausted_sender = RequestSenderService::new(stream_id);
+    exhausted_sender.record_original_frame_for_test(owner, &retained);
+    let mut capacity_sender = RequestSenderService::new(stream_id);
+    capacity_sender.record_original_frame_for_test(owner, &retained);
+    let mut exhausted_queue = ReliableRelaySenderQueue::default();
+    exhausted_sender.enqueue_critical_reinjection_frame(
+        &mut exhausted_queue,
+        Frame::StreamData {
+            stream_id,
+            offset: 2_000_000,
+            payload: Bytes::from(vec![0x44; initial_service]),
+        },
+        RelaySendCause::CompletionTailReinjection(ClientReinjectionOutputIdentity {
+            instance: target,
+        }),
+    );
+    let target_interval = reliable_data_retransmission_interval(
+        Some(target.key.underlay),
+        context.reliable_path_snapshot_for_instance(target),
+    );
+    assert_ne!(
+        target_interval, owner_interval,
+        "fixture requires asymmetric R"
+    );
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+
+    let mut capacity_queue = ReliableRelaySenderQueue::default();
+    target_commands_for_fill
+        .try_enqueue_reinjection_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 3_000_000,
+                payload: Bytes::from_static(b"full"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("fill exact completion target native queue");
+    let capacity_wait = crate::runtime::stream::arm_carrier_capacity_notifies(
+        remotes
+            .paths
+            .iter()
+            .flat_map(|path| path.stream.capacity_notifies())
+            .collect::<Vec<_>>(),
+    )
+    .expect("completion target exposes native capacity edge");
+    let blocked = capacity_sender.enqueue_completion_tail_reinjection(
+        &mut capacity_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        &[],
+        true,
+        0,
+        TrafficClass::Throughput,
+    );
+    assert!(
+        !blocked.queued,
+        "full-target outcome={blocked:?} queue={capacity_queue:?}",
+    );
+    assert!(
+        blocked.blocked_for_carrier_capacity,
+        "full-target outcome={blocked:?}",
+    );
+    assert!(
+        blocked.waiting_for_path_model_publication,
+        "a full measured target and a distinct unmeasured alternate retain both independent wake edges",
+    );
+    let filler = try_recv_reliable_path_command(&mut target_receivers)
+        .expect("release the full completion target queue");
+    target_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&filler));
+    tokio::time::timeout(Duration::from_millis(50), capacity_wait)
+        .await
+        .expect("pre-armed request completion-tail capacity wake cannot be lost");
+    assert!(
+        capacity_sender
+            .enqueue_completion_tail_reinjection(
+                &mut capacity_queue,
+                &context,
+                &remotes,
+                &send_stream,
+                &[],
+                true,
+                0,
+                TrafficClass::Throughput,
+            )
+            .queued,
+        "capacity release makes the same retained exact tail admissible",
+    );
+
+    let accepted_after = Instant::now();
+    assert!(
+        sender
+            .enqueue_completion_tail_reinjection(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                &[],
+                true,
+                0,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+    let accepted_by = Instant::now();
+    assert_eq!(
+        queue.reinjection_bytes() - queued_before,
+        32,
+        "Apply must shrink the ranked tail preview to the selected target's exact remaining Product service",
+    );
+    let successor_deadline = sender
+        .live_owner_frontier_floor_deadline()
+        .expect("only the accepted exact prefix consumes the shared floor epoch");
+    assert!(
+        successor_deadline >= accepted_after + target_interval
+            && successor_deadline <= accepted_by + target_interval,
+        "T_f uses the owner's R, but the accepted target-bound successor G must use selected target R_t",
+    );
+    if target_interval < owner_interval {
+        assert!(successor_deadline < accepted_after + owner_interval);
+    }
+
+    let (_, filler) = queue.pop_front().expect("target service filler");
+    assert!(matches!(
+        filler.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            frame: Frame::StreamData {
+                offset: 1_000_000,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(queue.reinjection_bytes(), 32);
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            TrafficClass::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut queue,
+            32,
+            ReliableDataAckFrontierState::Live,
+        )
+        .await
+        .expect("the M-bound completion target remains dispatchable after Apply shrinks to F");
+    assert!(matches!(
+        dispatch,
+        ClientQueuedDispatch::Reinjection {
+            payload_bytes: 32,
+            ..
+        }
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut target_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ref payload,
+            ..
+        })) if payload.len() == 32
+    ));
+    assert!(try_recv_reliable_path_command(&mut owner_receivers).is_none());
+
+    assert!(
+        !exhausted_sender
+            .enqueue_completion_tail_reinjection(
+                &mut exhausted_queue,
+                &context,
+                &remotes,
+                &send_stream,
+                &[],
+                true,
+                0,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+    assert_eq!(
+        exhausted_sender.live_owner_frontier_floor_deadline(),
+        None,
+        "an oversized preview rejected by exact target service cannot consume the epoch",
+    );
+}
+
+#[tokio::test]
+async fn completion_tail_uses_cache_independent_common_extent_for_target_and_apply() {
+    let stream_id = StreamId(228);
+    let resource_limits = ResourceLimits {
+        max_repair_bytes: 128 * 1024,
+        max_path_flight_bytes: 64 * 1024,
+        max_reliable_relay_chunk_bytes: 64 * 1024,
+        ..ResourceLimits::default()
+    };
+    let limits = MuxLimits::from(resource_limits);
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11361?initial-srtt-s=0.005&initial-rate-mbps=1",
+            "quic://127.0.0.1:11362?initial-srtt-s=0.04&initial-rate-mbps=500",
+            "tcp://127.0.0.1:11363?initial-srtt-s=0.001&initial-rate-mbps=500",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("path"))
+        .collect(),
+        security(),
+        resource_limits,
+    )
+    .expect("context");
+    let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+    let mut remotes = ReliableRelayRemoteSet::new(
+        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, owner_commands),
+        8,
+    );
+    consume_client_path_proof_for_test(&mut owner_receivers);
+    let owner = remotes.paths[0].instance();
+    let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            target_commands,
+        )),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut target_receivers);
+    let target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        })
+        .expect("completion-tail target");
+    context.install_relay_path_instance_for_test(owner);
+    context.install_relay_path_instance_for_test(target);
+    context.mark_tcp_path_open_success(
+        owner.key.index,
+        Duration::from_millis(5),
+        TrafficClass::Throughput,
+    );
+    context.mark_udp_path_open_success(target.key.index, Duration::from_millis(40));
+    context.mark_relay_path_rate_sample_for_test(
+        owner.key,
+        PathRateSample::new(64 * 1024, Duration::from_millis(524)).expect("slow owner sample"),
+    );
+    context.mark_relay_path_rate_sample_for_test(
+        target.key,
+        PathRateSample::new(64 * 1024, Duration::from_micros(1049)).expect("fast target sample"),
+    );
+
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let first = send_stream
+        .send_data(Bytes::from(vec![0x61; 1024]))
+        .expect("1 KiB cache chunk");
+    let second = send_stream
+        .send_data(Bytes::from(vec![0x62; 63 * 1024]))
+        .expect("63 KiB cache chunk");
+    let mut sender = RequestSenderService::new(stream_id);
+    sender.record_original_frame_for_test(owner, &first);
+    sender.record_original_frame_for_test(owner, &second);
+    let queue = ReliableRelaySenderQueue::default();
+    assert!(
+        sender
+            .multipath
+            .tail_reinjection_earlier_completion_service_target(
+                &context,
+                &remotes,
+                &first,
+                TrafficClass::Throughput,
+                &queue,
+                send_stream.reinjection_bytes(),
+                limits,
+            )
+            .is_none(),
+        "the low-RTT owner wins if storage's 1 KiB first chunk is incorrectly used as M",
+    );
+    assert_eq!(
+        sender
+            .multipath
+            .tail_reinjection_earlier_completion_service_target_for_extent(
+                &context,
+                &remotes,
+                &first,
+                TrafficClass::Throughput,
+                &queue,
+                send_stream.reinjection_bytes(),
+                limits,
+                64 * 1024,
+            )
+            .expect("the high-rate alternate wins the common 64 KiB extent")
+            .identity
+            .instance,
+        target,
+    );
+
+    let owner_interval = reliable_data_retransmission_interval(
+        Some(owner.key.underlay),
+        context.reliable_path_snapshot_for_instance(owner),
+    );
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+
+    let mut owner_wins_stream = ReliableSendStream::new(stream_id, limits);
+    let owner_wins_frame = owner_wins_stream
+        .send_data(Bytes::from(vec![0x60; 1024]))
+        .expect("small owner-favored tail");
+    let mut owner_wins_sender = RequestSenderService::new(stream_id);
+    owner_wins_sender.record_original_frame_for_test(owner, &owner_wins_frame);
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+    let mut owner_wins_queue = ReliableRelaySenderQueue::default();
+    let owner_wins_outcome = owner_wins_sender.enqueue_completion_tail_reinjection(
+        &mut owner_wins_queue,
+        &context,
+        &remotes,
+        &owner_wins_stream,
+        &[],
+        true,
+        0,
+        TrafficClass::Throughput,
+    );
+    assert!(
+        owner_wins_outcome.queued,
+        "after the exact owner's fallback deadline, G may use the best measured distinct target even when that target does not beat the owner's stale ETA",
+    );
+    let (_, owner_wins_work) = owner_wins_queue
+        .pop_front()
+        .expect("post-fallback request completion repair");
+    assert!(matches!(
+        owner_wins_work.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            cause: RelaySendCause::CompletionTailReinjection(identity),
+            ..
+        } if identity.instance == target
+    ));
+
+    let mut queue = ReliableRelaySenderQueue::default();
+    assert!(
+        sender
+            .enqueue_completion_tail_reinjection(
+                &mut queue,
+                &context,
+                &remotes,
+                &send_stream,
+                &[],
+                true,
+                0,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+
+    let mut cursor = 0_u64;
+    while let Some((lane, work)) = queue.pop_front() {
+        assert_eq!(lane, ReliableWorkClass::Reinjection);
+        let ReliableRelayQueuedWorkKind::Reinjection { frame, cause } = work.kind else {
+            panic!("completion-tail queue contains only reinjection work");
+        };
+        assert_eq!(
+            cause,
+            RelaySendCause::CompletionTailReinjection(ClientReinjectionOutputIdentity {
+                instance: target,
+            }),
+        );
+        let (start, end, _) = reliable_stream_frame_extent(&frame).expect("queued STREAM_DATA");
+        assert_eq!(start, cursor, "Apply keeps one exact contiguous prefix");
+        cursor = end;
+    }
+    assert_eq!(
+        cursor,
+        64 * 1024,
+        "Apply uses the same owner-uniform range scored independently of the two cache chunks",
+    );
+
+    let mut late_suffix_stream = ReliableSendStream::new(stream_id, limits);
+    let ranked_prefix = late_suffix_stream
+        .send_data(Bytes::from(vec![0x63; 64 * 1024]))
+        .expect("ranked 64 KiB prefix");
+    let mut late_suffix_sender = RequestSenderService::new(stream_id);
+    late_suffix_sender.record_original_frame_for_test(owner, &ranked_prefix);
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+    let unranked_suffix = late_suffix_stream
+        .send_data(Bytes::from(vec![0x64; 64 * 1024]))
+        .expect("fresh suffix beyond M");
+    late_suffix_sender.record_original_frame_for_test(owner, &unranked_suffix);
+    let mut late_suffix_queue = ReliableRelaySenderQueue::default();
+    let late_suffix_outcome = late_suffix_sender.enqueue_completion_tail_reinjection(
+        &mut late_suffix_queue,
+        &context,
+        &remotes,
+        &late_suffix_stream,
+        &[],
+        true,
+        0,
+        TrafficClass::Throughput,
+    );
+    assert!(late_suffix_outcome.queued);
+    assert_eq!(
+        late_suffix_queue.reinjection_bytes(),
+        64 * 1024,
+        "a fresh same-owner assignment beyond ranked M cannot postpone recovery of the mature lowest M",
+    );
+
+    let (boundary_target_commands, mut boundary_target_receivers) =
+        reliable_path_command_channels(8);
+    assert_eq!(
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Tcp,
+            1,
+            boundary_target_commands,
+        )),
+        ReliableRelayAttachOutcome::Attached,
+    );
+    consume_client_path_proof_for_test(&mut boundary_target_receivers);
+    let boundary_target = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        })
+        .expect("low-RTT boundary target");
+    context.install_relay_path_instance_for_test(boundary_target);
+    context.mark_tcp_path_open_success(
+        boundary_target.key.index,
+        Duration::from_millis(1),
+        TrafficClass::Throughput,
+    );
+    context.mark_relay_path_rate_sample_for_test(
+        boundary_target.key,
+        PathRateSample::new(64 * 1024, Duration::from_micros(1049))
+            .expect("fast boundary-target sample"),
+    );
+    let mut boundary_stream = ReliableSendStream::new(stream_id, limits);
+    let owner_prefix = boundary_stream
+        .send_data(Bytes::from(vec![0x71; 1024]))
+        .expect("A-owned prefix");
+    let target_suffix = boundary_stream
+        .send_data(Bytes::from(vec![0x72; 63 * 1024]))
+        .expect("B-owned suffix");
+    let mut boundary_sender = RequestSenderService::new(stream_id);
+    boundary_sender.record_original_frame_for_test(owner, &owner_prefix);
+    boundary_sender.record_original_frame_for_test(boundary_target, &target_suffix);
+    let uniform = boundary_sender
+        .multipath
+        .live_owner_uniform_frontier(
+            OffsetRange {
+                start: 0,
+                end: 64 * 1024,
+            },
+            &[owner, target, boundary_target],
+        )
+        .expect("lowest owner-uniform prefix");
+    assert_eq!(
+        uniform.range,
+        OffsetRange {
+            start: 0,
+            end: 1024
+        }
+    );
+    assert_eq!(uniform.owners, vec![owner]);
+
+    let owner_interval = reliable_data_retransmission_interval(
+        Some(owner.key.underlay),
+        context.reliable_path_snapshot_for_instance(owner),
+    );
+    tokio::time::sleep(owner_interval + Duration::from_millis(10)).await;
+    let mut boundary_queue = ReliableRelaySenderQueue::default();
+    assert!(
+        boundary_sender
+            .enqueue_completion_tail_reinjection(
+                &mut boundary_queue,
+                &context,
+                &remotes,
+                &boundary_stream,
+                &[],
+                true,
+                0,
+                TrafficClass::Throughput,
+            )
+            .queued
+    );
+    assert_eq!(
+        boundary_queue.reinjection_bytes(),
+        1024,
+        "one target-bound transaction stops before the next exact owner set",
+    );
+    let (_, work) = boundary_queue.pop_front().expect("bounded repair prefix");
+    assert!(matches!(
+        work.kind,
+        ReliableRelayQueuedWorkKind::Reinjection {
+            frame: Frame::StreamData {
+                offset: 0,
+                ref payload,
+                ..
+            },
+            cause: RelaySendCause::CompletionTailReinjection(identity),
+        } if payload.len() == 1024 && identity.instance == boundary_target
+    ));
+    assert!(boundary_queue.pop_front().is_none());
 }
 
 #[tokio::test]

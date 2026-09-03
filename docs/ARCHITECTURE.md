@@ -149,20 +149,51 @@ widen the shared window.
 
 Optional reinjection, including persistent authoritative Data ACK-gap repair
 while the exact original carrier remains live, consumes a cumulative
-extra-traffic budget. Critical path-failure and bounded live-tail recovery
-without an authoritative gap may exceed the remaining cumulative budget only
-by a cause-specific, event-bounded quantum. The exact range must remain
-unacknowledged and retained; overlapping queued copies are suppressed,
-live-tail and persistent-gap work use a distinct output, and all exception
+extra-traffic budget. A live gap's full target service window remains within
+that budget. At or after the original-owner boundary, either an authoritative
+gap or a contiguous tail may exceed remaining credit by only one exact
+frontier quantum. A target-bound ranked quantum is capped to the maximal
+lowest prefix with one exact live OriginalData owner and an unchanged exact
+copy-avoidance set; application/cache chunk boundaries alone do not divide
+that prefix. A pre-existing target-unbound tail instead retains its bounded
+unassigned prefix and is revalidated against the exact native target at
+dispatch. Both
+observations share one non-accumulating over-credit attempt token per stream
+send direction; accepting a batch at or after the owner boundary while that
+token is available consumes it, and target changes, queue expiry, or evidence
+transitions cannot renew it. Cumulative optional credit remains usable before
+the owner boundary and while the token is closed, and does not move its
+deadline. Exact
+terminal path failure retains separate bounded critical authority. The exact
+range must remain unacknowledged and retained; overlapping queued copies are
+suppressed, live-owner recovery uses a distinct output, and all exception
 bytes remain charged against later optional reinjection.
+
+Admission here means successful insertion into the serialized Product queue;
+an abandoned later writer attempt does not refund the token. A target-bound
+batch uses its selected alternate interval, while a target-unbound tail uses
+the observed original-owner interval. A multi-frame batch fixes its epoch to
+the maximum applicable interval across the frames actually admitted.
+Target selection ranks one common captured lowest-frontier quantum. Exact
+target capacity and repair quantum may shrink that same frontier during Apply,
+but cannot enlarge it or skip ahead. A funded suffix may continue only inside
+the same identity-uniform prefix on the frozen target, with per-slice Product
+and native revalidation. A response FIN tail ranked from target-specific
+capacity remains bound to that exact output incarnation through dispatch;
+target-unbound work remains conservatively bounded until native dispatch
+revalidates the exact target.
 
 Recovery timing follows the evidence owner. Exact path-instance failure is
 immediate. A complete Data ACK establishes gaps; positive partial ACK ranges
 may extend that state but cannot infer omitted ranges. Fragmented request
-feedback waits one owner RTO/PTO from first authoritative gap observation.
-Response feedback may use a later-ACK TCP RACK 5/4-SRTT or QUIC 9/8-SRTT time
-threshold, while ACK silence waits the owner RTO/PTO. A contiguous live tail
-may send one bounded probe per recovery interval without progress. A request
+feedback waits until one owner RTO/PTO from the exact OriginalData assignment
+epoch. Response feedback may use a later-ACK TCP 5/4-SRTT or QUIC 9/8-SRTT
+time threshold, while ACK silence waits the owner RTO/PTO. Gap and tail recovery
+share one live-owner over-credit token; after acceptance while that token is
+available, another frontier-floor attempt requires a full recovery interval
+without contiguous unique Data-ACK frontier progress. Optional-funded service
+remains available while the token is closed and does not move its deadline.
+Sparse suffix ACK release does not restart that interval. A request
 carrier with no exact Data ACK progress becomes stale for new placement after
 four TCP RTOs or three QUIC PTOs when an alternative exists, without stopping
 its native recovery.

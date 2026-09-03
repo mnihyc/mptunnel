@@ -1,5 +1,5 @@
 use super::super::{
-    ClientReinjectionOutputIdentity, PersistentClientAckGapBatch, PersistentServerAckGapBatch,
+    ClientReinjectionOutputIdentity, PersistentClientAckGapBatch, ServerBoundReinjectionBatch,
     ServerReinjectionOutputIdentity,
 };
 use super::*;
@@ -232,14 +232,14 @@ fn response_target_queue_view_keeps_bound_and_unbound_repair_authority_separate(
         (10, RelaySendCause::AckGapReinjection),
         (
             20,
-            RelaySendCause::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
+            RelaySendCause::PersistentServerAckGapReinjection(ServerBoundReinjectionBatch {
                 target: first,
                 expires_at: Instant::now() + Duration::from_secs(1),
             }),
         ),
         (
             30,
-            RelaySendCause::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
+            RelaySendCause::PersistentServerAckGapReinjection(ServerBoundReinjectionBatch {
                 target: second,
                 expires_at: Instant::now() + Duration::from_secs(1),
             }),
@@ -388,10 +388,7 @@ fn sender_queue_discards_stale_bound_reinjection_without_touching_ordinary_reinj
         );
     }
 
-    assert_eq!(
-        queue.discard_stale_persistent_ack_gap_reinjections(|_| false),
-        64
-    );
+    assert_eq!(queue.discard_stale_bound_reinjections(|_| false), 64);
     assert_eq!(queue.bytes(), 64);
     assert!(matches!(
         queue.front().map(|(_, work)| &work.kind),
@@ -411,7 +408,7 @@ fn sender_queue_discards_expired_bound_reinjection_on_live_output() {
             offset: 0,
             payload: Bytes::from_static(&[0x5d; 64]),
         },
-        RelaySendCause::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
+        RelaySendCause::PersistentServerAckGapReinjection(ServerBoundReinjectionBatch {
             target: ServerReinjectionOutputIdentity {
                 key: CarrierPathKey {
                     underlay: UnderlayProtocol::Udp,
@@ -423,10 +420,7 @@ fn sender_queue_discards_expired_bound_reinjection_on_live_output() {
         }),
     );
 
-    assert_eq!(
-        queue.discard_stale_persistent_ack_gap_reinjections(|_| true),
-        64
-    );
+    assert_eq!(queue.discard_stale_bound_reinjections(|_| true), 64);
     assert!(queue.is_empty());
     assert_eq!(queue.bytes(), 0);
 }

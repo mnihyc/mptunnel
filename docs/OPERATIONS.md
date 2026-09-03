@@ -402,7 +402,8 @@ seconds, and validate the rebuilt file; do not mix it with an earlier schema.
   omission does not enable that gate.
 - Omitted `[flow].optional_reinjection_budget_percent` is 10. It meters only
   optional reliable-payload reinjection, not native recovery, control, probes,
-  or critical path-failure recovery.
+  or the separately bounded cause-specific critical recovery authorities in
+  RFC Section 15.2.
 - Omitted `[flow].quic_loss_compensation_percent` is separately 10. It adjusts
   sender-local QUIC delivery/loss evidence without sending bytes or consuming
   the optional reinjection budget. Ordinary compensated loss carries a
@@ -606,8 +607,9 @@ window. The QUIC-native exactness bound does not restrict a TCP-only prior.
 
 Omission uses 10 for both `optional_reinjection_budget_percent` and
 `quic_loss_compensation_percent`. The former meters only optional reliable MPP
-payload reinjection; native TCP/QUIC recovery, MPP control and probes, and
-critical path-failure recovery are outside that optional allowance. The latter
+payload reinjection; native TCP/QUIC recovery, MPP control and probes, and the
+separately bounded cause-specific critical authorities in RFC Section 15.2 are
+outside that optional allowance. The latter
 changes sender-local QUIC delivery/loss evidence and does not itself send or
 budget bytes. Its nonzero policy includes the RFC's fixed three-round
 authorized-loss burst envelope; this prevents random or correlated placement
@@ -1117,27 +1119,48 @@ work around these with a fixed path role or a Linux-only eligibility rule.
 
 Ordinary reinjection is limited by a cumulative allowance derived from a
 bounded startup floor and unique MPP bytes acknowledged by Data ACK.
-Persistent authoritative Data ACK-gap repair remains within that allowance
-while the exact original carrier is live. Critical path-failure and bounded
-live-tail recovery without an authoritative gap may exceed the remaining
-allowance by one cause-specific event quantum. Exact retained ranges, queue
-and flight limits, overlap/repeat suppression, and alternate-output
-requirements still apply. Exception bytes remain charged, reducing the
-remaining optional reinjection allowance. A continuous over-budget stream is
-therefore a defect, not expected failover overhead.
+While the exact original carrier is live, a persistent authoritative Data ACK
+gap's full target service window remains within that allowance. At or after the
+original-owner boundary, either a gap or a contiguous tail may exceed remaining
+credit by only one exact frontier quantum. A target-bound ranked quantum covers
+only the maximal lowest prefix with one live exact owner and an unchanged exact
+copy-avoidance set; cache chunking alone does not change its rank. A pre-existing
+target-unbound tail retains a bounded unassigned prefix and is revalidated
+against the exact native target at dispatch. They share one
+non-accumulating over-credit token per stream send direction: acceptance at or
+after the owner boundary while that token is available consumes it, and target churn,
+queue expiry, or evidence transitions do not mint another attempt. Cumulative
+optional credit remains spendable before the owner boundary and while the token
+is closed, and does not renew it. Exact terminal path failure retains separate bounded
+critical authority. Exact retained ranges, queue and flight limits,
+overlap/repeat suppression, and alternate-output requirements still apply.
+Every accepted byte remains charged, reducing later optional allowance. A
+continuous over-budget stream is therefore a defect, not expected failover
+overhead.
 
 The current timers are cause-specific. Exact path-instance failure permits an
 immediate bounded copy, preferring measured survivors but using any eligible
 live survivor when necessary. Complete Data ACKs establish missing ranges;
 positive partial ACK ranges may extend established state but cannot infer an
-omission. Fragmented request feedback waits one original-carrier RTO/PTO from
-the first authoritative gap observation. Response feedback may use a later-ACK
-TCP RACK 5/4-SRTT or QUIC 9/8-SRTT time threshold; ACK silence waits that
-carrier's RTO/PTO. A
-contiguous live tail may send one bounded probe per recovery interval without
-progress. A request path becomes stale for new placement after four TCP RTOs
+omission. Fragmented request feedback waits until one original-carrier RTO/PTO
+from the exact OriginalData assignment epoch. Response feedback may use a
+later-ACK TCP 5/4-SRTT or QUIC 9/8-SRTT time threshold; ACK silence waits that
+carrier's RTO/PTO. A live-owner gap/tail batch accepted at or after the owner
+boundary while the over-credit token is available fixes the next frontier-floor
+eligibility one full recovery interval later. Optional-funded work remains
+cause-eligible before that boundary and while the token is closed, and cannot
+move its deadline. Newly
+acknowledged contiguous Data-ACK frontier progress, not sparse suffix ACKs,
+polling, or target changes, restarts that interval. A request path becomes
+stale for new placement after four TCP RTOs
 or three QUIC PTOs without exact Data ACK progress when another attachment
 exists; this does not terminate native recovery.
+
+Response finite-tail repair that was ranked from one target's measured
+capacity remains bound to that exact output incarnation through Product and
+native dispatch. If that incarnation disappears or the decision expires, the
+queued intent is removed for fresh evaluation; it is never silently moved to a
+different carrier.
 
 MPP datagram feedback confirms that the server accepted a datagram for target
 forwarding, not end-to-end delivery. Before feedback, the runtime makes at most

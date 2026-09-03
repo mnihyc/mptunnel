@@ -6,7 +6,7 @@
 use super::dispatch::{
     ResponseReinjectionServiceModel, emit_planned_response_data_frame,
     emit_response_frame_from_sender_service, response_frame_has_carrier_credit,
-    select_switchable_response_target,
+    select_switchable_response_target, select_switchable_response_target_for_extent,
 };
 use super::multipath::plan_response_data_payload_with_data_ack_outstanding_impl;
 use super::response_reinjection_avoid_outputs;
@@ -18,10 +18,16 @@ use crate::lab_diagnostics::{
 };
 use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
-use crate::model::multipath::OptionalReinjectionLedger;
+use crate::model::multipath::{
+    LiveOwnerFallbackEpoch, LiveOwnerFrontierFloorEpoch, OptionalReinjectionLedger,
+};
 use crate::model::path::CarrierPathKey;
+use crate::model::timing::{
+    ReliableDataAckGapTiming, reliable_data_ack_gap_timing_for_assignments,
+};
 use crate::model::work::{
-    ReliableReinjectionTargetWork, ReliableWorkClass, reliable_reinjection_service_limit_bytes,
+    ReliableReinjectionTargetWork, ReliableWorkClass, flight_interval_bytes,
+    reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
@@ -32,6 +38,9 @@ use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_f
 use crate::protocol::{Frame, OffsetRange, SessionId, StreamId};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::reliable_path_effective_frame_lane;
+use crate::runtime::relay::io::{
+    exact_contiguous_retransmission_frames, normalized_stream_ack_first_gap,
+};
 use crate::runtime::sender::{
     CarrierEmitMode, RelaySendCause, ReliableRelayQueuedWork, ReliableRelayQueuedWorkKind,
     ReliableRelaySenderQueue, ServerReinjectionOutputIdentity,
@@ -195,6 +204,8 @@ pub(in crate::runtime) struct ServerResponseSenderService {
     pub(in crate::runtime::sender) queue: ReliableRelaySenderQueue,
     pub(in crate::runtime::sender) performance: MppPerformanceConfig,
     pub(in crate::runtime::sender) optional_reinjection: OptionalReinjectionLedger,
+    live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch,
+    completion_tail_owner_fallback: LiveOwnerFallbackEpoch<ServerReinjectionOutputIdentity>,
     stale_response_recovery_generation: u64,
 }
 
@@ -214,6 +225,13 @@ pub(in crate::runtime) struct ServerAckGapReinjectionTarget {
     pub(in crate::runtime) completion: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ServerAckGapReinjectionObservation {
+    pub(in crate::runtime) uniform_frontier_extent_bytes: usize,
+    pub(in crate::runtime) owner_recovery_timing: ReliableDataAckGapTiming,
+    pub(in crate::runtime) target: Option<ServerAckGapReinjectionTarget>,
+}
+
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct StaleResponseRecoveryOutcome {
     pub(in crate::runtime) queued: bool,
@@ -226,11 +244,13 @@ impl ServerResponseSenderService {
         &self,
         send_stream: &ReliableSendStream,
         exclude_front_work: bool,
+        require_full_frame: bool,
     ) -> ResponseReinjectionServiceModel<'_> {
         ResponseReinjectionServiceModel {
             queue: &self.queue,
             exclude_front_work,
             reinjection_debt_bytes: send_stream.reinjection_bytes(),
+            require_full_frame,
         }
     }
 
@@ -306,6 +326,8 @@ impl ServerResponseSenderService {
             queue: ReliableRelaySenderQueue::default(),
             performance,
             optional_reinjection: OptionalReinjectionLedger::default(),
+            live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch::default(),
+            completion_tail_owner_fallback: LiveOwnerFallbackEpoch::default(),
             stale_response_recovery_generation: 0,
         }
     }
@@ -314,40 +336,106 @@ impl ServerResponseSenderService {
         self.stale_response_recovery_generation
     }
 
+    pub(in crate::runtime) fn observe_completion_tail_owner_fallback(
+        &mut self,
+        range: OffsetRange,
+        owners: &[ServerReinjectionOutputIdentity],
+        timing: ReliableDataAckGapTiming,
+    ) -> Instant {
+        self.completion_tail_owner_fallback
+            .observe(range, owners, timing)
+    }
+
+    pub(in crate::runtime) fn completion_tail_owner_fallback_deadline(&self) -> Option<Instant> {
+        self.completion_tail_owner_fallback.deadline()
+    }
+
     pub(in crate::runtime) fn ack_gap_reinjection_path_snapshot(
         &self,
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
         normalized_ranges: &[OffsetRange],
         preview_limit: usize,
-    ) -> Option<ServerAckGapReinjectionTarget> {
-        let preview = send_stream
-            .retransmission_frames_for_normalized_ack_gaps(normalized_ranges, preview_limit.max(1))
-            .into_iter()
-            .next()?;
-        let target = self.reinjection_path_target_for_frame(
-            path_stream,
-            &preview,
-            RelaySendCause::PersistentAckGapReinjection,
-            Some(self.reinjection_service_model(send_stream, false)),
-        )?;
-        let lane = path_stream.current_lane();
-        let score = scheduler::score_path(
-            response_completion_snapshot(&target),
-            lane,
-            reliable_stream_frame_accounted_bytes(&preview),
-        )?;
-        if !score.eta_ms.is_finite() {
+    ) -> Option<ServerAckGapReinjectionObservation> {
+        let (frontier, horizon) = normalized_stream_ack_first_gap(normalized_ranges)?;
+        let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
+            return None;
+        };
+        let uniform_frontier = binding.live_owner_uniform_frontier(OffsetRange {
+            start: frontier,
+            end: horizon,
+        })?;
+        if uniform_frontier.owners.len() != 1 {
             return None;
         }
-        let identity = ServerReinjectionOutputIdentity {
-            key: target.observation.key,
-            incarnation: target.observation.incarnation,
+        let uniform_frontier_extent_bytes =
+            flight_interval_bytes(uniform_frontier.range.start, uniform_frontier.range.end);
+        let scoring_payload_bytes = preview_limit.min(uniform_frontier_extent_bytes);
+        if scoring_payload_bytes == 0 {
+            return None;
+        }
+        let scoring_range = OffsetRange {
+            start: frontier,
+            end: frontier.saturating_add(scoring_payload_bytes as u64),
         };
-        Some(ServerAckGapReinjectionTarget {
-            identity,
-            snapshot: response_completion_snapshot(&target),
-            completion: Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0),
+        let scoring_frontier = binding.live_owner_uniform_frontier(scoring_range)?;
+        if scoring_frontier.range != scoring_range
+            || scoring_frontier.owners != uniform_frontier.owners
+            || scoring_frontier.avoid != uniform_frontier.avoid
+        {
+            return None;
+        }
+        let scoring_frames = exact_contiguous_retransmission_frames(send_stream, scoring_range)?;
+        let preview = scoring_frames
+            .first()
+            .expect("non-empty exact cache prefix");
+        let target = select_switchable_response_target_for_extent(
+            path_stream,
+            path_stream.current_lane(),
+            preview,
+            CarrierEmitMode::Classified,
+            &response_reinjection_avoid_outputs(
+                binding,
+                preview,
+                RelaySendCause::PersistentAckGapReinjection,
+            ),
+            Some(RelaySendCause::PersistentAckGapReinjection),
+            Some(self.reinjection_service_model(send_stream, false, false)),
+            scoring_payload_bytes,
+        );
+        let lane = path_stream.current_lane();
+        let owner_recovery_timing = reliable_data_ack_gap_timing_for_assignments(
+            &scoring_frontier.owner_assignments,
+            |owner| {
+                (
+                    owner.key.underlay,
+                    path_stream.response_output_snapshot(owner, lane),
+                )
+            },
+        )?;
+        let target = target.and_then(|target| {
+            let identity = ServerReinjectionOutputIdentity {
+                key: target.observation.key,
+                incarnation: target.observation.incarnation,
+            };
+            if uniform_frontier.avoid.contains(&identity) {
+                return None;
+            }
+            let snapshot = response_completion_snapshot(&target);
+            let score = scheduler::score_path(snapshot, lane, scoring_payload_bytes)?;
+            score
+                .eta_ms
+                .is_finite()
+                .then_some(ServerAckGapReinjectionTarget {
+                    identity,
+                    snapshot,
+                    completion: Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0),
+                })
+        });
+        Some(ServerAckGapReinjectionObservation {
+            uniform_frontier_extent_bytes,
+            owner_recovery_timing,
+            target,
         })
     }
 
@@ -362,7 +450,41 @@ impl ServerResponseSenderService {
             path_stream,
             preview,
             cause,
-            Some(self.reinjection_service_model(send_stream, false)),
+            Some(self.reinjection_service_model(send_stream, false, true)),
+        )
+        .map(|target| {
+            let identity = ServerReinjectionOutputIdentity {
+                key: target.observation.key,
+                incarnation: target.observation.incarnation,
+            };
+            (identity, response_completion_snapshot(&target))
+        })
+    }
+
+    /// Selects a positive-service witness for a common frontier preview.
+    /// Apply must shrink the queued prefix to this exact witness's K/A limits;
+    /// ordinary preflight above continues to require the whole frame.
+    pub(in crate::runtime) fn reinjection_frontier_preview_target_for_extent(
+        &self,
+        path_stream: &ReliablePathStream,
+        send_stream: &ReliableSendStream,
+        preview: &Frame,
+        cause: RelaySendCause,
+        scoring_payload_bytes: usize,
+    ) -> Option<(ServerReinjectionOutputIdentity, PathSnapshot)> {
+        let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
+            return None;
+        };
+        let avoid_outputs = response_reinjection_avoid_outputs(binding, preview, cause);
+        select_switchable_response_target_for_extent(
+            path_stream,
+            path_stream.current_lane(),
+            preview,
+            CarrierEmitMode::Classified,
+            &avoid_outputs,
+            Some(cause),
+            Some(self.reinjection_service_model(send_stream, false, false)),
+            scoring_payload_bytes,
         )
         .map(|target| {
             let identity = ServerReinjectionOutputIdentity {
@@ -425,16 +547,15 @@ impl ServerResponseSenderService {
         })
     }
 
-    pub(in crate::runtime) fn discard_stale_persistent_ack_gap_reinjections(
+    pub(in crate::runtime) fn discard_stale_bound_reinjections(
         &mut self,
         path_stream: &ReliablePathStream,
     ) -> usize {
-        self.queue
-            .discard_stale_persistent_ack_gap_reinjections(|cause| {
-                cause.persistent_server_target().is_none_or(|target| {
-                    path_stream.has_output_incarnation(target.key, target.incarnation)
-                }) && cause.persistent_client_target().is_none()
-            })
+        self.queue.discard_stale_bound_reinjections(|cause| {
+            cause.server_bound_target().is_none_or(|target| {
+                path_stream.has_output_incarnation(target.key, target.incarnation)
+            }) && cause.persistent_client_target().is_none()
+        })
     }
 
     pub(in crate::runtime) fn discard_resolved_stale_output_reinjections(
@@ -448,8 +569,8 @@ impl ServerResponseSenderService {
             })
     }
 
-    pub(in crate::runtime) fn persistent_ack_gap_reinjection_deadline(&self) -> Option<Instant> {
-        self.queue.persistent_ack_gap_reinjection_deadline()
+    pub(in crate::runtime) fn bound_reinjection_deadline(&self) -> Option<Instant> {
+        self.queue.bound_reinjection_deadline()
     }
 
     pub(in crate::runtime) fn optional_reinjection_budget_remaining(
@@ -481,6 +602,31 @@ impl ServerResponseSenderService {
         } else {
             remaining
         }
+    }
+
+    pub(in crate::runtime) fn live_owner_frontier_floor_ready(&self, observed_at: Instant) -> bool {
+        self.live_owner_frontier_floor.attempt_ready(observed_at)
+    }
+
+    pub(in crate::runtime) fn live_owner_frontier_floor_deadline(&self) -> Option<Instant> {
+        self.live_owner_frontier_floor.next_attempt_at()
+    }
+
+    pub(in crate::runtime) fn record_live_owner_frontier_floor_attempt(
+        &mut self,
+        observed_at: Instant,
+        recovery_interval: Duration,
+    ) {
+        self.live_owner_frontier_floor
+            .record_accepted_attempt(observed_at, recovery_interval);
+    }
+
+    pub(in crate::runtime) fn record_live_owner_data_ack_frontier_progress(
+        &mut self,
+        observed_at: Instant,
+    ) {
+        self.live_owner_frontier_floor
+            .record_data_ack_progress(observed_at);
     }
 
     pub(in crate::runtime) fn record_delivered_data(&mut self, bytes: usize) {
@@ -568,7 +714,7 @@ impl ServerResponseSenderService {
                     relay_lane,
                     CarrierEmitMode::Classified,
                     Some(*cause),
-                    Some(self.reinjection_service_model(send_stream, true)),
+                    Some(self.reinjection_service_model(send_stream, true, true)),
                 )
             }
         }
@@ -648,19 +794,6 @@ impl ServerResponseSenderService {
         } else {
             self.queue.push_reinjection_with_cause(frame, cause)
         })
-    }
-
-    pub(in crate::runtime) fn enqueue_critical_tail_reinjection_frame(
-        &mut self,
-        frame: Frame,
-    ) -> Option<u64> {
-        if self.has_queued_reinjection_overlap(&frame) {
-            return None;
-        }
-        Some(self.enqueue_critical_reinjection_frame_with_cause(
-            frame,
-            RelaySendCause::PathFailureReinjection,
-        ))
     }
 
     pub(in crate::runtime) fn enqueue_critical_reinjection_frame_with_cause(
@@ -1050,7 +1183,7 @@ impl ServerResponseSenderService {
                 CarrierEmitMode::Classified,
                 "tail_reinjection",
                 reinjection_cause,
-                Some(self.reinjection_service_model(send_stream, true)),
+                Some(self.reinjection_service_model(send_stream, true, true)),
             )?,
         };
         let (_, committed) = self

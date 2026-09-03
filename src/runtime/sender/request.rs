@@ -18,12 +18,19 @@ use crate::model::capacity::{
     ReliableStreamSourceAdmission, adaptive_reliable_relay_reinjection_bytes,
     reliable_stream_advertised_window_bytes,
 };
-use crate::model::multipath::OptionalReinjectionLedger;
+use crate::model::multipath::{
+    LiveOwnerFallbackEpoch, LiveOwnerFrontierFloorEpoch, OptionalReinjectionLedger,
+    include_live_owner_recovery_interval,
+};
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::requalification::StreamRequalificationProbe;
-use crate::model::timing::reliable_relay_tail_reinjection_delay;
+use crate::model::timing::{
+    ReliableDataAckGapTiming, reliable_data_ack_gap_timing_for_assignments,
+    reliable_data_retransmission_interval,
+};
 use crate::model::work::{
-    ReliableReinjectionTargetWork, reliable_critical_tail_reinjection_limit_bytes,
+    ReliableReinjectionTargetWork, flight_interval_bytes,
+    reliable_live_frontier_reinjection_limit_bytes, reliable_live_gap_reinjection_authority,
     reliable_reinjection_service_limit_bytes,
 };
 use crate::mux::MuxLimits;
@@ -39,6 +46,10 @@ use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{
     ReliablePathCommandSender, ReliablePathFrameReservation, reliable_path_effective_frame_lane,
+};
+use crate::runtime::relay::io::{
+    exact_contiguous_retransmission_frames, normalized_stream_ack_first_gap,
+    preserve_reinjection_frontier_quantum,
 };
 #[cfg(test)]
 use crate::runtime::stream::ReliablePathStreamHandle;
@@ -116,6 +127,19 @@ struct RequestPathRecoveryEnqueueOutcome {
     blocked_for_carrier_capacity: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::runtime) struct RequestCompletionTailEnqueueOutcome {
+    pub(in crate::runtime) queued: bool,
+    pub(in crate::runtime) blocked_for_carrier_capacity: bool,
+    pub(in crate::runtime) waiting_for_path_model_publication: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestTailReinjectionOutcome {
+    queued: bool,
+    completion_tail: Option<RequestCompletionTailEnqueueOutcome>,
+}
+
 /// Immutable evidence used to decide whether one Data ACK gap may be
 /// reinjected on a different live path.
 #[derive(Debug, Clone, Copy, Default)]
@@ -129,6 +153,29 @@ pub(in crate::runtime) struct RequestDataAckGapObservation {
     pub(in crate::runtime) reinjection_target_flight_bytes: usize,
     pub(in crate::runtime) reinjection_completion: Option<Duration>,
     pub(in crate::runtime) target_service_exhausted: bool,
+    pub(in crate::runtime) target_model_pending: bool,
+    pub(in crate::runtime) uniform_frontier_extent_bytes: usize,
+    pub(in crate::runtime) owner_recovery_timing: Option<ReliableDataAckGapTiming>,
+}
+
+/// Immutable target authority captured by one completion-tail Decide step.
+///
+/// Apply may shrink the ranked frontier against this exact snapshot and
+/// service headroom, but must not resample a replacement target before it
+/// records the shared live-owner recovery interval.
+#[derive(Debug, Clone, Copy)]
+struct RequestCompletionTailTarget {
+    identity: ClientReinjectionOutputIdentity,
+    snapshot: PathSnapshot,
+    service_limit_bytes: usize,
+    recovery_interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestCompletionTailTargetObservation {
+    target: Option<RequestCompletionTailTarget>,
+    target_service_exhausted: bool,
+    waiting_for_path_model_publication: bool,
 }
 
 #[derive(Debug)]
@@ -136,6 +183,8 @@ pub(in crate::runtime) struct RequestSenderService {
     multipath: RequestMultipathController,
     performance: MppPerformanceConfig,
     optional_reinjection: OptionalReinjectionLedger,
+    live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch,
+    completion_tail_owner_fallback: LiveOwnerFallbackEpoch<RelayPathInstance>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,7 +248,13 @@ impl RequestSenderService {
             multipath: RequestMultipathController::new(stream_id),
             performance,
             optional_reinjection: OptionalReinjectionLedger::default(),
+            live_owner_frontier_floor: LiveOwnerFrontierFloorEpoch::default(),
+            completion_tail_owner_fallback: LiveOwnerFallbackEpoch::default(),
         }
+    }
+
+    pub(in crate::runtime) fn completion_tail_owner_fallback_deadline(&self) -> Option<Instant> {
+        self.completion_tail_owner_fallback.deadline()
     }
 
     pub(in crate::runtime) fn fail_client_path_instance(
@@ -230,6 +285,31 @@ impl RequestSenderService {
         } else {
             remaining
         }
+    }
+
+    pub(in crate::runtime) fn live_owner_frontier_floor_ready(&self, observed_at: Instant) -> bool {
+        self.live_owner_frontier_floor.attempt_ready(observed_at)
+    }
+
+    pub(in crate::runtime) fn live_owner_frontier_floor_deadline(&self) -> Option<Instant> {
+        self.live_owner_frontier_floor.next_attempt_at()
+    }
+
+    pub(in crate::runtime) fn record_live_owner_frontier_floor_attempt(
+        &mut self,
+        observed_at: Instant,
+        recovery_interval: Duration,
+    ) {
+        self.live_owner_frontier_floor
+            .record_accepted_attempt(observed_at, recovery_interval);
+    }
+
+    pub(in crate::runtime) fn record_live_owner_data_ack_frontier_progress(
+        &mut self,
+        observed_at: Instant,
+    ) {
+        self.live_owner_frontier_floor
+            .record_data_ack_progress(observed_at);
     }
 
     pub(in crate::runtime) fn enqueue_reinjection_frame_with_priority(
@@ -337,13 +417,13 @@ impl RequestSenderService {
             > 1
     }
 
-    pub(in crate::runtime) fn discard_stale_persistent_ack_gap_reinjections(
+    pub(in crate::runtime) fn discard_stale_bound_reinjections(
         &self,
         sender_queue: &mut ReliableRelaySenderQueue,
         remotes: &ReliableRelayRemoteSet,
     ) -> usize {
         self.multipath
-            .discard_stale_persistent_ack_gap_reinjections(sender_queue, remotes)
+            .discard_stale_bound_reinjections(sender_queue, remotes)
     }
 
     pub(in crate::runtime) fn discard_resolved_stale_path_reinjections(
@@ -549,22 +629,89 @@ impl RequestSenderService {
         preview_limit: usize,
         lane: TrafficClass,
     ) -> RequestDataAckGapObservation {
-        let Some(preview) = send_stream
-            .retransmission_frames_for_normalized_ack_gaps(normalized_ranges, preview_limit.max(1))
-            .into_iter()
-            .next()
+        let Some((frontier, horizon)) = normalized_stream_ack_first_gap(normalized_ranges) else {
+            return RequestDataAckGapObservation::default();
+        };
+        let live_instances = self
+            .multipath
+            .owner_capable_instances(context, remotes, lane);
+        let Some(uniform_frontier) = self.multipath.live_owner_uniform_frontier(
+            OffsetRange {
+                start: frontier,
+                end: horizon,
+            },
+            &live_instances,
+        ) else {
+            return RequestDataAckGapObservation::default();
+        };
+        if uniform_frontier.owners.len() != 1 {
+            return RequestDataAckGapObservation::default();
+        }
+        let uniform_frontier_extent_bytes =
+            flight_interval_bytes(uniform_frontier.range.start, uniform_frontier.range.end);
+        let scoring_payload_bytes = preview_limit.min(uniform_frontier_extent_bytes);
+        if scoring_payload_bytes == 0 {
+            return RequestDataAckGapObservation::default();
+        }
+        let scoring_range = OffsetRange {
+            start: frontier,
+            end: frontier.saturating_add(scoring_payload_bytes as u64),
+        };
+        let Some(scoring_frontier) = self
+            .multipath
+            .live_owner_uniform_frontier(scoring_range, &live_instances)
         else {
             return RequestDataAckGapObservation::default();
         };
-        self.multipath.data_ack_gap_reinjection_service_model(
-            context,
-            remotes,
-            &preview,
-            lane,
-            sender_queue,
-            send_stream.reinjection_bytes(),
-            context.mux_limits,
-        )
+        if scoring_frontier.range != scoring_range
+            || scoring_frontier.owners != uniform_frontier.owners
+            || scoring_frontier.avoid != uniform_frontier.avoid
+        {
+            return RequestDataAckGapObservation::default();
+        }
+        let Some(scoring_frames) =
+            exact_contiguous_retransmission_frames(send_stream, scoring_range)
+        else {
+            return RequestDataAckGapObservation::default();
+        };
+        let preview = scoring_frames
+            .first()
+            .expect("non-empty exact cache prefix");
+        let owner_recovery_timing = reliable_data_ack_gap_timing_for_assignments(
+            &scoring_frontier.owner_assignments,
+            |instance| {
+                (
+                    instance.key.underlay,
+                    context.reliable_path_snapshot_for_instance(instance),
+                )
+            },
+        );
+        let mut model = self
+            .multipath
+            .data_ack_gap_reinjection_service_model_for_extent(
+                context,
+                remotes,
+                preview,
+                lane,
+                sender_queue,
+                send_stream.reinjection_bytes(),
+                context.mux_limits,
+                scoring_payload_bytes,
+            );
+        if model
+            .reinjection_target
+            .is_some_and(|(target, _)| uniform_frontier.avoid.contains(&target.instance))
+        {
+            return RequestDataAckGapObservation::default();
+        }
+        model.original_assignment_at = scoring_frontier
+            .owner_assignments
+            .iter()
+            .map(|(_, sent_at)| *sent_at)
+            .max();
+        model.uniform_frontier_extent_bytes = uniform_frontier_extent_bytes;
+        model.owner_recovery_timing = owner_recovery_timing;
+        model
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1292,12 +1439,13 @@ impl RequestSenderService {
             lane,
             false,
         )
+        .queued
     }
 
-    /// Races only a finite retained tail whose measured alternate is expected
-    /// to complete earlier than its still-live original owner. The existing
-    /// recovery interval, exact-range repeat suppression, and repair envelope
-    /// remain the authority for when and how much can be copied.
+    /// Recovers a finite retained completion tail on the best measured exact
+    /// alternate after the original owner's immutable native fallback. Exact
+    /// range suppression and the shared repair envelope remain the authority
+    /// for when and how much can be copied.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn enqueue_completion_tail_reinjection(
         &mut self,
@@ -1309,7 +1457,7 @@ impl RequestSenderService {
         last_send_ack_complete: bool,
         last_send_ack_frontier: u64,
         lane: TrafficClass,
-    ) -> bool {
+    ) -> RequestCompletionTailEnqueueOutcome {
         self.enqueue_tail_reinjection_inner(
             sender_queue,
             context,
@@ -1322,6 +1470,8 @@ impl RequestSenderService {
             lane,
             true,
         )
+        .completion_tail
+        .unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1336,13 +1486,13 @@ impl RequestSenderService {
         reinjection_horizon: Option<u64>,
         last_send_ack_frontier: u64,
         lane: TrafficClass,
-        require_earlier_completion: bool,
-    ) -> bool {
+        completion_tail_fallback: bool,
+    ) -> RequestTailReinjectionOutcome {
         let Some(reinjection_horizon) = reinjection_horizon else {
-            return false;
+            return RequestTailReinjectionOutcome::default();
         };
         if !last_send_ack_complete
-            || (!require_earlier_completion && last_send_ack_frontier == 0)
+            || (!completion_tail_fallback && last_send_ack_frontier == 0)
             || last_send_ack_frontier >= reinjection_horizon
             || send_stream.reinjection_bytes() == 0
             || !(matches!(
@@ -1350,7 +1500,7 @@ impl RequestSenderService {
                 [range] if range.start == 0 && range.end == last_send_ack_frontier
             ) || (last_send_ack_frontier == 0 && last_send_ack_ranges.is_empty()))
         {
-            return false;
+            return RequestTailReinjectionOutcome::default();
         }
         let live_instances = self
             .multipath
@@ -1360,25 +1510,63 @@ impl RequestSenderService {
             .map(|instance| instance.key)
             .collect::<Vec<_>>();
         if live_keys.len() <= 1 {
-            return false;
+            return RequestTailReinjectionOutcome::default();
         }
-        let reinjection_limit = reliable_critical_tail_reinjection_limit_bytes(
-            live_instances
-                .iter()
-                .map(|instance| {
-                    adaptive_reliable_relay_reinjection_bytes(
-                        context.reliable_path_snapshot_for_instance(*instance),
-                        lane,
-                        context.mux_limits,
-                    )
-                })
-                .max()
-                .unwrap_or(0),
+        let selection_reinjection_quantum = live_instances
+            .iter()
+            .map(|instance| {
+                adaptive_reliable_relay_reinjection_bytes(
+                    context.reliable_path_snapshot_for_instance(*instance),
+                    lane,
+                    context.mux_limits,
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        let exact_frontier_extent = usize::try_from(
+            reinjection_horizon
+                .min(send_stream.next_offset())
+                .saturating_sub(last_send_ack_frontier),
+        )
+        .unwrap_or(usize::MAX);
+        let observed_at = Instant::now();
+        if completion_tail_fallback {
+            return RequestTailReinjectionOutcome {
+                queued: false,
+                completion_tail: Some(self.enqueue_completion_tail_reinjection_inner(
+                    sender_queue,
+                    context,
+                    remotes,
+                    send_stream,
+                    last_send_ack_frontier,
+                    reinjection_horizon,
+                    lane,
+                    &live_instances,
+                    selection_reinjection_quantum,
+                    exact_frontier_extent,
+                    observed_at,
+                )),
+            };
+        }
+        let reinjection_limit = reliable_live_frontier_reinjection_limit_bytes(
+            selection_reinjection_quantum,
+            selection_reinjection_quantum,
+            exact_frontier_extent,
             send_stream.reinjection_bytes(),
             context.mux_limits,
         );
+        let optional_credit = self.reinjection_extra_event_budget_remaining(context.mux_limits);
+        let floor_ready_at_decide = self.live_owner_frontier_floor_ready(observed_at);
+        let (reinjection_limit, critical_live_owner_reinjection) =
+            reliable_live_gap_reinjection_authority(
+                reinjection_limit,
+                optional_credit,
+                reinjection_limit,
+                true,
+                floor_ready_at_decide,
+            );
         if reinjection_limit == 0 {
-            return false;
+            return RequestTailReinjectionOutcome::default();
         }
         let reinjection_frames = send_stream.retransmission_frames_for_ranges(
             &[OffsetRange {
@@ -1388,6 +1576,7 @@ impl RequestSenderService {
             reinjection_limit,
         );
         let mut queued = false;
+        let mut accepted_recovery_interval = None::<Duration>;
         for frame in reinjection_frames {
             let expected_owner_instances = self
                 .multipath
@@ -1406,7 +1595,8 @@ impl RequestSenderService {
             let first_reinjection_after = expected_owner_instances
                 .iter()
                 .map(|instance| {
-                    reliable_relay_tail_reinjection_delay(
+                    reliable_data_retransmission_interval(
+                        Some(instance.key.underlay),
                         context.reliable_path_snapshot_for_instance(*instance),
                     )
                 })
@@ -1421,27 +1611,30 @@ impl RequestSenderService {
                 break;
             }
             if sender_queue.has_queued_reinjection_overlap(&frame) {
-                continue;
+                break;
             }
-            let completion_target = if require_earlier_completion {
-                let Some(target) = self
-                    .multipath
-                    .tail_reinjection_earlier_completion_target(context, remotes, &frame, lane)
-                else {
-                    break;
-                };
-                Some(target)
-            } else {
-                None
-            };
+            let attempt_recovery_interval = first_reinjection_after;
             let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-            let cause = if let Some(target) = completion_target {
-                RelaySendCause::CompletionTailReinjection(target)
+            let cause = RelaySendCause::TailReinjection;
+            let accepted = if critical_live_owner_reinjection {
+                self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);
+                true
             } else {
-                RelaySendCause::TailReinjection
+                self.enqueue_reinjection_frame_with_priority(
+                    sender_queue,
+                    frame,
+                    cause,
+                    context.mux_limits,
+                    true,
+                )
             };
-            self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);
-            queued = true;
+            queued |= accepted;
+            if accepted {
+                accepted_recovery_interval = Some(include_live_owner_recovery_interval(
+                    accepted_recovery_interval,
+                    attempt_recovery_interval,
+                ));
+            }
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "reinjection",
@@ -1456,7 +1649,217 @@ impl RequestSenderService {
             #[cfg(not(feature = "lab-diagnostics"))]
             let _ = payload_bytes;
         }
-        queued
+        if let Some(recovery_interval) = accepted_recovery_interval {
+            // Owner age was proven above for every accepted frame. Linearize
+            // epoch consumption at the end of the successful batch: optional
+            // work accepted before G opens must not close it, while a batch
+            // crossing the boundary must consume G before another floor use.
+            let accepted_at = Instant::now();
+            if self.live_owner_frontier_floor_ready(accepted_at) {
+                self.record_live_owner_frontier_floor_attempt(accepted_at, recovery_interval);
+            }
+        }
+        RequestTailReinjectionOutcome {
+            queued,
+            completion_tail: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_completion_tail_reinjection_inner(
+        &mut self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        frontier: u64,
+        horizon: u64,
+        lane: TrafficClass,
+        live_instances: &[RelayPathInstance],
+        selection_reinjection_quantum: usize,
+        exact_frontier_extent: usize,
+        observed_at: Instant,
+    ) -> RequestCompletionTailEnqueueOutcome {
+        let selection_limit = reliable_live_frontier_reinjection_limit_bytes(
+            selection_reinjection_quantum,
+            selection_reinjection_quantum,
+            exact_frontier_extent,
+            send_stream.reinjection_bytes(),
+            context.mux_limits,
+        );
+        let range = OffsetRange {
+            start: frontier,
+            end: horizon.min(send_stream.next_offset()),
+        };
+        let Some(uniform_frontier) = self
+            .multipath
+            .live_owner_uniform_frontier(range, live_instances)
+        else {
+            return RequestCompletionTailEnqueueOutcome::default();
+        };
+        if uniform_frontier.owners.len() != 1 {
+            return RequestCompletionTailEnqueueOutcome::default();
+        }
+        let uniform_extent =
+            flight_interval_bytes(uniform_frontier.range.start, uniform_frontier.range.end);
+        let scoring_extent = selection_limit.min(uniform_extent);
+        if scoring_extent == 0 {
+            return RequestCompletionTailEnqueueOutcome::default();
+        }
+        let scoring_range = OffsetRange {
+            start: frontier,
+            end: frontier.saturating_add(scoring_extent as u64),
+        };
+        let Some(scoring_frontier) = self
+            .multipath
+            .live_owner_uniform_frontier(scoring_range, live_instances)
+        else {
+            return RequestCompletionTailEnqueueOutcome::default();
+        };
+        if scoring_frontier.range != scoring_range
+            || scoring_frontier.owners != uniform_frontier.owners
+            || scoring_frontier.avoid != uniform_frontier.avoid
+        {
+            return RequestCompletionTailEnqueueOutcome::default();
+        }
+        let Some(scoring_frames) =
+            exact_contiguous_retransmission_frames(send_stream, scoring_range)
+        else {
+            return RequestCompletionTailEnqueueOutcome::default();
+        };
+        let preview = scoring_frames
+            .first()
+            .expect("non-empty exact cache prefix")
+            .clone();
+
+        if !live_instances
+            .iter()
+            .any(|instance| !uniform_frontier.owners.contains(instance))
+        {
+            return RequestCompletionTailEnqueueOutcome::default();
+        }
+        let Some(owner_recovery_timing) = reliable_data_ack_gap_timing_for_assignments(
+            &scoring_frontier.owner_assignments,
+            |instance| {
+                (
+                    instance.key.underlay,
+                    context.reliable_path_snapshot_for_instance(instance),
+                )
+            },
+        ) else {
+            return RequestCompletionTailEnqueueOutcome::default();
+        };
+        let owner_recovery_deadline = self.completion_tail_owner_fallback.observe(
+            scoring_range,
+            &scoring_frontier.owners,
+            owner_recovery_timing,
+        );
+        if observed_at < owner_recovery_deadline {
+            return RequestCompletionTailEnqueueOutcome::default();
+        }
+
+        let target_observation = self
+            .multipath
+            .tail_reinjection_fallback_service_target_observation_for_extent(
+                context,
+                remotes,
+                &preview,
+                lane,
+                sender_queue,
+                send_stream.reinjection_bytes(),
+                context.mux_limits,
+                scoring_extent,
+            );
+        let Some(target) = target_observation.target else {
+            return RequestCompletionTailEnqueueOutcome {
+                blocked_for_carrier_capacity: target_observation.target_service_exhausted,
+                waiting_for_path_model_publication: target_observation
+                    .waiting_for_path_model_publication,
+                ..RequestCompletionTailEnqueueOutcome::default()
+            };
+        };
+        if uniform_frontier.avoid.contains(&target.identity.instance) {
+            return RequestCompletionTailEnqueueOutcome::default();
+        }
+        let target_reinjection_quantum = adaptive_reliable_relay_reinjection_bytes(
+            Some(target.snapshot),
+            lane,
+            context.mux_limits,
+        );
+        let frontier_limit = reliable_live_frontier_reinjection_limit_bytes(
+            target_reinjection_quantum,
+            selection_reinjection_quantum,
+            scoring_extent,
+            send_stream.reinjection_bytes(),
+            context.mux_limits,
+        )
+        .min(target.service_limit_bytes);
+        let optional_credit = self.reinjection_extra_event_budget_remaining(context.mux_limits);
+        let floor_ready_at_decide = self.live_owner_frontier_floor_ready(observed_at);
+        let (service_limit, critical_frontier_reinjection) =
+            reliable_live_gap_reinjection_authority(
+                target.service_limit_bytes,
+                optional_credit,
+                frontier_limit,
+                true,
+                floor_ready_at_decide,
+            );
+        if service_limit == 0 {
+            return RequestCompletionTailEnqueueOutcome {
+                blocked_for_carrier_capacity: target.service_limit_bytes == 0,
+                ..RequestCompletionTailEnqueueOutcome::default()
+            };
+        }
+        let applied_extent = service_limit.min(uniform_extent);
+        let apply_range = OffsetRange {
+            start: frontier,
+            end: frontier.saturating_add(applied_extent as u64),
+        };
+        let Some(frames) = exact_contiguous_retransmission_frames(send_stream, apply_range) else {
+            return RequestCompletionTailEnqueueOutcome::default();
+        };
+        let frames = preserve_reinjection_frontier_quantum(frames, frontier_limit);
+        let cause = RelaySendCause::CompletionTailReinjection(target.identity);
+        let mut queued = false;
+        let mut accepted_recovery_interval = None::<Duration>;
+        for frame in frames {
+            if sender_queue.has_queued_reinjection_overlap(&frame) {
+                break;
+            }
+            let accepted = if critical_frontier_reinjection {
+                self.enqueue_critical_reinjection_frame(sender_queue, frame, cause);
+                true
+            } else {
+                self.enqueue_reinjection_frame_with_priority(
+                    sender_queue,
+                    frame,
+                    cause,
+                    context.mux_limits,
+                    true,
+                )
+            };
+            if !accepted {
+                break;
+            }
+            queued = true;
+            accepted_recovery_interval = Some(include_live_owner_recovery_interval(
+                accepted_recovery_interval,
+                target.recovery_interval,
+            ));
+        }
+        if let Some(recovery_interval) = accepted_recovery_interval {
+            // The exact original-owner age was proven before target binding.
+            // Consume G only if it is open when this accepted batch commits.
+            let accepted_at = Instant::now();
+            if self.live_owner_frontier_floor_ready(accepted_at) {
+                self.record_live_owner_frontier_floor_attempt(accepted_at, recovery_interval);
+            }
+        }
+        RequestCompletionTailEnqueueOutcome {
+            queued,
+            blocked_for_carrier_capacity: false,
+            waiting_for_path_model_publication: false,
+        }
     }
 
     pub(in crate::runtime) fn drive_request_path_recovery(

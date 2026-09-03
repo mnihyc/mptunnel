@@ -121,6 +121,36 @@ pub(crate) fn reliable_data_ack_gap_timing(
     })
 }
 
+/// Aggregates the immutable assignment epochs in one exact ranked frontier.
+///
+/// Every supplied span must contribute its own exact owner observation.  The
+/// latest absolute loss/fallback boundary wins, so the ranked prefix is not
+/// eligible until all of its OriginalData spans have matured.  Runtime cause
+/// state retains the earliest observation for the same assignment set; this
+/// helper deliberately performs no cross-evaluation mutation.
+pub(crate) fn reliable_data_ack_gap_timing_for_assignments<I: Copy>(
+    assignments: &[(I, Instant)],
+    mut owner_path: impl FnMut(I) -> (UnderlayProtocol, Option<PathSnapshot>),
+) -> Option<ReliableDataAckGapTiming> {
+    let mut aggregate = None::<ReliableDataAckGapTiming>;
+    for (owner, assignment_at) in assignments.iter().copied() {
+        let (underlay, snapshot) = owner_path(owner);
+        let timing = reliable_data_ack_gap_timing(Some(assignment_at), Some(underlay), snapshot)?;
+        aggregate = Some(match aggregate {
+            Some(current) => ReliableDataAckGapTiming {
+                assignment_at: current.assignment_at.max(timing.assignment_at),
+                loss_at: match (current.loss_at, timing.loss_at) {
+                    (Some(current), Some(next)) => Some(current.max(next)),
+                    _ => None,
+                },
+                fallback_at: current.fallback_at.max(timing.fallback_at),
+            },
+            None => timing,
+        });
+    }
+    aggregate
+}
+
 /// An authoritative later Data ACK may start bounded repair at the owner's
 /// time-threshold loss boundary when the currently measured alternate can
 /// still finish before the owner's absolute recovery boundary. Otherwise that

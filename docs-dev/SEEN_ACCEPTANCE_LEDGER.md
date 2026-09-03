@@ -45,6 +45,13 @@ closed only as one of:
 Only the complete frozen SEEN matrix can make a release candidate acceptable.
 An isolated commit milestone never does.
 
+Every numeric threshold in this ledger and the corresponding runtime model is
+an advisory observation, confidence, ranking, probing, or reconsideration hint.
+It MUST NOT become a hard bandwidth ceiling, an ordinary-work admission cap,
+or a permanent path ban. A physical resource limit explicitly configured by
+the operator remains a resource contract, not an inferred performance
+threshold.
+
 ## Frozen SEEN ledger
 
 | Item | Scope | State | Evidence / isolated commit |
@@ -58,11 +65,11 @@ An isolated commit milestone never does.
 | SEEN-6A | Persistent live-owner ACK-gap repair could renew critical authority | Fixed | Zero/partial/full cumulative-budget RED/GREEN; `0b50e9a` |
 | SEEN-6B | HTTP/3 migration left QUIC latency priority diagnostic-only | Fixed | Actual Quinn priority RED/GREEN plus ordinary two-run non-downgrade; `a9450d8` |
 | SEEN-6C | QUIC-only sustained bulk/read-gap and loaded-latency mechanism | Model-constrained; encompassing acceptance remains open | Current same-native-stream gap is attributed to ordered QUIC recovery; this does not close cold/warm, recovery, upload, or concurrent behavior |
-| SEEN-6D | TCP-only cold/warm ramp, sustain, loaded latency, and recovery | Open; some bulk cells GREEN | Existing bulk/startup/gap improvement does not yet prove the complete reported timing and concurrency behavior |
+| SEEN-6D | TCP-only cold/warm ramp, sustain, loaded latency, and recovery | Open; bulk GREEN, loaded latency RED | Current unified matrix: 303.372 Mbps bulk but 1,417 ms interactive p95 versus 522 ms raw TCP and 538 ms V2Ray; all 48/48 requests succeeded, proving loaded service delay rather than timeout or disconnect |
 | SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Fixed; wider SEEN matrix open | `53d9ab5` restores bounded live-owner frontier authority; `dc4853d` corrects the completion race; the ordinary 500 -> 10 -> 500 gate sustained 360.800 Mbps with 0.679 s maximum read gap and returned to 407.1 Mbps in its first post-restore epoch |
 | SEEN-6F | QUIC-only 10 -> 500 recovery and cold/warm first-object behavior | Open | The user-observed slow recovery and size-dependent startup trajectory require ordinary-build timing evidence |
 | SEEN-6G | TCP, QUIC, and default single-thread plus Cloudflare-style download/upload behavior | Open | Acceptance requires stable/burstable short and sustained work; aggregate bulk goodput alone is insufficient |
-| SEEN-6H | Matched raw TCP, V2Ray/Xray, and Hysteria2 comparison under the declared changing 3--10% loss schedule | Open | No release-wide competitiveness conclusion has yet satisfied the frozen comparison contract |
+| SEEN-6H | Matched raw TCP, V2Ray/Xray, and Hysteria2 comparison under the declared changing 3--10% loss schedule | Matrix measured; acceptance remains open | One current six-way ordinary-build cohort is complete and valid; MPP bulk is competitive, but SEEN-6D loaded TCP latency fails, so the cohort cannot authorize release |
 | SEEN-7 | Retired peer rows, port projection, Evidence unknown/stale semantics, directional Suspect state | Retirement fixed; remaining current claims disproved | Absolute retirement core `e0e70e7` plus exact native-terminal-result follow-up retained in checkpoint `3a6d0ea`; later projection audit and focused tests found no additional defect |
 
 The tracked tree at `a9450d8` contains no uncommitted production correction.

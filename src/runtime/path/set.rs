@@ -121,6 +121,8 @@ struct ClientOutwardSettlementTestState {
     hook: Option<ClientOutwardSettlementTestHook>,
     reliable_selection_passes: usize,
     datagram_candidate_attempts: usize,
+    response_startup_open_rounds: usize,
+    fail_response_startup_opens: bool,
 }
 
 #[cfg(test)]
@@ -276,6 +278,43 @@ impl ClientPathContext {
             .lock()
             .expect("outward-settlement test state")
             .datagram_candidate_attempts
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn record_response_startup_open_round_for_test(&self) {
+        self.outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state")
+            .response_startup_open_rounds += 1;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn response_startup_open_rounds_for_test(&self) -> usize {
+        self.outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state")
+            .response_startup_open_rounds
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn fail_response_startup_opens_for_test(&self) {
+        let mut state = self
+            .outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state");
+        assert!(
+            !state.fail_response_startup_opens,
+            "response-startup failure hook may be armed once per context"
+        );
+        state.fail_response_startup_opens = true;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn response_startup_open_failure_for_test(&self) -> bool {
+        self.outward_settlement_test
+            .lock()
+            .expect("outward-settlement test state")
+            .fail_response_startup_opens
     }
 
     #[cfg(test)]

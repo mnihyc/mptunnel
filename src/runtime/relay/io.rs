@@ -750,6 +750,33 @@ impl ReadyStreamDataDirection {
     }
 }
 
+/// Receive-state application completed for one ready batch, while local
+/// delivery remains pending.
+///
+/// The receive actor may inspect `has_apply_error` before it constructs the
+/// single local-write future.  The deferred error remains owned here so the
+/// write/flush phase preserves the existing rule that an I/O error takes
+/// precedence after every successfully applied prefix has been delivered.
+#[must_use = "an applied ready batch must be completed by its write/flush phase"]
+pub(in crate::runtime) struct ReadyStreamDataBatchApplyState {
+    apply_error: Option<RuntimeError>,
+    flush_empty: bool,
+    #[cfg(feature = "lab-diagnostics")]
+    direction: ReadyStreamDataDirection,
+    #[cfg(feature = "lab-diagnostics")]
+    source_frames: usize,
+    #[cfg(feature = "lab-diagnostics")]
+    source_payload_bytes: usize,
+    #[cfg(feature = "lab-diagnostics")]
+    batch_started: Instant,
+}
+
+impl ReadyStreamDataBatchApplyState {
+    pub(in crate::runtime) fn has_apply_error(&self) -> bool {
+        self.apply_error.is_some()
+    }
+}
+
 /// Collects only the exact in-order STREAM_DATA backlog visible after the
 /// first dequeue. `ready_items` must be a queue-length snapshot taken at entry.
 ///
@@ -823,26 +850,24 @@ where
     deferred
 }
 
-/// Applies each original frame to the RFC receive state, then performs one
-/// vectored local write/flush transaction for all bytes released by the ready
-/// batch. The per-frame callback preserves role-specific state and path
-/// attribution while payload buffers are moved, never copied.
-pub(in crate::runtime) async fn apply_and_write_ready_stream_data_batch<S, T, A>(
-    local: &mut S,
+/// Applies each original frame to RFC receive state without taking local-I/O
+/// ownership. Delivered payload remains in the reusable batch until the one
+/// write/flush phase consumes the returned state.
+pub(in crate::runtime) fn apply_ready_stream_data_batch<T, A>(
     recv_stream: &mut ReliableRecvStream,
     batch: &mut ReadyStreamDataBatch<T>,
     direction: ReadyStreamDataDirection,
     flush_empty: bool,
     mut apply: A,
-) -> Result<usize, RuntimeError>
+) -> ReadyStreamDataBatchApplyState
 where
-    S: AsyncWrite + Unpin,
     A: FnMut(&mut ReliableRecvStream, T) -> Result<ReceiveOutcome, RuntimeError>,
 {
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = direction;
     #[cfg(feature = "lab-diagnostics")]
     let batch_started = Instant::now();
+    #[cfg(feature = "lab-diagnostics")]
     let source_frames = batch.len();
     #[cfg(feature = "lab-diagnostics")]
     let source_payload_bytes = batch.payload_bytes();
@@ -861,6 +886,45 @@ where
             delivered.extend(outcome.delivered);
         }
     }
+
+    ReadyStreamDataBatchApplyState {
+        apply_error,
+        flush_empty,
+        #[cfg(feature = "lab-diagnostics")]
+        direction,
+        #[cfg(feature = "lab-diagnostics")]
+        source_frames,
+        #[cfg(feature = "lab-diagnostics")]
+        source_payload_bytes,
+        #[cfg(feature = "lab-diagnostics")]
+        batch_started,
+    }
+}
+
+/// Performs the single local write/flush transaction for an already-applied
+/// ready batch. Callers that interleave protocol control while local delivery
+/// is pending must construct this future once and keep polling that same
+/// future; rebuilding it after a partial write would duplicate payload.
+pub(in crate::runtime) async fn write_applied_ready_stream_data_batch<S, T>(
+    local: &mut S,
+    batch: &mut ReadyStreamDataBatch<T>,
+    applied: ReadyStreamDataBatchApplyState,
+) -> Result<usize, RuntimeError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let ReadyStreamDataBatchApplyState {
+        apply_error,
+        flush_empty,
+        #[cfg(feature = "lab-diagnostics")]
+        direction,
+        #[cfg(feature = "lab-diagnostics")]
+        source_frames,
+        #[cfg(feature = "lab-diagnostics")]
+        source_payload_bytes,
+        #[cfg(feature = "lab-diagnostics")]
+        batch_started,
+    } = applied;
 
     #[cfg(feature = "lab-diagnostics")]
     let write_started = Instant::now();
@@ -893,25 +957,23 @@ where
             0,
         );
     }
+    #[cfg(feature = "lab-diagnostics")]
     if source_frames > 1 && apply_error.is_none() {
-        #[cfg(feature = "lab-diagnostics")]
-        {
-            crate::lab_diagnostics::lab_perf_record(
-                direction.metric(),
-                batch_started.elapsed(),
+        crate::lab_diagnostics::lab_perf_record(
+            direction.metric(),
+            batch_started.elapsed(),
+            delivered_bytes,
+        );
+        crate::lab_diagnostics::lab_diagnostic(
+            "relay_ready_stream_data_batch",
+            format_args!(
+                "direction={} source_frames={} source_payload_bytes={} delivered_bytes={}",
+                direction.label(),
+                source_frames,
+                source_payload_bytes,
                 delivered_bytes,
-            );
-            crate::lab_diagnostics::lab_diagnostic(
-                "relay_ready_stream_data_batch",
-                format_args!(
-                    "direction={} source_frames={} source_payload_bytes={} delivered_bytes={}",
-                    direction.label(),
-                    source_frames,
-                    source_payload_bytes,
-                    delivered_bytes,
-                ),
-            );
-        }
+            ),
+        );
     }
 
     batch.delivered.clear();
@@ -920,6 +982,25 @@ where
         return Err(err);
     }
     Ok(delivered_bytes)
+}
+
+/// Applies and locally delivers one ready batch without an interleaved control
+/// phase. This compatibility wrapper keeps the server path and existing client
+/// behavior unchanged while the receive actor adopts the split boundary.
+pub(in crate::runtime) async fn apply_and_write_ready_stream_data_batch<S, T, A>(
+    local: &mut S,
+    recv_stream: &mut ReliableRecvStream,
+    batch: &mut ReadyStreamDataBatch<T>,
+    direction: ReadyStreamDataDirection,
+    flush_empty: bool,
+    apply: A,
+) -> Result<usize, RuntimeError>
+where
+    S: AsyncWrite + Unpin,
+    A: FnMut(&mut ReliableRecvStream, T) -> Result<ReceiveOutcome, RuntimeError>,
+{
+    let applied = apply_ready_stream_data_batch(recv_stream, batch, direction, flush_empty, apply);
+    write_applied_ready_stream_data_batch(local, batch, applied).await
 }
 
 pub(in crate::runtime) fn receive_stream_fin(

@@ -1,8 +1,13 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
-use crate::model::capacity::reliable_relay_buffer_len;
+use crate::model::capacity::{
+    reliable_relay_buffer_len, reliable_stream_initial_advertised_window_bytes,
+};
+use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
-use crate::protocol::{CloseReason, OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{
+    CloseReason, OffsetRange, PathId, PathUsage, StreamId, TargetAddr, UnderlayProtocol,
+};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels, try_recv_reliable_path_command,
@@ -11,10 +16,207 @@ use crate::runtime::path::commands::{
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
 use bytes::Bytes;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
+use tokio::sync::{Notify, mpsc};
+
+#[derive(Default)]
+struct BlockedLocalDeliveryState {
+    accepted: Mutex<Vec<u8>>,
+    blocked: AtomicBool,
+    released: AtomicBool,
+    blocked_notify: Notify,
+    write_waker: Mutex<Option<Waker>>,
+}
+
+#[derive(Clone)]
+struct BlockedLocalDeliveryControl {
+    state: Arc<BlockedLocalDeliveryState>,
+}
+
+impl BlockedLocalDeliveryControl {
+    async fn wait_blocked(&self) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let blocked = self.state.blocked_notify.notified();
+                if self.state.blocked.load(Ordering::Acquire) {
+                    return;
+                }
+                blocked.await;
+            }
+        })
+        .await
+        .expect("relay reached the scripted blocked local write");
+    }
+
+    fn accepted_bytes(&self) -> Vec<u8> {
+        self.state
+            .accepted
+            .lock()
+            .expect("blocked local delivery bytes")
+            .clone()
+    }
+
+    fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+        if let Some(waker) = self
+            .state
+            .write_waker
+            .lock()
+            .expect("blocked local delivery waker")
+            .take()
+        {
+            waker.wake();
+        }
+    }
+}
+
+struct BlockedLocalDelivery {
+    state: Arc<BlockedLocalDeliveryState>,
+}
+
+impl BlockedLocalDelivery {
+    fn new() -> (Self, BlockedLocalDeliveryControl) {
+        let state = Arc::new(BlockedLocalDeliveryState::default());
+        (
+            Self {
+                state: state.clone(),
+            },
+            BlockedLocalDeliveryControl { state },
+        )
+    }
+}
+
+impl AsyncRead for BlockedLocalDelivery {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for BlockedLocalDelivery {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let state = &self.state;
+        let mut accepted = state.accepted.lock().expect("blocked local delivery bytes");
+        if accepted.is_empty() {
+            accepted.push(buf[0]);
+            return Poll::Ready(Ok(1));
+        }
+        if state.released.load(Ordering::Acquire) {
+            accepted.extend_from_slice(buf);
+            return Poll::Ready(Ok(buf.len()));
+        }
+        drop(accepted);
+        state.blocked.store(true, Ordering::Release);
+        state.blocked_notify.notify_waiters();
+        *state
+            .write_waker
+            .lock()
+            .expect("blocked local delivery waker") = Some(cx.waker().clone());
+        if state.released.load(Ordering::Acquire) {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Default)]
+struct ResponseStartupProgressObservation {
+    open_started: bool,
+    ack_frontier: u64,
+    final_retained_ordinals: Option<Vec<u8>>,
+    maximum_data_offset: Option<u64>,
+}
+
+impl ResponseStartupProgressObservation {
+    fn observe_command(&mut self, command: ReliablePathCommand, stream_id: StreamId) {
+        let ReliablePathCommand::SendFrame(frame) = command else {
+            return;
+        };
+        match frame {
+            Frame::StreamAck {
+                stream_id: ack_stream_id,
+                ranges,
+                ..
+            } if ack_stream_id == stream_id => {
+                self.ack_frontier = self.ack_frontier.max(
+                    ranges
+                        .iter()
+                        .filter(|range| range.start == 0)
+                        .map(|range| range.end)
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+            Frame::StreamReturnPlanFinal {
+                stream_id: final_stream_id,
+                retained_ordinals,
+            } if final_stream_id == stream_id => {
+                self.final_retained_ordinals = Some(retained_ordinals);
+            }
+            Frame::StreamMaxData {
+                stream_id: max_data_stream_id,
+                max_offset,
+            } if max_data_stream_id == stream_id => {
+                self.maximum_data_offset = Some(
+                    self.maximum_data_offset
+                        .unwrap_or(max_offset)
+                        .max(max_offset),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn observe_response_startup_progress(
+    context: &ClientPathContext,
+    receivers: &mut ReliablePathCommandReceivers,
+    stream_id: StreamId,
+    trigger_bytes: u64,
+    observation: &mut ResponseStartupProgressObservation,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        observation.open_started |= context.response_startup_open_rounds_for_test() > 0;
+        while let Some(command) = try_recv_reliable_path_command(receivers) {
+            observation.observe_command(command, stream_id);
+        }
+        if observation.open_started
+            && observation.ack_frontier >= trigger_bytes
+            && observation.final_retained_ordinals.is_some()
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
 
 fn test_security() -> ClientSecurityConfig {
     ClientSecurityConfig::for_test(
@@ -71,6 +273,184 @@ async fn wait_for_buffered_remote_frame(remotes: &ReliableRelayRemoteSet) {
     })
     .await
     .expect("relay frame-forwarder deadline");
+}
+
+#[tokio::test]
+async fn response_startup_ack_open_and_final_progress_during_blocked_local_delivery() {
+    const STARTUP_TRIGGER_BYTES: usize = 58_400;
+    let stream_id = StreamId(58_400);
+    let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("first test carrier endpoint");
+    let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("second test carrier endpoint");
+    let first_addr = first_listener
+        .local_addr()
+        .expect("first test carrier address");
+    let second_addr = second_listener
+        .local_addr()
+        .expect("second test carrier address");
+    drop(second_listener);
+    let context = ClientPathContext::new(
+        vec![
+            format!("tcp://{first_addr}")
+                .parse::<PathSpec>()
+                .expect("first test path"),
+            format!("tcp://{second_addr}")
+                .parse::<PathSpec>()
+                .expect("second test path"),
+        ],
+        test_security(),
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    context.fail_response_startup_opens_for_test();
+    let limits = context.mux_limits;
+    let initial_window = reliable_stream_initial_advertised_window_bytes(
+        UnderlayProtocol::Tcp,
+        TrafficClass::Latency,
+        limits,
+    );
+    assert!(
+        reliable_relay_buffer_len(limits) >= STARTUP_TRIGGER_BYTES,
+        "the decisive trigger must fit one received frame"
+    );
+
+    let (commands, mut command_receivers) = reliable_path_command_channels(32);
+    let (frames_tx, frames_rx) = mpsc::channel(2);
+    let initial = test_opened_remote_stream(stream_id, 0, commands, frames_rx);
+    let initial_instance_id = initial.path_instance_id();
+    let plan = Arc::new(
+        ReliableRelayReturnPlan::new(
+            STARTUP_TRIGGER_BYTES as u64,
+            PathUsage::Available,
+            vec![
+                (
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index: 0,
+                    },
+                    Some(initial_instance_id),
+                ),
+                (
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index: 1,
+                    },
+                    None,
+                ),
+            ],
+        )
+        .expect("two-candidate lazy response-startup plan"),
+    );
+    let initial = initial.with_startup(plan, 0, Vec::new());
+    let (local, local_control) = BlockedLocalDelivery::new();
+    let relay_context = context.clone();
+    let relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream(
+            local,
+            &relay_context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec::new(TargetAddr::Ip(first_addr), TrafficClass::Latency),
+            initial,
+            None,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                recv_reliable_path_command(&mut command_receivers).await,
+                Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("initial attachment path proof is queued before response injection");
+
+    let payload = Bytes::from(vec![0x5a; STARTUP_TRIGGER_BYTES]);
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            payload: payload.clone(),
+        }))
+        .await
+        .expect("inject exact contiguous response-startup trigger");
+    local_control.wait_blocked().await;
+    let accepted_while_blocked = local_control.accepted_bytes();
+
+    let mut observation = ResponseStartupProgressObservation::default();
+    observe_response_startup_progress(
+        &context,
+        &mut command_receivers,
+        stream_id,
+        STARTUP_TRIGGER_BYTES as u64,
+        &mut observation,
+        Duration::from_secs(1),
+    )
+    .await;
+    let open_while_blocked = observation.open_started;
+    let ack_frontier_while_blocked = observation.ack_frontier;
+    let final_while_blocked = observation.final_retained_ordinals.clone();
+    let max_data_while_blocked = observation.maximum_data_offset;
+
+    local_control.release();
+    observe_response_startup_progress(
+        &context,
+        &mut command_receivers,
+        stream_id,
+        STARTUP_TRIGGER_BYTES as u64,
+        &mut observation,
+        Duration::from_secs(1),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while local_control.accepted_bytes().len() < STARTUP_TRIGGER_BYTES {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("release proves the same trigger progresses only after local delivery");
+    let delivered_after_release = local_control.accepted_bytes();
+    let open_rounds_after_release = context.response_startup_open_rounds_for_test();
+    relay.abort();
+    let _ = relay.await;
+
+    assert_eq!(
+        accepted_while_blocked,
+        vec![0x5a],
+        "the scripted Product sink must accept one byte and then block"
+    );
+    assert!(
+        max_data_while_blocked.is_none_or(|max_offset| max_offset <= initial_window),
+        "blocked Product bytes must not reopen receive credit beyond initial W; observed {max_data_while_blocked:?}"
+    );
+    assert_eq!(
+        delivered_after_release.as_slice(),
+        payload.as_ref(),
+        "releasing the Product sink must deliver the exact payload once"
+    );
+    assert_eq!(open_rounds_after_release, 1, "one frozen OPEN round");
+    assert_eq!(
+        observation.ack_frontier, STARTUP_TRIGGER_BYTES as u64,
+        "the exact injected Product range must produce exact Data ACK [0,h)"
+    );
+    assert_eq!(
+        observation.final_retained_ordinals,
+        Some(vec![0]),
+        "controlled failed ordinal 1 must produce exact FINAL [0]"
+    );
+    assert!(
+        ack_frontier_while_blocked >= STARTUP_TRIGGER_BYTES as u64
+            && open_while_blocked
+            && final_while_blocked == Some(vec![0]),
+        "SEEN-4: contiguous frontier h={STARTUP_TRIGGER_BYTES} reached the blocked Product sink, but independent progress stalled (ACK frontier={ack_frontier_while_blocked}, OPEN={open_while_blocked}, FINAL={final_while_blocked:?}); all three appeared only after local delivery release"
+    );
 }
 
 #[test]

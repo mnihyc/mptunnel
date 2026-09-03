@@ -173,8 +173,7 @@ async fn ready_stream_data_batch_preserves_attribution_boundaries_and_vectored_d
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     let mut writer = VectoredWriteProbe::default();
     let mut observed_paths = Vec::new();
-    let written = apply_and_write_ready_stream_data_batch(
-        &mut writer,
+    let applied = apply_ready_stream_data_batch(
         &mut recv_stream,
         &mut batch,
         ReadyStreamDataDirection::ClientDownload,
@@ -194,12 +193,18 @@ async fn ready_stream_data_batch_preserves_attribution_boundaries_and_vectored_d
                 .receive_data(offset, payload)
                 .map_err(RuntimeError::Stream)
         },
-    )
-    .await
-    .expect("apply and write ready data");
+    );
+    assert!(!applied.has_apply_error());
+    assert_eq!(recv_stream.next_offset(), 12);
+    assert!(
+        writer.bytes.is_empty(),
+        "the synchronous phase must not take local-I/O ownership"
+    );
+    let written = write_applied_ready_stream_data_batch(&mut writer, &mut batch, applied)
+        .await
+        .expect("apply and write ready data");
 
     assert_eq!(observed_paths, vec![tcp_path, udp_path, tcp_path]);
-    assert_eq!(recv_stream.next_offset(), 12);
     assert_eq!(written, 12);
     assert_eq!(writer.bytes, b"abcdefghijkl");
     assert_eq!(writer.scalar_writes, 0);
@@ -276,8 +281,7 @@ async fn ready_stream_data_batch_preserves_attribution_boundaries_and_vectored_d
     );
     assert!(deferred.is_none());
     let mut applied = 0usize;
-    let error = apply_and_write_ready_stream_data_batch(
-        &mut writer,
+    let applied_batch = apply_ready_stream_data_batch(
         &mut recv_stream,
         &mut batch,
         ReadyStreamDataDirection::ServerUpload,
@@ -297,9 +301,18 @@ async fn ready_stream_data_batch_preserves_attribution_boundaries_and_vectored_d
                 .receive_data(offset, payload)
                 .map_err(RuntimeError::Stream)
         },
-    )
-    .await
-    .expect_err("later apply failure remains terminal");
+    );
+    assert!(
+        applied_batch.has_apply_error(),
+        "the synchronous phase exposes a deferred later-frame failure"
+    );
+    assert_eq!(
+        writer.bytes, b"abcdefghijklmnopqrst",
+        "an applied prefix remains pending until the write phase"
+    );
+    let error = write_applied_ready_stream_data_batch(&mut writer, &mut batch, applied_batch)
+        .await
+        .expect_err("later apply failure remains terminal");
     assert!(matches!(
         error,
         RuntimeError::Protocol("synthetic later-frame failure")

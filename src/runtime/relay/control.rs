@@ -9,15 +9,16 @@ use super::flow::{
 };
 use super::io::{
     ReadyStreamDataBatchBounds, ReadyStreamDataDirection, accepted_copy_wake_is_due,
-    apply_and_write_ready_stream_data_batch, collect_ready_stream_data_batch,
-    pending_stream_fin_ready, read_reliable_relay_payload, receive_stream_fin,
-    reconcile_accepted_copy_wake, resize_reliable_relay_buffer, retain_accepted_copy_wake,
+    apply_ready_stream_data_batch, collect_ready_stream_data_batch, pending_stream_fin_ready,
+    read_reliable_relay_payload, receive_stream_fin, reconcile_accepted_copy_wake,
+    resize_reliable_relay_buffer, retain_accepted_copy_wake,
     stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
-    stream_terminal_fin_replay_required,
+    stream_terminal_fin_replay_required, write_applied_ready_stream_data_batch,
 };
 use super::lifecycle::{
-    ClientReliableReturnPlan, attach_reliable_relay_paths_with_suppressions,
-    cancel_pending_additional_path_opens, recover_reliable_relay_after_path_failure,
+    ClientReliableReturnPlan, RelayAdditionalPathOpenResult,
+    attach_reliable_relay_paths_with_suppressions, cancel_pending_additional_path_opens,
+    matching_additional_path_open_pending, recover_reliable_relay_after_path_failure,
     reliable_relay_can_send_pending_fin, reliable_relay_disconnected_retry_delay,
     reliable_relay_lane_changed, reliable_relay_product_stall_deadline,
     reliable_relay_product_stall_preserves_attached_path_set,
@@ -66,6 +67,7 @@ use crate::runtime::stream::{
 };
 use crate::runtime::telemetry::ObservedProductIo;
 use crate::scheduler::TrafficClass;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
@@ -348,6 +350,146 @@ fn reliable_relay_topology_lane(
     } else {
         TrafficClass::Latency
     }
+}
+
+enum PendingLocalWritePathOpen {
+    Applied(Option<ReliableRelayAttachMode>),
+    Deferred(RelayAdditionalPathOpenResult),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_client_response_startup_control(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    return_plan: &mut ClientReliableReturnPlan,
+    output_lane: TrafficClass,
+    stream_id: crate::protocol::StreamId,
+    response_frontier: u64,
+    remotes: &mut ReliableRelayRemoteSet,
+    state: &mut ClientRelayState,
+    additional_path_open_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
+) -> Result<(), RuntimeError> {
+    let response_startup_triggered = return_plan.observe_response_frontier(response_frontier);
+    if return_plan.is_done() {
+        remotes.clear_return_plan_final();
+    }
+    if response_startup_triggered {
+        if spawn_reliable_relay_response_startup_path_opens(
+            context,
+            spec,
+            return_plan,
+            output_lane,
+            stream_id,
+            &mut state.recovery.pending_additional_path_opens,
+            additional_path_open_tx,
+        )? {
+            state.progress.last_stream_at = Instant::now();
+        }
+    }
+    if let Some(retained_ordinals) = return_plan.prepare_final(remotes).map(ToOwned::to_owned) {
+        remotes.publish_return_plan_final(&retained_ordinals)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_matching_client_additional_path_open(
+    stream_id: crate::protocol::StreamId,
+    state: &mut ClientRelayState,
+    return_plan: &mut ClientReliableReturnPlan,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &mut ReliableSendStream,
+    output_lane: TrafficClass,
+    additional_path_open: RelayAdditionalPathOpenResult,
+) -> Result<Option<ReliableRelayAttachMode>, RuntimeError> {
+    if super::lifecycle::take_matching_additional_path_open(
+        &mut state.recovery.pending_additional_path_opens,
+        additional_path_open.key,
+        additional_path_open.generation,
+    )
+    .is_none()
+    {
+        if let Ok(opened) = additional_path_open.result {
+            opened.retire_uncommitted();
+        }
+        return Ok(None);
+    }
+    let additional_path_key = additional_path_open.key;
+    let startup_ordinal = additional_path_open.startup_ordinal;
+    let attached_mode = try_handle_additional_path_open_result(
+        stream_id,
+        remotes,
+        send_stream,
+        !state.endpoint.local_open,
+        output_lane,
+        additional_path_open,
+        state.recovery.pending_additional_path_opens.len(),
+        &mut state.progress.last_stream_at,
+    )?;
+    settle_client_return_plan_open_result(
+        return_plan,
+        remotes,
+        additional_path_key,
+        startup_ordinal,
+        attached_mode.is_some(),
+    )?;
+    if attached_mode.is_some() {
+        state.progress.sender_retry_at = None;
+    }
+    Ok(attached_mode)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_client_additional_path_open_postaction(
+    attached_mode: Option<ReliableRelayAttachMode>,
+    sender: &mut RequestSenderService,
+    sender_queue: &mut ReliableRelaySenderQueue,
+    context: &ClientPathContext,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    recv_stream: &mut ReliableRecvStream,
+    state: &mut ClientRelayState,
+    request_lane: TrafficClass,
+    response_lane: TrafficClass,
+) -> Result<(), RuntimeError> {
+    if !matches!(attached_mode, Some(ReliableRelayAttachMode::Recovery)) {
+        return Ok(());
+    }
+    if sender.enqueue_tail_reinjection(
+        sender_queue,
+        context,
+        remotes,
+        send_stream,
+        state.progress.last_send_ack.ranges(),
+        state.progress.last_send_ack.complete(),
+        Some(send_stream.next_offset()),
+        state.progress.last_send_ack_frontier,
+        request_lane,
+    ) {
+        state.progress.sender_retry_at = None;
+    }
+    let response_path_snapshot =
+        remotes.lowest_eta_path_snapshot(context, response_lane, PATH_OPEN_SCORE_BYTES);
+    match sender
+        .send_recv_progress(
+            remotes,
+            context,
+            recv_stream,
+            &mut state.progress.recv_progress,
+            RelayRecvProgressSend::new(response_path_snapshot, response_lane, true),
+        )
+        .await
+    {
+        Ok(sent) => state.record_recv_progress_sent(sent),
+        Err(err) if reliable_path_error_is_migratable(&err) => {
+            state.progress.sender_retry_at = None;
+        }
+        Err(err) => return Err(err),
+    }
+    let attempted_at = Instant::now();
+    state.progress.last_response_stall_reinjection_at = attempted_at;
+    state.progress.last_product_stall_attempt_at = Some(attempted_at);
+    Ok(())
 }
 
 pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
@@ -881,29 +1023,17 @@ where
                 ),
             );
         }
-        let response_startup_triggered =
-            return_plan.observe_response_frontier(recv_stream.next_offset());
-        if return_plan.is_done() {
-            remotes.clear_return_plan_final();
-        }
-        if response_startup_triggered {
-            match spawn_reliable_relay_response_startup_path_opens(
-                context,
-                &spec,
-                &mut return_plan,
-                request_lane,
-                stream_id,
-                &mut state.recovery.pending_additional_path_opens,
-                &additional_path_open_tx,
-            ) {
-                Ok(true) => state.progress.last_stream_at = Instant::now(),
-                Ok(false) => {}
-                Err(err) => break Err(err),
-            }
-        }
-        if let Some(retained_ordinals) = return_plan.prepare_final(&remotes).map(ToOwned::to_owned)
-            && let Err(err) = remotes.publish_return_plan_final(&retained_ordinals)
-        {
+        if let Err(err) = drive_client_response_startup_control(
+            context,
+            &spec,
+            &mut return_plan,
+            request_lane,
+            stream_id,
+            recv_stream.next_offset(),
+            &mut remotes,
+            &mut state,
+            &additional_path_open_tx,
+        ) {
             break Err(err);
         }
         let topology_preopen = request_demand_update.preopen_additional_paths
@@ -2143,81 +2273,33 @@ where
                     cancel_pending_additional_path_opens(stream_id, &mut state.recovery.pending_additional_path_opens);
                     continue;
                 };
-                if super::lifecycle::take_matching_additional_path_open(
-                    &mut state.recovery.pending_additional_path_opens,
-                    additional_path_open.key,
-                    additional_path_open.generation,
-                )
-                .is_none()
-                {
-                    if let Ok(opened) = additional_path_open.result {
-                        opened.retire_uncommitted();
-                    }
-                    continue;
-                }
-                let additional_path_key = additional_path_open.key;
-                let startup_ordinal = additional_path_open.startup_ordinal;
-                let attached_mode = match try_handle_additional_path_open_result(
+                let attached_mode = match settle_matching_client_additional_path_open(
                     stream_id,
+                    &mut state,
+                    &mut return_plan,
                     &mut remotes,
                     &mut send_stream,
-                    !state.endpoint.local_open,
                     request_lane,
                     additional_path_open,
-                    state.recovery.pending_additional_path_opens.len(),
-                    &mut state.progress.last_stream_at,
                 ) {
                     Ok(mode) => mode,
                     Err(err) => break Err(err),
                 };
-                if let Err(err) = settle_client_return_plan_open_result(
-                    &mut return_plan,
-                    &remotes,
-                    additional_path_key,
-                    startup_ordinal,
-                    attached_mode.is_some(),
-                ) {
+                if let Err(err) = apply_client_additional_path_open_postaction(
+                    attached_mode,
+                    &mut sender,
+                    &mut sender_queue,
+                    context,
+                    &mut remotes,
+                    &send_stream,
+                    &mut recv_stream,
+                    &mut state,
+                    request_lane,
+                    response_lane,
+                )
+                .await
+                {
                     break Err(err);
-                }
-                if attached_mode.is_some() {
-                    state.progress.sender_retry_at = None;
-                }
-                if matches!(attached_mode, Some(ReliableRelayAttachMode::Recovery)) {
-                    if sender.enqueue_tail_reinjection(
-                        &mut sender_queue,
-                        context,
-                        &remotes,
-                        &send_stream,
-                        state.progress.last_send_ack.ranges(),
-                        state.progress.last_send_ack.complete(),
-                        Some(send_stream.next_offset()),
-                        state.progress.last_send_ack_frontier,
-                        request_lane,
-                    ) {
-                        state.progress.sender_retry_at = None;
-                    }
-                    match sender.send_recv_progress(
-                        &mut remotes,
-                        context,
-                        &mut recv_stream,
-                        &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::new(
-                            response_path_snapshot,
-                            response_lane,
-                            true,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(sent) => state.record_recv_progress_sent(sent),
-                        Err(err) if reliable_path_error_is_migratable(&err) => {
-                            state.progress.sender_retry_at = None;
-                        }
-                        Err(err) => break Err(err),
-                    }
-                    let attempted_at = Instant::now();
-                    state.progress.last_response_stall_reinjection_at = attempted_at;
-                    state.progress.last_product_stall_attempt_at = Some(attempted_at);
                 }
             }
             read = async {
@@ -2533,8 +2615,7 @@ where
                         debug_assert!(deferred_remote_frame.is_none());
                         deferred_remote_frame = deferred;
                         let mut data_effect = None;
-                        let write = apply_and_write_ready_stream_data_batch(
-                            &mut local,
+                        let applied = apply_ready_stream_data_batch(
                             &mut recv_stream,
                             &mut ready_remote_data,
                             ReadyStreamDataDirection::ClientDownload,
@@ -2562,20 +2643,272 @@ where
                                 data_effect = Some(effect);
                                 Ok(outcome)
                             },
-                        )
-                        .await;
+                        );
+                        if applied.has_apply_error() {
+                            // Client ready-batch collection admits only the exact
+                            // contiguous stream, payload, final-offset, and
+                            // published-credit geometry consumed by the callback.
+                            // Its first fallible operation therefore precedes all
+                            // receive-state mutation; a later-item error cannot
+                            // follow an accepted prefix in this synchronous branch.
+                            debug_assert!(data_effect.is_none());
+                            if let Err(err) = write_applied_ready_stream_data_batch(
+                                &mut local,
+                                &mut ready_remote_data,
+                                applied,
+                            )
+                            .await
+                            {
+                                break Err(err);
+                            }
+                            unreachable!("a deferred apply error must surface after its valid prefix write");
+                        }
+
+                        let prewrite_response_path_snapshot = remotes.lowest_eta_path_snapshot(
+                            context,
+                            response_lane,
+                            PATH_OPEN_SCORE_BYTES,
+                        );
+                        match sender
+                            .send_recv_progress(
+                                &mut remotes,
+                                context,
+                                &mut recv_stream,
+                                &mut state.progress.recv_progress,
+                                RelayRecvProgressSend::ack_only(
+                                    prewrite_response_path_snapshot,
+                                    response_lane,
+                                ),
+                            )
+                            .await
+                        {
+                            Ok(sent) => state.record_recv_progress_sent(sent),
+                            Err(err) if reliable_path_error_is_migratable(&err) => {
+                                state.progress.sender_retry_at = None;
+                            }
+                            Err(err) => break Err(err),
+                        }
+                        if let Err(err) = drive_client_response_startup_control(
+                            context,
+                            &spec,
+                            &mut return_plan,
+                            request_lane,
+                            stream_id,
+                            recv_stream.next_offset(),
+                            &mut remotes,
+                            &mut state,
+                            &additional_path_open_tx,
+                        ) {
+                            break Err(err);
+                        }
+
+                        let mut pending_write_path_opens = VecDeque::new();
+                        let write = {
+                            let write = write_applied_ready_stream_data_batch(
+                                &mut local,
+                                &mut ready_remote_data,
+                                applied,
+                            );
+                            tokio::pin!(write);
+                            loop {
+                                if let Err(err) = drive_client_response_startup_control(
+                                    context,
+                                    &spec,
+                                    &mut return_plan,
+                                    request_lane,
+                                    stream_id,
+                                    recv_stream.next_offset(),
+                                    &mut remotes,
+                                    &mut state,
+                                    &additional_path_open_tx,
+                                ) {
+                                    break Err(err);
+                                }
+
+                                let stream_ack_pending =
+                                    remotes.has_pending_stream_ack_publication();
+                                let stream_ack_capacity_wait = stream_ack_pending
+                                    .then(|| {
+                                        arm_carrier_capacity_notifies(
+                                            remotes.pending_stream_ack_capacity_notifies(),
+                                        )
+                                    })
+                                    .flatten();
+                                if stream_ack_pending {
+                                    let publication = remotes.retry_pending_stream_ack();
+                                    state.record_recv_progress_sent(publication.published);
+                                }
+                                let stream_ack_blocked =
+                                    remotes.has_pending_stream_ack_publication();
+                                let has_stream_ack_capacity_wait =
+                                    stream_ack_capacity_wait.is_some();
+
+                                let return_plan_final_pending =
+                                    remotes.has_pending_return_plan_final_publication();
+                                let return_plan_final_capacity_wait = return_plan_final_pending
+                                    .then(|| {
+                                        arm_carrier_capacity_notifies(
+                                            remotes
+                                                .pending_return_plan_final_capacity_notifies(),
+                                        )
+                                    })
+                                    .flatten();
+                                if return_plan_final_pending {
+                                    remotes.retry_pending_return_plan_final();
+                                }
+                                let return_plan_final_blocked =
+                                    remotes.has_pending_return_plan_final_publication();
+                                let has_return_plan_final_capacity_wait =
+                                    return_plan_final_capacity_wait.is_some();
+
+                                tokio::select! {
+                                    biased;
+                                    result = &mut write => break result,
+                                    additional_path_open = additional_path_open_rx.recv(), if !state.recovery.pending_additional_path_opens.is_empty() => {
+                                        let Some(additional_path_open) = additional_path_open else {
+                                            cancel_pending_additional_path_opens(
+                                                stream_id,
+                                                &mut state.recovery.pending_additional_path_opens,
+                                            );
+                                            continue;
+                                        };
+                                        if additional_path_open.startup_ordinal.is_none() {
+                                            if matching_additional_path_open_pending(
+                                                &state.recovery.pending_additional_path_opens,
+                                                additional_path_open.key,
+                                                additional_path_open.generation,
+                                            ) {
+                                                pending_write_path_opens.push_back(
+                                                    PendingLocalWritePathOpen::Deferred(
+                                                        additional_path_open,
+                                                    ),
+                                                );
+                                            } else if let Ok(opened) = additional_path_open.result {
+                                                opened.retire_uncommitted();
+                                            }
+                                            continue;
+                                        }
+                                        let attached_mode = match settle_matching_client_additional_path_open(
+                                            stream_id,
+                                            &mut state,
+                                            &mut return_plan,
+                                            &mut remotes,
+                                            &mut send_stream,
+                                            request_lane,
+                                            additional_path_open,
+                                        ) {
+                                            Ok(mode) => mode,
+                                            Err(err) => break Err(err),
+                                        };
+                                        let attached = attached_mode.is_some();
+                                        pending_write_path_opens.push_back(
+                                            PendingLocalWritePathOpen::Applied(attached_mode),
+                                        );
+                                        if attached {
+                                            let current_response_path_snapshot = remotes
+                                                .lowest_eta_path_snapshot(
+                                                    context,
+                                                    response_lane,
+                                                    PATH_OPEN_SCORE_BYTES,
+                                                );
+                                            match sender
+                                                .send_recv_progress(
+                                                    &mut remotes,
+                                                    context,
+                                                    &mut recv_stream,
+                                                    &mut state.progress.recv_progress,
+                                                    RelayRecvProgressSend::ack_only(
+                                                        current_response_path_snapshot,
+                                                        response_lane,
+                                                    ),
+                                                )
+                                                .await
+                                            {
+                                                Ok(sent) => state.record_recv_progress_sent(sent),
+                                                Err(err) if reliable_path_error_is_migratable(&err) => {
+                                                    state.progress.sender_retry_at = None;
+                                                }
+                                                Err(err) => break Err(err),
+                                            }
+                                        }
+                                    }
+                                    _ = async move {
+                                        if let Some(wait) = stream_ack_capacity_wait {
+                                            wait.await;
+                                        }
+                                    }, if stream_ack_blocked && has_stream_ack_capacity_wait => {
+                                        continue;
+                                    }
+                                    _ = async move {
+                                        if let Some(wait) = return_plan_final_capacity_wait {
+                                            wait.await;
+                                        }
+                                    }, if return_plan_final_blocked && has_return_plan_final_capacity_wait => {
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         if let Err(err) = write {
                             break Err(err);
                         }
+
+                        let postactions = 'postactions: {
+                            while let Some(open) = pending_write_path_opens.pop_front() {
+                                let attached_mode = match open {
+                                    PendingLocalWritePathOpen::Applied(mode) => mode,
+                                    PendingLocalWritePathOpen::Deferred(additional_path_open) => {
+                                        match settle_matching_client_additional_path_open(
+                                            stream_id,
+                                            &mut state,
+                                            &mut return_plan,
+                                            &mut remotes,
+                                            &mut send_stream,
+                                            request_lane,
+                                            additional_path_open,
+                                        ) {
+                                            Ok(mode) => mode,
+                                            Err(err) => break 'postactions Err(err),
+                                        }
+                                    }
+                                };
+                                if let Err(err) = apply_client_additional_path_open_postaction(
+                                    attached_mode,
+                                    &mut sender,
+                                    &mut sender_queue,
+                                    context,
+                                    &mut remotes,
+                                    &send_stream,
+                                    &mut recv_stream,
+                                    &mut state,
+                                    request_lane,
+                                    response_lane,
+                                )
+                                .await
+                                {
+                                    break 'postactions Err(err);
+                                }
+                            }
+                            Ok(())
+                        };
+                        if let Err(err) = postactions {
+                            break Err(err);
+                        }
+
                         let data_effect =
                             data_effect.expect("ready data batch contains its first frame");
+                        let mut current_response_path_snapshot = remotes.lowest_eta_path_snapshot(
+                            context,
+                            response_lane,
+                            PATH_OPEN_SCORE_BYTES,
+                        );
                         match sender.send_recv_progress(
                             &mut remotes,
                             context,
                             &mut recv_stream,
                             &mut state.progress.recv_progress,
                             RelayRecvProgressSend::new(
-                                response_path_snapshot,
+                                current_response_path_snapshot,
                                 response_lane,
                                 false,
                             ),
@@ -2611,6 +2944,11 @@ where
                             }
                             Err(err) => break Err(err),
                         }
+                        current_response_path_snapshot = remotes.lowest_eta_path_snapshot(
+                            context,
+                            response_lane,
+                            PATH_OPEN_SCORE_BYTES,
+                        );
                         if data_effect.fin_ready {
                             let feedback_published = match sender.send_recv_progress(
                                 &mut remotes,
@@ -2618,7 +2956,7 @@ where
                                 &mut recv_stream,
                                 &mut state.progress.recv_progress,
                                 RelayRecvProgressSend::final_ack(
-                                    response_path_snapshot,
+                                    current_response_path_snapshot,
                                     response_lane,
                                 ),
                             )
@@ -2628,7 +2966,7 @@ where
                                     record_final_recv_progress_enqueue(
                                         &mut state,
                                         sent,
-                                        response_path_snapshot,
+                                        current_response_path_snapshot,
                                     );
                                     sent
                                 }

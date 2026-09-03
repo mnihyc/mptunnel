@@ -742,13 +742,20 @@ pub(super) fn take_matching_additional_path_open(
     key: RelayPathKey,
     generation: RelayAdditionalPathOpenGeneration,
 ) -> Option<RelayAdditionalPathOpenTask> {
-    if !pending
-        .get(&key)
-        .is_some_and(|task| task.generation == generation)
-    {
+    if !matching_additional_path_open_pending(pending, key, generation) {
         return None;
     }
     pending.remove(&key)
+}
+
+pub(super) fn matching_additional_path_open_pending(
+    pending: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+    key: RelayPathKey,
+    generation: RelayAdditionalPathOpenGeneration,
+) -> bool {
+    pending
+        .get(&key)
+        .is_some_and(|task| task.generation == generation)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -847,7 +854,7 @@ pub(super) fn spawn_reliable_relay_response_startup_path_opens(
     if candidates.is_empty() {
         return Ok(false);
     }
-    Ok(spawn_reliable_relay_path_opens(
+    let spawned = spawn_reliable_relay_path_opens(
         context,
         spec,
         output_lane,
@@ -856,7 +863,12 @@ pub(super) fn spawn_reliable_relay_response_startup_path_opens(
         candidates,
         pending,
         result_tx,
-    ))
+    );
+    #[cfg(test)]
+    if spawned {
+        context.record_response_startup_open_round_for_test();
+    }
+    Ok(spawned)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -992,7 +1004,17 @@ fn spawn_reliable_relay_path_opens(
         );
         let result_tx = result_tx.clone();
         let generation = next_relay_additional_path_open_generation();
+        #[cfg(test)]
+        let fail_response_startup_open = matches!(mode, ReliableRelayAttachMode::Startup)
+            && context.response_startup_open_failure_for_test();
         let handle = tokio::spawn(async move {
+            #[cfg(test)]
+            let result = if fail_response_startup_open {
+                Err(RuntimeError::NoSchedulableTcpPath)
+            } else {
+                open_remote_stream_for_relay_path(&context, stream_id, &spec, lane, key).await
+            };
+            #[cfg(not(test))]
             let result =
                 open_remote_stream_for_relay_path(&context, stream_id, &spec, lane, key).await;
             let message = RelayAdditionalPathOpenResult {

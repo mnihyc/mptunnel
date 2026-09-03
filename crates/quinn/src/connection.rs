@@ -28,8 +28,8 @@ use crate::{
     udp_transmit,
 };
 use proto::{
-    ActivePathSnapshot, ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent,
-    Side, StreamEvent, StreamId, congestion::Controller,
+    ActivePathSnapshot, ClosedStream, ConnectionError, ConnectionHandle, ConnectionStats, Dir,
+    EndpointEvent, Side, StreamEvent, StreamId, congestion::Controller,
 };
 
 /// In-progress connection attempt future
@@ -661,6 +661,31 @@ impl Connection {
         let mut conn = self.0.state.lock("set_send_window");
         conn.inner.set_send_window(send_window);
         conn.wake();
+    }
+
+    /// Set the transmission priority of an existing send stream by identity.
+    ///
+    /// This is equivalent to [`SendStream::set_priority`], but remains usable
+    /// by protocol adapters that retain the stream identity while wrapping the
+    /// concrete [`SendStream`].
+    pub fn set_stream_priority(
+        &self,
+        stream: StreamId,
+        priority: i32,
+    ) -> Result<(), ClosedStream> {
+        let mut conn = self.0.state.lock("set_stream_priority");
+        conn.inner.send_stream(stream).set_priority(priority)?;
+        Ok(())
+    }
+
+    /// Get the transmission priority of an existing send stream by identity.
+    pub fn stream_priority(&self, stream: StreamId) -> Result<i32, ClosedStream> {
+        self.0
+            .state
+            .lock("stream_priority")
+            .inner
+            .send_stream(stream)
+            .priority()
     }
 
     /// See [`proto::TransportConfig::receive_window()`]

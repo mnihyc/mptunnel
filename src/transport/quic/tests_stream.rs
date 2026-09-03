@@ -484,6 +484,12 @@ async fn quic_carrier_round_trips_product_frames() {
     let server_task = tokio::spawn(async move {
         let connection = server.accept().await.expect("accepted connection");
         let (mut send, mut recv) = connection.accept_bi().await.expect("accepted stream");
+        send.set_priority(1)
+            .expect("set server QUIC stream priority");
+        assert_eq!(
+            send.priority().expect("read server QUIC stream priority"),
+            1
+        );
         match read_frame(&mut recv, limits)
             .await
             .expect("server read ping")

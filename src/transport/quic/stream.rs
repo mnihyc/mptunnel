@@ -20,12 +20,13 @@ const QUIC_STREAM_RECORD_PAYLOAD_BYTES: usize = 10 * 1200;
 #[derive(Debug)]
 pub struct SendStream {
     pub(super) stream: H3SendStream,
+    pub(super) connection: quinn::Connection,
+    pub(super) request_stream_id: quinn::StreamId,
     pub(super) native: NativeDatagramSender,
     pub(super) write_backlog: Arc<AtomicU64>,
     pub(super) telemetry: Arc<QuicCarrierTelemetry>,
     pub(super) known_datagram_flows: Arc<Mutex<DatagramFlowRegistry>>,
     pub(super) known_ip_tunnel: Arc<Mutex<IpTunnelRegistry>>,
-    pub(super) priority: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -57,12 +58,13 @@ impl IpPacketSender {
 }
 
 impl SendStream {
-    /// H3's current Quinn adapter does not expose the raw request stream after
-    /// construction. Product/Core still schedule writes by traffic class; this
-    /// value preserves the requested class for diagnostics and future RFC 9218
-    /// transport-priority plumbing without changing MPP scheduling.
+    /// Apply Product/Core's traffic class to Quinn's native stream scheduler.
+    ///
+    /// H3 retains the concrete send stream, so the carrier addresses the same
+    /// QUIC request stream through its stable native identity.
     pub fn set_priority(&mut self, priority: i32) -> Result<(), QuicCarrierError> {
-        self.priority = priority;
+        self.connection
+            .set_stream_priority(self.request_stream_id, priority)?;
         Ok(())
     }
 
@@ -76,7 +78,7 @@ impl SendStream {
 
     #[cfg(test)]
     pub(super) fn priority(&self) -> Result<i32, QuicCarrierError> {
-        Ok(self.priority)
+        Ok(self.connection.stream_priority(self.request_stream_id)?)
     }
 
     pub async fn reject(&mut self) -> Result<(), QuicCarrierError> {

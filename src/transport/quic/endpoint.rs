@@ -324,6 +324,10 @@ impl Connection {
 
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
         let stream = self.presentation.open().await?;
+        let request_stream_id = quinn::StreamId::from(
+            VarInt::from_u64(stream.request_stream_id)
+                .expect("HTTP/3 request stream identity is a QUIC variable integer"),
+        );
         let known_datagram_flows = Arc::new(std::sync::Mutex::new(DatagramFlowRegistry::new(
             self.max_datagram_flows,
         )));
@@ -333,12 +337,13 @@ impl Connection {
         Ok((
             SendStream {
                 stream: stream.send,
+                connection: self.connection.clone(),
+                request_stream_id,
                 native: native_send,
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
                 known_datagram_flows: known_datagram_flows.clone(),
                 known_ip_tunnel: known_ip_tunnel.clone(),
-                priority: 0,
             },
             RecvStream::new(
                 stream.recv,
@@ -352,6 +357,10 @@ impl Connection {
 
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
         let stream = self.presentation.accept().await?;
+        let request_stream_id = quinn::StreamId::from(
+            VarInt::from_u64(stream.request_stream_id)
+                .expect("HTTP/3 request stream identity is a QUIC variable integer"),
+        );
         let known_datagram_flows = Arc::new(std::sync::Mutex::new(DatagramFlowRegistry::new(
             self.max_datagram_flows,
         )));
@@ -361,12 +370,13 @@ impl Connection {
         Ok((
             SendStream {
                 stream: stream.send,
+                connection: self.connection.clone(),
+                request_stream_id,
                 native: native_send,
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
                 known_datagram_flows: known_datagram_flows.clone(),
                 known_ip_tunnel: known_ip_tunnel.clone(),
-                priority: 0,
             },
             RecvStream::new(
                 stream.recv,

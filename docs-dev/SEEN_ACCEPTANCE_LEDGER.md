@@ -59,7 +59,7 @@ An isolated commit milestone never does.
 | SEEN-6B | HTTP/3 migration left QUIC latency priority diagnostic-only | Fixed | Actual Quinn priority RED/GREEN plus ordinary two-run non-downgrade; `a9450d8` |
 | SEEN-6C | QUIC-only sustained bulk/read-gap and loaded-latency mechanism | Model-constrained; encompassing acceptance remains open | Current same-native-stream gap is attributed to ordered QUIC recovery; this does not close cold/warm, recovery, upload, or concurrent behavior |
 | SEEN-6D | TCP-only cold/warm ramp, sustain, loaded latency, and recovery | Open; some bulk cells GREEN | Existing bulk/startup/gap improvement does not yet prove the complete reported timing and concurrency behavior |
-| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Open; current causal priority | `53d9ab5` restores the bounded live-owner frontier invariant but remains runtime-RED; the next isolated correction is the proven owner-versus-alternate completion race |
+| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Implementation-fixed / affected gate pending | `53d9ab5` restores the bounded live-owner frontier invariant; `dc4853d` corrects the owner-versus-alternate completion race with symmetric RED/GREEN and independent review; ordinary mixed recovery remains the acceptance gate |
 | SEEN-6F | QUIC-only 10 -> 500 recovery and cold/warm first-object behavior | Open | The user-observed slow recovery and size-dependent startup trajectory require ordinary-build timing evidence |
 | SEEN-6G | TCP, QUIC, and default single-thread plus Cloudflare-style download/upload behavior | Open | Acceptance requires stable/burstable short and sustained work; aggregate bulk goodput alone is insufficient |
 | SEEN-6H | Matched raw TCP, V2Ray/Xray, and Hysteria2 comparison under the declared changing 3--10% loss schedule | Open | No release-wide competitiveness conclusion has yet satisfied the frozen comparison contract |
@@ -95,13 +95,16 @@ component invariant, but its ordinary mixed-recovery repetitions remain
 unstable, so it is an intermediary checkpoint rather than an accepted
 correction.
 
-The next exact trace proves a narrower timing-model defect: before the owner
-fallback, the implementation compares an alternate's predicted delivery with
+The next exact trace proved a narrower timing-model defect: before the owner
+fallback, the implementation compared an alternate's predicted delivery with
 the fallback timer rather than comparing alternate and owner delivery for the
-same frontier. That correction can remove only the timer remainder (about
-89 ms in the captured run); it cannot solve the preceding evidence delay or
-native ordered-service wait. The proof and commit verdicts are recorded in
-`docs-dev/RECENT_SEEN_CHANGE_REFLECTION.md`.
+same frontier. Commit `dc4853d` corrects that race symmetrically from one
+immutable observation. Focused tests and independent review are GREEN. The
+correction can remove only the timer remainder (about 89 ms in the captured
+run); it cannot solve the preceding evidence delay or native ordered-service
+wait. The affected ordinary mixed-recovery gate therefore remains pending.
+The proof and commit verdicts are recorded in
+`docs-dev/RECENT_SEEN_CHANGE_REFLECTION.md` and `PROGRESS.md`.
 
 Fixing this causal cell does not close the wider SEEN-6 matrix. The retained
 matrix still requires, for TCP-only, QUIC-only, and default TCP+QUIC:
@@ -126,6 +129,11 @@ RFC, configuration, public documentation, or release changes:
 
 - 31 deterministic pre-v10/full-suite fixture expectations that remain test or
   conformance debt, not proven production defects;
+- `retained_tail_uses_only_a_measured_earlier_completion`, whose stale fixture
+  treats an unscoped sibling per-flow sample as exact Product authority;
+- `confidence_and_durable_progress_use_explicit_sample_thresholds` and
+  `fresh_product_point_rate_requires_epoch_and_lifetime_floors_for_completion_authority`,
+  whose stale fixtures treat an ACK-byte floor as Product durability;
 - exact all-stage carrier-work and peer-service-frontier accounting;
 - the RFC `STREAM_ACK(..., services)` service-frontier wire/input mismatch;
 - exact `STREAM_MAX_DATA` publication cadence and partial local-write
@@ -152,15 +160,12 @@ subject to the ordinary SEEN-6 composition matrix above.
 
 ## Deterministic next step
 
-1. Correct the bounded SEEN-6E owner-versus-alternate completion race,
-   including symmetric deterministic RED/GREEN proofs and independent diff
-   review.
-2. Commit that correction alone, then rerun only its ordinary mixed recovery
-   gate; do not tune a timer or score to manufacture a pass.
-3. Keep SEEN-6E visibly open unless both the component proof and affected
+1. Run only the existing ordinary mixed recovery gate against `dc4853d`; do
+   not tune a timer or score to manufacture a pass.
+2. Keep SEEN-6E visibly open unless both the component proof and affected
    ordinary runtime gate pass without a goodput or traffic-expansion downgrade.
-4. Continue the remaining frozen SEEN-6 acceptance cells one at a time; a
+3. Continue the remaining frozen SEEN-6 acceptance cells one at a time; a
    newly exposed causal defect is still SEEN only when it is necessary to
    explain one of those already-reported failures.
-5. Record independent findings in the held UNSEEN batch, but do not implement
+4. Record independent findings in the held UNSEEN batch, but do not implement
    them without consent.

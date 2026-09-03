@@ -502,7 +502,7 @@ fn unavailable_carrier_does_not_advance_mux_or_consume_data() {
 }
 
 #[test]
-fn acquisition_skips_a_blocked_nondominated_regular_and_visits_its_sibling() {
+fn ordinary_ecf_retains_the_frontier_owner_within_hysteresis() {
     let mut fixture = response_acquisition_fixture(1);
     let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
     establish_qualified_response_owner(&fixture, &mut send_stream);
@@ -524,32 +524,31 @@ fn acquisition_skips_a_blocked_nondominated_regular_and_visits_its_sibling() {
             fixture.limits,
             outstanding,
         )
-        .expect("ordinary ECF selects an eligible faster sibling");
+        .expect("ordinary ECF retains the live frontier owner");
 
     assert_eq!(
         dispatch.selected_path,
-        Some(fixture.second_additional),
-        "acquisition accounting must preserve ordinary completion placement",
+        Some(fixture.owner),
+        "a small modeled advantage does not override frontier hysteresis",
     );
-    assert!(try_recv_reliable_path_command(&mut fixture.owner_receivers).is_none());
     assert!(matches!(
-        try_recv_reliable_path_command(&mut fixture.second_receivers),
+        try_recv_reliable_path_command(&mut fixture.owner_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
+    assert!(try_recv_reliable_path_command(&mut fixture.second_receivers).is_none());
 }
 
 #[test]
-fn response_acquisition_writer_race_skips_failed_regular_and_commits_sibling() {
+fn ordinary_ecf_uses_backup_after_regular_outputs_are_blocked() {
     let mut fixture = response_acquisition_fixture(1);
     let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
     establish_qualified_response_owner(&fixture, &mut send_stream);
-    fixture
-        .binding
-        .set_output_product_model_for_test(fixture.first_additional, 600_000_000.0, 0.5);
-    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
-    sender.fill_response_acquisition_writer_before_reservation_for_test(fixture.first_additional);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
+    mark_response_output_backup(&fixture.binding, fixture.second_additional);
+    fill_response_data_queue(&fixture.owner_commands, 20_000);
+    fill_response_data_queue(&fixture.first_commands, 30_000);
     let outstanding = send_stream.reinjection_bytes();
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
 
     let dispatch = sender
         .dispatch_next_with_data_ack_outstanding(
@@ -559,16 +558,12 @@ fn response_acquisition_writer_race_skips_failed_regular_and_commits_sibling() {
             fixture.limits,
             outstanding,
         )
-        .expect("the finite acquisition scan continues after a writer race");
-    assert_eq!(dispatch.selected_path, Some(fixture.second_additional));
-    assert!(try_recv_reliable_path_command(&mut fixture.owner_receivers).is_none());
-    assert!(matches!(
-        try_recv_reliable_path_command(&mut fixture.first_receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
-            stream_id: StreamId(u64::MAX),
-            ..
-        }))
-    ));
+        .expect("backup remains the ordinary work-conserving fallback");
+    assert_eq!(
+        dispatch.selected_path,
+        Some(fixture.second_additional),
+        "a zero-commit Regular pass permits ordinary Backup placement",
+    );
     assert!(matches!(
         try_recv_reliable_path_command(&mut fixture.second_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }))
@@ -577,38 +572,7 @@ fn response_acquisition_writer_race_skips_failed_regular_and_commits_sibling() {
 }
 
 #[test]
-fn response_acquisition_regular_membership_blocks_backup_acquisition() {
-    let mut fixture = response_acquisition_fixture(1);
-    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
-    establish_qualified_response_owner(&fixture, &mut send_stream);
-    mark_response_output_backup(&fixture.binding, fixture.second_additional);
-    fill_response_data_queue(&fixture.owner_commands, 20_000);
-    fill_response_data_queue(&fixture.first_commands, 30_000);
-    let next_offset = send_stream.next_offset();
-    let outstanding = send_stream.reinjection_bytes();
-    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
-    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
-
-    assert!(matches!(
-        sender.dispatch_next_with_data_ack_outstanding(
-            &fixture.stream,
-            &mut send_stream,
-            TrafficClass::Throughput,
-            fixture.limits,
-            outstanding,
-        ),
-        Err(RuntimeError::SenderServiceBlocked)
-    ));
-    assert_eq!(
-        send_stream.next_offset(),
-        next_offset,
-        "a transiently blocked regular tier cannot turn an unqualified backup into the response acquisition tier",
-    );
-    assert!(try_recv_reliable_path_command(&mut fixture.second_receivers).is_none());
-}
-
-#[test]
-fn response_acquisition_blockage_keeps_a_qualified_owner_work_conserving() {
+fn blocked_additional_outputs_keep_a_qualified_owner_work_conserving() {
     let mut fixture = response_acquisition_fixture(1);
     let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
     establish_qualified_response_owner(&fixture, &mut send_stream);
@@ -626,7 +590,7 @@ fn response_acquisition_blockage_keeps_a_qualified_owner_work_conserving() {
             fixture.limits,
             outstanding,
         )
-        .expect("blocked acquisition must not stall an independently usable qualified owner");
+        .expect("blocked alternatives must not stall an independently usable qualified owner");
 
     assert_eq!(dispatch.selected_path, Some(fixture.owner));
     assert!(matches!(
@@ -672,7 +636,43 @@ fn response_acquisition_does_not_bypass_the_ordinary_ecf_owner() {
 }
 
 #[test]
-fn response_acquisition_defers_when_only_ordinary_ecf_placement_remains() {
+fn unmeasured_response_output_cannot_override_the_qualified_ecf_owner() {
+    let mut fixture = response_acquisition_fixture(4);
+    let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
+    establish_qualified_response_owner(&fixture, &mut send_stream);
+    // Keep the first additional output wholly unmeasured and unqualified. Its
+    // lack of Product evidence is not authority to bypass ordinary completion
+    // ordering with a unique low-sequence acquisition quantum.
+    mark_response_output_backup(&fixture.binding, fixture.second_additional);
+    let outstanding = send_stream.reinjection_bytes();
+    let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"next"), TrafficClass::Throughput);
+
+    let dispatch = sender
+        .dispatch_next_with_data_ack_outstanding(
+            &fixture.stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            fixture.limits,
+            outstanding,
+        )
+        .expect("qualified ordinary ECF owner has Product and writer authority");
+
+    assert_eq!(
+        dispatch.selected_path,
+        Some(fixture.owner),
+        "missing rate evidence cannot grant a second arbiter authority over the ordinary ECF result",
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut fixture.owner_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }))
+            if payload == Bytes::from_static(b"next")
+    ));
+    assert!(try_recv_reliable_path_command(&mut fixture.first_receivers).is_none());
+}
+
+#[test]
+fn ordinary_ecf_keeps_the_selected_unqualified_output_while_it_remains_best() {
     let mut fixture = response_acquisition_fixture(4);
     fixture
         .binding
@@ -710,24 +710,25 @@ fn response_acquisition_defers_when_only_ordinary_ecf_placement_remains() {
             fixture.limits,
             outstanding,
         )
-        .expect("ordinary ECF remains authoritative after the first placement");
+        .expect("ordinary ECF keeps the lower-completion output");
     assert_eq!(
         second.selected_path,
-        Some(fixture.owner),
-        "with no admissible additional probe, ordinary completion placement remains authoritative",
+        Some(fixture.first_additional),
+        "qualification state does not override ordinary completion placement",
     );
     assert!(matches!(
         try_recv_reliable_path_command(&mut fixture.first_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
     assert!(matches!(
-        try_recv_reliable_path_command(&mut fixture.owner_receivers),
+        try_recv_reliable_path_command(&mut fixture.first_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
+    assert!(try_recv_reliable_path_command(&mut fixture.owner_receivers).is_none());
 }
 
 #[test]
-fn response_acquisition_later_flight_remains_additional_until_deficit_is_satisfied() {
+fn frontier_hysteresis_is_not_overridden_by_additional_output_qualification() {
     let mut fixture = response_acquisition_fixture(4);
     let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);
     establish_qualified_response_owner(&fixture, &mut send_stream);
@@ -748,18 +749,23 @@ fn response_acquisition_later_flight_remains_additional_until_deficit_is_satisfi
                 fixture.limits,
                 outstanding,
             )
-            .expect("the same lower-frontier-relative additional output retains a deficit");
-        assert_eq!(dispatch.selected_path, Some(fixture.first_additional));
+            .expect("ordinary frontier owner remains schedulable");
+        assert_eq!(
+            dispatch.selected_path,
+            Some(fixture.owner),
+            "qualification demand is not a second placement policy",
+        );
     }
 
     assert!(matches!(
-        try_recv_reliable_path_command(&mut fixture.first_receivers),
+        try_recv_reliable_path_command(&mut fixture.owner_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
     assert!(matches!(
-        try_recv_reliable_path_command(&mut fixture.first_receivers),
+        try_recv_reliable_path_command(&mut fixture.owner_receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
+    assert!(try_recv_reliable_path_command(&mut fixture.first_receivers).is_none());
 }
 
 #[test]

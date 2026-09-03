@@ -6,10 +6,8 @@
 
 use super::ResponseStreamBinding;
 use super::attachment::{
-    ResponseAcquisitionOutputId, ResponseDispatchTarget, ResponseSenderPathTarget,
-    ResponseStreamOutputEntry, ResponseStreamOutputs,
+    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
 };
-use super::delivery::response_latest_original_hole;
 use super::evidence::{
     ServerPathMetricsEntry, server_output_has_bulk_rate_evidence_at,
     server_output_local_path_metrics, server_output_peer_path_metrics,
@@ -19,51 +17,24 @@ use super::evidence::{
     server_path_metrics_has_qualified_delivery_history, server_path_metrics_native_window_sample,
     server_path_metrics_rate_evidence_is_fresh_at, server_path_metrics_snapshot_is_fresh_at,
 };
-use crate::model::acquisition_cursor::{
-    AcquisitionCandidate, AcquisitionQualificationIdentity, AcquisitionSnapshot, AcquisitionTier,
-};
-use crate::model::admission::{
-    BulkCandidatePosition, ReliableDataAckFrontierState, bulk_original_data_assignment_authority,
-};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, ReliableOriginalDataOutput,
-    ReliableStreamSourceAdmission, reliable_bulk_product_windows,
-    reliable_product_feedback_window_bytes, reliable_relay_buffer_len,
+    ReliableStreamSourceAdmission, reliable_product_feedback_window_bytes,
     reliable_stream_source_admission, reliable_stream_source_path,
 };
 use crate::model::carrier_rate_authority::CarrierRateAuthorityBasis;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
-use crate::model::response::{CarrierPathFlightDebt, response_oldest_lower_flight_owner};
-use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, SessionId};
+use crate::protocol::SessionId;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-/// One coherent response acquisition observation and its exact apply targets.
-pub(in crate::runtime) struct ResponseAcquisitionObservation {
-    pub(in crate::runtime) snapshot: AcquisitionSnapshot<ResponseAcquisitionOutputId>,
-    pub(in crate::runtime) expected_model_generation: u64,
-    targets: Vec<(ResponseAcquisitionOutputId, ResponseDispatchTarget)>,
-}
-
-impl ResponseAcquisitionObservation {
-    pub(in crate::runtime) fn target(
-        &self,
-        id: ResponseAcquisitionOutputId,
-    ) -> Option<ResponseDispatchTarget> {
-        self.targets
-            .iter()
-            .find_map(|(candidate, target)| (*candidate == id).then_some(*target))
-    }
-}
 use tokio::sync::Notify;
 
 impl ResponseStreamBinding {
@@ -198,164 +169,6 @@ impl ResponseStreamBinding {
                 .collect();
         drop(outputs);
         targets
-    }
-
-    /// Captures one complete response-direction acquisition quantum while the
-    /// output membership and exact flight ledger are observed in their global
-    /// `outputs -> flights` order.
-    pub(in crate::runtime) fn response_acquisition_observation(
-        &self,
-        lane: TrafficClass,
-        pending_range: OffsetRange,
-        data_ack_outstanding_bytes: usize,
-        frontier_state: ReliableDataAckFrontierState,
-    ) -> Option<ResponseAcquisitionObservation> {
-        let quantum_bytes = pending_range.len();
-        let payload_bytes = usize::try_from(quantum_bytes).ok()?;
-        if quantum_bytes == 0 {
-            return None;
-        }
-
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let flights = self
-            .flights
-            .lock()
-            .expect("server reliable stream flight lock");
-        let now = Instant::now();
-        let mut lower_flights = BTreeMap::<u64, CarrierPathFlightDebt>::new();
-        for (flight_offset, path_flights) in flights.range(..pending_range.start) {
-            if let Some(original) = path_flights
-                .iter()
-                .rev()
-                .find(|flight| flight.kind == CarrierWorkKind::OriginalData)
-            {
-                lower_flights.insert(
-                    *flight_offset,
-                    CarrierPathFlightDebt {
-                        key: original.key,
-                        output_incarnation: original.output_incarnation,
-                        bytes: original.bytes as u64,
-                    },
-                );
-            }
-        }
-        drop(flights);
-        let ack_ordering = self
-            .ack_ordering
-            .lock()
-            .expect("server response ACK ordering lock");
-        for (hole_offset, holes) in ack_ordering.acked_holes.range(..pending_range.start) {
-            if let Some(latest) = response_latest_original_hole(holes) {
-                lower_flights.insert(
-                    *hole_offset,
-                    CarrierPathFlightDebt {
-                        key: latest.key,
-                        output_incarnation: latest.output_incarnation,
-                        bytes: latest.bytes,
-                    },
-                );
-            }
-        }
-        drop(ack_ordering);
-        let lower_flights = lower_flights.into_values().collect::<Vec<_>>();
-        let lower_owner = response_oldest_lower_flight_owner(&lower_flights);
-        let ordinary_owner_established =
-            outputs.original_data_in_flight_bytes > 0 && lower_owner.is_some();
-
-        let product_windows = reliable_bulk_product_windows(self.mux_limits);
-        let connection_limit = u64::try_from(self.mux_limits.max_reorder_bytes)
-            .unwrap_or(u64::MAX)
-            .min(self.mux_limits.max_stream_window_bytes);
-        let shared_quantum_legal = quantum_bytes
-            <= u64::try_from(reliable_relay_buffer_len(self.mux_limits)).unwrap_or(u64::MAX)
-            && outputs
-                .original_data_in_flight_bytes
-                .checked_add(quantum_bytes)
-                .is_some_and(|next| next <= product_windows.stream_resource_limit_bytes)
-            && u64::try_from(data_ack_outstanding_bytes)
-                .ok()
-                .and_then(|outstanding| outstanding.checked_add(quantum_bytes))
-                .is_some_and(|next| next <= connection_limit);
-
-        let mut candidates = Vec::with_capacity(outputs.entries.len());
-        let mut targets = Vec::with_capacity(outputs.entries.len());
-        for entry in &outputs.entries {
-            let id = ResponseAcquisitionOutputId::from(entry);
-            let path = server_bulk_output_snapshot_at(
-                entry,
-                outputs.data_level_queue_bytes,
-                lane,
-                self.mux_limits,
-                now,
-            );
-            let locally_eligible = entry.commands.product_admission_active()
-                && crate::scheduler::path_is_schedulable(path, lane);
-            let stale = entry.qualification.stale_for_original_data();
-            let qualified = entry.product_qualification.qualified();
-            let authority = bulk_original_data_assignment_authority(
-                path,
-                payload_bytes,
-                self.mux_limits,
-                BulkCandidatePosition::AdditionalPath,
-                qualified,
-            );
-            let legal_whole_quantum = shared_quantum_legal
-                && locally_eligible
-                && !stale
-                && entry.commands.can_enqueue_lane_now(lane)
-                && authority.has_headroom(entry.original_data_in_flight_bytes);
-            let owns_live_contiguous_frontier = lower_owner == Some((entry.key, entry.incarnation))
-                && frontier_state.owner_has_live_contiguous_frontier();
-            let additional = !owns_live_contiguous_frontier;
-            candidates.push(AcquisitionCandidate {
-                exact_id: id,
-                qualification_identity: AcquisitionQualificationIdentity::capture(
-                    &entry.product_qualification,
-                ),
-                tier: if crate::scheduler::path_is_backup(path) {
-                    AcquisitionTier::Backup
-                } else {
-                    AcquisitionTier::Regular
-                },
-                locally_eligible,
-                stale,
-                additional,
-                qualified,
-                generation_deficit_bytes: entry.product_qualification.deficit_bytes(),
-                legal_whole_quantum,
-            });
-            targets.push((
-                id,
-                ResponseDispatchTarget {
-                    key: entry.key,
-                    path_instance_id: entry.path_instance_id,
-                    incarnation: entry.incarnation,
-                    has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_at(
-                        entry,
-                        self.mux_limits,
-                        now,
-                    ),
-                    native_authority_stamp: entry
-                        .native_scheduling_shape
-                        .map(|shape| shape.stamp()),
-                },
-            ));
-        }
-        let expected_model_generation = self.response_model_generation.load(Ordering::Acquire);
-        drop(outputs);
-        Some(ResponseAcquisitionObservation {
-            snapshot: AcquisitionSnapshot {
-                pending_range,
-                quantum_bytes,
-                ordinary_owner_established,
-                candidates,
-            },
-            expected_model_generation,
-            targets,
-        })
     }
 
     pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {

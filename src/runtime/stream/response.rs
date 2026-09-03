@@ -42,7 +42,6 @@ pub(in crate::runtime) use delivery::{ResponseDataAckRecoveryCandidate, Response
 pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
-pub(in crate::runtime) use snapshot::ResponseAcquisitionObservation;
 pub(in crate::runtime) use startup::ResponseStartupFinalOutcome;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

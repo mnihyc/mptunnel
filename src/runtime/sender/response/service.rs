@@ -8,19 +8,13 @@ use super::dispatch::{
     emit_response_frame_from_sender_service, response_frame_has_carrier_credit,
     select_switchable_response_target,
 };
-use super::multipath::{
-    ResponseDataDispatchTarget, plan_response_data_payload_with_acquisition_guard,
-};
+use super::multipath::plan_response_data_payload_with_data_ack_outstanding_impl;
 use super::response_reinjection_avoid_outputs;
 use super::scheduling::response_completion_snapshot;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
     lab_server_response_stream_data,
-};
-use crate::model::acquisition_cursor::{
-    AcquisitionApplyOutcome, AcquisitionAttemptResolution, AcquisitionDispatchStart,
-    AcquisitionReadiness, DirectionLocalAcquisitionCursor,
 };
 use crate::model::admission::ReliableDataAckFrontierState;
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
@@ -45,9 +39,7 @@ use crate::runtime::sender::{
     sender_optional_reinjection_startup_floor_bytes,
     sender_reinjection_minimum_useful_attempt_bytes,
 };
-use crate::runtime::stream::response::{
-    ResponseAcquisitionObservation, ResponseAcquisitionOutputId, ResponseSenderPathTarget,
-};
+use crate::runtime::stream::response::ResponseSenderPathTarget;
 use crate::runtime::stream::{
     ReliablePathStream, ReliablePathStreamOutput, RequalificationAttempt,
 };
@@ -189,105 +181,6 @@ fn response_startup_dispatch_payload_bytes(
     }
 }
 
-fn response_acquisition_observation(
-    path_stream: &ReliablePathStream,
-    lane: TrafficClass,
-    next_offset: u64,
-    payload_bytes: usize,
-    data_ack_outstanding_bytes: usize,
-    frontier_state: ReliableDataAckFrontierState,
-) -> Option<ResponseAcquisitionObservation> {
-    if lane != TrafficClass::Throughput {
-        return None;
-    }
-    let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
-        return None;
-    };
-    let end = next_offset.checked_add(u64::try_from(payload_bytes).ok()?)?;
-    binding.response_acquisition_observation(
-        lane,
-        OffsetRange {
-            start: next_offset,
-            end,
-        },
-        data_ack_outstanding_bytes,
-        frontier_state,
-    )
-}
-
-fn response_acquisition_target_id(
-    planned: &ResponseDataDispatchTarget,
-) -> Option<ResponseAcquisitionOutputId> {
-    let ResponseDataDispatchTarget::Switchable { target, .. } = planned else {
-        return None;
-    };
-    Some(ResponseAcquisitionOutputId {
-        key: target.key,
-        path_instance_id: target.path_instance_id,
-        incarnation: target.incarnation,
-    })
-}
-
-/// Product acquisition may spend one bounded quantum to discover an output
-/// with no achieved-service evidence. Once both sides of the comparison have
-/// fresh bulk evidence, however, the ordinary ECF result is authoritative: a
-/// strictly slower candidate is no longer an unknown worth probing and cannot
-/// preempt that owner merely because its Product ledger is incomplete.
-fn retain_response_acquisition_candidates_not_dominated_by_ecf(
-    path_stream: &ReliablePathStream,
-    lane: TrafficClass,
-    payload_bytes: usize,
-    planned: &ResponseDataDispatchTarget,
-    observation: &mut ResponseAcquisitionObservation,
-) -> bool {
-    let probe_snapshot = |target: &ResponseSenderPathTarget| {
-        let mut snapshot = response_completion_snapshot(target);
-        // Acquisition asks whether one new bounded measurement is justified;
-        // already assigned work is not an intrinsic property of either path.
-        snapshot.queue_bytes = 0;
-        snapshot.bytes_in_flight = 0;
-        snapshot.data_level_queue_bytes = 0;
-        snapshot.data_level_bytes_in_flight = 0;
-        snapshot
-    };
-    let Some(ordinary_id) = response_acquisition_target_id(planned) else {
-        return false;
-    };
-    let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
-        return false;
-    };
-    let targets = binding.sender_path_targets(lane, payload_bytes);
-    let Some(ordinary) = targets.iter().find(|target| {
-        target.observation.key == ordinary_id.key
-            && target.observation.path_instance_id == ordinary_id.path_instance_id
-            && target.observation.incarnation == ordinary_id.incarnation
-    }) else {
-        return false;
-    };
-    let Some(ordinary_score) = scheduler::score_path(probe_snapshot(ordinary), lane, payload_bytes)
-    else {
-        return false;
-    };
-    observation.snapshot.candidates.retain(|candidate| {
-        if candidate.exact_id == ordinary_id || candidate.qualified || !candidate.additional {
-            return true;
-        }
-        let Some(target) = targets.iter().find(|target| {
-            target.observation.key == candidate.exact_id.key
-                && target.observation.path_instance_id == candidate.exact_id.path_instance_id
-                && target.observation.incarnation == candidate.exact_id.incarnation
-        }) else {
-            return false;
-        };
-        if !target.observation.has_bulk_rate_evidence {
-            return true;
-        }
-        scheduler::score_path(probe_snapshot(target), lane, payload_bytes)
-            .is_some_and(|candidate_score| candidate_score.eta_ms <= ordinary_score.eta_ms)
-    });
-    true
-}
-
 #[derive(Debug)]
 /// Current server response sender-service boundary.
 ///
@@ -302,9 +195,6 @@ pub(in crate::runtime) struct ServerResponseSenderService {
     pub(in crate::runtime::sender) queue: ReliableRelaySenderQueue,
     pub(in crate::runtime::sender) performance: MppPerformanceConfig,
     pub(in crate::runtime::sender) optional_reinjection: OptionalReinjectionLedger,
-    response_acquisition: DirectionLocalAcquisitionCursor<ResponseAcquisitionOutputId>,
-    #[cfg(test)]
-    response_acquisition_writer_race_target: Option<CarrierPathKey>,
     stale_response_recovery_generation: u64,
 }
 
@@ -416,49 +306,8 @@ impl ServerResponseSenderService {
             queue: ReliableRelaySenderQueue::default(),
             performance,
             optional_reinjection: OptionalReinjectionLedger::default(),
-            response_acquisition: DirectionLocalAcquisitionCursor::default(),
-            #[cfg(test)]
-            response_acquisition_writer_race_target: None,
             stale_response_recovery_generation: 0,
         }
-    }
-
-    #[cfg(test)]
-    fn fill_response_acquisition_writer_before_reservation_for_test(
-        &mut self,
-        target: CarrierPathKey,
-    ) {
-        self.response_acquisition_writer_race_target = Some(target);
-    }
-
-    #[cfg(test)]
-    fn apply_response_acquisition_writer_race_for_test(
-        &mut self,
-        path_stream: &ReliablePathStream,
-        target: &crate::runtime::stream::response::ResponseDispatchTarget,
-        lane: TrafficClass,
-    ) {
-        let Some(expected) = self.response_acquisition_writer_race_target.take() else {
-            return;
-        };
-        assert_eq!(
-            target.key, expected,
-            "test writer race must intercept the expected first acquisition target",
-        );
-        let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
-            panic!("response acquisition requires a switchable output");
-        };
-        binding
-            .try_enqueue_stream_ordered_frame_for_target(
-                target,
-                Frame::StreamData {
-                    stream_id: StreamId(u64::MAX),
-                    offset: 10_000,
-                    payload: Bytes::from_static(b"writer-race"),
-                },
-                lane,
-            )
-            .expect("test writer race fills the exact selected carrier queue");
     }
 
     pub(in crate::runtime) fn stale_response_recovery_generation(&self) -> u64 {
@@ -692,78 +541,15 @@ impl ServerResponseSenderService {
                 ) else {
                     return false;
                 };
-                let acquisition = response_acquisition_observation(
+                plan_response_data_payload_with_data_ack_outstanding_impl(
                     path_stream,
                     data_lane,
                     send_stream.next_offset(),
                     payload_bytes,
                     data_ack_outstanding_bytes,
                     frontier_state,
-                );
-                let acquisition_readiness = acquisition
-                    .as_ref()
-                    .map(|observation| observation.snapshot.acquisition_readiness());
-                if acquisition_readiness == Some(AcquisitionReadiness::InvalidSnapshot) {
-                    return false;
-                }
-                let ordinary_guard = matches!(
-                    acquisition_readiness,
-                    Some(AcquisitionReadiness::Blocked(_) | AcquisitionReadiness::OrdinaryOnly)
                 )
-                .then(|| {
-                    &acquisition
-                        .as_ref()
-                        .expect("blocked acquisition owns its observation")
-                        .snapshot
-                });
-                let Ok((planned_bytes, planned)) =
-                    plan_response_data_payload_with_acquisition_guard(
-                        path_stream,
-                        data_lane,
-                        send_stream.next_offset(),
-                        payload_bytes,
-                        data_ack_outstanding_bytes,
-                        frontier_state,
-                        ordinary_guard,
-                    )
-                else {
-                    return false;
-                };
-                let Some(_) = acquisition else {
-                    return true;
-                };
-                let Some(mut apply) = response_acquisition_observation(
-                    path_stream,
-                    data_lane,
-                    send_stream.next_offset(),
-                    planned_bytes,
-                    data_ack_outstanding_bytes,
-                    frontier_state,
-                ) else {
-                    return false;
-                };
-                if !retain_response_acquisition_candidates_not_dominated_by_ecf(
-                    path_stream,
-                    data_lane,
-                    planned_bytes,
-                    &planned,
-                    &mut apply,
-                ) {
-                    return false;
-                }
-                let Some(id) = response_acquisition_target_id(&planned) else {
-                    return false;
-                };
-                match apply.snapshot.acquisition_readiness() {
-                    AcquisitionReadiness::Ready(_) => {
-                        self.response_acquisition.can_begin_dispatch()
-                    }
-                    AcquisitionReadiness::Blocked(_) | AcquisitionReadiness::OrdinaryOnly => {
-                        apply.snapshot.ordinary_target_preserves_acquisition(&id)
-                    }
-                    AcquisitionReadiness::OrdinaryFirstOwner => true,
-                    AcquisitionReadiness::InvalidSnapshot => false,
-                }
+                .is_ok()
             }
             ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
                 response_frame_has_carrier_credit(
@@ -1093,139 +879,6 @@ impl ServerResponseSenderService {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_response_acquisition_quantum(
-        &mut self,
-        path_stream: &ReliablePathStream,
-        send_stream: &mut ReliableSendStream,
-        relay_lane: TrafficClass,
-        data_lane: TrafficClass,
-        data_ack_outstanding_bytes: usize,
-        frontier_state: ReliableDataAckFrontierState,
-        payload: Bytes,
-        observation: ResponseAcquisitionObservation,
-        queued_lane: ReliableWorkClass,
-        enqueue_id: u64,
-        queue_delay_ms: u128,
-    ) -> Result<ServerResponseDispatch, RuntimeError> {
-        let payload_bytes = payload.len();
-        let max_attempts = observation.snapshot.candidates.len();
-        let dispatch_snapshot = observation.snapshot.clone();
-        if self
-            .response_acquisition
-            .begin_dispatch(observation.snapshot)
-            != AcquisitionDispatchStart::Started
-        {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-
-        for _ in 0..max_attempts {
-            let Some(attempt) = self.response_acquisition.advisory_attempt() else {
-                return Err(RuntimeError::SenderServiceBlocked);
-            };
-            let Some(apply) = response_acquisition_observation(
-                path_stream,
-                data_lane,
-                attempt.pending_range.start,
-                payload_bytes,
-                data_ack_outstanding_bytes,
-                frontier_state,
-            ) else {
-                let _ = self.response_acquisition.resolve_attempt(
-                    &attempt,
-                    AcquisitionApplyOutcome::Failed,
-                    &dispatch_snapshot,
-                );
-                return Err(RuntimeError::SenderServiceBlocked);
-            };
-            if !self
-                .response_acquisition
-                .attempt_is_current(&attempt, &apply.snapshot)
-            {
-                let _ = self.response_acquisition.resolve_attempt(
-                    &attempt,
-                    AcquisitionApplyOutcome::Failed,
-                    &apply.snapshot,
-                );
-                return Err(RuntimeError::SenderServiceBlocked);
-            }
-            let Some(target) = apply.target(attempt.exact_id) else {
-                let _ = self.response_acquisition.resolve_attempt(
-                    &attempt,
-                    AcquisitionApplyOutcome::Failed,
-                    &apply.snapshot,
-                );
-                return Err(RuntimeError::SenderServiceBlocked);
-            };
-
-            let frame = match send_stream.send_data(payload.clone()) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    let _ = self.response_acquisition.resolve_attempt(
-                        &attempt,
-                        AcquisitionApplyOutcome::Failed,
-                        &apply.snapshot,
-                    );
-                    return Err(err.into());
-                }
-            };
-            let planned = ResponseDataDispatchTarget::Switchable {
-                target,
-                expected_model_generation: apply.expected_model_generation,
-                position: crate::model::admission::BulkCandidatePosition::AdditionalPath,
-            };
-            #[cfg(test)]
-            self.apply_response_acquisition_writer_race_for_test(
-                path_stream,
-                &target,
-                reliable_path_effective_frame_lane(&frame, data_lane),
-            );
-            match emit_planned_response_data_frame(
-                path_stream,
-                planned,
-                frame.clone(),
-                reliable_path_effective_frame_lane(&frame, data_lane),
-            ) {
-                Ok(selected_path) => {
-                    let resolution = self.response_acquisition.resolve_attempt(
-                        &attempt,
-                        AcquisitionApplyOutcome::Committed,
-                        &apply.snapshot,
-                    );
-                    debug_assert_eq!(resolution, AcquisitionAttemptResolution::Committed);
-                    let committed = self
-                        .queue
-                        .commit_front_data_prefix(payload_bytes)
-                        .expect("dispatched queued data must still be at queue front");
-                    return self.finish_dispatched_work(
-                        path_stream,
-                        relay_lane,
-                        queued_lane,
-                        committed,
-                        frame,
-                        selected_path,
-                        None,
-                        "data",
-                        enqueue_id,
-                        queue_delay_ms,
-                    );
-                }
-                Err(err) => {
-                    let _ = send_stream.rollback_committed_data(&frame);
-                    let resolution = self.response_acquisition.resolve_attempt(
-                        &attempt,
-                        AcquisitionApplyOutcome::Failed,
-                        &apply.snapshot,
-                    );
-                    if resolution != AcquisitionAttemptResolution::Skipped {
-                        return Err(err);
-                    }
-                }
-            }
-        }
-        Err(RuntimeError::SenderServiceBlocked)
-    }
-
     fn dispatch_next_attempt_with_data_ack_outstanding(
         &mut self,
         path_stream: &ReliablePathStream,
@@ -1279,91 +932,15 @@ impl ServerResponseSenderService {
                     dispatch_payload_bytes,
                 )
                 .ok_or(RuntimeError::SenderServiceBlocked)?;
-                let acquisition = response_acquisition_observation(
-                    path_stream,
-                    data_lane,
-                    send_stream.next_offset(),
-                    dispatch_payload_bytes,
-                    data_ack_outstanding_bytes,
-                    frontier_state,
-                );
-                let acquisition_readiness = acquisition
-                    .as_ref()
-                    .map(|observation| observation.snapshot.acquisition_readiness());
-                if acquisition_readiness == Some(AcquisitionReadiness::InvalidSnapshot) {
-                    return Err(RuntimeError::SenderServiceBlocked);
-                }
-                let ordinary_guard = matches!(
-                    acquisition_readiness,
-                    Some(AcquisitionReadiness::Blocked(_) | AcquisitionReadiness::OrdinaryOnly)
-                )
-                .then(|| {
-                    &acquisition
-                        .as_ref()
-                        .expect("blocked acquisition owns its observation")
-                        .snapshot
-                });
                 let (dispatch_payload_bytes, planned) =
-                    plan_response_data_payload_with_acquisition_guard(
+                    plan_response_data_payload_with_data_ack_outstanding_impl(
                         path_stream,
                         data_lane,
                         send_stream.next_offset(),
                         dispatch_payload_bytes,
                         data_ack_outstanding_bytes,
                         frontier_state,
-                        ordinary_guard,
                     )?;
-                if acquisition.is_some() {
-                    let Some(mut apply) = response_acquisition_observation(
-                        path_stream,
-                        data_lane,
-                        send_stream.next_offset(),
-                        dispatch_payload_bytes,
-                        data_ack_outstanding_bytes,
-                        frontier_state,
-                    ) else {
-                        return Err(RuntimeError::SenderServiceBlocked);
-                    };
-                    if !retain_response_acquisition_candidates_not_dominated_by_ecf(
-                        path_stream,
-                        data_lane,
-                        dispatch_payload_bytes,
-                        &planned,
-                        &mut apply,
-                    ) {
-                        return Err(RuntimeError::SenderServiceBlocked);
-                    }
-                    match apply.snapshot.acquisition_readiness() {
-                        AcquisitionReadiness::Ready(_) => {
-                            let dispatch_payload = payload.slice(..dispatch_payload_bytes);
-                            return self.dispatch_response_acquisition_quantum(
-                                path_stream,
-                                send_stream,
-                                relay_lane,
-                                data_lane,
-                                data_ack_outstanding_bytes,
-                                frontier_state,
-                                dispatch_payload,
-                                apply,
-                                queued_lane,
-                                enqueue_id,
-                                queue_delay_ms,
-                            );
-                        }
-                        AcquisitionReadiness::Blocked(_) | AcquisitionReadiness::OrdinaryOnly => {
-                            let Some(id) = response_acquisition_target_id(&planned) else {
-                                return Err(RuntimeError::SenderServiceBlocked);
-                            };
-                            if !apply.snapshot.ordinary_target_preserves_acquisition(&id) {
-                                return Err(RuntimeError::SenderServiceBlocked);
-                            }
-                        }
-                        AcquisitionReadiness::InvalidSnapshot => {
-                            return Err(RuntimeError::SenderServiceBlocked);
-                        }
-                        AcquisitionReadiness::OrdinaryFirstOwner => {}
-                    }
-                }
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();

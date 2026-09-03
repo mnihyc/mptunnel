@@ -67,7 +67,7 @@ threshold.
 | SEEN-6C | QUIC-only sustained bulk/read-gap and loaded-latency mechanism | Model-constrained; encompassing acceptance remains open | Current same-native-stream gap is attributed to ordered QUIC recovery; this does not close cold/warm, recovery, upload, or concurrent behavior |
 | SEEN-6D1 | TCP-only loaded interactive latency while bulk occupies every configured TCP carrier | Model-constrained | Current unified matrix: 303.372 Mbps bulk but 1,417 ms interactive p95 versus 522 ms raw TCP and 538 ms V2Ray; exact diagnostics show zero MPP command wait and hundreds of KiB to MiB of already-native FIFO debt. A later priority frame cannot overtake that prefix without a hard handoff bound or another ordering domain |
 | SEEN-6D2 | TCP-only cold/warm ramp, sustained single-stream service, and impairment recovery | Open; current bulk cell GREEN | The current unified matrix disproves a sustained aggregate collapse in its one realization, but the separately reported cold/warm and recovery trajectories remain to be closed by their existing gates |
-| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Fixed; wider SEEN matrix open | `53d9ab5` restores bounded live-owner frontier authority; `dc4853d` corrects the completion race; the ordinary 500 -> 10 -> 500 gate sustained 360.800 Mbps with 0.679 s maximum read gap and returned to 407.1 Mbps in its first post-restore epoch |
+| SEEN-6E | Default TCP+QUIC stability, failover, and 500 -> 10 -> 500 recovery | Implementation-fixed / post-accounting gate pending; wider matrix open | `53d9ab5` restores bounded live-owner frontier authority; `dc4853d` installs the advisory completion race and its follow-up removes duplicate owner payload accounting. The 360.800 Mbps / 0.679 s run predates that follow-up and is not its acceptance evidence |
 | SEEN-6F | QUIC-only 10 -> 500 recovery and cold/warm first-object behavior | Open | The user-observed slow recovery and size-dependent startup trajectory require ordinary-build timing evidence |
 | SEEN-6G | TCP, QUIC, and default single-thread plus Cloudflare-style download/upload behavior | Open | Acceptance requires stable/burstable short and sustained work; aggregate bulk goodput alone is insufficient |
 | SEEN-6H | Matched raw TCP, V2Ray/Xray, and Hysteria2 comparison under the declared changing 3--10% loss schedule | Matrix measured; acceptance remains open | One current six-way ordinary-build cohort is complete and valid; MPP bulk is competitive, but SEEN-6D loaded TCP latency fails, so the cohort cannot authorize release |
@@ -105,16 +105,18 @@ correction.
 
 The next exact trace proved a narrower timing-model defect: before the owner
 fallback, the implementation compared an alternate's predicted delivery with
-the fallback timer rather than comparing alternate and owner delivery for the
-same frontier. Commit `dc4853d` corrects that race symmetrically from one
-immutable observation. Focused tests and independent review are GREEN. The
-correction can remove only the timer remainder (about 89 ms in the captured
-run); it cannot solve the preceding evidence delay or native ordered-service
-wait. Its affected ordinary mixed-recovery gate passed at 360.800 Mbps with a
-0.679-second maximum positive read gap; the first five-second epoch after QUIC
-restoration returned to 407.1 Mbps. Independent randomized loss realizations
-mean the larger difference from prior runs is not attributed to this bounded
-comparator. The proof and commit verdicts are recorded in
+the fallback timer rather than comparing alternate and owner delivery from one
+observation. Commit `dc4853d` installed that advisory race, but final audit
+then found its owner projection charged the already-accepted frontier payload
+twice. The focused follow-up removes that duplicate term in both directions;
+the owner estimate still conservatively contains aggregate later owner debt
+and is not claimed as exact byte-position proof. The correction can remove
+only the timer remainder (about 89 ms in the captured run); it cannot solve the
+preceding evidence delay or native ordered-service wait. Its affected ordinary
+mixed-recovery gate before the accounting follow-up passed at 360.800 Mbps
+with a 0.679-second maximum positive read gap; that stochastic result must not
+be attributed to the comparator and does not waive the wider matrix. The proof
+and commit verdicts are recorded in
 `docs-dev/RECENT_SEEN_CHANGE_REFLECTION.md` and `PROGRESS.md`.
 
 Fixing this causal cell does not close the wider SEEN-6 matrix. The retained

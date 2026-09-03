@@ -962,6 +962,15 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         TrafficClass::Throughput,
     );
     assert!(early_observation.reinjection_target.is_some());
+    let expected_owner_completion = early_observation
+        .original_path_timing
+        .and_then(|snapshot| crate::scheduler::score_path(snapshot, TrafficClass::Throughput, 0))
+        .filter(|score| score.eta_ms.is_finite())
+        .map(|score| Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0));
+    assert_eq!(
+        early_observation.owner_completion, expected_owner_completion,
+        "the already-accepted owner frontier must not be charged as a new payload a second time",
+    );
     assert!(
         early_observation
             .reinjection_completion

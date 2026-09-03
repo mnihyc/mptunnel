@@ -4640,21 +4640,28 @@ absolute deadlines, as specified below. The thresholds are:
 - `9/8 * SRTT` for QUIC;
 
 Before `fallback_at`, score the exact live owner `o` and each currently
-measured alternate `t` from one immutable observation, using the same frontier
-payload `M_s`. At serialized evaluation time `now`, an alternate is a
-completion-winning repair candidate no earlier than `loss_at` only when:
+measured alternate `t` from one immutable observation. The frontier payload
+`M_s` is already accepted OriginalData in the owner's Product debt and may
+also remain in native debt; it is new work only for the alternate. At
+serialized evaluation time `now`, an
+alternate is an advisory completion-winning repair candidate no earlier than
+`loss_at` only when:
 
 ```text
-max(now, loss_at) + S_t(M_s) < now + S_o(M_s)
+max(now, loss_at) + S_t(M_s) < now + S_o(0)
 ```
 
 The owner fallback is an independent authority epoch, not an owner-delivery
-estimate, and therefore MUST NOT replace the right-hand completion term. A
-missing or non-finite owner projection supplies no early-race evidence, so a
-measured target retains `fallback_at` as its next evaluation. Without a
-measured target there is no target-bound candidate deadline; the independent
-owner fallback epoch remains retained for a later target observation and actor
-wake calculation.
+estimate, and therefore MUST NOT replace the right-hand completion term.
+`S_o(0)` may conservatively include later outstanding offsets because Product
+debt is aggregate per output/instance and portable native telemetry does not
+expose an exact byte position inside an established TCP or QUIC ordering
+domain. It is consequently a bounded scheduling hint, not proof that the exact
+frontier owner will lose. A missing or non-finite owner
+projection supplies no early-race evidence, so a measured target retains
+`fallback_at` as its next evaluation. Without a measured target there is no
+target-bound candidate deadline; the independent owner fallback epoch remains
+retained for a later target observation and actor wake calculation.
 These loss, fallback, and completion comparisons are scheduling hints; they do
 not cap native rate, ordinary Product placement, or path capacity. At or after
 `fallback_at`, an eligible distinct alternate may perform bounded optional

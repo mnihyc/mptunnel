@@ -65,11 +65,11 @@ which fallback authority fires:
 max(now, loss_at) + S_alt < fallback_at
 ```
 
-This compares delivery with a timer, not with owner delivery. The clean race
-for the same exact frontier `M` is:
+This compares delivery with a timer, not with owner delivery. The bounded
+advisory race for frontier `M` is:
 
 ```text
-max(now, loss_at) + S_alt(M) < now + S_owner(M)
+max(now, loss_at) + S_alt(M) < now + S_owner(0), with M already in D_owner
 ```
 
 The loss and fallback epochs remain evidence/liveness hints; they are not rate
@@ -78,6 +78,12 @@ can advance optional repair. At or after fallback, the existing bounded
 liveness authority remains available even without that advantage. If either
 comparable projection is absent, the fallback hint remains the conservative
 evaluation point.
+
+The owner's exact OriginalData debt already contains `M`; charging `M` again
+would count the same work twice. Portable native telemetry can leave later
+owner offsets in `D_owner`, so `S_owner(0)` is a conservative total-outstanding
+projection rather than an exact byte-position oracle. It may authorize bounded
+optional repair early; it cannot cap ordinary work or prove native failure.
 
 For the trace above, the corrected comparison can remove only the remaining
 approximately 89 ms wait. It cannot remove the preceding 1.318 s evidence

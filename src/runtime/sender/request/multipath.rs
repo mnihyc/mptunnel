@@ -826,7 +826,8 @@ impl RequestMultipathController {
         // A replacement carrier with the same numeric path key must not lend
         // its RTT or congestion evidence to an older attachment's flight. The
         // owner and alternate below are both projected from this one immutable
-        // observation and the same exact frontier payload.
+        // observation. The frontier is already part of the owner's exact
+        // OriginalData debt, so only the alternate is charged the new copy.
         let original_path_timing = original_path.and_then(|instance| {
             self.request_reinjection_target_snapshot_from_observation(
                 &recovery_observation,
@@ -834,7 +835,7 @@ impl RequestMultipathController {
             )
         });
         let owner_completion = original_path_timing
-            .and_then(|snapshot| scheduler::score_path(snapshot, lane, scoring_payload_bytes))
+            .and_then(|snapshot| scheduler::score_path(snapshot, lane, 0))
             .filter(|score| score.eta_ms.is_finite())
             .map(|score| Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0));
         let live_instances = remotes.path_instances();

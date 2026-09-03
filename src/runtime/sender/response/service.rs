@@ -230,6 +230,8 @@ pub(in crate::runtime) struct ServerAckGapReinjectionTarget {
 pub(in crate::runtime) struct ServerAckGapReinjectionObservation {
     pub(in crate::runtime) uniform_frontier_extent_bytes: usize,
     pub(in crate::runtime) owner_recovery_timing: ReliableDataAckGapTiming,
+    #[cfg(test)]
+    pub(in crate::runtime) owner_snapshot: Option<crate::scheduler::PathSnapshot>,
     pub(in crate::runtime) owner_completion: Option<Duration>,
     pub(in crate::runtime) target: Option<ServerAckGapReinjectionTarget>,
 }
@@ -417,7 +419,9 @@ impl ServerResponseSenderService {
             })
             .map(response_completion_snapshot);
         let owner_completion = owner_snapshot
-            .and_then(|snapshot| scheduler::score_path(snapshot, lane, scoring_payload_bytes))
+            // The retained frontier is already included in this output's
+            // exact OriginalData debt; it is not a second new payload.
+            .and_then(|snapshot| scheduler::score_path(snapshot, lane, 0))
             .filter(|score| score.eta_ms.is_finite())
             .map(|score| Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0));
         let owner_recovery_timing = reliable_data_ack_gap_timing_for_assignments(
@@ -451,6 +455,8 @@ impl ServerResponseSenderService {
         Some(ServerAckGapReinjectionObservation {
             uniform_frontier_extent_bytes,
             owner_recovery_timing,
+            #[cfg(test)]
+            owner_snapshot,
             owner_completion,
             target,
         })

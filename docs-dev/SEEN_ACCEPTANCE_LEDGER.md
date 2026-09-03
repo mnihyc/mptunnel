@@ -133,10 +133,10 @@ close one as disproved, unreachable, model-constrained, or stale fixture debt.
 | SEEN-P1 | Lowest-frontier temporal service and the hard optional-repair percentage gate | Necessary: exact diagnostics show RFC-conforming sequential copies contribute observed delay, while a percentage currently denies recovery as a hard cap. Replace budget authority with structural live-copy identity, then prove or reject each service policy under coupled load. |
 | SEEN-P2 | Sufficiency of native ordering domains, including a possible additional QUIC/TCP domain | Already triggered for TCP by SEEN-6D1; P1 may also trigger QUIC. Prove current-domain sufficiency, validate one clean domain design, or reject the candidate as model-constrained. |
 | SEEN-P3 | Request/fixed-output typed rate hints, omitted-hint startup, and stale-path requalification | Necessary: cold/warm startup and restart-dependent 10-to-500 recovery are reported SEEN symptoms. Close with exact authority chronology and restart-free recovery. |
-| SEEN-P4 | Generic score/admission conformance, uncertainty, flapping, and overlapping contention | Necessary at L3 for reported default-path sway and marginal path swaps. Overlapping latent-factor inference is processed by proving it necessary or irrelevant to v0.4.7; it is not automatically implemented. |
-| SEEN-P5 | Version-10 `STREAM_ACK(..., services)`, `STREAM_MAX_DATA`, partial local writes, target-bound tail authority, and service-frontier accounting | Necessary protocol/conformance audit. Each item needs a reachable current-model RED/GREEN or an explicit unreachable/irrelevant proof; no compatibility branch. |
+| SEEN-P4 | Generic score/admission conformance, uncertainty, flapping, and overlapping contention | Necessary at the carrier-neutral decision boundary for reported L4 default-path sway and marginal path swaps. Experimental L3 inherits correctness only. Overlapping latent-factor inference is processed by proving it necessary or irrelevant to v0.4.7; it is not automatically implemented. |
+| SEEN-P5 | Version-10 `STREAM_ACK(..., services)`, `STREAM_MAX_DATA`, partial local writes, target-bound tail authority, and service-frontier accounting | Necessary protocol/conformance audit. The service-vector/all-stage-ledger branch is now rejected as an unproved RFC model rather than implemented; remaining items still need a reachable RED/GREEN or explicit unreachable/irrelevant proof. No compatibility branch. |
 | SEEN-P6 | 32 current pre-v10/full-suite failures, including the three named stale fixtures | Necessary for release/CI truthfulness, not presumed production defects. Map each premise to the current RFC, then update stale tests or fix a reachable product mismatch. |
-| SEEN-P7 | Exact all-stage metrics, path/incarnation projection, and recovery-score observability | Necessary for the already reported stale/zero/reversed/mapping diagnostics and for causal release evidence. Unsupported values remain unavailable rather than synthesized. |
+| SEEN-P7 | Truthful stage-local metrics, path/incarnation projection, and recovery-score observability | Necessary for the already reported stale/zero/reversed/mapping diagnostics and for causal release evidence. Unsupported values remain unavailable rather than synthesized. |
 | SEEN-P8 | Final TCP, QUIC, default, short-object, single-stream, concurrent down/up, recovery, and matched-baseline matrix | Necessary release gate. Three complete valid cohorts, with at most two additional whole cohorts only for conflicting paired signs; no isolated lucky reruns. |
 
 An evaluator or harness extension with no direct need in P1--P8 is processed as
@@ -154,9 +154,10 @@ subject to the ordinary SEEN-6 composition matrix above.
 ## Deterministic next step
 
 1. Commit the explicit reflection and finite plan without production changes.
-2. Process the exact atomic order T01--T13 in
-   `docs-dev/V0_4_7_FINITE_CLOSURE.md`. Generic score/admission and typed rate
-   authority precede P1 because owner/alternate projections consume them.
+2. Process the exact atomic order T01--T14 in
+   `docs-dev/V0_4_7_FINITE_CLOSURE.md`. The RFC authority boundary precedes
+   typed rate/unit, advisory score, and admission; all precede P1 because
+   owner/alternate projections consume them.
 3. Preserve each earlier focused GREEN as a non-downgrade gate. Do not tune a
    timer, percentage, score, or test condition to manufacture a later pass.
 4. A failed or unresolved required package rejects v0.4.7; it cannot create a

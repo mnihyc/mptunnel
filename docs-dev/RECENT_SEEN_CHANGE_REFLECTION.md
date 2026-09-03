@@ -52,12 +52,72 @@ proofs, by itself, establishes sustained or startup performance.
 ## Why the conflicting policies existed
 
 The generic jitter, loss, confidence, `Suspect`, and active-flow score terms
-predate RFC 15.1's exact carrier-work `D` and typed `C/U` model. They were
-reasonable heuristic proxies for contention and uncertainty when exact inputs
-did not exist. With exact `D`, `C`, and incumbent uncertainty now specified,
-the same terms double-represent evidence and can reverse the RFC completion
-order. Their historical intent must be preserved through typed inputs and
-deadband, not by retaining duplicate penalties.
+predate the typed `C/U` model and the later proposed exact carrier-work `D`.
+They were reasonable heuristic proxies for contention and uncertainty when
+the inputs had no explicit roles. They nevertheless double-represent evidence
+and can reverse even a simple service-time order: 100 idle browser flows can
+turn a 500-Mbit/s physical-capacity observation into a 5-Mbit/s ranking value.
+Their historical intent belongs in typed rate/timing evidence and incumbent
+uncertainty, not in independent penalties.
+
+## Post-checkpoint correction: exact carrier ledger rejected for v0.4.7
+
+Three independent owner audits found that the all-stage carrier-work model
+added to RFC Section 15.1 in non-release checkpoint `3a6d0ea` is not present in
+the runtime. Current queue counters have the wrong scope, unit, and lifetime:
+response scoring can count its dequeued subset twice, QUIC sibling writers do
+not share queue ownership, payload-like charges are not encoded work, and a
+local flush removes the charge before peer processing. The v10 `STREAM_ACK`
+wire frame also has no service vector.
+
+That does **not** justify implementing the proposed ledger. A separate model
+audit disproved it as a Core prerequisite for this release:
+
+- exact token stages would not make remaining native service exact because
+  the proposed `Z` still drains using predicted `C`;
+- retaining a finite `N^B` until a peer receipt imposes the operational bound
+  `rate <= 8*N^B/receipt_delay`, regardless of calling it a resource limit;
+- conservative cross-writer predecessor accounting can suppress independently
+  ordered QUIC work; and
+- the change would couple reservation, every writer, cancellation, recovery,
+  and a new wire receipt before addressing the observed stale/underestimated
+  rate authority.
+
+For example, retaining 64 MiB for a five-second service-receipt delay caps
+publication near 107 Mbit/s. That is the same family of feedback-clocked
+underfill already rejected elsewhere. A partial ledger would be worse: it
+would add the cap while still lacking the receipt that releases it.
+
+The v0.4.7 model therefore keeps exact Product ownership, configured resource
+limits, bounded stage-local queues, lifecycle checks, and native transport
+backpressure as admission authorities. Path scoring is strictly advisory. For
+one scheduling action it may use only a coherent local pre-native work term
+`A`, a pending work term `M` in the same declared unit, typed positive carrier
+service `C`, propagation `T`, and incumbent uncertainty `U`:
+
+```text
+S = T + ceil(8 * (A + M) / C)
+U = max(J, 1 ms)
+```
+
+`A` ends at native handoff. It excludes Product/Data-ACK flight, native flight,
+loss, confidence, active-flow count, and the `Suspect` label. If the owner
+cannot prove a coherent `A` for every candidate in one comparison domain, it
+omits `A` uniformly rather than treating missing evidence as zero. Actual
+writer reservation and Product/resource revalidation remain the commit
+authority. A finite frozen order tries every structurally eligible candidate;
+an infinite advisory score ranks last but cannot deny the only successful
+commit. Equal ranks use exact path identity, and an incumbent changes only
+across `U_old + U_best`.
+
+This smaller model proves work conservation, no second congestion controller,
+deterministic ordering, monotonic response to lower `T/A` or higher `C`, no
+intentional double counting, and a combined-uncertainty anti-flap boundary. It
+does not claim receiver-completion prediction, independent bottlenecks,
+restart-free rate recovery, or superiority to a baseline. Those are the
+frozen runtime gates. The unsupported all-stage/service-receipt text must be
+removed from the authoritative RFC as a rejected draft model, not implemented
+by stealth or left as a known code/RFC mismatch.
 
 The hard ECF/completion-horizon admission branches were introduced to protect
 receive-hole and reorder exposure. The current model now has explicit Product

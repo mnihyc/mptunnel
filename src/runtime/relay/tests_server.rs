@@ -2,7 +2,7 @@ use super::*;
 use crate::config::ProductPolicyConfig;
 use crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
 use crate::model::path::CarrierPathKey;
-use crate::model::timing::transport_pto_from_snapshot;
+use crate::model::timing::{ReliableDataAckGapTiming, transport_pto_from_snapshot};
 use crate::mux::stream::validate_stream_ack;
 use crate::outbound::OutboundConfig;
 use crate::product::{
@@ -4242,19 +4242,7 @@ fn failed_original_tail_reinjection_is_not_blocked_by_optional_budget() {
     );
     let optional_budget = response_sender.reinjection_extra_budget_remaining(limits);
     assert!(optional_budget > 0);
-    assert!(
-        response_sender
-            .enqueue_reinjection_frame_with_priority(
-                Frame::StreamData {
-                    stream_id,
-                    offset: 10_000,
-                    payload: Bytes::from(vec![0x99; optional_budget]),
-                },
-                limits,
-                true,
-            )
-            .is_some()
-    );
+    response_sender.record_reinjection_for_test(optional_budget);
     assert_eq!(
         response_sender.reinjection_extra_event_budget_remaining(limits),
         0
@@ -4285,7 +4273,7 @@ fn failed_original_tail_reinjection_is_not_blocked_by_optional_budget() {
 }
 
 #[test]
-fn ack_gap_timer_retransmission_is_not_optional_traffic() {
+fn ack_gap_timer_retransmission_obeys_optional_budget() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(102);
     let original_key = CarrierPathKey {
@@ -4356,19 +4344,7 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
     );
     let optional_budget = response_sender.reinjection_extra_budget_remaining(limits);
     assert!(optional_budget > 0);
-    assert!(
-        response_sender
-            .enqueue_reinjection_frame_with_priority(
-                Frame::StreamData {
-                    stream_id,
-                    offset: 10_000,
-                    payload: Bytes::from(vec![0x99; optional_budget]),
-                },
-                limits,
-                true,
-            )
-            .is_some()
-    );
+    response_sender.record_reinjection_for_test(optional_budget);
     assert_eq!(
         response_sender.reinjection_extra_event_budget_remaining(limits),
         0
@@ -4391,7 +4367,10 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
         4096,
     );
 
-    assert_eq!(outcome.queued, 1);
+    assert_eq!(
+        outcome.queued, 0,
+        "a persistent authoritative gap on a live owner is optional acceleration even when the generic tail timer observes it",
+    );
     assert!(!outcome.pending);
 }
 
@@ -4425,6 +4404,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         ),
         ResponseStreamAttachOutcome::Attached
     );
+    record_server_delivery_evidence_with_srtt(&binding, original_key, 80_000);
     record_server_delivery_evidence_with_srtt(&binding, reinjection_key, 100_000);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
@@ -4440,26 +4420,37 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let quantum = MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
-    let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x51; quantum * 9]))
-        .expect("prepare sparse ACK-gap flight");
-    send_stream
-        .commit_prepared_data(&frame)
-        .expect("commit sparse ACK-gap flight");
-    binding.record_original_flight(original_key, &frame);
+    for _ in 0..4 {
+        let qualification_frame = send_stream
+            .prepare_data(Bytes::from(vec![0x50; quantum]))
+            .expect("prepare alternate qualification flight");
+        send_stream
+            .commit_prepared_data(&qualification_frame)
+            .expect("commit alternate qualification flight");
+        binding.record_original_flight(reinjection_key, &qualification_frame);
+    }
+    let qualification_ack = [OffsetRange {
+        start: 0,
+        end: (quantum * 4) as u64,
+    }];
+    let _ = send_stream.apply_ack(&qualification_ack);
+    binding.release_normalized_acked_ranges(&qualification_ack);
+
+    for _ in 0..9 {
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x51; quantum]))
+            .expect("prepare sparse ACK-gap flight");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit sparse ACK-gap flight");
+        binding.record_original_flight(original_key, &frame);
+    }
     binding.age_original_flights_for_test(Duration::from_millis(150));
+    let ack_frontier = (quantum * 5) as u64;
     let ack_ranges = [
         OffsetRange {
             start: 0,
-            end: quantum as u64,
-        },
-        OffsetRange {
-            start: (quantum * 2) as u64,
-            end: (quantum * 3) as u64,
-        },
-        OffsetRange {
-            start: (quantum * 4) as u64,
-            end: (quantum * 5) as u64,
+            end: ack_frontier,
         },
         OffsetRange {
             start: (quantum * 6) as u64,
@@ -4468,6 +4459,14 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         OffsetRange {
             start: (quantum * 8) as u64,
             end: (quantum * 9) as u64,
+        },
+        OffsetRange {
+            start: (quantum * 10) as u64,
+            end: (quantum * 11) as u64,
+        },
+        OffsetRange {
+            start: (quantum * 12) as u64,
+            end: (quantum * 13) as u64,
         },
     ];
     let validated_ack = begin_reliable_stream_ack(&send_stream, true, ack_ranges.to_vec())
@@ -4500,12 +4499,12 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         SessionId(103),
         stream_id,
         MppPerformanceConfig {
-            optional_reinjection_budget_percent: 5,
+            optional_reinjection_budget_percent: 100,
         },
     );
     let mut progress = ReliableAckGapReinjectionProgress::default();
     let assignment_at = path_stream
-        .data_ack_recovery_candidate(quantum as u64)
+        .data_ack_recovery_candidate(ack_frontier)
         .expect("exact original assignment")
         .sent_at;
     let stale_pre_selection_epoch = assignment_at + Duration::from_millis(100);
@@ -4516,7 +4515,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &send_stream,
         &mut progress,
         &authoritative_ack,
-        quantum as u64,
+        ack_frontier,
         Some(owner_timing_path),
         Some(modeled_path),
         TrafficClass::Throughput,
@@ -4529,6 +4528,153 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
     );
 
     binding.age_original_flights_for_test(Duration::from_secs(1));
+
+    let mut exhausted_response_sender = ServerResponseSenderService::new_with_performance(
+        SessionId(103),
+        stream_id,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 5,
+        },
+    );
+    let startup_credit = exhausted_response_sender.reinjection_extra_event_budget_remaining(limits);
+    assert!(startup_credit > 0);
+    exhausted_response_sender.record_reinjection_for_test(startup_credit);
+    assert_eq!(
+        exhausted_response_sender.reinjection_extra_event_budget_remaining(limits),
+        0,
+    );
+    assert_eq!(exhausted_response_sender.bytes(), 0);
+    let mut exhausted_progress = ReliableAckGapReinjectionProgress::default();
+    let observed_at = Instant::now();
+    let expired = path_stream
+        .data_ack_recovery_candidate(ack_frontier)
+        .expect("aged exact original assignment")
+        .sent_at;
+    assert!(expired < observed_at);
+    assert!(
+        exhausted_progress
+            .observe_recovery_timing(
+                true,
+                authoritative_ack.ranges(),
+                true,
+                Some(ReliableDataAckGapTiming {
+                    assignment_at: expired,
+                    loss_at: Some(expired),
+                    fallback_at: expired,
+                }),
+                Some(Duration::ZERO),
+                observed_at,
+            )
+            .is_some_and(|deadline| deadline <= observed_at)
+    );
+    let exhausted = evaluate_server_data_ack_reinjection(
+        &mut exhausted_response_sender,
+        &path_stream,
+        &send_stream,
+        &mut exhausted_progress,
+        &authoritative_ack,
+        ack_frontier,
+        Some(modeled_path),
+        Some(slow_send_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+    assert!(
+        exhausted.has_multipath_alternative,
+        "fixture must retain a distinct response repair carrier",
+    );
+    assert!(
+        exhausted.has_measured_target,
+        "fixture must retain a measurable response repair target",
+    );
+    assert!(
+        exhausted.persistent_ready,
+        "pre-armed live-owner ACK-gap recovery must be due",
+    );
+    assert!(!exhausted.target_service_exhausted);
+    assert_eq!(
+        exhausted.frame_count, 0,
+        "a persistent ACK gap on a live reliable owner is optional acceleration and cannot bypass exhausted cumulative credit",
+    );
+    assert_eq!(exhausted.queued, 0);
+    assert_eq!(exhausted_response_sender.bytes(), 0);
+
+    let mut partial_response_sender = ServerResponseSenderService::new_with_performance(
+        SessionId(103),
+        stream_id,
+        MppPerformanceConfig {
+            optional_reinjection_budget_percent: 5,
+        },
+    );
+    partial_response_sender.record_delivered_data(quantum.saturating_mul(9));
+    let partial_credit = quantum.saturating_add(scored_frontier_bytes);
+    let funded_credit = partial_response_sender.reinjection_extra_event_budget_remaining(limits);
+    assert!(funded_credit > partial_credit);
+    partial_response_sender.record_reinjection_for_test(funded_credit - partial_credit);
+    assert_eq!(
+        partial_response_sender.reinjection_extra_event_budget_remaining(limits),
+        partial_credit,
+    );
+    let partial = evaluate_server_data_ack_reinjection(
+        &mut partial_response_sender,
+        &path_stream,
+        &send_stream,
+        &mut exhausted_progress,
+        &authoritative_ack,
+        ack_frontier,
+        Some(modeled_path),
+        Some(slow_send_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+    assert!(partial.persistent_ready);
+    assert!(!partial.target_service_exhausted);
+    assert_eq!(
+        partial.service_limit, partial_credit,
+        "remaining optional credit, not the larger target service window, bounds this live-owner race",
+    );
+    assert!(partial.queued > 0);
+    assert_eq!(
+        partial_response_sender.bytes(),
+        partial_credit,
+        "accepted persistent-gap payload must not exceed the exact remaining cumulative credit",
+    );
+    assert_eq!(
+        partial_response_sender.reinjection_extra_event_budget_remaining(limits),
+        0,
+    );
+    let serialized_bytes = partial_response_sender.bytes();
+    partial_response_sender.clear_queued_work_for_test();
+    assert_eq!(partial_response_sender.bytes(), 0);
+    let serialized = evaluate_server_data_ack_reinjection(
+        &mut partial_response_sender,
+        &path_stream,
+        &send_stream,
+        &mut exhausted_progress,
+        &authoritative_ack,
+        ack_frontier,
+        Some(modeled_path),
+        Some(slow_send_path),
+        TrafficClass::Throughput,
+        limits,
+        stream_id,
+    );
+    assert_eq!(serialized.frame_count, 0);
+    assert_eq!(serialized.queued, 0);
+    assert_eq!(
+        partial_response_sender.bytes(),
+        0,
+        "a serialized response evaluation cannot renew a fixed repair quantum after prior queued work leaves, before unique Data ACK progress funds it",
+    );
+    assert!(serialized_bytes > 0);
+
+    response_sender.record_delivered_data(quantum.saturating_mul(9));
+    assert!(
+        response_sender.reinjection_extra_event_budget_remaining(limits) >= quantum * 5,
+        "funded live-gap recovery must retain the complete target service-window authority",
+    );
     let frontier_frame = send_stream
         .retransmission_frames_for_normalized_ack_gaps(
             authoritative_ack.ranges(),
@@ -4541,9 +4687,10 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         SessionId(103),
         stream_id,
         MppPerformanceConfig {
-            optional_reinjection_budget_percent: 5,
+            optional_reinjection_budget_percent: 100,
         },
     );
+    blocked_response_sender.record_delivered_data(quantum.saturating_mul(9));
     blocked_response_sender.enqueue_critical_reinjection_frame_with_cause(
         frontier_frame,
         RelaySendCause::AckGapReinjection,
@@ -4555,7 +4702,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &send_stream,
         &mut progress,
         &authoritative_ack,
-        quantum as u64,
+        ack_frontier,
         Some(modeled_path),
         Some(slow_send_path),
         TrafficClass::Throughput,
@@ -4579,7 +4726,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
         &send_stream,
         &mut progress,
         &authoritative_ack,
-        quantum as u64,
+        ack_frontier,
         Some(modeled_path),
         Some(slow_send_path),
         TrafficClass::Throughput,
@@ -4614,7 +4761,7 @@ fn persistent_response_ack_gap_commits_frontier_before_filling_service_window() 
             offset,
             payload,
             ..
-        })) if offset == quantum as u64 && payload.len() == scored_frontier_bytes
+        })) if offset == ack_frontier && payload.len() == scored_frontier_bytes
     ));
 }
 

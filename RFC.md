@@ -4600,10 +4600,11 @@ MPP Data ACK.
 The Product default is 10 percent. `[flow].optional_reinjection_budget_percent`
 sets the local sender default and an MPP inbound/outbound performance value may
 override it for that node. The value is directional and peers do not negotiate
-it. It meters optional repair reinjection, active observation, and stale-path
-requalification payload. It does not meter native transport retransmission,
-MPP control headers or receipts, or the cause-bounded critical recovery
-authority defined below.
+it. It meters optional repair reinjection, including persistent authoritative
+gap repair while the exact original carrier remains live, active observation,
+and stale-path requalification payload. It does not meter native transport
+retransmission, MPP control headers or receipts, or the cause-bounded critical
+recovery authority defined below.
 
 Exact carrier-instance failure permits immediate bounded reinjection on an
 eligible live alternative. A measured survivor is preferred, but liveness is
@@ -4641,9 +4642,11 @@ authorized no earlier than `loss_at` only when, at serialized evaluation time
 captured shared carrier-ledger generation. If the alternate cannot win that
 absolute comparison, the
 retained gap waits until `fallback_at`. At or after `fallback_at`, an eligible
-distinct alternate may perform bounded repair without a completion
-gain; expiration is liveness authority, not evidence that the alternate is
-faster or that native recovery failed.
+distinct alternate may perform bounded optional repair without a completion
+gain. Expiration authorizes another race; it is not evidence that the
+alternate is faster or that native recovery failed, and it does not waive the
+cumulative optional-reinjection budget while the original carrier remains
+live.
 
 The repair uses exact target `t`'s current published Product envelope `P_t`,
 already bounded by shared `W` and the configured repair and path-flight
@@ -4659,6 +4662,15 @@ repair_cap_t = max(saturating_sub(P_t, O_t), A_t^r)
 R_t = B_t + U_s + J_t
 K_t = repair_cap_t - R_t                 (saturating at zero)
 ```
+
+For a persistent authoritative gap whose exact original carrier remains live,
+let `C_s` be the sending direction's remaining cumulative optional-reinjection
+credit after applying the minimum useful-attempt rule. The effective repair
+limit is `L_t = min(K_t, C_s)`. This preserves the complete target service
+window when funded without converting ACK silence into proof that the native
+reliable owner failed. Exact terminal carrier failure uses the separate
+cause-bounded critical recovery authority and is not capped by `C_s`; its bytes
+remain charged against later optional work.
 
 `B_t` is queued ReinjectedData bound to exact target `t`; `U_s` is
 target-unbound queued ReinjectedData in the current stream and direction; and
@@ -4708,9 +4720,9 @@ generation whose `S_c` rank authorized that target. If that frame cannot be
 committed because it overlaps queued or recent
 repair work, the evaluation MUST stop without publishing later omitted ranges.
 After the frontier quantum is committed, the sender may fill the remainder of
-the same bounded target service window behind it. A larger coalesced batch or
-whole-window throughput estimate MUST NOT replace the exact frontier-quantum
-carrier rank as the primary target objective.
+the same bounded effective target service window `L_t` behind it. A larger
+coalesced batch or whole-window throughput estimate MUST NOT replace the exact
+frontier-quantum carrier rank as the primary target objective.
 
 When a persistent-gap reinjection attempt is accepted by a selected alternate,
 its repeat deadline is fixed from that alternate's observed MPP recovery
@@ -5044,14 +5056,15 @@ Reconciliation itself is neither assignment nor Data ACK progress and MUST NOT
 restart a surviving clock. Attachment staleness remains stream-local; only
 exact carrier-instance failure is session-wide.
 
-If cumulative extra-traffic credit is exhausted, an exact carrier failure or
-persistent authoritative gap may use one bounded target Product service window
-to prevent the budget itself from deadlocking recovery. A live-tail event
-without an authoritative gap remains limited to one critical recovery quantum.
-Both are bounded by retained ranges, exact flight identity, queue and flight
-limits, repeat-delay suppression, and a distinct output while the original
-carrier is live. Their bytes remain charged and reduce later optional
-reinjection authority.
+If cumulative extra-traffic credit is exhausted, exact terminal carrier
+failure may use one bounded target Product service window so that the budget
+cannot deadlock correctness recovery. A persistent authoritative gap on a live
+original carrier remains optional and waits for new credit, Data ACK progress,
+or exact terminal failure. A live-tail event without an authoritative gap
+remains limited to one critical recovery quantum. Critical work remains
+bounded by retained ranges, exact flight identity, queue and flight limits,
+repeat-delay suppression, and a distinct output while the original carrier is
+live. Its bytes remain charged and reduce later optional reinjection authority.
 
 ### 15.3 Datagram retry
 

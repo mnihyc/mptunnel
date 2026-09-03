@@ -279,6 +279,11 @@ impl RequestSenderService {
         self.optional_reinjection.record_delivered_data(bytes);
     }
 
+    #[cfg(test)]
+    pub(in crate::runtime) fn record_reinjection_for_test(&mut self, bytes: usize) {
+        self.optional_reinjection.record_reinjection(bytes);
+    }
+
     /// Advances the complete request product-ACK transaction once.
     ///
     /// Unique mux bytes, every transmitted flight copy, and exact OriginalData

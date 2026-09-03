@@ -596,8 +596,10 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     );
     let persistent_ack_gap_reinjection_ready =
         ack_gap_reinjection_ready && reinjection_target.is_some();
-    // Persistent authoritative evidence may fill one measured target service
-    // window despite optional duplicate-budget exhaustion. Missing, failed, or
+    // A complete persistent gap proves missing Product order, not failure of
+    // the live native-reliable owner. Racing that owner is optional work, so
+    // its full measured target service window remains subject to the sender's
+    // cumulative optional-reinjection credit. Missing, failed, or
     // declared-stale owners retain their separate exact-range recovery.
     let reinjection_limit = if reinjection.target_service_exhausted {
         0
@@ -612,6 +614,7 @@ pub(super) fn evaluate_client_data_ack_reinjection(
             send_stream.reinjection_bytes(),
             context.mux_limits,
         )
+        .min(reinjection_event_budget)
     } else {
         base_reinjection_limit.min(reinjection_event_budget)
     };
@@ -647,12 +650,13 @@ pub(super) fn evaluate_client_data_ack_reinjection(
         {
             false
         } else if persistent_ack_gap_reinjection {
-            sender.enqueue_critical_reinjection_frame(
+            sender.enqueue_reinjection_frame_with_priority(
                 sender_queue,
                 frame,
                 ack_gap_reinjection_cause,
-            );
-            true
+                context.mux_limits,
+                true,
+            )
         } else {
             sender.enqueue_reinjection_frame_with_priority(
                 sender_queue,

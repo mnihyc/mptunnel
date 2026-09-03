@@ -487,6 +487,16 @@ impl ServerResponseSenderService {
         self.optional_reinjection.record_delivered_data(bytes);
     }
 
+    #[cfg(test)]
+    pub(in crate::runtime) fn record_reinjection_for_test(&mut self, bytes: usize) {
+        self.optional_reinjection.record_reinjection(bytes);
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn clear_queued_work_for_test(&mut self) {
+        while self.queue.pop_front().is_some() {}
+    }
+
     pub(in crate::runtime) fn publish_queue_bytes(&self, path_stream: &ReliablePathStream) {
         path_stream.set_sender_queue_bytes(self.queue.bytes());
     }
@@ -607,6 +617,22 @@ impl ServerResponseSenderService {
         mux_limits: MuxLimits,
         critical_priority: bool,
     ) -> Option<u64> {
+        self.enqueue_reinjection_frame_with_cause_and_priority(
+            frame,
+            RelaySendCause::AckGapReinjection,
+            mux_limits,
+            critical_priority,
+        )
+    }
+
+    pub(in crate::runtime) fn enqueue_reinjection_frame_with_cause_and_priority(
+        &mut self,
+        frame: Frame,
+        cause: RelaySendCause,
+        mux_limits: MuxLimits,
+        critical_priority: bool,
+    ) -> Option<u64> {
+        debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         let budget = self.optional_reinjection.budget(
             sender_optional_reinjection_startup_floor_bytes(mux_limits),
@@ -618,9 +644,9 @@ impl ServerResponseSenderService {
         self.optional_reinjection.record_reinjection(payload_bytes);
         Some(if critical_priority {
             self.queue
-                .push_critical_reinjection_with_cause(frame, RelaySendCause::AckGapReinjection)
+                .push_critical_reinjection_with_cause(frame, cause)
         } else {
-            self.queue.push_reinjection(frame)
+            self.queue.push_reinjection_with_cause(frame, cause)
         })
     }
 

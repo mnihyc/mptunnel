@@ -1718,7 +1718,7 @@ fn client_reinjection_extra_budget_is_cumulative_not_per_event() {
 }
 
 #[test]
-fn client_critical_reinjection_closes_tail_after_optional_budget_exhaustion() {
+fn client_exact_failure_reinjection_bypasses_optional_budget_exhaustion() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(95);
     let mut sender = RequestSenderService::new_with_performance(
@@ -1758,7 +1758,7 @@ fn client_critical_reinjection_closes_tail_after_optional_budget_exhaustion() {
     sender.enqueue_critical_reinjection_frame(
         &mut sender_queue,
         closure_frame,
-        RelaySendCause::AckGapReinjection,
+        RelaySendCause::PathFailureReinjection,
     );
     assert_eq!(sender.optional_reinjection_budget_remaining(mux_limits), 0);
 }

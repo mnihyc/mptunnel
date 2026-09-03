@@ -716,15 +716,15 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         .find(|path| path.key().index == 2)
         .expect("second alternate")
         .instance();
-    for alternate in [first_alternate, second_alternate] {
-        context.install_relay_path_instance_for_test(alternate);
+    for path in [owner, first_alternate, second_alternate] {
+        context.install_relay_path_instance_for_test(path);
         context.mark_tcp_path_open_success(
-            alternate.key.index,
+            path.key.index,
             Duration::from_millis(20),
             TrafficClass::Throughput,
         );
         context.mark_relay_path_rate_sample_for_test(
-            alternate.key,
+            path.key,
             PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20))
                 .expect("bulk rate sample"),
         );
@@ -735,7 +735,12 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
     let original = send_stream
         .send_data(Bytes::from(vec![0x61; quantum * 3]))
         .expect("sparse request flight");
-    let mut sender = RequestSenderService::new(stream_id);
+    let mut sender = RequestSenderService::new_with_performance(
+        stream_id,
+        crate::performance::MppPerformanceConfig {
+            optional_reinjection_budget_percent: 100,
+        },
+    );
     sender.record_original_frame_for_test(owner, &original);
     let ack_ranges = vec![
         OffsetRange {
@@ -756,15 +761,30 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
         &validated_ack,
     );
     state.progress.last_send_ack_frontier = quantum as u64;
-    drop(
-        remotes
-            .remove_path_instance(owner)
-            .expect("remove missing original output"),
-    );
 
     let authoritative_ranges = state.progress.last_send_ack.ranges().to_vec();
+    let scored_path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_500_000.0);
+    let scored_frontier_bytes = adaptive_reliable_relay_reinjection_bytes(
+        Some(scored_path),
+        TrafficClass::Throughput,
+        limits,
+    );
+    assert!(scored_frontier_bytes < quantum);
+    let empty_queue = ReliableRelaySenderQueue::default();
+    let original_observation = sender.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &send_stream,
+        &empty_queue,
+        &authoritative_ranges,
+        scored_frontier_bytes,
+        TrafficClass::Throughput,
+    );
+    assert!(original_observation.has_live_original_path);
+    let original_assignment_at = original_observation
+        .original_assignment_at
+        .expect("live request owner assignment");
     let observed_at = Instant::now();
-    let expired = observed_at - Duration::from_secs(1);
     assert!(
         state
             .progress
@@ -774,9 +794,9 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
                 &authoritative_ranges,
                 true,
                 Some(ReliableDataAckGapTiming {
-                    assignment_at: expired,
-                    loss_at: Some(expired),
-                    fallback_at: expired,
+                    assignment_at: original_assignment_at,
+                    loss_at: Some(original_assignment_at),
+                    fallback_at: original_assignment_at,
                 }),
                 Some(Duration::ZERO),
                 observed_at,
@@ -784,13 +804,187 @@ async fn persistent_request_ack_gap_commits_frontier_before_filling_service_wind
             .is_some_and(|deadline| deadline <= observed_at)
     );
 
-    let scored_path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_500_000.0);
-    let scored_frontier_bytes = adaptive_reliable_relay_reinjection_bytes(
+    let mut exhausted_sender = RequestSenderService::new(stream_id);
+    exhausted_sender.record_original_frame_for_test(owner, &original);
+    let mut exhausted_queue = ReliableRelaySenderQueue::default();
+    let startup_credit = exhausted_sender.reinjection_extra_event_budget_remaining(limits);
+    assert!(startup_credit > 0);
+    exhausted_sender.record_reinjection_for_test(startup_credit);
+    assert_eq!(
+        exhausted_sender.reinjection_extra_event_budget_remaining(limits),
+        0,
+    );
+    let mut exhausted_state = ClientRelayState::new();
+    update_reinjection_authoritative_ack_snapshot(
+        &mut exhausted_state.progress.last_send_ack,
+        &validated_ack,
+    );
+    exhausted_state.progress.last_send_ack_frontier = quantum as u64;
+    let exhausted_observation = exhausted_sender.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &send_stream,
+        &exhausted_queue,
+        &authoritative_ranges,
+        scored_frontier_bytes,
+        TrafficClass::Throughput,
+    );
+    assert!(exhausted_observation.has_live_original_path);
+    let exhausted_assignment_at = exhausted_observation
+        .original_assignment_at
+        .expect("live exhausted request owner assignment");
+    let exhausted_observed_at = Instant::now();
+    assert!(
+        exhausted_state
+            .progress
+            .ack_gap_reinjection
+            .observe_recovery_timing(
+                true,
+                &authoritative_ranges,
+                true,
+                Some(ReliableDataAckGapTiming {
+                    assignment_at: exhausted_assignment_at,
+                    loss_at: Some(exhausted_assignment_at),
+                    fallback_at: exhausted_assignment_at,
+                }),
+                Some(Duration::ZERO),
+                exhausted_observed_at,
+            )
+            .is_some_and(|deadline| deadline <= exhausted_observed_at)
+    );
+    let exhausted = evaluate_client_data_ack_reinjection(
+        &mut exhausted_state,
+        &mut exhausted_sender,
+        &mut exhausted_queue,
+        &context,
+        &remotes,
+        &send_stream,
         Some(scored_path),
         TrafficClass::Throughput,
-        limits,
+        stream_id,
     );
-    assert!(scored_frontier_bytes < quantum);
+    assert!(exhausted.persistent_ready);
+    assert!(!exhausted.target_service_exhausted);
+    assert_eq!(
+        exhausted.frame_count, 0,
+        "a persistent ACK gap on a live reliable owner is optional acceleration and cannot bypass exhausted cumulative credit",
+    );
+    assert!(exhausted_queue.is_empty());
+
+    let mut partial_sender = RequestSenderService::new(stream_id);
+    partial_sender.record_original_frame_for_test(owner, &original);
+    partial_sender.record_delivered_data(quantum.saturating_mul(2));
+    let partial_credit = scored_frontier_bytes;
+    let funded_credit = partial_sender.reinjection_extra_event_budget_remaining(limits);
+    assert!(funded_credit > partial_credit);
+    partial_sender.record_reinjection_for_test(funded_credit - partial_credit);
+    assert_eq!(
+        partial_sender.reinjection_extra_event_budget_remaining(limits),
+        partial_credit,
+    );
+    let mut partial_queue = ReliableRelaySenderQueue::default();
+    let partial_observation = partial_sender.data_ack_gap_reinjection_model(
+        &context,
+        &remotes,
+        &send_stream,
+        &partial_queue,
+        &authoritative_ranges,
+        scored_frontier_bytes,
+        TrafficClass::Throughput,
+    );
+    let (partial_target, partial_snapshot) = partial_observation
+        .reinjection_target
+        .expect("partial-credit request repair target");
+    assert!(
+        request_target_reinjection_service_limit(
+            partial_target.instance(),
+            partial_snapshot,
+            &partial_queue,
+            partial_observation.reinjection_target_flight_bytes,
+            send_stream.reinjection_bytes(),
+            limits,
+        ) > partial_credit,
+        "fixture requires target service capacity larger than exact remaining credit",
+    );
+    let partial_assignment_at = partial_observation
+        .original_assignment_at
+        .expect("live partial-credit request owner assignment");
+    let partial_observed_at = Instant::now();
+    let mut partial_state = ClientRelayState::new();
+    update_reinjection_authoritative_ack_snapshot(
+        &mut partial_state.progress.last_send_ack,
+        &validated_ack,
+    );
+    partial_state.progress.last_send_ack_frontier = quantum as u64;
+    assert!(
+        partial_state
+            .progress
+            .ack_gap_reinjection
+            .observe_recovery_timing(
+                true,
+                &authoritative_ranges,
+                true,
+                Some(ReliableDataAckGapTiming {
+                    assignment_at: partial_assignment_at,
+                    loss_at: Some(partial_assignment_at),
+                    fallback_at: partial_assignment_at,
+                }),
+                Some(Duration::ZERO),
+                partial_observed_at,
+            )
+            .is_some_and(|deadline| deadline <= partial_observed_at)
+    );
+    let partial = evaluate_client_data_ack_reinjection(
+        &mut partial_state,
+        &mut partial_sender,
+        &mut partial_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        Some(scored_path),
+        TrafficClass::Throughput,
+        stream_id,
+    );
+    assert!(partial.persistent_ready);
+    assert!(!partial.target_service_exhausted);
+    assert!(partial.frame_count > 0);
+    assert_eq!(
+        partial_queue.bytes(),
+        partial_credit,
+        "accepted persistent-gap request payload must not exceed the exact remaining cumulative credit",
+    );
+    assert_eq!(
+        partial_sender.reinjection_extra_event_budget_remaining(limits),
+        0,
+    );
+    let serialized_bytes = partial_queue.bytes();
+    while partial_queue.pop_front().is_some() {}
+    assert!(partial_queue.is_empty());
+    let serialized = evaluate_client_data_ack_reinjection(
+        &mut partial_state,
+        &mut partial_sender,
+        &mut partial_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        Some(scored_path),
+        TrafficClass::Throughput,
+        stream_id,
+    );
+    assert_eq!(serialized.frame_count, 0);
+    assert_eq!(
+        partial_queue.bytes(),
+        0,
+        "a serialized request evaluation cannot renew a fixed repair quantum after prior queued work leaves, before unique Data ACK progress funds it",
+    );
+    assert!(partial_state.progress.data_ack_reinjection_at.is_none());
+    assert!(serialized_bytes > 0);
+
+    sender.record_delivered_data(quantum.saturating_mul(2));
+    assert!(
+        sender.reinjection_extra_event_budget_remaining(limits) >= quantum,
+        "the exact two acknowledged quanta must fund the one retained request gap",
+    );
     let frontier_frame = send_stream
         .retransmission_frames_for_normalized_ack_gaps(&authoritative_ranges, scored_frontier_bytes)
         .into_iter()

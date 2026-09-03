@@ -1220,7 +1220,12 @@ fn evaluate_server_data_ack_reinjection(
         };
     };
 
-    let service_limit = response_sender.reinjection_service_limit_for_target(
+    // A complete persistent gap proves missing Product order, not failure of
+    // the live native-reliable owner. Preserve the full target Product service
+    // window when funded, but racing that owner cannot exceed cumulative
+    // optional-reinjection credit. Exact terminal failure uses its separate
+    // cause-bounded critical path below this lifecycle.
+    let target_service_limit = response_sender.reinjection_service_limit_for_target(
         path_stream,
         send_stream,
         target.identity,
@@ -1228,6 +1233,8 @@ fn evaluate_server_data_ack_reinjection(
         false,
         mux_limits,
     );
+    let service_limit = target_service_limit
+        .min(response_sender.reinjection_extra_event_budget_remaining(mux_limits));
     let frames = stream_ack_gap_reinjection_frames_normalized(
         send_stream,
         ranges,
@@ -1252,8 +1259,9 @@ fn evaluate_server_data_ack_reinjection(
         {
             false
         } else {
-            response_sender.enqueue_critical_reinjection_frame_with_cause(frame, cause);
-            true
+            response_sender
+                .enqueue_reinjection_frame_with_cause_and_priority(frame, cause, mux_limits, true)
+                .is_some()
         };
         if accepted {
             queued = queued.saturating_add(1);
@@ -1329,7 +1337,7 @@ fn evaluate_server_data_ack_reinjection(
         has_multipath_alternative,
         has_measured_target,
         target_service_exhausted: persistent_ready
-            && service_limit == 0
+            && target_service_limit == 0
             && send_stream.reinjection_bytes() > 0,
         base_limit,
         service_limit,
@@ -1435,15 +1443,16 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                 last_send_ack_frontier,
             )
         {
-            // ACK silence grants one liveness quantum. Persistent gap service
-            // is driven separately from retained ACK evidence and a measured
-            // target, so this generic tail clock cannot inherit that target's
-            // service window or repeat deadline.
+            // This tail clock authorizes one optional live-owner gap attempt.
+            // Persistent gap service is driven separately from retained ACK
+            // evidence and a measured target, so this generic clock cannot
+            // inherit that target's service window or repeat deadline.
             let gap_limit = reliable_critical_tail_reinjection_limit_bytes(
                 base_reinjection_limit,
                 send_stream.reinjection_bytes(),
                 mux_limits,
-            );
+            )
+            .min(response_sender.reinjection_extra_event_budget_remaining(mux_limits));
             let gap_source_frames = stream_ack_gap_reinjection_frames_normalized(
                 send_stream,
                 last_send_ack_ranges,
@@ -1462,7 +1471,6 @@ fn enqueue_reliable_tail_reinjection_with_ack_horizon(
                     RelaySendCause::AckGapReinjection,
                 );
             if !gap_frames.is_empty() {
-                critical_tail_reinjection = true;
                 reinjection_limit = gap_limit;
                 reinjection_frames = gap_frames;
                 blocked_frontier_offset = gap_blocked_offset;

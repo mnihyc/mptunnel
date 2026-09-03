@@ -147,13 +147,14 @@ QUIC attachments are accepted with a zero maximum, which is credit-neutral
 because senders retain the greatest advertised offset; path demand can never
 widen the shared window.
 
-Ordinary reinjection consumes a cumulative extra-traffic budget. Critical
-path-failure, persistent authoritative Data ACK gap, and bounded live-tail
-recovery may exceed the remaining cumulative budget only by a cause-specific,
-event-bounded quantum. The exact range must remain unacknowledged and retained;
-overlapping queued copies are suppressed, live-tail and persistent-gap work use
-a distinct output, and all exception bytes remain charged against later
-optional reinjection.
+Optional reinjection, including persistent authoritative Data ACK-gap repair
+while the exact original carrier remains live, consumes a cumulative
+extra-traffic budget. Critical path-failure and bounded live-tail recovery
+without an authoritative gap may exceed the remaining cumulative budget only
+by a cause-specific, event-bounded quantum. The exact range must remain
+unacknowledged and retained; overlapping queued copies are suppressed,
+live-tail and persistent-gap work use a distinct output, and all exception
+bytes remain charged against later optional reinjection.
 
 Recovery timing follows the evidence owner. Exact path-instance failure is
 immediate. A complete Data ACK establishes gaps; positive partial ACK ranges

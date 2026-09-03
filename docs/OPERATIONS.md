@@ -1117,13 +1117,14 @@ work around these with a fixed path role or a Linux-only eligibility rule.
 
 Ordinary reinjection is limited by a cumulative allowance derived from a
 bounded startup floor and unique MPP bytes acknowledged by Data ACK.
-Critical path-failure, persistent authoritative Data ACK gap, and bounded
-live-tail recovery may exceed the remaining allowance by one cause-specific
-event quantum so that budget exhaustion cannot deadlock recovery. Exact
-retained ranges, queue and flight limits, overlap/repeat suppression, and
-alternate-output requirements still apply. Exception bytes remain charged,
-reducing the remaining optional reinjection allowance. A continuous over-budget
-stream is therefore a defect, not expected failover overhead.
+Persistent authoritative Data ACK-gap repair remains within that allowance
+while the exact original carrier is live. Critical path-failure and bounded
+live-tail recovery without an authoritative gap may exceed the remaining
+allowance by one cause-specific event quantum. Exact retained ranges, queue
+and flight limits, overlap/repeat suppression, and alternate-output
+requirements still apply. Exception bytes remain charged, reducing the
+remaining optional reinjection allowance. A continuous over-budget stream is
+therefore a defect, not expected failover overhead.
 
 The current timers are cause-specific. Exact path-instance failure permits an
 immediate bounded copy, preferring measured survivors but using any eligible

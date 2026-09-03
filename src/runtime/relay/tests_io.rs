@@ -1122,7 +1122,7 @@ fn data_retransmission_keeps_tcp_and_quic_recovery_clocks_separate() {
 }
 
 #[test]
-fn persistent_ack_gap_reinjection_limit_ignores_optional_budget_exhaustion() {
+fn exact_failure_reinjection_limit_is_independent_of_optional_budget() {
     let limits = MuxLimits::default();
     let base_limit = MAX_RELIABLE_SERVICE_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
     let small_tail = base_limit.saturating_sub(1024).max(1);
@@ -1132,7 +1132,7 @@ fn persistent_ack_gap_reinjection_limit_ignores_optional_budget_exhaustion() {
 
     assert_eq!(
         reinjection_limit, small_tail,
-        "persistent ACK-gap reinjection is correctness reinjection and must not depend on optional duplicate/probe budget"
+        "exact terminal carrier failure retains correctness-recovery authority after optional credit is exhausted"
     );
     assert_eq!(
         reliable_critical_tail_reinjection_limit_bytes(
@@ -1141,7 +1141,7 @@ fn persistent_ack_gap_reinjection_limit_ignores_optional_budget_exhaustion() {
             limits
         ),
         limits.max_repair_bytes.min(limits.max_path_flight_bytes),
-        "persistent ACK-gap reinjection remains bounded by configured reinjection/path-flight caps"
+        "exact terminal carrier-failure recovery remains bounded by configured reinjection/path-flight caps"
     );
 }
 

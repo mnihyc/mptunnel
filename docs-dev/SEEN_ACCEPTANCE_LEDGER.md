@@ -63,7 +63,7 @@ An isolated commit milestone never does.
 | SEEN-6F | QUIC-only 10 -> 500 recovery and cold/warm first-object behavior | Open | The user-observed slow recovery and size-dependent startup trajectory require ordinary-build timing evidence |
 | SEEN-6G | TCP, QUIC, and default single-thread plus Cloudflare-style download/upload behavior | Open | Acceptance requires stable/burstable short and sustained work; aggregate bulk goodput alone is insufficient |
 | SEEN-6H | Matched raw TCP, V2Ray/Xray, and Hysteria2 comparison under the declared changing 3--10% loss schedule | Open | No release-wide competitiveness conclusion has yet satisfied the frozen comparison contract |
-| SEEN-7 | Retired peer rows, port projection, Evidence unknown/stale semantics, directional Suspect state | Retirement fixed; remaining current claims disproved | Bounded retirement lifecycle `e0e70e7`; later projection audit and focused tests found no additional defect |
+| SEEN-7 | Retired peer rows, port projection, Evidence unknown/stale semantics, directional Suspect state | Retirement fixed; remaining current claims disproved | Absolute retirement core `e0e70e7` plus exact native-terminal-result follow-up retained in checkpoint `3a6d0ea`; later projection audit and focused tests found no additional defect |
 
 The tracked tree at `a9450d8` contains no uncommitted production correction.
 The non-release checkpoint `3a6d0ea` preserves the complete v10 integration
@@ -88,9 +88,11 @@ trace shows:
 This is a Product head-of-line and recovery-latency failure, not a congestion-
 controller throughput failure. Shortening the stale timer, treating a rate
 sample as packet loss, or bypassing the cumulative optional-traffic ledger is
-not a justified fix. The remaining proof must decide whether an already
-specified recovery authority failed to execute, or whether satisfying the
-stronger latency requirement needs a new temporal frontier-race authority.
+not a justified fix. History and symbolic review identified an intended
+one-frontier-quantum live-owner race that `0b50e9a` accidentally removed while
+correctly bounding cumulative optional repair. The bounded restoration is
+being implemented and reviewed as this SEEN-6E transaction; it has no runtime
+benefit claim until the ordinary mixed recovery gate passes.
 
 Fixing this causal cell does not close the wider SEEN-6 matrix. The retained
 matrix still requires, for TCP-only, QUIC-only, and default TCP+QUIC:
@@ -141,13 +143,12 @@ subject to the ordinary SEEN-6 composition matrix above.
 
 ## Deterministic next step
 
-1. Finish the existing SEEN-6E trace attribution without editing production.
-2. If an existing RFC authority is not exercised, add one deterministic RED,
-   make the smallest symmetric correction, review it independently, commit it
-   alone, and rerun only the affected existing gates.
-3. If implementation already matches the RFC, leave SEEN-6E visibly open and
-   present the exact new model and tradeoff for consent. Do not tune a timer or
-   score to manufacture a pass.
+1. Finish the bounded SEEN-6E live-owner frontier transaction, including its
+   symmetric deterministic RED/GREEN proofs and independent diff review.
+2. Commit that correction alone, then rerun only its ordinary mixed recovery
+   gate; do not tune a timer or score to manufacture a pass.
+3. Keep SEEN-6E visibly open unless both the component proof and affected
+   ordinary runtime gate pass without a goodput or traffic-expansion downgrade.
 4. Continue the remaining frozen SEEN-6 acceptance cells one at a time; a
    newly exposed causal defect is still SEEN only when it is necessary to
    explain one of those already-reported failures.

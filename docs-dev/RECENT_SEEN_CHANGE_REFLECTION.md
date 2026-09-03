@@ -90,34 +90,43 @@ would add the cap while still lacking the receipt that releases it.
 
 The v0.4.7 model therefore keeps exact Product ownership, configured resource
 limits, bounded stage-local queues, lifecycle checks, and native transport
-backpressure as admission authorities. Path scoring is strictly advisory. For
-one scheduling action it may use only a coherent local pre-native work term
-`A`, a pending work term `M` in the same declared unit, typed positive carrier
-service `C`, propagation `T`, and incumbent uncertainty `U`:
+backpressure as admission authorities. Path ranking is strictly advisory and
+is not a receiver- or application-completion ETA. For one exact, positive
+scheduling action it may use only a coherent local pre-native predecessor term
+`A`, the action work `M` in the same declared normalized-MPP unit, typed
+positive carrier-direction service `C`, propagation proxy `T`, and incumbent
+timing variation `U`:
 
 ```text
 S = T + ceil(8 * (A + M) / C)
 U = max(J, 1 ms)
 ```
 
-`A` ends at native handoff. It excludes Product/Data-ACK flight, native flight,
-loss, confidence, active-flow count, and the `Suspect` label. If the owner
-cannot prove a coherent `A` for every candidate in one comparison domain, it
-omits `A` uniformly rather than treating missing evidence as zero. Actual
-writer reservation and Product/resource revalidation remain the commit
-authority. A finite frozen order tries every structurally eligible candidate;
-an infinite advisory score ranks last but cannot deny the only successful
-commit. Equal ranks use exact path identity, and an incumbent changes only
+`M` is the complete encoded MPP action at the MPP boundary; native transport
+framing, retransmission, and headers are excluded. `A` ends at native handoff.
+It excludes Product/Data-ACK flight, native flight, loss, confidence,
+active-flow count, and the `Suspect` label. If the owner cannot prove a
+coherent `A` for every candidate in one comparison domain, it omits `A`
+uniformly rather than treating missing evidence as zero. Actual writer
+reservation and Product/resource revalidation remain the commit authority. A
+finite frozen order tries every structurally eligible candidate; an infinite
+advisory rank sorts last but cannot deny the only successful commit. Equal
+ranks use the exact action/output/carrier/incarnation identity supplied by the
+caller, not a bare path number or input order. An incumbent changes only
 across `U_old + U_best`.
 
 This smaller model proves work conservation, no second congestion controller,
 deterministic ordering, monotonic response to lower `T/A` or higher `C`, no
-intentional double counting, and a combined-uncertainty anti-flap boundary. It
-does not claim receiver-completion prediction, independent bottlenecks,
-restart-free rate recovery, or superiority to a baseline. Those are the
-frozen runtime gates. The unsupported all-stage/service-receipt text must be
-removed from the authoritative RFC as a rejected draft model, not implemented
-by stealth or left as a known code/RFC mismatch.
+intentional double counting, and a timing-variation deadband. It does not
+claim a statistical rate-confidence bound, receiver-completion prediction,
+independent bottlenecks, restart-free rate recovery, or superiority to a
+baseline. In particular, `U = max(J, 1 ms)` alone cannot prove that an
+approximately ten-percent estimated-rate change is significant; T09 must
+either derive a typed duration-valued uncertainty or explicitly leave that
+stronger no-flap claim unmade. Those questions remain frozen gates. The
+unsupported all-stage/service-receipt text must be removed from the
+authoritative RFC as a rejected draft model, not implemented by stealth or
+left as a known code/RFC mismatch.
 
 The hard ECF/completion-horizon admission branches were introduced to protect
 receive-hole and reorder exposure. The current model now has explicit Product

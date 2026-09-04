@@ -74,7 +74,7 @@ The scalar tables below are accepted historical evidence for the releases
 identified with each cohort; they do not characterize the current tree. The
 chart is a historical two-run diagnostic series, not a current-release ranking.
 See the [performance methodology](docs/PERFORMANCE.md) for measurement details
-and the accepted v0.4.7 startup and mixed-path corrections.
+and the accepted v0.4.7 startup and v0.4.8 mixed-path recovery corrections.
 
 ### Historical diagnostic series
 

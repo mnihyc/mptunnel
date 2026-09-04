@@ -1,7 +1,7 @@
 # T06 live-owner recovery service
 
-Status: implemented v0.4.8 candidate. The focused model and causal runtime
-gates are green; uninstrumented matched performance acceptance remains pending.
+Status: accepted for v0.4.8. Focused model, causal-runtime, and clean matched
+performance gates are green.
 
 ## Scope and observed counterexample
 
@@ -195,5 +195,14 @@ persistent repair fell from 266,315,936 bytes to 6,712,728 bytes (97.479
 percent), and total Product repair was 7,255,320 bytes, or 0.676 percent of
 1,073,742,032 OriginalData bytes. This proves removal of the observed
 score/Apply amplification. Its instrumented throughput is not performance
-acceptance. The remaining gate is the documented clean, uninstrumented,
-matched QUIC-only/TCP+QUIC comparison.
+acceptance.
+
+The clean uninstrumented matched comparison delivered 336.156 Mbit/s for
+QUIC-only and 332.393 Mbit/s for default TCP+QUIC, a mixed/QUIC ratio of
+0.9888. Both completed 80/80 concurrent interactive probes; p95 latency was
+414.06 and 414.63 ms. Mixed's largest read gap was 0.741 s, below the prior
+accepted 0.983-second same-request QoS-recovery bound. Approximate client-edge
+excess was 8.454 percent for QUIC-only and 11.702 percent for mixed. The
+transaction therefore passes its frozen acceptance gate without changing
+allocator, TCP-HOL, lifecycle, congestion-control, dashboard, or stale-owner
+policy.

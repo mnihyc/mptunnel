@@ -22,7 +22,7 @@ Hysteria2 received the measured directional capacities. Missing echo values
 remain gaps rather than zeroes; clipped display outliers retain their exact
 values in hover text.
 
-## v0.4.5-v0.4.7 accepted correctness evidence
+## v0.4.5-v0.4.8 accepted correctness evidence
 
 Focused correctness gates establish the following bounded corrections. They
 are not throughput or latency measurements and do not establish a product
@@ -60,6 +60,15 @@ ranking.
   zero-policy draft behavior are unchanged. Immediate randomized loss no
   longer ends backlogged Startup before representative bandwidth acquisition,
   while sustained app-limited excess loss retains its native escape.
+- Live-owner recovery now preserves the exact frontier quantum used to rank an
+  alternate through Product Apply. Larger target headroom cannot append an
+  unranked suffix, while exact terminal failure retains prompt multi-quantum
+  service. Symmetric request/response tests cover persistent gaps, finite
+  tails, percentage invariance, exact target revalidation, and terminal
+  failure. In the accepted matched dynamic-loss gate, QUIC-only and default
+  TCP+QUIC delivered 336.156 and 332.393 Mbps; all 80 interactive probes in
+  each case completed, with p95 latency of 414.06 and 414.63 ms. This is a
+  bounded regression gate for the correction, not a general product ranking.
 
 ## Historical accepted fixed-profile evidence (v0.2.1–v0.2.2)
 
